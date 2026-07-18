@@ -517,7 +517,7 @@ def _binding(
     )
     return ServiceRunBinding(
         execution_mode=ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-        runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image="openevo/science-runtime:0.1.1",
         runtime_image_immutable_reference=(
             MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
         ),
@@ -1493,9 +1493,7 @@ def test_timeline_and_log_sequence_allocation_is_concurrency_safe(
     project = _project(store, registry)
     request = _run_request(project)
     state_root = tmp_path / "owner"
-    run_id = _seed_run(
-        state_root, request, status=m.RunStatus.CANCELLED, run_id="run-concurrent"
-    )
+    run_id = _seed_run(state_root, request, status=m.RunStatus.CANCELLED, run_id="run-concurrent")
     services = _FakeServiceOwner(_binding(registry))
 
     def fixed_clock() -> datetime:

@@ -17,8 +17,8 @@ from typing import Final, Literal, TypeAlias
 ManagedRuntimeProfile: TypeAlias = Literal["managed_science", "python_research"]
 
 MANAGED_RUNTIME_IMAGES: Final[dict[ManagedRuntimeProfile, str]] = {
-    "managed_science": "openevo/science-runtime:0.1.0",
-    "python_research": "openevo/python-research-runtime:0.1.0",
+    "managed_science": "openevo/science-runtime:0.1.1",
+    "python_research": "openevo/python-research-runtime:0.1.1",
 }
 _SHA256_DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"^sha256:[0-9a-f]{64}$")
 _SHA256_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
@@ -157,27 +157,27 @@ class ManagedCredentialMount:
 MANAGED_RUNTIME_RELEASES: Final[dict[ManagedRuntimeProfile, ManagedRuntimeImageRelease]] = {
     profile: ManagedRuntimeImageRelease(
         image=image,
-        trusted_digest=("sha256:16837a0db8af654383ea9af8af4f81a1175fbb0add74b98d7692cbaa87f44a5c"),
+        trusted_digest=("sha256:af67c6b8c9cb0debd3a29addc23f518a680369ad53ec5347a829ef7318529c5c"),
         loaded_image_id=(
-            "sha256:014ee0866c332b73dfa9165397486a0ffbd132b274705e18b2b8c9b78d5dbb90"
+            "sha256:7a0079f9cb1bce5768cff5bce3d1181811c6a231ad800cac8fb503d66852c81b"
         ),
     )
     for profile, image in MANAGED_RUNTIME_IMAGES.items()
 }
 MANAGED_RUNTIME_ARCHIVE_RELEASE: Final[ManagedRuntimeArchiveRelease] = (
     ManagedRuntimeArchiveRelease(
-        asset_release_id=354404740,
-        asset_release_tag="openevo-managed-runtime-assets-v0.1.0",
-        asset_id=478167627,
+        asset_release_id=356072935,
+        asset_release_tag="openevo-managed-runtime-assets-v0.1.1",
+        asset_id=481361975,
         asset_api_digest=(
-            "sha256:7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a"
+            "sha256:ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149"
         ),
-        filename="openevo-science-runtime-0.1.0-linux-amd64.tar.gz",
-        sha256="7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a",
-        byte_size=374_592_823,
+        filename="openevo-science-runtime-0.1.1-linux-amd64.tar.gz",
+        sha256="ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149",
+        byte_size=352_236_726,
         platform="linux-amd64",
-        config_id=("sha256:ae4e0189161bec78e419ab4887b1028e51f30996beee7b078011e3656e6084a1"),
-        oci_index_id=("sha256:014ee0866c332b73dfa9165397486a0ffbd132b274705e18b2b8c9b78d5dbb90"),
+        config_id=("sha256:0e5783e7839fe06d2df14d7a431c90f0982ca2099ef33bfa4c9e5933149bf5f2"),
+        oci_index_id=("sha256:7a0079f9cb1bce5768cff5bce3d1181811c6a231ad800cac8fb503d66852c81b"),
         aliases=(MANAGED_RUNTIME_IMAGES["managed_science"],),
     )
 )
@@ -538,10 +538,16 @@ def _safe_archive_member_name(value: str) -> str:
 
 
 MANAGED_HOME: Final[str] = "/openevo/session/home"
+MANAGED_WORKSPACE: Final[str] = "/openevo/session/workspace"
 MANAGED_CODEX_HOME: Final[str] = "/openevo/credentials/codex"
-MANAGED_CODEX_BINARY: Final[str] = "/home/openevo/.local/bin/codex"
+MANAGED_CODEX_PACKAGE_ROOT: Final[str] = "/opt/codex"
+MANAGED_CODEX_BINARY: Final[str] = f"{MANAGED_CODEX_PACKAGE_ROOT}/bin/codex"
+MANAGED_CODEX_VERSION: Final[str] = "0.144.1"
+MANAGED_CODEX_NPM_PACKAGE: Final[str] = f"@openai/codex@{MANAGED_CODEX_VERSION}"
+MANAGED_CODEX_DEFAULT_MODEL: Final[str] = "gpt-5.5"
 MANAGED_PATH: Final[str] = (
-    "/home/openevo/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+    f"{MANAGED_CODEX_PACKAGE_ROOT}/bin:"
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 )
 MANAGED_SUBSCRIPTION_ENV: Final[dict[str, str]] = {
     "HOME": MANAGED_HOME,
@@ -549,6 +555,10 @@ MANAGED_SUBSCRIPTION_ENV: Final[dict[str, str]] = {
     "CODEX_HOME": MANAGED_CODEX_HOME,
 }
 MANAGED_SUBSCRIPTION_ENV_KEYS: Final[frozenset[str]] = frozenset(MANAGED_SUBSCRIPTION_ENV)
+MANAGED_SUBSCRIPTION_PREPARE_COMMAND: Final[str] = (
+    f"mkdir -p {MANAGED_HOME}/.codex {MANAGED_WORKSPACE} && "
+    f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex"
+)
 
 
 def reject_managed_subscription_env(
@@ -699,6 +709,7 @@ def require_managed_subscription_runtime(
     image: str | None,
     backend: str,
     container_user: str,
+    workdir: str | None = None,
 ) -> None:
     """Require the exact Core-managed Docker runtime used for subscription auth."""
 
@@ -715,6 +726,8 @@ def require_managed_subscription_runtime(
         raise ValueError("subscription execution requires the managed Docker runtime")
     if container_user != "host":
         raise ValueError("subscription credentials require runtime.container_user='host'")
+    if workdir is not None and workdir != MANAGED_WORKSPACE:
+        raise ValueError(f"subscription execution requires runtime.workdir={MANAGED_WORKSPACE!r}")
 
 
 def require_managed_runtime_binding(
@@ -739,8 +752,13 @@ def require_managed_runtime_binding(
 __all__ = [
     "MANAGED_CODEX_HOME",
     "MANAGED_CODEX_BINARY",
+    "MANAGED_CODEX_PACKAGE_ROOT",
+    "MANAGED_CODEX_VERSION",
+    "MANAGED_CODEX_NPM_PACKAGE",
+    "MANAGED_CODEX_DEFAULT_MODEL",
     "MANAGED_HOME",
     "MANAGED_PATH",
+    "MANAGED_WORKSPACE",
     "MANAGED_RUNTIME_IMAGES",
     "MANAGED_RUNTIME_LABEL",
     "MANAGED_RUNTIME_LABEL_VALUE",
@@ -748,6 +766,7 @@ __all__ = [
     "MANAGED_RUNTIME_RELEASES",
     "MANAGED_SUBSCRIPTION_ENV",
     "MANAGED_SUBSCRIPTION_ENV_KEYS",
+    "MANAGED_SUBSCRIPTION_PREPARE_COMMAND",
     "ManagedRuntimeProfile",
     "ManagedRuntimeArchiveAuthority",
     "ManagedRuntimeArchiveVerificationError",

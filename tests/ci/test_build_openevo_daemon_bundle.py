@@ -12,7 +12,12 @@ from zipfile import ZIP_DEFLATED, ZipFile
 import pytest
 
 from openevo.backend import daemon_bundle
-from openevo.backend.service import CoreServiceError, CoreServiceErrorCode
+from openevo.backend.runtime_identity import CoreReleaseIdentity
+from openevo.backend.service import (
+    CoreDaemonBundleIdentity,
+    CoreServiceError,
+    CoreServiceErrorCode,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -151,7 +156,8 @@ def test_build_metadata_schema_is_canonical_and_closed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    version = daemon_bundle.__version__
+    wheel = tmp_path / f"openevo-{version}-py3-none-any.whl"
     wheel.write_bytes(b"wheel")
     assets = tmp_path / "frozen" / "openevo_daemon_bundle"
     assets.mkdir(parents=True)
@@ -159,7 +165,7 @@ def test_build_metadata_schema_is_canonical_and_closed(
         "bundle_format": "pyinstaller-onefile",
         "core": {
             "distribution": "openevo",
-            "version": "0.1.0",
+            "version": version,
             "wheel_filename": wheel.name,
             "wheel_sha256": hashlib.sha256(b"wheel").hexdigest(),
             "wheel_size": 5,
@@ -187,6 +193,120 @@ def test_source_execution_is_not_a_bundle(monkeypatch: pytest.MonkeyPatch) -> No
     monkeypatch.delattr(daemon_bundle.sys, "_MEIPASS", raising=False)
     with pytest.raises(daemon_bundle.DaemonBundleError, match="not running from a frozen bundle"):
         daemon_bundle._bundle_root()
+
+
+def test_service_invocation_rehashes_executing_inode_and_rejects_path_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_stat = daemon_bundle.os.stat
+    executing_path = tmp_path / "openevo-daemon"
+    monkeypatch.setattr(daemon_bundle.sys, "executable", str(executing_path))
+    executable_digest = daemon_bundle._sha256(Path("/proc/self/exe"))
+    manifest_payload = b"{}\n"
+    manifest_digest = hashlib.sha256(manifest_payload).hexdigest()
+    manifest_path = tmp_path / f"bundle-{manifest_digest}"
+    manifest_path.write_bytes(manifest_payload)
+
+    def stat_running_path(path: object, *args: object, **kwargs: object) -> object:
+        if str(path) == str(executing_path):
+            return original_stat("/proc/self/exe")
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_bundle.os, "stat", stat_running_path)
+    monkeypatch.setattr(daemon_bundle, "_verified_release", lambda: ({}, object(), object()))
+    monkeypatch.setattr(
+        daemon_bundle, "_verify_canonical_manifest", lambda *_args, **_kwargs: None
+    )
+    identity = daemon_bundle._verified_running_bundle_identity(
+        expected_bundle_sha256=executable_digest,
+        expected_canonical_manifest_sha256=manifest_digest,
+        canonical_manifest_path=str(manifest_path),
+    )
+    assert identity.bundle_sha256 == executable_digest
+    assert identity.canonical_manifest_sha256 == manifest_digest
+
+    replacement = tmp_path / "replacement-daemon"
+    replacement.write_bytes(b"replacement")
+    monkeypatch.setattr(daemon_bundle.sys, "executable", str(replacement))
+    with pytest.raises(daemon_bundle.DaemonBundleError, match="does not match"):
+        daemon_bundle._verified_running_bundle_identity(
+            expected_bundle_sha256=executable_digest,
+            expected_canonical_manifest_sha256=manifest_digest,
+            canonical_manifest_path=str(manifest_path),
+        )
+
+
+def test_canonical_manifest_binds_bundle_and_verified_release() -> None:
+    release = CoreReleaseIdentity(
+        digest="1" * 64,
+        registry_digest="2" * 64,
+        framework_lock_sha256="3" * 64,
+        source_commit="4" * 40,
+    )
+    metadata = {
+        "core": {
+            "version": "0.1.0",
+            "wheel_sha256": "5" * 64,
+            "wheel_size": 123,
+        },
+        "dependency_lock": {"sha256": "6" * 64},
+    }
+    manifest = {
+        "artifact": {
+            "filename": "openevo-daemon-linux-x86_64",
+            "sha256": "7" * 64,
+            "size": 456,
+        },
+        "build_environment_distributions": [],
+        "core": {
+            "framework_lock": {
+                "filename": "framework-lock.json",
+                "sha256": release.framework_lock_sha256,
+            },
+            "registry_digest": release.registry_digest,
+            "wheel": {
+                "filename": "openevo.whl",
+                "sha256": "5" * 64,
+                "size": 123,
+                "version": "0.1.0",
+            },
+        },
+        "dependency_lock": {"filename": "uv.lock", "sha256": "6" * 64},
+        "platform": {"architecture": "x86_64", "system": "linux"},
+        "release": {
+            "identity": release.digest,
+            "source_commit": release.source_commit,
+        },
+        "runtime": {
+            "format": "pyinstaller-onefile",
+            "python": {"implementation": "CPython", "version": "3.11.15"},
+            "system_python_required": False,
+            "target_pypi_required": False,
+        },
+        "schema_version": 1,
+        "smoke": {
+            "backend_readiness": "passed",
+            "controlled_exit": "passed",
+            "identity": "passed",
+        },
+    }
+    daemon_bundle._verify_canonical_manifest(
+        manifest,
+        expected_bundle_sha256="7" * 64,
+        expected_bundle_size=456,
+        metadata=metadata,
+        release=release,
+    )
+    manifest["artifact"]["sha256"] = "8" * 64
+    with pytest.raises(daemon_bundle.DaemonBundleError, match="does not bind"):
+        daemon_bundle._verify_canonical_manifest(
+            manifest,
+            expected_bundle_sha256="7" * 64,
+            expected_bundle_size=456,
+            metadata=metadata,
+            release=release,
+        )
 
 
 def test_internal_launcher_dispatch_rebinds_ephemeral_assets(
@@ -372,7 +492,10 @@ def test_service_ensure_returns_authenticated_subscription_attachment(
     attachment = SimpleNamespace(
         attached=False,
         bearer_token="B" * 64,
+        bundle_sha256="7" * 64,
+        canonical_manifest_sha256="8" * 64,
         generation="5" * 32,
+        lifecycle_compatibility=2,
         port=43117,
         registry_digest="3" * 64,
         release_identity="2" * 64,
@@ -396,27 +519,85 @@ def test_service_ensure_returns_authenticated_subscription_attachment(
         lambda name: Path("/embedded") / name,
     )
     monkeypatch.setattr(daemon_bundle, "ensure_core_service", ensure)
+    monkeypatch.setattr(
+        daemon_bundle,
+        "_verified_running_bundle_identity",
+        lambda **_kwargs: CoreDaemonBundleIdentity(
+            bundle_sha256="7" * 64,
+            canonical_manifest_sha256="8" * 64,
+            lifecycle_compatibility=2,
+        ),
+    )
 
     result = daemon_bundle._run_service_command(
         SimpleNamespace(
             service_command="ensure",
             port=43117,
             deadline_seconds=30.0,
+            expect_service_absent=True,
+            expect_service_generation=None,
+            expect_service_release_identity=None,
+            expect_service_bundle_sha256=None,
+            expect_service_canonical_manifest_sha256=None,
+            expect_service_lifecycle_compatibility=None,
+            expected_bundle_sha256="7" * 64,
+            expected_canonical_manifest_sha256="8" * 64,
+            canonical_manifest_path="/embedded/bundle-" + "8" * 64,
         )
     )
 
     assert result == {
         "attached": False,
         "bearer_token": "B" * 64,
+        "bundle_sha256": "7" * 64,
+        "canonical_manifest_sha256": "8" * 64,
         "capture_mode": "transcript",
         "execution_mode": "subscription",
         "generation": "5" * 32,
         "host": "127.0.0.1",
+        "lifecycle_compatibility": 2,
         "port": 43117,
         "registry_digest": "3" * 64,
         "release_identity": "2" * 64,
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": "1" * 40,
         "status_proof": "4" * 64,
     }
     assert captured["replace_mismatched"] is True
+    assert captured["expected_predecessor"].state == "absent"
+
+
+def test_service_inspect_excludes_bearer_and_status_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    attachment = SimpleNamespace(
+        attached=True,
+        bearer_token="B" * 64,
+        bundle_sha256="7" * 64,
+        canonical_manifest_sha256="8" * 64,
+        generation="5" * 32,
+        lifecycle_compatibility=2,
+        port=43117,
+        registry_digest="3" * 64,
+        release_identity="2" * 64,
+        source_commit="1" * 40,
+        status_proof="4" * 64,
+    )
+    monkeypatch.setattr(daemon_bundle, "inspect_core_service", lambda **_kwargs: attachment)
+
+    result = daemon_bundle._run_service_command(SimpleNamespace(service_command="inspect"))
+
+    assert result == {
+        "attached": True,
+        "bundle_sha256": "7" * 64,
+        "canonical_manifest_sha256": "8" * 64,
+        "generation": "5" * 32,
+        "lifecycle_compatibility": 2,
+        "port": 43117,
+        "registry_digest": "3" * 64,
+        "release_identity": "2" * 64,
+        "schema_version": 2,
+        "source_commit": "1" * 40,
+    }
+    assert "bearer_token" not in result
+    assert "status_proof" not in result

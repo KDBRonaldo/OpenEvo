@@ -18,12 +18,16 @@ from openevo.deployment import managed_runtime_assets
 from openevo.deployment.core_control import RemoteCoreControlAttachment
 from openevo.deployment.daemon_bundle_transport import (
     DOCKER_USER_CONTAINER_V1,
+    DaemonBundleServicePredecessor,
     DaemonBundleTransportContractError,
     OpenedDaemonBundle,
     StagedDaemonBundle,
     _STAGE_SCRIPT,
     build_daemon_bundle_ensure_command,
+    build_daemon_bundle_observe_command,
+    parse_daemon_bundle_error_code,
     parse_daemon_bundle_identity,
+    parse_daemon_bundle_service_predecessor,
     parse_staged_daemon_bundle,
 )
 from openevo.deployment.host_keys import ProviderKnownHostStore, TrustedKnownHostsBinding
@@ -41,6 +45,7 @@ remote_user=${relative_root%%/*}
 [ -n "$remote_user" ]
 [ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
 """
+_MANIFEST_DIGEST = "8" * 64
 
 
 def _canonical(value: object) -> str:
@@ -142,23 +147,30 @@ def _identity(*, digest: str, size: int) -> str:
     )
 
 
-def _attachment() -> str:
+def _attachment(*, bundle_sha256: str = "a" * 64) -> str:
     return _canonical(
         {
             "attached": False,
             "bearer_token": "a" * 64,
+            "bundle_sha256": bundle_sha256,
+            "canonical_manifest_sha256": _MANIFEST_DIGEST,
             "capture_mode": "transcript",
             "execution_mode": "subscription",
             "generation": "b" * 32,
             "host": "127.0.0.1",
+            "lifecycle_compatibility": 2,
             "port": 43123,
             "registry_digest": "4" * 64,
             "release_identity": "5" * 64,
-            "schema_version": 1,
+            "schema_version": 2,
             "source_commit": "6" * 40,
             "status_proof": "7" * 64,
         }
     )
+
+
+def _absent_predecessor() -> str:
+    return _canonical({"schema_version": 2, "state": "absent"})
 
 
 def _runtime_receipt(release: object, *, reused: bool) -> str:
@@ -366,12 +378,130 @@ def test_ensure_command_uses_public_bundle_command() -> None:
         bundle,
         port=0,
         deadline_seconds=45,
+        expected_predecessor=DaemonBundleServicePredecessor(state="absent"),
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+    )
+    replacement = build_daemon_bundle_ensure_command(
+        bundle,
+        port=43117,
+        deadline_seconds=45,
+        expected_predecessor=DaemonBundleServicePredecessor(
+            state="running",
+            generation="b" * 32,
+            release_identity="5" * 64,
+            bundle_sha256="a" * 64,
+            canonical_manifest_sha256=_MANIFEST_DIGEST,
+            lifecycle_compatibility=2,
+        ),
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
     )
 
-    assert command.endswith("service ensure --port 0 --deadline-seconds 45.000000")
+    assert command.endswith("--expect-service-absent")
+    assert f"--expected-bundle-sha256 {'a' * 64}" in command
+    assert f"--expected-canonical-manifest-sha256 {_MANIFEST_DIGEST}" in command
+    assert (
+        "--canonical-manifest-path "
+        f"/home/alice/.openevo/daemon-bundles/bundle-{_MANIFEST_DIGEST}" in command
+    )
     assert "openevo.backend.service" not in command
     assert "attachment-name" not in command
+    assert f"--expect-service-generation {'b' * 32}" in replacement
+    assert f"--expect-service-release-identity {'5' * 64}" in replacement
+    assert f"--expect-service-bundle-sha256 {'a' * 64}" in replacement
     assert "/home/alice" not in repr(bundle)
+
+
+def test_observe_command_and_predecessor_parser_are_closed() -> None:
+    bundle = _staged(digest="a" * 64, size=12)
+
+    command = build_daemon_bundle_observe_command(
+        bundle,
+        deadline_seconds=12,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+    )
+    predecessor = parse_daemon_bundle_service_predecessor(SecretStr(_absent_predecessor()))
+    exact = parse_daemon_bundle_service_predecessor(
+        SecretStr(
+            _canonical(
+                {
+                    "bundle_sha256": "a" * 64,
+                    "canonical_manifest_sha256": _MANIFEST_DIGEST,
+                    "generation": "b" * 32,
+                    "lifecycle_compatibility": 2,
+                    "release_identity": "5" * 64,
+                    "schema_version": 2,
+                    "state": "running",
+                }
+            )
+        )
+    )
+    legacy = parse_daemon_bundle_service_predecessor(
+        SecretStr(
+            _canonical(
+                {
+                    "generation": "b" * 32,
+                    "lifecycle_compatibility": 1,
+                    "release_identity": "5" * 64,
+                    "schema_version": 2,
+                    "state": "legacy",
+                }
+            )
+        )
+    )
+
+    assert "service observe --deadline-seconds 12.000000" in command
+    assert f"--expected-canonical-manifest-sha256 {_MANIFEST_DIGEST}" in command
+    assert predecessor == DaemonBundleServicePredecessor(state="absent")
+    assert exact.bundle_sha256 == "a" * 64
+    assert exact.canonical_manifest_sha256 == _MANIFEST_DIGEST
+    assert legacy.state == "legacy"
+    with pytest.raises(DaemonBundleTransportContractError):
+        parse_daemon_bundle_service_predecessor(
+            SecretStr(
+                _canonical(
+                    {
+                        "generation": "b" * 32,
+                        "release_identity": "5" * 64,
+                        "schema_version": 1,
+                        "state": "running",
+                        "unexpected": True,
+                    }
+                )
+            )
+        )
+
+
+def test_daemon_error_parser_returns_only_closed_error_code() -> None:
+    payload = SecretStr(
+        _canonical(
+            {
+                "error": {
+                    "code": "core_service_predecessor_mismatch",
+                    "message": "private diagnostic",
+                    "retryable": True,
+                },
+                "schema_version": 1,
+            }
+        )
+    )
+
+    assert parse_daemon_bundle_error_code(payload) == "core_service_predecessor_mismatch"
+    with pytest.raises(DaemonBundleTransportContractError):
+        parse_daemon_bundle_error_code(
+            SecretStr(
+                _canonical(
+                    {
+                        "error": {
+                            "code": "core_service_predecessor_mismatch",
+                            "message": "private diagnostic",
+                            "retryable": True,
+                            "secret": "not-allowed",
+                        },
+                        "schema_version": 1,
+                    }
+                )
+            )
+        )
 
 
 def test_ssh_stage_streams_bundle_fd_without_binary_in_argv(tmp_path: Path) -> None:
@@ -379,6 +509,10 @@ def test_ssh_stage_streams_bundle_fd_without_binary_in_argv(tmp_path: Path) -> N
     digest = hashlib.sha256(payload).hexdigest()
     bundle_path = tmp_path / "openevo-daemon"
     bundle_path.write_bytes(payload)
+    manifest_payload = b"{}\n"
+    manifest_path = tmp_path / "openevo-daemon-bundle.json"
+    manifest_path.write_bytes(manifest_payload)
+    manifest_digest = hashlib.sha256(manifest_payload).hexdigest()
     calls: list[list[str]] = []
 
     def streaming_runner(
@@ -392,12 +526,13 @@ def test_ssh_stage_streams_bundle_fd_without_binary_in_argv(tmp_path: Path) -> N
         streamed = bytearray()
         while chunk := os.read(stdin_fd, 8):
             streamed.extend(chunk)
-        assert bytes(streamed) == payload
+        assert bytes(streamed) in {payload, manifest_payload}
         assert payload.decode("ascii", errors="ignore") not in "\0".join(argv)
+        streamed_digest = hashlib.sha256(streamed).hexdigest()
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout=_stage_receipt(digest=digest, size=len(payload)),
+            stdout=_stage_receipt(digest=streamed_digest, size=len(streamed)),
             stderr=_completion_stderr(argv[-1]),
         )
 
@@ -411,11 +546,14 @@ def test_ssh_stage_streams_bundle_fd_without_binary_in_argv(tmp_path: Path) -> N
         bundle_path=str(bundle_path),
         bundle_sha256=digest,
         bundle_size=len(payload),
+        manifest_path=str(manifest_path),
+        manifest_sha256=manifest_digest,
+        manifest_size=len(manifest_payload),
         timeout_seconds=10,
     )
 
     assert staged.sha256 == digest
-    assert len(calls) == 1
+    assert len(calls) == 2
     remote_command = calls[0][-1].lower()
     assert "python" not in remote_command
     assert "rsync" not in remote_command
@@ -427,6 +565,9 @@ def test_ssh_stage_revalidates_host_key_authority_before_streaming(tmp_path: Pat
     digest = hashlib.sha256(payload).hexdigest()
     bundle_path = tmp_path / "openevo-daemon"
     bundle_path.write_bytes(payload)
+    manifest_path = tmp_path / "openevo-daemon-bundle.json"
+    manifest_path.write_bytes(b"{}\n")
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     profile = _profile()
     binding = _trusted_binding(tmp_path, profile)
     called = False
@@ -454,6 +595,9 @@ def test_ssh_stage_revalidates_host_key_authority_before_streaming(tmp_path: Pat
             bundle_path=str(bundle_path),
             bundle_sha256=digest,
             bundle_size=len(payload),
+            manifest_path=str(manifest_path),
+            manifest_sha256=manifest_digest,
+            manifest_size=manifest_path.stat().st_size,
             timeout_seconds=10,
         )
 
@@ -479,6 +623,9 @@ def test_ssh_stage_failures_are_typed_and_fail_closed(
     digest = hashlib.sha256(payload).hexdigest()
     bundle_path = tmp_path / "openevo-daemon"
     bundle_path.write_bytes(payload)
+    manifest_path = tmp_path / "openevo-daemon-bundle.json"
+    manifest_path.write_bytes(b"{}\n")
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
     cancel_event = threading.Event()
     if runner_failure == "cancelled":
         cancel_event.set()
@@ -513,6 +660,9 @@ def test_ssh_stage_failures_are_typed_and_fail_closed(
             bundle_path=str(bundle_path),
             bundle_sha256=digest,
             bundle_size=len(payload),
+            manifest_path=str(manifest_path),
+            manifest_sha256=manifest_digest,
+            manifest_size=manifest_path.stat().st_size,
             timeout_seconds=10,
             cancel_event=cancel_event,
         )
@@ -532,7 +682,12 @@ def test_ssh_ensure_returns_existing_remote_attachment_model(tmp_path: Path) -> 
         del timeout_seconds
         command = argv[-1]
         commands.append(command)
-        stdout = _identity(digest=digest, size=12) if " identity" in command else _attachment()
+        if " identity" in command:
+            stdout = _identity(digest=digest, size=12)
+        elif " service observe" in command:
+            stdout = _absent_predecessor()
+        else:
+            stdout = _attachment()
         return subprocess.CompletedProcess(
             argv,
             0,
@@ -547,8 +702,15 @@ def test_ssh_ensure_returns_existing_remote_attachment_model(tmp_path: Path) -> 
         runner=runner,
     )
 
-    attachment = transport.ensure_daemon_bundle(
+    predecessor = transport.observe_daemon_bundle_service(
         bundle,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+        timeout_seconds=30,
+    )
+    attachment, status = transport.ensure_daemon_bundle(
+        bundle,
+        expected_predecessor=predecessor,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
         port=0,
         timeout_seconds=45,
     )
@@ -556,9 +718,121 @@ def test_ssh_ensure_returns_existing_remote_attachment_model(tmp_path: Path) -> 
     assert isinstance(attachment, RemoteCoreControlAttachment)
     assert attachment.remote_port == 43123
     assert attachment.bearer_token == "a" * 64
-    assert len(commands) == 2
-    assert " service ensure --port 0 " in commands[1]
-    assert "openevo.backend.service" not in commands[1]
+    assert status.bundle_sha256 == digest
+    assert len(commands) == 3
+    assert " service observe " in commands[0]
+    assert " service ensure --port 0 " in commands[2]
+    assert " --expect-service-absent" in commands[2]
+    assert "openevo.backend.service" not in commands[2]
+
+
+def test_ssh_ensure_preserves_predecessor_conflict_without_remote_message(
+    tmp_path: Path,
+) -> None:
+    digest = "a" * 64
+    bundle = _staged(digest=digest, size=12)
+    private = "bearer-" + "s" * 64
+
+    def runner(
+        argv: list[str],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        command = argv[-1]
+        if " identity" in command:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=_identity(digest=digest, size=12),
+                stderr=_completion_stderr(command),
+            )
+        error = _canonical(
+            {
+                "error": {
+                    "code": "core_service_predecessor_mismatch",
+                    "message": private,
+                    "retryable": True,
+                },
+                "schema_version": 1,
+            }
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            stdout="",
+            stderr=error + _completion_stderr(command, return_code=1),
+        )
+
+    profile = _profile()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=_trusted_binding(tmp_path, profile),
+        runner=runner,
+    )
+
+    with pytest.raises(SshTransportError) as raised:
+        transport.ensure_daemon_bundle(
+            bundle,
+            expected_predecessor=DaemonBundleServicePredecessor(state="absent"),
+            canonical_manifest_sha256=_MANIFEST_DIGEST,
+            timeout_seconds=45,
+        )
+
+    assert raised.value.code is SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH
+    assert private not in str(raised.value)
+
+
+def test_ssh_ensure_preserves_nonretryable_update_required_error(
+    tmp_path: Path,
+) -> None:
+    digest = "a" * 64
+    bundle = _staged(digest=digest, size=12)
+
+    def runner(
+        argv: list[str],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        command = argv[-1]
+        if " identity" in command:
+            stdout = _identity(digest=digest, size=12)
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout=stdout,
+                stderr=_completion_stderr(command),
+            )
+        error = _canonical(
+            {
+                "error": {
+                    "code": "core_service_update_required",
+                    "message": "A different live bundle remains active.",
+                    "retryable": False,
+                },
+                "schema_version": 1,
+            }
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            stdout="",
+            stderr=error + _completion_stderr(command, return_code=1),
+        )
+
+    profile = _profile()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=_trusted_binding(tmp_path, profile),
+        runner=runner,
+    )
+    with pytest.raises(SshTransportError) as raised:
+        transport.ensure_daemon_bundle(
+            bundle,
+            expected_predecessor=DaemonBundleServicePredecessor(state="absent"),
+            canonical_manifest_sha256=_MANIFEST_DIGEST,
+            timeout_seconds=45,
+        )
+    assert raised.value.code is SshTransportErrorCode.DAEMON_UPDATE_REQUIRED
 
 
 def test_ssh_inspect_and_stop_use_closed_bundle_responses(tmp_path: Path) -> None:
@@ -566,11 +840,14 @@ def test_ssh_inspect_and_stop_use_closed_bundle_responses(tmp_path: Path) -> Non
     status = _canonical(
         {
             "attached": True,
+            "bundle_sha256": "a" * 64,
+            "canonical_manifest_sha256": _MANIFEST_DIGEST,
             "generation": "b" * 32,
+            "lifecycle_compatibility": 2,
             "port": 43123,
             "registry_digest": "4" * 64,
             "release_identity": "5" * 64,
-            "schema_version": 1,
+            "schema_version": 2,
             "source_commit": "6" * 40,
         }
     )
@@ -609,7 +886,7 @@ def test_daemon_managed_runtime_streams_without_python_rsync_or_scp(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    archive = tmp_path / "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
     release = write_test_managed_runtime_archive(archive)
     monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
     payload = archive.read_bytes()
@@ -693,7 +970,7 @@ def test_daemon_managed_runtime_reuses_ready_image_without_reading_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    archive = tmp_path / "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
     release = write_test_managed_runtime_archive(archive)
     monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
     archive.unlink()
@@ -742,7 +1019,7 @@ def test_daemon_managed_runtime_stream_failure_discards_exact_transfer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    archive = tmp_path / "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
     release = write_test_managed_runtime_archive(archive)
     monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
     transfer_id = "d" * 32

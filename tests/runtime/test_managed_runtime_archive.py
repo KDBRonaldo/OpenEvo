@@ -30,17 +30,17 @@ def test_release_contract_binds_actual_archive_config_authority() -> None:
     assert release.asset_release_id == RUNTIME_RELEASE_ID
     assert release.asset_id == RUNTIME_ASSET_ID
     assert release.filename == RUNTIME_FILENAME
-    assert release.byte_size == 374_592_823
-    assert release.sha256 == "7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a"
+    assert release.byte_size == 352_236_726
+    assert release.sha256 == "ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149"
     assert release.asset_api_digest == "sha256:" + release.sha256
     assert (
         release.config_id
-        == "sha256:ae4e0189161bec78e419ab4887b1028e51f30996beee7b078011e3656e6084a1"
+        == "sha256:0e5783e7839fe06d2df14d7a431c90f0982ca2099ef33bfa4c9e5933149bf5f2"
     )
     assert release.oci_index_id == (
-        "sha256:014ee0866c332b73dfa9165397486a0ffbd132b274705e18b2b8c9b78d5dbb90"
+        "sha256:7a0079f9cb1bce5768cff5bce3d1181811c6a231ad800cac8fb503d66852c81b"
     )
-    assert release.aliases == ("openevo/science-runtime:0.1.0",)
+    assert release.aliases == ("openevo/science-runtime:0.1.1",)
     assert {item.loaded_image_id for item in MANAGED_RUNTIME_RELEASES.values()} == {
         release.oci_index_id
     }
@@ -118,8 +118,7 @@ def test_offline_image_authority_is_distinct_from_registry_authority() -> None:
             MANAGED_RUNTIME_RELEASES["managed_science"].repository
             + "@"
             + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
-            "other/science-runtime@"
-            + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+            "other/science-runtime@" + MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
         ],
         [
             MANAGED_RUNTIME_RELEASES["managed_science"].repository
@@ -202,7 +201,7 @@ def test_structured_archive_verifier_rejects_oci_index_alias_publication(
     archive = tmp_path / RUNTIME_FILENAME
     release = write_test_managed_runtime_archive(
         archive,
-        index_reference="docker.io/openevo/science-runtime:0.1.0",
+        index_reference="docker.io/openevo/science-runtime:0.1.1",
     )
 
     with pytest.raises(ManagedRuntimeArchiveVerificationError):
@@ -226,7 +225,7 @@ def test_structured_archive_verifier_rejects_nested_manifest_alias_annotations(
     archive = tmp_path / RUNTIME_FILENAME
     release = write_test_managed_runtime_archive(
         archive,
-        manifest_reference="docker.io/openevo/science-runtime:0.1.0",
+        manifest_reference="docker.io/openevo/science-runtime:0.1.1",
     )
 
     with pytest.raises(ManagedRuntimeArchiveVerificationError):
@@ -237,8 +236,8 @@ def test_archive_rebuilder_removes_all_non_runtime_descriptor_graphs(tmp_path: P
     source = tmp_path / ("source-" + RUNTIME_FILENAME)
     release = write_test_managed_runtime_archive(
         source,
-        index_reference="docker.io/openevo/science-runtime:0.1.0",
-        manifest_reference="docker.io/openevo/science-runtime:0.1.0",
+        index_reference="docker.io/openevo/science-runtime:0.1.1",
+        manifest_reference="docker.io/openevo/science-runtime:0.1.1",
         include_attestation=True,
     )
     with pytest.raises(ManagedRuntimeArchiveVerificationError):

@@ -22,6 +22,7 @@ from openevo.runtime.base import (
     RuntimeReadbackBudget,
 )
 from openevo.runtime.docker import DockerRuntime
+from openevo.runtime.docker_host import DOCKER_EXECUTABLE_PATH
 from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
@@ -317,6 +318,13 @@ async def test_compatibility_download_accounts_write_unlink_byte_churn(
                 await asyncio.sleep(0.01)
                 churn.unlink()
 
+        def _start_download_dir_operation(
+            self, remote_path: str, local_path: str
+        ) -> runtime_base.RuntimeDownloadOperation:
+            return runtime_base.RuntimeDownloadOperation(
+                self.download_dir(remote_path, local_path)
+            )
+
     budget = RuntimeReadbackBudget()
 
     with pytest.raises(RuntimePathSecurityError, match="byte budget"):
@@ -424,9 +432,7 @@ async def test_compatibility_download_refusing_cancellation_has_hard_join_bound(
 
     runtime = RefusingRuntime()
     budget = RuntimeReadbackBudget()
-    task = asyncio.create_task(
-        _compatibility_readback(runtime, tmp_path, budget=budget)
-    )
+    task = asyncio.create_task(_compatibility_readback(runtime, tmp_path, budget=budget))
     await asyncio.wait_for(runtime.started.wait(), timeout=1)
     started = asyncio.get_running_loop().time()
     task.cancel()
@@ -513,13 +519,13 @@ async def test_docker_public_download_uses_docker_cp_outside_session_bind(
     assert await runtime.download_dir("/workspace/results", str(local_dir)) is None
 
     assert run_command.await_args_list[0].args == (
-        "docker",
+        DOCKER_EXECUTABLE_PATH,
         "cp",
         f"{'a' * 64}:/workspace/result.txt",
         str(local_file),
     )
     assert run_command.await_args_list[1].args == (
-        "docker",
+        DOCKER_EXECUTABLE_PATH,
         "cp",
         f"{'a' * 64}:/workspace/results",
         str(local_dir),
@@ -1227,9 +1233,7 @@ def test_discard_readback_staging_preserves_raced_directory_replacement(
     assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
     quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
     assert len(quarantines) == 1
-    assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == (
-        "replacement"
-    )
+    assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == ("replacement")
 
 
 @pytest.mark.parametrize("is_directory", [False, True])
@@ -1288,9 +1292,7 @@ def test_discard_readback_publication_preserves_raced_replacement(
         assert (displaced / "original.txt").read_text(encoding="utf-8") == "original"
         quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
         assert len(quarantines) == 1
-        assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == (
-            "replacement"
-        )
+        assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == ("replacement")
     else:
         assert displaced.read_text(encoding="utf-8") == "original"
         quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
@@ -1438,15 +1440,11 @@ def test_discard_readback_publication_preserves_raced_child_replacement(
     top_quarantines = list(parent.glob(".openevo-readback-quarantine-*"))
     assert len(top_quarantines) == 1
     quarantined_publication = top_quarantines[0]
-    child_quarantines = list(
-        quarantined_publication.glob(".openevo-readback-quarantine-*")
-    )
+    child_quarantines = list(quarantined_publication.glob(".openevo-readback-quarantine-*"))
     assert len(child_quarantines) == 1
     displaced = quarantined_publication / "displaced-child"
     if child_is_directory:
-        assert (displaced / "original-child.txt").read_text(encoding="utf-8") == (
-            "original"
-        )
+        assert (displaced / "original-child.txt").read_text(encoding="utf-8") == ("original")
         assert (child_quarantines[0] / "replacement-child.txt").read_text(
             encoding="utf-8"
         ) == "replacement"
@@ -1515,11 +1513,7 @@ def test_bind_copy_rejects_fifo_leaf_without_blocking(
     direction: str,
 ) -> None:
     runtime = _runtime(tmp_path)
-    fifo = (
-        tmp_path / "source.fifo"
-        if direction == "to"
-        else runtime.session_dir / "source.fifo"
-    )
+    fifo = tmp_path / "source.fifo" if direction == "to" else runtime.session_dir / "source.fifo"
     os.mkfifo(fifo, mode=0o600)
     started = time.monotonic()
 

@@ -12,13 +12,15 @@ import secrets
 import shlex
 import signal
 import stat
-import shutil
 from hashlib import sha256
 from pathlib import Path
 from typing import Final, Literal
 
 from openevo.runtime.base import BaseRuntime, RuntimeDownloadOperation
 from openevo.runtime.docker_host import (
+    DOCKER_EXECUTABLE_PATH,
+    DockerEngineAuthority,
+    DockerHostPathError,
     DockerHostPathSpec,
     HeldDockerSessionRoot,
     docker_self_inspect_argv,
@@ -46,6 +48,13 @@ _CREDENTIAL_VIEW_NAME: Final[str] = ".openevo-codex-home"
 _IMAGE_INSPECT_MAX_BYTES: Final[int] = 1024 * 1024
 _IMAGE_INSPECT_TIMEOUT_SECONDS: Final[float] = 10.0
 _SESSION_ADOPTION_MARKER_BYTES: Final[int] = 64
+MANAGED_SUBSCRIPTION_SANDBOX_PROFILE_ID: Final[str] = "codex_nested_bwrap_v1"
+_MANAGED_SUBSCRIPTION_SECURITY_OPTIONS: Final[tuple[str, ...]] = (
+    "no-new-privileges:true",
+    "seccomp=unconfined",
+    "apparmor=unconfined",
+)
+_MANAGED_SUBSCRIPTION_APPARMOR_PROFILES: Final[frozenset[str]] = frozenset({"", "unconfined"})
 _OwnershipState = Literal[
     "none",
     "create_pending",
@@ -74,23 +83,24 @@ async def _inspect_managed_runtime_image(
     profile: str | None,
     requested_image: str,
 ) -> str:
-    docker = shutil.which("docker", path=os.environ.get("PATH", os.defpath))
-    if docker is None:
-        raise RuntimeError("managed runtime image authority is unavailable")
+    try:
+        docker = DockerEngineAuthority.open()
+    except DockerHostPathError as exc:
+        raise RuntimeError("managed runtime image authority is unavailable") from exc
+    docker.verify()
     process = await asyncio.create_subprocess_exec(
-        docker,
+        DOCKER_EXECUTABLE_PATH,
         "image",
         "inspect",
         requested_image,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
-        env={
-            key: os.environ[key] for key in ("HOME", "LANG", "LC_ALL", "PATH") if key in os.environ
-        },
+        env=docker.environment(),
         cwd="/",
         start_new_session=True,
     )
+    docker.verify()
     assert process.stdout is not None and process.stderr is not None
     aggregate = [0]
     stdout = bytearray()
@@ -120,7 +130,9 @@ async def _inspect_managed_runtime_image(
                 pass
             await process.wait()
         await asyncio.gather(*tasks, return_exceptions=True)
+        docker.verify()
         raise
+    docker.verify()
     if process.returncode != 0:
         raise RuntimeError("managed runtime image inspect failed")
     try:
@@ -267,6 +279,9 @@ class DockerRuntime(BaseRuntime):
         docker_host_path: DockerHostPathSpec | None = None,
     ) -> None:
         super().__init__(spec, session_id, session_dir)
+        if credential_mount is not None and spec.kwargs:
+            raise ValueError("managed subscription containers forbid custom Docker options")
+        self._docker_engine = DockerEngineAuthority.open()
         self._docker_host_path = docker_host_path
         self._docker_session_root: HeldDockerSessionRoot | None = None
         self._session_mount_fd = -1
@@ -361,6 +376,41 @@ class DockerRuntime(BaseRuntime):
     @property
     def can_disable_internet(self) -> bool:
         return True
+
+    @property
+    def sandbox_profile_id(self) -> str | None:
+        if self._credential_mount is None:
+            return None
+        return MANAGED_SUBSCRIPTION_SANDBOX_PROFILE_ID
+
+    async def _run_local_command(
+        self,
+        *args: str,
+        timeout: float | None = None,
+        env: dict[str, str] | None = None,
+        capture: bool = False,
+    ) -> tuple[int, str | None, str | None]:
+        if not args or args[0] != DOCKER_EXECUTABLE_PATH:
+            return await super()._run_local_command(
+                *args,
+                timeout=timeout,
+                env=env,
+                capture=capture,
+            )
+        if env is not None:
+            raise ValueError("Docker command environment overrides are forbidden")
+        self._docker_engine.verify()
+        try:
+            return await super()._run_local_command(
+                DOCKER_EXECUTABLE_PATH,
+                *args[1:],
+                timeout=timeout,
+                env=self._docker_engine.environment(),
+                inherit_env=False,
+                capture=capture,
+            )
+        finally:
+            self._docker_engine.verify()
 
     @property
     def supports_cpu_limits(self) -> bool:
@@ -587,46 +637,64 @@ class DockerRuntime(BaseRuntime):
             return
         root_source, auth_source = self._credential_mount_sources()
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "container",
             "inspect",
             "--format",
-            "{{json .Mounts}}",
+            (
+                '{"mounts":{{json .Mounts}},'
+                '"host_config":{{json .HostConfig}},'
+                '"apparmor_profile":{{json .AppArmorProfile}}}'
+            ),
             self._container_ref,
             capture=True,
             timeout=self._STOP_TIMEOUT,
         )
         try:
-            mounts = json.loads(str(stdout or ""))
+            evidence = json.loads(str(stdout or ""))
         except json.JSONDecodeError as exc:
-            raise RuntimeError("managed credential mount inspect returned invalid JSON") from exc
+            raise RuntimeError(
+                "managed subscription sandbox inspect returned invalid JSON"
+            ) from exc
+        if not isinstance(evidence, dict) or set(evidence) != {
+            "mounts",
+            "host_config",
+            "apparmor_profile",
+        }:
+            raise RuntimeError("managed subscription sandbox inspect is invalid")
+        mounts = evidence["mounts"]
+        host_config = evidence["host_config"]
+        apparmor_profile = evidence["apparmor_profile"]
+        session_source = os.fspath(self._session_docker_source)
         destinations = {
-            MANAGED_CODEX_HOME: root_source,
-            f"{MANAGED_CODEX_HOME}/auth.json": auth_source,
+            self.runtime_session_dir: (session_source, True),
+            MANAGED_CODEX_HOME: (root_source, True),
+            f"{MANAGED_CODEX_HOME}/auth.json": (auth_source, False),
         }
-        matches = (
-            [
-                mount
-                for mount in mounts
-                if isinstance(mount, dict) and mount.get("Destination") in destinations
-            ]
-            if isinstance(mounts, list)
-            else []
-        )
         if (
             rc != 0
-            or len(matches) != len(destinations)
-            or {mount.get("Destination") for mount in matches} != set(destinations)
+            or not isinstance(mounts, list)
+            or len(mounts) != len(destinations)
+            or not all(isinstance(mount, dict) for mount in mounts)
+            or not all(isinstance(mount.get("Destination"), str) for mount in mounts)
+            or {mount.get("Destination") for mount in mounts} != set(destinations)
+            or not isinstance(host_config, dict)
+            or host_config.get("CapDrop") != ["ALL"]
+            or host_config.get("SecurityOpt") != list(_MANAGED_SUBSCRIPTION_SECURITY_OPTIONS)
+            or host_config.get("Privileged") is not False
+            or not isinstance(apparmor_profile, str)
+            or apparmor_profile not in _MANAGED_SUBSCRIPTION_APPARMOR_PROFILES
         ):
-            raise RuntimeError("managed credential mount inspect is invalid")
-        for mount in matches:
+            raise RuntimeError("managed subscription sandbox configuration changed")
+        for mount in mounts:
             destination = mount.get("Destination")
+            source, writable = destinations[destination]
             if (
                 mount.get("Type") != "bind"
-                or mount.get("Source") != destinations[destination]
-                or mount.get("RW") is not False
+                or mount.get("Source") != source
+                or mount.get("RW") is not writable
             ):
-                raise RuntimeError("managed credential mount configuration changed")
+                raise RuntimeError("managed subscription mount configuration changed")
         self._verify_credential_mount_pins()
 
     async def _verify_docker_host_authority(self) -> None:
@@ -775,7 +843,7 @@ class DockerRuntime(BaseRuntime):
         self._verify_session_mount_pin()
         marker_path = f"{self.runtime_session_dir}/{name}"
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "exec",
             self._container_ref,
             "/usr/bin/stat",
@@ -800,7 +868,7 @@ class DockerRuntime(BaseRuntime):
         if rc != 0 or len(fields) != 6 or observed != identity:
             raise RuntimeError("managed session adoption identity changed")
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "exec",
             self._container_ref,
             "/usr/bin/head",
@@ -850,7 +918,7 @@ class DockerRuntime(BaseRuntime):
         if self._docker_host_path is None:
             return
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "container",
             "inspect",
             "--format",
@@ -909,13 +977,22 @@ class DockerRuntime(BaseRuntime):
             self._release_credential_mount_pins()
             raise
         create_args = [
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "create",
             "--name",
             self._container_name,
             "--cidfile",
             str(self._cidfile),
         ]
+        if self._credential_mount is not None:
+            create_args.extend(
+                [
+                    "--cap-drop=ALL",
+                    "--security-opt=no-new-privileges:true",
+                    "--security-opt=seccomp=unconfined",
+                    "--security-opt=apparmor=unconfined",
+                ]
+            )
         if self.spec.container_user == "host":
             create_args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
         if not self.spec.allow_internet:
@@ -948,7 +1025,7 @@ class DockerRuntime(BaseRuntime):
             create_args.extend(
                 [
                     "--mount",
-                    f"type=bind,source={root_source},target={MANAGED_CODEX_HOME},readonly",
+                    f"type=bind,source={root_source},target={MANAGED_CODEX_HOME}",
                     "--mount",
                     "type=bind,"
                     f"source={auth_source},"
@@ -956,7 +1033,7 @@ class DockerRuntime(BaseRuntime):
                     "readonly",
                 ]
             )
-        # Additional volumes from kwargs (e.g., Docker socket for agents that need DinD)
+        # Unmanaged runtimes retain the legacy extension point.
         for vol in self.spec.kwargs.get("volumes", []):
             create_args.extend(["-v", vol])
         create_args.extend(["--restart", "no", create_image, "sleep", "infinity"])
@@ -1009,7 +1086,7 @@ class DockerRuntime(BaseRuntime):
                 ) from exc
             self._verify_credential_mount_pins()
         rc, _, stderr = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "start",
             self._container_ref,
             capture=True,
@@ -1043,7 +1120,7 @@ class DockerRuntime(BaseRuntime):
         )
         if self._chmod_needed:
             await self._run_local_command(
-                "docker",
+                DOCKER_EXECUTABLE_PATH,
                 "exec",
                 "--user",
                 "root",
@@ -1063,7 +1140,7 @@ class DockerRuntime(BaseRuntime):
         if release is None:
             return self.spec.image
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "image",
             "inspect",
             self.spec.image,
@@ -1101,7 +1178,7 @@ class DockerRuntime(BaseRuntime):
         self._verify_credential_mount_pins()
         first = await self._credential_container_process_identity()
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "exec",
             self._container_ref,
             "/usr/bin/stat",
@@ -1153,7 +1230,7 @@ class DockerRuntime(BaseRuntime):
         self,
     ) -> tuple[str, int, str, bool, int]:
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "container",
             "inspect",
             "--format",
@@ -1282,7 +1359,7 @@ class DockerRuntime(BaseRuntime):
         if self.spec.container_user != "host" and self._chmod_needed is not False:
             try:
                 await self._run_local_command(
-                    "docker",
+                    DOCKER_EXECUTABLE_PATH,
                     "exec",
                     "--user",
                     "root",
@@ -1298,7 +1375,7 @@ class DockerRuntime(BaseRuntime):
         # kill first (instant SIGKILL), then rm to remove metadata.
         try:
             await self._run_local_command(
-                "docker",
+                DOCKER_EXECUTABLE_PATH,
                 "kill",
                 self._container_ref,
                 timeout=self._STOP_TIMEOUT,
@@ -1307,7 +1384,7 @@ class DockerRuntime(BaseRuntime):
             logger.warning("docker kill failed for %s", self._container_name)
         try:
             rc, _, stderr = await self._run_local_command(
-                "docker",
+                DOCKER_EXECUTABLE_PATH,
                 "rm",
                 "-f",
                 self._container_ref,
@@ -1577,7 +1654,7 @@ class DockerRuntime(BaseRuntime):
             return "unknown"
         _require_container_id(container_id)
         rc, stdout, stderr = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "container",
             "inspect",
             "--format",
@@ -1650,7 +1727,7 @@ class DockerRuntime(BaseRuntime):
     async def _detect_chmod_needed(self) -> bool:
         """True unless the container's effective UID matches the host's."""
         rc, stdout, _ = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "exec",
             self._container_ref,
             "id",
@@ -1673,7 +1750,7 @@ class DockerRuntime(BaseRuntime):
         env: dict[str, str] | None = None,
         timeout_sec: float | None = None,
     ) -> ExecResult:
-        args = ["docker", "exec"]
+        args = [DOCKER_EXECUTABLE_PATH, "exec"]
         effective_env = {**self.spec.env, **(env or {})}
         effective_workdir = cwd or self.spec.workdir or self.runtime_session_dir
         if effective_workdir:
@@ -1696,9 +1773,19 @@ class DockerRuntime(BaseRuntime):
             await self._make_runtime_path_writable(remote_path, recursive=False)
             return
         parent = str(Path(remote_path).parent)
-        await self._run_local_command("docker", "exec", self._container_ref, "mkdir", "-p", parent)
+        await self._run_local_command(
+            DOCKER_EXECUTABLE_PATH,
+            "exec",
+            self._container_ref,
+            "mkdir",
+            "-p",
+            parent,
+        )
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", local_path, f"{self._container_ref}:{remote_path}"
+            DOCKER_EXECUTABLE_PATH,
+            "cp",
+            local_path,
+            f"{self._container_ref}:{remote_path}",
         )
         if rc != 0:
             raise RuntimeError(f"docker cp upload_file failed with exit code {rc}")
@@ -1709,10 +1796,18 @@ class DockerRuntime(BaseRuntime):
             await self._make_runtime_path_writable(remote_path, recursive=True)
             return
         await self._run_local_command(
-            "docker", "exec", self._container_ref, "mkdir", "-p", remote_path
+            DOCKER_EXECUTABLE_PATH,
+            "exec",
+            self._container_ref,
+            "mkdir",
+            "-p",
+            remote_path,
         )
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", f"{local_path}/.", f"{self._container_ref}:{remote_path}"
+            DOCKER_EXECUTABLE_PATH,
+            "cp",
+            f"{local_path}/.",
+            f"{self._container_ref}:{remote_path}",
         )
         if rc != 0:
             raise RuntimeError(f"docker cp upload_dir failed with exit code {rc}")
@@ -1726,7 +1821,7 @@ class DockerRuntime(BaseRuntime):
             chmod_args.append("-R")
         chmod_args.extend(["a+rwX", remote_path])
         rc, _, stderr = await self._run_local_command(
-            "docker",
+            DOCKER_EXECUTABLE_PATH,
             "exec",
             "--user",
             "root",
@@ -1745,7 +1840,10 @@ class DockerRuntime(BaseRuntime):
             return
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
+            DOCKER_EXECUTABLE_PATH,
+            "cp",
+            f"{self._container_ref}:{remote_path}",
+            local_path,
         )
         if rc != 0:
             raise RuntimeError(f"docker cp download_file failed with exit code {rc}")
@@ -1755,7 +1853,10 @@ class DockerRuntime(BaseRuntime):
             return
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
         rc, _, _ = await self._run_local_command(
-            "docker", "cp", f"{self._container_ref}:{remote_path}", local_path
+            DOCKER_EXECUTABLE_PATH,
+            "cp",
+            f"{self._container_ref}:{remote_path}",
+            local_path,
         )
         if rc != 0:
             raise RuntimeError(f"docker cp download_dir failed with exit code {rc}")

@@ -53,10 +53,16 @@ from openevo.runtime.base import (
     RuntimePathSecurityError,
     RuntimeReadbackBudget,
 )
+from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_CANARY_OK,
+    codex_subscription_readiness_receipt,
+)
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
     MANAGED_RUNTIME_IMAGES,
     MANAGED_RUNTIME_RELEASES,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+    MANAGED_WORKSPACE,
     ManagedCredentialMount,
 )
 from openevo.runtime.models import ExecInput, ExecResult, RuntimeSpec
@@ -442,6 +448,13 @@ def test_gateway_subscription_admission_accepts_transcript_capture_aliases(
             profile="managed_science",
             image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
             container_user="host",
+            workdir=MANAGED_WORKSPACE,
+            prepare=[
+                PrepareAction(
+                    type="exec",
+                    command=MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+                )
+            ],
         ),
         agent=AgentSpec(
             harness="codex",
@@ -548,6 +561,7 @@ async def test_invalid_subscription_auth_fails_before_runtime_creation(
     manager._cleanup_retries = {}
     manager._cleanup_journal_dir = tmp_path / "journal"
     manager._docker_ownership_root = tmp_path / "docker-ownership"
+    manager._docker_host_path = None
     create = Mock(side_effect=AssertionError("runtime must not be created"))
     monkeypatch.setattr("openevo.gateway.node.create_runtime", create)
 
@@ -579,6 +593,13 @@ async def test_subscription_initialization_exception_log_redacts_credential_cana
             profile="managed_science",
             image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
             container_user="host",
+            workdir=MANAGED_WORKSPACE,
+            prepare=[
+                PrepareAction(
+                    type="exec",
+                    command=MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+                )
+            ],
         ),
         agent=AgentSpec(
             harness="codex",
@@ -598,6 +619,7 @@ async def test_subscription_initialization_exception_log_redacts_credential_cana
     manager._cleanup_retries = {}
     manager._cleanup_journal_dir = tmp_path / "journal"
     manager._docker_ownership_root = tmp_path / "docker-ownership"
+    manager._docker_host_path = None
     credential_dir = tmp_path / "credentials"
     credential_dir.mkdir(mode=0o700)
     auth = credential_dir / "auth.json"
@@ -648,6 +670,10 @@ async def test_subscription_postprocess_exception_log_redacts_credential_canary(
     secret = "postprocess-secret-canary"
 
     class FailingPostprocessHarness(RunStepHarness):
+        @property
+        def subscription_credential_isolation_receipt(self) -> dict[str, object]:
+            return codex_subscription_readiness_receipt()
+
         def run_steps(self, instruction: str) -> list[ExecInput]:
             del instruction
             return []
@@ -748,6 +774,129 @@ def test_gateway_rejects_subscription_closed_environment_overrides(
 
     with pytest.raises(RuntimeError, match=f"{env_name} is Core-owned"):
         GatewayNodeManager._validate_subscription_admission(request, runtime, tmp_path)
+
+
+def test_gateway_rejects_subscription_runtime_environment_extensions(
+    tmp_path: Path,
+) -> None:
+    runtime = RuntimeSpec(
+        profile="managed_science",
+        image=MANAGED_RUNTIME_IMAGES["managed_science"],
+        container_user="host",
+        env={"BASH_ENV": "/openevo/session/workspace/attacker.sh"},
+    )
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=runtime,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="non-Core fields"):
+        GatewayNodeManager._validate_subscription_admission(request, runtime, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["prepare", "eval_prepare"],
+)
+def test_gateway_rejects_subscription_runtime_action_extensions(
+    tmp_path: Path,
+    field: str,
+) -> None:
+    action = PrepareAction(type="exec", command="touch /tmp/attacker")
+    runtime = RuntimeSpec(
+        profile="managed_science",
+        image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
+        container_user="host",
+        workdir=MANAGED_WORKSPACE,
+        **{field: [action]},
+    )
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=runtime,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+
+    message = "eval_prepare actions" if field == "eval_prepare" else "Core-managed prepare recipe"
+    with pytest.raises(RuntimeError, match=message):
+        GatewayNodeManager._validate_subscription_admission(request, runtime, tmp_path)
+
+
+def test_gateway_accepts_exact_subscription_prepare_recipe(tmp_path: Path) -> None:
+    runtime = RuntimeSpec(
+        profile="managed_science",
+        image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
+        container_user="host",
+        workdir=MANAGED_WORKSPACE,
+        prepare=[
+            PrepareAction(
+                type="exec",
+                command=MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+            )
+        ],
+    )
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=runtime,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+
+    GatewayNodeManager._validate_subscription_admission(request, runtime, tmp_path)
+
+
+def test_gateway_accepts_core_workspace_upload_before_subscription_prepare(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    runtime = RuntimeSpec(
+        profile="managed_science",
+        image=MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference,
+        container_user="host",
+        workdir=MANAGED_WORKSPACE,
+        prepare=[
+            PrepareAction(
+                type="upload_dir",
+                source=str(workspace),
+                target=MANAGED_WORKSPACE,
+            ),
+            PrepareAction(
+                type="exec",
+                command=MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+            ),
+        ],
+    )
+    request = SessionDispatchRequest(
+        session_id="session_1",
+        task_id="task_1",
+        instruction="Do work.",
+        remaining_timeout_seconds=60,
+        runtime=runtime,
+        agent=AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        ),
+    )
+
+    GatewayNodeManager._validate_subscription_admission(request, runtime, tmp_path)
 
 
 def _session_result(
@@ -4235,6 +4384,11 @@ class BindMountRuntime(BaseRuntime):
     ) -> ExecResult:
         self.exec_commands.append(command)
         self.exec_envs.append(dict(env or {}))
+        if "-probe.sh" in command and "command_execution" in command:
+            return ExecResult(
+                stdout=f"{CODEX_SUBSCRIPTION_CANARY_OK}\n",
+                return_code=0,
+            )
         if self.exec_results:
             return self.exec_results.pop(0)
         return ExecResult(return_code=0)
@@ -4254,6 +4408,7 @@ class BindMountRuntime(BaseRuntime):
     async def download_dir(self, remote_path: str, local_path: str) -> None:
         copied = self._copy_from_bind_mount(remote_path, Path(local_path))
         assert copied is True
+
 
 @pytest.mark.asyncio
 async def test_write_evolution_context_files(tmp_path):
@@ -4634,9 +4789,14 @@ async def test_gateway_runtime_receipt_custom_target_uses_compatible_download(
     tmp_path: Path,
 ) -> None:
     target_dir = "/custom/evolution"
-    manager, _managed, injection, _context, _artifact_ids, runtime = (
-        await _stage_gateway_runtime_receipt_context(tmp_path, target_dir=target_dir)
-    )
+    (
+        manager,
+        _managed,
+        injection,
+        _context,
+        _artifact_ids,
+        runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path, target_dir=target_dir)
 
     receipt = await node_module._runtime_injection_receipt_from_readback(
         runtime=runtime,
@@ -4653,12 +4813,15 @@ async def test_gateway_compatibility_cleanup_preserves_background_root_replaceme
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager, _managed, injection, _context, _artifact_ids, runtime = (
-        await _stage_gateway_runtime_receipt_context(tmp_path)
-    )
-    runtime.spec = runtime.spec.model_copy(
-        update={"import_path": "tests.runtime:PluginRuntime"}
-    )
+    (
+        manager,
+        _managed,
+        injection,
+        _context,
+        _artifact_ids,
+        runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
+    runtime.spec = runtime.spec.model_copy(update={"import_path": "tests.runtime:PluginRuntime"})
     monkeypatch.setattr(runtime_base.tempfile, "gettempdir", lambda: str(tmp_path))
     original_download = runtime.download_dir
     original_rename = runtime_base._rename_readback_cleanup_noreplace
@@ -4713,9 +4876,7 @@ async def test_gateway_compatibility_cleanup_preserves_background_root_replaceme
     assert displaced.is_dir()
     quarantines = list(tmp_path.glob(".openevo-readback-quarantine-*"))
     assert len(quarantines) == 1
-    assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == (
-        "replacement"
-    )
+    assert (quarantines[0] / "replacement.txt").read_text(encoding="utf-8") == ("replacement")
 
 
 @pytest.mark.asyncio
@@ -4723,9 +4884,14 @@ async def test_gateway_deadline_is_bounded_when_public_download_refuses_cancel(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager, _managed, injection, _context, _artifact_ids, _runtime = (
-        await _stage_gateway_runtime_receipt_context(tmp_path)
-    )
+    (
+        manager,
+        _managed,
+        injection,
+        _context,
+        _artifact_ids,
+        _runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
     monkeypatch.setattr(runtime_base.tempfile, "gettempdir", lambda: str(tmp_path))
 
     class RefusingRuntime:
@@ -4773,9 +4939,14 @@ async def test_gateway_compatibility_readback_shares_budget_with_agent_system(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    manager, _managed, injection, _context, _artifact_ids, _runtime = (
-        await _stage_gateway_runtime_receipt_context(tmp_path)
-    )
+    (
+        manager,
+        _managed,
+        injection,
+        _context,
+        _artifact_ids,
+        _runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
 
     class PublicDownloadRuntime:
         async def download_dir(self, _remote_path: str, local_path: str) -> None:
@@ -4842,9 +5013,14 @@ async def test_gateway_runtime_receipt_without_sealed_primitive_uses_compatible_
     monkeypatch: pytest.MonkeyPatch,
     fallback: str,
 ) -> None:
-    manager, _managed, injection, _context, _artifact_ids, runtime = (
-        await _stage_gateway_runtime_receipt_context(tmp_path)
-    )
+    (
+        manager,
+        _managed,
+        injection,
+        _context,
+        _artifact_ids,
+        runtime,
+    ) = await _stage_gateway_runtime_receipt_context(tmp_path)
     if fallback == "non_linux":
         monkeypatch.setattr(runtime_base.sys, "platform", "darwin")
     elif fallback == "unavailable":
@@ -5546,9 +5722,14 @@ async def test_handle_run_codex_subscription_auth_mode_unsets_openevo_proxy_env(
     await manager._handle_run(managed)
 
     codex_commands = [command for command in runtime.exec_commands if "codex exec" in command]
-    assert len(codex_commands) == 1
-    command = codex_commands[0]
-    assert command.startswith("env ")
+    assert len(codex_commands) == 2
+    canary_command, command = codex_commands
+    assert "-probe.sh" in canary_command
+    assert canary_command.count("/opt/codex/bin/codex exec ") == 2
+    assert "sandbox linux" not in canary_command
+    assert "command_execution" in canary_command
+    assert command.startswith("/bin/bash -o pipefail -c ")
+    assert "env -u" in command
     for key in (
         "OPENAI_BASE_URL",
         "OPENAI_API_KEY",
@@ -5849,6 +6030,10 @@ async def test_handle_run_postprocess_timeout_preserves_step_transcript_metadata
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class SlowPostprocessHarness(RunStepHarness):
+        @property
+        def subscription_credential_isolation_receipt(self) -> dict[str, object]:
+            return codex_subscription_readiness_receipt()
+
         async def postprocess(
             self,
             runtime: BaseRuntime,

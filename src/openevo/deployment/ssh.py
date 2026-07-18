@@ -17,7 +17,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from enum import Enum
@@ -29,6 +29,7 @@ from pydantic import SecretStr
 from openevo.deployment.daemon_bundle_transport import (
     DOCKER_USER_CONTAINER_V1,
     DaemonBundleIdentity,
+    DaemonBundleServicePredecessor,
     DaemonBundleServiceStatus,
     DaemonBundleStopReceipt,
     DaemonBundleTransportContractError,
@@ -37,12 +38,16 @@ from openevo.deployment.daemon_bundle_transport import (
     build_daemon_bundle_ensure_command,
     build_daemon_bundle_identity_command,
     build_daemon_bundle_inspect_command,
+    build_daemon_bundle_observe_command,
     build_daemon_bundle_stage_command,
     build_daemon_bundle_stop_command,
     parse_daemon_bundle_identity,
+    parse_daemon_bundle_error_code,
+    parse_daemon_bundle_service_predecessor,
     parse_daemon_bundle_service_status,
     parse_daemon_bundle_stop_receipt,
     parse_staged_daemon_bundle,
+    split_daemon_bundle_service_attachment,
 )
 from openevo.deployment.core_assets import (
     CORE_ASSET_TRANSFER_LEASE,
@@ -240,6 +245,8 @@ class SshTransportErrorCode(str, Enum):
     CORE_RUNTIME_PREFLIGHT_FAILED = "core_runtime_preflight_failed"
     MANAGED_RUNTIME_FAILED = "managed_runtime_failed"
     DAEMON_BUNDLE_FAILED = "daemon_bundle_failed"
+    DAEMON_SERVICE_PREDECESSOR_MISMATCH = "daemon_service_predecessor_mismatch"
+    DAEMON_UPDATE_REQUIRED = "daemon_update_required"
     CANCELLED = "ssh_operation_cancelled"
     INVALID_REQUEST = "invalid_ssh_request"
     TIMEOUT = "ssh_timeout"
@@ -278,6 +285,12 @@ class SshTransportError(RuntimeError):
             ),
             SshTransportErrorCode.DAEMON_BUNDLE_FAILED: (
                 "OpenEvo Daemon bundle staging or control failed."
+            ),
+            SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH: (
+                "OpenEvo Daemon generation changed during activation."
+            ),
+            SshTransportErrorCode.DAEMON_UPDATE_REQUIRED: (
+                "The active OpenEvo Daemon is incompatible with this Desktop release."
             ),
             SshTransportErrorCode.CANCELLED: "SSH operation was cancelled.",
             SshTransportErrorCode.INVALID_REQUEST: "SSH request is invalid.",
@@ -1172,6 +1185,9 @@ class SshRemoteExecutorTransport:
         bundle_path: str,
         bundle_sha256: str,
         bundle_size: int,
+        manifest_path: str,
+        manifest_sha256: str,
+        manifest_size: int,
         timeout_seconds: float = 300.0,
         cancel_event: threading.Event | None = None,
     ) -> StagedDaemonBundle:
@@ -1183,93 +1199,133 @@ class SshRemoteExecutorTransport:
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         service_root = f"/home/{self._profile.user}/.openevo/daemon-bundles"
+        snapshot: OpenedDaemonBundle | None = None
+        manifest_snapshot: OpenedDaemonBundle | None = None
         try:
             snapshot = OpenedDaemonBundle.open(
                 bundle_path,
                 expected_sha256=bundle_sha256,
                 expected_size=bundle_size,
             )
+            manifest_snapshot = OpenedDaemonBundle.open(
+                manifest_path,
+                expected_sha256=manifest_sha256,
+                expected_size=manifest_size,
+            )
         except (OSError, DaemonBundleTransportContractError):
+            if snapshot is not None:
+                snapshot.close()
             _log_transport_failure(SshTransportErrorCode.INVALID_REQUEST)
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
 
-        transfer_id = secrets.token_hex(16)
         try:
-            command = build_daemon_bundle_stage_command(
+            deadline = time.monotonic() + float(timeout_seconds)
+            staged = self._stage_opened_daemon_asset(
+                snapshot,
                 service_root=service_root,
-                sha256=snapshot.sha256,
-                size=snapshot.size,
-                transfer_id=transfer_id,
-                host_profile=DOCKER_USER_CONTAINER_V1,
+                timeout_seconds=_stage_remaining(deadline),
+                cancel_event=cancel_event,
             )
-            completion_marker = f"__OPENEVO_DAEMON_BUNDLE_COMPLETION_{secrets.token_hex(16)}__="
-            marked_command = _with_completion_marker(command, completion_marker)
-            completed: subprocess.CompletedProcess[str] | None = None
-            known_hosts_file: Path | None = None
-            failure_code: SshTransportErrorCode | None = None
-            try:
-                snapshot.rewind()
-                completed, known_hosts_file = self._run_trusted_streaming_subprocess(
-                    lambda known_hosts_file: self._ssh_argv(
-                        marked_command,
-                        known_hosts_file,
-                    ),
-                    float(timeout_seconds),
-                    stdin_fd=snapshot.descriptor,
-                    cancel_event=cancel_event,
-                )
-            except _SubprocessCancelled:
-                failure_code = SshTransportErrorCode.CANCELLED
-            except subprocess.TimeoutExpired:
-                failure_code = SshTransportErrorCode.TIMEOUT
-            except _KnownHostsSpawnFailure:
-                failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
-            except Exception:
-                failure_code = SshTransportErrorCode.START_FAILED
-            try:
-                snapshot.verify_unchanged()
-            except (OSError, DaemonBundleTransportContractError):
-                failure_code = SshTransportErrorCode.DAEMON_BUNDLE_FAILED
-            if failure_code is not None:
-                _log_transport_failure(failure_code)
-                raise SshTransportError(failure_code)
-            assert completed is not None
-            assert known_hosts_file is not None
-            stderr, remote_return_code = _extract_remote_completion(
-                completed.stderr or "",
-                completion_marker,
+            manifest_staged = self._stage_opened_daemon_asset(
+                manifest_snapshot,
+                service_root=service_root,
+                timeout_seconds=_stage_remaining(deadline),
+                cancel_event=cancel_event,
             )
-            if remote_return_code is None or completed.returncode == 255:
-                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
-                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
-            if int(completed.returncode) != remote_return_code:
-                _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
-                raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
-            if remote_return_code != 0:
-                _redact_trust_paths(
-                    stderr,
-                    known_hosts_file,
-                    self._trusted_host.known_hosts_file,
-                )
+            if (
+                manifest_staged._service_root != staged._service_root
+                or manifest_staged.sha256 != manifest_sha256
+                or manifest_staged.size != manifest_size
+            ):
                 _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
                 raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
-            try:
-                staged = parse_staged_daemon_bundle(completed.stdout or "")
-                if (
-                    staged.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
-                    or staged._service_root != service_root
-                    or staged.sha256 != snapshot.sha256
-                    or staged.size != snapshot.size
-                ):
-                    raise DaemonBundleTransportContractError(
-                        "Daemon bundle staging receipt does not match the request."
-                    )
-                return staged
-            except DaemonBundleTransportContractError:
-                _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
-                raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+            return staged
         finally:
             snapshot.close()
+            manifest_snapshot.close()
+
+    def _stage_opened_daemon_asset(
+        self,
+        snapshot: OpenedDaemonBundle,
+        *,
+        service_root: str,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None,
+    ) -> StagedDaemonBundle:
+        transfer_id = secrets.token_hex(16)
+        command = build_daemon_bundle_stage_command(
+            service_root=service_root,
+            sha256=snapshot.sha256,
+            size=snapshot.size,
+            transfer_id=transfer_id,
+            host_profile=DOCKER_USER_CONTAINER_V1,
+        )
+        completion_marker = f"__OPENEVO_DAEMON_BUNDLE_COMPLETION_{secrets.token_hex(16)}__="
+        marked_command = _with_completion_marker(command, completion_marker)
+        completed: subprocess.CompletedProcess[str] | None = None
+        known_hosts_file: Path | None = None
+        failure_code: SshTransportErrorCode | None = None
+        try:
+            snapshot.rewind()
+            completed, known_hosts_file = self._run_trusted_streaming_subprocess(
+                lambda known_hosts_file: self._ssh_argv(
+                    marked_command,
+                    known_hosts_file,
+                ),
+                timeout_seconds,
+                stdin_fd=snapshot.descriptor,
+                cancel_event=cancel_event,
+            )
+        except _SubprocessCancelled:
+            failure_code = SshTransportErrorCode.CANCELLED
+        except subprocess.TimeoutExpired:
+            failure_code = SshTransportErrorCode.TIMEOUT
+        except _KnownHostsSpawnFailure:
+            failure_code = SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED
+        except Exception:
+            failure_code = SshTransportErrorCode.START_FAILED
+        try:
+            snapshot.verify_unchanged()
+        except (OSError, DaemonBundleTransportContractError):
+            failure_code = SshTransportErrorCode.DAEMON_BUNDLE_FAILED
+        if failure_code is not None:
+            _log_transport_failure(failure_code)
+            raise SshTransportError(failure_code)
+        assert completed is not None
+        assert known_hosts_file is not None
+        stderr, remote_return_code = _extract_remote_completion(
+            completed.stderr or "",
+            completion_marker,
+        )
+        if remote_return_code is None or completed.returncode == 255:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if int(completed.returncode) != remote_return_code:
+            _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
+            raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if remote_return_code != 0:
+            _redact_trust_paths(
+                stderr,
+                known_hosts_file,
+                self._trusted_host.known_hosts_file,
+            )
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+        try:
+            staged = parse_staged_daemon_bundle(completed.stdout or "")
+            if (
+                staged.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
+                or staged._service_root != service_root
+                or staged.sha256 != snapshot.sha256
+                or staged.size != snapshot.size
+            ):
+                raise DaemonBundleTransportContractError(
+                    "Daemon bundle staging receipt does not match the request."
+                )
+            return staged
+        except DaemonBundleTransportContractError:
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
 
     def daemon_bundle_identity(
         self,
@@ -1304,17 +1360,28 @@ class SshRemoteExecutorTransport:
         self,
         bundle: StagedDaemonBundle,
         *,
+        expected_predecessor: DaemonBundleServicePredecessor,
+        canonical_manifest_sha256: str,
         port: int = 0,
         timeout_seconds: float = 90.0,
         cancel_event: threading.Event | None = None,
-    ) -> RemoteCoreControlAttachment:
+    ) -> tuple[RemoteCoreControlAttachment, DaemonBundleServiceStatus]:
         self._validate_daemon_bundle_control_request(
             bundle,
             timeout_seconds=timeout_seconds,
             cancel_event=cancel_event,
         )
-        if type(port) is not int or not 0 <= port <= 65535:
+        if (
+            type(port) is not int
+            or not 0 <= port <= 65535
+            or not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
+            or re.fullmatch(r"[0-9a-f]{64}", canonical_manifest_sha256) is None
+        ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        try:
+            expected_predecessor.__post_init__()
+        except DaemonBundleTransportContractError:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         deadline = time.monotonic() + float(timeout_seconds)
         identity = self.daemon_bundle_identity(
             bundle,
@@ -1326,11 +1393,19 @@ class SshRemoteExecutorTransport:
                 bundle,
                 port=port,
                 deadline_seconds=_stage_remaining(deadline),
+                expected_predecessor=expected_predecessor,
+                canonical_manifest_sha256=canonical_manifest_sha256,
             )
             payload = self._run_secret_with_remote_failure(
                 command,
                 timeout_seconds=_stage_remaining(deadline),
                 remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                remote_error_codes={
+                    "core_service_predecessor_mismatch": (
+                        SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH
+                    ),
+                    "core_service_update_required": (SshTransportErrorCode.DAEMON_UPDATE_REQUIRED),
+                },
                 cancel_event=cancel_event,
             )
             from openevo.deployment.core_control import (
@@ -1339,7 +1414,8 @@ class SshRemoteExecutorTransport:
             )
 
             try:
-                attachment = parse_core_control_attachment(payload)
+                service_status, control_payload = split_daemon_bundle_service_attachment(payload)
+                attachment = parse_core_control_attachment(control_payload)
             except CoreControlBootstrapError:
                 raise DaemonBundleTransportContractError(
                     "Daemon ensure attachment is invalid."
@@ -1348,11 +1424,52 @@ class SshRemoteExecutorTransport:
                 attachment.release_identity != identity.release_identity
                 or attachment.registry_digest != identity.registry_digest
                 or attachment.source_commit != identity.source_commit
+                or service_status.bundle_sha256 != bundle.sha256
+                or service_status.canonical_manifest_sha256 != canonical_manifest_sha256
+                or service_status.lifecycle_compatibility < 2
+                or service_status.release_identity != attachment.release_identity
+                or service_status.registry_digest != attachment.registry_digest
+                or service_status.source_commit != attachment.source_commit
+                or service_status.generation != attachment.generation
+                or service_status.remote_port != attachment.remote_port
+                or service_status.attached != attachment.attached
             ):
                 raise DaemonBundleTransportContractError(
                     "Daemon attachment does not match the bundle identity."
                 )
-            return attachment
+            return attachment, service_status
+        except DaemonBundleTransportContractError:
+            _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
+            raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
+
+    def observe_daemon_bundle_service(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        canonical_manifest_sha256: str,
+        timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleServicePredecessor:
+        self._validate_daemon_bundle_control_request(
+            bundle,
+            timeout_seconds=timeout_seconds,
+            cancel_event=cancel_event,
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", canonical_manifest_sha256) is None:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        try:
+            command = build_daemon_bundle_observe_command(
+                bundle,
+                deadline_seconds=float(timeout_seconds),
+                canonical_manifest_sha256=canonical_manifest_sha256,
+            )
+            payload = self._run_secret_with_remote_failure(
+                command,
+                timeout_seconds=float(timeout_seconds),
+                remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                cancel_event=cancel_event,
+            )
+            return parse_daemon_bundle_service_predecessor(payload)
         except DaemonBundleTransportContractError:
             _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
             raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None
@@ -1592,6 +1709,9 @@ class SshRemoteExecutorTransport:
                 build_daemon_bundle_inspect_command(bundle),
                 timeout_seconds=float(timeout_seconds),
                 remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                remote_error_codes={
+                    "core_service_update_required": (SshTransportErrorCode.DAEMON_UPDATE_REQUIRED)
+                },
                 cancel_event=cancel_event,
             )
             return parse_daemon_bundle_service_status(payload)
@@ -2304,6 +2424,7 @@ class SshRemoteExecutorTransport:
         *,
         timeout_seconds: float,
         remote_failure_code: SshTransportErrorCode,
+        remote_error_codes: Mapping[str, SshTransportErrorCode] | None = None,
         env: dict[str, str] | None = None,
         cancel_event: threading.Event | None = None,
     ) -> SecretStr:
@@ -2345,8 +2466,16 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
         if remote_return_code != 0:
-            _log_transport_failure(remote_failure_code)
-            raise SshTransportError(remote_failure_code)
+            failure = remote_failure_code
+            if remote_error_codes:
+                try:
+                    remote_error_code = parse_daemon_bundle_error_code(SecretStr(_stderr))
+                except DaemonBundleTransportContractError:
+                    pass
+                else:
+                    failure = remote_error_codes.get(remote_error_code, failure)
+            _log_transport_failure(failure)
+            raise SshTransportError(failure)
         return SecretStr(completed.stdout or "")
 
     def _bind_core_asset_consumption(self, command: str) -> str:

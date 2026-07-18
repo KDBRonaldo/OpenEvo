@@ -84,8 +84,18 @@ from openevo.runtime.docker import (
     verify_managed_runtime_image_admission,
 )
 from openevo.runtime.docker_host import DockerHostPathSpec, HeldDockerSessionRoot
+from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_CONTRACT_KEY,
+    CODEX_SUBSCRIPTION_READINESS_KEY,
+    codex_subscription_contract,
+    codex_subscription_readiness_receipt,
+    validate_codex_subscription_surface,
+)
 from openevo.runtime.managed import (
     MANAGED_SUBSCRIPTION_ENV,
+    MANAGED_SUBSCRIPTION_ENV_KEYS,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+    MANAGED_WORKSPACE,
     ManagedCredentialMount,
     reject_managed_subscription_env,
     require_managed_runtime_binding,
@@ -1258,6 +1268,36 @@ def _existing_evolution_metadata(metadata: dict) -> dict:
     return {}
 
 
+def _existing_openevo_metadata(metadata: dict) -> dict:
+    existing = metadata.get("openevo")
+    if existing is None:
+        return {}
+    if not isinstance(existing, dict):
+        raise RuntimeError("subscription task metadata.openevo must be an object")
+    return dict(existing)
+
+
+def _pin_codex_subscription_contract(request: SessionDispatchRequest) -> None:
+    contract = codex_subscription_contract()
+    supplied_setting = request.agent.settings.get(CODEX_SUBSCRIPTION_CONTRACT_KEY)
+    if supplied_setting is not None and supplied_setting != contract:
+        raise RuntimeError(
+            "Codex subscription credential-isolation setting does not match Core policy"
+        )
+    request.agent.settings[CODEX_SUBSCRIPTION_CONTRACT_KEY] = contract
+
+    openevo_metadata = _existing_openevo_metadata(request.metadata)
+    supplied_metadata = openevo_metadata.get(CODEX_SUBSCRIPTION_CONTRACT_KEY)
+    if supplied_metadata is not None and supplied_metadata != contract:
+        raise RuntimeError(
+            "Codex subscription credential-isolation metadata does not match Core policy"
+        )
+    if CODEX_SUBSCRIPTION_READINESS_KEY in openevo_metadata:
+        raise RuntimeError("Codex subscription credential-isolation receipt must be Core-produced")
+    openevo_metadata[CODEX_SUBSCRIPTION_CONTRACT_KEY] = contract
+    request.metadata["openevo"] = openevo_metadata
+
+
 def _admitted_context_artifact_ids(
     metadata: dict[str, object],
 ) -> tuple[str, ...] | None:
@@ -2046,12 +2086,7 @@ class GatewayNodeManager:
                 )
             if _is_codex_subscription_agent(request.agent):
                 runtime_spec = runtime_spec.model_copy(
-                    update={
-                        "env": {
-                            **runtime_spec.env,
-                            **MANAGED_SUBSCRIPTION_ENV,
-                        }
-                    }
+                    update={"env": dict(MANAGED_SUBSCRIPTION_ENV)}
                 )
             docker_host_kwargs = (
                 {}
@@ -2302,6 +2337,8 @@ class GatewayNodeManager:
                 owner="runtime",
                 allow_exact=True,
             )
+            if set(runtime_spec.env) - MANAGED_SUBSCRIPTION_ENV_KEYS:
+                raise ValueError("Codex subscription runtime env contains non-Core fields")
             for action in [
                 *runtime_spec.prepare,
                 *(runtime_spec.eval_prepare or []),
@@ -2310,6 +2347,13 @@ class GatewayNodeManager:
                     action.env,
                     owner="runtime action",
                 )
+                if action.env:
+                    raise ValueError("Codex subscription runtime action env must be empty")
+            validate_codex_subscription_surface(
+                settings=request.agent.settings,
+                env=request.agent.env,
+                mcp_servers=request.agent.mcp_servers,
+            )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         try:
@@ -2318,11 +2362,46 @@ class GatewayNodeManager:
                 image=runtime_spec.image,
                 backend=runtime_spec.backend,
                 container_user=runtime_spec.container_user,
+                workdir=runtime_spec.workdir,
             )
         except ValueError as exc:
             raise RuntimeError(str(exc)) from exc
         if runtime_spec.import_path is not None or runtime_spec.kwargs:
             raise RuntimeError("subscription execution forbids custom runtime loaders and options")
+        if runtime_spec.eval_prepare:
+            raise RuntimeError("subscription execution forbids eval_prepare actions")
+        if runtime_spec.workdir != MANAGED_WORKSPACE:
+            raise RuntimeError("subscription execution requires the Core-managed workdir")
+        prepare = runtime_spec.prepare
+        if not prepare:
+            raise RuntimeError("subscription execution requires the Core-managed prepare recipe")
+        setup = prepare[-1]
+        if (
+            setup.type != "exec"
+            or setup.command != MANAGED_SUBSCRIPTION_PREPARE_COMMAND
+            or setup.source is not None
+            or setup.target is not None
+            or setup.cwd is not None
+            or setup.env is not None
+        ):
+            raise RuntimeError("subscription execution requires the Core-managed prepare recipe")
+        workspace_uploads = prepare[:-1]
+        if len(workspace_uploads) > 1:
+            raise RuntimeError("subscription execution requires the Core-managed prepare recipe")
+        if workspace_uploads:
+            upload = workspace_uploads[0]
+            if (
+                upload.type != "upload_dir"
+                or upload.source is None
+                or upload.target != MANAGED_WORKSPACE
+                or upload.command is not None
+                or upload.cwd is not None
+                or upload.env is not None
+            ):
+                raise RuntimeError(
+                    "subscription execution requires the Core-managed prepare recipe"
+                )
+        _pin_codex_subscription_contract(request)
 
         auth_path = Path(os.path.abspath(Path.home() / ".codex" / "auth.json"))
         protected_paths = (
@@ -2446,6 +2525,11 @@ class GatewayNodeManager:
 
             # Setup
             await self._await_with_budget(harness.setup(runtime), managed)
+            if _is_codex_subscription_agent(request.agent):
+                self._publish_codex_subscription_credential_isolation(
+                    managed,
+                    harness,
+                )
 
             # Run
             steps = harness.run_steps(request.instruction)
@@ -2521,6 +2605,35 @@ class GatewayNodeManager:
 
     def _resolve_agent_harness(self, request: SessionDispatchRequest) -> BaseHarness:
         return create_harness(request.agent)
+
+    def _publish_codex_subscription_credential_isolation(
+        self,
+        managed: ManagedSession,
+        harness: BaseHarness,
+    ) -> None:
+        expected = codex_subscription_readiness_receipt()
+        observed = getattr(
+            harness,
+            "subscription_credential_isolation_receipt",
+            None,
+        )
+        if observed != expected:
+            raise RuntimeError(
+                "Codex subscription credential-isolation receipt is missing or invalid"
+            )
+        openevo_metadata = _existing_openevo_metadata(managed.request.metadata)
+        if CODEX_SUBSCRIPTION_READINESS_KEY in openevo_metadata:
+            raise RuntimeError(
+                "Codex subscription credential-isolation receipt was supplied by the caller"
+            )
+        openevo_metadata[CODEX_SUBSCRIPTION_READINESS_KEY] = expected
+        managed.request.metadata["openevo"] = openevo_metadata
+        session_registry = getattr(self, "session_registry", None)
+        if session_registry is not None:
+            session_registry.update_metadata(
+                managed.request.session_id,
+                {"openevo": openevo_metadata},
+            )
 
     async def _resolve_and_inject_evolution_context(
         self,

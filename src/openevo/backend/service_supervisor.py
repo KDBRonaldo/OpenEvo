@@ -69,9 +69,12 @@ from openevo.runtime.managed import (
     verified_managed_runtime_image_reference,
 )
 from openevo.runtime.docker_host import (
+    DockerEngineAuthority,
+    DockerExecutableAuthority,
     DockerHostPathError,
     DockerHostPathSpec,
     discover_docker_host_path,
+    docker_cli_environment,
     docker_self_inspect_argv,
 )
 from openevo.internal_auth import (
@@ -137,9 +140,7 @@ _MAX_LOG_LINE_BYTES = 16_384
 _MIN_SENSITIVE_CREDENTIAL_PREFIX_BYTES = 8
 _CODEX_VERSION_MAX_BYTES = 4096
 _SEMVER_NUMBER = r"(?:0|[1-9][0-9]*)"
-_SEMVER_PRERELEASE_IDENTIFIER = (
-    r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
-)
+_SEMVER_PRERELEASE_IDENTIFIER = r"(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
 _SEMVER_BUILD_IDENTIFIER = r"[0-9A-Za-z-]+"
 _PROBE_EXECUTABLE_MAX_BYTES = 256 * 1024 * 1024
 _CODEX_VERSION_RE = re.compile(
@@ -349,12 +350,12 @@ class ManagedScienceRuntimeReadiness:
     runtime_image_immutable_reference: str | None
     message: str
     docker_host_path: DockerHostPathSpec | None = None
-    credential_authority: (
-        HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
-    ) = field(
-        default=None,
-        repr=False,
-        compare=False,
+    credential_authority: HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None = (
+        field(
+            default=None,
+            repr=False,
+            compare=False,
+        )
     )
 
     def __post_init__(self) -> None:
@@ -481,13 +482,17 @@ class BoundedProbeCommandRunner:
         process: subprocess.Popen[bytes] | None = None
         selector: selectors.BaseSelector | None = None
         try:
-            process_env = _controlled_environment()
-            for key, value in (env or {}).items():
-                if key != "CODEX_HOME" or not os.path.isabs(value):
-                    raise OSError("probe environment override is invalid")
-                if not value or any(ord(char) < 0x20 for char in value):
-                    raise OSError("probe environment override is invalid")
-                process_env[key] = value
+            requested_env = dict(env or {})
+            if requested_env == docker_cli_environment():
+                process_env = requested_env
+            else:
+                process_env = _controlled_environment()
+                for key, value in requested_env.items():
+                    if key != "CODEX_HOME" or not os.path.isabs(value):
+                        raise OSError("probe environment override is invalid")
+                    if not value or any(ord(char) < 0x20 for char in value):
+                        raise OSError("probe environment override is invalid")
+                    process_env[key] = value
             if any(fd < 3 for fd in pass_fds) or len(set(pass_fds)) != len(pass_fds):
                 raise OSError("probe inherited descriptor set is invalid")
             process = subprocess.Popen(
@@ -738,7 +743,10 @@ def _digest_probe_executable(descriptor: int, expected_size: int) -> str:
 
 
 def _valid_codex_version(result: ProbeCommandResult) -> bool:
-    if result.returncode != 0 or len(result.stdout) + len(result.stderr) > _CODEX_VERSION_MAX_BYTES:
+    if (
+        result.returncode != 0
+        or len(result.stdout) + len(result.stderr) > _CODEX_VERSION_MAX_BYTES
+    ):
         return False
     try:
         stdout = result.stdout.decode("utf-8")
@@ -863,12 +871,36 @@ class LocalManagedScienceRuntimeProbe:
                 )
 
             try:
-                runtime = self._command_runner.run(
-                    ("docker", "--version"), deadline, cancellation
-                )
-            except BaseException:
+                docker_executable = DockerExecutableAuthority.open()
+            except Exception:
                 credential_snapshot.close()
-                raise
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+                    "The managed Science runtime executable is unavailable.",
+                )
+            try:
+                docker_engine = DockerEngineAuthority.open()
+                if docker_engine.executable.identity != docker_executable.identity:
+                    raise DockerHostPathError("the release Docker executable authority changed")
+            except Exception:
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                    "The local Docker Engine authority is unavailable.",
+                )
+            try:
+                runtime = self._run_docker(
+                    docker_engine,
+                    ("--version",),
+                    deadline,
+                    cancellation,
+                )
+            except Exception:
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+                    "The managed Science runtime executable is unavailable.",
+                )
             if runtime.returncode != 0:
                 credential_snapshot.close()
                 return _runtime_not_ready(
@@ -876,14 +908,18 @@ class LocalManagedScienceRuntimeProbe:
                     "The managed Science runtime executable is unavailable.",
                 )
             try:
-                image_result = self._command_runner.run(
-                    ("docker", "image", "inspect", request.runtime_image),
+                image_result = self._run_docker(
+                    docker_engine,
+                    ("image", "inspect", request.runtime_image),
                     deadline,
                     cancellation,
                 )
-            except BaseException:
+            except Exception:
                 credential_snapshot.close()
-                raise
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                    "Managed Science runtime image evidence is unavailable.",
+                )
             if image_result.returncode != 0:
                 credential_snapshot.close()
                 return _runtime_not_ready(
@@ -911,6 +947,7 @@ class LocalManagedScienceRuntimeProbe:
             except (
                 UnicodeDecodeError,
                 json.JSONDecodeError,
+                RecursionError,
                 ValueError,
             ):
                 credential_snapshot.close()
@@ -921,8 +958,10 @@ class LocalManagedScienceRuntimeProbe:
             docker_host_path: DockerHostPathSpec | None = None
             if self._runtime_namespace is not None:
                 try:
-                    host_result = self._command_runner.run(
-                        docker_self_inspect_argv(),
+                    self_inspect = docker_self_inspect_argv()
+                    host_result = self._run_docker(
+                        docker_engine,
+                        self_inspect[1:],
                         deadline,
                         cancellation,
                     )
@@ -934,7 +973,7 @@ class LocalManagedScienceRuntimeProbe:
                         host_result.stdout,
                         namespace=self._runtime_namespace,
                     )
-                except (DockerHostPathError, OSError, ValueError):
+                except Exception:
                     if self._require_docker_user_container:
                         credential_snapshot.close()
                         return _runtime_not_ready(
@@ -948,19 +987,17 @@ class LocalManagedScienceRuntimeProbe:
                     {
                         "auth_content_sha256": credential_snapshot.content_sha256,
                         "auth_identity": credential_snapshot.identity,
-                        "codex_executable_identity_digest": (
-                            codex_executable.identity_digest
-                        ),
+                        "codex_executable_identity_digest": (codex_executable.identity_digest),
                         "codex_model": request.codex_model,
                         "codex_version_evidence": _command_evidence(codex),
                         "runtime_version_evidence": _command_evidence(runtime),
+                        "runtime_executable_identity_digest": (docker_executable.identity_digest),
+                        "runtime_engine_identity_digest": (docker_engine.identity_digest),
                         "runtime_image": request.runtime_image,
                         "runtime_image_id": image_id,
                         "runtime_image_immutable_reference": immutable_image,
                         "docker_host_path_identity": (
-                            None
-                            if docker_host_path is None
-                            else docker_host_path.identity_digest
+                            None if docker_host_path is None else docker_host_path.identity_digest
                         ),
                     }
                 ),
@@ -975,6 +1012,24 @@ class LocalManagedScienceRuntimeProbe:
             if credential_snapshot is not None:
                 credential_snapshot.close()
             codex_executable.close()
+
+    def _run_docker(
+        self,
+        authority: DockerEngineAuthority,
+        arguments: tuple[str, ...],
+        deadline: float,
+        cancellation: threading.Event | None,
+    ) -> ProbeCommandResult:
+        argv = authority.argv(*arguments)
+        try:
+            return self._command_runner.run(
+                argv,
+                deadline,
+                cancellation,
+                env=authority.environment(),
+            )
+        finally:
+            authority.verify()
 
     def _prepare_login_snapshot(self) -> PreparedCodexCredentialSnapshot | None:
         authority: HeldCodexCredentialAuthority | None = None
@@ -2049,20 +2104,15 @@ class CoreServiceSupervisor:
             self._port_probe = port_probe or SocketPortProbe()
             self._root.ensure_directory("credential-probes")
             self._credential_probe_root = self._root.path / "credential-probes"
-            self._managed_runtime_probe = (
-                managed_runtime_probe
-                or LocalManagedScienceRuntimeProbe(
-                    credential_probe_root=self._credential_probe_root,
-                    runtime_namespace=(
-                        "core-"
-                        + hashlib.sha256(
-                            os.fsencode(os.fspath(self._root.path.absolute()))
-                        ).hexdigest()[:24]
-                    ),
-                    require_docker_user_container=(
-                        launch_mode is ServiceLaunchMode.RELEASE
-                    ),
-                )
+            self._managed_runtime_probe = managed_runtime_probe or LocalManagedScienceRuntimeProbe(
+                credential_probe_root=self._credential_probe_root,
+                runtime_namespace=(
+                    "core-"
+                    + hashlib.sha256(
+                        os.fsencode(os.fspath(self._root.path.absolute()))
+                    ).hexdigest()[:24]
+                ),
+                require_docker_user_container=(launch_mode is ServiceLaunchMode.RELEASE),
             )
             self._startup_timeout = startup_timeout
             self._stop_timeout = stop_timeout
@@ -2614,9 +2664,7 @@ class CoreServiceSupervisor:
             if total_timeout is not None and total_timeout <= 0:
                 raise ValueError("total_timeout must be positive")
             if self._active_run_lease is not None:
-                raise SupervisorStateError(
-                    "managed service generation is leased to an active run"
-                )
+                raise SupervisorStateError("managed service generation is leased to an active run")
             deadline = time.monotonic() + (
                 total_timeout
                 if total_timeout is not None
@@ -2691,11 +2739,7 @@ class CoreServiceSupervisor:
                         **(
                             {}
                             if docker_host_path is None
-                            else {
-                                "docker_host_path": docker_host_path.model_dump(
-                                    mode="json"
-                                )
-                            }
+                            else {"docker_host_path": docker_host_path.model_dump(mode="json")}
                         ),
                     }
                 ],
@@ -4005,13 +4049,9 @@ def _require_private_file(info: os.stat_result, uid: int, label: str) -> None:
 
 def _require_private_framework_lock(info: os.stat_result, uid: int) -> None:
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise SupervisorStateError(
-            "framework lock is not a link-count-one regular file"
-        )
+        raise SupervisorStateError("framework lock is not a link-count-one regular file")
     if info.st_uid != uid or stat.S_IMODE(info.st_mode) not in {0o400, _FILE_MODE}:
-        raise SupervisorStateError(
-            "framework lock must be owner-only mode 0600 or immutable 0400"
-        )
+        raise SupervisorStateError("framework lock must be owner-only mode 0600 or immutable 0400")
 
 
 def _fd_identity(fd: int) -> tuple[int, int, int]:
@@ -4163,8 +4203,7 @@ def _binding_matches_snapshot(
         snapshot.run_ready
         and binding.execution_mode is snapshot.execution_mode
         and binding.runtime_image == snapshot.runtime_image
-        and binding.runtime_image_immutable_reference
-        == snapshot.runtime_image_immutable_reference
+        and binding.runtime_image_immutable_reference == snapshot.runtime_image_immutable_reference
         and binding.runtime_identity_digest == snapshot.runtime_identity_digest
         and binding.generation_digest == snapshot.generation_digest
     )

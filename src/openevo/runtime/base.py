@@ -67,15 +67,9 @@ _IN_MUTATION_MASK: Final[int] = (
     | _IN_MOVE_SELF
 )
 _INOTIFY_EVENT_HEADER: Final[struct.Struct] = struct.Struct("iIII")
-_DIRECTORY_FLAGS: Final[int] = (
-    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
-)
-_FILE_READ_FLAGS: Final[int] = (
-    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-)
-_FILE_WRITE_FLAGS: Final[int] = (
-    os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-)
+_DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+_FILE_READ_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+_FILE_WRITE_FLAGS: Final[int] = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 
 
 class RuntimePathSecurityError(RuntimeError):
@@ -367,16 +361,12 @@ def _open_relative_directories(
                     pass
             before = os.stat(part, dir_fd=parent_fd, follow_symlinks=False)
             if not stat.S_ISDIR(before.st_mode) or before.st_uid != expected_owner:
-                raise RuntimePathSecurityError(
-                    "session path ancestor is not an owned directory"
-                )
+                raise RuntimePathSecurityError("session path ancestor is not an owned directory")
             descriptor = os.open(part, _DIRECTORY_FLAGS, dir_fd=parent_fd)
             opened = os.fstat(descriptor)
             if _directory_identity(before) != _directory_identity(opened):
                 os.close(descriptor)
-                raise RuntimePathSecurityError(
-                    "session path ancestor changed while it was opened"
-                )
+                raise RuntimePathSecurityError("session path ancestor changed while it was opened")
             descriptors.append(descriptor)
             identities.append(_directory_identity(opened))
             parent_fd = descriptor
@@ -392,9 +382,7 @@ def _open_relative_directories(
     except OSError as exc:
         while descriptors:
             os.close(descriptors.pop())
-        raise RuntimePathSecurityError(
-            "session path ancestor could not be opened safely"
-        ) from exc
+        raise RuntimePathSecurityError("session path ancestor could not be opened safely") from exc
 
 
 def _require_session_root(
@@ -490,9 +478,7 @@ def _open_source_path(
             raise RuntimePathSecurityError("copy source is not owned by the Core user")
         if stat.S_ISREG(before.st_mode):
             if before.st_nlink != 1 or before.st_size < 0:
-                raise RuntimePathSecurityError(
-                    "copy source must be a single-link regular file"
-                )
+                raise RuntimePathSecurityError("copy source must be a single-link regular file")
             flags = _FILE_READ_FLAGS
         elif stat.S_ISDIR(before.st_mode):
             flags = _DIRECTORY_FLAGS
@@ -501,14 +487,10 @@ def _open_source_path(
         descriptor = os.open(name, flags, dir_fd=parent_pin.descriptor)
         opened = os.fstat(descriptor)
         expected = (
-            _file_identity(before)
-            if stat.S_ISREG(before.st_mode)
-            else _directory_identity(before)
+            _file_identity(before) if stat.S_ISREG(before.st_mode) else _directory_identity(before)
         )
         actual = (
-            _file_identity(opened)
-            if stat.S_ISREG(opened.st_mode)
-            else _directory_identity(opened)
+            _file_identity(opened) if stat.S_ISREG(opened.st_mode) else _directory_identity(opened)
         )
         if expected != actual:
             raise RuntimePathSecurityError("copy source changed while it was opened")
@@ -549,9 +531,7 @@ def _require_named_file_identity(
         else _directory_identity(expected)
     )
     named_identity = (
-        _file_identity(named)
-        if stat.S_ISREG(named.st_mode)
-        else _directory_identity(named)
+        _file_identity(named) if stat.S_ISREG(named.st_mode) else _directory_identity(named)
     )
     if named_identity != expected_identity:
         raise RuntimePathSecurityError(f"{label} path changed")
@@ -613,17 +593,13 @@ def _open_target_file(
             descriptor = os.open(name, _FILE_WRITE_FLAGS, dir_fd=parent_fd)
             opened = os.fstat(descriptor)
             if _file_identity(before) != _file_identity(opened):
-                raise RuntimePathSecurityError(
-                    "copy target changed while it was opened"
-                )
+                raise RuntimePathSecurityError("copy target changed while it was opened")
         if (
             not stat.S_ISREG(opened.st_mode)
             or opened.st_uid != expected_owner
             or opened.st_nlink != 1
         ):
-            raise RuntimePathSecurityError(
-                "copy target is not an owned single-link regular file"
-            )
+            raise RuntimePathSecurityError("copy target is not an owned single-link regular file")
         os.fchmod(descriptor, mode)
         identity = _object_identity(os.fstat(descriptor))
         result = descriptor
@@ -757,18 +733,14 @@ def _open_or_create_target_directory(
         opened = os.fstat(descriptor)
         if _directory_identity(before) != _directory_identity(opened):
             os.close(descriptor)
-            raise RuntimePathSecurityError(
-                "copy target directory changed while it was opened"
-            )
+            raise RuntimePathSecurityError("copy target directory changed while it was opened")
         return descriptor, _directory_identity(opened)
     except RuntimePathSecurityError:
         raise
     except PermissionError:
         raise
     except OSError as exc:
-        raise RuntimePathSecurityError(
-            "copy target directory could not be opened safely"
-        ) from exc
+        raise RuntimePathSecurityError("copy target directory could not be opened safely") from exc
 
 
 def _copy_directory_contents(
@@ -797,16 +769,12 @@ def _copy_directory_contents(
             raise RuntimePathSecurityError("copy source contains an unowned entry")
         if stat.S_ISREG(before.st_mode):
             if before.st_nlink != 1:
-                raise RuntimePathSecurityError(
-                    "copy source contains a hard-linked file"
-                )
+                raise RuntimePathSecurityError("copy source contains a hard-linked file")
             child_fd = os.open(name, _FILE_READ_FLAGS, dir_fd=source_fd)
             try:
                 opened = os.fstat(child_fd)
                 if _file_identity(before) != _file_identity(opened):
-                    raise RuntimePathSecurityError(
-                        "copy source file changed while it was opened"
-                    )
+                    raise RuntimePathSecurityError("copy source file changed while it was opened")
                 _copy_regular_file(
                     child_fd,
                     opened,
@@ -844,9 +812,7 @@ def _copy_directory_contents(
                     budget=budget,
                 )
                 if _directory_identity(os.fstat(child_target_fd)) != target_identity:
-                    raise RuntimePathSecurityError(
-                        "copy target directory changed during transfer"
-                    )
+                    raise RuntimePathSecurityError("copy target directory changed during transfer")
                 _require_named_file_identity(
                     target_fd,
                     name,
@@ -1000,9 +966,7 @@ class _RuntimeDownloadAccounting:
         observed: os.stat_result | None,
     ) -> None:
         receipt_path = self._receipt_path(relative_path)
-        identity = (
-            _readback_object_identity(observed) if observed is not None else None
-        )
+        identity = _readback_object_identity(observed) if observed is not None else None
         existing = self._credits.get(receipt_path)
         if (
             identity is not None
@@ -1191,9 +1155,8 @@ class _ReadbackMutationAuthority:
                     raise RuntimePathSecurityError(
                         "runtime readback mutation evidence is malformed"
                     )
-                if (
-                    watch not in self._watches
-                    or mask & (_IN_Q_OVERFLOW | _IN_IGNORED | _IN_MUTATION_MASK)
+                if watch not in self._watches or mask & (
+                    _IN_Q_OVERFLOW | _IN_IGNORED | _IN_MUTATION_MASK
                 ):
                     raise RuntimePathSecurityError(
                         "runtime readback source tree changed during transfer"
@@ -1253,8 +1216,7 @@ def _enumerate_readback_source_directory(
                     "runtime readback source contains a hard-linked file"
                 )
             if consume_files and (
-                accounting is None
-                or not accounting.claim_file(relative_path, observed)
+                accounting is None or not accounting.claim_file(relative_path, observed)
             ):
                 budget.consume_file()
             is_directory = False
@@ -1323,7 +1285,9 @@ def _open_private_readback_file(parent_fd: int, name: str) -> int:
             dir_fd=parent_fd,
         )
     except OSError as exc:
-        raise RuntimePathSecurityError("runtime readback target file could not be created") from exc
+        raise RuntimePathSecurityError(
+            "runtime readback target file could not be created"
+        ) from exc
 
 
 def _copy_readback_regular_file(
@@ -1388,8 +1352,7 @@ def _copy_readback_regular_file(
             or target_after.st_nlink != 1
             or target_after.st_size != opened.st_size
             or stat.S_IMODE(target_after.st_mode) != 0o600
-            or _readback_file_identity(named_target)
-            != _readback_file_identity(target_after)
+            or _readback_file_identity(named_target) != _readback_file_identity(target_after)
         ):
             raise RuntimePathSecurityError("runtime readback target file changed during transfer")
         return (
@@ -1608,16 +1571,12 @@ def _remove_quarantined_readback_contents(
         for entry in entries:
             names.append(entry.name)
             if len(names) > budget[0]:
-                raise RuntimePathSecurityError(
-                    "runtime readback cleanup exceeds the node limit"
-                )
+                raise RuntimePathSecurityError("runtime readback cleanup exceeds the node limit")
     names.sort()
     for name in names:
         budget[0] -= 1
         if budget[0] < 0:
-            raise RuntimePathSecurityError(
-                "runtime readback cleanup exceeds the node limit"
-            )
+            raise RuntimePathSecurityError("runtime readback cleanup exceeds the node limit")
         try:
             before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except OSError as exc:
@@ -1625,9 +1584,7 @@ def _remove_quarantined_readback_contents(
                 "runtime readback cleanup entry is unavailable"
             ) from exc
         if before.st_uid != expected_owner:
-            raise RuntimePathSecurityError(
-                "runtime readback cleanup contains an unowned entry"
-            )
+            raise RuntimePathSecurityError("runtime readback cleanup contains an unowned entry")
         if stat.S_ISDIR(before.st_mode):
             is_directory = True
             flags = _DIRECTORY_FLAGS
@@ -1755,9 +1712,7 @@ def _quarantine_readback_entry(
     try:
         first = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except OSError as exc:
-        raise RuntimePathSecurityError(
-            "runtime readback cleanup pathname is unavailable"
-        ) from exc
+        raise RuntimePathSecurityError("runtime readback cleanup pathname is unavailable") from exc
     if _readback_object_identity(first) != expected_identity:
         raise RuntimePathSecurityError("runtime readback cleanup pathname changed")
 
@@ -1774,9 +1729,7 @@ def _quarantine_readback_entry(
             continue
         break
     else:
-        raise RuntimePathSecurityError(
-            "runtime readback cleanup quarantine is unavailable"
-        )
+        raise RuntimePathSecurityError("runtime readback cleanup quarantine is unavailable")
     os.fsync(parent_fd)
     _require_quarantined_readback_binding(
         parent_fd,
@@ -1839,9 +1792,7 @@ class _RuntimeReadbackTemporaryRoot:
     def quarantine_for_worker(self) -> None:
         with self._lock:
             if self._closed:
-                raise RuntimePathSecurityError(
-                    "runtime readback temporary root is already closed"
-                )
+                raise RuntimePathSecurityError("runtime readback temporary root is already closed")
             if self._quarantine_name is None:
                 self._quarantine_name = _quarantine_readback_entry(
                     self._parent_pin.descriptor,
@@ -1909,12 +1860,7 @@ def _create_runtime_readback_temporary_root(
     prefix: str = "openevo-evolution-readback-",
     parent: Path | None = None,
 ) -> _RuntimeReadbackTemporaryRoot:
-    if (
-        not prefix
-        or "/" in prefix
-        or "\x00" in prefix
-        or prefix in {".", ".."}
-    ):
+    if not prefix or "/" in prefix or "\x00" in prefix or prefix in {".", ".."}:
         raise ValueError("runtime readback temporary prefix is invalid")
     parent_path = (parent or Path(tempfile.gettempdir())).absolute()
     parent_pin = _pin_absolute_directory(parent_path)
@@ -1931,9 +1877,7 @@ def _create_runtime_readback_temporary_root(
             name = candidate
             break
         if name is None:
-            raise RuntimePathSecurityError(
-                "runtime readback temporary root is unavailable"
-            )
+            raise RuntimePathSecurityError("runtime readback temporary root is unavailable")
         descriptor = os.open(name, _DIRECTORY_FLAGS, dir_fd=parent_pin.descriptor)
         opened = os.fstat(descriptor)
         named = os.stat(name, dir_fd=parent_pin.descriptor, follow_symlinks=False)
@@ -1943,9 +1887,7 @@ def _create_runtime_readback_temporary_root(
             or opened.st_uid != os.geteuid()
             or stat.S_IMODE(opened.st_mode) != 0o700
         ):
-            raise RuntimePathSecurityError(
-                "runtime readback temporary root is not private"
-            )
+            raise RuntimePathSecurityError("runtime readback temporary root is not private")
         os.fsync(parent_pin.descriptor)
         return _RuntimeReadbackTemporaryRoot(
             path=parent_path / name,
@@ -2038,9 +1980,7 @@ class BaseRuntime(ABC):
         self.session_dir = session_dir.absolute()
         session_pin = _pin_absolute_directory(self.session_dir, create=True)
         try:
-            self._session_root_identity = _directory_identity(
-                os.fstat(session_pin.descriptor)
-            )
+            self._session_root_identity = _directory_identity(os.fstat(session_pin.descriptor))
             _require_session_root(session_pin, self._session_root_identity)
             session_pin.verify(label="session root")
         finally:
@@ -2214,9 +2154,7 @@ class BaseRuntime(ABC):
                 expected_owner=self._session_root_identity[3],
             )
             source_parent_fd = (
-                source_parents.descriptor
-                if source_parents.descriptors
-                else session_pin.descriptor
+                source_parents.descriptor if source_parents.descriptors else session_pin.descriptor
             )
             source_name = relative_parts[-1]
             source_before = os.stat(
@@ -2235,17 +2173,13 @@ class BaseRuntime(ABC):
                 if expected_directory:
                     raise RuntimePathSecurityError("runtime readback expected a directory")
                 if source_before.st_nlink != 1:
-                    raise RuntimePathSecurityError(
-                        "runtime readback source is a hard-linked file"
-                    )
+                    raise RuntimePathSecurityError("runtime readback source is a hard-linked file")
                 source_flags = _FILE_READ_FLAGS
                 source_identity = _readback_file_identity(source_before)
                 budget.consume_node()
                 budget.consume_file()
             else:
-                raise RuntimePathSecurityError(
-                    "runtime readback source is a link or special file"
-                )
+                raise RuntimePathSecurityError("runtime readback source is a link or special file")
             source_fd = os.open(source_name, source_flags, dir_fd=source_parent_fd)
             source_opened = os.fstat(source_fd)
             opened_identity = (
@@ -2420,11 +2354,11 @@ class BaseRuntime(ABC):
                 raise RuntimePathSecurityError("runtime readback target file changed")
             target_parent_pin.verify(label="runtime readback target parent")
             readback_complete = True
-            return RuntimeReadback(
-                files=tuple(sorted(files, key=lambda item: item.relative_path))
-            )
+            return RuntimeReadback(files=tuple(sorted(files, key=lambda item: item.relative_path)))
         except FileNotFoundError as exc:
-            raise FileNotFoundError(f"runtime readback source is unavailable: {runtime_path}") from exc
+            raise FileNotFoundError(
+                f"runtime readback source is unavailable: {runtime_path}"
+            ) from exc
         except RuntimePathSecurityError:
             raise
         except OSError as exc:
@@ -2496,9 +2430,7 @@ class BaseRuntime(ABC):
                 expected_owner=self._session_root_identity[3],
             )
             source_parent_fd = (
-                source_parents.descriptor
-                if source_parents.descriptors
-                else session_pin.descriptor
+                source_parents.descriptor if source_parents.descriptors else session_pin.descriptor
             )
             source_name = relative_parts[-1]
             before = os.stat(
@@ -2561,9 +2493,7 @@ class BaseRuntime(ABC):
             target_parent_pin.verify(label="copy target ancestor")
             return True
         except FileNotFoundError as exc:
-            raise FileNotFoundError(
-                f"bind source does not exist: {runtime_path}"
-            ) from exc
+            raise FileNotFoundError(f"bind source does not exist: {runtime_path}") from exc
         finally:
             if target_parent_pin is not None:
                 target_parent_pin.close()
@@ -2594,9 +2524,7 @@ class BaseRuntime(ABC):
                 expected_owner=self._session_root_identity[3],
             )
             target_parent_fd = (
-                target_parents.descriptor
-                if target_parents.descriptors
-                else session_pin.descriptor
+                target_parents.descriptor if target_parents.descriptors else session_pin.descriptor
             )
             _copy_opened_entry(
                 source_fd,
@@ -2628,10 +2556,13 @@ class BaseRuntime(ABC):
         *args: str,
         timeout: float | None = None,
         env: dict[str, str] | None = None,
+        inherit_env: bool = True,
         capture: bool = False,
     ) -> tuple[int, str | None, str | None]:
         """Run a local subprocess, optionally capturing stdout/stderr."""
-        process_env = None if env is None else {**os.environ, **env}
+        process_env = (
+            None if env is None else ({**os.environ, **env} if inherit_env else dict(env))
+        )
         if capture:
             stdout_target = asyncio.subprocess.PIPE
             stderr_target = asyncio.subprocess.PIPE
@@ -2653,12 +2584,8 @@ class BaseRuntime(ABC):
             assert process.stdout is not None
             assert process.stderr is not None
             drain_tasks = [
-                asyncio.create_task(
-                    self._drain_bounded_stream(process.stdout, stdout_buffer)
-                ),
-                asyncio.create_task(
-                    self._drain_bounded_stream(process.stderr, stderr_buffer)
-                ),
+                asyncio.create_task(self._drain_bounded_stream(process.stdout, stdout_buffer)),
+                asyncio.create_task(self._drain_bounded_stream(process.stderr, stderr_buffer)),
             ]
         try:
             try:
@@ -3003,9 +2930,7 @@ class _RuntimeDownloadEventMonitor:
             )
         observed_directory = stat.S_ISDIR(observed.st_mode)
         if observed_directory is not is_directory:
-            raise RuntimePathSecurityError(
-                "runtime compatibility download entry type is unstable"
-            )
+            raise RuntimePathSecurityError("runtime compatibility download entry type is unstable")
         if not observed_directory and (
             not stat.S_ISREG(observed.st_mode) or observed.st_nlink != 1
         ):
@@ -3047,12 +2972,8 @@ class _RuntimeDownloadEventMonitor:
             )
         if mask & _IN_DELETE:
             if watch.relative_path is None:
-                raise RuntimePathSecurityError(
-                    "runtime compatibility download target was removed"
-                )
-            self._accounting.forget(
-                self._join_relative(watch.relative_path, name)
-            )
+                raise RuntimePathSecurityError("runtime compatibility download target was removed")
+            self._accounting.forget(self._join_relative(watch.relative_path, name))
         if mask & (_IN_MODIFY | _IN_ATTRIB | _IN_CLOSE_WRITE):
             if watch.relative_path is None:
                 if name == self._target_name and self._target_watch is None:
@@ -3462,9 +3383,7 @@ def _scan_runtime_download_sync(
             )
         if mutation_authority is not None:
             mutation_authority.require_quiet()
-        return RuntimeReadback(
-            files=tuple(sorted(files, key=lambda item: item.relative_path))
-        )
+        return RuntimeReadback(files=tuple(sorted(files, key=lambda item: item.relative_path)))
     finally:
         if mutation_authority is not None:
             mutation_authority.close()
@@ -3491,9 +3410,7 @@ async def _stop_runtime_download_tasks(
             termination = asyncio.create_task(operation.terminate())
     deadline = asyncio.get_running_loop().time() + _DOWNLOAD_JOIN_SECONDS
     pending: set[asyncio.Task[None]] = {
-        task
-        for task in (download, monitor, termination)
-        if task is not None and not task.done()
+        task for task in (download, monitor, termination) if task is not None and not task.done()
     }
     for completed in (download, monitor, termination):
         if completed is not None and completed.done() and not completed.cancelled():
@@ -3571,9 +3488,7 @@ async def _bounded_public_runtime_readback(
         != _readback_object_identity(os.fstat(temporary_root.descriptor))
     ):
         parent_pin.close()
-        raise RuntimePathSecurityError(
-            "runtime compatibility readback parent is not private"
-        )
+        raise RuntimePathSecurityError("runtime compatibility readback parent is not private")
     parent_identity = _directory_identity(parent_state)
     try:
         try:
@@ -3581,9 +3496,7 @@ async def _bounded_public_runtime_readback(
         except FileNotFoundError:
             pass
         else:
-            raise RuntimePathSecurityError(
-                "runtime compatibility readback target already exists"
-            )
+            raise RuntimePathSecurityError("runtime compatibility readback target already exists")
         os.mkdir(target_name, mode=0o700, dir_fd=parent_pin.descriptor)
         target_fd = os.open(target_name, _DIRECTORY_FLAGS, dir_fd=parent_pin.descriptor)
         try:
@@ -3603,10 +3516,7 @@ async def _bounded_public_runtime_readback(
                         "runtime compatibility download directory authority is invalid"
                     )
                 parts = tuple(value.split("/"))
-                if (
-                    len(parts) > _COPY_MAX_DEPTH
-                    or any(part in {"", ".", ".."} for part in parts)
-                ):
+                if len(parts) > _COPY_MAX_DEPTH or any(part in {"", ".", ".."} for part in parts):
                     raise RuntimePathSecurityError(
                         "runtime compatibility download directory authority is invalid"
                     )
@@ -3658,9 +3568,7 @@ async def _bounded_public_runtime_readback(
             operation_method = getattr(runtime, "_start_download_dir_operation", None)
             if callable(operation_method):
                 operation = operation_method(remote_path, str(local_path))
-                if operation is not None and not isinstance(
-                    operation, RuntimeDownloadOperation
-                ):
+                if operation is not None and not isinstance(operation, RuntimeDownloadOperation):
                     raise RuntimePathSecurityError(
                         "runtime download operation authority is invalid"
                     )

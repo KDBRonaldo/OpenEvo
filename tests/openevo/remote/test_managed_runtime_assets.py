@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import socket
 import subprocess
 import stat
 import sys
@@ -17,17 +18,17 @@ from openevo.deployment import managed_runtime_assets as assets
 from openevo.runtime.managed import ManagedRuntimeArchiveRelease
 
 
-FILENAME = "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
-ALIASES = ("openevo/science-runtime:0.1.0",)
+FILENAME = "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
+ALIASES = ("openevo/science-runtime:0.1.1",)
 CONFIG_ID = "sha256:" + "1" * 64
 OCI_INDEX_ID = "sha256:" + "2" * 64
 
 
 def _release(payload: bytes) -> ManagedRuntimeArchiveRelease:
     return ManagedRuntimeArchiveRelease(
-        asset_release_id=354404740,
-        asset_release_tag="openevo-managed-runtime-assets-v0.1.0",
-        asset_id=478167627,
+        asset_release_id=356072935,
+        asset_release_tag="openevo-managed-runtime-assets-v0.1.1",
+        asset_id=481361975,
         asset_api_digest="sha256:" + hashlib.sha256(payload).hexdigest(),
         filename=FILENAME,
         sha256=hashlib.sha256(payload).hexdigest(),
@@ -340,9 +341,8 @@ def _remote_run(
     environment = os.environ.copy()
     environment["HOME"] = str(home)
     environment["PATH"] = str(fake_bin) + os.pathsep + environment["PATH"]
-    environment["OPENEVO_FAKE_DOCKER_STATE"] = str(home / "docker-state.json")
     completed = subprocess.run(
-        [sys.executable, "-I", "-c", assets._REMOTE_MANAGED_RUNTIME_SCRIPT, *arguments],
+        [sys.executable, "-I", "-c", _test_remote_script(fake_bin), *arguments],
         check=check,
         capture_output=True,
         input=input_payload,
@@ -357,6 +357,36 @@ def _remote_run(
         returncode=completed.returncode,
         stdout=completed.stdout.decode("utf-8"),
         stderr=completed.stderr.decode("utf-8"),
+    )
+
+
+def _test_remote_script(fake_bin: Path) -> str:
+    socket_path = fake_bin / "docker.sock"
+    if not socket_path.exists():
+        engine_socket = socket.socket(socket.AF_UNIX)
+        try:
+            engine_socket.bind(os.fspath(socket_path))
+        finally:
+            engine_socket.close()
+        socket_path.chmod(0o660)
+    return (
+        assets._REMOTE_MANAGED_RUNTIME_SCRIPT.replace(
+            'DOCKER = "/usr/bin/docker"',
+            f"DOCKER = {os.fspath(fake_bin / 'docker')!r}",
+            1,
+        )
+        .replace(
+            'DOCKER_SOCKET = "/var/run/docker.sock"',
+            f"DOCKER_SOCKET = {os.fspath(socket_path)!r}",
+            1,
+        )
+        .replace(
+            '"DOCKER_HOST": "unix:///var/run/docker.sock"',
+            f'"DOCKER_HOST": "unix://{os.fspath(socket_path)}"',
+            1,
+        )
+        .replace("executable.st_uid != 0", "executable.st_uid != uid", 1)
+        .replace("engine_socket.st_uid != 0", "engine_socket.st_uid != uid", 1)
     )
 
 
@@ -375,7 +405,7 @@ def _fake_docker(
             [
                 f"#!{sys.executable}",
                 "import json, os, pathlib, sys, time",
-                "state = pathlib.Path(os.environ['OPENEVO_FAKE_DOCKER_STATE'])",
+                "state = pathlib.Path(__file__).parent.parent / 'home/docker-state.json'",
                 f"image = {OCI_INDEX_ID!r}",
                 "args = sys.argv[1:]",
                 "if args[:2] == ['image', 'inspect']:",
@@ -490,6 +520,124 @@ def _receive_arguments(
         release.sha256,
         str(release.byte_size),
     )
+
+
+def test_remote_probe_ignores_polluted_path_docker(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    polluted_bin = tmp_path / "polluted-bin"
+    polluted_bin.mkdir()
+    marker = tmp_path / "polluted-docker-ran"
+    polluted_docker = polluted_bin / "docker"
+    polluted_docker.write_text(
+        f"#!/bin/sh\ntouch {os.fspath(marker)!r}\nexit 99\n",
+        encoding="utf-8",
+    )
+    polluted_docker.chmod(0o755)
+    environment = os.environ.copy()
+    environment["HOME"] = os.fspath(home)
+    environment["PATH"] = os.fspath(polluted_bin)
+    definitions, separator, unused = assets._REMOTE_MANAGED_RUNTIME_SCRIPT.partition(
+        "\naction = sys.argv[1]"
+    )
+    assert separator
+    del unused
+    probe_script = definitions + '\nrun_docker(["--version"], capture=True)\n'
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            probe_script,
+        ],
+        check=True,
+        capture_output=True,
+        env=environment,
+        timeout=10,
+    )
+
+    assert not marker.exists()
+
+
+def test_remote_docker_process_receives_only_fixed_engine_environment(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    observed = tmp_path / "docker-environment.json"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        "\n".join(
+            [
+                f"#!{sys.executable}",
+                "import json, os",
+                f"open({os.fspath(observed)!r}, 'w').write(json.dumps(dict(os.environ)))",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o700)
+    script = _test_remote_script(fake_bin)
+    definitions, separator, unused = script.partition("\naction = sys.argv[1]")
+    assert separator
+    del unused
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "DOCKER_CONFIG": "/tmp/attacker-config",
+            "DOCKER_CONTEXT": "attacker",
+            "DOCKER_HOST": "tcp://attacker.invalid:2375",
+            "HOME": "/tmp/attacker-home",
+            "PATH": "/tmp/attacker-bin",
+        }
+    )
+
+    subprocess.run(
+        [sys.executable, "-I", "-c", definitions + '\nrun_docker(["--version"])\n'],
+        check=True,
+        capture_output=True,
+        env=environment,
+        timeout=10,
+    )
+
+    assert json.loads(observed.read_text(encoding="utf-8")) == {
+        "DOCKER_CONFIG": "/proc/self",
+        "DOCKER_HOST": f"unix://{fake_bin / 'docker.sock'}",
+        "HOME": "/proc/self",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+
+
+def test_remote_docker_rejects_unsafe_engine_socket_mode_before_exec(
+    tmp_path: Path,
+) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "docker-ran"
+    fake_docker = fake_bin / "docker"
+    fake_docker.write_text(
+        f"#!/bin/sh\ntouch {os.fspath(marker)!r}\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o700)
+    script = _test_remote_script(fake_bin)
+    (fake_bin / "docker.sock").chmod(0o666)
+    definitions, separator, unused = script.partition("\naction = sys.argv[1]")
+    assert separator
+    del unused
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", definitions + '\nrun_docker(["--version"])\n'],
+        check=False,
+        capture_output=True,
+        timeout=10,
+    )
+
+    assert result.returncode != 0
+    assert not marker.exists()
 
 
 def test_remote_receive_streams_exact_archive_without_rsync(tmp_path: Path) -> None:
@@ -616,7 +764,7 @@ def test_remote_finalize_cancellation_terminates_load_and_cleans_stage(
             sys.executable,
             "-I",
             "-c",
-            assets._REMOTE_MANAGED_RUNTIME_SCRIPT,
+            _test_remote_script(fake_bin),
             *_finalize_arguments(prepared, release),
         ],
         stdout=subprocess.PIPE,
@@ -666,7 +814,7 @@ def test_remote_finalize_cancellation_rolls_back_aliases_before_receipt(
             sys.executable,
             "-I",
             "-c",
-            assets._REMOTE_MANAGED_RUNTIME_SCRIPT,
+            _test_remote_script(fake_bin),
             *_finalize_arguments(prepared, release),
         ],
         stdout=subprocess.PIPE,
@@ -783,7 +931,7 @@ def test_remote_rollback_persists_cleanup_authority_until_real_remove_succeeds(
             sys.executable,
             "-I",
             "-c",
-            assets._REMOTE_MANAGED_RUNTIME_SCRIPT,
+            _test_remote_script(fake_bin),
             *_finalize_arguments(prepared, release),
         ],
         env=environment,

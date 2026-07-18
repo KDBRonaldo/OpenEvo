@@ -3,15 +3,20 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import socket
 
 import pytest
 from pydantic import ValidationError
 
+from openevo.runtime import docker_host as docker_host_module
 from openevo.runtime.docker_host import (
+    DOCKER_HOST_ENDPOINT,
+    DockerSocketAuthority,
     DockerHostPathError,
     DockerHostPathSpec,
     HeldDockerSessionRoot,
     discover_docker_host_path,
+    docker_cli_environment,
     docker_self_inspect_argv,
     verify_docker_host_path,
 )
@@ -258,3 +263,121 @@ def test_self_inspect_command_requires_container_identity_hostname() -> None:
     assert docker_self_inspect_argv(_HOSTNAME)[-1] == _HOSTNAME
     with pytest.raises(DockerHostPathError, match="container-ID hostname"):
         docker_self_inspect_argv("gpu-server")
+
+
+def test_host_path_admission_requires_hostname_to_equal_id_prefix(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    with pytest.raises(DockerHostPathError, match="self-container identity"):
+        discover_docker_host_path(
+            _inspect_payload(
+                [_bind_mount(data_root)],
+                hostname="a" * 12,
+                container_id=("b" * 12) + ("c" * 52),
+            ),
+            namespace="core-release",
+            hostname="a" * 12,
+            minimum_available_bytes=0,
+        )
+
+
+@pytest.mark.parametrize("length", [13, 64])
+def test_self_inspect_rejects_container_id_prefix_hostname(length: int) -> None:
+    with pytest.raises(DockerHostPathError, match="container-ID hostname"):
+        docker_self_inspect_argv("a" * length)
+
+
+@pytest.mark.parametrize("length", [13, 64])
+def test_host_path_admission_rejects_long_container_id_prefix_hostname(
+    tmp_path: Path,
+    length: int,
+) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    hostname = "a" * length
+    with pytest.raises(DockerHostPathError, match="self-container identity"):
+        discover_docker_host_path(
+            _inspect_payload(
+                [_bind_mount(data_root)],
+                hostname=hostname,
+                container_id=hostname + ("b" * (64 - length)),
+            ),
+            namespace="core-release",
+            hostname=hostname,
+            minimum_available_bytes=0,
+        )
+
+
+def _bind_unix_socket(path: Path, *, mode: int = 0o660) -> None:
+    engine_socket = socket.socket(socket.AF_UNIX)
+    try:
+        engine_socket.bind(os.fspath(path))
+    finally:
+        engine_socket.close()
+    path.chmod(mode)
+
+
+def test_docker_cli_environment_is_complete_and_ignores_user_configuration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCKER_HOST", "tcp://attacker.invalid:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "attacker")
+    monkeypatch.setenv("DOCKER_CONFIG", "/tmp/attacker-config")
+    monkeypatch.setenv("HOME", "/tmp/attacker-home")
+
+    assert docker_cli_environment() == {
+        "DOCKER_CONFIG": "/proc/self",
+        "DOCKER_HOST": DOCKER_HOST_ENDPOINT,
+        "HOME": "/proc/self",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
+    assert "DOCKER_CONTEXT" not in docker_cli_environment()
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="release socket authority is root-owned")
+def test_docker_socket_authority_accepts_root_docker_mode_and_rejects_aba(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    _bind_unix_socket(socket_path)
+    monkeypatch.setattr(
+        docker_host_module,
+        "DOCKER_SOCKET_PATH",
+        os.fspath(socket_path),
+    )
+    authority = DockerSocketAuthority.open()
+    original_identity = authority.identity
+    displaced = tmp_path / "docker.displaced.sock"
+    socket_path.rename(displaced)
+    _bind_unix_socket(socket_path)
+
+    assert authority.identity == original_identity
+    with pytest.raises(DockerHostPathError, match="socket authority changed"):
+        authority.verify()
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="release socket authority is root-owned")
+@pytest.mark.parametrize("kind", ["regular", "world_writable"])
+def test_docker_socket_authority_rejects_invalid_type_or_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    socket_path = tmp_path / "docker.sock"
+    if kind == "regular":
+        socket_path.write_text("not a socket", encoding="utf-8")
+        socket_path.chmod(0o660)
+    else:
+        _bind_unix_socket(socket_path, mode=0o666)
+    monkeypatch.setattr(
+        docker_host_module,
+        "DOCKER_SOCKET_PATH",
+        os.fspath(socket_path),
+    )
+
+    with pytest.raises(DockerHostPathError, match="socket identity is invalid"):
+        DockerSocketAuthority.open()

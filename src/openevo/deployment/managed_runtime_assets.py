@@ -854,7 +854,7 @@ import stat
 import subprocess
 import sys
 
-FILENAME = "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+FILENAME = "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
 LEASE = ".openevo-runtime-transfer.lock"
 GLOBAL_LOCK = "managed-runtime-staging.lock"
 LABEL = "io.openevo.managed-runtime"
@@ -865,8 +865,18 @@ MAX_RECEIPTS = 16
 MAX_RECEIPT_BYTES = 4096
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+DOCKER = "/usr/bin/docker"
+DOCKER_SOCKET = "/var/run/docker.sock"
+DOCKER_ENV = {
+    "DOCKER_CONFIG": "/proc/self",
+    "DOCKER_HOST": "unix:///var/run/docker.sock",
+    "HOME": "/proc/self",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+}
 uid = os.getuid()
 current_child = None
+docker_authority = None
 
 def fail():
     raise SystemExit(1)
@@ -1321,15 +1331,70 @@ def reconcile_receipts(receipts_fd, preserve_cleanup=None):
         os.unlink(record["name"], dir_fd=receipts_fd)
         os.fsync(receipts_fd)
 
+def docker_engine_identity():
+    try:
+        executable = os.stat(DOCKER, follow_symlinks=False)
+        engine_socket = os.stat(DOCKER_SOCKET, follow_symlinks=False)
+    except OSError:
+        fail()
+    executable_mode = stat.S_IMODE(executable.st_mode)
+    socket_mode = stat.S_IMODE(engine_socket.st_mode)
+    if (not stat.S_ISREG(executable.st_mode) or executable.st_uid != 0
+            or executable.st_nlink < 1 or not executable_mode & 0o111
+            or executable_mode & 0o022 or executable.st_size <= 0
+            or not stat.S_ISSOCK(engine_socket.st_mode)
+            or engine_socket.st_uid != 0 or socket_mode not in {0o600, 0o660}
+            or engine_socket.st_nlink != 1):
+        fail()
+    return (
+        (
+            executable.st_dev,
+            executable.st_ino,
+            executable.st_mode,
+            executable.st_uid,
+            executable.st_gid,
+            executable.st_nlink,
+            executable.st_size,
+            executable.st_mtime_ns,
+            executable.st_ctime_ns,
+        ),
+        (
+            engine_socket.st_dev,
+            engine_socket.st_ino,
+            engine_socket.st_mode,
+            engine_socket.st_uid,
+            engine_socket.st_gid,
+            engine_socket.st_nlink,
+            engine_socket.st_ctime_ns,
+        ),
+    )
+
+def verify_docker_engine():
+    global docker_authority
+    identity = docker_engine_identity()
+    if docker_authority is None:
+        docker_authority = identity
+    elif docker_authority != identity:
+        fail()
+
 def run_docker(arguments, timeout=30, capture=False, pass_fds=()):
     global current_child
+    verify_docker_engine()
     current_child = subprocess.Popen(
-        ["docker", *arguments],
+        [DOCKER, *arguments],
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
         stderr=subprocess.PIPE if capture else subprocess.DEVNULL,
+        env=DOCKER_ENV,
+        cwd="/",
+        close_fds=True,
         pass_fds=pass_fds,
     )
+    try:
+        verify_docker_engine()
+    except BaseException:
+        stop_child()
+        raise
     try:
         try:
             stdout, stderr = current_child.communicate(timeout=timeout)
@@ -1339,6 +1404,7 @@ def run_docker(arguments, timeout=30, capture=False, pass_fds=()):
         return current_child.returncode, stdout or b"", stderr or b""
     finally:
         current_child = None
+        verify_docker_engine()
 
 def docker_not_found(error):
     if len(error) > 4096:

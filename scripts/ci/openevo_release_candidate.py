@@ -31,19 +31,19 @@ TAURI_EXECUTABLE_NAME = "openevo-desktop"
 CORE_PYTHON_REQUIRES = ">=3.11"
 CORE_SUPPORTED_PLATFORMS = ("linux-x86_64",)
 MANAGED_RUNTIME_REPOSITORY = "CompLifeLab-ZJU/OpenEvo"
-MANAGED_RUNTIME_RELEASE_ID = 354404740
-MANAGED_RUNTIME_RELEASE_TAG = "openevo-managed-runtime-assets-v0.1.0"
-MANAGED_RUNTIME_ASSET_ID = 478167627
-MANAGED_RUNTIME_ARCHIVE_NAME = "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
-MANAGED_RUNTIME_ARCHIVE_SIZE = 374_592_823
-MANAGED_RUNTIME_ARCHIVE_SHA256 = "7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a"
+MANAGED_RUNTIME_RELEASE_ID = 356072935
+MANAGED_RUNTIME_RELEASE_TAG = "openevo-managed-runtime-assets-v0.1.1"
+MANAGED_RUNTIME_ASSET_ID = 481361975
+MANAGED_RUNTIME_ARCHIVE_NAME = "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
+MANAGED_RUNTIME_ARCHIVE_SIZE = 352_236_726
+MANAGED_RUNTIME_ARCHIVE_SHA256 = "ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149"
 MANAGED_RUNTIME_CONFIG_ID = (
-    "sha256:ae4e0189161bec78e419ab4887b1028e51f30996beee7b078011e3656e6084a1"
+    "sha256:0e5783e7839fe06d2df14d7a431c90f0982ca2099ef33bfa4c9e5933149bf5f2"
 )
 MANAGED_RUNTIME_OCI_INDEX_ID = (
-    "sha256:014ee0866c332b73dfa9165397486a0ffbd132b274705e18b2b8c9b78d5dbb90"
+    "sha256:7a0079f9cb1bce5768cff5bce3d1181811c6a231ad800cac8fb503d66852c81b"
 )
-MANAGED_RUNTIME_ALIAS = "openevo/science-runtime:0.1.0"
+MANAGED_RUNTIME_ALIAS = "openevo/science-runtime:0.1.1"
 MANAGED_RUNTIME_LABEL = "io.openevo.managed-runtime"
 MANAGED_RUNTIME_LABEL_VALUE = "true"
 MANAGED_RUNTIME_PLATFORM = "linux-amd64"
@@ -319,10 +319,7 @@ def render_draft_release_body(*, release_notes: str, ownership_token: str) -> st
         raise CandidateError("draft ownership token must be 128-bit lowercase hex")
     if not release_notes:
         raise CandidateError("draft release notes must not be empty")
-    return (
-        release_notes.rstrip("\n")
-        + f"\n\n<!-- openevo-draft-owner:{ownership_token} -->\n"
-    )
+    return release_notes.rstrip("\n") + f"\n\n<!-- openevo-draft-owner:{ownership_token} -->\n"
 
 
 def write_draft_release_body(
@@ -357,9 +354,7 @@ def assert_release_tag_absent(inventory_path: Path, *, expected_tag: str) -> Non
                 f"GitHub release inventory line {line_number} is invalid"
             ) from exc
         if type(tag) is not str or not tag:
-            raise CandidateError(
-                f"GitHub release inventory line {line_number} is not a tag name"
-            )
+            raise CandidateError(f"GitHub release inventory line {line_number} is not a tag name")
         if tag == expected_tag:
             raise CandidateError(f"GitHub release already exists: {expected_tag}")
 
@@ -504,8 +499,7 @@ def validate_daemon_release_inputs(
     runtime = manifest.get("runtime")
     if (
         type(runtime) is not dict
-        or set(runtime)
-        != {"format", "python", "system_python_required", "target_pypi_required"}
+        or set(runtime) != {"format", "python", "system_python_required", "target_pypi_required"}
         or runtime.get("format") != "pyinstaller-onefile"
         or runtime.get("system_python_required") is not False
         or runtime.get("target_pypi_required") is not False
@@ -535,10 +529,8 @@ def validate_daemon_release_inputs(
             or not item["version"]
             for item in distributions
         )
-        or distributions
-        != sorted(distributions, key=lambda item: (item["name"], item["version"]))
-        or len(distributions)
-        != len({(item["name"], item["version"]) for item in distributions})
+        or distributions != sorted(distributions, key=lambda item: (item["name"], item["version"]))
+        or len(distributions) != len({(item["name"], item["version"]) for item in distributions})
     ):
         raise CandidateError("Daemon build distribution inventory is invalid")
     return manifest
@@ -624,7 +616,9 @@ def _validate_mach_o_observation(payload: object, *, subject: str) -> list[str]:
     if (
         type(slices) is not list
         or not slices
-        or any(type(value) is not str or value not in ARCHITECTURE_SLICES.values() for value in slices)
+        or any(
+            type(value) is not str or value not in ARCHITECTURE_SLICES.values() for value in slices
+        )
         or slices != sorted(set(slices))
     ):
         raise CandidateError(f"{subject} Mach-O slices are invalid")
@@ -661,7 +655,9 @@ def _validate_evidence(
     }
     for ecosystem, path in lockfiles.items():
         if path.is_file() and dependency_ecosystems[ecosystem]["lockfile_sha256"] != _sha256(path):
-            raise CandidateError(f"dependency evidence does not bind the checkout {ecosystem} lockfile")
+            raise CandidateError(
+                f"dependency evidence does not bind the checkout {ecosystem} lockfile"
+            )
 
     if type(license_inventory) is not dict or set(license_inventory) != {
         "schema_version",
@@ -674,9 +670,8 @@ def _validate_evidence(
         raise CandidateError("license inventory schema version is invalid")
     _require_digest(license_inventory.get("project_license_sha256"), "project license digest")
     project_license = REPO_ROOT / "LICENSE"
-    if (
-        project_license.is_file()
-        and license_inventory.get("project_license_sha256") != _sha256(project_license)
+    if project_license.is_file() and license_inventory.get("project_license_sha256") != _sha256(
+        project_license
     ):
         raise CandidateError("license evidence does not bind the checkout LICENSE")
     if set(license_ecosystems) != ecosystems:
@@ -779,13 +774,9 @@ def _validate_evidence(
             _validate_mach_o_observation(mach_o[binary], subject=f"{filename} {binary}")
         smoke_payloads.append(smoke)
     if smoke_payloads[0]["mach_o"] != smoke_payloads[1]["mach_o"]:
-        raise CandidateError(
-            "Mounted-DMG app and detached-copy Mach-O evidence do not match"
-        )
+        raise CandidateError("Mounted-DMG app and detached-copy Mach-O evidence do not match")
     if smoke_payloads[0]["binary_sha256"] != smoke_payloads[1]["binary_sha256"]:
-        raise CandidateError(
-            "Mounted-DMG app and detached-copy binary digests do not match"
-        )
+        raise CandidateError("Mounted-DMG app and detached-copy binary digests do not match")
     expected_slice = ARCHITECTURE_SLICES[architecture]
     mach_o = smoke_payloads[0]["mach_o"]
     assert isinstance(mach_o, dict)
@@ -858,10 +849,7 @@ def _validate_draft_release_metadata(
         ownership_token=expected_owner,
     )
     release_body = metadata.get("body")
-    if (
-        type(release_body) is not str
-        or release_body.rstrip("\n") != expected_body.rstrip("\n")
-    ):
+    if type(release_body) is not str or release_body.rstrip("\n") != expected_body.rstrip("\n"):
         raise CandidateError("Draft release body does not match the candidate release notes")
     expected = {
         "isDraft": True,
@@ -1008,7 +996,9 @@ def create_candidate_manifest(
     if SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("source_commit must be one full lowercase Git commit")
     if architecture not in ARCHITECTURE_TARGETS:
-        raise CandidateError("candidate architecture must be the actual host architecture, not universal")
+        raise CandidateError(
+            "candidate architecture must be the actual host architecture, not universal"
+        )
     if ARCHITECTURE_TARGETS[architecture] != rust_target:
         raise CandidateError("candidate architecture does not match the actual Rust host target")
     _require_digest(registry_digest, "registry digest")
@@ -1159,7 +1149,9 @@ def _validate_candidate_manifest(
     if type(version) is not str or not version:
         raise CandidateError("candidate version is invalid")
     if release != {"channel": "unsigned-draft-prerelease", "notarized": False, "signed": False}:
-        raise CandidateError("candidate release must remain unsigned, not notarized, and prerelease")
+        raise CandidateError(
+            "candidate release must remain unsigned, not notarized, and prerelease"
+        )
     if type(macos) is not dict or set(macos) != {
         "architecture",
         "minimum_system_version",

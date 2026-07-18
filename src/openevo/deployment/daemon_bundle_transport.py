@@ -23,6 +23,7 @@ _VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}\Z")
 _REMOTE_PATH_PATTERN = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
 _BUNDLE_ROOT_PATTERN = re.compile(r"/home/[A-Za-z0-9._@%+=,-]+/\.openevo/daemon-bundles\Z")
 _TRANSFER_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
+_ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
 
 class DaemonBundleTransportContractError(ValueError):
@@ -118,11 +119,61 @@ class DaemonBundleIdentity:
 @dataclass(frozen=True, slots=True)
 class DaemonBundleServiceStatus:
     remote_port: int
+    bundle_sha256: str
+    canonical_manifest_sha256: str
+    lifecycle_compatibility: int
     release_identity: str
     registry_digest: str
     source_commit: str
     generation: str
     attached: bool
+
+
+@dataclass(frozen=True, slots=True)
+class DaemonBundleServicePredecessor:
+    state: Literal["absent", "legacy", "running"]
+    generation: str | None = None
+    release_identity: str | None = None
+    bundle_sha256: str | None = None
+    canonical_manifest_sha256: str | None = None
+    lifecycle_compatibility: int | None = None
+
+    def __post_init__(self) -> None:
+        absent = (
+            self.state == "absent"
+            and self.generation is None
+            and self.release_identity is None
+            and self.bundle_sha256 is None
+            and self.canonical_manifest_sha256 is None
+            and self.lifecycle_compatibility is None
+        )
+        legacy = (
+            self.state == "legacy"
+            and type(self.generation) is str
+            and _GENERATION_PATTERN.fullmatch(self.generation) is not None
+            and type(self.release_identity) is str
+            and _DIGEST_PATTERN.fullmatch(self.release_identity) is not None
+            and self.bundle_sha256 is None
+            and self.canonical_manifest_sha256 is None
+            and self.lifecycle_compatibility == 1
+        )
+        running = (
+            self.state == "running"
+            and type(self.generation) is str
+            and _GENERATION_PATTERN.fullmatch(self.generation) is not None
+            and type(self.release_identity) is str
+            and _DIGEST_PATTERN.fullmatch(self.release_identity) is not None
+            and type(self.bundle_sha256) is str
+            and _DIGEST_PATTERN.fullmatch(self.bundle_sha256) is not None
+            and type(self.canonical_manifest_sha256) is str
+            and _DIGEST_PATTERN.fullmatch(self.canonical_manifest_sha256) is not None
+            and type(self.lifecycle_compatibility) is int
+            and self.lifecycle_compatibility >= 2
+        )
+        if not absent and not legacy and not running:
+            raise DaemonBundleTransportContractError(
+                "Daemon service predecessor identity is invalid."
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -318,6 +369,8 @@ def build_daemon_bundle_ensure_command(
     *,
     port: int,
     deadline_seconds: float,
+    expected_predecessor: DaemonBundleServicePredecessor,
+    canonical_manifest_sha256: str,
 ) -> str:
     bundle.__post_init__()
     if (
@@ -326,10 +379,60 @@ def build_daemon_bundle_ensure_command(
         or isinstance(deadline_seconds, bool)
         or not isinstance(deadline_seconds, (int, float))
         or not 0 < deadline_seconds <= 300
+        or not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
+        or not _valid_digest(canonical_manifest_sha256)
     ):
         raise DaemonBundleTransportContractError("Daemon bundle ensure request is invalid.")
+    expected_predecessor.__post_init__()
     executable = shlex.quote(bundle._executable_path)
-    return f"{executable} service ensure --port {port} --deadline-seconds {deadline_seconds:.6f}"
+    manifest_path = shlex.quote(f"{bundle._service_root}/bundle-{canonical_manifest_sha256}")
+    command = (
+        f"{executable} service ensure --port {port} --deadline-seconds {deadline_seconds:.6f}"
+        f" --expected-bundle-sha256 {bundle.sha256}"
+        f" --expected-canonical-manifest-sha256 {canonical_manifest_sha256}"
+        f" --canonical-manifest-path {manifest_path}"
+    )
+    if expected_predecessor.state == "absent":
+        return f"{command} --expect-service-absent"
+    predecessor = (
+        f"{command} --expect-service-generation {expected_predecessor.generation}"
+        " --expect-service-release-identity "
+        f"{expected_predecessor.release_identity}"
+        " --expect-service-lifecycle-compatibility "
+        f"{expected_predecessor.lifecycle_compatibility}"
+    )
+    if expected_predecessor.state == "legacy":
+        return predecessor
+    return (
+        f"{predecessor} --expect-service-bundle-sha256 "
+        f"{expected_predecessor.bundle_sha256}"
+        " --expect-service-canonical-manifest-sha256 "
+        f"{expected_predecessor.canonical_manifest_sha256}"
+    )
+
+
+def build_daemon_bundle_observe_command(
+    bundle: StagedDaemonBundle,
+    *,
+    deadline_seconds: float,
+    canonical_manifest_sha256: str,
+) -> str:
+    bundle.__post_init__()
+    if (
+        isinstance(deadline_seconds, bool)
+        or not isinstance(deadline_seconds, (int, float))
+        or not 0 < deadline_seconds <= 300
+        or not _valid_digest(canonical_manifest_sha256)
+    ):
+        raise DaemonBundleTransportContractError("Daemon bundle observe request is invalid.")
+    return (
+        f"{shlex.quote(bundle._executable_path)} service observe"
+        f" --deadline-seconds {deadline_seconds:.6f}"
+        f" --expected-bundle-sha256 {bundle.sha256}"
+        f" --expected-canonical-manifest-sha256 {canonical_manifest_sha256}"
+        " --canonical-manifest-path "
+        f"{shlex.quote(f'{bundle._service_root}/bundle-{canonical_manifest_sha256}')}"
+    )
 
 
 def build_daemon_bundle_inspect_command(bundle: StagedDaemonBundle) -> str:
@@ -414,18 +517,38 @@ def parse_daemon_bundle_identity(payload: SecretStr) -> DaemonBundleIdentity:
     )
 
 
+def parse_daemon_bundle_error_code(payload: SecretStr) -> str:
+    value = _load_secret_json(payload)
+    if type(value) is not dict or set(value) != {"error", "schema_version"}:
+        raise DaemonBundleTransportContractError("Daemon bundle error receipt is invalid.")
+    error = _closed_dict(value["error"], {"code", "message", "retryable"})
+    if (
+        value["schema_version"] != 1
+        or type(error["code"]) is not str
+        or _ERROR_CODE_PATTERN.fullmatch(error["code"]) is None
+        or type(error["message"]) is not str
+        or not 0 < len(error["message"].encode("utf-8")) <= 1024
+        or type(error["retryable"]) is not bool
+    ):
+        raise DaemonBundleTransportContractError("Daemon bundle error receipt is invalid.")
+    return error["code"]
+
+
 def parse_daemon_bundle_service_status(payload: SecretStr) -> DaemonBundleServiceStatus:
     value = _load_secret_json(payload)
     expected = {
         "attached",
+        "bundle_sha256",
+        "canonical_manifest_sha256",
         "generation",
+        "lifecycle_compatibility",
         "port",
         "registry_digest",
         "release_identity",
         "schema_version",
         "source_commit",
     }
-    if type(value) is not dict or set(value) != expected or value["schema_version"] != 1:
+    if type(value) is not dict or set(value) != expected or value["schema_version"] != 2:
         raise DaemonBundleTransportContractError("Daemon service status is invalid.")
     if (
         type(value["attached"]) is not bool
@@ -433,6 +556,10 @@ def parse_daemon_bundle_service_status(payload: SecretStr) -> DaemonBundleServic
         or not 1 <= value["port"] <= 65535
         or not _valid_digest(value["registry_digest"])
         or not _valid_digest(value["release_identity"])
+        or not _valid_digest(value["bundle_sha256"])
+        or not _valid_digest(value["canonical_manifest_sha256"])
+        or type(value["lifecycle_compatibility"]) is not int
+        or value["lifecycle_compatibility"] < 2
         or type(value["source_commit"]) is not str
         or _COMMIT_PATTERN.fullmatch(value["source_commit"]) is None
         or type(value["generation"]) is not str
@@ -441,12 +568,119 @@ def parse_daemon_bundle_service_status(payload: SecretStr) -> DaemonBundleServic
         raise DaemonBundleTransportContractError("Daemon service status is invalid.")
     return DaemonBundleServiceStatus(
         remote_port=value["port"],
+        bundle_sha256=value["bundle_sha256"],
+        canonical_manifest_sha256=value["canonical_manifest_sha256"],
+        lifecycle_compatibility=value["lifecycle_compatibility"],
         release_identity=value["release_identity"],
         registry_digest=value["registry_digest"],
         source_commit=value["source_commit"],
         generation=value["generation"],
         attached=value["attached"],
     )
+
+
+def split_daemon_bundle_service_attachment(
+    payload: SecretStr,
+) -> tuple[DaemonBundleServiceStatus, SecretStr]:
+    value = _load_secret_json(payload)
+    secret_keys = {
+        "bearer_token",
+        "capture_mode",
+        "execution_mode",
+        "host",
+        "status_proof",
+    }
+    public_keys = {
+        "attached",
+        "bundle_sha256",
+        "canonical_manifest_sha256",
+        "generation",
+        "lifecycle_compatibility",
+        "port",
+        "registry_digest",
+        "release_identity",
+        "schema_version",
+        "source_commit",
+    }
+    if type(value) is not dict or set(value) != public_keys | secret_keys:
+        raise DaemonBundleTransportContractError("Daemon service attachment is invalid.")
+    public = {key: value[key] for key in public_keys}
+    status = parse_daemon_bundle_service_status(
+        SecretStr(json.dumps(public, separators=(",", ":"), sort_keys=True) + "\n")
+    )
+    control = dict(value)
+    for key in (
+        "bundle_sha256",
+        "canonical_manifest_sha256",
+        "lifecycle_compatibility",
+    ):
+        del control[key]
+    control["schema_version"] = 1
+    return (
+        status,
+        SecretStr(json.dumps(control, separators=(",", ":"), sort_keys=True)),
+    )
+
+
+def parse_daemon_bundle_service_predecessor(
+    payload: SecretStr,
+) -> DaemonBundleServicePredecessor:
+    value = _load_secret_json(payload)
+    if type(value) is dict and value == {"schema_version": 2, "state": "absent"}:
+        return DaemonBundleServicePredecessor(state="absent")
+    if (
+        type(value) is dict
+        and set(value)
+        == {
+            "generation",
+            "lifecycle_compatibility",
+            "release_identity",
+            "schema_version",
+            "state",
+        }
+        and value.get("schema_version") == 2
+        and value.get("state") == "legacy"
+    ):
+        try:
+            return DaemonBundleServicePredecessor(
+                state="legacy",
+                generation=value["generation"],
+                release_identity=value["release_identity"],
+                lifecycle_compatibility=value["lifecycle_compatibility"],
+            )
+        except DaemonBundleTransportContractError:
+            raise DaemonBundleTransportContractError(
+                "Daemon service predecessor identity is invalid."
+            ) from None
+    if (
+        type(value) is not dict
+        or set(value)
+        != {
+            "bundle_sha256",
+            "canonical_manifest_sha256",
+            "generation",
+            "lifecycle_compatibility",
+            "release_identity",
+            "schema_version",
+            "state",
+        }
+        or value.get("schema_version") != 2
+        or value.get("state") != "running"
+    ):
+        raise DaemonBundleTransportContractError("Daemon service predecessor identity is invalid.")
+    try:
+        return DaemonBundleServicePredecessor(
+            state="running",
+            generation=value["generation"],
+            release_identity=value["release_identity"],
+            bundle_sha256=value["bundle_sha256"],
+            canonical_manifest_sha256=value["canonical_manifest_sha256"],
+            lifecycle_compatibility=value["lifecycle_compatibility"],
+        )
+    except DaemonBundleTransportContractError:
+        raise DaemonBundleTransportContractError(
+            "Daemon service predecessor identity is invalid."
+        ) from None
 
 
 def parse_daemon_bundle_stop_receipt(payload: SecretStr) -> DaemonBundleStopReceipt:

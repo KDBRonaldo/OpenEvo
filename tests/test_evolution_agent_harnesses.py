@@ -10,6 +10,11 @@ from openevo.harness.presets.claude_code import ClaudeCodeHarness
 from openevo.harness.presets.codex import CodexHarness
 from openevo.harness.presets.openhands_sdk import OpenHandsSdkHarness
 from openevo.runtime.base import BaseRuntime
+from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_CANARY_OK,
+    CODEX_SUBSCRIPTION_CONTRACT_KEY,
+    codex_subscription_contract,
+)
 from openevo.runtime.managed import MANAGED_CODEX_BINARY
 from openevo.runtime.models import ExecResult, RuntimeSpec
 
@@ -183,9 +188,7 @@ async def test_codex_setup_clears_native_memory_when_requested(tmp_path):
     await harness.setup(runtime)
 
     cleanup_commands = [
-        command
-        for command in runtime.commands
-        if "/memories" in command or "memories_" in command
+        command for command in runtime.commands if "/memories" in command or "memories_" in command
     ]
     assert len(cleanup_commands) == 1
     cleanup = cleanup_commands[0]
@@ -314,7 +317,6 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
             harness="codex",
             model_name="gpt-5.5",
             settings={"auth_mode": "subscription", "capture_mode": "transcript"},
-            env={"CODEX_HOME": "/openevo/session/preauthenticated-codex"},
         )
     )
 
@@ -326,13 +328,165 @@ def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     assert "--model gpt-5.5" in step.command
     assert f"{MANAGED_CODEX_BINARY} exec " in step.command
     assert "auth.json" not in step.command
-    assert step.command.startswith("env -u")
+    assert step.command.startswith("/bin/bash -o pipefail -c ")
+    assert "env -u" in step.command
     for key in SUBSCRIPTION_PROXY_ENV_VARS:
         assert f"-u {key}" in step.command
     assert "harness_proxy" not in step.command
     assert "model_providers.harness_proxy" not in step.command
     assert step.env is not None
     assert step.env["CODEX_HOME"] == "/openevo/credentials/codex"
+    assert "--ephemeral" in step.command
+    assert "--dangerously-bypass-approvals-and-sandbox" not in step.command
+    assert " --sandbox " not in step.command
+    assert "-s " not in step.command
+    assert "--strict-config" in step.command
+    assert "--ignore-user-config" in step.command
+    assert "--ignore-rules" in step.command
+    assert 'default_permissions="openevo_codex_subscription_v1"' in step.command
+    assert '"/openevo/credentials/codex"="deny"' in step.command
+    assert "features.hooks=false" in step.command
+    assert "features.multi_agent=false" in step.command
+    assert "features.plugins=false" in step.command
+    assert "mcp_servers={}" in step.command
+    assert "network.enabled=true" in step.command
+
+
+@pytest.mark.parametrize("allow_internet", [True, False])
+@pytest.mark.asyncio
+async def test_codex_subscription_setup_requires_real_exec_canary(
+    tmp_path: Path,
+    allow_internet: bool,
+) -> None:
+    class ReadyRuntime(RecordingRuntime):
+        async def exec(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> ExecResult:
+            del env, timeout_sec
+            self.commands.append(command)
+            if "-probe.sh" in command and "command_execution" in command:
+                assert cwd == "/openevo/session/workspace"
+                return ExecResult(
+                    stdout=f"{CODEX_SUBSCRIPTION_CANARY_OK}\n",
+                    return_code=0,
+                )
+            return ExecResult(return_code=0)
+
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={
+                "auth_mode": "subscription",
+                "capture_mode": "transcript",
+                CODEX_SUBSCRIPTION_CONTRACT_KEY: codex_subscription_contract(),
+            },
+        )
+    )
+    runtime = ReadyRuntime(tmp_path)
+    runtime.spec = runtime.spec.model_copy(update={"allow_internet": allow_internet})
+
+    await harness.setup(runtime)
+
+    joined = "\n".join(runtime.commands)
+    assert "config.toml" not in joined
+    assert "/opt/codex/bin/codex exec " in joined
+    assert joined.count("/opt/codex/bin/codex exec ") == 2
+    assert joined.count(f"network.enabled={str(allow_internet).lower()}") == 2
+    assert "sandbox linux" not in joined
+    assert "command_execution" in joined
+    assert "turn.completed" in joined
+    assert "test -r /openevo/credentials/codex/auth.json" in joined
+    assert "/proc/self/root /proc/[0-9]*/root" in joined
+    assert "command -v sudo" in joined
+    assert "sudo -n /bin/cat" in joined
+    assert "-events.jsonl" in joined
+    assert "-workspace" in joined
+    assert "-write" in joined
+    assert harness.subscription_credential_isolation_receipt is not None
+    normal_command = harness.run_steps("Do work.")[0].command
+    assert f"network.enabled={str(allow_internet).lower()}" in normal_command
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_setup_fails_closed_without_exact_canary(
+    tmp_path: Path,
+) -> None:
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        )
+    )
+    runtime = RecordingRuntime(tmp_path)
+
+    with pytest.raises(RuntimeError, match="credential isolation could not be proven"):
+        await harness.setup(runtime)
+
+    assert harness.subscription_credential_isolation_receipt is None
+
+
+@pytest.mark.parametrize(
+    "agent",
+    [
+        AgentSpec(
+            harness="codex",
+            settings={
+                "auth_mode": "subscription",
+                "capture_mode": "transcript",
+                "sandbox_mode": "danger-full-access",
+            },
+        ),
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            env={"BWRAP": "/openevo/session/workspace/evil-bwrap"},
+        ),
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            mcp_servers=[
+                MCPServerSpec(
+                    name="evil",
+                    transport="stdio",
+                    command="/openevo/session/workspace/evil-mcp",
+                )
+            ],
+        ),
+    ],
+)
+def test_codex_subscription_rejects_caller_execution_surfaces(
+    agent: AgentSpec,
+) -> None:
+    harness = CodexHarness(agent)
+
+    with pytest.raises(ValueError, match="forbidden|env overrides|MCP"):
+        harness.run_steps("Do work.")
+
+
+def test_codex_subscription_fixed_overrides_follow_optional_config() -> None:
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={
+                "auth_mode": "subscription",
+                "capture_mode": "transcript",
+                "reasoning_effort": "high",
+            },
+        )
+    )
+
+    command = harness.run_steps("Do work.")[0].command
+
+    assert command.index("-c model_reasoning_effort=high") < command.index(
+        'default_permissions="openevo_codex_subscription_v1"'
+    )
+    assert command.rindex("features.plugins=false") < command.rindex("Do work.")
 
 
 def test_codex_subscription_auth_mode_requires_transcript_capture_option():
@@ -360,7 +514,8 @@ def test_codex_subscription_auth_mode_accepts_shared_transcript_aliases(
 
     step = harness.run_steps("Do work.")[0]
 
-    assert step.command.startswith("env -u")
+    assert step.command.startswith("/bin/bash -o pipefail -c ")
+    assert "env -u" in step.command
     assert harness.settings["capture_mode"] == "transcript"
 
 
@@ -403,7 +558,8 @@ def test_codex_run_steps_keeps_chatgpt_subscription_auth_mode_alias():
 
     step = harness.run_steps("Do work.")[0]
 
-    assert step.command.startswith("env -u")
+    assert step.command.startswith("/bin/bash -o pipefail -c ")
+    assert "env -u" in step.command
     assert "codex exec" in step.command
 
 

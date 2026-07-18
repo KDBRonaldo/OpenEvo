@@ -15,6 +15,7 @@ Run on a supported macOS release-builder host with:
   run the managed Docker runtime;
 - a working Codex subscription login for the remote user;
 - the exact managed subscription Science runtime archive for the release;
+- the exact Linux Daemon bundle and canonical Daemon manifest for the release;
 - either an exact packaged sidecar/Core wheel/framework lock triplet or the
   complete local sidecar build toolchain.
 
@@ -34,16 +35,20 @@ uv run python scripts/e2e/desktop_real_science_e2e.py \
   --core-wheel <exact-core-wheel> \
   --framework-lock <exact-framework-lock> \
   --managed-runtime-archive <exact-managed-runtime-archive> \
+  --daemon-bundle <exact-openevo-daemon-linux-x86_64> \
+  --daemon-manifest <exact-openevo-daemon-bundle.json> \
   --output desktop-real-science-e2e-evidence.json
 ```
 
-All three release-asset arguments are required together. Before launch, the
+The sidecar/Core wheel/framework lock arguments are required together. The
+Daemon pair and runtime archive are required in every real run. Before launch, the
 runner checks the closed framework-lock schema, binds it to the wheel bytes,
 and uses the release builder's PyInstaller inspection to prove that the
-packaged sidecar embeds that exact wheel, lock, and managed runtime archive.
-The runtime archive is required for every non-structural run.
+packaged sidecar embeds that exact wheel, lock, runtime archive, Daemon bundle,
+and Daemon manifest. Held file descriptors bind validation, evidence, and the
+executed sidecar snapshot to the same source inodes.
 
-Omit all three asset arguments to build a fresh packaged sidecar and export the
+Omit the sidecar/Core wheel/framework lock triplet to build a fresh packaged sidecar and export the
 exact embedded wheel/lock pair. That mode uses
 `desktop/packaging/build_sidecar.py`; it is not a substitute for candidate
 signing, DMG copy smoke, or clean-machine rehearsal.
@@ -55,12 +60,14 @@ uv run python scripts/e2e/desktop_real_science_e2e.py \
   --user <remote-user> \
   --expected-host-key-fingerprint 'SHA256:<reviewed-fingerprint>' \
   --managed-runtime-archive <exact-managed-runtime-archive> \
+  --daemon-bundle <exact-openevo-daemon-linux-x86_64> \
+  --daemon-manifest <exact-openevo-daemon-bundle.json> \
   --output desktop-real-science-e2e-evidence.json
 ```
 
-The local mode invokes the builder with `--managed-runtime-archive` and
-`--release-build`, so a development sidecar without the controlled runtime
-cannot be used as release E2E evidence.
+The local mode invokes the builder with the managed runtime and Daemon pair plus
+`--release-build`, so a development sidecar without the complete controlled
+release payload cannot be used as release E2E evidence.
 
 The runner always enables `text_memory`, `skill_bundle`, and `agent_system`.
 There is no target or method override. `agent_system` must expose the Core-owned

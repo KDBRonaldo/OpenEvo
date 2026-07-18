@@ -9,11 +9,11 @@ import tarfile
 from openevo.runtime.managed import ManagedRuntimeArchiveRelease
 
 
-RUNTIME_ASSET_TAG = "openevo-managed-runtime-assets-v0.1.0"
-RUNTIME_FILENAME = "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
-RUNTIME_RELEASE_ID = 354404740
-RUNTIME_ASSET_ID = 478167627
-RUNTIME_ALIASES = ("openevo/science-runtime:0.1.0",)
+RUNTIME_ASSET_TAG = "openevo-managed-runtime-assets-v0.1.1"
+RUNTIME_FILENAME = "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
+RUNTIME_RELEASE_ID = 356072935
+RUNTIME_ASSET_ID = 481361975
+RUNTIME_ALIASES = ("openevo/science-runtime:0.1.1",)
 
 
 def write_test_managed_runtime_archive(

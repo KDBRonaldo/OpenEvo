@@ -45,8 +45,10 @@ from openevo.gateway.session_files import (
 )
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 from openevo.runtime.docker_host import (
+    DOCKER_EXECUTABLE_PATH,
     DockerHostPathSpec,
     discover_docker_host_path,
+    docker_cli_environment,
     docker_self_inspect_argv,
 )
 from tests.framework_testkit import verified_builtin_registry
@@ -228,9 +230,7 @@ class FakeManagedScienceRuntimeProbe:
             ),
             identity_digest="f" * 64 if self.ready else None,
             runtime_image_immutable_reference=(
-                MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
-                if self.ready
-                else None
+                MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest if self.ready else None
             ),
             message=(
                 "Managed Science runtime bootstrap is verified."
@@ -315,14 +315,12 @@ class FakeProbeCommandRunner:
             return ProbeCommandResult(0, b"codex-cli 1.2.3\n", b"")
         if argv == ("codex", "login", "status"):
             return ProbeCommandResult(0, b"", b"Logged in using ChatGPT\n")
-        if argv == ("docker", "--version"):
+        if argv == (DOCKER_EXECUTABLE_PATH, "--version"):
             return ProbeCommandResult(0, b"Docker version 27.0.1\n", b"")
         payload = [
             {
                 "Id": f"sha256:{self.image_id}",
-                "RepoDigests": [
-                    f"openevo/science-runtime@sha256:{self.image_id}"
-                ],
+                "RepoDigests": [f"openevo/science-runtime@sha256:{self.image_id}"],
                 "Config": {"Labels": {"io.openevo.managed-runtime": "true"}},
             }
         ]
@@ -416,7 +414,7 @@ def _ensure_subscription(
     return supervisor.ensure(
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         codex_model=codex_model,
-        runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image="openevo/science-runtime:0.1.1",
     )
 
 
@@ -428,7 +426,7 @@ def _ensure_subscription_binding(
     return supervisor.ensure_run_binding(
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         codex_model=codex_model,
-        runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image="openevo/science-runtime:0.1.1",
     )
 
 
@@ -442,7 +440,7 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert snapshot.services_available is True
         assert snapshot.run_ready is True
         assert snapshot.run_readiness_code is ServiceRunReadinessCode.READY
-        assert snapshot.runtime_image == "openevo/science-runtime:0.1.0"
+        assert snapshot.runtime_image == "openevo/science-runtime:0.1.1"
         assert snapshot.runtime_image_immutable_reference == (
             MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
         )
@@ -488,15 +486,13 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert parsed_topology.evolution.event_export.fail_open is False
         assert runtime_probe.requests == [
             ManagedScienceRuntimeRequest(
-                runtime_image="openevo/science-runtime:0.1.0",
+                runtime_image="openevo/science-runtime:0.1.1",
                 codex_model="gpt-5.1-codex-mini",
             )
         ]
         assert all("codex" not in part.lower() for spec in backend.spawned for part in spec.argv)
         assert all(spec.argv[1] == "-I" for spec in backend.spawned)
-        framework_specs = [
-            spec for spec in backend.spawned if "--framework-lock" in spec.argv
-        ]
+        framework_specs = [spec for spec in backend.spawned if "--framework-lock" in spec.argv]
         assert len(framework_specs) == 2
         assert all(
             spec.argv[spec.argv.index("--framework-lock") + 1] == os.fspath(framework_lock)
@@ -512,7 +508,7 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         )
         binding = supervisor.run_binding()
         assert binding.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-        assert binding.runtime_image == "openevo/science-runtime:0.1.0"
+        assert binding.runtime_image == "openevo/science-runtime:0.1.1"
         assert binding.runtime_image_immutable_reference == (
             MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
         )
@@ -2105,17 +2101,27 @@ def test_default_runtime_probe_uses_private_managed_credential_root(
 
 def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     auth = tmp_path / "auth.json"
     auth.write_text('{"tokens":"not-read-by-probe"}', encoding="utf-8")
     auth.chmod(0o600)
+    polluted_bin = tmp_path / "polluted-bin"
+    polluted_bin.mkdir()
+    polluted_docker = polluted_bin / "docker"
+    polluted_docker.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    polluted_docker.chmod(0o755)
+    monkeypatch.setenv("PATH", os.fspath(polluted_bin))
+    monkeypatch.setenv("DOCKER_HOST", "tcp://attacker.invalid:2375")
+    monkeypatch.setenv("DOCKER_CONTEXT", "attacker")
+    monkeypatch.setenv("DOCKER_CONFIG", os.fspath(tmp_path / "attacker-config"))
     command_runner = FakeProbeCommandRunner()
     probe = LocalManagedScienceRuntimeProbe(
         command_runner=command_runner,
         codex_auth_path=auth,
     )
     request = ManagedScienceRuntimeRequest(
-        runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image="openevo/science-runtime:0.1.1",
         codex_model="gpt-5.1-codex-mini",
     )
 
@@ -2127,8 +2133,18 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
     assert command_runner.calls == [
         ("codex", "--version"),
         ("codex", "login", "status"),
-        ("docker", "--version"),
-        ("docker", "image", "inspect", "openevo/science-runtime:0.1.0"),
+        (DOCKER_EXECUTABLE_PATH, "--version"),
+        (
+            DOCKER_EXECUTABLE_PATH,
+            "image",
+            "inspect",
+            "openevo/science-runtime:0.1.1",
+        ),
+    ]
+    assert all(call[0] != os.fspath(polluted_docker) for call in command_runner.calls)
+    assert command_runner.environments[2:] == [
+        docker_cli_environment(),
+        docker_cli_environment(),
     ]
     assert "not-read-by-probe" not in readiness.message
     assert readiness.credential_authority is not None
@@ -2151,9 +2167,7 @@ def test_release_probe_discovers_docker_user_container_data_root(
         hostname=hostname,
         container_id=hostname + ("d" * 52),
     )
-    runner = FakeProbeCommandRunner(
-        results={self_inspect: ProbeCommandResult(0, evidence, b"")}
-    )
+    runner = FakeProbeCommandRunner(results={self_inspect: ProbeCommandResult(0, evidence, b"")})
     monkeypatch.setattr(
         "openevo.runtime.docker_host.socket.gethostname",
         lambda: hostname,
@@ -2165,7 +2179,7 @@ def test_release_probe_discovers_docker_user_container_data_root(
         require_docker_user_container=True,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2204,7 +2218,7 @@ def test_release_probe_fails_closed_without_docker_user_container_mapping(
         require_docker_user_container=True,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2215,6 +2229,37 @@ def test_release_probe_fails_closed_without_docker_user_container_mapping(
     assert readiness.docker_host_path is None
     assert readiness.credential_authority is None
     assert runner.calls[-1] == self_inspect
+
+
+def test_release_probe_returns_typed_failure_for_invalid_local_engine_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"not-read-by-probe"}', encoding="utf-8")
+    auth.chmod(0o600)
+    invalid_socket = tmp_path / "docker.sock"
+    invalid_socket.write_text("not a socket", encoding="utf-8")
+    invalid_socket.chmod(0o660)
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.DOCKER_SOCKET_PATH",
+        os.fspath(invalid_socket),
+    )
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=FakeProbeCommandRunner(),
+        codex_auth_path=auth,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.1",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID
+    assert readiness.credential_authority is None
 
 
 def test_local_probe_login_uses_snapshot_and_resists_source_path_aba(
@@ -2271,7 +2316,7 @@ def test_local_probe_login_uses_snapshot_and_resists_source_path_aba(
         credential_probe_root=probe_root,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2320,7 +2365,7 @@ def test_local_probe_source_replacement_during_snapshot_never_runs_login(
         credential_probe_root=probe_root,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2355,16 +2400,14 @@ def test_local_probe_rejects_empty_unbounded_or_malformed_codex_version(
     auth = tmp_path / "auth.json"
     auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
     auth.chmod(0o600)
-    runner = FakeProbeCommandRunner(
-        results={("codex", "--version"): version_result}
-    )
+    runner = FakeProbeCommandRunner(results={("codex", "--version"): version_result})
 
     readiness = LocalManagedScienceRuntimeProbe(
         command_runner=runner,
         codex_auth_path=auth,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2396,7 +2439,7 @@ def test_local_probe_rejects_stderr_only_version(
         codex_auth_path=auth,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2429,7 +2472,7 @@ def test_local_probe_retains_bounded_stderr_as_non_authoritative_evidence(
             codex_auth_path=auth,
         ).verify(
             ManagedScienceRuntimeRequest(
-                runtime_image="openevo/science-runtime:0.1.0",
+                runtime_image="openevo/science-runtime:0.1.1",
                 codex_model="gpt-5.1-codex-mini",
             ),
             time.monotonic() + 1,
@@ -2467,7 +2510,7 @@ def test_local_probe_accepts_legal_semver_prerelease_and_build(tmp_path: Path) -
         codex_auth_path=auth,
     ).verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2505,7 +2548,7 @@ def test_runtime_probe_exception_closes_held_credential_authority(
             env=None,
             pass_fds=(),
         ) -> ProbeCommandResult:
-            if argv == ("docker", "--version"):
+            if argv == (DOCKER_EXECUTABLE_PATH, "--version"):
                 raise RuntimeError("controlled runtime probe failure")
             return super().run(
                 argv,
@@ -2526,19 +2569,76 @@ def test_runtime_probe_exception_closes_held_credential_authority(
     )
     before_fds = len(os.listdir("/proc/self/fd"))
 
-    with pytest.raises(RuntimeError, match="controlled runtime probe failure"):
-        probe.verify(
-            ManagedScienceRuntimeRequest(
-                runtime_image="openevo/science-runtime:0.1.0",
-                codex_model="gpt-5.1-codex-mini",
-            ),
-            time.monotonic() + 1,
-        )
+    readiness = probe.verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.1",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
 
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE
     assert len(opened) == 1
     with pytest.raises(SessionFileSecurityError, match="closed"):
         opened[0].verify()
     assert len(os.listdir("/proc/self/fd")) == before_fds
+
+
+@pytest.mark.parametrize("failure_stage", ["image", "self"])
+def test_runtime_probe_docker_exceptions_return_typed_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"private-auth-material"}', encoding="utf-8")
+    auth.chmod(0o600)
+    hostname = "a" * 12
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+    self_inspect = docker_self_inspect_argv(hostname)
+
+    class ExplodingRunner(FakeProbeCommandRunner):
+        def run(
+            self,
+            argv,
+            deadline,
+            cancellation=None,
+            *,
+            env=None,
+            pass_fds=(),
+        ) -> ProbeCommandResult:
+            if (failure_stage == "image" and argv[1:3] == ("image", "inspect")) or (
+                failure_stage == "self" and argv == self_inspect
+            ):
+                raise RuntimeError("controlled Docker admission failure")
+            return super().run(
+                argv,
+                deadline,
+                cancellation,
+                env=env,
+                pass_fds=pass_fds,
+            )
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=ExplodingRunner(),
+        codex_auth_path=auth,
+        runtime_namespace="core-release",
+        require_docker_user_container=True,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.1",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID
+    assert readiness.credential_authority is None
 
 
 def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(
@@ -2554,7 +2654,7 @@ def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(
 
     readiness = probe.verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2585,12 +2685,17 @@ def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(
             ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
         ),
         (
-            ("docker", "--version"),
+            (DOCKER_EXECUTABLE_PATH, "--version"),
             ProbeCommandResult(127, b"", b"docker: not found"),
             ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
         ),
         (
-            ("docker", "image", "inspect", "openevo/science-runtime:0.1.0"),
+            (
+                DOCKER_EXECUTABLE_PATH,
+                "image",
+                "inspect",
+                "openevo/science-runtime:0.1.1",
+            ),
             ProbeCommandResult(1, b"", b"No such image"),
             ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
         ),
@@ -2613,7 +2718,7 @@ def test_local_managed_runtime_probe_reports_typed_prerequisite_failures_without
 
     readiness = probe.verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2642,7 +2747,7 @@ def test_local_managed_runtime_probe_rejects_symlinked_auth(
 
     readiness = probe.verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,
@@ -2665,7 +2770,7 @@ def test_local_managed_runtime_probe_rejects_missing_auth_evidence(tmp_path: Pat
 
     readiness = probe.verify(
         ManagedScienceRuntimeRequest(
-            runtime_image="openevo/science-runtime:0.1.0",
+            runtime_image="openevo/science-runtime:0.1.1",
             codex_model="gpt-5.1-codex-mini",
         ),
         time.monotonic() + 1,

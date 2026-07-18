@@ -53,6 +53,8 @@ from openevo.deployment.core_assets import (
 )
 from openevo.deployment.daemon_bundle_transport import (
     DaemonBundleIdentity,
+    DaemonBundleServicePredecessor,
+    DaemonBundleServiceStatus,
     StagedDaemonBundle,
 )
 from openevo.deployment.preflight import RemoteCommandResult
@@ -69,6 +71,7 @@ _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _WHEEL_FILENAME_PATTERN = re.compile(r"[A-Za-z0-9_.+-]+\.whl\Z")
 _DAEMON_BUNDLE_FILENAME = "openevo-daemon-linux-x86_64"
+_DAEMON_MANIFEST_FILENAME = "openevo-daemon-bundle.json"
 
 
 class _CoreTunnelEndpoint(Protocol):
@@ -91,6 +94,9 @@ class _CoreSshTransport(Protocol):
         bundle_path: str,
         bundle_sha256: str,
         bundle_size: int,
+        manifest_path: str,
+        manifest_sha256: str,
+        manifest_size: int,
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
     ) -> StagedDaemonBundle: ...
@@ -122,10 +128,21 @@ class _CoreSshTransport(Protocol):
         self,
         bundle: StagedDaemonBundle,
         *,
+        expected_predecessor: DaemonBundleServicePredecessor,
+        canonical_manifest_sha256: str,
         port: int = 0,
         timeout_seconds: float = 90.0,
         cancel_event: threading.Event | None = None,
-    ) -> RemoteCoreControlAttachment: ...
+    ) -> tuple[RemoteCoreControlAttachment, DaemonBundleServiceStatus]: ...
+
+    def observe_daemon_bundle_service(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        canonical_manifest_sha256: str,
+        timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleServicePredecessor: ...
 
     def run(
         self,
@@ -623,10 +640,14 @@ class DesktopCoreSshBridgeAdapterV1:
         )
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
+            manifest_path = Path(daemon.local_path).with_name(_DAEMON_MANIFEST_FILENAME)
             staged = cast(_CoreSshTransport, transport).stage_daemon_bundle(
                 bundle_path=daemon.local_path,
                 bundle_sha256=daemon.sha256,
                 bundle_size=daemon.byte_size,
+                manifest_path=str(manifest_path),
+                manifest_sha256=daemon.manifest_sha256,
+                manifest_size=manifest_path.stat().st_size,
                 timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
                 cancel_event=activation_cancel,
             )
@@ -669,6 +690,28 @@ class DesktopCoreSshBridgeAdapterV1:
         self._require_same_transport(profile_id, transport)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
+            predecessor = cast(_CoreSshTransport, transport).observe_daemon_bundle_service(
+                staged,
+                canonical_manifest_sha256=daemon.manifest_sha256,
+                timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
+            )
+        except SshTransportError as exc:
+            _require_activation_not_cancelled(activation_cancel)
+            raise _ssh_daemon_bundle_error(exc, action="observe") from None
+        except BaseException as exc:
+            if not isinstance(exc, Exception):
+                raise
+            raise _adapter_error(
+                "daemon_service_observation_failed",
+                "The active OpenEvo Daemon generation could not be observed.",
+                retryable=True,
+            ) from None
+        _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        _require_activation_not_cancelled(activation_cancel)
+        self._require_same_transport(profile_id, transport)
+        remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
+        try:
             cast(_CoreSshTransport, transport).ensure_managed_runtime_from_daemon(
                 staged,
                 archive_path=managed_runtime.local_path,
@@ -697,8 +740,10 @@ class DesktopCoreSshBridgeAdapterV1:
         self._require_same_transport(profile_id, transport)
         remaining = _remaining(deadline, minimum=_MIN_BOOTSTRAP_SECONDS)
         try:
-            remote = cast(_CoreSshTransport, transport).ensure_daemon_bundle(
+            remote, service_status = cast(_CoreSshTransport, transport).ensure_daemon_bundle(
                 staged,
+                expected_predecessor=predecessor,
+                canonical_manifest_sha256=daemon.manifest_sha256,
                 port=self._bootstrap.remote_port,
                 timeout_seconds=min(remaining, _MAX_REMOTE_OPERATION_SECONDS),
                 cancel_event=activation_cancel,
@@ -717,8 +762,8 @@ class DesktopCoreSshBridgeAdapterV1:
         _remaining(deadline)
         _require_activation_not_cancelled(activation_cancel)
         self._require_same_transport(profile_id, transport)
-        _verify_daemon_attachment(daemon, remote)
-        bearer_identity = _host_identity(profile_id, remote)
+        _verify_daemon_attachment(daemon, remote, service_status)
+        bearer_identity = _host_identity(profile_id, remote, service_status)
         with self._lock:
             self._generation += 1
             authority = _AttachmentAuthority(
@@ -892,6 +937,7 @@ class DesktopCoreSshBridgeAdapterV1:
                 (
                     "stage_daemon_bundle",
                     "daemon_bundle_identity",
+                    "observe_daemon_bundle_service",
                     "ensure_daemon_bundle",
                 )
                 if require_daemon_bundle
@@ -1004,12 +1050,19 @@ class AdoptedWorkspaceArchiveSourceV1:
             ) from None
 
 
-def _host_identity(profile_id: str, attachment: RemoteCoreControlAttachment) -> str:
+def _host_identity(
+    profile_id: str,
+    attachment: RemoteCoreControlAttachment,
+    service_status: DaemonBundleServiceStatus,
+) -> str:
     public_identity = json.dumps(
         {
             "capture_mode": attachment.capture_mode,
+            "bundle_sha256": service_status.bundle_sha256,
+            "canonical_manifest_sha256": service_status.canonical_manifest_sha256,
             "execution_mode": attachment.execution_mode,
             "generation": attachment.generation,
+            "lifecycle_compatibility": service_status.lifecycle_compatibility,
             "profile_id": profile_id,
             "registry_digest": attachment.registry_digest,
             "release_identity": attachment.release_identity,
@@ -1081,11 +1134,23 @@ def _verify_daemon_identity(
 def _verify_daemon_attachment(
     expected: SealedDaemonBundleV1,
     actual: object,
+    service_status: object,
 ) -> None:
-    if not isinstance(actual, RemoteCoreControlAttachment):
+    if not isinstance(actual, RemoteCoreControlAttachment) or not isinstance(
+        service_status, DaemonBundleServiceStatus
+    ):
         raise _daemon_identity_error()
     if (
-        actual.release_identity != expected.release_identity
+        service_status.bundle_sha256 != expected.sha256
+        or service_status.canonical_manifest_sha256 != expected.manifest_sha256
+        or service_status.lifecycle_compatibility < 2
+        or service_status.release_identity != expected.release_identity
+        or service_status.registry_digest != expected.registry_digest
+        or service_status.source_commit != expected.source_commit
+        or service_status.generation != actual.generation
+        or service_status.remote_port != actual.remote_port
+        or service_status.attached != actual.attached
+        or actual.release_identity != expected.release_identity
         or actual.registry_digest != expected.registry_digest
         or actual.source_commit != expected.source_commit
         or actual.execution_mode != "subscription"
@@ -1211,6 +1276,21 @@ def _ssh_daemon_bundle_error(
             "core_ssh_authority_invalid",
             "The active SSH host authority is no longer valid.",
             status=409,
+        )
+    if exc.code is SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH:
+        return _adapter_error(
+            "daemon_service_predecessor_mismatch",
+            "The OpenEvo Daemon generation changed during activation.",
+            status=409,
+            retryable=True,
+        )
+    if exc.code is SshTransportErrorCode.DAEMON_UPDATE_REQUIRED:
+        return _adapter_error(
+            "daemon_update_required",
+            "The active OpenEvo Daemon is not compatible with this Desktop release.",
+            status=409,
+            retryable=False,
+            next_action="Stop the active Daemon before installing the required Desktop update.",
         )
     if exc.code is SshTransportErrorCode.DAEMON_BUNDLE_FAILED and action == "verify":
         return _daemon_identity_error()

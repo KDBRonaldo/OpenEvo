@@ -19,10 +19,13 @@ from openevo.backend import launcher
 from openevo.backend import service
 from openevo.backend.runtime_identity import CoreReleaseIdentity, HostServiceRoot
 from openevo.backend.service import (
+    CoreDaemonBundleIdentity,
     CoreServiceError,
     CoreServiceErrorCode,
+    CoreServicePredecessor,
     ProcessIdentity,
     ensure_core_service,
+    stop_core_service,
 )
 
 
@@ -38,6 +41,16 @@ RELEASE_B = CoreReleaseIdentity(
     registry_digest="e" * 64,
     framework_lock_sha256="f" * 64,
     source_commit=SOURCE_COMMIT,
+)
+DAEMON_A = CoreDaemonBundleIdentity(
+    bundle_sha256="2" * 64,
+    canonical_manifest_sha256="3" * 64,
+    lifecycle_compatibility=2,
+)
+DAEMON_B = CoreDaemonBundleIdentity(
+    bundle_sha256="4" * 64,
+    canonical_manifest_sha256="5" * 64,
+    lifecycle_compatibility=2,
 )
 
 
@@ -878,18 +891,244 @@ def test_identity_mismatch_requires_controlled_replacement(
     assert exc_info.value.code is CoreServiceErrorCode.IDENTITY_MISMATCH
     assert controller.terminated == []
 
+    with HostServiceRoot(root, create=False) as pinned:
+        legacy_ledger = pinned.read_json("service.json")
+        legacy_ledger["schema_version"] = 1
+        pinned.atomic_write_json("service.json", legacy_ledger, replace=True)
+    predecessor = service.observe_core_service_predecessor(
+        service_root=root,
+        process_controller=controller,
+    )
     replacement = ensure_core_service(
         service_root=root,
         framework_lock=lock,
         source_commit=SOURCE_COMMIT,
         port=first.port,
         replace_mismatched=True,
+        expected_predecessor=predecessor,
         process_controller=controller,
     )
     assert replacement.release_identity == RELEASE_B.digest
     assert replacement.bearer_token != first_bearer
     assert len(controller.terminated) == 1
     assert len(children) == 2
+
+
+def test_mixed_version_interleaving_fences_stale_rollback_and_allows_exact_retry(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+    stale_old_activation = service.observe_core_service_predecessor(
+        service_root=root,
+        process_controller=controller,
+    )
+    assert stale_old_activation == CoreServicePredecessor.running(
+        generation=old.generation,
+        release_identity=RELEASE_A.digest,
+    )
+
+    monkeypatch.setattr(service, "compute_release_identity", lambda **_kwargs: RELEASE_B)
+    with pytest.raises(CoreServiceError) as unfenced:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            replace_mismatched=True,
+            process_controller=controller,
+        )
+    assert unfenced.value.code is CoreServiceErrorCode.PREDECESSOR_MISMATCH
+    assert controller.terminated == []
+
+    new = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        replace_mismatched=True,
+        expected_predecessor=stale_old_activation,
+        process_controller=controller,
+    )
+    terminated_after_upgrade = list(controller.terminated)
+
+    monkeypatch.setattr(service, "compute_release_identity", lambda **_kwargs: RELEASE_A)
+    with pytest.raises(CoreServiceError) as exc_info:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            replace_mismatched=True,
+            expected_predecessor=stale_old_activation,
+            process_controller=controller,
+        )
+
+    assert exc_info.value.code is CoreServiceErrorCode.PREDECESSOR_MISMATCH
+    assert controller.terminated == terminated_after_upgrade
+    assert controller.is_alive(controller.current[children[-1].pid])
+
+    monkeypatch.setattr(service, "compute_release_identity", lambda **_kwargs: RELEASE_B)
+    retry = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        replace_mismatched=True,
+        expected_predecessor=stale_old_activation,
+        process_controller=controller,
+    )
+    assert retry.attached is True
+    assert retry.generation == new.generation
+    assert len(children) == 2
+    with HostServiceRoot(root, create=False) as pinned:
+        ledger = pinned.read_json("service.json")
+    assert ledger["schema_version"] == 2
+
+
+def test_daemon_same_release_different_bundle_fails_without_stopping_live_service(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+
+    first = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+    predecessor = service.observe_core_service_predecessor(
+        service_root=root,
+        process_controller=controller,
+    )
+
+    with pytest.raises(CoreServiceError) as stale:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            expected_predecessor=CoreServicePredecessor.absent(),
+            daemon_bundle_identity=DAEMON_A,
+            process_controller=controller,
+        )
+    assert stale.value.code is CoreServiceErrorCode.PREDECESSOR_MISMATCH
+    assert stale.value.retryable is True
+    assert controller.terminated == []
+
+    same = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=predecessor,
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+    assert same.attached is True
+    assert same.generation == first.generation
+
+    with pytest.raises(CoreServiceError) as raised:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            replace_mismatched=True,
+            expected_predecessor=predecessor,
+            daemon_bundle_identity=DAEMON_B,
+            process_controller=controller,
+        )
+
+    assert raised.value.code is CoreServiceErrorCode.UPDATE_REQUIRED
+    assert raised.value.retryable is False
+    assert controller.terminated == []
+    assert controller.is_alive(controller.current[children[0].pid])
+    assert (
+        service.inspect_core_service(
+            service_root=root,
+            process_controller=controller,
+        ).generation
+        == first.generation
+    )
+
+
+def test_daemon_floor_allows_legacy_upgrade_and_rejects_same_abi_downgrade(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        process_controller=controller,
+    )
+
+    stop_core_service(
+        service_root=root,
+        process_controller=controller,
+        preserve_compatibility_floor=True,
+    )
+    upgraded = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+    assert upgraded.attached is False
+    stop_core_service(service_root=root, process_controller=controller)
+
+    with pytest.raises(CoreServiceError) as downgrade:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            expected_predecessor=CoreServicePredecessor.absent(),
+            daemon_bundle_identity=DAEMON_B,
+            process_controller=controller,
+        )
+    assert downgrade.value.code is CoreServiceErrorCode.UPDATE_REQUIRED
+    assert downgrade.value.retryable is False
+
+    with pytest.raises(CoreServiceError) as legacy:
+        ensure_core_service(
+            service_root=root,
+            framework_lock=lock,
+            source_commit=SOURCE_COMMIT,
+            process_controller=controller,
+        )
+    assert legacy.value.code is CoreServiceErrorCode.UPDATE_REQUIRED
+    with pytest.raises(CoreServiceError) as stopped:
+        service.inspect_core_service(
+            service_root=root,
+            process_controller=controller,
+        )
+    assert stopped.value.code is CoreServiceErrorCode.STATUS_INVALID
+    with HostServiceRoot(root, create=False) as pinned:
+        floor = pinned.read_json("service.json")
+    assert floor == {
+        "bundle_sha256": DAEMON_A.bundle_sha256,
+        "canonical_manifest_sha256": DAEMON_A.canonical_manifest_sha256,
+        "lifecycle_compatibility": 2,
+        "release_identity": RELEASE_A.digest,
+        "schema_version": 3,
+        "state": "stopped",
+    }
 
 
 def test_pending_process_is_recovered_before_restart(

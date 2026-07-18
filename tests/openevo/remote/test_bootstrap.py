@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 import openevo.deployment.bootstrap as bootstrap_module
 
+from openevo import __version__
 from openevo.deployment.bootstrap import (
     RemoteBootstrapPlan,
     RemoteBootstrapReport,
@@ -30,7 +33,7 @@ class RecordingTransport:
         self,
         *,
         fail_commands: set[str] | None = None,
-        openevo_version: str = "0.1.0",
+        openevo_version: str = __version__,
     ) -> None:
         self.fail_commands = fail_commands or set()
         self.openevo_version = openevo_version
@@ -52,6 +55,14 @@ class RecordingTransport:
                 stderr="failed",
             )
         if "importlib.metadata" in command and "version('openevo')" in command:
+            expected_match = re.search(
+                r"^expected = '([^']+)'$",
+                command,
+                flags=re.MULTILINE,
+            )
+            expected_version = (
+                expected_match.group(1) if expected_match is not None else self.openevo_version
+            )
             if (
                 "no bundled wheel was available" in command
                 and f"expected = {self.openevo_version!r}" not in command
@@ -60,7 +71,7 @@ class RecordingTransport:
                     command=command,
                     return_code=1,
                     stderr=(
-                        "Remote OpenEvo Core must be 0.1.0; "
+                        f"Remote OpenEvo Core must be {expected_version}; "
                         "no bundled wheel was available"
                     ),
                 )
@@ -153,10 +164,7 @@ class LeakyCliInstallFailureTransport(RecordingTransport):
             return RemoteCommandResult(
                 command=command,
                 return_code=13,
-                stdout=(
-                    "Looking in indexes: "
-                    "https://pip-user:pip-secret@pypi.example/simple"
-                ),
+                stdout=("Looking in indexes: https://pip-user:pip-secret@pypi.example/simple"),
                 stderr=(
                     "Proxy http://proxy-user:proxy-secret@127.0.0.1:7890 "
                     "failed for https://other-user:other-secret@example.test/pkg"
@@ -183,10 +191,7 @@ class LeakyVersionProbeFailureTransport(RecordingTransport):
             return RemoteCommandResult(
                 command=command,
                 return_code=1,
-                stdout=(
-                    "Looking in indexes: "
-                    "https://pip-user:pip-secret@pypi.example/simple"
-                ),
+                stdout=("Looking in indexes: https://pip-user:pip-secret@pypi.example/simple"),
                 stderr=(
                     "Proxy http://proxy-user:proxy-secret@127.0.0.1:7890 "
                     "failed for https://other-user:other-secret@example.test/pkg"
@@ -444,9 +449,7 @@ def test_exact_openevo_cli_step_without_wheel_only_accepts_existing_exact_versio
         "bundled_wheel": False,
         "bundled_wheel_remote_path": None,
     }
-    assert "Remote OpenEvo Core must be 0.1.0; no bundled wheel was available" in (
-        step.command
-    )
+    assert "Remote OpenEvo Core must be 0.1.0; no bundled wheel was available" in (step.command)
     assert "pip install" not in step.command
     assert "importlib.metadata" in step.command
     assert "expected = '0.1.0'" in step.command
@@ -481,25 +484,16 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
     assert steps_by_id["ensure_state_root"].command == (
         "mkdir -p /home/alice/.openevo/runs/protein-design/folding-baseline"
     )
-    assert steps_by_id["write_experiment_snapshot"].kind == (
-        RemoteBootstrapStepKind.WRITE_FILE
-    )
+    assert steps_by_id["write_experiment_snapshot"].kind == (RemoteBootstrapStepKind.WRITE_FILE)
     assert (
         "/home/alice/.openevo/runs/protein-design/folding-baseline/experiment.json"
         in steps_by_id["write_experiment_snapshot"].command
     )
-    assert steps_by_id["ensure_openevo_cli"].kind == (
-        RemoteBootstrapStepKind.CHECK_COMMAND
-    )
+    assert steps_by_id["ensure_openevo_cli"].kind == (RemoteBootstrapStepKind.CHECK_COMMAND)
     assert steps_by_id["ensure_openevo_cli"].required is True
     assert steps_by_id["ensure_openevo_cli"].network is True
-    assert (
-        steps_by_id["ensure_openevo_cli"].remediation_kind
-        == "upload_exact_openevo_wheel"
-    )
-    assert steps_by_id["ensure_openevo_cli"].env["HTTPS_PROXY"] == (
-        "http://127.0.0.1:7890"
-    )
+    assert steps_by_id["ensure_openevo_cli"].remediation_kind == "upload_exact_openevo_wheel"
+    assert steps_by_id["ensure_openevo_cli"].env["HTTPS_PROXY"] == ("http://127.0.0.1:7890")
     assert steps_by_id["ensure_openevo_cli"].manifest == {
         "expected_version": "0.1.0",
         "bundled_wheel": True,
@@ -511,26 +505,16 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
     assert "python3 -m pip install --user" in steps_by_id["ensure_openevo_cli"].command
     assert "--force-reinstall" in steps_by_id["ensure_openevo_cli"].command
     assert "--no-input" in steps_by_id["ensure_openevo_cli"].command
-    assert "--disable-pip-version-check" in (
-        steps_by_id["ensure_openevo_cli"].command
-    )
-    assert "openevo-0.1.0-py3-none-any.whl" in (
-        steps_by_id["ensure_openevo_cli"].command
-    )
+    assert "--disable-pip-version-check" in (steps_by_id["ensure_openevo_cli"].command)
+    assert "openevo-0.1.0-py3-none-any.whl" in (steps_by_id["ensure_openevo_cli"].command)
     assert "importlib.metadata" in steps_by_id["ensure_openevo_cli"].command
     assert "pip install --user --upgrade openevo" not in (
         steps_by_id["ensure_openevo_cli"].command
     )
-    assert steps_by_id["write_bootstrap_manifest"].kind == (
-        RemoteBootstrapStepKind.WRITE_FILE
-    )
-    assert steps_by_id["write_bootstrap_manifest"].manifest["path"].endswith(
-        "/bootstrap.json"
-    )
+    assert steps_by_id["write_bootstrap_manifest"].kind == (RemoteBootstrapStepKind.WRITE_FILE)
+    assert steps_by_id["write_bootstrap_manifest"].manifest["path"].endswith("/bootstrap.json")
     assert '"experiment_snapshot":' in steps_by_id["write_bootstrap_manifest"].command
-    assert '"managed_runtime_mode": "release"' in (
-        steps_by_id["write_bootstrap_manifest"].command
-    )
+    assert '"managed_runtime_mode": "release"' in (steps_by_id["write_bootstrap_manifest"].command)
     release = MANAGED_RUNTIME_RELEASES["managed_science"]
     assert f'"runtime_image_digest": "{release.trusted_digest}"' in (
         steps_by_id["write_bootstrap_manifest"].command
@@ -543,18 +527,12 @@ def test_build_remote_bootstrap_plan_derives_subscription_steps() -> None:
     assert steps_by_id["docker_pull_runtime"].manifest["trusted_digest"] == (
         release.trusted_digest
     )
-    assert steps_by_id["docker_pull_runtime"].env["HTTPS_PROXY"] == (
-        "http://127.0.0.1:7890"
-    )
+    assert steps_by_id["docker_pull_runtime"].env["HTTPS_PROXY"] == ("http://127.0.0.1:7890")
     assert steps_by_id["check_codex_cli"].command == "codex --version"
-    assert steps_by_id["check_codex_subscription"].command == (
-        "test -f ~/.codex/auth.json"
-    )
+    assert steps_by_id["check_codex_subscription"].command == ("test -f ~/.codex/auth.json")
     step_ids = [step.id for step in plan.steps]
     assert step_ids.index("docker_pull_runtime") < step_ids.index("check_codex_cli")
-    assert step_ids.index("docker_pull_runtime") < step_ids.index(
-        "check_codex_subscription"
-    )
+    assert step_ids.index("docker_pull_runtime") < step_ids.index("check_codex_subscription")
     assert "hf_snapshot_download" not in steps_by_id
 
 
@@ -577,10 +555,7 @@ def test_compiled_managed_runtime_uses_tag_only_as_local_bootstrap_alias(
     assert compiled.runtime.image == release.immutable_reference
     assert sidecar_plan.experiment["runtime"]["image"] == release.immutable_reference
     assert f"docker pull {release.immutable_reference}" in docker_step.command
-    assert (
-        f"docker tag {release.immutable_reference} {release.image}"
-        in docker_step.command
-    )
+    assert f"docker tag {release.immutable_reference} {release.image}" in docker_step.command
     assert f"docker tag {release.immutable_reference} {release.immutable_reference}" not in (
         docker_step.command
     )
@@ -608,7 +583,15 @@ def test_managed_runtime_bootstrap_builds_image_when_pull_fails() -> None:
     assert f"if docker pull {release.immutable_reference}" in docker_step.command
     assert "node:22-bookworm-slim@sha256:" in docker_step.command
     assert "python:3.12-slim-bookworm@sha256:" in docker_step.command
-    assert "@openai/codex@0.121.0" in docker_step.command
+    assert "@openai/codex@0.144.1" in docker_step.command
+    assert "npm cache clean --force" in docker_step.command
+    assert "rm -rf /home/openevo/.npm" in docker_step.command
+    assert "NPM_CONFIG_PREFIX=/opt/codex" in docker_step.command
+    assert "PATH=/opt/codex/bin:" in docker_step.command
+    assert "chown -R root:root /opt/codex" in docker_step.command
+    assert "chmod -R go-w /opt/codex" in docker_step.command
+    assert "sudo \\" not in docker_step.command
+    assert "NOPASSWD" not in docker_step.command
     assert "https://deb.debian.org" in docker_step.command
     assert "allow-unauthenticated" not in docker_step.command.lower()
     assert "trusted=yes" not in docker_step.command.lower()
@@ -687,9 +670,7 @@ def test_custom_runtime_bootstrap_remains_pull_only() -> None:
     plan = build_remote_bootstrap_plan(sidecar_plan)
     docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
 
-    assert docker_step.command.endswith(
-        "docker pull ghcr.io/example/science:latest"
-    )
+    assert docker_step.command.endswith("docker pull ghcr.io/example/science:latest")
     assert docker_step.command.startswith("unset ALL_PROXY HTTP_PROXY")
     assert "docker build" not in docker_step.command
     assert "--network=host" not in docker_step.command
@@ -702,7 +683,7 @@ def test_custom_profile_collision_with_managed_tag_remains_pull_only() -> None:
         _project(
             environment={
                 "profile": "custom_image",
-                "custom_image": "openevo/science-runtime:0.1.0",
+                "custom_image": "openevo/science-runtime:0.1.1",
             },
             execution={"mode": "self-deployed", "hf_model": "Qwen/Qwen3-8B"},
         ),
@@ -712,7 +693,7 @@ def test_custom_profile_collision_with_managed_tag_remains_pull_only() -> None:
     plan = build_remote_bootstrap_plan(original)
     docker_step = {step.id: step for step in plan.steps}["docker_pull_runtime"]
 
-    assert docker_step.command.endswith("docker pull openevo/science-runtime:0.1.0")
+    assert docker_step.command.endswith("docker pull openevo/science-runtime:0.1.1")
     assert "docker build" not in docker_step.command
     assert "--network=host" not in docker_step.command
     assert docker_step.manifest["managed_runtime"] is False
@@ -755,9 +736,7 @@ def test_build_remote_bootstrap_plan_adds_managed_inference_hf_prefetch() -> Non
         RemoteBootstrapStepKind.HF_SNAPSHOT_DOWNLOAD
     )
     assert steps_by_id["hf_snapshot_download"].network is True
-    assert steps_by_id["hf_snapshot_download"].env["HF_ENDPOINT"] == (
-        "https://hf-mirror.com"
-    )
+    assert steps_by_id["hf_snapshot_download"].env["HF_ENDPOINT"] == ("https://hf-mirror.com")
     assert "snapshot_download('Qwen/Qwen3-Coder-30B-A3B-Instruct')" in (
         steps_by_id["hf_snapshot_download"].command
     )
@@ -781,9 +760,7 @@ def test_managed_runtime_development_fallback_rejects_unpinned_base(
 
 
 def test_execute_remote_bootstrap_plan_runs_steps_and_reports_ready() -> None:
-    plan = build_remote_bootstrap_plan(
-        build_sidecar_science_plan(_project(), _profile())
-    )
+    plan = build_remote_bootstrap_plan(build_sidecar_science_plan(_project(), _profile()))
     transport = RecordingTransport()
 
     report = execute_remote_bootstrap_plan(
@@ -794,9 +771,9 @@ def test_execute_remote_bootstrap_plan_runs_steps_and_reports_ready() -> None:
 
     assert report.ready is True
     assert report.status == RemoteBootstrapStepStatus.PASS
-    assert [step.status for step in report.steps] == [
-        RemoteBootstrapStepStatus.PASS
-    ] * len(plan.steps)
+    assert [step.status for step in report.steps] == [RemoteBootstrapStepStatus.PASS] * len(
+        plan.steps
+    )
     commands = [command for command, _cwd, _env, _timeout in transport.commands]
     version_probe = next(
         command
@@ -826,9 +803,7 @@ def test_execute_remote_bootstrap_plan_runs_steps_and_reports_ready() -> None:
 
 
 def test_execute_remote_bootstrap_plan_blocks_steps_when_preflight_fails() -> None:
-    plan = build_remote_bootstrap_plan(
-        build_sidecar_science_plan(_project(), _profile())
-    )
+    plan = build_remote_bootstrap_plan(build_sidecar_science_plan(_project(), _profile()))
     transport = FailingPreflightTransport()
 
     report = execute_remote_bootstrap_plan(plan, transport)
@@ -837,9 +812,7 @@ def test_execute_remote_bootstrap_plan_blocks_steps_when_preflight_fails() -> No
     assert report.status == RemoteBootstrapStepStatus.FAIL
     assert report.steps == ()
     assert [command for command, _cwd, _env, _timeout in transport.commands] == ["true"]
-    assert report.next_actions == (
-        "Fix remote preflight failures and rerun bootstrap.",
-    )
+    assert report.next_actions == ("Fix remote preflight failures and rerun bootstrap.",)
 
 
 def test_execute_remote_bootstrap_plan_uses_plan_preflight_settings() -> None:
@@ -877,12 +850,8 @@ def test_execute_remote_bootstrap_plan_uses_plan_preflight_settings() -> None:
 
 
 def test_execute_remote_bootstrap_plan_stops_after_required_step_failure() -> None:
-    plan = build_remote_bootstrap_plan(
-        build_sidecar_science_plan(_project(), _profile())
-    )
-    failing_command = {step.id: step.command for step in plan.steps}[
-        "docker_pull_runtime"
-    ]
+    plan = build_remote_bootstrap_plan(build_sidecar_science_plan(_project(), _profile()))
+    failing_command = {step.id: step.command for step in plan.steps}["docker_pull_runtime"]
     transport = RecordingTransport(fail_commands={failing_command})
 
     report = execute_remote_bootstrap_plan(
@@ -942,32 +911,24 @@ def test_execute_remote_bootstrap_plan_verifies_exact_version_after_install() ->
     assert report.ready is False
     ensure_execution = next(step for step in report.steps if step.id == "ensure_openevo_cli")
     assert ensure_execution.status == RemoteBootstrapStepStatus.FAIL
-    assert ensure_execution.message == (
-        "Remote OpenEvo Core must be 0.1.0; found 0.2.0."
-    )
+    assert ensure_execution.message == ("Remote OpenEvo Core must be 0.1.0; found 0.2.0.")
     assert ensure_execution.remediation_kind == "upload_exact_openevo_wheel"
     assert report.next_actions == ("Resolve failed bootstrap steps and rerun.",)
 
 
-def test_execute_remote_bootstrap_plan_reports_sanitized_openevo_install_failure() -> (
-    None
-):
+def test_execute_remote_bootstrap_plan_reports_sanitized_openevo_install_failure() -> None:
     plan = build_remote_bootstrap_plan(
         build_sidecar_science_plan(
             _project(),
             _profile(
                 proxy={
                     "https_proxy": "http://proxy-user:proxy-secret@127.0.0.1:7890",
-                    "pip_index_url": (
-                        "https://pip-user:pip-secret@pypi.example/simple"
-                    ),
+                    "pip_index_url": ("https://pip-user:pip-secret@pypi.example/simple"),
                 }
             ),
         )
     )
-    failing_command = {step.id: step.command for step in plan.steps}[
-        "ensure_openevo_cli"
-    ]
+    failing_command = {step.id: step.command for step in plan.steps}["ensure_openevo_cli"]
 
     report = execute_remote_bootstrap_plan(
         plan,
@@ -1002,9 +963,7 @@ def test_execute_remote_bootstrap_plan_reports_sanitized_version_probe_failure()
             _profile(
                 proxy={
                     "https_proxy": "http://proxy-user:proxy-secret@127.0.0.1:7890",
-                    "pip_index_url": (
-                        "https://pip-user:pip-secret@pypi.example/simple"
-                    ),
+                    "pip_index_url": ("https://pip-user:pip-secret@pypi.example/simple"),
                 }
             ),
         ),
@@ -1050,9 +1009,7 @@ def test_execute_remote_bootstrap_plan_sanitizes_invalid_successful_probe_stdout
 
     ensure_execution = next(step for step in report.steps if step.id == "ensure_openevo_cli")
     assert ensure_execution.status == RemoteBootstrapStepStatus.FAIL
-    assert ensure_execution.message == (
-        "Remote OpenEvo Core must be 0.1.0; found unknown."
-    )
+    assert ensure_execution.message == ("Remote OpenEvo Core must be 0.1.0; found unknown.")
     assert "secret" not in ensure_execution.message
     assert "user:secret" not in ensure_execution.stdout
     assert "[REDACTED]" in ensure_execution.stdout
@@ -1100,9 +1057,7 @@ def test_execute_remote_bootstrap_plan_fails_when_cli_entrypoint_is_stale() -> N
 
 
 def test_execute_remote_bootstrap_plan_reports_step_exception() -> None:
-    plan = build_remote_bootstrap_plan(
-        build_sidecar_science_plan(_project(), _profile())
-    )
+    plan = build_remote_bootstrap_plan(build_sidecar_science_plan(_project(), _profile()))
 
     report = execute_remote_bootstrap_plan(
         plan,

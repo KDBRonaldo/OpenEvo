@@ -39,6 +39,8 @@ from openevo.deployment import core_control
 from openevo.deployment.core_control import parse_core_control_attachment
 from openevo.deployment.daemon_bundle_transport import (
     DaemonBundleIdentity,
+    DaemonBundleServicePredecessor,
+    DaemonBundleServiceStatus,
     StagedDaemonBundle,
 )
 from openevo.deployment.preflight import RemoteCommandResult
@@ -89,6 +91,9 @@ def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
     daemon.write_bytes(b"\x7fELF\0sealed-openevo-daemon")
     daemon.chmod(0o700)
     daemon_digest = hashlib.sha256(daemon.read_bytes()).hexdigest()
+    daemon_manifest = tmp_path / "openevo-daemon-bundle.json"
+    daemon_manifest.write_bytes(b'{"schema_version":1}\n')
+    daemon_manifest_digest = hashlib.sha256(daemon_manifest.read_bytes()).hexdigest()
     framework_lock_digest = FRAMEWORK_LOCK_DIGEST
     return CoreBootstrapConfigV1(
         source_commit=SOURCE_COMMIT,
@@ -106,7 +111,7 @@ def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
             local_path=str(daemon),
             sha256=daemon_digest,
             byte_size=daemon.stat().st_size,
-            manifest_sha256="8" * 64,
+            manifest_sha256=daemon_manifest_digest,
             release_identity=RELEASE_IDENTITY,
             registry_digest=REGISTRY_DIGEST,
             source_commit=SOURCE_COMMIT,
@@ -185,7 +190,10 @@ class FakeCoreTransport:
         self.stage_error: Exception | None = None
         self.stage_calls: list[dict[str, object]] = []
         self.identity_error: Exception | None = None
+        self.observation_error: Exception | None = None
         self.ensure_error: Exception | None = None
+        self.service_bundle_sha256: str | None = None
+        self.service_manifest_sha256: str | None = None
         self.after_stage: Callable[[], None] | None = None
         self.after_identity: Callable[[], None] | None = None
         self.after_ensure: Callable[[], None] | None = None
@@ -194,6 +202,7 @@ class FakeCoreTransport:
         self.managed_runtime_entered = threading.Event()
         self.managed_runtime_cancelled = threading.Event()
         self.operation_order: list[str] = []
+        self.ensure_predecessors: list[DaemonBundleServicePredecessor] = []
 
     def stage_daemon_bundle(
         self,
@@ -201,6 +210,9 @@ class FakeCoreTransport:
         bundle_path: str,
         bundle_sha256: str,
         bundle_size: int,
+        manifest_path: str,
+        manifest_sha256: str,
+        manifest_size: int,
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
     ) -> StagedDaemonBundle:
@@ -210,11 +222,20 @@ class FakeCoreTransport:
         payload = Path(bundle_path).read_bytes()
         if len(payload) != bundle_size or hashlib.sha256(payload).hexdigest() != bundle_sha256:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        manifest_payload = Path(manifest_path).read_bytes()
+        if (
+            len(manifest_payload) != manifest_size
+            or hashlib.sha256(manifest_payload).hexdigest() != manifest_sha256
+        ):
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         self.stage_calls.append(
             {
                 "bundle_path": bundle_path,
                 "bundle_sha256": bundle_sha256,
                 "bundle_size": bundle_size,
+                "manifest_path": manifest_path,
+                "manifest_sha256": manifest_sha256,
+                "manifest_size": manifest_size,
                 "timeout_seconds": timeout_seconds,
                 "cancel_event": cancel_event,
             }
@@ -282,18 +303,47 @@ class FakeCoreTransport:
             raise SshTransportError(SshTransportErrorCode.CANCELLED)
         return object()
 
+    def observe_daemon_bundle_service(
+        self,
+        bundle: StagedDaemonBundle,
+        **kwargs: object,
+    ) -> DaemonBundleServicePredecessor:
+        del bundle, kwargs
+        self.operation_order.append("daemon_observe")
+        if self.observation_error is not None:
+            raise self.observation_error
+        return DaemonBundleServicePredecessor(state="absent")
+
     def ensure_daemon_bundle(
         self,
         bundle: StagedDaemonBundle,
         **kwargs: object,
     ) -> object:
-        del bundle, kwargs
         self.operation_order.append("daemon_start")
+        predecessor = kwargs["expected_predecessor"]
+        assert isinstance(predecessor, DaemonBundleServicePredecessor)
+        self.ensure_predecessors.append(predecessor)
         if self.ensure_error is not None:
             raise self.ensure_error
         if self.after_ensure is not None:
             self.after_ensure()
-        return parse_core_control_attachment(_attachment_payload())
+        attachment = parse_core_control_attachment(_attachment_payload())
+        return (
+            attachment,
+            DaemonBundleServiceStatus(
+                remote_port=attachment.remote_port,
+                bundle_sha256=self.service_bundle_sha256 or bundle.sha256,
+                canonical_manifest_sha256=(
+                    self.service_manifest_sha256 or str(kwargs["canonical_manifest_sha256"])
+                ),
+                lifecycle_compatibility=2,
+                release_identity=attachment.release_identity,
+                registry_digest=attachment.registry_digest,
+                source_commit=attachment.source_commit,
+                generation=attachment.generation,
+                attached=attachment.attached,
+            ),
+        )
 
     def run(
         self,
@@ -374,12 +424,18 @@ def test_core_host_stages_verified_daemon_prepares_runtime_then_starts(
     assert transport.operation_order == [
         "daemon_stage",
         "daemon_identity",
+        "daemon_observe",
         "managed_runtime",
         "daemon_start",
         "daemon_stage",
         "daemon_identity",
+        "daemon_observe",
         "managed_runtime",
         "daemon_start",
+    ]
+    assert transport.ensure_predecessors == [
+        DaemonBundleServicePredecessor(state="absent"),
+        DaemonBundleServicePredecessor(state="absent"),
     ]
     assert (
         transport.stage_calls[0]["bundle_sha256"]
@@ -635,6 +691,51 @@ def test_core_host_maps_daemon_timeout_and_expired_deadline(tmp_path: Path) -> N
     with pytest.raises(DesktopCoreBridgeErrorV1) as expired:
         adapter.ensure_core(PROFILE_ID, deadline=time.monotonic())
     assert expired.value.error.code == "core_bridge_adapter_deadline_exceeded"
+
+
+def test_core_host_preserves_daemon_predecessor_conflict(tmp_path: Path) -> None:
+    transport = FakeCoreTransport()
+    transport.ensure_error = SshTransportError(
+        SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH
+    )
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as conflict:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert conflict.value.error.code == "daemon_service_predecessor_mismatch"
+    assert conflict.value.error.http_status == 409
+    assert conflict.value.error.retryable is True
+    assert BEARER not in str(conflict.value)
+
+
+def test_core_host_rejects_attachment_with_different_exact_bundle(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    transport.service_bundle_sha256 = "9" * 64
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as mismatch:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert mismatch.value.error.code == "daemon_bundle_identity_mismatch"
+    assert mismatch.value.error.retryable is False
+
+
+def test_core_host_preserves_nonretryable_daemon_update_required(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    transport.ensure_error = SshTransportError(SshTransportErrorCode.DAEMON_UPDATE_REQUIRED)
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as update:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert update.value.error.code == "daemon_update_required"
+    assert update.value.error.http_status == 409
+    assert update.value.error.retryable is False
 
 
 def test_tunnel_uses_same_transport_exact_attachment_and_idempotent_close(

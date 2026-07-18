@@ -9,15 +9,20 @@ from openevo.backend.contracts.v1 import models as m
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.evolution.framework import EvolutionExecutionProfile
 from openevo.experiments.models import ExperimentConfig
+from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_CONTRACT_KEY,
+    codex_subscription_contract,
+)
 from openevo.runtime.managed import (
     MANAGED_HOME,
     MANAGED_PATH,
     MANAGED_RUNTIME_IMAGES,
+    MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
+    MANAGED_WORKSPACE,
     require_immutable_managed_runtime_image,
 )
 
 
-_RUNTIME_WORKDIR = "/openevo/session/workspace"
 _MANAGED_PROXY_CODEX_HOME = f"{MANAGED_HOME}/.codex"
 
 
@@ -27,6 +32,7 @@ class CompiledScienceExecution:
     execution_profile: EvolutionExecutionProfile
     task_id: str
     submitted_task_id: str
+    credential_isolation: dict[str, object] | None
 
 
 def compile_science_execution(
@@ -44,10 +50,7 @@ def compile_science_execution(
         raise ValueError("run_id is outside the closed execution identity policy")
     workspace = _workspace_path(project, workspace_path)
     task_id = f"science-{project.current_task_snapshot.content_sha256[:24]}"
-    subscription = (
-        project.spec.execution_mode
-        is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-    )
+    subscription = project.spec.execution_mode is m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
     expected_service_mode = (
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
         if subscription
@@ -67,15 +70,19 @@ def compile_science_execution(
     capture_mode = project.spec.capture_mode
     if subscription and capture_mode is not m.CaptureMode.TRANSCRIPT:
         raise ValueError("subscription science execution requires transcript capture")
+    credential_isolation = codex_subscription_contract() if subscription else None
+    agent_settings: dict[str, object] = {
+        "auth_mode": "subscription" if subscription else "proxy",
+        "capture_mode": capture_mode.value,
+    }
+    if credential_isolation is not None:
+        agent_settings[CODEX_SUBSCRIPTION_CONTRACT_KEY] = credential_isolation
     agent = {
         "preset": project.spec.harness_id,
         "model": project.spec.agent_model_ref,
         "auth": "subscription" if subscription else "proxy",
         "provider": "codex_cli",
-        "settings": {
-            "auth_mode": "subscription" if subscription else "proxy",
-            "capture_mode": capture_mode.value,
-        },
+        "settings": agent_settings,
         "env": {} if subscription else {"CODEX_HOME": _MANAGED_PROXY_CODEX_HOME},
     }
     runtime_env = {"HOME": MANAGED_HOME, "PATH": MANAGED_PATH}
@@ -99,6 +106,11 @@ def compile_science_execution(
                             "revision_id": project.active_revision.id,
                             "task_snapshot_id": project.current_task_snapshot.id,
                             "workspace_snapshot_id": project.current_workspace_snapshot.id,
+                            **(
+                                {CODEX_SUBSCRIPTION_CONTRACT_KEY: (credential_isolation)}
+                                if credential_isolation is not None
+                                else {}
+                            ),
                         }
                     },
                 }
@@ -108,15 +120,12 @@ def compile_science_execution(
                 "kind": "docker",
                 "image": binding.runtime_image_immutable_reference,
                 "container_user": "host",
-                "workdir": _RUNTIME_WORKDIR,
+                "workdir": MANAGED_WORKSPACE,
                 "env": runtime_env,
                 "prepare": [
                     {
                         "type": "exec",
-                        "command": (
-                            f"mkdir -p {MANAGED_HOME}/.codex {_RUNTIME_WORKDIR} && "
-                            f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex"
-                        ),
+                        "command": MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
                     }
                 ],
             },
@@ -139,6 +148,7 @@ def compile_science_execution(
         execution_profile=profile,
         task_id=task_id,
         submitted_task_id=f"{task_id}--run-{run_id}--round-0",
+        credential_isolation=credential_isolation,
     )
 
 

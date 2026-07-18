@@ -20,10 +20,14 @@ from openevo.backend.runtime_identity import (
     default_core_service_root,
 )
 from openevo.backend.service import (
+    CoreDaemonBundleIdentity,
     CoreServiceAttachment,
     CoreServiceError,
+    CoreServiceErrorCode,
+    CoreServicePredecessor,
     ensure_core_service,
     inspect_core_service,
+    observe_core_service_predecessor,
     stop_core_service,
     stop_core_service_if_generation,
 )
@@ -38,6 +42,7 @@ _ASSET_DIRECTORY = "openevo_daemon_bundle"
 _BUILD_METADATA_NAME = "build-metadata.json"
 _FRAMEWORK_LOCK_NAME = "framework-lock.json"
 _MAX_METADATA_BYTES = 1024 * 1024
+_MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _BUILD_METADATA_KEYS = {
@@ -59,6 +64,7 @@ _CORE_METADATA_KEYS = {
 _FILE_METADATA_KEYS = {"filename", "sha256"}
 _PLATFORM_METADATA_KEYS = {"architecture", "system"}
 _PYTHON_METADATA_KEYS = {"implementation", "version"}
+_LIFECYCLE_COMPATIBILITY = 2
 
 
 class DaemonBundleError(RuntimeError):
@@ -75,6 +81,243 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _hash_descriptor(descriptor: int) -> str:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _read_descriptor(descriptor: int, size: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    payload = bytearray()
+    while len(payload) <= size:
+        chunk = os.read(descriptor, min(1024 * 1024, size + 1 - len(payload)))
+        if not chunk:
+            break
+        payload.extend(chunk)
+    if len(payload) != size:
+        raise DaemonBundleError("The canonical Daemon manifest size changed while reading.")
+    return bytes(payload)
+
+
+def _verified_running_bundle_identity(
+    *,
+    expected_bundle_sha256: str,
+    expected_canonical_manifest_sha256: str,
+    canonical_manifest_path: str,
+) -> CoreDaemonBundleIdentity:
+    _require_digest(expected_bundle_sha256, "Expected Daemon bundle identity")
+    _require_digest(
+        expected_canonical_manifest_sha256,
+        "Expected canonical Daemon manifest identity",
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise DaemonBundleError("No-follow Daemon identity verification is unavailable.")
+    try:
+        descriptor = os.open("/proc/self/exe", flags)
+        try:
+            executing = os.fstat(descriptor)
+            pathname = os.stat(sys.executable, follow_symlinks=False)
+            executable_digest = _hash_descriptor(descriptor)
+            final_executing = os.fstat(descriptor)
+            final_pathname = os.stat(sys.executable, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(executing.st_mode)
+                or not stat.S_ISREG(pathname.st_mode)
+                or executing.st_uid != os.geteuid()
+                or (executing.st_dev, executing.st_ino) != (pathname.st_dev, pathname.st_ino)
+                or executable_digest != expected_bundle_sha256
+                or (
+                    final_executing.st_dev,
+                    final_executing.st_ino,
+                    final_executing.st_size,
+                    final_executing.st_mtime_ns,
+                    final_executing.st_ctime_ns,
+                )
+                != (
+                    executing.st_dev,
+                    executing.st_ino,
+                    executing.st_size,
+                    executing.st_mtime_ns,
+                    executing.st_ctime_ns,
+                )
+                or (final_pathname.st_dev, final_pathname.st_ino)
+                != (executing.st_dev, executing.st_ino)
+            ):
+                raise DaemonBundleError(
+                    "The executing Daemon bundle does not match the sealed deployment identity."
+                )
+        finally:
+            os.close(descriptor)
+        expected_manifest_path = (
+            Path(sys.executable).parent / f"bundle-{expected_canonical_manifest_sha256}"
+        )
+        if canonical_manifest_path != str(expected_manifest_path):
+            raise DaemonBundleError("The canonical Daemon manifest path is not content-addressed.")
+        manifest_fd = os.open(canonical_manifest_path, flags | nofollow)
+        try:
+            manifest_metadata = os.fstat(manifest_fd)
+            manifest_path_metadata = os.stat(
+                canonical_manifest_path,
+                follow_symlinks=False,
+            )
+            manifest_identity = (
+                manifest_metadata.st_dev,
+                manifest_metadata.st_ino,
+                manifest_metadata.st_size,
+                manifest_metadata.st_mtime_ns,
+                manifest_metadata.st_ctime_ns,
+            )
+            if (
+                not stat.S_ISREG(manifest_metadata.st_mode)
+                or manifest_metadata.st_uid != os.geteuid()
+                or manifest_metadata.st_nlink != 1
+                or not 0 < manifest_metadata.st_size <= _MAX_MANIFEST_BYTES
+                or (manifest_path_metadata.st_dev, manifest_path_metadata.st_ino)
+                != (manifest_metadata.st_dev, manifest_metadata.st_ino)
+            ):
+                raise DaemonBundleError("The canonical Daemon manifest digest is invalid.")
+            payload = _read_descriptor(manifest_fd, manifest_metadata.st_size)
+            final_metadata = os.fstat(manifest_fd)
+            final_path_metadata = os.stat(
+                canonical_manifest_path,
+                follow_symlinks=False,
+            )
+            if (
+                hashlib.sha256(payload).hexdigest() != expected_canonical_manifest_sha256
+                or (
+                    final_metadata.st_dev,
+                    final_metadata.st_ino,
+                    final_metadata.st_size,
+                    final_metadata.st_mtime_ns,
+                    final_metadata.st_ctime_ns,
+                )
+                != manifest_identity
+                or (final_path_metadata.st_dev, final_path_metadata.st_ino)
+                != (manifest_metadata.st_dev, manifest_metadata.st_ino)
+            ):
+                raise DaemonBundleError(
+                    "The canonical Daemon manifest changed during verification."
+                )
+        finally:
+            os.close(manifest_fd)
+    except OSError as exc:
+        raise DaemonBundleError(
+            "The executing Daemon bundle identity could not be verified."
+        ) from exc
+    try:
+        manifest = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DaemonBundleError("The canonical Daemon manifest is unreadable.") from exc
+    if payload != _canonical_json(manifest):
+        raise DaemonBundleError("The canonical Daemon manifest is not canonical.")
+    metadata, _lock, release = _verified_release()
+    _verify_canonical_manifest(
+        manifest,
+        expected_bundle_sha256=expected_bundle_sha256,
+        expected_bundle_size=executing.st_size,
+        metadata=metadata,
+        release=release,
+    )
+    return CoreDaemonBundleIdentity(
+        bundle_sha256=expected_bundle_sha256,
+        canonical_manifest_sha256=expected_canonical_manifest_sha256,
+        lifecycle_compatibility=_LIFECYCLE_COMPATIBILITY,
+    )
+
+
+def _verify_canonical_manifest(
+    value: object,
+    *,
+    expected_bundle_sha256: str,
+    expected_bundle_size: int,
+    metadata: dict[str, Any],
+    release: CoreReleaseIdentity,
+) -> None:
+    keys = {
+        "artifact",
+        "build_environment_distributions",
+        "core",
+        "dependency_lock",
+        "platform",
+        "release",
+        "runtime",
+        "schema_version",
+        "smoke",
+    }
+    if type(value) is not dict or set(value) != keys:
+        raise DaemonBundleError("The canonical Daemon manifest schema is not closed.")
+    artifact = _require_closed_dict(value["artifact"], {"filename", "sha256", "size"}, "Artifact")
+    core = _require_closed_dict(
+        value["core"],
+        {"framework_lock", "registry_digest", "wheel"},
+        "Core manifest",
+    )
+    framework_lock = _require_closed_dict(
+        core["framework_lock"],
+        {"filename", "sha256"},
+        "Framework lock manifest",
+    )
+    wheel = _require_closed_dict(
+        core["wheel"],
+        {"filename", "sha256", "size", "version"},
+        "Core wheel manifest",
+    )
+    dependency_lock = _require_closed_dict(
+        value["dependency_lock"],
+        {"filename", "sha256"},
+        "Dependency lock manifest",
+    )
+    release_value = _require_closed_dict(
+        value["release"],
+        {"identity", "source_commit"},
+        "Release manifest",
+    )
+    runtime = _require_closed_dict(
+        value["runtime"],
+        {"format", "python", "system_python_required", "target_pypi_required"},
+        "Runtime manifest",
+    )
+    smoke = _require_closed_dict(
+        value["smoke"],
+        {"backend_readiness", "controlled_exit", "identity"},
+        "Smoke manifest",
+    )
+    if (
+        value["schema_version"] != 1
+        or artifact["sha256"] != expected_bundle_sha256
+        or artifact["size"] != expected_bundle_size
+        or core["registry_digest"] != release.registry_digest
+        or framework_lock["sha256"] != release.framework_lock_sha256
+        or wheel["sha256"] != metadata["core"]["wheel_sha256"]
+        or wheel["size"] != metadata["core"]["wheel_size"]
+        or wheel["version"] != metadata["core"]["version"]
+        or dependency_lock["sha256"] != metadata["dependency_lock"]["sha256"]
+        or value["platform"] != {"architecture": "x86_64", "system": "linux"}
+        or release_value != {"identity": release.digest, "source_commit": release.source_commit}
+        or runtime["format"] != "pyinstaller-onefile"
+        or runtime["system_python_required"] is not False
+        or runtime["target_pypi_required"] is not False
+        or smoke
+        != {
+            "backend_readiness": "passed",
+            "controlled_exit": "passed",
+            "identity": "passed",
+        }
+        or type(value["build_environment_distributions"]) is not list
+    ):
+        raise DaemonBundleError(
+            "The canonical Daemon manifest does not bind the executing release."
+        )
 
 
 def _bundle_root() -> Path:
@@ -258,14 +501,51 @@ def release_identity() -> dict[str, object]:
 
 
 def _service_metadata(attachment: CoreServiceAttachment) -> dict[str, object]:
+    if (
+        attachment.bundle_sha256 is None
+        or attachment.canonical_manifest_sha256 is None
+        or attachment.lifecycle_compatibility is None
+    ):
+        raise CoreServiceError(
+            CoreServiceErrorCode.UPDATE_REQUIRED,
+            "The active service predates exact Daemon bundle attachment.",
+            retryable=False,
+        )
     return {
         "attached": attachment.attached,
+        "bundle_sha256": attachment.bundle_sha256,
+        "canonical_manifest_sha256": attachment.canonical_manifest_sha256,
         "generation": attachment.generation,
+        "lifecycle_compatibility": attachment.lifecycle_compatibility,
         "port": attachment.port,
         "registry_digest": attachment.registry_digest,
         "release_identity": attachment.release_identity,
-        "schema_version": 1,
+        "schema_version": 2,
         "source_commit": attachment.source_commit,
+    }
+
+
+def _service_predecessor_metadata(
+    predecessor: CoreServicePredecessor,
+) -> dict[str, object]:
+    if predecessor.state == "absent":
+        return {"schema_version": 2, "state": "absent"}
+    if predecessor.state == "legacy":
+        return {
+            "generation": predecessor.generation,
+            "lifecycle_compatibility": predecessor.lifecycle_compatibility,
+            "release_identity": predecessor.release_identity,
+            "schema_version": 2,
+            "state": "legacy",
+        }
+    return {
+        "bundle_sha256": predecessor.bundle_sha256,
+        "canonical_manifest_sha256": predecessor.canonical_manifest_sha256,
+        "generation": predecessor.generation,
+        "lifecycle_compatibility": predecessor.lifecycle_compatibility,
+        "release_identity": predecessor.release_identity,
+        "schema_version": 2,
+        "state": "running",
     }
 
 
@@ -403,6 +683,21 @@ def build_parser() -> argparse.ArgumentParser:
     ensure = service_subparsers.add_parser("ensure")
     ensure.add_argument("--port", type=int, default=0)
     ensure.add_argument("--deadline-seconds", type=float, default=45.0)
+    predecessor = ensure.add_mutually_exclusive_group(required=True)
+    predecessor.add_argument("--expect-service-absent", action="store_true")
+    predecessor.add_argument("--expect-service-generation")
+    ensure.add_argument("--expect-service-release-identity")
+    ensure.add_argument("--expect-service-bundle-sha256")
+    ensure.add_argument("--expect-service-canonical-manifest-sha256")
+    ensure.add_argument("--expect-service-lifecycle-compatibility", type=int)
+    ensure.add_argument("--expected-bundle-sha256", required=True)
+    ensure.add_argument("--expected-canonical-manifest-sha256", required=True)
+    ensure.add_argument("--canonical-manifest-path", required=True)
+    observe = service_subparsers.add_parser("observe")
+    observe.add_argument("--deadline-seconds", type=float, default=15.0)
+    observe.add_argument("--expected-bundle-sha256", required=True)
+    observe.add_argument("--expected-canonical-manifest-sha256", required=True)
+    observe.add_argument("--canonical-manifest-path", required=True)
     service_subparsers.add_parser("inspect")
     stop = service_subparsers.add_parser("stop")
     stop.add_argument("--deadline-seconds", type=float, default=15.0)
@@ -418,6 +713,47 @@ def build_parser() -> argparse.ArgumentParser:
 def _run_service_command(args: argparse.Namespace) -> dict[str, object]:
     service_root = default_core_service_root()
     if args.service_command == "ensure":
+        bundle_identity = _verified_running_bundle_identity(
+            expected_bundle_sha256=args.expected_bundle_sha256,
+            expected_canonical_manifest_sha256=(args.expected_canonical_manifest_sha256),
+            canonical_manifest_path=args.canonical_manifest_path,
+        )
+        if args.expect_service_absent:
+            if any(
+                value is not None
+                for value in (
+                    args.expect_service_release_identity,
+                    args.expect_service_bundle_sha256,
+                    args.expect_service_canonical_manifest_sha256,
+                    args.expect_service_lifecycle_compatibility,
+                )
+            ):
+                raise DaemonBundleError("Daemon service predecessor expectation is invalid.")
+            predecessor = CoreServicePredecessor.absent()
+        else:
+            try:
+                if args.expect_service_lifecycle_compatibility == 1:
+                    if (
+                        args.expect_service_bundle_sha256 is not None
+                        or args.expect_service_canonical_manifest_sha256 is not None
+                    ):
+                        raise ValueError
+                    predecessor = CoreServicePredecessor.legacy(
+                        generation=args.expect_service_generation,
+                        release_identity=args.expect_service_release_identity,
+                    )
+                else:
+                    predecessor = CoreServicePredecessor.running(
+                        generation=args.expect_service_generation,
+                        release_identity=args.expect_service_release_identity,
+                        bundle_sha256=args.expect_service_bundle_sha256,
+                        canonical_manifest_sha256=(args.expect_service_canonical_manifest_sha256),
+                        lifecycle_compatibility=(args.expect_service_lifecycle_compatibility),
+                    )
+            except (TypeError, ValueError):
+                raise DaemonBundleError(
+                    "Daemon service predecessor expectation is invalid."
+                ) from None
         metadata = _load_build_metadata()
         attachment = ensure_core_service(
             service_root=service_root,
@@ -426,14 +762,28 @@ def _run_service_command(args: argparse.Namespace) -> dict[str, object]:
             port=args.port,
             deadline_seconds=args.deadline_seconds,
             replace_mismatched=True,
+            expected_predecessor=predecessor,
+            daemon_bundle_identity=bundle_identity,
         )
         return _service_bootstrap_payload(attachment)
+    if args.service_command == "observe":
+        _verified_running_bundle_identity(
+            expected_bundle_sha256=args.expected_bundle_sha256,
+            expected_canonical_manifest_sha256=(args.expected_canonical_manifest_sha256),
+            canonical_manifest_path=args.canonical_manifest_path,
+        )
+        predecessor = observe_core_service_predecessor(
+            service_root=service_root,
+            deadline_seconds=args.deadline_seconds,
+        )
+        return _service_predecessor_metadata(predecessor)
     if args.service_command == "inspect":
         return _service_metadata(inspect_core_service(service_root=service_root))
     if args.service_command == "stop":
         stop_core_service(
             service_root=service_root,
             deadline_seconds=args.deadline_seconds,
+            preserve_compatibility_floor=True,
         )
         return {"schema_version": 1, "stopped": True}
     raise DaemonBundleError("The Daemon service command is invalid.")

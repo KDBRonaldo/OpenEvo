@@ -22,9 +22,14 @@ DOCKER_SELF_INSPECT_FORMAT: Final[str] = (
 )
 _MAX_INSPECT_BYTES: Final[int] = 256 * 1024
 _CONTAINER_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
-_HOSTNAME_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{12,64}$")
+_HOSTNAME_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{12}$")
 _NAMESPACE_RE: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
+DOCKER_EXECUTABLE_PATH: Final[str] = "/usr/bin/docker"
+DOCKER_SOCKET_PATH: Final[str] = "/var/run/docker.sock"
+DOCKER_HOST_ENDPOINT: Final[str] = f"unix://{DOCKER_SOCKET_PATH}"
+_DOCKER_CONFIG_PATH: Final[str] = "/proc/self"
+_DOCKER_SOCKET_MODES: Final[frozenset[int]] = frozenset({0o600, 0o660})
 _DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _PRIVATE_DIRECTORY_CREATE_ATTEMPTS: Final[int] = 128
 _EXCLUDED_DESTINATIONS: Final[frozenset[str]] = frozenset(
@@ -34,6 +39,130 @@ _EXCLUDED_DESTINATIONS: Final[frozenset[str]] = frozenset(
 
 class DockerHostPathError(RuntimeError):
     """The release-host Docker path authority cannot be established."""
+
+
+@dataclass(frozen=True, slots=True)
+class DockerExecutableAuthority:
+    """Pinned identity for the release Docker executable pathname."""
+
+    identity: tuple[int, int, int, int, int, int, int, int, int]
+    identity_digest: str
+
+    @classmethod
+    def open(cls) -> DockerExecutableAuthority:
+        try:
+            metadata = os.stat(DOCKER_EXECUTABLE_PATH, follow_symlinks=False)
+            identity = _docker_executable_identity(metadata)
+        except OSError as exc:
+            raise DockerHostPathError(
+                "the release Docker executable authority is unavailable"
+            ) from exc
+        authority = cls(
+            identity=identity,
+            identity_digest=_identity_digest(
+                {"path": DOCKER_EXECUTABLE_PATH, "identity": identity}
+            ),
+        )
+        authority.verify()
+        return authority
+
+    def verify(self) -> None:
+        try:
+            metadata = os.stat(DOCKER_EXECUTABLE_PATH, follow_symlinks=False)
+            identity = _docker_executable_identity(metadata)
+        except OSError as exc:
+            raise DockerHostPathError("the release Docker executable authority changed") from exc
+        if identity != self.identity:
+            raise DockerHostPathError("the release Docker executable authority changed")
+
+    def argv(self, *arguments: str) -> tuple[str, ...]:
+        self.verify()
+        return (DOCKER_EXECUTABLE_PATH, *arguments)
+
+
+@dataclass(frozen=True, slots=True)
+class DockerSocketAuthority:
+    """Pinned identity for the only Docker Engine socket allowed in release mode."""
+
+    identity: tuple[int, int, int, int, int, int, int]
+    identity_digest: str
+
+    @classmethod
+    def open(cls) -> DockerSocketAuthority:
+        try:
+            metadata = os.stat(DOCKER_SOCKET_PATH, follow_symlinks=False)
+            identity = _docker_socket_identity(metadata)
+        except OSError as exc:
+            raise DockerHostPathError(
+                "the release Docker Engine socket authority is unavailable"
+            ) from exc
+        authority = cls(
+            identity=identity,
+            identity_digest=_identity_digest({"path": DOCKER_SOCKET_PATH, "identity": identity}),
+        )
+        authority.verify()
+        return authority
+
+    def verify(self) -> None:
+        try:
+            metadata = os.stat(DOCKER_SOCKET_PATH, follow_symlinks=False)
+            identity = _docker_socket_identity(metadata)
+        except OSError as exc:
+            raise DockerHostPathError(
+                "the release Docker Engine socket authority changed"
+            ) from exc
+        if identity != self.identity:
+            raise DockerHostPathError("the release Docker Engine socket authority changed")
+
+
+@dataclass(frozen=True, slots=True)
+class DockerEngineAuthority:
+    """Pinned executable and local-socket authority for one Docker command phase."""
+
+    executable: DockerExecutableAuthority
+    engine_socket: DockerSocketAuthority
+    identity_digest: str
+
+    @classmethod
+    def open(cls) -> DockerEngineAuthority:
+        executable = DockerExecutableAuthority.open()
+        engine_socket = DockerSocketAuthority.open()
+        authority = cls(
+            executable=executable,
+            engine_socket=engine_socket,
+            identity_digest=_identity_digest(
+                {
+                    "executable": executable.identity_digest,
+                    "engine_socket": engine_socket.identity_digest,
+                }
+            ),
+        )
+        authority.verify()
+        return authority
+
+    def verify(self) -> None:
+        self.executable.verify()
+        self.engine_socket.verify()
+
+    def argv(self, *arguments: str) -> tuple[str, ...]:
+        self.verify()
+        return (DOCKER_EXECUTABLE_PATH, *arguments)
+
+    def environment(self) -> dict[str, str]:
+        self.verify()
+        return docker_cli_environment()
+
+
+def docker_cli_environment() -> dict[str, str]:
+    """Return the complete, non-inheriting environment for release Docker CLI calls."""
+
+    return {
+        "DOCKER_CONFIG": _DOCKER_CONFIG_PATH,
+        "DOCKER_HOST": DOCKER_HOST_ENDPOINT,
+        "HOME": "/proc/self",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin",
+    }
 
 
 class DockerHostPathSpec(BaseModel):
@@ -351,7 +480,7 @@ def docker_self_inspect_argv(hostname: str | None = None) -> tuple[str, ...]:
             "the Docker user-container profile requires a container-ID hostname"
         )
     return (
-        "docker",
+        DOCKER_EXECUTABLE_PATH,
         "container",
         "inspect",
         "--format",
@@ -526,7 +655,7 @@ def _parse_observation(payload: bytes, hostname: str) -> dict[str, object]:
         not isinstance(container_id, str)
         or _CONTAINER_ID_RE.fullmatch(container_id) is None
         or _HOSTNAME_RE.fullmatch(hostname) is None
-        or not container_id.startswith(hostname)
+        or hostname != container_id[:12]
         or observed_hostname != hostname
         or value.get("running") is not True
         or not isinstance(mounts, list)
@@ -618,12 +747,67 @@ def _identity_digest(payload: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _docker_executable_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_nlink < 1
+        or not mode & 0o111
+        or mode & 0o022
+        or metadata.st_size <= 0
+    ):
+        raise DockerHostPathError("the release Docker executable identity is invalid")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _docker_socket_identity(
+    metadata: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    mode = stat.S_IMODE(metadata.st_mode)
+    if (
+        not stat.S_ISSOCK(metadata.st_mode)
+        or metadata.st_uid != 0
+        or mode not in _DOCKER_SOCKET_MODES
+        or metadata.st_nlink != 1
+    ):
+        raise DockerHostPathError("the release Docker Engine socket identity is invalid")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_ctime_ns,
+    )
+
+
 __all__ = [
+    "DOCKER_EXECUTABLE_PATH",
+    "DOCKER_HOST_ENDPOINT",
+    "DOCKER_SOCKET_PATH",
     "DOCKER_SELF_INSPECT_FORMAT",
+    "DockerEngineAuthority",
+    "DockerExecutableAuthority",
     "DockerHostPathError",
     "DockerHostPathSpec",
+    "DockerSocketAuthority",
     "HeldDockerSessionRoot",
     "discover_docker_host_path",
+    "docker_cli_environment",
     "docker_self_inspect_argv",
     "verify_docker_host_path",
 ]

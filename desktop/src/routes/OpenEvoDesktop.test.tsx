@@ -299,7 +299,7 @@ describe("OpenEvoDesktop", () => {
             id: "docker_pull_runtime",
             status: "fail",
             message: "Runtime image pull failed.",
-            command: "docker pull openevo/science-runtime:0.1.0",
+            command: "docker pull openevo/science-runtime:0.1.1",
             stderr: "network timeout",
           },
         ],
@@ -321,7 +321,7 @@ describe("OpenEvoDesktop", () => {
     expect(document.body.textContent).toContain("docker_pull_runtime");
     expect(document.body.textContent).toContain("Runtime image pull failed.");
     expect(document.body.textContent).toContain(
-      "docker pull openevo/science-runtime:0.1.0",
+      "docker pull openevo/science-runtime:0.1.1",
     );
     expect(document.body.textContent).toContain("network timeout");
     await unmountClient(root);

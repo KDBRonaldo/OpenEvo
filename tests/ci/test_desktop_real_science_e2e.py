@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -210,12 +211,51 @@ def test_wheel_lock_validation_binds_exact_bytes(tmp_path: Path) -> None:
         module._validate_wheel_lock(wheel, lock)
 
 
+def test_held_release_asset_rejects_path_replacement_and_copies_held_bytes(
+    tmp_path: Path,
+) -> None:
+    module = _load_runner()
+    source = tmp_path / "sidecar"
+    source.write_bytes(b"verified-sidecar")
+    authority = module.HeldReleaseAsset.open(source)
+    replacement = tmp_path / "replacement"
+    replacement.write_bytes(b"replacement")
+    os.replace(replacement, source)
+
+    with pytest.raises(module.E2EFailure, match="release_asset_authority_changed"):
+        authority.verify_unchanged()
+    with pytest.raises(module.E2EFailure, match="release_asset_authority_changed"):
+        authority.copy_to(tmp_path / "launch", executable=True)
+    assert not (tmp_path / "launch").exists()
+    authority.close()
+
+
+def test_held_release_asset_copy_is_digest_bound_and_executable(tmp_path: Path) -> None:
+    module = _load_runner()
+    source = tmp_path / "sidecar"
+    source.write_bytes(b"verified-sidecar")
+    authority = module.HeldReleaseAsset.open(source)
+    launch = tmp_path / "launch"
+
+    authority.copy_to(launch, executable=True)
+
+    assert launch.read_bytes() == b"verified-sidecar"
+    assert stat.S_IMODE(launch.stat().st_mode) == 0o500
+    assert authority.evidence() == {
+        "sha256": hashlib.sha256(b"verified-sidecar").hexdigest(),
+        "byte_size": len(b"verified-sidecar"),
+    }
+    authority.close()
+
+
 def test_arguments_require_the_complete_exact_asset_triplet() -> None:
     module = _load_runner()
     args = argparse.Namespace(
         sidecar=Path("sidecar"),
         core_wheel=None,
         framework_lock=None,
+        daemon_bundle=Path("openevo-daemon-linux-x86_64"),
+        daemon_manifest=Path("openevo-daemon-bundle.json"),
         managed_runtime_archive=Path("runtime.tar"),
         structural_check=False,
         host="compute.example.org",
@@ -233,6 +273,8 @@ def test_arguments_require_managed_runtime_archive_for_real_e2e() -> None:
         sidecar=Path("sidecar"),
         core_wheel=Path("openevo.whl"),
         framework_lock=Path("framework-lock.json"),
+        daemon_bundle=Path("openevo-daemon-linux-x86_64"),
+        daemon_manifest=Path("openevo-daemon-bundle.json"),
         managed_runtime_archive=None,
         structural_check=False,
         host="compute.example.org",
@@ -252,6 +294,10 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     module = _load_runner()
     runtime_archive = tmp_path / "managed-runtime.tar"
     runtime_archive.write_bytes(b"runtime")
+    daemon_bundle = tmp_path / "openevo-daemon-linux-x86_64"
+    daemon_manifest = tmp_path / "openevo-daemon-bundle.json"
+    daemon_bundle.write_bytes(b"daemon")
+    daemon_manifest.write_bytes(b"manifest")
     built_sidecar = tmp_path / "built-sidecar"
     built_sidecar.write_bytes(b"sidecar")
     captured: dict[str, object] = {}
@@ -276,9 +322,19 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
         wheel: Path,
         lock: Path,
         archive: Path,
+        bundle: Path,
+        manifest: Path,
     ):
-        captured["inspected"] = (sidecar, wheel, lock, archive)
-        return module.ReleaseAssets(sidecar, wheel, lock, archive, {})
+        captured["inspected"] = (sidecar, wheel, lock, archive, bundle, manifest)
+        return module.ReleaseAssets(
+            sidecar,
+            wheel,
+            lock,
+            archive,
+            bundle,
+            manifest,
+            {},
+        )
 
     monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(module.os, "getpgid", lambda _pid: FakeProcess.pid)
@@ -288,6 +344,8 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     assets = module._build_assets(
         tmp_path / "build",
         runtime_archive,
+        daemon_bundle,
+        daemon_manifest,
         timeout_seconds=1,
     )
 
@@ -296,9 +354,15 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     assert command[command.index("--managed-runtime-archive") + 1] == str(
         runtime_archive.resolve()
     )
+    assert command[command.index("--daemon-bundle") + 1] == str(daemon_bundle.resolve())
+    assert command[command.index("--daemon-manifest") + 1] == str(daemon_manifest.resolve())
     assert command.count("--release-build") == 1
     assert assets.managed_runtime_archive == runtime_archive.resolve()
-    assert captured["inspected"][-1] == runtime_archive.resolve()  # type: ignore[index]
+    assert captured["inspected"][-3:] == (  # type: ignore[index]
+        runtime_archive.resolve(),
+        daemon_bundle,
+        daemon_manifest,
+    )
 
 
 def test_external_assets_bind_exact_embedded_managed_runtime(
@@ -312,13 +376,28 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
     lock = tmp_path / "framework-lock.json"
     runtime_archive = tmp_path / "managed-runtime.tar"
+    daemon_bundle = tmp_path / "openevo-daemon-linux-x86_64"
+    daemon_manifest = tmp_path / "openevo-daemon-bundle.json"
     _write_wheel(wheel)
     _write_lock(lock, wheel)
     runtime_archive.write_bytes(b"exact-runtime")
+    daemon_bundle.write_bytes(b"exact-daemon")
+    daemon_bundle.chmod(0o700)
+    daemon_manifest.write_bytes(b"exact-manifest")
     runtime_digest = hashlib.sha256(runtime_archive.read_bytes()).hexdigest()
     calls: list[tuple[object, ...]] = []
 
     class FakeBuilder:
+        class Source:
+            def __init__(self, path: Path) -> None:
+                self.name = path.name
+                self.path = path
+                self.byte_size = path.stat().st_size
+                self.sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+
+            def close(self) -> None:
+                calls.append(("close", self.path))
+
         @staticmethod
         def _validate_managed_runtime_archive(archive: Path) -> tuple[int, str]:
             calls.append(("runtime", archive))
@@ -349,6 +428,35 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
         ) -> None:
             calls.append(("embedded_runtime", executable, archive))
 
+        @classmethod
+        def _open_daemon_release_input_pair(
+            cls,
+            bundle: Path,
+            manifest: Path,
+            *,
+            repo: Path,
+        ):
+            calls.append(("daemon_pair", bundle, manifest, repo))
+            return cls.Source(bundle), cls.Source(manifest), {"core": {}}
+
+        @staticmethod
+        def _validate_daemon_manifest_core(
+            manifest: dict[str, object],
+            *,
+            wheel: Path,
+            framework_lock: Path,
+            version: str,
+        ) -> None:
+            calls.append(("daemon_core", manifest, wheel, framework_lock, version))
+
+        @staticmethod
+        def _validate_embedded_daemon_release_inputs(
+            executable: Path,
+            bundle: object,
+            manifest: object,
+        ) -> None:
+            calls.append(("embedded_daemon", executable, bundle, manifest))
+
     monkeypatch.setattr(module, "_load_sidecar_builder", lambda: FakeBuilder())
 
     assets = module._inspect_release_assets(
@@ -356,15 +464,26 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
         wheel,
         lock,
         runtime_archive,
+        daemon_bundle,
+        daemon_manifest,
     )
 
     assert ("runtime", runtime_archive) in calls
     assert ("embedded_runtime", sidecar, runtime_archive) in calls
+    assert any(call[0] == "embedded_daemon" for call in calls)
     assert assets.evidence["managed_runtime_archive"] == {
         "sha256": runtime_digest,
         "byte_size": runtime_archive.stat().st_size,
     }
     assert assets.evidence["exact_embedded_assets_verified"] is True
+    assert (
+        assets.evidence["daemon_bundle"]["sha256"]
+        == hashlib.sha256(daemon_bundle.read_bytes()).hexdigest()
+    )
+    assert (
+        assets.evidence["daemon_manifest"]["sha256"]
+        == hashlib.sha256(daemon_manifest.read_bytes()).hexdigest()
+    )
     module._audit_evidence(assets.evidence, private_values=())
 
 

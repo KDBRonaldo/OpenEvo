@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 import re
 import secrets
-import shutil
 import signal
 import socket
 import stat
@@ -102,6 +101,8 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "core_wheel",
         "framework_lock",
         "managed_runtime_archive",
+        "daemon_bundle",
+        "daemon_manifest",
         "sha256",
         "byte_size",
         "filename",
@@ -221,12 +222,136 @@ class E2EFailure(RuntimeError):
 
 
 @dataclass(frozen=True)
+class HeldReleaseAsset:
+    path: Path
+    descriptor: int = field(repr=False, compare=False)
+    identity: tuple[int, ...] = field(repr=False)
+    sha256: str
+    byte_size: int
+
+    @classmethod
+    def open(cls, path: Path) -> HeldReleaseAsset:
+        descriptor = -1
+        try:
+            descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+            opened = os.fstat(descriptor)
+            named = path.lstat()
+            identity = _release_asset_identity(opened)
+            if (
+                _release_asset_identity(named) != identity
+                or not stat.S_ISREG(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or opened.st_nlink != 1
+                or opened.st_size <= 0
+            ):
+                raise OSError("release asset identity is invalid")
+            digest = _sha256_descriptor(descriptor, opened.st_size)
+            return cls(
+                path=path,
+                descriptor=descriptor,
+                identity=identity,
+                sha256=digest,
+                byte_size=opened.st_size,
+            )
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise E2EFailure("release_assets", "release_asset_authority_invalid") from exc
+
+    def verify_unchanged(self) -> None:
+        try:
+            opened = os.fstat(self.descriptor)
+            named = self.path.lstat()
+            if (
+                _release_asset_identity(opened) != self.identity
+                or _release_asset_identity(named) != self.identity
+                or _sha256_descriptor(self.descriptor, self.byte_size) != self.sha256
+            ):
+                raise OSError("release asset changed")
+        except OSError as exc:
+            raise E2EFailure("release_assets", "release_asset_authority_changed") from exc
+
+    def evidence(self) -> dict[str, object]:
+        self.verify_unchanged()
+        return {"sha256": self.sha256, "byte_size": self.byte_size}
+
+    def copy_to(self, destination: Path, *, executable: bool) -> None:
+        self.verify_unchanged()
+        target_fd = -1
+        try:
+            target_fd = os.open(
+                destination,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o500 if executable else 0o400,
+            )
+            offset = 0
+            while offset < self.byte_size:
+                chunk = os.pread(
+                    self.descriptor,
+                    min(1024 * 1024, self.byte_size - offset),
+                    offset,
+                )
+                if not chunk:
+                    raise OSError("release asset ended during copy")
+                written = 0
+                while written < len(chunk):
+                    count = os.write(target_fd, chunk[written:])
+                    if count <= 0:
+                        raise OSError("release asset copy stopped")
+                    written += count
+                offset += len(chunk)
+            if os.pread(self.descriptor, 1, self.byte_size):
+                raise OSError("release asset grew during copy")
+            os.fchmod(target_fd, 0o500 if executable else 0o400)
+            os.fsync(target_fd)
+            copied = os.fstat(target_fd)
+            if (
+                not stat.S_ISREG(copied.st_mode)
+                or copied.st_uid != os.getuid()
+                or copied.st_nlink != 1
+                or copied.st_size != self.byte_size
+                or _sha256_descriptor(target_fd, self.byte_size) != self.sha256
+            ):
+                raise OSError("release asset copy identity is invalid")
+            self.verify_unchanged()
+        except OSError as exc:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+            raise E2EFailure("native_launch", "sidecar_snapshot_failed") from exc
+        finally:
+            if target_fd >= 0:
+                os.close(target_fd)
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True)
 class ReleaseAssets:
     sidecar: Path
     wheel: Path
     framework_lock: Path
     managed_runtime_archive: Path
+    daemon_bundle: Path
+    daemon_manifest: Path
     evidence: dict[str, object]
+    authorities: tuple[HeldReleaseAsset, ...] = field(
+        default=(),
+        repr=False,
+        compare=False,
+    )
+
+    def authority(self, path: Path) -> HeldReleaseAsset:
+        matches = [authority for authority in self.authorities if authority.path == path]
+        if len(matches) != 1:
+            raise E2EFailure("release_assets", "release_asset_authority_missing")
+        return matches[0]
+
+    def close(self) -> None:
+        for authority in self.authorities:
+            authority.close()
 
 
 @dataclass(frozen=True)
@@ -1204,6 +1329,8 @@ class DesktopScienceWorkflow:
 def _build_assets(
     root: Path,
     managed_runtime_archive: Path,
+    daemon_bundle: Path,
+    daemon_manifest: Path,
     *,
     timeout_seconds: float,
 ) -> ReleaseAssets:
@@ -1217,6 +1344,10 @@ def _build_assets(
         str(output),
         "--managed-runtime-archive",
         str(managed_runtime_archive),
+        "--daemon-bundle",
+        str(Path(os.path.abspath(daemon_bundle))),
+        "--daemon-manifest",
+        str(Path(os.path.abspath(daemon_manifest))),
         "--release-build",
     ]
     with TemporaryFile(mode="w+b") as build_log:
@@ -1253,7 +1384,14 @@ def _build_assets(
     lock = output / "framework-lock.json"
     if len(wheels) != 1:
         raise E2EFailure("release_assets", "built_wheel_inventory_invalid")
-    return _inspect_release_assets(sidecar, wheels[0], lock, managed_runtime_archive)
+    return _inspect_release_assets(
+        sidecar,
+        wheels[0],
+        lock,
+        managed_runtime_archive,
+        daemon_bundle,
+        daemon_manifest,
+    )
 
 
 def _inspect_release_assets(
@@ -1261,23 +1399,38 @@ def _inspect_release_assets(
     wheel: Path,
     lock: Path,
     managed_runtime_archive: Path,
+    daemon_bundle: Path,
+    daemon_manifest: Path,
 ) -> ReleaseAssets:
-    for item, code in (
+    inputs = (
         (sidecar, "packaged_sidecar_invalid"),
         (wheel, "core_wheel_invalid"),
         (lock, "framework_lock_invalid"),
         (managed_runtime_archive, "managed_runtime_archive_invalid"),
-    ):
+        (daemon_bundle, "daemon_bundle_invalid"),
+        (daemon_manifest, "daemon_manifest_invalid"),
+    )
+    for item, code in inputs:
         if item.is_symlink() or not item.is_file() or not stat.S_ISREG(item.stat().st_mode):
             raise E2EFailure("release_assets", code)
     if not os.access(sidecar, os.X_OK):
         raise E2EFailure("release_assets", "packaged_sidecar_not_executable")
-    name, version, wheel_digest = _validate_wheel_lock(wheel, lock)
-    builder = _load_sidecar_builder()
+    authorities: list[HeldReleaseAsset] = []
     try:
+        authorities.extend(HeldReleaseAsset.open(path) for path, _code in inputs)
+        authority_by_path = {authority.path: authority for authority in authorities}
+        name, version, wheel_digest = _validate_wheel_lock(wheel, lock)
+        if wheel_digest != authority_by_path[wheel].sha256:
+            raise E2EFailure("release_assets", "framework_lock_wheel_mismatch")
+        builder = _load_sidecar_builder()
         runtime_size, runtime_digest = builder._validate_managed_runtime_archive(
             managed_runtime_archive
         )
+        if (
+            runtime_size != authority_by_path[managed_runtime_archive].byte_size
+            or runtime_digest != authority_by_path[managed_runtime_archive].sha256
+        ):
+            raise E2EFailure("release_assets", "managed_runtime_archive_changed")
         builder._validate_fd_bound_bootloader(sidecar)
         builder._validate_embedded_core_wheel(sidecar, wheel)
         builder._validate_embedded_core_framework_lock(
@@ -1290,31 +1443,65 @@ def _inspect_release_assets(
             sidecar,
             managed_runtime_archive,
         )
-    except Exception as exc:
-        raise E2EFailure("release_assets", "packaged_assets_not_exact") from exc
-    return ReleaseAssets(
-        sidecar=sidecar,
-        wheel=wheel,
-        framework_lock=lock,
-        managed_runtime_archive=managed_runtime_archive,
-        evidence={
-            "sidecar": _file_evidence(sidecar),
+        bundle_source, manifest_source, daemon_identity = builder._open_daemon_release_input_pair(
+            daemon_bundle,
+            daemon_manifest,
+            repo=REPOSITORY_ROOT,
+        )
+        try:
+            builder._validate_daemon_manifest_core(
+                daemon_identity,
+                wheel=wheel,
+                framework_lock=lock,
+                version=version,
+            )
+            builder._validate_embedded_daemon_release_inputs(
+                sidecar,
+                bundle_source,
+                manifest_source,
+            )
+        finally:
+            manifest_source.close()
+            bundle_source.close()
+        for authority in authorities:
+            authority.verify_unchanged()
+        evidence = {
+            "sidecar": authority_by_path[sidecar].evidence(),
             "core_wheel": {
-                **_file_evidence(wheel),
+                **authority_by_path[wheel].evidence(),
                 "filename": wheel.name,
                 "distribution": name,
                 "version": version,
             },
             "framework_lock": {
-                **_file_evidence(lock),
+                **authority_by_path[lock].evidence(),
                 "distribution_digest": wheel_digest,
             },
             "managed_runtime_archive": {
                 "sha256": runtime_digest,
                 "byte_size": runtime_size,
             },
+            "daemon_bundle": authority_by_path[daemon_bundle].evidence(),
+            "daemon_manifest": authority_by_path[daemon_manifest].evidence(),
             "exact_embedded_assets_verified": True,
-        },
+        }
+    except E2EFailure:
+        for authority in authorities:
+            authority.close()
+        raise
+    except Exception as exc:
+        for authority in authorities:
+            authority.close()
+        raise E2EFailure("release_assets", "packaged_assets_not_exact") from exc
+    return ReleaseAssets(
+        sidecar=sidecar,
+        wheel=wheel,
+        framework_lock=lock,
+        managed_runtime_archive=managed_runtime_archive,
+        daemon_bundle=daemon_bundle,
+        daemon_manifest=daemon_manifest,
+        authorities=tuple(authorities),
+        evidence=evidence,
     )
 
 
@@ -1368,13 +1555,12 @@ def _wheel_identity(wheel: Path) -> tuple[str, str]:
     return name, version
 
 
-def _launch_sidecar(sidecar: Path, root: Path) -> NativeSidecar:
+def _launch_sidecar(assets: ReleaseAssets, root: Path) -> NativeSidecar:
     if os.name != "posix":
         raise E2EFailure("native_launch", "posix_process_boundary_required")
     root.mkdir(parents=True, exist_ok=True)
     launch_path = root / "openevo-desktop-sidecar"
-    shutil.copyfile(sidecar, launch_path)
-    launch_path.chmod(0o500)
+    assets.authority(assets.sidecar).copy_to(launch_path, executable=True)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
@@ -1922,6 +2108,34 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _sha256_descriptor(descriptor: int, expected_size: int) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < expected_size:
+        chunk = os.pread(descriptor, min(1024 * 1024, expected_size - offset), offset)
+        if not chunk:
+            raise OSError("release asset ended during hashing")
+        digest.update(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, expected_size):
+        raise OSError("release asset grew during hashing")
+    return digest.hexdigest()
+
+
+def _release_asset_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
 def _file_evidence(path: Path) -> dict[str, object]:
     return {"sha256": _sha256_file(path), "byte_size": path.stat().st_size}
 
@@ -2089,13 +2303,15 @@ def _build_environment() -> dict[str, str]:
 
 
 def _validate_runtime_arguments(args: argparse.Namespace) -> None:
-    external = (args.sidecar, args.core_wheel, args.framework_lock)
-    if any(item is not None for item in external) and not all(
-        item is not None for item in external
+    external_sidecar = (args.sidecar, args.core_wheel, args.framework_lock)
+    if any(item is not None for item in external_sidecar) and not all(
+        item is not None for item in external_sidecar
     ):
         raise E2EFailure("arguments", "release_asset_triplet_required")
     if args.structural_check:
         return
+    if args.daemon_bundle is None or args.daemon_manifest is None:
+        raise E2EFailure("arguments", "daemon_release_pair_required")
     if args.managed_runtime_archive is None:
         raise E2EFailure("arguments", "managed_runtime_archive_required")
     if not args.host or not args.user or not args.expected_host_key_fingerprint:
@@ -2135,6 +2351,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sidecar", type=Path)
     parser.add_argument("--core-wheel", type=Path)
     parser.add_argument("--framework-lock", type=Path)
+    parser.add_argument("--daemon-bundle", type=Path)
+    parser.add_argument("--daemon-manifest", type=Path)
     parser.add_argument(
         "--managed-runtime-archive",
         type=Path,
@@ -2147,7 +2365,7 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("desktop-real-science-e2e-evidence.json"),
     )
-    parser.add_argument("--codex-model", default="gpt-5")
+    parser.add_argument("--codex-model", default="gpt-5.5")
     parser.add_argument("--task-title", default="Release Desktop science E2E")
     parser.add_argument(
         "--task-objective",
@@ -2208,6 +2426,7 @@ def main(argv: list[str] | None = None) -> int:
     }
     private_values = [os.environ.get("SSH_AUTH_SOCK", "")]
     native: NativeSidecar | None = None
+    assets: ReleaseAssets | None = None
     workflow: DesktopScienceWorkflow | None = None
     cleanup = {
         "active_run_cleanup_required": False,
@@ -2227,6 +2446,8 @@ def main(argv: list[str] | None = None) -> int:
                 assets = _build_assets(
                     root / "build",
                     args.managed_runtime_archive,
+                    args.daemon_bundle,
+                    args.daemon_manifest,
                     timeout_seconds=args.build_timeout_seconds,
                 )
             else:
@@ -2235,9 +2456,11 @@ def main(argv: list[str] | None = None) -> int:
                     args.core_wheel,
                     args.framework_lock,
                     args.managed_runtime_archive,
+                    args.daemon_bundle,
+                    args.daemon_manifest,
                 )
             evidence["release_assets"] = assets.evidence
-            native = _launch_sidecar(assets.sidecar, root / "native")
+            native = _launch_sidecar(assets, root / "native")
             private_values.extend(native.credentials.private_values())
             api = LocalApi(native.base_url, native.credentials.session_token)
             evidence["desktop"] = _release_identity(api)
@@ -2276,6 +2499,8 @@ def main(argv: list[str] | None = None) -> int:
             if native is not None:
                 cleanup["core_ownership_release_requested"] = True
                 cleanup["sidecar_shutdown_succeeded"] = native.terminate()
+            if assets is not None:
+                assets.close()
             evidence["cleanup"] = cleanup
             evidence["finished_at"] = _utc_now()
             cleanup_complete = (

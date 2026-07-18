@@ -498,7 +498,7 @@ def create_sidecar_app(
 
     app = FastAPI(
         title="OpenEvo Desktop Sidecar",
-        version="0.1.0",
+        version=OPENEVO_VERSION,
         lifespan=lifespan,
     )
     app.add_middleware(

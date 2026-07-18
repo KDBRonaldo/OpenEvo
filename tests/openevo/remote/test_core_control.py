@@ -801,8 +801,9 @@ def test_generation_bootstrap_quarantines_legacy_unauthorized_stage_without_dele
     service_root = tmp_path / "core"
     legacy_generation = "d" * 32
     retried_generation = "e" * 32
-    legacy_stage = service_root / "release-staging" / f"staged-{legacy_generation}"
-    legacy_stage.mkdir(mode=0o700, parents=True)
+    staging_root = _prepare_private_stage_root(service_root)
+    legacy_stage = staging_root / f"staged-{legacy_generation}"
+    legacy_stage.mkdir(mode=0o700)
     sentinel = legacy_stage / "foreign-sentinel"
     sentinel.write_bytes(b"preserve me")
     wheel = tmp_path / "openevo.whl"
@@ -839,13 +840,11 @@ def test_generation_bootstrap_never_claims_authority_free_bound_stage(
     service_root = tmp_path / "core"
     foreign_generation = "1" * 32
     retried_generation = "2" * 32
-    staging_root = service_root / "release-staging"
+    staging_root = _prepare_private_stage_root(service_root)
     foreign_stage = staging_root / "unbound"
-    foreign_stage.mkdir(mode=0o700, parents=True)
+    foreign_stage.mkdir(mode=0o700)
     metadata = foreign_stage.stat()
-    bound_name = (
-        f"{state}-{foreign_generation}-{metadata.st_dev:x}-{metadata.st_ino:x}"
-    )
+    bound_name = f"{state}-{foreign_generation}-{metadata.st_dev:x}-{metadata.st_ino:x}"
     foreign_stage = foreign_stage.rename(staging_root / bound_name)
     sentinel = foreign_stage / "foreign-sentinel"
     sentinel.write_bytes(b"preserve me")
@@ -881,22 +880,29 @@ def _create_bound_stage(
     generation: str,
     state: str,
 ) -> Path:
-    staging_root = service_root / "release-staging"
+    staging_root = _prepare_private_stage_root(service_root)
     stage = staging_root / "unbound"
-    stage.mkdir(mode=0o700, parents=True)
+    stage.mkdir(mode=0o700)
     metadata = stage.stat()
     return stage.rename(
-        staging_root
-        / f"{state}-{generation}-{metadata.st_dev:x}-{metadata.st_ino:x}"
+        staging_root / f"{state}-{generation}-{metadata.st_dev:x}-{metadata.st_ino:x}"
     )
+
+
+def _prepare_private_stage_root(service_root: Path) -> Path:
+    service_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    service_root.chmod(0o700)
+    staging_root = service_root / "release-staging"
+    staging_root.mkdir(mode=0o700, exist_ok=True)
+    staging_root.chmod(0o700)
+    return staging_root
 
 
 def _write_stage_authority(stage: Path, generation: str) -> Path:
     metadata = stage.stat()
     authority = stage / ".openevo-generation-authority"
     authority.write_text(
-        "openevo-core-generation-stage-v2\n"
-        f"{generation}\n{metadata.st_dev}:{metadata.st_ino}\n",
+        f"openevo-core-generation-stage-v2\n{generation}\n{metadata.st_dev}:{metadata.st_ino}\n",
         encoding="ascii",
     )
     authority.chmod(0o600)
@@ -948,8 +954,7 @@ def test_generation_bootstrap_rejects_untrusted_active_stage_without_deleting(
         elif corruption == "stage_identity":
             metadata = stage.stat()
             stage = stage.rename(
-                staging_root
-                / f"active-{generation}-{metadata.st_dev:x}-{metadata.st_ino + 1:x}"
+                staging_root / f"active-{generation}-{metadata.st_dev:x}-{metadata.st_ino + 1:x}"
             )
             preserved = stage / sentinel.name
         elif corruption == "authority_symlink":
@@ -959,8 +964,7 @@ def test_generation_bootstrap_rejects_untrusted_active_stage_without_deleting(
             authority.chmod(0o644)
         elif corruption == "authority_identity":
             authority.write_text(
-                "openevo-core-generation-stage-v2\n"
-                f"{'7' * 32}\n1:1\n",
+                f"openevo-core-generation-stage-v2\n{'7' * 32}\n1:1\n",
                 encoding="ascii",
             )
         elif corruption == "authority_owner":
@@ -1040,10 +1044,7 @@ def test_generation_bootstrap_never_traverses_authority_free_tombstone(
     metadata = tombstone.stat()
     tombstone = tombstone.rename(
         quarantine_root
-        / (
-            f"discard-{stale_generation}-{metadata.st_dev:x}-{metadata.st_ino:x}-"
-            f"{'b' * 32}"
-        )
+        / (f"discard-{stale_generation}-{metadata.st_dev:x}-{metadata.st_ino:x}-{'b' * 32}")
     )
     sentinel = tombstone / "foreign-sentinel"
     sentinel.write_bytes(b"preserve tombstone")
@@ -1096,9 +1097,7 @@ def test_generation_bootstrap_serializes_concurrent_publications(tmp_path: Path)
     results = [process.communicate(timeout=20) for process in processes]
 
     assert [process.returncode for process in processes] == [0, 0], results
-    assert {path.name for path in (service_root / "releases").iterdir()} == set(
-        generations
-    )
+    assert {path.name for path in (service_root / "releases").iterdir()} == set(generations)
     assert list((service_root / "release-staging").iterdir()) == []
 
 

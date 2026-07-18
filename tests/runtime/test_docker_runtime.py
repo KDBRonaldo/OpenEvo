@@ -15,13 +15,16 @@ from unittest.mock import AsyncMock
 import pytest
 
 from openevo.runtime import docker as docker_module
-from openevo.runtime.base import RuntimePathSecurityError
+from openevo.runtime.base import BaseRuntime, RuntimePathSecurityError
 from openevo.runtime.docker import (
     DockerRuntime,
+    MANAGED_SUBSCRIPTION_SANDBOX_PROFILE_ID,
     _CREDENTIAL_VIEW_NAME,
     verify_managed_runtime_image_admission,
 )
 from openevo.runtime.docker_host import (
+    DOCKER_EXECUTABLE_PATH,
+    docker_cli_environment,
     discover_docker_host_path,
     docker_self_inspect_argv,
 )
@@ -173,6 +176,46 @@ def _isolate_default_ownership_root(
     )
 
 
+@pytest.mark.asyncio
+async def test_runtime_commands_ignore_polluted_path_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    polluted_bin = tmp_path / "polluted-bin"
+    polluted_bin.mkdir()
+    polluted_docker = polluted_bin / "docker"
+    polluted_docker.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+    polluted_docker.chmod(0o755)
+    monkeypatch.setenv("PATH", os.fspath(polluted_bin))
+    observed: list[tuple[str, ...]] = []
+
+    async def run_local(
+        _runtime,
+        *args: str,
+        timeout=None,
+        env=None,
+        inherit_env=True,
+        capture=False,
+    ):
+        del timeout, capture
+        observed.append(args)
+        assert env == docker_cli_environment()
+        assert inherit_env is False
+        return 0, "", ""
+
+    monkeypatch.setattr(BaseRuntime, "_run_local_command", run_local)
+    runtime = DockerRuntime(
+        RuntimeSpec(image="python:3.12", container_user="host"),
+        "path-authority",
+        tmp_path / "session",
+    )
+
+    await runtime._run_local_command(DOCKER_EXECUTABLE_PATH, "--version", capture=True)
+
+    assert observed == [(DOCKER_EXECUTABLE_PATH, "--version")]
+    assert observed[0][0] != os.fspath(polluted_docker)
+
+
 def _write_mock_cidfile(
     args: tuple[str, ...],
     container_id: str,
@@ -218,22 +261,45 @@ def _credential_stat_output(authority: ManagedCredentialMount) -> str:
     )
 
 
-def _credential_mount_inspect_output(authority: ManagedCredentialMount) -> str:
+def _credential_mount_inspect_output(
+    authority: ManagedCredentialMount,
+    runtime: DockerRuntime,
+    *,
+    apparmor_profile: str = "unconfined",
+) -> str:
     return json.dumps(
-        [
-            {
-                "Type": "bind",
-                "Source": str(authority.root / _CREDENTIAL_VIEW_NAME),
-                "Destination": MANAGED_CODEX_HOME,
-                "RW": False,
+        {
+            "mounts": [
+                {
+                    "Type": "bind",
+                    "Source": os.fspath(runtime._session_docker_source),
+                    "Destination": runtime.runtime_session_dir,
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(authority.root / _CREDENTIAL_VIEW_NAME),
+                    "Destination": MANAGED_CODEX_HOME,
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": str(authority.root / "auth.json"),
+                    "Destination": f"{MANAGED_CODEX_HOME}/auth.json",
+                    "RW": False,
+                },
+            ],
+            "host_config": {
+                "CapDrop": ["ALL"],
+                "Privileged": False,
+                "SecurityOpt": [
+                    "no-new-privileges:true",
+                    "seccomp=unconfined",
+                    "apparmor=unconfined",
+                ],
             },
-            {
-                "Type": "bind",
-                "Source": str(authority.root / "auth.json"),
-                "Destination": f"{MANAGED_CODEX_HOME}/auth.json",
-                "RW": False,
-            },
-        ]
+            "apparmor_profile": apparmor_profile,
+        }
     )
 
 
@@ -475,7 +541,7 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
     monkeypatch.setattr(os, "getgid", lambda: host_uid + 1)
     runtime = DockerRuntime(
         RuntimeSpec(
-            image="openevo/science-runtime:0.1.0",
+            image="openevo/science-runtime:0.1.1",
             container_user="host",
             env={
                 "HOME": "/openevo/session/home",
@@ -505,7 +571,12 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
     await runtime.start()
 
     create = run_command.await_args_list[0].args
-    assert create[:4] == ("docker", "create", "--name", "openevo-science-session")
+    assert create[:4] == (
+        DOCKER_EXECUTABLE_PATH,
+        "create",
+        "--name",
+        "openevo-science-session",
+    )
     assert create[4] == "--cidfile"
     volume_sources = [
         create[index + 1].split(":", 1)[0]
@@ -743,11 +814,11 @@ async def test_user_container_runtime_rejects_daemon_source_path_aba_wrong_objec
     assert runtime.absence_proven is True
     assert not any(session_dir.glob(".openevo-adoption-*"))
     assert any(
-        call.args[:4] == ("docker", "kill", runtime_container_id)
+        call.args[:4] == (DOCKER_EXECUTABLE_PATH, "kill", runtime_container_id)
         for call in run_command.await_args_list
     )
     assert any(
-        call.args[:4] == ("docker", "rm", "-f", runtime_container_id)
+        call.args[:4] == (DOCKER_EXECUTABLE_PATH, "rm", "-f", runtime_container_id)
         for call in run_command.await_args_list
     )
 
@@ -860,7 +931,7 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     runtime = DockerRuntime(
         RuntimeSpec(
             profile="managed_science",
-            image="openevo/science-runtime:0.1.0",
+            image="openevo/science-runtime:0.1.1",
             container_user="host",
         ),
         "science-session",
@@ -878,7 +949,11 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
             return 0, container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
             if any("json .Mounts" in str(value) for value in args):
-                return 0, _credential_mount_inspect_output(credential_mount), None
+                return (
+                    0,
+                    _credential_mount_inspect_output(credential_mount, runtime),
+                    None,
+                )
             if any("State.Pid" in str(value) for value in args):
                 return 0, f"{container_id}|1234|started-at|true|0\n", None
             return 0, container_id + "\n", None
@@ -894,16 +969,116 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     mounts = [create[index + 1] for index, value in enumerate(create) if value == "--mount"]
     credential_mounts = [mount for mount in mounts if MANAGED_CODEX_HOME in mount]
     assert credential_mounts == [
-        "type=bind,"
-        f"source={credential_dir / _CREDENTIAL_VIEW_NAME},"
-        f"target={MANAGED_CODEX_HOME},"
-        "readonly",
+        f"type=bind,source={credential_dir / _CREDENTIAL_VIEW_NAME},target={MANAGED_CODEX_HOME}",
         "type=bind,"
         f"source={credential_dir / 'auth.json'},"
         f"target={MANAGED_CODEX_HOME}/auth.json,"
         "readonly",
     ]
+    assert runtime.sandbox_profile_id == MANAGED_SUBSCRIPTION_SANDBOX_PROFILE_ID
+    assert "--cap-drop=ALL" in create
+    assert "--security-opt=no-new-privileges:true" in create
+    assert "--security-opt=seccomp=unconfined" in create
+    assert "--security-opt=apparmor=unconfined" in create
     assert not credential_dir.is_relative_to(session_dir)
+
+
+def test_credential_mount_forbids_custom_docker_options(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="forbid custom Docker options"):
+        DockerRuntime(
+            RuntimeSpec(
+                image="runtime:latest",
+                container_user="host",
+                kwargs={"volumes": ["/var/run/docker.sock:/var/run/docker.sock"]},
+            ),
+            "credential-options",
+            tmp_path / "session",
+            credential_mount=_credential_mount(tmp_path / "credentials"),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("apparmor_profile", ["", "unconfined"])
+async def test_credential_sandbox_accepts_closed_apparmor_platform_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    apparmor_profile: str,
+) -> None:
+    authority = _credential_mount(tmp_path / "credentials")
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "credential-apparmor",
+        tmp_path / "session",
+        credential_mount=authority,
+    )
+    runtime._container_id = "a" * 64
+    runtime._ownership_state = "verified"
+    monkeypatch.setattr(runtime, "_verify_credential_mount_pins", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_run_local_command",
+        AsyncMock(
+            return_value=(
+                0,
+                _credential_mount_inspect_output(
+                    authority,
+                    runtime,
+                    apparmor_profile=apparmor_profile,
+                ),
+                None,
+            )
+        ),
+    )
+
+    await runtime._verify_created_credential_mount()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    ["cap_drop", "security_opt", "privileged", "apparmor", "docker_socket_mount"],
+)
+async def test_credential_sandbox_rejects_changed_security_or_mount_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    authority = _credential_mount(tmp_path / "credentials")
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        f"credential-sandbox-{mutation}",
+        tmp_path / "session",
+        credential_mount=authority,
+    )
+    runtime._container_id = "b" * 64
+    runtime._ownership_state = "verified"
+    evidence = json.loads(_credential_mount_inspect_output(authority, runtime))
+    if mutation == "cap_drop":
+        evidence["host_config"]["CapDrop"] = []
+    elif mutation == "security_opt":
+        evidence["host_config"]["SecurityOpt"].append("label=disable")
+    elif mutation == "privileged":
+        evidence["host_config"]["Privileged"] = True
+    elif mutation == "apparmor":
+        evidence["apparmor_profile"] = "docker-default"
+    else:
+        evidence["mounts"].append(
+            {
+                "Type": "bind",
+                "Source": "/var/run/docker.sock",
+                "Destination": "/var/run/docker.sock",
+                "RW": True,
+            }
+        )
+    monkeypatch.setattr(runtime, "_verify_credential_mount_pins", lambda: None)
+    monkeypatch.setattr(
+        runtime,
+        "_run_local_command",
+        AsyncMock(return_value=(0, json.dumps(evidence), None)),
+    )
+
+    with pytest.raises(RuntimeError, match="sandbox configuration changed"):
+        await runtime._verify_created_credential_mount()
 
 
 @pytest.mark.asyncio
@@ -920,7 +1095,7 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
     runtime = DockerRuntime(
         RuntimeSpec(
             profile="managed_science",
-            image="openevo/science-runtime:0.1.0",
+            image="openevo/science-runtime:0.1.1",
             container_user="host",
         ),
         "credential-race-session",
@@ -948,8 +1123,7 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
             assert credential_mounts == [
                 "type=bind,"
                 f"source={authority.root / _CREDENTIAL_VIEW_NAME},"
-                f"target={MANAGED_CODEX_HOME},"
-                "readonly",
+                f"target={MANAGED_CODEX_HOME}",
                 "type=bind,"
                 f"source={authority.root / 'auth.json'},"
                 f"target={MANAGED_CODEX_HOME}/auth.json,"
@@ -961,7 +1135,11 @@ async def test_credential_mount_rejects_path_replacement_adopted_by_docker(
             if container_present:
                 if any("json .Mounts" in str(value) for value in args):
                     assert replacement is not None
-                    return 0, _credential_mount_inspect_output(replacement), None
+                    return (
+                        0,
+                        _credential_mount_inspect_output(replacement, runtime),
+                        None,
+                    )
                 if any("State.Pid" in str(value) for value in args):
                     return 0, f"{container_id}|5678|started-at|true|0\n", None
                 return 0, container_id, None
@@ -997,7 +1175,7 @@ async def test_credential_mount_rejects_replacement_after_final_process_identity
     runtime = DockerRuntime(
         RuntimeSpec(
             profile="managed_science",
-            image="openevo/science-runtime:0.1.0",
+            image="openevo/science-runtime:0.1.1",
             container_user="host",
         ),
         "credential-final-race-session",
@@ -1020,7 +1198,11 @@ async def test_credential_mount_rejects_replacement_after_final_process_identity
             if not container_present:
                 return 1, None, f"Error: No such object: {container_id}"
             if any("json .Mounts" in str(value) for value in args):
-                return 0, _credential_mount_inspect_output(authority), None
+                return (
+                    0,
+                    _credential_mount_inspect_output(authority, runtime),
+                    None,
+                )
             if any("State.Pid" in str(value) for value in args):
                 process_inspects += 1
                 if process_inspects == 2:
@@ -1084,15 +1266,16 @@ async def test_managed_image_admission_checks_only_exact_immutable_reference(
 ) -> None:
     release = MANAGED_RUNTIME_RELEASES["managed_science"]
     inspected: list[str] = []
+    environments: list[dict[str, str]] = []
 
-    async def create_process(*args, **_kwargs):
+    async def create_process(*args, **kwargs):
         inspected.append(args[-1])
+        environments.append(kwargs["env"])
         return _InspectProcess(
             returncode=0,
             stdout=json.dumps([_managed_image_record(release.trusted_digest)]).encode("utf-8"),
         )
 
-    monkeypatch.setattr(docker_module.shutil, "which", lambda *_args, **_kwargs: "/docker")
     monkeypatch.setattr(docker_module.asyncio, "create_subprocess_exec", create_process)
     spec = RuntimeSpec(
         profile="managed_science",
@@ -1103,6 +1286,7 @@ async def test_managed_image_admission_checks_only_exact_immutable_reference(
     await verify_managed_runtime_image_admission(spec)
 
     assert inspected == [release.trusted_digest]
+    assert environments == [docker_cli_environment()]
 
 
 @pytest.mark.asyncio
@@ -1128,7 +1312,6 @@ async def test_managed_image_tag_mutation_does_not_affect_synchronous_admission(
             stdout=json.dumps([_managed_image_record("sha256:" + "1" * 64)]).encode("utf-8"),
         )
 
-    monkeypatch.setattr(docker_module.shutil, "which", lambda *_args, **_kwargs: "/docker")
     monkeypatch.setattr(docker_module.asyncio, "create_subprocess_exec", create_process)
     spec = RuntimeSpec(
         profile="managed_science",
@@ -1155,7 +1338,7 @@ async def test_managed_image_drift_fails_before_credential_mount_or_create(
     runtime = DockerRuntime(
         RuntimeSpec(
             profile="managed_science",
-            image="openevo/science-runtime:0.1.0",
+            image="openevo/science-runtime:0.1.1",
             container_user="host",
         ),
         "drifted-science-session",
@@ -2019,7 +2202,7 @@ def test_container_user_rejects_unknown_modes(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="container_user"):
         DockerRuntime(
             RuntimeSpec(
-                image="openevo/science-runtime:0.1.0",
+                image="openevo/science-runtime:0.1.1",
                 container_user="root",  # type: ignore[arg-type]
             ),
             "science-session",
@@ -2032,7 +2215,7 @@ def test_runtime_spec_rejects_custom_entrypoint() -> None:
         RuntimeSpec.model_validate(
             {
                 "profile": "managed_science",
-                "image": "openevo/science-runtime:0.1.0",
+                "image": "openevo/science-runtime:0.1.1",
                 "container_user": "host",
                 "entrypoint": ["/bin/sh"],
             }

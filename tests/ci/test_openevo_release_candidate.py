@@ -49,8 +49,8 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
 
     assert notes.endswith("\n")
     assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
-    assert "openevo-science-runtime-0.1.0-linux-amd64.tar.gz" in notes
-    assert "Managed Science runtime source asset ID: 478167627." in notes
+    assert "openevo-science-runtime-0.1.1-linux-amd64.tar.gz" in notes
+    assert "Managed Science runtime source asset ID: 481361975." in notes
     assert "Credential-canary verification for release assets: pending." in notes
     assert "Local Desktop data under ~/.openevo/desktop is retained" in notes
     assert "org.openevo.desktop" in notes
@@ -184,9 +184,7 @@ def test_candidate_manifest_rejects_extra_or_contradictory_release_claims(
 
 def _draft_release_metadata(*, body: str) -> dict[str, object]:
     return {
-        "apiUrl": (
-            "https://api.github.com/repos/CompLifeLab-ZJU/OpenEvo/releases/354404740"
-        ),
+        "apiUrl": ("https://api.github.com/repos/CompLifeLab-ZJU/OpenEvo/releases/356072935"),
         "body": body,
         "isDraft": True,
         "isPrerelease": True,
@@ -194,8 +192,7 @@ def _draft_release_metadata(*, body: str) -> dict[str, object]:
         "tagName": "openevo-desktop-v0.1.0-exhibition.123.2",
         "targetCommitish": "8e45af371eef49a86530a849041f7dcf047620ec",
         "url": (
-            "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/"
-            "untagged-7a9ca728f876fa16a90d"
+            "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/untagged-7a9ca728f876fa16a90d"
         ),
     }
 
@@ -236,20 +233,23 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         str(release_id),
     ]
 
-    assert candidate.validate_draft_release_metadata(
-        metadata,
-        release_notes=notes,
-        expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
-        expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
-        expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
-        expected_repository="CompLifeLab-ZJU/OpenEvo",
-        expected_owner="d" * 32,
-    ) == []
+    assert (
+        candidate.validate_draft_release_metadata(
+            metadata,
+            release_notes=notes,
+            expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+            expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
+            expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+            expected_repository="CompLifeLab-ZJU/OpenEvo",
+            expected_owner="d" * 32,
+        )
+        == []
+    )
     assert candidate.main(validation_arguments) == 0
-    assert release_id.read_text(encoding="ascii") == "354404740\n"
+    assert release_id.read_text(encoding="ascii") == "356072935\n"
     assert release_id.stat().st_mode & 0o777 == 0o600
     assert candidate.main(validation_arguments) == 1
-    assert release_id.read_text(encoding="ascii") == "354404740\n"
+    assert release_id.read_text(encoding="ascii") == "356072935\n"
 
 
 @pytest.mark.parametrize(
@@ -263,7 +263,7 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         ("targetCommitish", "f" * 40),
         (
             "apiUrl",
-            "https://api.github.com/repos/attacker/unrelated/releases/354404740",
+            "https://api.github.com/repos/attacker/unrelated/releases/356072935",
         ),
         (
             "apiUrl",
@@ -319,10 +319,13 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         registry_digest="a" * 64,
     )
 
-    assert candidate.validate_candidate_manifest(
-        manifest,
-        expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
-    ) == []
+    assert (
+        candidate.validate_candidate_manifest(
+            manifest,
+            expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        )
+        == []
+    )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     assert payload["schema_version"] == 4
     assert payload["release"] == {
@@ -341,9 +344,9 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     }
     by_role = {entry["role"]: entry for entry in payload["files"]}
     assert by_role["desktop_dmg"]["filename"] == paths["dmg"].name
-    assert by_role["core_wheel"]["sha256"] == hashlib.sha256(
-        paths["wheel"].read_bytes()
-    ).hexdigest()
+    assert (
+        by_role["core_wheel"]["sha256"] == hashlib.sha256(paths["wheel"].read_bytes()).hexdigest()
+    )
     assert by_role["framework_lock"]["filename"] == "framework-lock.json"
     assert by_role["daemon_bundle"]["filename"] == candidate.DAEMON_BUNDLE_NAME
     assert by_role["daemon_manifest"]["filename"] == candidate.DAEMON_MANIFEST_NAME
@@ -368,9 +371,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "token_level_metrics_available": False,
     }
     assert "self-deployed" not in json.dumps(payload["managed_runtime"])
-    descriptor = json.loads(
-        (tmp_path / "core-install-artifact.json").read_text(encoding="utf-8")
-    )
+    descriptor = json.loads((tmp_path / "core-install-artifact.json").read_text(encoding="utf-8"))
     assert descriptor["artifact"] == by_role["core_wheel"]
     assert descriptor["framework_lock"] == by_role["framework_lock"]
     assert descriptor["source_commit"] == payload["source_commit"]
@@ -640,9 +641,7 @@ def test_candidate_manifest_rejects_mismatched_dmg_mach_o_slices(tmp_path: Path)
             registry_digest="a" * 64,
         )
     except candidate.CandidateError as exc:
-        assert str(exc) == (
-            "Mounted-DMG app and detached-copy Mach-O evidence do not match"
-        )
+        assert str(exc) == ("Mounted-DMG app and detached-copy Mach-O evidence do not match")
     else:
         raise AssertionError("mismatched detached-copy Mach-O slices must fail closed")
 
@@ -848,10 +847,7 @@ def _write_candidate_inputs(
     with ZipFile(wheel, "w") as archive:
         archive.writestr(
             "openevo-0.1.0.dist-info/METADATA",
-            "Metadata-Version: 2.4\n"
-            "Name: openevo\n"
-            "Version: 0.1.0\n"
-            "Requires-Python: >=3.11\n\n",
+            "Metadata-Version: 2.4\nName: openevo\nVersion: 0.1.0\nRequires-Python: >=3.11\n\n",
         )
         archive.writestr(
             "openevo-0.1.0.dist-info/entry_points.txt",

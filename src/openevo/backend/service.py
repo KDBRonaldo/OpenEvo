@@ -68,6 +68,8 @@ _PIDFD_SYSCALL_NUMBERS = {
 class CoreServiceErrorCode(StrEnum):
     INVALID_ROOT = "core_service_root_invalid"
     IDENTITY_MISMATCH = "core_service_identity_mismatch"
+    PREDECESSOR_MISMATCH = "core_service_predecessor_mismatch"
+    UPDATE_REQUIRED = "core_service_update_required"
     PORT_UNAVAILABLE = "core_service_port_unavailable"
     START_FAILED = "core_service_start_failed"
     STATUS_INVALID = "core_service_status_invalid"
@@ -113,10 +115,129 @@ class CoreServiceAttachment:
     status_proof: str
     attached: bool
     _bearer: SecretStr = field(repr=False, compare=False)
+    bundle_sha256: str | None = None
+    canonical_manifest_sha256: str | None = None
+    lifecycle_compatibility: int | None = None
 
     @property
     def bearer_token(self) -> str:
         return self._bearer.get_secret_value()
+
+
+@dataclass(frozen=True, slots=True)
+class CoreServicePredecessor:
+    state: str
+    generation: str | None
+    release_identity: str | None
+    bundle_sha256: str | None
+    canonical_manifest_sha256: str | None
+    lifecycle_compatibility: int | None
+
+    def __post_init__(self) -> None:
+        absent = (
+            self.state == "absent"
+            and self.generation is None
+            and self.release_identity is None
+            and self.bundle_sha256 is None
+            and self.canonical_manifest_sha256 is None
+            and self.lifecycle_compatibility is None
+        )
+        legacy = (
+            self.state == "legacy"
+            and isinstance(self.generation, str)
+            and re.fullmatch(r"[0-9a-f]{32}", self.generation) is not None
+            and isinstance(self.release_identity, str)
+            and re.fullmatch(r"[0-9a-f]{64}", self.release_identity) is not None
+            and self.bundle_sha256 is None
+            and self.canonical_manifest_sha256 is None
+            and self.lifecycle_compatibility == 1
+        )
+        running = (
+            self.state == "running"
+            and isinstance(self.generation, str)
+            and re.fullmatch(r"[0-9a-f]{32}", self.generation) is not None
+            and isinstance(self.release_identity, str)
+            and re.fullmatch(r"[0-9a-f]{64}", self.release_identity) is not None
+            and isinstance(self.bundle_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", self.bundle_sha256) is not None
+            and isinstance(self.canonical_manifest_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", self.canonical_manifest_sha256) is not None
+            and type(self.lifecycle_compatibility) is int
+            and self.lifecycle_compatibility >= 2
+        )
+        if not absent and not legacy and not running:
+            raise ValueError("Core service predecessor identity is invalid.")
+
+    @classmethod
+    def absent(cls) -> CoreServicePredecessor:
+        return cls(
+            state="absent",
+            generation=None,
+            release_identity=None,
+            bundle_sha256=None,
+            canonical_manifest_sha256=None,
+            lifecycle_compatibility=None,
+        )
+
+    @classmethod
+    def legacy(
+        cls,
+        *,
+        generation: str,
+        release_identity: str,
+    ) -> CoreServicePredecessor:
+        return cls(
+            state="legacy",
+            generation=generation,
+            release_identity=release_identity,
+            bundle_sha256=None,
+            canonical_manifest_sha256=None,
+            lifecycle_compatibility=1,
+        )
+
+    @classmethod
+    def running(
+        cls,
+        *,
+        generation: str,
+        release_identity: str,
+        bundle_sha256: str | None = None,
+        canonical_manifest_sha256: str | None = None,
+        lifecycle_compatibility: int | None = None,
+    ) -> CoreServicePredecessor:
+        if (
+            bundle_sha256 is None
+            and canonical_manifest_sha256 is None
+            and lifecycle_compatibility is None
+        ):
+            return cls.legacy(
+                generation=generation,
+                release_identity=release_identity,
+            )
+        return cls(
+            state="running",
+            generation=generation,
+            release_identity=release_identity,
+            bundle_sha256=bundle_sha256,
+            canonical_manifest_sha256=canonical_manifest_sha256,
+            lifecycle_compatibility=lifecycle_compatibility,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class CoreDaemonBundleIdentity:
+    bundle_sha256: str
+    canonical_manifest_sha256: str
+    lifecycle_compatibility: int
+
+    def __post_init__(self) -> None:
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", self.bundle_sha256) is None
+            or re.fullmatch(r"[0-9a-f]{64}", self.canonical_manifest_sha256) is None
+            or type(self.lifecycle_compatibility) is not int
+            or self.lifecycle_compatibility < 2
+        ):
+            raise ValueError("Core Daemon bundle identity is invalid.")
 
 
 class CoreServiceEndpoint(Protocol):
@@ -361,12 +482,26 @@ def ensure_core_service(
     port: int = 0,
     deadline_seconds: float = 45.0,
     replace_mismatched: bool = False,
+    expected_predecessor: CoreServicePredecessor | None = None,
+    daemon_bundle_identity: CoreDaemonBundleIdentity | None = None,
     process_controller: LinuxProcessController | None = None,
     _fault_injector: Callable[[str, int], None] | None = None,
     _bootstrap_lock_fd: int | None = None,
 ) -> CoreServiceAttachment:
     _retry_orphaned_service_children()
-    if not 0 <= port <= 65535 or deadline_seconds <= 0 or deadline_seconds > 300:
+    if (
+        not 0 <= port <= 65535
+        or deadline_seconds <= 0
+        or deadline_seconds > 300
+        or (
+            expected_predecessor is not None
+            and not isinstance(expected_predecessor, CoreServicePredecessor)
+        )
+        or (
+            daemon_bundle_identity is not None
+            and not isinstance(daemon_bundle_identity, CoreDaemonBundleIdentity)
+        )
+    ):
         raise CoreServiceError(
             CoreServiceErrorCode.START_FAILED,
             "Core service startup settings are invalid.",
@@ -409,9 +544,79 @@ def ensure_core_service(
                     port=port,
                     deadline=deadline,
                     replace_mismatched=replace_mismatched,
+                    expected_predecessor=expected_predecessor,
+                    daemon_bundle_identity=daemon_bundle_identity,
                     controller=controller,
                     fault_injector=_fault_injector,
                 )
+            finally:
+                os.close(lifecycle_lock_fd)
+        finally:
+            os.close(bootstrap_lock_fd)
+
+
+def observe_core_service_predecessor(
+    *,
+    service_root: str | Path,
+    deadline_seconds: float = 15.0,
+    process_controller: LinuxProcessController | None = None,
+) -> CoreServicePredecessor:
+    if not 0 < deadline_seconds <= 300:
+        raise CoreServiceError(
+            CoreServiceErrorCode.START_FAILED,
+            "Core service observation settings are invalid.",
+            retryable=False,
+        )
+    deadline = time.monotonic() + deadline_seconds
+    try:
+        require_host_global_service_root(service_root)
+        root = HostServiceRoot(service_root)
+    except (OSError, RuntimeIdentityError) as exc:
+        raise CoreServiceError(
+            CoreServiceErrorCode.INVALID_ROOT,
+            "Core service root failed private ownership validation.",
+            retryable=False,
+        ) from exc
+    with root:
+        root.ensure_directory("state")
+        controller = process_controller or LinuxProcessController()
+        bootstrap_lock_fd = root.open_lock("bootstrap.lock")
+        try:
+            _flock_until(bootstrap_lock_fd, deadline)
+            lifecycle_lock_fd = root.open_lock("lifecycle.lock")
+            try:
+                _flock_until(lifecycle_lock_fd, deadline)
+                value = root.read_optional_json(_LEDGER_NAME)
+                if value is None:
+                    _recover_pending(root, controller=controller, deadline=deadline)
+                    return CoreServicePredecessor.absent()
+                state = _require_service_state(value)
+                if state.get("state") == "stopped":
+                    return CoreServicePredecessor.absent()
+                ledger = state
+                process = _process_from_ledger(ledger)
+                if not controller.is_alive(process):
+                    if _is_exact_daemon_ledger(ledger):
+                        root.atomic_write_json(
+                            _LEDGER_NAME,
+                            _floor_from_ledger(ledger),
+                            replace=True,
+                        )
+                    else:
+                        root.unlink_regular(_LEDGER_NAME)
+                    root.unlink_regular(_READY_NAME)
+                    root.unlink_regular(_PENDING_NAME)
+                    return CoreServicePredecessor.absent()
+                bearer = load_or_create_core_bearer_token(root)
+                proof = _authenticated_status_proof(
+                    port=ledger["port"],
+                    bearer=bearer,
+                    release=_release_from_ledger(ledger),
+                    generation=ledger["generation"],
+                    deadline=deadline,
+                )
+                _verify_ready_ledger(root, ledger, proof)
+                return _predecessor_from_ledger(ledger)
             finally:
                 os.close(lifecycle_lock_fd)
         finally:
@@ -464,8 +669,9 @@ def stop_core_service(
     service_root: str | Path,
     deadline_seconds: float = 15.0,
     process_controller: LinuxProcessController | None = None,
+    preserve_compatibility_floor: bool = False,
 ) -> None:
-    if not 0 < deadline_seconds <= 300:
+    if not 0 < deadline_seconds <= 300 or type(preserve_compatibility_floor) is not bool:
         raise CoreServiceError(
             CoreServiceErrorCode.START_FAILED,
             "Core service stop settings are invalid.",
@@ -491,12 +697,21 @@ def stop_core_service(
                 _flock_until(lifecycle_lock_fd, deadline)
                 ledger = root.read_optional_json(_LEDGER_NAME)
                 if ledger is not None:
-                    identity = _process_from_ledger(_require_ledger(ledger))
-                    if controller.is_alive(identity):
-                        controller.terminate(identity, deadline=deadline)
+                    state = _require_service_state(ledger)
+                    if state.get("state", "running") == "running":
+                        identity = _process_from_ledger(state)
+                        if controller.is_alive(identity):
+                            controller.terminate(identity, deadline=deadline)
+                        if preserve_compatibility_floor or _is_exact_daemon_ledger(state):
+                            root.atomic_write_json(
+                                _LEDGER_NAME,
+                                _floor_from_ledger(state),
+                                replace=True,
+                            )
+                        else:
+                            root.unlink_regular(_LEDGER_NAME)
                 else:
                     _recover_pending(root, controller=controller, deadline=deadline)
-                root.unlink_regular(_LEDGER_NAME)
                 root.unlink_regular(_READY_NAME)
                 root.unlink_regular(_PENDING_NAME)
             finally:
@@ -546,7 +761,10 @@ def stop_core_service_if_generation(
                 value = root.read_optional_json(_LEDGER_NAME)
                 if value is None:
                     return False
-                ledger = _require_ledger(value)
+                state = _require_service_state(value)
+                if state.get("state") == "stopped":
+                    return False
+                ledger = state
                 if (
                     ledger["generation"] != expected_generation
                     or ledger["release_identity"] != expected_release_identity
@@ -555,7 +773,14 @@ def stop_core_service_if_generation(
                 identity = _process_from_ledger(ledger)
                 if controller.is_alive(identity):
                     controller.terminate(identity, deadline=deadline)
-                root.unlink_regular(_LEDGER_NAME)
+                if _is_exact_daemon_ledger(ledger):
+                    root.atomic_write_json(
+                        _LEDGER_NAME,
+                        _floor_from_ledger(ledger),
+                        replace=True,
+                    )
+                else:
+                    root.unlink_regular(_LEDGER_NAME)
                 root.unlink_regular(_READY_NAME)
                 root.unlink_regular(_PENDING_NAME)
                 return True
@@ -732,52 +957,106 @@ def _ensure_locked(
     port: int,
     deadline: float,
     replace_mismatched: bool,
+    expected_predecessor: CoreServicePredecessor | None,
+    daemon_bundle_identity: CoreDaemonBundleIdentity | None,
     controller: LinuxProcessController,
     fault_injector: Callable[[str, int], None] | None = None,
 ) -> CoreServiceAttachment:
     bearer = load_or_create_core_bearer_token(root)
     existing_value = root.read_optional_json(_LEDGER_NAME)
+    floor: dict[str, Any] | None = None
     if existing_value is None:
         _recover_pending(root, controller=controller, deadline=deadline)
     if existing_value is not None:
-        ledger = _require_ledger(existing_value)
-        process = _process_from_ledger(ledger)
-        alive = controller.is_alive(process)
-        matching = ledger["release_identity"] == release.digest
-        if alive and matching:
-            if port not in {0, ledger["port"]}:
-                raise CoreServiceError(
-                    CoreServiceErrorCode.PORT_UNAVAILABLE,
-                    "Core service already owns a different loopback port.",
-                    retryable=False,
+        state = _require_service_state(existing_value)
+        if state.get("state") == "stopped":
+            floor = state
+            if expected_predecessor is not None:
+                _require_predecessor_match(
+                    expected=expected_predecessor,
+                    actual=CoreServicePredecessor.absent(),
                 )
-            proof = _authenticated_status_proof(
-                port=ledger["port"],
-                bearer=bearer,
-                release=release,
-                generation=ledger["generation"],
-                deadline=deadline,
-            )
-            _verify_ready_ledger(root, ledger, proof)
+            _require_floor_compatibility(floor, daemon_bundle_identity)
+            root.unlink_regular(_READY_NAME)
             root.unlink_regular(_PENDING_NAME)
-            return _attachment_from_ledger(
-                ledger,
-                bearer=bearer,
-                status_proof=proof,
-                attached=True,
-            )
-        if not matching:
-            if alive and not replace_mismatched:
-                raise CoreServiceError(
-                    CoreServiceErrorCode.IDENTITY_MISMATCH,
-                    "A different verified Core release is already running.",
-                    retryable=False,
-                )
+        else:
+            ledger = state
+            process = _process_from_ledger(ledger)
+            alive = controller.is_alive(process)
+            if not alive and _is_exact_daemon_ledger(ledger):
+                floor = _floor_from_ledger(ledger)
+                root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
+                root.unlink_regular(_READY_NAME)
+                root.unlink_regular(_PENDING_NAME)
+            elif not alive:
+                root.unlink_regular(_LEDGER_NAME)
+                root.unlink_regular(_READY_NAME)
+                root.unlink_regular(_PENDING_NAME)
             if alive:
+                actual_predecessor = _predecessor_from_ledger(ledger)
+                if daemon_bundle_identity is not None:
+                    _require_predecessor_match(
+                        expected=expected_predecessor,
+                        actual=actual_predecessor,
+                    )
+                matching = _service_identity_matches(
+                    ledger,
+                    release=release,
+                    daemon_bundle_identity=daemon_bundle_identity,
+                )
+                if matching:
+                    if port not in {0, ledger["port"]}:
+                        raise CoreServiceError(
+                            CoreServiceErrorCode.PORT_UNAVAILABLE,
+                            "Core service already owns a different loopback port.",
+                            retryable=False,
+                        )
+                    proof = _authenticated_status_proof(
+                        port=ledger["port"],
+                        bearer=bearer,
+                        release=release,
+                        generation=ledger["generation"],
+                        deadline=deadline,
+                    )
+                    _verify_ready_ledger(root, ledger, proof)
+                    root.unlink_regular(_PENDING_NAME)
+                    return _attachment_from_ledger(
+                        ledger,
+                        bearer=bearer,
+                        status_proof=proof,
+                        attached=True,
+                    )
+                if daemon_bundle_identity is not None:
+                    raise CoreServiceError(
+                        CoreServiceErrorCode.UPDATE_REQUIRED,
+                        "A different OpenEvo Daemon bundle is already running; stop it "
+                        "explicitly before a compatible upgrade.",
+                        retryable=False,
+                    )
+                if not replace_mismatched:
+                    raise CoreServiceError(
+                        CoreServiceErrorCode.IDENTITY_MISMATCH,
+                        "A different verified Core release is already running.",
+                        retryable=False,
+                    )
+                _require_predecessor_match(
+                    expected=expected_predecessor,
+                    actual=actual_predecessor,
+                )
                 controller.terminate(process, deadline=deadline)
-        root.unlink_regular(_LEDGER_NAME)
-        root.unlink_regular(_READY_NAME)
-        root.unlink_regular(_PENDING_NAME)
+                root.unlink_regular(_LEDGER_NAME)
+                root.unlink_regular(_READY_NAME)
+                root.unlink_regular(_PENDING_NAME)
+        if floor is not None and expected_predecessor is not None:
+            _require_predecessor_match(
+                expected=expected_predecessor,
+                actual=CoreServicePredecessor.absent(),
+            )
+    elif expected_predecessor is not None:
+        _require_predecessor_match(
+            expected=expected_predecessor,
+            actual=CoreServicePredecessor.absent(),
+        )
 
     _require_time(deadline)
     bearer = rotate_core_bearer_token(root)
@@ -893,16 +1172,27 @@ def _ensure_locked(
             generation=generation,
             deadline=deadline,
         )
-        ready_ledger = {
-            "schema_version": 1,
+        ready_ledger: dict[str, object] = {
+            "schema_version": 1 if daemon_bundle_identity is None else 2,
             "generation": generation,
             "release_identity": release.digest,
             "registry_digest": release.registry_digest,
             "status_proof": proof,
         }
+        if daemon_bundle_identity is not None:
+            ready_ledger.update(
+                {
+                    "bundle_sha256": daemon_bundle_identity.bundle_sha256,
+                    "canonical_manifest_sha256": (
+                        daemon_bundle_identity.canonical_manifest_sha256
+                    ),
+                    "lifecycle_compatibility": (daemon_bundle_identity.lifecycle_compatibility),
+                }
+            )
         ready_digest = hashlib.sha256(canonical_json_bytes(ready_ledger)).hexdigest()
-        ledger = {
-            "schema_version": 1,
+        ledger: dict[str, object] = {
+            "schema_version": 2 if daemon_bundle_identity is None else 3,
+            "state": "running" if daemon_bundle_identity is not None else None,
             "release_identity": release.digest,
             "registry_digest": release.registry_digest,
             "framework_lock_sha256": release.framework_lock_sha256,
@@ -914,8 +1204,20 @@ def _ensure_locked(
             "generation": generation,
             "ready_sha256": ready_digest,
         }
+        if daemon_bundle_identity is None:
+            ledger.pop("state")
+        else:
+            ledger.update(
+                {
+                    "bundle_sha256": daemon_bundle_identity.bundle_sha256,
+                    "canonical_manifest_sha256": (
+                        daemon_bundle_identity.canonical_manifest_sha256
+                    ),
+                    "lifecycle_compatibility": (daemon_bundle_identity.lifecycle_compatibility),
+                }
+            )
         root.atomic_write_json(_READY_NAME, ready_ledger, replace=False)
-        root.atomic_write_json(_LEDGER_NAME, ledger, replace=False)
+        root.atomic_write_json(_LEDGER_NAME, ledger, replace=floor is not None)
         root.unlink_regular(_PENDING_NAME)
         if not controller.is_alive(process):
             raise CoreServiceError(
@@ -937,7 +1239,10 @@ def _ensure_locked(
                 _retain_orphaned_service_child(child)
         if child_exit_confirmed:
             try:
-                root.unlink_regular(_LEDGER_NAME)
+                if floor is None:
+                    root.unlink_regular(_LEDGER_NAME)
+                else:
+                    root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
                 root.unlink_regular(_READY_NAME)
                 root.unlink_regular(_PENDING_NAME)
             except Exception:
@@ -1194,13 +1499,20 @@ def _verify_ready_ledger(
     proof: str,
 ) -> None:
     ready = root.read_json(_READY_NAME, max_bytes=_MAX_READY_BYTES)
-    if not isinstance(ready, dict) or set(ready) != {
+    legacy_keys = {
         "schema_version",
         "generation",
         "release_identity",
         "registry_digest",
         "status_proof",
-    }:
+    }
+    exact_keys = legacy_keys | {
+        "bundle_sha256",
+        "canonical_manifest_sha256",
+        "lifecycle_compatibility",
+    }
+    expected_keys = exact_keys if _is_exact_daemon_ledger(ledger) else legacy_keys
+    if not isinstance(ready, dict) or set(ready) != expected_keys:
         raise CoreServiceError(
             CoreServiceErrorCode.STATE_INVALID,
             "Core service readiness state is invalid.",
@@ -1208,12 +1520,20 @@ def _verify_ready_ledger(
         )
     digest = hashlib.sha256(canonical_json_bytes(ready)).hexdigest()
     if (
-        ready.get("schema_version") != 1
+        ready.get("schema_version") != (2 if _is_exact_daemon_ledger(ledger) else 1)
         or ready.get("generation") != ledger["generation"]
         or ready.get("release_identity") != ledger["release_identity"]
         or ready.get("registry_digest") != ledger["registry_digest"]
         or ready.get("status_proof") != proof
         or digest != ledger["ready_sha256"]
+        or (
+            _is_exact_daemon_ledger(ledger)
+            and (
+                ready.get("bundle_sha256") != ledger["bundle_sha256"]
+                or ready.get("canonical_manifest_sha256") != ledger["canonical_manifest_sha256"]
+                or ready.get("lifecycle_compatibility") != ledger["lifecycle_compatibility"]
+            )
+        )
     ):
         raise CoreServiceError(
             CoreServiceErrorCode.STATE_INVALID,
@@ -1419,17 +1739,89 @@ def claim_core_service_spawn(
 
 def _read_ledger(root: HostServiceRoot) -> dict[str, Any]:
     try:
-        return _require_ledger(root.read_json(_LEDGER_NAME))
+        state = _require_service_state(root.read_json(_LEDGER_NAME))
     except FileNotFoundError as exc:
         raise CoreServiceError(
             CoreServiceErrorCode.STATUS_INVALID,
             "Core service is not running.",
             retryable=True,
         ) from exc
+    if state.get("state") == "stopped":
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATUS_INVALID,
+            "Core service is not running.",
+            retryable=True,
+        )
+    return state
+
+
+def _predecessor_from_ledger(ledger: dict[str, Any]) -> CoreServicePredecessor:
+    if not _is_exact_daemon_ledger(ledger):
+        return CoreServicePredecessor.legacy(
+            generation=ledger["generation"],
+            release_identity=ledger["release_identity"],
+        )
+    return CoreServicePredecessor.running(
+        generation=ledger["generation"],
+        release_identity=ledger["release_identity"],
+        bundle_sha256=ledger["bundle_sha256"],
+        canonical_manifest_sha256=ledger["canonical_manifest_sha256"],
+        lifecycle_compatibility=ledger["lifecycle_compatibility"],
+    )
+
+
+def _require_predecessor_match(
+    *,
+    expected: CoreServicePredecessor | None,
+    actual: CoreServicePredecessor,
+) -> None:
+    if expected != actual:
+        raise CoreServiceError(
+            CoreServiceErrorCode.PREDECESSOR_MISMATCH,
+            "Core service changed after activation observed its predecessor.",
+            retryable=True,
+        )
+
+
+def _require_service_state(value: Any) -> dict[str, Any]:
+    if (
+        isinstance(value, dict)
+        and value.get("schema_version") == 3
+        and value.get("state") == "stopped"
+    ):
+        keys = {
+            "schema_version",
+            "state",
+            "release_identity",
+            "bundle_sha256",
+            "canonical_manifest_sha256",
+            "lifecycle_compatibility",
+        }
+        if set(value) != keys:
+            _raise_invalid_service_state()
+        for key in ("release_identity", "bundle_sha256", "canonical_manifest_sha256"):
+            item = value.get(key)
+            if item is not None and (
+                not isinstance(item, str) or re.fullmatch(r"[0-9a-f]{64}", item) is None
+            ):
+                _raise_invalid_service_state()
+        compatibility = value.get("lifecycle_compatibility")
+        if type(compatibility) is not int or not 1 <= compatibility <= 2**31 - 1:
+            _raise_invalid_service_state()
+        if compatibility == 1:
+            if (
+                value["bundle_sha256"] is not None
+                or value["canonical_manifest_sha256"] is not None
+            ):
+                _raise_invalid_service_state()
+        elif value["bundle_sha256"] is None or value["canonical_manifest_sha256"] is None:
+            _raise_invalid_service_state()
+        return value
+    return _require_ledger(value)
 
 
 def _require_ledger(value: Any) -> dict[str, Any]:
-    keys = {
+    legacy_keys = {
         "schema_version",
         "release_identity",
         "registry_digest",
@@ -1442,12 +1834,21 @@ def _require_ledger(value: Any) -> dict[str, Any]:
         "generation",
         "ready_sha256",
     }
-    if not isinstance(value, dict) or set(value) != keys or value.get("schema_version") != 1:
-        raise CoreServiceError(
-            CoreServiceErrorCode.STATE_INVALID,
-            "Core service lifecycle state is invalid.",
-            retryable=False,
-        )
+    exact_keys = legacy_keys | {
+        "state",
+        "bundle_sha256",
+        "canonical_manifest_sha256",
+        "lifecycle_compatibility",
+    }
+    schema_version = value.get("schema_version") if isinstance(value, dict) else None
+    expected_keys = exact_keys if schema_version == 3 else legacy_keys
+    if (
+        not isinstance(value, dict)
+        or set(value) != expected_keys
+        or schema_version not in {1, 2, 3}
+        or (schema_version == 3 and value.get("state") != "running")
+    ):
+        _raise_invalid_service_state()
     for key in (
         "release_identity",
         "registry_digest",
@@ -1455,11 +1856,17 @@ def _require_ledger(value: Any) -> dict[str, Any]:
         "ready_sha256",
     ):
         if not isinstance(value[key], str) or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None:
-            raise CoreServiceError(
-                CoreServiceErrorCode.STATE_INVALID,
-                "Core service lifecycle state is invalid.",
-                retryable=False,
-            )
+            _raise_invalid_service_state()
+    if schema_version == 3:
+        for key in ("bundle_sha256", "canonical_manifest_sha256"):
+            if (
+                not isinstance(value.get(key), str)
+                or re.fullmatch(r"[0-9a-f]{64}", value[key]) is None
+            ):
+                _raise_invalid_service_state()
+        compatibility = value.get("lifecycle_compatibility")
+        if type(compatibility) is not int or not 2 <= compatibility <= 2**31 - 1:
+            _raise_invalid_service_state()
     if (
         not isinstance(value["source_commit"], str)
         or re.fullmatch(r"[0-9a-f]{40}", value["source_commit"]) is None
@@ -1468,15 +1875,85 @@ def _require_ledger(value: Any) -> dict[str, Any]:
         or not isinstance(value["generation"], str)
         or re.fullmatch(r"[0-9a-f]{32}", value["generation"]) is None
     ):
-        raise CoreServiceError(
-            CoreServiceErrorCode.STATE_INVALID,
-            "Core service lifecycle state is invalid.",
-            retryable=False,
-        )
+        _raise_invalid_service_state()
     _required_int(value, "pid", minimum=1)
     _required_int(value, "start_time_ticks", minimum=1)
     _required_int(value, "port", minimum=1, maximum=65535)
     return value
+
+
+def _raise_invalid_service_state() -> None:
+    raise CoreServiceError(
+        CoreServiceErrorCode.STATE_INVALID,
+        "Core service lifecycle state is invalid.",
+        retryable=False,
+    )
+
+
+def _is_exact_daemon_ledger(ledger: dict[str, Any]) -> bool:
+    return ledger.get("schema_version") == 3 and ledger.get("state") == "running"
+
+
+def _floor_from_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
+    if _is_exact_daemon_ledger(ledger):
+        return {
+            "schema_version": 3,
+            "state": "stopped",
+            "release_identity": ledger["release_identity"],
+            "bundle_sha256": ledger["bundle_sha256"],
+            "canonical_manifest_sha256": ledger["canonical_manifest_sha256"],
+            "lifecycle_compatibility": ledger["lifecycle_compatibility"],
+        }
+    return {
+        "schema_version": 3,
+        "state": "stopped",
+        "release_identity": ledger["release_identity"],
+        "bundle_sha256": None,
+        "canonical_manifest_sha256": None,
+        "lifecycle_compatibility": 1,
+    }
+
+
+def _require_floor_compatibility(
+    floor: dict[str, Any],
+    candidate: CoreDaemonBundleIdentity | None,
+) -> None:
+    if candidate is None:
+        raise CoreServiceError(
+            CoreServiceErrorCode.UPDATE_REQUIRED,
+            "This service root requires a compatible OpenEvo Daemon bundle.",
+            retryable=False,
+        )
+    floor_compatibility = floor["lifecycle_compatibility"]
+    exact = (
+        candidate.lifecycle_compatibility == floor_compatibility
+        and candidate.bundle_sha256 == floor["bundle_sha256"]
+        and candidate.canonical_manifest_sha256 == floor["canonical_manifest_sha256"]
+    )
+    if candidate.lifecycle_compatibility <= floor_compatibility and not exact:
+        raise CoreServiceError(
+            CoreServiceErrorCode.UPDATE_REQUIRED,
+            "The OpenEvo Daemon bundle does not satisfy the persisted no-downgrade floor.",
+            retryable=False,
+        )
+
+
+def _service_identity_matches(
+    ledger: dict[str, Any],
+    *,
+    release: CoreReleaseIdentity,
+    daemon_bundle_identity: CoreDaemonBundleIdentity | None,
+) -> bool:
+    if ledger["release_identity"] != release.digest:
+        return False
+    if daemon_bundle_identity is None:
+        return not _is_exact_daemon_ledger(ledger)
+    return (
+        _is_exact_daemon_ledger(ledger)
+        and ledger["bundle_sha256"] == daemon_bundle_identity.bundle_sha256
+        and ledger["canonical_manifest_sha256"] == daemon_bundle_identity.canonical_manifest_sha256
+        and ledger["lifecycle_compatibility"] == daemon_bundle_identity.lifecycle_compatibility
+    )
 
 
 def _process_from_ledger(ledger: dict[str, Any]) -> ProcessIdentity:
@@ -1512,6 +1989,9 @@ def _attachment_from_ledger(
         status_proof=status_proof,
         attached=attached,
         _bearer=SecretStr(bearer),
+        bundle_sha256=ledger.get("bundle_sha256"),
+        canonical_manifest_sha256=ledger.get("canonical_manifest_sha256"),
+        lifecycle_compatibility=ledger.get("lifecycle_compatibility"),
     )
 
 
@@ -1864,13 +2344,16 @@ __all__ = [
     "claim_core_service_spawn",
     "consume_core_service_attachment",
     "CoreServiceAttachment",
+    "CoreDaemonBundleIdentity",
     "CoreServiceError",
     "CoreServiceErrorCode",
+    "CoreServicePredecessor",
     "LinuxProcessController",
     "LockIdentity",
     "ProcessIdentity",
     "ensure_core_service",
     "inspect_core_service",
+    "observe_core_service_predecessor",
     "stop_core_service",
     "stop_core_service_if_generation",
 ]

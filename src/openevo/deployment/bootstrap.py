@@ -27,6 +27,7 @@ from openevo.deployment.preflight import (
 )
 from openevo.deployment.redaction import sanitize_remote_text
 from openevo.runtime.managed import (
+    MANAGED_CODEX_NPM_PACKAGE,
     ManagedRuntimeImageRelease,
     managed_runtime_image_release,
 )
@@ -36,14 +37,12 @@ if TYPE_CHECKING:
 
 
 _MANAGED_RUNTIME_BASE_IMAGE = (
-    "node:22-bookworm-slim@"
-    "sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3"
+    "node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3"
 )
 _MANAGED_RUNTIME_PYTHON_IMAGE = (
     "python:3.12-slim-bookworm@"
     "sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b"
 )
-_MANAGED_RUNTIME_CODEX_PACKAGE = "@openai/codex@0.121.0"
 _DOCKER_PROXY_BUILD_ARGS = (
     "ALL_PROXY",
     "HTTP_PROXY",
@@ -209,11 +208,7 @@ class RemoteBootstrapReport(_StrictFrozenModel):
     @classmethod
     def _ignore_dumped_computed_fields(cls, value):
         if isinstance(value, dict):
-            return {
-                key: item
-                for key, item in value.items()
-                if key not in {"ready", "status"}
-            }
+            return {key: item for key, item in value.items() if key not in {"ready", "status"}}
         return value
 
     @field_validator("remote_profile_id", "project_name", "task_id")
@@ -338,9 +333,7 @@ def build_remote_bootstrap_plan(
                         if managed_runtime_release is None
                         else managed_runtime_release.trusted_digest
                     ),
-                    managed_runtime_mode=(
-                        managed_runtime_mode if is_managed_runtime else None
-                    ),
+                    managed_runtime_mode=(managed_runtime_mode if is_managed_runtime else None),
                     hf_model=hf_model,
                 ),
             ),
@@ -375,9 +368,7 @@ def build_remote_bootstrap_plan(
                 manifest={
                     "image": runtime_image,
                     "managed_runtime": is_managed_runtime,
-                    "managed_runtime_mode": (
-                        managed_runtime_mode if is_managed_runtime else None
-                    ),
+                    "managed_runtime_mode": (managed_runtime_mode if is_managed_runtime else None),
                     "trusted_digest": (
                         None
                         if managed_runtime_release is None
@@ -448,8 +439,7 @@ def ensure_remote_openevo_cli_step(
         command = _openevo_exact_version_check_command(
             expected,
             no_wheel_message=(
-                f"Remote OpenEvo Core must be {expected}; "
-                "no bundled wheel was available"
+                f"Remote OpenEvo Core must be {expected}; no bundled wheel was available"
             ),
         )
     else:
@@ -512,10 +502,7 @@ def execute_remote_bootstrap_plan(
     executions: list[RemoteBootstrapStepExecution] = []
     for step in plan.steps:
         execution = _execute_bootstrap_step(step, transport)
-        if (
-            step.id == "ensure_openevo_cli"
-            and execution.status == RemoteBootstrapStepStatus.PASS
-        ):
+        if step.id == "ensure_openevo_cli" and execution.status == RemoteBootstrapStepStatus.PASS:
             execution = _verify_remote_openevo_cli_version(
                 step,
                 execution,
@@ -589,12 +576,8 @@ def _runtime_image_command(
     state_root: str,
     proxy_env: Mapping[str, str],
 ) -> str:
-    inherited_proxy_keys = tuple(
-        key for key in _DOCKER_PROXY_BUILD_ARGS if key not in proxy_env
-    )
-    unset_proxy = (
-        "unset " + " ".join(inherited_proxy_keys) if inherited_proxy_keys else ":"
-    )
+    inherited_proxy_keys = tuple(key for key in _DOCKER_PROXY_BUILD_ARGS if key not in proxy_env)
+    unset_proxy = "unset " + " ".join(inherited_proxy_keys) if inherited_proxy_keys else ":"
     if managed_runtime_release is None:
         return f"{unset_proxy}\ndocker pull {shlex.quote(runtime_image)}"
 
@@ -604,9 +587,7 @@ def _runtime_image_command(
         _slugify(runtime_image),
     )
     dockerfile_path = posixpath.join(context_dir, "Dockerfile")
-    build_args = " ".join(
-        f"--build-arg {arg_name}" for arg_name in _DOCKER_PROXY_BUILD_ARGS
-    )
+    build_args = " ".join(f"--build-arg {arg_name}" for arg_name in _DOCKER_PROXY_BUILD_ARGS)
     image_ref = shlex.quote(managed_runtime_release.image)
     immutable_ref = shlex.quote(managed_runtime_release.immutable_reference)
     commands = [unset_proxy]
@@ -697,9 +678,9 @@ COPY --from=node /usr/local/ /usr/local/
 
 ENV DEBIAN_FRONTEND=noninteractive \\
     HOME=/home/openevo \\
-    NPM_CONFIG_PREFIX=/home/openevo/.local \\
+    NPM_CONFIG_PREFIX=/opt/codex \\
     NPM_CONFIG_UPDATE_NOTIFIER=false \\
-    PATH=/home/openevo/.local/bin:${{PATH}}
+    PATH=/opt/codex/bin:${{PATH}}
 
 LABEL io.openevo.managed-runtime="true"
 
@@ -714,19 +695,22 @@ RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' \\
         git \\
         python-is-python3 \\
         rsync \\
-        sudo \\
         tmux \\
     && rm -rf /var/lib/apt/lists/*
 
+RUN npm install -g {MANAGED_CODEX_NPM_PACKAGE} \\
+    && npm cache clean --force \\
+    && rm -rf /home/openevo/.npm \\
+    && chown -R root:root /opt/codex \\
+    && chmod -R go-w /opt/codex
+
 RUN useradd -m -s /bin/bash openevo \\
-    && echo 'openevo ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers \\
-    && mkdir -p /openevo/session/workspace /home/openevo/.local \\
+    && mkdir -p /openevo/session/workspace \\
     && chown -R openevo:openevo /openevo/session /home/openevo
 
-RUN echo 'export PATH=/home/openevo/.local/bin:$PATH' > /etc/profile.d/openevo-path.sh
+RUN echo 'export PATH=/opt/codex/bin:$PATH' > /etc/profile.d/openevo-path.sh
 
 USER openevo
-RUN npm install -g {_MANAGED_RUNTIME_CODEX_PACKAGE}
 
 WORKDIR /openevo/session/workspace
 """
@@ -818,8 +802,7 @@ def _openevo_exact_version_check_command(
     no_wheel_message: str | None = None,
 ) -> str:
     mismatch_message = (
-        no_wheel_message
-        or f"Remote OpenEvo Core must be {expected_version}; found {{found}}"
+        no_wheel_message or f"Remote OpenEvo Core must be {expected_version}; found {{found}}"
     )
     return "\n".join(
         [
@@ -914,11 +897,7 @@ def _execute_bootstrap_step(
             stderr=_sanitize_bootstrap_text(result.stderr, step.env),
         )
 
-    status = (
-        RemoteBootstrapStepStatus.FAIL
-        if step.required
-        else RemoteBootstrapStepStatus.WARN
-    )
+    status = RemoteBootstrapStepStatus.FAIL if step.required else RemoteBootstrapStepStatus.WARN
     return RemoteBootstrapStepExecution(
         id=step.id,
         kind=step.kind,
@@ -955,9 +934,7 @@ def _verify_remote_openevo_cli_version(
         return execution.model_copy(
             update={
                 "status": RemoteBootstrapStepStatus.FAIL,
-                "message": (
-                    f"Remote OpenEvo Core must be {expected_version}; found unknown."
-                ),
+                "message": (f"Remote OpenEvo Core must be {expected_version}; found unknown."),
                 "return_code": None,
                 "stderr": _join_sanitized(execution.stderr, message),
             }
@@ -984,9 +961,7 @@ def _verify_remote_openevo_cli_version(
     return execution.model_copy(
         update={
             "status": RemoteBootstrapStepStatus.FAIL,
-            "message": (
-                f"Remote OpenEvo Core must be {expected_version}; found {found_label}."
-            ),
+            "message": (f"Remote OpenEvo Core must be {expected_version}; found {found_label}."),
             "return_code": result.return_code,
             "stdout": _join_sanitized(execution.stdout, stdout),
             "stderr": _join_sanitized(execution.stderr, stderr),
@@ -1025,9 +1000,7 @@ def _verify_remote_openevo_cli_entrypoint(
     version_stdout = _sanitize_bootstrap_text(version_result.stdout, step.env)
     version_stderr = _sanitize_bootstrap_text(version_result.stderr, step.env)
     cli_version = (
-        _parse_openevo_cli_version_probe_stdout(version_result.stdout)
-        if version_result.ok
-        else ""
+        _parse_openevo_cli_version_probe_stdout(version_result.stdout) if version_result.ok else ""
     )
     if not version_result.ok or cli_version != expected_version:
         return execution.model_copy(

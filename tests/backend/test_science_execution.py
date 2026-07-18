@@ -70,7 +70,7 @@ def _binding(
     )
     return ServiceRunBinding(
         execution_mode=execution_mode,
-        runtime_image="openevo/science-runtime:0.1.0",
+        runtime_image="openevo/science-runtime:0.1.1",
         runtime_image_immutable_reference=(
             MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
         ),
@@ -116,9 +116,7 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     assert execution.execution_profile.execution_mode == "subscription"
     assert execution.execution_profile.capture_mode == "transcript"
     assert execution.task_id.startswith("science-")
-    assert execution.submitted_task_id == (
-        f"{execution.task_id}--run-run-public-1--round-0"
-    )
+    assert execution.submitted_task_id == (f"{execution.task_id}--run-run-public-1--round-0")
 
 
 @pytest.mark.parametrize("field", ["profile", "container_user"])

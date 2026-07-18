@@ -207,11 +207,11 @@ jobs:
       - name: Download and verify controlled managed subscription runtime asset
         env:
           GH_TOKEN: ${{ github.token }}
-          RUNTIME_RELEASE_ID: "354404740"
-          RUNTIME_ASSET_ID: "478167627"
-          RUNTIME_ASSET_NAME: openevo-science-runtime-0.1.0-linux-amd64.tar.gz
-          RUNTIME_ASSET_SIZE: "374592823"
-          RUNTIME_ASSET_SHA256: 7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a
+          RUNTIME_RELEASE_ID: "356072935"
+          RUNTIME_ASSET_ID: "481361975"
+          RUNTIME_ASSET_NAME: openevo-science-runtime-0.1.1-linux-amd64.tar.gz
+          RUNTIME_ASSET_SIZE: "352236726"
+          RUNTIME_ASSET_SHA256: ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149
         run: |
           runtime_dir="$RUNNER_TEMP/openevo-managed-runtime"
           mkdir -m 700 "$runtime_dir"
@@ -543,11 +543,11 @@ jobs:
       - name: Redownload and bind the same managed subscription runtime source
         env:
           GH_TOKEN: ${{ github.token }}
-          RUNTIME_RELEASE_ID: "354404740"
-          RUNTIME_ASSET_ID: "478167627"
-          RUNTIME_ASSET_NAME: openevo-science-runtime-0.1.0-linux-amd64.tar.gz
-          RUNTIME_ASSET_SIZE: "374592823"
-          RUNTIME_ASSET_SHA256: 7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a
+          RUNTIME_RELEASE_ID: "356072935"
+          RUNTIME_ASSET_ID: "481361975"
+          RUNTIME_ASSET_NAME: openevo-science-runtime-0.1.1-linux-amd64.tar.gz
+          RUNTIME_ASSET_SIZE: "352236726"
+          RUNTIME_ASSET_SHA256: ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149
         run: |
           runtime_dir="$RUNNER_TEMP/openevo-managed-runtime-linux"
           mkdir -m 700 "$runtime_dir"

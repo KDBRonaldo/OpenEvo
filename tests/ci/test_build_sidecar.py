@@ -211,9 +211,9 @@ def test_managed_runtime_archive_contract_is_exact_and_rejects_tamper(
 ) -> None:
     builder = _load_builder()
     release = builder.MANAGED_RUNTIME_ARCHIVE_RELEASE
-    assert release.filename == ("openevo-science-runtime-0.1.0-linux-amd64.tar.gz")
-    assert release.byte_size == 374_592_823
-    assert release.sha256 == ("7d022f2e62cbc50b0cfb909bb09755cde42f5b540513ad2c9dadaf96d629598a")
+    assert release.filename == ("openevo-science-runtime-0.1.1-linux-amd64.tar.gz")
+    assert release.byte_size == 352_236_726
+    assert release.sha256 == ("ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149")
     archive = tmp_path / release.filename
     archive.write_bytes(b"managed subscription runtime")
     archive.chmod(0o600)
@@ -492,11 +492,12 @@ def test_daemon_manifest_must_bind_embedded_core_wheel_and_lock(tmp_path: Path) 
 def test_core_wheel_and_lock_build_are_reproducible(tmp_path: Path) -> None:
     builder = _load_builder()
     repo = Path.cwd()
+    _, version = builder._project_identity(repo)
 
     first = builder._build_core_wheel(repo, tmp_path / "first")
     second = builder._build_core_wheel(repo, tmp_path / "second")
-    first_lock = builder._core_framework_lock_bytes(first, version="0.1.0")
-    second_lock = builder._core_framework_lock_bytes(second, version="0.1.0")
+    first_lock = builder._core_framework_lock_bytes(first, version=version)
+    second_lock = builder._core_framework_lock_bytes(second, version=version)
 
     assert first.read_bytes() == second.read_bytes()
     assert first_lock == second_lock
@@ -613,17 +614,15 @@ def test_product_web_policy_rejects_every_non_release_provider_kind() -> None:
         Path("desktop/packaging/product-web-policy.json").read_text(encoding="utf-8")
     )
 
-    assert {"contract_simulator", "scaffold", "dry_run"}.issubset(
-        policy["forbidden_text"]
-    )
+    assert {"contract_simulator", "scaffold", "dry_run"}.issubset(policy["forbidden_text"])
     schemas = Path("desktop/src/api/v1/schemas.ts").read_text(encoding="utf-8")
     assert '["dry", "run"].join("_")' not in schemas
 
 
 def test_packaged_product_graph_excludes_non_release_provider_code() -> None:
-    release_schema = Path(
-        "desktop/src/api/v1/providerKinds.release.ts"
-    ).read_text(encoding="utf-8")
+    release_schema = Path("desktop/src/api/v1/providerKinds.release.ts").read_text(
+        encoding="utf-8"
+    )
     vite_config = Path("desktop/vite.config.ts").read_text(encoding="utf-8")
     packaged_text = "\n".join(
         path.read_text(encoding="utf-8")
@@ -758,9 +757,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
                 if destination == "openevo/runtime-assets"
             ]
             assert runtime_data == (
-                [(runtime_archive, "openevo/runtime-assets")]
-                if release_build
-                else []
+                [(runtime_archive, "openevo/runtime-assets")] if release_build else []
             )
             daemon_data = sorted(
                 (Path(source_value), destination)
@@ -894,8 +891,7 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     utils_header.write_text(builder._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
     wscript = source_root / "bootloader/wscript"
     wscript.write_text(
-        builder._BOOTLOADER_DARWIN_LIB_NEEDLE
-        + builder._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+        builder._BOOTLOADER_DARWIN_LIB_NEEDLE + builder._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
         encoding="utf-8",
     )
 
@@ -915,10 +911,7 @@ def test_fd_bound_bootloader_patch_is_exact_and_cross_platform(
     assert "pyi_utils_openevo_native_handoff_prepare()" in patched
     assert "pyi_utils_openevo_native_handoff_finish()" in patched
     assert "F_DUPFD" in patched_utils
-    assert (
-        "dup2(openevo_listener_guard_fd, OPENEVO_NATIVE_LISTENER_FD)"
-        in patched_utils
-    )
+    assert "dup2(openevo_listener_guard_fd, OPENEVO_NATIVE_LISTENER_FD)" in patched_utils
     assert "dup2(openevo_archive_guard_fd, OPENEVO_NATIVE_ARCHIVE_FD)" in patched_utils
     assert "FD_CLOEXEC" in patched_utils
     assert "SO_ACCEPTCONN" in patched_utils
@@ -959,8 +952,7 @@ def test_fd_bound_bootloader_rejections_emit_closed_startup_diagnostics(
     utils_header.write_text(builder._BOOTLOADER_UTILS_HEADER_NEEDLE, encoding="utf-8")
     wscript = source_root / "bootloader/wscript"
     wscript.write_text(
-        builder._BOOTLOADER_DARWIN_LIB_NEEDLE
-        + builder._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
+        builder._BOOTLOADER_DARWIN_LIB_NEEDLE + builder._BOOTLOADER_PROGRAM_LIBS_NEEDLE,
         encoding="utf-8",
     )
 

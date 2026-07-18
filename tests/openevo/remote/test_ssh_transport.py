@@ -263,9 +263,7 @@ def _core_runtime_authority() -> CorePythonRuntimeAuthority:
     }
     canonical = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
     return CorePythonRuntimeAuthority(
-        authority_id=hashlib.sha256(
-            b"openevo-core-python-runtime-v1\0" + canonical
-        ).hexdigest(),
+        authority_id=hashlib.sha256(b"openevo-core-python-runtime-v1\0" + canonical).hexdigest(),
         executable_path=str(values["executable_path"]),
         executable_sha256=str(values["executable_sha256"]),
         device=1,
@@ -306,8 +304,7 @@ def _runtime_prepare(transfer_id: str) -> SecretStr:
                 "incoming_device": 1,
                 "incoming_inode": 3,
                 "incoming_root": (
-                    "/home/alice/.openevo/core/managed-runtime-staging/incoming-"
-                    + transfer_id
+                    "/home/alice/.openevo/core/managed-runtime-staging/incoming-" + transfer_id
                 ),
                 "schema_version": 1,
                 "service_root": "/home/alice/.openevo/core",
@@ -2450,7 +2447,7 @@ def test_source_birth_launcher_uses_platform_bound_execution_target() -> None:
     assert "os.stat(argv[0], follow_symlinks=True)" in launcher
     assert 'if sys.platform == "darwin":\n    execution_path = argv[0]' in launcher
     assert 'elif sys.platform.startswith("linux"):' in launcher
-    assert "execution_path = f\"/dev/fd/{executable_fd}\"" in launcher
+    assert 'execution_path = f"/dev/fd/{executable_fd}"' in launcher
     assert "os.execve(execution_path, argv, environment)" in launcher
 
 
@@ -3854,9 +3851,9 @@ def test_recovered_observer_detects_exit_before_retryable_group_cleanup(
         deadline = time.monotonic() + 3
         while True:
             if os.path.isfile(f"/proc/{process.pid}/stat"):
-                leader_state = ssh_module._read_proc_process_group_states(
+                leader_state = ssh_module._read_proc_process_group_states(process.pid).get(
                     process.pid
-                ).get(process.pid)
+                )
             else:
                 identity = ssh_module._read_ps_process_group_states().get(process.pid)
                 leader_state = None if identity is None else identity[1]
@@ -4025,9 +4022,7 @@ def test_group_signal_skips_kill_when_only_zombie_members_remain(
     monkeypatch.setattr(
         ssh_module.os,
         "killpg",
-        lambda process_group_id, signal_number: signals.append(
-            (process_group_id, signal_number)
-        ),
+        lambda process_group_id, signal_number: signals.append((process_group_id, signal_number)),
     )
 
     ssh_module._signal_owned_process_group(
@@ -4383,7 +4378,7 @@ def test_managed_runtime_existing_image_is_idempotent_without_archive_read(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    archive = tmp_path / "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
     release = write_test_managed_runtime_archive(archive)
     monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
     archive.unlink()
@@ -4416,7 +4411,7 @@ def test_managed_runtime_threads_cancellation_through_probe_upload_and_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    archive = tmp_path / "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
     release = write_test_managed_runtime_archive(archive)
     monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
     transport = _transport(tmp_path)
@@ -4465,7 +4460,7 @@ def test_managed_runtime_transfer_failure_discards_exact_remote_stage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    archive = tmp_path / "openevo-science-runtime-0.1.0-linux-amd64.tar.gz"
+    archive = tmp_path / "openevo-science-runtime-0.1.1-linux-amd64.tar.gz"
     release = write_test_managed_runtime_archive(archive)
     monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
     transport = _transport(tmp_path)
