@@ -995,6 +995,10 @@ class DockerRuntime(BaseRuntime):
             )
         if self.spec.container_user == "host":
             create_args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+            # Docker creates a missing image WORKDIR as root before switching
+            # to --user. Start at the existing session root so preparation can
+            # create the managed workspace with the host user's ownership.
+            create_args.extend(["--workdir", self.runtime_session_dir])
         if not self.spec.allow_internet:
             create_args.extend(["--network", "none"])
         elif self.spec.network:

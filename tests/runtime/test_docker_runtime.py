@@ -30,6 +30,7 @@ from openevo.runtime.docker_host import (
 )
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
+    MANAGED_RUNTIME_IMAGES,
     MANAGED_RUNTIME_RELEASES,
     ManagedCredentialMount,
 )
@@ -585,6 +586,7 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
     ]
     assert str(runtime._ownership_dir) not in volume_sources
     assert ("--user", f"{host_uid}:{host_uid + 1}") == create[6:8]
+    assert create[8:10] == ("--workdir", runtime.runtime_session_dir)
     assert all("chmod" not in call.args for call in run_command.await_args_list)
     assert all(call.args[-2:] != ("id", "-u") for call in run_command.await_args_list)
 
@@ -604,6 +606,47 @@ async def test_host_user_mode_sets_the_container_uid_without_permission_widening
 
     assert all("a+rwX" not in call.args for call in run_command.await_args_list)
     assert all("chmod" not in call.args for call in run_command.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_image_user_mode_preserves_the_image_workdir(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "2" * 64
+    runtime = DockerRuntime(
+        RuntimeSpec(image="custom-runtime:latest"),
+        "image-user-session",
+        tmp_path,
+    )
+    inspect_count = 0
+
+    async def run_command_impl(*args, **kwargs):
+        nonlocal inspect_count
+        del kwargs
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id + "\n", None
+        if args[1:3] == ("container", "inspect"):
+            inspect_count += 1
+            if inspect_count < 3:
+                return 0, container_id + "\n", None
+            return 1, None, f"Error: No such object: {container_id}"
+        if args[1:3] == ("exec", "--user"):
+            return 0, None, None
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+    monkeypatch.setattr(runtime, "_detect_chmod_needed", AsyncMock(return_value=False))
+
+    await runtime.start()
+
+    create = run_command.await_args_list[0].args
+    assert "--user" not in create
+    assert "--workdir" not in create
+
+    await runtime.stop()
 
 
 @pytest.mark.asyncio
@@ -980,6 +1023,7 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     assert "--security-opt=no-new-privileges:true" in create
     assert "--security-opt=seccomp=unconfined" in create
     assert "--security-opt=apparmor=unconfined" in create
+    assert create[create.index("--workdir") + 1] == runtime.runtime_session_dir
     assert not credential_dir.is_relative_to(session_dir)
 
 
@@ -2082,6 +2126,73 @@ async def test_real_docker_name_collision_preserves_running_external_container(
             check=False,
             capture_output=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_real_docker_host_user_creates_managed_workspace_as_host(
+    tmp_path: Path,
+) -> None:
+    if os.geteuid() == 0:
+        _real_docker_unavailable("workspace ownership probe requires a non-root host user")
+    if shutil.which("docker") is None:
+        _real_docker_unavailable("docker CLI is unavailable")
+    image_name = MANAGED_RUNTIME_IMAGES["managed_science"]
+    image = subprocess.run(
+        ["docker", "image", "inspect", image_name],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if image.returncode != 0:
+        _real_docker_unavailable(
+            f"required managed runtime image is unavailable: {image_name}"
+        )
+
+    session_dir = tmp_path / "managed-workspace-session"
+    session_dir.mkdir()
+    authority = session_dir / "authority"
+    authority.write_text("shared\n", encoding="ascii")
+    shared = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--mount",
+            f"type=bind,source={session_dir},target=/probe,readonly",
+            image_name,
+            "test",
+            "-f",
+            "/probe/authority",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if shared.returncode != 0:
+        _real_docker_unavailable(
+            "Docker daemon cannot observe the test process session filesystem"
+        )
+
+    runtime = DockerRuntime(
+        RuntimeSpec(image=image_name, container_user="host"),
+        f"workspace-owner-{uuid.uuid4().hex[:16]}",
+        session_dir,
+    )
+    try:
+        await runtime.start()
+        workspace = session_dir / "workspace"
+        assert not workspace.exists()
+
+        created = await runtime.exec(
+            "mkdir -p /openevo/session/workspace && "
+            "stat -c '%u:%g' /openevo/session/workspace"
+        )
+        assert created.return_code == 0, created.stderr
+        assert created.stdout is not None
+        assert created.stdout.strip() == f"{os.getuid()}:{os.getgid()}"
+    finally:
+        if runtime.container_id is not None and not runtime.absence_proven:
+            await runtime.stop()
 
 
 @pytest.mark.asyncio
