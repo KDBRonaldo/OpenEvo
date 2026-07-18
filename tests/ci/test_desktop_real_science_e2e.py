@@ -138,6 +138,7 @@ def test_arguments_require_the_complete_exact_asset_triplet() -> None:
         sidecar=Path("sidecar"),
         core_wheel=None,
         framework_lock=None,
+        managed_runtime_archive=Path("runtime.tar"),
         structural_check=False,
         host="compute.example.org",
         user="researcher",
@@ -146,6 +147,147 @@ def test_arguments_require_the_complete_exact_asset_triplet() -> None:
 
     with pytest.raises(module.E2EFailure, match="release_asset_triplet_required"):
         module._validate_runtime_arguments(args)
+
+
+def test_arguments_require_managed_runtime_archive_for_real_e2e() -> None:
+    module = _load_runner()
+    args = argparse.Namespace(
+        sidecar=Path("sidecar"),
+        core_wheel=Path("openevo.whl"),
+        framework_lock=Path("framework-lock.json"),
+        managed_runtime_archive=None,
+        structural_check=False,
+        host="compute.example.org",
+        port=22,
+        user="researcher",
+        expected_host_key_fingerprint="SHA256:" + "A" * 43 + "=",
+    )
+
+    with pytest.raises(module.E2EFailure, match="managed_runtime_archive_required"):
+        module._validate_runtime_arguments(args)
+
+
+def test_local_build_is_release_build_with_managed_runtime_archive(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_runner()
+    runtime_archive = tmp_path / "managed-runtime.tar"
+    runtime_archive.write_bytes(b"runtime")
+    built_sidecar = tmp_path / "built-sidecar"
+    built_sidecar.write_bytes(b"sidecar")
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 1234
+
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
+        captured["command"] = command
+        output = Path(command[command.index("--core-wheel-output-dir") + 1])
+        output.mkdir(parents=True)
+        wheel = output / "openevo-0.1.0-py3-none-any.whl"
+        wheel.write_bytes(b"wheel")
+        (output / "framework-lock.json").write_bytes(b"lock")
+        build_log = kwargs["stdout"]
+        build_log.write(f"{built_sidecar}\n".encode())  # type: ignore[union-attr]
+        build_log.flush()  # type: ignore[union-attr]
+        return FakeProcess()
+
+    def fake_inspect(
+        sidecar: Path,
+        wheel: Path,
+        lock: Path,
+        archive: Path,
+    ):
+        captured["inspected"] = (sidecar, wheel, lock, archive)
+        return module.ReleaseAssets(sidecar, wheel, lock, archive, {})
+
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(module.os, "getpgid", lambda _pid: FakeProcess.pid)
+    monkeypatch.setattr(module, "_wait_for_build_process_group", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(module, "_inspect_release_assets", fake_inspect)
+
+    assets = module._build_assets(
+        tmp_path / "build",
+        runtime_archive,
+        timeout_seconds=1,
+    )
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert command[command.index("--managed-runtime-archive") + 1] == str(
+        runtime_archive.resolve()
+    )
+    assert command.count("--release-build") == 1
+    assert assets.managed_runtime_archive == runtime_archive.resolve()
+    assert captured["inspected"][-1] == runtime_archive.resolve()  # type: ignore[index]
+
+
+def test_external_assets_bind_exact_embedded_managed_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_runner()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    sidecar.write_bytes(b"sidecar")
+    sidecar.chmod(0o700)
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    runtime_archive = tmp_path / "managed-runtime.tar"
+    _write_wheel(wheel)
+    _write_lock(lock, wheel)
+    runtime_archive.write_bytes(b"exact-runtime")
+    runtime_digest = hashlib.sha256(runtime_archive.read_bytes()).hexdigest()
+    calls: list[tuple[object, ...]] = []
+
+    class FakeBuilder:
+        @staticmethod
+        def _validate_managed_runtime_archive(archive: Path) -> tuple[int, str]:
+            calls.append(("runtime", archive))
+            return archive.stat().st_size, runtime_digest
+
+        @staticmethod
+        def _validate_fd_bound_bootloader(executable: Path) -> None:
+            calls.append(("bootloader", executable))
+
+        @staticmethod
+        def _validate_embedded_core_wheel(executable: Path, core_wheel: Path) -> None:
+            calls.append(("wheel", executable, core_wheel))
+
+        @staticmethod
+        def _validate_embedded_core_framework_lock(
+            executable: Path,
+            core_wheel: Path,
+            framework_lock: Path,
+            *,
+            version: str,
+        ) -> None:
+            calls.append(("lock", executable, core_wheel, framework_lock, version))
+
+        @staticmethod
+        def _validate_embedded_managed_runtime_archive(
+            executable: Path,
+            archive: Path,
+        ) -> None:
+            calls.append(("embedded_runtime", executable, archive))
+
+    monkeypatch.setattr(module, "_load_sidecar_builder", lambda: FakeBuilder())
+
+    assets = module._inspect_release_assets(
+        sidecar,
+        wheel,
+        lock,
+        runtime_archive,
+    )
+
+    assert ("runtime", runtime_archive) in calls
+    assert ("embedded_runtime", sidecar, runtime_archive) in calls
+    assert assets.evidence["managed_runtime_archive"] == {
+        "sha256": runtime_digest,
+        "byte_size": runtime_archive.stat().st_size,
+    }
+    assert assets.evidence["exact_embedded_assets_verified"] is True
+    module._audit_evidence(assets.evidence, private_values=())
 
 
 def test_successor_reuse_requires_the_second_real_session_pin() -> None:
@@ -277,9 +419,7 @@ def test_successor_reuse_rejects_session_one_consuming_its_own_output() -> None:
             {
                 "id": f"artifact-session-2-{target_id}",
                 "target_id": target_id,
-                "lineage": {
-                    "source_artifact_ids": [f"artifact-session-1-{target_id}"]
-                },
+                "lineage": {"source_artifact_ids": [f"artifact-session-1-{target_id}"]},
             }
             for target_id in module.REQUIRED_TARGET_IDS
         ),

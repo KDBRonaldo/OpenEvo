@@ -101,6 +101,7 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "sidecar",
         "core_wheel",
         "framework_lock",
+        "managed_runtime_archive",
         "sha256",
         "byte_size",
         "filename",
@@ -224,6 +225,7 @@ class ReleaseAssets:
     sidecar: Path
     wheel: Path
     framework_lock: Path
+    managed_runtime_archive: Path
     evidence: dict[str, object]
 
 
@@ -1094,15 +1096,10 @@ class DesktopScienceWorkflow:
         own_output_ids = set(first_artifact_ids.values())
         if any(
             isinstance(item, dict)
-            and (
-                item.get("artifact_id") in own_output_ids
-                or item.get("revision") == successor
-            )
+            and (item.get("artifact_id") in own_output_ids or item.get("revision") == successor)
             for item in first_context_artifacts
         ):
-            raise E2EFailure(
-                "successor_reuse", "first_session_consumed_own_successor"
-            )
+            raise E2EFailure("successor_reuse", "first_session_consumed_own_successor")
         context_artifacts = second.context.get("artifacts")
         if not isinstance(context_artifacts, list):
             raise E2EFailure("successor_reuse", "second_context_invalid")
@@ -1199,14 +1196,23 @@ class DesktopScienceWorkflow:
         return f"real-science-e2e-{self._nonce}-{action}"
 
 
-def _build_assets(root: Path, *, timeout_seconds: float) -> ReleaseAssets:
+def _build_assets(
+    root: Path,
+    managed_runtime_archive: Path,
+    *,
+    timeout_seconds: float,
+) -> ReleaseAssets:
     root.mkdir(parents=True, exist_ok=True)
     output = root / "core-release-assets"
+    managed_runtime_archive = Path(os.path.abspath(managed_runtime_archive))
     command = [
         sys.executable,
         str(REPOSITORY_ROOT / "desktop/packaging/build_sidecar.py"),
         "--core-wheel-output-dir",
         str(output),
+        "--managed-runtime-archive",
+        str(managed_runtime_archive),
+        "--release-build",
     ]
     with TemporaryFile(mode="w+b") as build_log:
         process = subprocess.Popen(
@@ -1242,14 +1248,20 @@ def _build_assets(root: Path, *, timeout_seconds: float) -> ReleaseAssets:
     lock = output / "framework-lock.json"
     if len(wheels) != 1:
         raise E2EFailure("release_assets", "built_wheel_inventory_invalid")
-    return _inspect_release_assets(sidecar, wheels[0], lock)
+    return _inspect_release_assets(sidecar, wheels[0], lock, managed_runtime_archive)
 
 
-def _inspect_release_assets(sidecar: Path, wheel: Path, lock: Path) -> ReleaseAssets:
+def _inspect_release_assets(
+    sidecar: Path,
+    wheel: Path,
+    lock: Path,
+    managed_runtime_archive: Path,
+) -> ReleaseAssets:
     for item, code in (
         (sidecar, "packaged_sidecar_invalid"),
         (wheel, "core_wheel_invalid"),
         (lock, "framework_lock_invalid"),
+        (managed_runtime_archive, "managed_runtime_archive_invalid"),
     ):
         if item.is_symlink() or not item.is_file() or not stat.S_ISREG(item.stat().st_mode):
             raise E2EFailure("release_assets", code)
@@ -1258,6 +1270,9 @@ def _inspect_release_assets(sidecar: Path, wheel: Path, lock: Path) -> ReleaseAs
     name, version, wheel_digest = _validate_wheel_lock(wheel, lock)
     builder = _load_sidecar_builder()
     try:
+        runtime_size, runtime_digest = builder._validate_managed_runtime_archive(
+            managed_runtime_archive
+        )
         builder._validate_fd_bound_bootloader(sidecar)
         builder._validate_embedded_core_wheel(sidecar, wheel)
         builder._validate_embedded_core_framework_lock(
@@ -1266,12 +1281,17 @@ def _inspect_release_assets(sidecar: Path, wheel: Path, lock: Path) -> ReleaseAs
             lock,
             version=version,
         )
+        builder._validate_embedded_managed_runtime_archive(
+            sidecar,
+            managed_runtime_archive,
+        )
     except Exception as exc:
         raise E2EFailure("release_assets", "packaged_assets_not_exact") from exc
     return ReleaseAssets(
         sidecar=sidecar,
         wheel=wheel,
         framework_lock=lock,
+        managed_runtime_archive=managed_runtime_archive,
         evidence={
             "sidecar": _file_evidence(sidecar),
             "core_wheel": {
@@ -1283,6 +1303,10 @@ def _inspect_release_assets(sidecar: Path, wheel: Path, lock: Path) -> ReleaseAs
             "framework_lock": {
                 **_file_evidence(lock),
                 "distribution_digest": wheel_digest,
+            },
+            "managed_runtime_archive": {
+                "sha256": runtime_digest,
+                "byte_size": runtime_size,
             },
             "exact_embedded_assets_verified": True,
         },
@@ -2066,6 +2090,8 @@ def _validate_runtime_arguments(args: argparse.Namespace) -> None:
         raise E2EFailure("arguments", "release_asset_triplet_required")
     if args.structural_check:
         return
+    if args.managed_runtime_archive is None:
+        raise E2EFailure("arguments", "managed_runtime_archive_required")
     if not args.host or not args.user or not args.expected_host_key_fingerprint:
         raise E2EFailure("arguments", "remote_identity_required")
     if not 1 <= args.port <= 65_535:
@@ -2103,6 +2129,13 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--sidecar", type=Path)
     parser.add_argument("--core-wheel", type=Path)
     parser.add_argument("--framework-lock", type=Path)
+    parser.add_argument(
+        "--managed-runtime-archive",
+        type=Path,
+        help=(
+            "Exact managed subscription Science runtime archive. Required for every real E2E run."
+        ),
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -2185,12 +2218,17 @@ def main(argv: list[str] | None = None) -> int:
         root = Path(temporary)
         try:
             if args.sidecar is None:
-                assets = _build_assets(root / "build", timeout_seconds=args.build_timeout_seconds)
+                assets = _build_assets(
+                    root / "build",
+                    args.managed_runtime_archive,
+                    timeout_seconds=args.build_timeout_seconds,
+                )
             else:
                 assets = _inspect_release_assets(
                     args.sidecar,
                     args.core_wheel,
                     args.framework_lock,
+                    args.managed_runtime_archive,
                 )
             evidence["release_assets"] = assets.evidence
             native = _launch_sidecar(assets.sidecar, root / "native")

@@ -14,6 +14,7 @@ Run on a supported macOS release-builder host with:
 - a Linux x86-64 remote host that satisfies the packaged Core preflight and can
   run the managed Docker runtime;
 - a working Codex subscription login for the remote user;
+- the exact managed subscription Science runtime archive for the release;
 - either an exact packaged sidecar/Core wheel/framework lock triplet or the
   complete local sidecar build toolchain.
 
@@ -32,18 +33,34 @@ uv run python scripts/e2e/desktop_real_science_e2e.py \
   --sidecar <packaged-sidecar> \
   --core-wheel <exact-core-wheel> \
   --framework-lock <exact-framework-lock> \
+  --managed-runtime-archive <exact-managed-runtime-archive> \
   --output desktop-real-science-e2e-evidence.json
 ```
 
 All three release-asset arguments are required together. Before launch, the
 runner checks the closed framework-lock schema, binds it to the wheel bytes,
 and uses the release builder's PyInstaller inspection to prove that the
-packaged sidecar embeds that exact wheel and lock.
+packaged sidecar embeds that exact wheel, lock, and managed runtime archive.
+The runtime archive is required for every non-structural run.
 
 Omit all three asset arguments to build a fresh packaged sidecar and export the
 exact embedded wheel/lock pair. That mode uses
 `desktop/packaging/build_sidecar.py`; it is not a substitute for candidate
 signing, DMG copy smoke, or clean-machine rehearsal.
+
+```bash
+uv run python scripts/e2e/desktop_real_science_e2e.py \
+  --host <remote-host> \
+  --port 22 \
+  --user <remote-user> \
+  --expected-host-key-fingerprint 'SHA256:<reviewed-fingerprint>' \
+  --managed-runtime-archive <exact-managed-runtime-archive> \
+  --output desktop-real-science-e2e-evidence.json
+```
+
+The local mode invokes the builder with `--managed-runtime-archive` and
+`--release-build`, so a development sidecar without the controlled runtime
+cannot be used as release E2E evidence.
 
 The runner always enables `text_memory`, `skill_bundle`, and `agent_system`.
 There is no target or method override. `agent_system` must expose the Core-owned
@@ -113,11 +130,12 @@ manufacture a successor/artifact observation.
 ## Evidence policy
 
 The output is canonical JSON, mode `0600`, and at most 128 KiB. It contains
-release digests, build identity, redacted remote identity digests, state/count
-inventories, revision generations/manifests, artifact metadata digests, the
-runtime-context receipt digest, session-1 exclusion and session-2 consumption
-booleans, and cleanup results. A closed field allowlist rejects every
-unrecognized evidence key.
+release digests and sizes including the validated managed runtime archive,
+build identity, redacted remote identity digests, state/count inventories,
+revision generations/manifests, artifact metadata digests, the runtime-context
+receipt digest, session-1 exclusion and session-2 consumption booleans, and
+cleanup results. A closed field allowlist rejects every unrecognized evidence
+key.
 
 It does not contain:
 
@@ -142,7 +160,8 @@ uv run pytest -q tests/ci/test_desktop_real_science_e2e.py
 
 `--structural-check` verifies only the frozen release contract shape and native
 launcher shape. It does not build assets, contact a remote host, launch the
-sidecar, or write evidence. Its success text explicitly states that E2E was not
-run. Unit tests use synthetic capability/revision/session documents and real
-local child processes only to test fail-closed assertions and cleanup; they
-never emit a passing E2E artifact or claim a real Codex/SSH session ran.
+sidecar, require the managed runtime archive or release-asset triplet, or write
+evidence. Its success text explicitly states that E2E was not run. Unit tests
+use synthetic capability/revision/session documents and real local child
+processes only to test fail-closed assertions and cleanup; they never emit a
+passing E2E artifact or claim a real Codex/SSH session ran.
