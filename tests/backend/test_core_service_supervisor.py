@@ -43,7 +43,7 @@ from openevo.gateway.session_files import (
     PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
 )
-from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.runtime.managed import MANAGED_CODEX_VERSION, MANAGED_RUNTIME_RELEASES
 from openevo.runtime.docker_host import (
     DOCKER_EXECUTABLE_PATH,
     DockerHostPathSpec,
@@ -312,7 +312,11 @@ class FakeProbeCommandRunner:
         if argv in self.results:
             return self.results[argv]
         if argv == ("codex", "--version"):
-            return ProbeCommandResult(0, b"codex-cli 1.2.3\n", b"")
+            return ProbeCommandResult(
+                0,
+                f"codex-cli {MANAGED_CODEX_VERSION}\n".encode(),
+                b"",
+            )
         if argv == ("codex", "login", "status"):
             return ProbeCommandResult(0, b"", b"Logged in using ChatGPT\n")
         if argv == (DOCKER_EXECUTABLE_PATH, "--version"):
@@ -2418,6 +2422,40 @@ def test_local_probe_rejects_empty_unbounded_or_malformed_codex_version(
     assert runner.calls == [("codex", "--version")]
 
 
+@pytest.mark.parametrize(
+    "version_result",
+    [
+        ProbeCommandResult(0, b"codex-cli 0.121.0\n", b""),
+        ProbeCommandResult(0, b"codex-cli 0.144.2\n", b""),
+        ProbeCommandResult(0, b"codex-cli 0.144.1-beta.1\n", b""),
+        ProbeCommandResult(0, b"codex 0.144.1\n", b""),
+    ],
+)
+def test_local_probe_rejects_codex_version_outside_managed_runtime_contract(
+    tmp_path: Path,
+    version_result: ProbeCommandResult,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
+    auth.chmod(0o600)
+    runner = FakeProbeCommandRunner(results={("codex", "--version"): version_result})
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.1",
+            codex_model="gpt-5.1-codex-mini",
+        ),
+        time.monotonic() + 1,
+    )
+
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE
+    assert runner.calls == [("codex", "--version")]
+
+
 def test_local_probe_rejects_stderr_only_version(
     tmp_path: Path,
 ) -> None:
@@ -2462,7 +2500,7 @@ def test_local_probe_retains_bounded_stderr_as_non_authoritative_evidence(
             results={
                 ("codex", "--version"): ProbeCommandResult(
                     0,
-                    b"codex-cli 1.2.3\n",
+                    f"codex-cli {MANAGED_CODEX_VERSION}\n".encode(),
                     stderr,
                 ),
             }
@@ -2491,7 +2529,7 @@ def test_local_probe_retains_bounded_stderr_as_non_authoritative_evidence(
         second.credential_authority.close()
 
 
-def test_local_probe_accepts_legal_semver_prerelease_and_build(tmp_path: Path) -> None:
+def test_local_probe_rejects_legal_semver_prerelease_and_build(tmp_path: Path) -> None:
     auth = tmp_path / "auth.json"
     auth.write_text('{"tokens":{"access_token":"private"}}', encoding="utf-8")
     auth.chmod(0o600)
@@ -2516,11 +2554,9 @@ def test_local_probe_accepts_legal_semver_prerelease_and_build(tmp_path: Path) -
         time.monotonic() + 1,
     )
 
-    try:
-        assert readiness.ready is True
-    finally:
-        assert readiness.credential_authority is not None
-        readiness.credential_authority.close()
+    assert readiness.ready is False
+    assert readiness.code is ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE
+    assert readiness.credential_authority is None
 
 
 def test_runtime_probe_exception_closes_held_credential_authority(

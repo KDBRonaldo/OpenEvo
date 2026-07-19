@@ -65,6 +65,7 @@ from openevo.gateway.session_files import (
     stage_codex_subscription_auth,
 )
 from openevo.runtime.managed import (
+    MANAGED_CODEX_VERSION,
     require_immutable_managed_runtime_image,
     verified_managed_runtime_image_reference,
 )
@@ -755,7 +756,11 @@ def _valid_codex_version(result: ProbeCommandResult) -> bool:
     line = stdout.removesuffix("\r\n").removesuffix("\n")
     if stdout not in {line, f"{line}\n", f"{line}\r\n"}:
         return False
-    return bool(line) and _CODEX_VERSION_RE.fullmatch(line) is not None
+    return (
+        bool(line)
+        and _CODEX_VERSION_RE.fullmatch(line) is not None
+        and line == f"codex-cli {MANAGED_CODEX_VERSION}"
+    )
 
 
 def _command_evidence(result: ProbeCommandResult) -> dict[str, object]:
