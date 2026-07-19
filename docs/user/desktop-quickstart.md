@@ -1,9 +1,9 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the `0.1.2` exhibition candidate. Follow it only after the
-`0.1.2` GitHub Release is public. The Preview publication workflow verifies the
-exact packaged applications and assets, but it does not establish the canonical
-two-session science gate or general host support.
+This guide describes the published `0.1.2` exhibition Preview. The Preview
+publication workflow verifies the exact packaged applications and assets, but
+it does not establish the canonical two-session science gate or general host
+support.
 
 ## Before You Start
 
@@ -24,10 +24,10 @@ a runtime image manually.
 
 ## Install The Unsigned DMG
 
-1. Confirm that the public release title is **OpenEvo Desktop 0.1.2 Preview**,
-   then download `OpenEvo-Desktop-0.1.2-aarch64.dmg` and `SHA256SUMS` from that
-   same immutable
-   [GitHub Release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases).
+1. Open the immutable
+   [OpenEvo Desktop 0.1.2 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.2-exhibition.29702250883.1),
+   confirm the title **OpenEvo Desktop 0.1.2 Preview**, then download
+   `OpenEvo-Desktop-0.1.2-aarch64.dmg` and `SHA256SUMS`.
 2. Verify the exact DMG checksum recorded by that release:
 
    ```bash

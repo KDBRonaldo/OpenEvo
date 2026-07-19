@@ -13,10 +13,12 @@ It predates and does not satisfy the immutable Preview publication policy
 defined below; its GitHub title/body changed when the draft was made public.
 Do not withdraw or replace it merely because it is not a gating candidate.
 
-Version `0.1.2` is the current unsigned exhibition Preview candidate. It is not
-the current public release until the draft produced by the workflow below has
-completed its exact-asset roundtrip, maintainer review, and visibility-only
-publication step.
+Version `0.1.2` is the current public unsigned exhibition Preview, published on
+July 19, 2026 from the immutable candidate produced by run `29702250883`.
+Preserve its exact source commit, tag, release assets, checksums, and complete
+publication evidence. It is a packaging Preview, not a G1-G12 candidate:
+there is still no candidate-bound real Codex science E2E, clean-host matrix,
+protected-performance verdict, or External Beta qualification.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
@@ -29,9 +31,9 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-No checked-in, validator-bound two-session science E2E evidence exists for that
-Preview. Its packaging and managed-runtime smoke do not satisfy G2, G3, G4, G7,
-G12, or the ordinary-user science workflow.
+No checked-in, validator-bound two-session science E2E evidence exists for the
+published `0.1.2` Preview. Its packaging and managed-runtime smoke do not
+satisfy G2, G3, G4, G7, G12, or the ordinary-user science workflow.
 
 Final External Beta publication remains disabled while productization work
 tracked by #131/#163 is in progress. PyPI is not part of either the Preview or

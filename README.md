@@ -2,9 +2,8 @@
 
 OpenEvo runs scientific tasks through a real agent harness and evolves selected
 textual context between sessions. Version `0.1.2` is the ordinary-user
-exhibition Preview candidate being prepared for publication; `0.1.1` remains
-the current public historical Preview until the `0.1.2` GitHub Release is
-published. OpenEvo has exactly two user-facing applications:
+exhibition Preview released on July 19, 2026; `0.1.1` is retained only as a
+historical Preview. OpenEvo has exactly two user-facing applications:
 
 - **OpenEvo Desktop Client** is the macOS application used to connect a remote
   server, configure projects, run tasks, and inspect evolution.
@@ -21,12 +20,10 @@ to the server to install, start, stop, repair, or update OpenEvo.
 
 ## Install The Preview
 
-After the `0.1.2` Preview is published, ordinary users should download its exact
-DMG and `SHA256SUMS` from the same immutable
-[GitHub Release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases), then start
-with the [Preview user guide](docs/user/README.md). Until that release appears,
-the files are not public installation artifacts. Do not install OpenEvo from
-PyPI or use a repository checkout as the Desktop installation.
+Ordinary users should download the exact `0.1.2` DMG and `SHA256SUMS` from the
+[OpenEvo Desktop 0.1.2 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.2-exhibition.29702250883.1),
+then start with the [Preview user guide](docs/user/README.md). Do not install
+OpenEvo from PyPI or use a repository checkout as the Desktop installation.
 
 The first Preview DMG is unsigned and not notarized. After verifying the release
 checksum, follow the [Desktop quickstart](docs/user/desktop-quickstart.md) to
@@ -57,12 +54,13 @@ Self-Deployed execution, parameter or adapter evolution, other harnesses,
 in-session evolution, a public CLI, and PyPI distribution are not supported in
 this Preview.
 
-The `0.1.2` Preview candidate proves only its real DMG, packaged sidecar and
+The published `0.1.2` Preview proves only its real DMG, packaged sidecar and
 renderer, Daemon Bundle, and managed-runtime packaging smoke. It is unsigned
 and non-gating: it does not prove the canonical science E2E, G2 clean-user
 lifecycle, G3 clean-host/network matrix, G12 publication gate, or full External
 Beta readiness. The historical `0.1.1` Preview predates the current immutable
-Preview publication policy.
+Preview publication policy. The published release is immutable; corrections
+must use a new candidate and version.
 
 ## Target User Workflow
 

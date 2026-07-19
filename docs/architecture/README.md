@@ -1,12 +1,13 @@
 # OpenEvo Architecture Docs
 
 This directory describes the current architecture and External Beta target.
-OpenEvo `0.1.1` is an installable historical exhibition Preview with a real
-Desktop DMG, packaged sidecar and renderer, self-contained Daemon Bundle, and
-managed-runtime packaging smoke. It has no checked-in candidate-bound science
-E2E or clean-host evidence. Target documents must not be read as proof that the
-Preview satisfies the full External Beta contract or G1-G12. The product
-surfaces are:
+OpenEvo `0.1.2` is the current installable unsigned exhibition Preview with a
+real Desktop DMG, packaged sidecar and renderer, self-contained Daemon Bundle,
+managed-runtime packaging smoke, and immutable release asset verification. It
+has no checked-in candidate-bound science E2E or clean-host evidence. Target
+documents must not be read as proof that the Preview satisfies the full
+External Beta contract or G1-G12. Version `0.1.1` is historical evidence. The
+product surfaces are:
 
 - **OpenEvo Desktop**: the ordinary-user macOS app and local sidecar facade.
 - **OpenEvo Daemon**: the remote Linux backend that owns execution, deployment,
@@ -24,7 +25,7 @@ Terminal Bench maintainer commands and package boundaries are documented in
 1. [Canonical Productization Spec](../maintainer/productization/spec.md)
    - Product boundaries, supported modes, protected algorithms, and release
      gates.
-2. [Pre-release Desktop User Docs](../user/README.md)
+2. [Desktop Preview User Docs](../user/README.md)
    - Short target workflows while the packaged application is implemented.
 3. [OpenEvo Daemon API Target](../core/backend-api.md)
    - Typed backend routes, Desktop facade boundary, state-root reads, and error

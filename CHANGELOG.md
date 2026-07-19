@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased - First Unsigned Preview
+## 0.1.2 Preview - 2026-07-19
 
 ### Added
 
@@ -33,3 +33,14 @@
   in-session evolution, PyPI installation, and a public CLI are not supported.
 - The Preview does not claim automatic preparation of every clean Linux host
   and does not expose a complete in-app remote uninstall or data-erasure flow.
+- This packaging Preview has no candidate-bound real Codex science E2E,
+  protected benchmark result, clean-host matrix, or External Beta qualification.
+
+The immutable release is available from the
+[OpenEvo Desktop 0.1.2 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.2-exhibition.29702250883.1).
+
+## Unreleased
+
+The next release must not be cut from this published Preview without a new
+candidate identity. It requires the real Codex science E2E and the remaining
+canonical release gates described in `docs/maintainer/productization/spec.md`.

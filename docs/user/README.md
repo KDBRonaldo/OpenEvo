@@ -7,12 +7,12 @@ OpenEvo Preview has two applications:
   on a remote Linux server. Ordinary users manage it through Desktop and do not
   operate it directly.
 
-Version `0.1.2` is the Preview candidate described by these guides. Install it
-only after its exact DMG and `SHA256SUMS` appear together in the immutable
-[GitHub Release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases); until
-then, `0.1.1` remains the current public historical Preview. The Preview DMG is
-unsigned and not notarized. Open it only after checking the exact checksum in
-the quickstart.
+Version `0.1.2` is the current immutable Preview described by these guides. Its
+exact DMG and `SHA256SUMS` are available in the
+[OpenEvo Desktop 0.1.2 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.2-exhibition.29702250883.1).
+The Preview DMG is unsigned and not notarized. Open it only after checking the
+exact checksum in the quickstart. `0.1.1` is retained only as a historical
+Preview.
 
 ## Start Here
 

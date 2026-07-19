@@ -38,20 +38,21 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-Version `0.1.1` is a public, installable historical exhibition Preview. It
-proves the real mounted and copied DMG, packaged sidecar and renderer, a
-self-contained Daemon Bundle, and managed-runtime packaging smoke. It has no
-checked-in candidate-bound science E2E or clean-host matrix evidence, and it
-predates the current immutable Preview publication policy. It is intentionally
-unsigned and non-gating. It does not prove G2, G3, G12, or any full science
-workflow, and it is not the candidate that will be promoted through G1-G12.
+Version `0.1.2` is the current public, installable unsigned exhibition Preview.
+It proves the real mounted and copied DMG, packaged sidecar and renderer, a
+self-contained Daemon Bundle, managed-runtime packaging smoke, and immutable
+release asset roundtrip. It has no checked-in candidate-bound science E2E or
+clean-host matrix evidence, and it is intentionally non-gating. It does not
+prove G2, G3, G12, or any full science workflow, and it is not the candidate
+that will satisfy G1-G12. Version `0.1.1` is retained as historical evidence.
 System, Files, and History remain incomplete; the v2 authority cutover, G4, and
 G7-G12 remain open.
 
 Current priority is:
 
-1. cut and validate the next unsigned Preview with the read-only first-launch
-   science example and the real Codex Subscription Desktop/Daemon path;
+1. execute and record the candidate-bound real Codex Subscription Desktop/Daemon
+   science E2E for the published product path, without treating the published
+   packaging Preview as G1-G12 evidence;
 2. assign the clean-host workstream owner and complete a G3-shaped rehearsal,
    including mediated Subscription authentication and the direct/proxy matrix;
 3. complete and independently review the durable System recovery owner;
@@ -64,7 +65,7 @@ Current priority is:
 This order changes implementation scheduling only. It does not reduce any
 blocking requirement in the canonical specification.
 
-The Preview is suitable only for a controlled packaging exhibition. A full
+The published Preview is suitable only for a controlled packaging exhibition. A full
 External Beta must support the canonical ordinary-user lifecycle, both
 execution modes, clean-host and network matrices, authoritative recovery and
 maintenance views, protected performance, security, upgrade/rollback, and one
@@ -120,8 +121,8 @@ artifacts, revisions, recovery, and both execution modes.
 
 **Current state:** a real versioned control API, durable project/run stores,
 remote bootstrap, tunnel routing, Subscription prerequisite checks, and child
-service supervision exist. The `0.1.1` Preview ships a self-contained Daemon
-Bundle and has packaging plus managed-runtime smoke evidence. It has no
+service supervision exist. The published `0.1.2` Preview ships a self-contained
+Daemon Bundle and has packaging plus managed-runtime smoke evidence. It has no
 checked-in candidate-bound Docker plus Codex science rehearsal or clean-host
 matrix evidence. Clean-host preparation and lifecycle evidence, mediated
 Subscription authentication, the direct/proxy matrix, Self-Deployed,
@@ -150,7 +151,7 @@ capabilities, task execution, retry/cancel, timeline/transcript, and evolution
 inspection are implemented. First launch opens a read-only synthetic enzyme
 kinetics project that demonstrates three cross-session tasks and textual-memory,
 trajectory-to-skill, and agent-system evolution without creating authoritative
-or remote state. The public `0.1.1` Preview launches from the real DMG with its
+or remote state. The public `0.1.2` Preview launches from the real DMG with its
 packaged renderer and sidecar. G2 clean-user lifecycle evidence, Files, History,
 System maintenance, mediated credential choices, and several recovery flows
 remain incomplete.
@@ -172,8 +173,9 @@ GitHub releases present one coherent Desktop-plus-Daemon product.
 `benchmarks/` boundaries and one canonical product specification. Some active
 documentation, issue state, package inventory, release metadata, dependency
 evidence, and cleanup work still reflect intermediate implementation states.
-The exact source, tag, assets, and checksums for the public `0.1.1` Preview must
-remain available as non-gating release records.
+The exact source, tag, assets, checksums, and publication evidence for the
+public `0.1.2` Preview must remain available as non-gating release records;
+the `0.1.1` Preview remains historical evidence.
 
 **Owning issues:** #131 and #193.
 
@@ -187,11 +189,12 @@ G1 and G12. PyPI remains outside this release.
 
 **Outcome:** one immutable candidate satisfies every G1-G12 gate.
 
-**Current state:** component and subsystem tests exist, but there is no candidate
-with complete clean-host Desktop/Daemon evidence, both execution modes, all
-evolution gates, protected performance, recovery/security matrices, and
-downloaded draft-release verification. The published `0.1.1` Preview is not
-such a candidate and cannot be reused as one.
+**Current state:** component and subsystem tests exist, and the published
+`0.1.2` Preview has complete packaging and downloaded-release verification, but
+there is no candidate with complete clean-host Desktop/Daemon evidence, both
+execution modes, all evolution gates, protected performance, recovery/security
+matrices, and full G1-G12 evidence. The published Preview cannot be reused as
+that candidate.
 
 **Owning issue:** #131.
 
@@ -204,8 +207,9 @@ independently review product/spec compliance and release risk/evidence.
 
 ## Immediate Execution Order
 
-1. Cut and validate the next unsigned Preview containing the first-launch
-   science example and real Codex Subscription Desktop/Daemon workflow.
+1. Run the candidate-bound real Codex Subscription Desktop/Daemon science E2E
+   against the exact published product composition, then create a new candidate
+   if any product or evidence change is required.
 2. Give the clean-host workstream one owner and rehearse fresh-host Daemon
    installation, mediated Codex Subscription authentication, Docker execution,
    and the supported direct/proxy matrix. This is non-gating integration
