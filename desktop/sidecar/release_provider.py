@@ -1650,7 +1650,10 @@ class DesktopReleaseProvider:
         for check in response.checks:
             if check.status is not core_v1.CheckStatus.OK and check.next_action:
                 return DesktopReleaseProvider._bounded_check_summary(check.next_action)
-        return "Resolve the reported checks on the remote server, then run Check again."
+        return (
+            "Ask the server administrator to resolve the reported host prerequisite, "
+            "then run Check again in OpenEvo Desktop."
+        )
 
     @staticmethod
     def _validate_remote_repair_continuation(

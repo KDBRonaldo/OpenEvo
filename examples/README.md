@@ -1,9 +1,13 @@
 # OpenEvo Examples
 
-- `science-minimal/`: minimal Core Backend experiment config.
-- `science-with-local-folder/`: ordinary science workspace shape.
-- `self-deployed-model/`: self-deployed model-serving notes.
-- `backend-automation/`: backend automation examples for maintainers.
+- `science-with-local-folder/`: ordinary Desktop project flow using a local
+  research folder.
+- `self-deployed-model/`: target Desktop flow for a Daemon-managed model;
+  unavailable in the current Preview.
+- `science-minimal/`: minimal Daemon automation fixture for maintainers.
+- `backend-automation/`: Daemon automation examples for maintainers.
 - `research-benchmarks/`: benchmark and training examples for researchers.
 
-Research benchmark examples are not ordinary-user Desktop quickstarts.
+Ordinary users follow the Desktop examples and never run repository commands
+on the remote server. Automation and benchmark examples are maintainer tools,
+not ordinary-user Desktop quickstarts.

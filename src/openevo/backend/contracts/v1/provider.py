@@ -277,21 +277,28 @@ def _release_readiness_error(
             m.ErrorCategory.ENVIRONMENT,
             m.RepairAction.USER_ACTION_REQUIRED,
             (
-                "Install the supported Codex CLI as the current remote SSH user, "
-                "then retry activation."
+                "This Preview cannot install Codex on an arbitrary host. Ask the "
+                "server administrator to prepare the selected account, then retry "
+                "activation in OpenEvo Desktop."
             ),
         ),
         "codex_subscription_auth_unavailable": (
             "Codex subscription login is unavailable for the remote SSH user.",
             m.ErrorCategory.AUTHENTICATION,
             m.RepairAction.USER_ACTION_REQUIRED,
-            "Sign in with Codex CLI as the current remote SSH user, then retry activation.",
+            (
+                "Ask the server administrator to prepare the Codex subscription for "
+                "the selected account, then retry activation in OpenEvo Desktop."
+            ),
         ),
         "runtime_executable_unavailable": (
             "The managed Science runtime executable is unavailable.",
             m.ErrorCategory.ENVIRONMENT,
             m.RepairAction.USER_ACTION_REQUIRED,
-            "Restore the supported container runtime for the SSH user, then retry activation.",
+            (
+                "Ask the server administrator to provide the supported Docker "
+                "user-container capability, then retry activation in OpenEvo Desktop."
+            ),
         ),
         "runtime_image_unavailable": (
             "The managed Science runtime image is unavailable.",
@@ -309,13 +316,19 @@ def _release_readiness_error(
             "Required OpenEvo Daemon services are unavailable.",
             m.ErrorCategory.SERVICE,
             m.RepairAction.OPENEVO_CAN_RETRY,
-            "Reconnect OpenEvo Daemon, then retry project activation.",
+            (
+                "Reconnect in OpenEvo Desktop; it will restore the managed Daemon "
+                "services, then retry project activation."
+            ),
         ),
         "run_admission_unavailable": (
             "The managed science run admission owner is unavailable.",
             m.ErrorCategory.SERVICE,
             m.RepairAction.OPENEVO_CAN_RETRY,
-            "Restart OpenEvo Daemon, then retry project activation.",
+            (
+                "Reconnect OpenEvo Desktop; it will restore the managed Daemon "
+                "service, then retry project activation."
+            ),
         ),
         "self_deployed_unavailable": (
             "The managed service group does not support this release project.",
@@ -331,7 +344,10 @@ def _release_readiness_error(
             "Managed Science readiness is unavailable.",
             m.ErrorCategory.SERVICE,
             m.RepairAction.OPENEVO_CAN_RETRY,
-            "Reconnect OpenEvo Daemon, then retry project activation.",
+            (
+                "Reconnect in OpenEvo Desktop; it will restore the managed Daemon "
+                "services, then retry project activation."
+            ),
         ),
     )
     return _release_activation_error(
@@ -1005,7 +1021,10 @@ class CoreControlProviderV1:
                 message="Managed service readiness cannot be verified by this Core daemon.",
                 category=m.ErrorCategory.SERVICE,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
-                next_action="Restart or update OpenEvo Daemon, then retry project activation.",
+                next_action=(
+                    "Reconnect or update OpenEvo Desktop; it will restore the managed "
+                    "Daemon service, then retry project activation."
+                ),
             )
         image = MANAGED_RUNTIME_IMAGES["managed_science"]
         try:
@@ -1028,7 +1047,10 @@ class CoreControlProviderV1:
                 message="OpenEvo Daemon received invalid managed service readiness evidence.",
                 category=m.ErrorCategory.SERVICE,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
-                next_action="Restart or update OpenEvo Daemon, then retry project activation.",
+                next_action=(
+                    "Reconnect or update OpenEvo Desktop; it will restore the managed "
+                    "Daemon service, then retry project activation."
+                ),
             )
         if snapshot.execution_mode is not ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
             raise _release_activation_error(
@@ -1036,7 +1058,10 @@ class CoreControlProviderV1:
                 message="Managed services do not match the Codex subscription project mode.",
                 category=m.ErrorCategory.SERVICE,
                 repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
-                next_action="Reconnect OpenEvo Daemon, then retry project activation.",
+                next_action=(
+                    "Reconnect in OpenEvo Desktop; it will restore the managed Daemon "
+                    "services, then retry project activation."
+                ),
             )
         if not snapshot.run_ready:
             raise _release_readiness_error(snapshot.run_readiness_code)

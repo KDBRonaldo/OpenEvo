@@ -1,54 +1,63 @@
 # Remote Server Setup
 
-OpenEvo Desktop connects to a remote Linux server and installs OpenEvo Daemon
-under the selected SSH account. The packaged managed science runtime is Linux
-amd64. The `0.1.2` Preview has no general clean-host matrix; the requirements
-below describe the exhibition profile, not general Linux support.
+OpenEvo Desktop is the only application an ordinary user operates. It connects
+to a remote Linux server and installs, starts, updates, repairs, and attaches
+the OpenEvo Daemon under the selected SSH account. The Daemon is an internal
+remote service; ordinary users do not SSH to it or run its commands.
 
-## Server Requirements
+The packaged managed science runtime is Linux amd64. The `0.1.2` Preview has no
+general clean-host matrix; the requirements below describe the exhibition
+profile, not general Linux support.
 
-Before opening Desktop, confirm that:
+## Host Prerequisites
+
+These are capabilities that the server administrator or hosting environment
+must provide for the Preview:
 
 - the server is reachable over SSH from the Mac;
-- your remote account can write to its home directory;
-- your Mac can authenticate to that account through its SSH agent;
-- Docker Engine is installed and exposes the Docker API to that account using
-  the exhibition user-container profile;
-- the server has enough home-directory and container storage for the project,
-  Daemon, runtime, transcripts, and artifacts;
+- the selected remote account can write to its home directory;
+- the account has Docker user-container access using the exhibition profile;
+- the server has enough home-directory and container storage for projects,
+  Daemon state, the managed runtime, transcripts, and artifacts;
 - required outbound HTTPS access works directly or through the configured
   remote proxy;
-- Codex CLI is installed and on `PATH` for that account;
-- `codex login status` succeeds for a Codex subscription as that account.
+- a supported Codex CLI is already installed and signed in for the selected
+  remote account.
 
-OpenEvo does not automatically install or sign in to Codex in this Preview.
-Codex authentication belongs to the remote SSH user. Complete the normal Codex
-installation and login on the server before project activation.
+The ordinary user does not need to perform these checks in a remote shell.
+Desktop runs the supported preflight and shows a typed result. If a host
+prerequisite is missing in this Preview, ask the server administrator to
+prepare the host or choose another supported host, then use **Retry** in
+Desktop.
 
-If SSH agent authentication is not already working, load the required identity
-into the Mac's agent. For example, `ssh-add -l` lists available identities and
-`ssh-add ~/.ssh/<key>` adds one. OpenEvo never receives the private-key bytes.
+The Mac must have an SSH identity available to its configured SSH agent because
+this Preview does not accept private-key bytes in the app. This is a local
+credential prerequisite, not a request to log in to the remote server or
+operate the Daemon manually.
 
-## What Desktop Installs
+## What Desktop Does Automatically
 
-Desktop transfers release-matched, integrity-checked assets and prepares:
+Desktop transfers release-matched, integrity-checked assets and manages:
 
 - the OpenEvo Daemon and its isolated user-level Python environment;
 - the verified method registry used by that Daemon;
 - the controlled science runtime used for Preview sessions;
-- the private SSH tunnel between Desktop and the Daemon.
+- the private SSH tunnel between Desktop and the Daemon;
+- readiness checks, service startup, reconnection, upgrade, and supported
+  repair actions.
 
-You do not clone the repository, run `pip install`, choose a remote OpenEvo
-path, or upload a runtime image. Desktop may provision its isolated Python
-runtime in user space when the supported automatic path is available. Failure
-is reported as a typed action rather than silently using another version.
+You do not clone the repository, install an OpenEvo package, choose a remote
+OpenEvo path, upload a runtime image, start or stop the Daemon, or copy remote
+commands from this guide. Desktop reports failures as typed actions rather than
+silently using another version.
 
-## What Desktop Does Not Change
+## Host-Level Limitations
 
-Desktop does not promise to prepare an arbitrary clean server. It does not
-modify system packages, Docker daemon policy, `systemd`, drivers, firewalls,
-global shell profiles, SSH server configuration, or SSH private keys. Required
-administrator work remains the server owner's responsibility.
+Desktop does not modify system packages, Docker daemon policy, `systemd`,
+drivers, firewalls, global shell profiles, SSH server configuration, or SSH
+private keys. Those host-level responsibilities belong to the server owner.
+OpenEvo-owned installation and lifecycle work remains fully controlled by
+Desktop.
 
 ## Confirm The Host Key
 

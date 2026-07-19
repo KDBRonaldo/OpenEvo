@@ -254,6 +254,15 @@ require the user to open Terminal, clone the repository, run Python, invoke a
 backend launcher, upload a runtime image manually, or choose an internal remote
 workspace path.
 
+The ordinary-user workflow MUST NOT require the user to SSH to the server or
+operate the OpenEvo Daemon directly. Desktop owns the SSH lifecycle used for
+host inspection, Daemon installation, startup, attachment, upgrade, repair,
+rollback, and tunnel recovery. A missing host-level prerequisite that the
+current release cannot safely change (for example Docker host policy or a
+pre-existing Codex installation) MUST be reported as a typed administrator
+prerequisite; the user is given a Desktop retry or reconnection action and is
+never given a remote command as the ordinary workflow.
+
 OpenEvo owns the science runtime image and creates a managed workspace for each
 project. The user chooses local files or directories to import. Desktop handles
 transfer, integrity verification, and presentation of remote outputs.
@@ -338,6 +347,14 @@ server address, SSH identity, and optional remote network settings
 -> required Codex login or model preparation
 -> service readiness
 ```
+
+If an interactive harness authentication step is required, Desktop MUST
+mediate it in the app or through a narrowly scoped native authentication
+surface. It MUST NOT instruct an ordinary user to open a remote shell, run
+harness commands, or manually control the Daemon. A Preview may instead
+declare a pre-existing authenticated harness as a host prerequisite, but its
+failure message MUST remain a typed Desktop action or an administrator
+prerequisite.
 
 Before any server is configured, Desktop MUST open a bundled read-only
 scientific project example rather than an empty marketing or setup screen. The

@@ -7,7 +7,8 @@ two-session science gate or general host support.
 
 ## Before You Start
 
-You need:
+You operate OpenEvo through Desktop. A server administrator or hosting
+environment must provide:
 
 - an Apple Silicon Mac running macOS 12 or later;
 - a remote Linux x86-64 server reachable over SSH and matching the exhibition
@@ -17,7 +18,9 @@ You need:
 - Docker Engine configured so your remote SSH user can run user containers;
 - Codex CLI installed and signed in to a subscription as that same remote user.
 
-See [Remote server setup](remote-server-setup.md) before connecting.
+See [Remote server setup](remote-server-setup.md) for the host prerequisite
+boundary. You do not need to SSH to the server, install the Daemon, or prepare
+a runtime image manually.
 
 ## Install The Unsigned DMG
 
@@ -76,14 +79,15 @@ after real projects are created.
 Desktop uses the SSH agent already running on the Mac. This Preview does not
 accept an SSH password, a private-key file, or a passphrase in the app.
 
-During connection and activation, Desktop transfers and verifies the
-version-matched self-contained OpenEvo Daemon Bundle and managed science
-runtime. The current Preview does not prepare Docker or Codex: the remote SSH
-user must already be able to run Docker user containers, and Codex must already
-be installed and signed in for that user. Do not install the Daemon with `pip`
-and do not upload a runtime image. A normal first preparation can take time.
-**Cancel operation** stops that connection or preparation attempt and leaves it
-retryable.
+During connection and activation, Desktop runs preflight, transfers and
+verifies the version-matched self-contained OpenEvo Daemon Bundle, prepares the
+managed science runtime, starts or attaches the Daemon, and establishes the
+private tunnel. The current Preview cannot add Docker host access or complete a
+Codex installation/login on an arbitrary clean host. If either host
+prerequisite is missing, Desktop identifies the blocked prerequisite; ask the
+server administrator to prepare it or choose another supported host, then
+retry in Desktop. **Cancel operation** stops that connection or preparation
+attempt and leaves it retryable.
 
 ## Create A Project
 
@@ -103,8 +107,11 @@ retryable.
 7. Review the enabled targets and methods, then choose **Save and activate**.
 
 Activation checks the remote Codex installation, subscription login, Docker
-Engine, managed science runtime, and Daemon services. It does not install or
-sign in to Codex. Follow any typed remediation shown by Desktop, then retry.
+Engine, managed science runtime, and Daemon services. OpenEvo-owned components
+are repaired or restarted through Desktop. For a host-level Docker or Codex
+prerequisite that this Preview cannot change, follow the typed administrator
+action shown by Desktop and then choose **Retry**; do not open a remote shell
+to operate OpenEvo.
 
 ## Try The Exhibition Workflow
 
@@ -149,7 +156,7 @@ quitting Desktop, remove `~/.openevo/desktop` and, if present,
 delete remote data.
 
 The first Preview does not expose a complete in-app OpenEvo Daemon uninstall or
-remote project-erasure workflow. Do not manually delete remote OpenEvo
-directories while a run or transition may be active. Retain the remote state,
-or arrange deliberate cleanup with the server owner after preserving any
-required research data.
+remote project-erasure workflow. Do not manually edit or delete OpenEvo remote
+state while a run or transition may be active. Retain the remote state, or
+arrange deliberate cleanup with the server owner after preserving any required
+research data.

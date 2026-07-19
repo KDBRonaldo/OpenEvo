@@ -2909,6 +2909,42 @@ def test_desktop_visual_gates_use_one_bounded_cross_runner_tolerance() -> None:
         assert "maxDiffPixelRatio: 0.04" not in config
 
 
+def test_packaged_release_visuals_use_fixed_viewports_not_full_page_height() -> None:
+    release_test = Path(
+        "desktop/tests/product-browser/release-readonly.pw.ts"
+    ).read_text(encoding="utf-8")
+
+    assert "fullPage: true" not in release_test
+    assert "scrollIntoViewIfNeeded" in release_test
+    assert 'toHaveScreenshot("release-packaged-research.png")' in release_test
+    assert 'toHaveScreenshot("release-packaged-evolution.png")' in release_test
+
+
+def test_release_remediation_keeps_daemon_lifecycle_inside_desktop() -> None:
+    sources = [
+        Path("src/openevo/backend/contracts/v1/provider.py"),
+        Path("desktop/sidecar/core_bridge_adapters_v1.py"),
+        Path("desktop/sidecar/release_provider.py"),
+        Path("desktop/src/product/DesktopProductApp.tsx"),
+    ]
+    text = "\n".join(path.read_text(encoding="utf-8") for path in sources)
+
+    for forbidden in (
+        "Install the supported Codex CLI as the current remote SSH user",
+        "Sign in with Codex CLI as the current remote SSH user",
+        "Restart OpenEvo Daemon",
+        "Restart or update OpenEvo Daemon",
+        "Reconnect OpenEvo Daemon",
+        "Stop the active Daemon",
+    ):
+        assert forbidden not in text
+
+    assert "server administrator" in text
+    assert "retry activation in OpenEvo Desktop" in text
+    assert "Desktop will manage the compatible " in text
+    assert '"Daemon transition."' in text
+
+
 def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:
     with Path("pyproject.toml").open("rb") as stream:
         dependencies = tomllib.load(stream)["project"]["dependencies"]

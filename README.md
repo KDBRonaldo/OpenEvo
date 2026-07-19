@@ -15,6 +15,10 @@ published. OpenEvo has exactly two user-facing applications:
 `src/openevo/` contains the Core implementation assembled into OpenEvo Daemon.
 Core is not a third product that users install or operate.
 
+Ordinary users operate only OpenEvo Desktop. Desktop performs the remote SSH
+bootstrap and lifecycle management required for the Daemon; users do not SSH
+to the server to install, start, stop, repair, or update OpenEvo.
+
 ## Install The Preview
 
 After the `0.1.2` Preview is published, ordinary users should download its exact
@@ -42,10 +46,12 @@ Its publication workflow requires candidate-bound browser, mounted-DMG,
 detached-copy, Daemon Bundle, managed-runtime, checksum, and asset-roundtrip
 verification. It does not claim a general clean-host matrix or the canonical
 two-session science gate. Treat it as an exhibition artifact, not a generally
-supported release. The remote SSH user must already have Codex CLI installed
-and signed in to a subscription and must match the documented Docker
-user-container assumptions. Desktop uploads the version-matched Daemon Bundle
-and controlled science runtime; users do not upload a runtime image.
+supported release. The Preview host must already have Codex CLI installed and
+signed in to a subscription and must match the documented Docker user-container
+assumptions. Desktop checks those host prerequisites, uploads the
+version-matched Daemon Bundle, prepares the controlled science runtime, and
+manages the remote Daemon; users do not upload a runtime image or operate the
+Daemon manually.
 
 Self-Deployed execution, parameter or adapter evolution, other harnesses,
 in-session evolution, a public CLI, and PyPI distribution are not supported in

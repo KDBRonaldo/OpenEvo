@@ -267,6 +267,55 @@ def test_release_facing_docs_present_only_desktop_and_daemon() -> None:
     )
 
 
+def test_ordinary_user_docs_do_not_require_remote_shell_operations() -> None:
+    user_docs = [
+        REPO_ROOT / "docs" / "user" / "README.md",
+        REPO_ROOT / "docs" / "user" / "desktop-quickstart.md",
+        REPO_ROOT / "docs" / "user" / "remote-server-setup.md",
+        REPO_ROOT / "docs" / "user" / "troubleshooting.md",
+    ]
+    forbidden = (
+        "ssh-add",
+        "codex login status",
+        "codex --version",
+        "openevo-backend",
+        "Restart OpenEvo Daemon",
+        "Stop the active Daemon",
+    )
+    offenders = [
+        f"{path.relative_to(REPO_ROOT)}: {marker}"
+        for path in user_docs
+        for marker in forbidden
+        if marker in path.read_text(encoding="utf-8")
+    ]
+    assert offenders == []
+
+    combined = "\n".join(path.read_text(encoding="utf-8") for path in user_docs)
+    assert "OpenEvo Desktop is the only application an ordinary user operates" in combined
+    assert "operate the remote Daemon manually" in combined
+    assert "server administrator" in combined
+
+
+def test_ordinary_science_examples_use_desktop_managed_workspaces() -> None:
+    local_folder = (
+        REPO_ROOT / "examples" / "science-with-local-folder" / "README.md"
+    ).read_text(encoding="utf-8")
+    self_deployed = (
+        REPO_ROOT / "examples" / "self-deployed-model" / "README.md"
+    ).read_text(encoding="utf-8")
+
+    assert "Choose a folder on the Mac" in local_folder
+    assert "Daemon-managed" in local_folder
+    assert "experiment.yaml" not in local_folder
+    assert "Core Backend" not in local_folder
+    assert "points at a user workspace folder on the remote server" not in local_folder
+
+    assert "unavailable in the current Preview" in self_deployed
+    assert "OpenEvo Daemon" in self_deployed
+    assert "Core Backend" not in self_deployed
+    assert "users will not SSH to the server" in self_deployed
+
+
 def test_release_repository_metadata_is_present() -> None:
     required_paths = [
         REPO_ROOT / "CHANGELOG.md",

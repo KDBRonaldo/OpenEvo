@@ -31,6 +31,10 @@ type HarnessObservation = {
 test("first launch uses the release sidecar composition and keeps its sample read-only", async ({
   page,
 }, testInfo) => {
+  const sidecarObservation: Pick<HarnessObservation, "httpCalls" | "unexpectedCalls"> = {
+    httpCalls: [],
+    unexpectedCalls: [],
+  };
   const externalNetworkCalls: string[] = [];
   page.on("request", (request) => {
     const url = new URL(request.url());
@@ -44,7 +48,7 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   });
   expect(EXPECTED_PROJECTS.has(testInfo.project.name)).toBe(true);
   await installReleaseNativeContract(page);
-  await installReleaseSidecarContract(page);
+  await installReleaseSidecarContract(page, sidecarObservation);
 
   await page.goto("/");
   await expect(page.getByTestId("sample-research-workspace")).toBeVisible();
@@ -61,9 +65,7 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await expect(page.getByText("内置合成数据 · 12 个观测点", { exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("contract_simulator");
   await assertViewportSafety(page, testInfo.project.name);
-  await expect(page).toHaveScreenshot("release-packaged-research.png", {
-    fullPage: true,
-  });
+  await expect(page).toHaveScreenshot("release-packaged-research.png");
 
   const selectedSession = page.locator('.sample-session-card[aria-selected="true"]');
   await selectedSession.focus();
@@ -96,10 +98,8 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await page.getByRole("tab", { name: /可读产物/ }).click();
   await expect(page.getByText("AGENTS.md", { exact: true })).toBeVisible();
   await assertViewportSafety(page, testInfo.project.name);
-  await page.evaluate(() => window.scrollTo(0, 0));
-  await expect(page).toHaveScreenshot("release-packaged-evolution.png", {
-    fullPage: true,
-  });
+  await page.getByText("AGENTS.md", { exact: true }).scrollIntoViewIfNeeded();
+  await expect(page).toHaveScreenshot("release-packaged-evolution.png");
 
   const system = page.getByRole("button", { name: "System", exact: true });
   await system.focus();
@@ -119,14 +119,15 @@ test("first launch uses the release sidecar composition and keeps its sample rea
 
   const connectedObservation = await readHarnessObservation(page);
   expect(connectedObservation.unexpectedCalls).toEqual([]);
+  expect(sidecarObservation.unexpectedCalls).toEqual([]);
   expect(externalNetworkCalls).toEqual([]);
-  expect(connectedObservation.httpCalls).toEqual(expect.arrayContaining([
+  expect(sidecarObservation.httpCalls).toEqual(expect.arrayContaining([
     { method: "GET", path: "/version", authenticated: false },
     { method: "GET", path: "/desktop/v1/state", authenticated: true },
     { method: "GET", path: "/desktop/v1/profiles?limit=100", authenticated: true },
     { method: "GET", path: "/desktop/v1/projects?limit=100", authenticated: true },
   ]));
-  expect(connectedObservation.httpCalls.every(({ method }) => method === "GET")).toBe(true);
+  expect(sidecarObservation.httpCalls.every(({ method }) => method === "GET")).toBe(true);
   expect(connectedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(true);
   expect(connectedObservation.nativeCalls.some(({ command }) => command === "renderer_ready")).toBe(true);
   expect(connectedObservation.nativeCalls.every(({ command }) => [
@@ -142,6 +143,8 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await assertAccessibility(page);
   await expectPackagedReleaseAssets(page);
 
+  sidecarObservation.httpCalls.length = 0;
+  sidecarObservation.unexpectedCalls.length = 0;
   await page.goto("/?native=readiness-failure");
   await expect(page.getByTestId("release-startup-sample")).toBeVisible();
   await expect(page.getByTestId("sample-research-workspace")).toBeVisible();
@@ -200,7 +203,8 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   }
 
   const failedObservation = await readHarnessObservation(page);
-  expect(failedObservation.httpCalls).toEqual([]);
+  expect(sidecarObservation.httpCalls).toEqual([]);
+  expect(sidecarObservation.unexpectedCalls).toEqual([]);
   expect(failedObservation.unexpectedCalls).toEqual([]);
   expect(externalNetworkCalls).toEqual([]);
   expect(failedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(true);
@@ -291,7 +295,10 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
   });
 }
 
-async function installReleaseSidecarContract(page: Page): Promise<void> {
+async function installReleaseSidecarContract(
+  page: Page,
+  observation: Pick<HarnessObservation, "httpCalls" | "unexpectedCalls">,
+): Promise<void> {
   await page.route(`${DESKTOP_ENDPOINT}/**`, async (route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -299,15 +306,13 @@ async function installReleaseSidecarContract(page: Page): Promise<void> {
     const method = request.method();
     const authenticated =
       request.headers()["x-openevo-desktop-session"] === DESKTOP_SESSION_TOKEN;
-    await page.evaluate((call) => {
-      (window as typeof window & {
-        __OPENEVO_RELEASE_READONLY__: HarnessObservation;
-      }).__OPENEVO_RELEASE_READONLY__.httpCalls.push(call);
-    }, { method, path, authenticated });
+    observation.httpCalls.push({ method, path, authenticated });
 
-    if (method !== "GET") return rejectUnexpectedRoute(route, page, `${method} ${path}`);
+    if (method !== "GET") return rejectUnexpectedRoute(route, observation, `${method} ${path}`);
     if (path === "/version") {
-      if (authenticated) return rejectUnexpectedRoute(route, page, "authenticated /version");
+      if (authenticated) {
+        return rejectUnexpectedRoute(route, observation, "authenticated /version");
+      }
       return json(route, {
         schema_version: "1",
         api_name: "openevo-desktop-local-api",
@@ -321,7 +326,9 @@ async function installReleaseSidecarContract(page: Page): Promise<void> {
         feature_flags: [...FEATURE_FLAGS],
       });
     }
-    if (!authenticated) return rejectUnexpectedRoute(route, page, `unauthenticated ${path}`);
+    if (!authenticated) {
+      return rejectUnexpectedRoute(route, observation, `unauthenticated ${path}`);
+    }
     if (path === "/desktop/v1/state") {
       return json(route, disconnectedDesktopState());
     }
@@ -343,7 +350,7 @@ async function installReleaseSidecarContract(page: Page): Promise<void> {
         body: ": release-readonly heartbeat\n\n",
       });
     }
-    return rejectUnexpectedRoute(route, page, `${method} ${path}`);
+    return rejectUnexpectedRoute(route, observation, `${method} ${path}`);
   });
 }
 
@@ -502,14 +509,10 @@ async function readHarnessObservation(page: Page): Promise<HarnessObservation> {
 
 async function rejectUnexpectedRoute(
   route: Route,
-  page: Page,
+  observation: Pick<HarnessObservation, "unexpectedCalls">,
   label: string,
 ): Promise<void> {
-  await page.evaluate((unexpected) => {
-    (window as typeof window & {
-      __OPENEVO_RELEASE_READONLY__: HarnessObservation;
-    }).__OPENEVO_RELEASE_READONLY__.unexpectedCalls.push(unexpected);
-  }, `sidecar route ${label}`);
+  observation.unexpectedCalls.push(`sidecar route ${label}`);
   await route.abort("blockedbyclient");
 }
 

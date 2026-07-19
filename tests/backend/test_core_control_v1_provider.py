@@ -2569,19 +2569,19 @@ def test_release_patch_checks_the_persisted_effective_spec(tmp_path: Path) -> No
             ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
             "project_activation_codex_cli_unavailable",
             "user_action_required",
-            "current remote SSH user",
+            "server administrator",
         ),
         (
             ServiceRunReadinessCode.CODEX_SUBSCRIPTION_AUTH_UNAVAILABLE,
             "project_activation_codex_subscription_auth_unavailable",
             "user_action_required",
-            "current remote SSH user",
+            "server administrator",
         ),
         (
             ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
             "project_activation_runtime_executable_unavailable",
             "user_action_required",
-            "container runtime for the SSH user",
+            "Docker user-container capability",
         ),
         (
             ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
@@ -2593,7 +2593,7 @@ def test_release_patch_checks_the_persisted_effective_spec(tmp_path: Path) -> No
             ServiceRunReadinessCode.SERVICE_GROUP_UNAVAILABLE,
             "project_activation_service_group_unavailable",
             "openevo_can_retry",
-            "Reconnect OpenEvo Daemon",
+            "Reconnect in OpenEvo Desktop",
         ),
     ],
 )

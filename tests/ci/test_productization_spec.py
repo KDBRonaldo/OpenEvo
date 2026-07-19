@@ -74,6 +74,19 @@ def test_spec_defines_the_desktop_daemon_product_boundary() -> None:
     assert "**OpenEvo Core Backend**" not in readme
 
 
+def test_spec_requires_desktop_owned_remote_lifecycle() -> None:
+    spec = " ".join(_text(SPEC).split())
+    for marker in (
+        "MUST NOT require the user to SSH to the server",
+        "operate the OpenEvo Daemon directly",
+        "Daemon installation, startup, attachment, upgrade, repair",
+        "typed administrator prerequisite",
+        "never given a remote command as the ordinary workflow",
+        "MUST NOT instruct an ordinary user to open a remote shell",
+    ):
+        assert marker in spec
+
+
 def test_spec_closes_the_science_task_and_workspace_state_model() -> None:
     spec = " ".join(_text(SPEC).split())
     for marker in (

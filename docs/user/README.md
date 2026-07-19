@@ -3,7 +3,9 @@
 OpenEvo Preview has two applications:
 
 - **OpenEvo Desktop Client** runs on macOS.
-- **OpenEvo Daemon** runs under your SSH account on a remote Linux server.
+- **OpenEvo Daemon** runs as an internal service under the selected SSH account
+  on a remote Linux server. Ordinary users manage it through Desktop and do not
+  operate it directly.
 
 Version `0.1.2` is the Preview candidate described by these guides. Install it
 only after its exact DMG and `SHA256SUMS` appear together in the immutable
@@ -14,7 +16,7 @@ the quickstart.
 
 ## Start Here
 
-1. [Prepare the remote server](remote-server-setup.md).
+1. [Check host prerequisites](remote-server-setup.md).
 2. [Install Desktop and run two sessions](desktop-quickstart.md).
 3. [Configure a restricted network](proxy-and-network.md), if needed.
 4. [Resolve typed errors](troubleshooting.md).
@@ -27,7 +29,8 @@ This Preview packages:
 - a built-in, read-only synthetic science project tour showing three task
   sessions and the three textual evolution targets without contacting a server;
 - SSH agent authentication;
-- a remote Codex CLI that is already installed and signed in for the SSH user;
+- a host whose remote Codex CLI is already installed and signed in for the
+  selected SSH user;
 - the intended Codex subscription transcript path and textual memory, skill
   bundle, and agent-system targets.
 
@@ -39,5 +42,6 @@ or general clean-host support evidence. Use it only for the documented
 exhibition profile.
 
 Desktop uploads and installs the version-matched OpenEvo Daemon and managed
-science runtime. You do not install an `openevo` Python package or upload a
-runtime image.
+science runtime, starts the remote services, and maintains the private tunnel.
+You do not install an `openevo` Python package, upload a runtime image, or
+operate the remote Daemon manually.

@@ -1290,7 +1290,10 @@ def _ssh_daemon_bundle_error(
             "The active OpenEvo Daemon is not compatible with this Desktop release.",
             status=409,
             retryable=False,
-            next_action="Stop the active Daemon before installing the required Desktop update.",
+            next_action=(
+                "Update OpenEvo Desktop and retry. Desktop will manage the compatible "
+                "Daemon transition."
+            ),
         )
     if exc.code is SshTransportErrorCode.DAEMON_BUNDLE_FAILED and action == "verify":
         return _daemon_identity_error()

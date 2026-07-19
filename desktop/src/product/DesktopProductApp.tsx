@@ -2738,7 +2738,8 @@ function repairActionGuidance(action: SystemRepairAction): string | null {
       return "OpenEvo can update the managed configuration.";
     case "user_input_required":
     case "user_action_required":
-      return "Complete the required server action, then run Check again.";
+      return "Ask the server administrator to resolve the host prerequisite, "
+        + "then run Check again in OpenEvo Desktop.";
     case "reconnect_required":
       return "Reconnect the remote workspace, then run Check again.";
     case "none":

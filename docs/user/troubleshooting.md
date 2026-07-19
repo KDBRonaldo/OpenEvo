@@ -35,22 +35,28 @@ network access, then use the Desktop retry action.
 
 `managed_runtime_prepare_failed`
 
-Confirm that Docker Engine is usable by the SSH user and has enough storage,
-then retry.
+Desktop could not prepare the managed runtime. Choose **Repair** or **Retry** in
+Desktop. If the report identifies missing Docker host access or insufficient
+host storage, ask the server administrator to resolve that host prerequisite,
+then retry in Desktop.
 
 `project_activation_codex_cli_unavailable`
 
-Install the release-supported Codex CLI on the remote server so
-`codex --version` works for the SSH user.
+This Preview cannot install Codex on an arbitrary clean host. Ask the server
+administrator to provide a host with the supported Codex CLI for the selected
+remote account, then choose **Retry** in Desktop.
 
 `project_activation_codex_subscription_auth_unavailable`
 
-Sign in to Codex as the same remote SSH user and confirm `codex login status`,
-then retry activation.
+Desktop could not verify a Codex subscription for the selected remote account.
+Ask the server administrator to prepare that account for the Preview, then
+choose **Retry** in Desktop.
 
 `project_activation_runtime_executable_unavailable`
 
-Install or restore Docker Engine access for the SSH user.
+The host does not provide the Docker user-container capability required by this
+Preview. Ask the server administrator to provide a supported host, then choose
+**Retry** in Desktop.
 
 `project_activation_runtime_image_unavailable`
 
@@ -74,31 +80,20 @@ open **System Settings > Privacy & Security** and choose **Open Anyway** for
 OpenEvo. This is a manual exception for an unsigned, non-notarized Preview; it
 does not make the app signed.
 
-## SSH Agent Has No Usable Key
+## SSH Credential Is Unavailable
 
-Desktop does not prompt for a password or key file. In Terminal on the Mac:
+This Preview uses the macOS SSH agent and never receives private-key bytes.
+Ensure the configured Mac credential is available through the normal macOS
+credential flow, then choose **Reconnect** in Desktop. Do not disable host-key
+checking and do not open a remote shell to operate OpenEvo.
 
-```bash
-ssh-add -l
-```
+## Codex Readiness Is Unavailable
 
-If the required identity is absent, add it to the agent and reconnect. Confirm
-that the same identity can access the configured remote user. Do not disable
-host-key checking to work around a connection problem.
-
-## Codex Works In One Shell But Activation Fails
-
-OpenEvo checks `codex` and the subscription status as the configured SSH user.
-On the server, verify:
-
-```bash
-codex --version
-codex login status
-```
-
-The login must be a Codex subscription and its authentication state must be
-readable from that user's normal Codex home. Desktop does not perform the login
-and does not accept a token as a substitute.
+Desktop checks Codex installation and subscription readiness for the configured
+remote account. If Codex works in another environment but activation fails,
+review the account and host shown in Desktop, ask the server administrator to
+prepare the matching account, and choose **Retry**. Desktop does not accept a
+token pasted into the project form.
 
 ## Connection Or Preparation Was Interrupted
 
@@ -131,8 +126,8 @@ not report a successful successor revision.
 
 ## Disk Or Runtime Problems
 
-Check free space in the remote user's home and in container storage. OpenEvo
-does not change Docker daemon configuration or delete project history to make
-space. Do not manually replace files under remote `~/.openevo` while the Daemon
-may be active; a partial manual cleanup can make release identity checks fail
-closed.
+Use **Check** or **Repair** in Desktop to inspect remote storage and managed
+runtime state. OpenEvo does not change Docker daemon configuration or delete
+project history to make space. Do not manually edit or delete OpenEvo remote
+state while the Daemon may be active; a partial cleanup can make release
+identity checks fail closed.

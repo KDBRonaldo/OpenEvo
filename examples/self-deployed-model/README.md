@@ -1,10 +1,10 @@
 # Self-Deployed Model
 
 Self-deployed mode runs OpenEvo against a remote model-serving backend such as
-vLLM. The user provides a Hugging Face model ID or compatible model
-configuration in Desktop, and Core Backend owns the serving lifecycle.
+vLLM. In the target product, the user selects a validated Hugging Face model
+profile in Desktop. OpenEvo Daemon then owns model download, serving,
+readiness, and session execution on the remote GPU server.
 
-This directory documents the release-facing self-deployed configuration shape.
-The current backend API exposes the mode and service preparation boundary; a
-fully automated runnable example should be added when model-serving lifecycle
-control is owned end to end by Core Backend.
+Self-Deployed is unavailable in the current Preview. A future runnable example
+must remain a Desktop workflow: users will not SSH to the server to install
+OpenEvo, start vLLM, download model files, or operate the Daemon manually.

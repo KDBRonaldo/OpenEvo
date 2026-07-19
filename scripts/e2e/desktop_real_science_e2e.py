@@ -2365,7 +2365,7 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("desktop-real-science-e2e-evidence.json"),
     )
-    parser.add_argument("--codex-model", default="gpt-5.5")
+    parser.add_argument("--codex-model", default="gpt-5.3-codex-spark")
     parser.add_argument("--task-title", default="Release Desktop science E2E")
     parser.add_argument(
         "--task-objective",
