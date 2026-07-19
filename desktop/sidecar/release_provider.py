@@ -9,6 +9,7 @@ import hmac
 import logging
 import re
 import sqlite3
+import time
 from threading import BoundedSemaphore, Event, Lock, RLock
 from typing import Literal, NoReturn, Protocol, cast
 
@@ -66,6 +67,7 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
 )
+from openevo.backend.contracts.v1 import models as core_v1
 from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
 from desktop.sidecar.workspace_identity import ownership_for_native_import
 from desktop.sidecar.workspace_imports import (
@@ -85,6 +87,28 @@ _LOCAL_CORE_SESSION_LOSS_CODES = frozenset(
         "desktop_core_bridge_closed",
     }
 )
+_PROJECT_REPAIR_TIMEOUT_SECONDS = 300.0
+_PROJECT_REPAIR_INITIAL_POLL_SECONDS = 0.25
+_PROJECT_REPAIR_MAX_POLL_SECONDS = 2.0
+_LOCAL_CHECK_SUMMARY_CHARS = 512
+_AUTOMATIC_REPAIR_ACTIONS = frozenset(
+    {
+        RepairAction.OPENEVO_CAN_RETRY,
+        RepairAction.OPENEVO_CAN_INSTALL,
+        RepairAction.OPENEVO_CAN_RECONFIGURE,
+    }
+)
+_REPAIR_ACTION_BY_CHECK = {
+    core_v1.EnvironmentCheckKind.NETWORK: core_v1.EnvironmentRepairAction.RETRY_NETWORK,
+    core_v1.EnvironmentCheckKind.CONTAINER_RUNTIME:
+        core_v1.EnvironmentRepairAction.RESTART_CONTAINER_RUNTIME,
+    core_v1.EnvironmentCheckKind.MODEL_SERVICE:
+        core_v1.EnvironmentRepairAction.RESTART_MODEL_SERVICE,
+    core_v1.EnvironmentCheckKind.REGISTRY:
+        core_v1.EnvironmentRepairAction.REPAIR_REGISTRY_INSTALL,
+    core_v1.EnvironmentCheckKind.STORAGE:
+        core_v1.EnvironmentRepairAction.RECONCILE_MANAGED_STATE,
+}
 
 
 class ProviderCapabilityUnavailableError(Exception):
@@ -110,6 +134,14 @@ class ActiveProjectMismatchError(Exception):
     def __init__(self, operation_id: str) -> None:
         super().__init__("requested project does not own the active Desktop session")
         self.operation_id = operation_id
+
+
+class LocalOperationCancellationUnavailableError(Exception):
+    """A Local operation cannot claim cancellation of its remote side effect."""
+
+    def __init__(self, operation_kind: str) -> None:
+        super().__init__("local operation cancellation is unavailable")
+        self.operation_kind = operation_kind
 
 
 class EvolutionConfigurationPendingError(Exception):
@@ -173,6 +205,16 @@ class _ConnectionActionGate:
 class _ProjectActivationWork:
     reservation: ProjectRuntimeActionReservation
     route: str
+    project_id: str
+    key: str
+    if_match: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectMaintenanceWork:
+    reservation: ProjectRuntimeActionReservation
+    route: str
+    operation_kind: Literal["project_doctor", "project_repair"]
     project_id: str
     key: str
     if_match: str
@@ -397,6 +439,8 @@ class DesktopReleaseProvider:
             "updateProject": self._update_project,
             "deleteProject": self._delete_project,
             "activateProject": self._activate_project,
+            "doctorProject": self._doctor_project,
+            "repairProject": self._repair_project,
             "getProjectCapabilities": self._get_project_capabilities,
             "validateProject": self._validate_project,
             "getLocalOperation": self._get_local_operation,
@@ -415,9 +459,13 @@ class DesktopReleaseProvider:
             "getArtifactContent": self._get_artifact_content,
             "getArtifactDiff": self._get_artifact_diff,
             "listServices": self._list_services,
+            "restartService": self._restart_service,
             "getCoreOperation": self._get_core_operation,
             "getCoreLogsByRef": self._get_core_logs_by_ref,
             "listServiceLogs": self._list_service_logs,
+            "createDiagnostic": self._create_diagnostic,
+            "getDiagnostic": self._get_diagnostic,
+            "deleteDiagnostic": self._delete_diagnostic,
             "cleanupCaches": self._cleanup_caches,
             "subscribeDesktopEvents": self._subscribe_events,
         }
@@ -488,7 +536,8 @@ class DesktopReleaseProvider:
         if active_projects:
             project = active_projects[0]
             if (
-                core_state.state == "online"
+                core_state.state in {"online", "degraded"}
+                and core_state.active_tunnel
                 and core_state.profile_id == project.profile_id
                 and core_binding is not None
                 and core_binding.project.project_id == project.project_id
@@ -1203,6 +1252,457 @@ class DesktopReleaseProvider:
             self.publish_state_changed()
         return self._project_operation_response(operation)
 
+    def _doctor_project(self, arguments: Mapping[str, object]) -> JSONResponse:
+        return self._start_project_maintenance(arguments, operation_kind="project_doctor")
+
+    def _repair_project(self, arguments: Mapping[str, object]) -> JSONResponse:
+        return self._start_project_maintenance(arguments, operation_kind="project_repair")
+
+    def _start_project_maintenance(
+        self,
+        arguments: Mapping[str, object],
+        *,
+        operation_kind: Literal["project_doctor", "project_repair"],
+    ) -> JSONResponse:
+        operation_id = {
+            "project_doctor": "doctorProject",
+            "project_repair": "repairProject",
+        }[operation_kind]
+        self._require_bridge(operation_id)
+        project_id = cast(str, arguments["project_id"])
+        if_match = cast(str, arguments["if_match"])
+        key = cast(str, arguments["idempotency_key"])
+        route_suffix = "doctor" if operation_kind == "project_doctor" else "repair"
+        route = f"/desktop/v1/projects/{project_id}/{route_suffix}"
+        with self._project_session_lock:
+            binding = self._active_project_for_runtime()
+            if binding is None:
+                raise ProviderStoreError("Desktop has no active project for this Core request")
+            if binding.project.project_id != project_id:
+                raise ActiveProjectMismatchError(operation_id)
+            reservation = self._store.begin_project_runtime_action(
+                route=route,
+                operation_kind=operation_kind,
+                project_id=project_id,
+                key=key,
+                body={},
+                if_match=if_match,
+            )
+        if reservation.replayed:
+            return self._project_operation_response(reservation.operation)
+        work = _ProjectMaintenanceWork(
+            reservation=reservation,
+            route=route,
+            operation_kind=operation_kind,
+            project_id=project_id,
+            key=key,
+            if_match=if_match,
+        )
+        accepted = self._project_executor.submit(
+            reservation.operation.operation_id,
+            lambda cancel_event: self._execute_project_maintenance(work, cancel_event),
+            accepted=self.publish_state_changed,
+            interrupt=lambda: None,
+        )
+        operation = reservation.operation
+        if not accepted:
+            operation = self._store.fail_project_runtime_action(
+                reservation=reservation,
+                route=route,
+                operation_kind=operation_kind,
+                project_id=project_id,
+                key=key,
+                body={},
+                if_match=if_match,
+                error=self._project_queue_capacity_error(reservation),
+            )
+            self.publish_state_changed()
+        return self._project_operation_response(operation)
+
+    def _execute_project_maintenance(
+        self,
+        work: _ProjectMaintenanceWork,
+        cancel_event: Event,
+    ) -> None:
+        try:
+            operation = self._store.start_project_runtime_action(
+                reservation=work.reservation,
+                route=work.route,
+                operation_kind=work.operation_kind,
+                project_id=work.project_id,
+                key=work.key,
+                body={},
+                if_match=work.if_match,
+            )
+            if operation.state != "running" or cancel_event.is_set():
+                return
+            checks: tuple[local_v1.NormalizedCheckV1, ...] = ()
+            if work.operation_kind == "project_doctor":
+                response = self._invoke_active_core(
+                    "doctorProject",
+                    lambda bridge, project: bridge.doctor_project(
+                        project,
+                        idempotency_key=work.key,
+                    ),
+                )
+                if not isinstance(response, core_v1.EnvironmentDoctorResponseV1):
+                    raise ProviderStoreError("Core doctor returned an invalid response")
+                checks = self._normalize_doctor_checks(response)
+            else:
+                doctor_key = hashlib.sha256(
+                    f"{work.key}\0repair-doctor".encode("utf-8")
+                ).hexdigest()
+                doctor_response = self._invoke_active_core(
+                    "repairProject",
+                    lambda bridge, project: bridge.doctor_project(
+                        project,
+                        idempotency_key=doctor_key,
+                    ),
+                )
+                if not isinstance(doctor_response, core_v1.EnvironmentDoctorResponseV1):
+                    raise ProviderStoreError("Core repair preflight returned an invalid response")
+                checks = self._normalize_doctor_checks(doctor_response)
+                actions = self._repair_actions_from_doctor(
+                    doctor_response,
+                    execution_mode=work.reservation.project.execution.mode
+                    if work.reservation.project is not None
+                    else None,
+                )
+                if not actions:
+                    if doctor_response.status is not core_v1.DoctorStatus.OK:
+                        raise DesktopCoreBridgeErrorV1(
+                            core_v1.ApiErrorV1(
+                                request_id=work.reservation.operation.operation_id,
+                                code="project_repair_requires_user_action",
+                                http_status=409,
+                                message=(
+                                    "The environment has no repair action that OpenEvo "
+                                    "can perform automatically."
+                                ),
+                                severity=ErrorSeverity.BLOCKING,
+                                category=ErrorCategory.ENVIRONMENT,
+                                retryable=False,
+                                repair_action=RepairAction.USER_ACTION_REQUIRED,
+                                next_action=self._doctor_next_action(doctor_response),
+                            )
+                        )
+                else:
+                    remote_operation = self._invoke_active_core(
+                        "repairProject",
+                        lambda bridge, project: bridge.repair_project(
+                            project,
+                            actions=actions,
+                            idempotency_key=work.key,
+                        ),
+                    )
+                    if not isinstance(remote_operation, core_v1.OperationV1):
+                        raise ProviderStoreError("Core repair returned an invalid operation")
+                    self._await_project_repair(work, remote_operation, cancel_event)
+                    post_doctor_key = hashlib.sha256(
+                        f"{work.key}\0repair-post-doctor".encode("utf-8")
+                    ).hexdigest()
+                    post_doctor = self._invoke_active_core(
+                        "repairProject",
+                        lambda bridge, project: bridge.doctor_project(
+                            project,
+                            idempotency_key=post_doctor_key,
+                        ),
+                    )
+                    if not isinstance(post_doctor, core_v1.EnvironmentDoctorResponseV1):
+                        raise ProviderStoreError(
+                            "Core repair verification returned an invalid response"
+                        )
+                    checks = self._normalize_doctor_checks(post_doctor)
+            if cancel_event.is_set():
+                return
+            self._store.complete_project_runtime_action(
+                reservation=work.reservation,
+                route=work.route,
+                operation_kind=work.operation_kind,
+                project_id=work.project_id,
+                key=work.key,
+                body={},
+                if_match=work.if_match,
+                remote_state=None,
+                checks=checks,
+            )
+        except Exception as exc:
+            error = self._project_maintenance_error(work.reservation, exc)
+            self._finalize_project_maintenance_failure(work, error)
+            _LOGGER.warning(
+                "Desktop project maintenance failed",
+                extra={
+                    "project_id": work.project_id,
+                    "operation_kind": work.operation_kind,
+                    "error_code": error.code,
+                },
+            )
+        finally:
+            self.publish_state_changed()
+
+    def _await_project_repair(
+        self,
+        work: _ProjectMaintenanceWork,
+        operation: core_v1.OperationV1,
+        cancel_event: Event,
+    ) -> None:
+        deadline = time.monotonic() + _PROJECT_REPAIR_TIMEOUT_SECONDS
+        poll_seconds = _PROJECT_REPAIR_INITIAL_POLL_SECONDS
+        while operation.status not in {
+            core_v1.OperationStatus.SUCCEEDED,
+            core_v1.OperationStatus.FAILED,
+            core_v1.OperationStatus.CANCELLED,
+        }:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DesktopCoreBridgeErrorV1(
+                    core_v1.ApiErrorV1(
+                        request_id=operation.id,
+                        code="core_repair_observation_timed_out",
+                        http_status=503,
+                        message="OpenEvo could not prove that the remote repair completed.",
+                        severity=ErrorSeverity.BLOCKING,
+                        category=ErrorCategory.ENVIRONMENT,
+                        retryable=False,
+                        repair_action=RepairAction.USER_ACTION_REQUIRED,
+                        next_action=(
+                            "Run Check again before deciding whether another repair is needed."
+                        ),
+                    )
+                )
+            if cancel_event.wait(min(poll_seconds, remaining)):
+                self._cancel_remote_repair(work, operation)
+                return
+            observed = self._invoke_active_core(
+                "repairProject",
+                lambda bridge, project: bridge.get_operation(project, operation.id),
+            )
+            if not isinstance(observed, core_v1.OperationV1):
+                raise ProviderStoreError("Core repair lookup returned an invalid operation")
+            self._validate_remote_repair_continuation(operation, observed)
+            operation = observed
+            poll_seconds = min(poll_seconds * 2, _PROJECT_REPAIR_MAX_POLL_SECONDS)
+        if operation.status is core_v1.OperationStatus.FAILED:
+            if operation.error is None:
+                raise ProviderStoreError("failed Core repair has no typed error")
+            raise DesktopCoreBridgeErrorV1(operation.error)
+        if operation.status is core_v1.OperationStatus.CANCELLED:
+            raise DesktopCoreBridgeErrorV1(
+                core_v1.ApiErrorV1(
+                    request_id=operation.id,
+                    code="core_repair_cancelled",
+                    http_status=409,
+                    message="The remote project repair was cancelled.",
+                    severity=ErrorSeverity.BLOCKING,
+                    category=ErrorCategory.ENVIRONMENT,
+                    retryable=True,
+                    repair_action=RepairAction.OPENEVO_CAN_RETRY,
+                    next_action="Retry project repair from OpenEvo Desktop.",
+                )
+            )
+
+    def _cancel_remote_repair(
+        self,
+        work: _ProjectMaintenanceWork,
+        operation: core_v1.OperationV1,
+    ) -> None:
+        if not operation.descriptor.cancellable:
+            return
+        cancel_key = hashlib.sha256(
+            f"{work.reservation.operation.operation_id}\0core-cancel".encode("utf-8")
+        ).hexdigest()
+        self._invoke_active_core(
+            "repairProject",
+            lambda bridge, project: bridge.cancel_operation(
+                project,
+                operation.id,
+                core_v1.OperationCancelRequestV1(
+                    reason=core_v1.OperationCancelReason.USER_REQUESTED
+                ),
+                if_match=operation.etag,
+                idempotency_key=cancel_key,
+            ),
+        )
+
+    def _finalize_project_maintenance_failure(
+        self,
+        work: _ProjectMaintenanceWork,
+        error: ApiErrorV1,
+    ) -> LocalOperationV1:
+        for attempt in range(2):
+            try:
+                return self._store.fail_project_runtime_action(
+                    reservation=work.reservation,
+                    route=work.route,
+                    operation_kind=work.operation_kind,
+                    project_id=work.project_id,
+                    key=work.key,
+                    body={},
+                    if_match=work.if_match,
+                    error=error,
+                )
+            except (ProviderStoreError, sqlite3.Error):
+                observed = self._store.observe_project_runtime_action(
+                    reservation=work.reservation,
+                    route=work.route,
+                    operation_kind=work.operation_kind,
+                    project_id=work.project_id,
+                    key=work.key,
+                    body={},
+                    if_match=work.if_match,
+                )
+                if observed.state not in {"queued", "running"}:
+                    return observed
+                if attempt != 0:
+                    raise
+        raise AssertionError("project maintenance failure finalization did not return")
+
+    @staticmethod
+    def _project_maintenance_error(
+        reservation: ProjectRuntimeActionReservation,
+        exc: Exception,
+    ) -> ApiErrorV1:
+        if isinstance(exc, DesktopCoreBridgeErrorV1):
+            return exc.error.model_copy(update={"request_id": reservation.operation.operation_id})
+        return ApiErrorV1(
+            request_id=reservation.operation.operation_id,
+            code="project_maintenance_failed",
+            http_status=503,
+            message="OpenEvo Desktop could not complete remote project maintenance.",
+            severity=ErrorSeverity.BLOCKING,
+            category=ErrorCategory.SERVICE,
+            retryable=True,
+            repair_action=RepairAction.OPENEVO_CAN_RETRY,
+            next_action="Retry project maintenance from OpenEvo Desktop.",
+        )
+
+    @staticmethod
+    def _normalize_doctor_checks(
+        response: core_v1.EnvironmentDoctorResponseV1,
+    ) -> tuple[local_v1.NormalizedCheckV1, ...]:
+        status_map: dict[core_v1.CheckStatus, str] = {
+            core_v1.CheckStatus.OK: "passed",
+            core_v1.CheckStatus.WARNING: "warning",
+            core_v1.CheckStatus.BLOCKING: "failed",
+            core_v1.CheckStatus.UNAVAILABLE: "failed",
+        }
+        repair_map: dict[RepairAction, str] = {
+            RepairAction.OPENEVO_CAN_RETRY: "openevo_can_retry",
+            RepairAction.OPENEVO_CAN_INSTALL: "openevo_can_retry",
+            RepairAction.OPENEVO_CAN_RECONFIGURE: "openevo_can_retry",
+            RepairAction.USER_ACTION_REQUIRED: "user_input_required",
+            RepairAction.UNSUPPORTED: "none",
+        }
+        return tuple(
+            local_v1.NormalizedCheckV1(
+                check_id=check.id,
+                label=check.kind.value.replace("_", " ").title(),
+                status=cast(
+                    Literal["passed", "warning", "failed"],
+                    status_map[check.status],
+                ),
+                summary=DesktopReleaseProvider._bounded_check_summary(check.message),
+                repair_action=cast(
+                    Literal[
+                        "none",
+                        "openevo_can_retry",
+                        "user_input_required",
+                        "reconnect_required",
+                    ],
+                    repair_map[check.repair_action],
+                ),
+            )
+            for check in response.checks
+        )
+
+    @staticmethod
+    def _bounded_check_summary(message: str) -> str:
+        if len(message) <= _LOCAL_CHECK_SUMMARY_CHARS:
+            return message
+        return f"{message[: _LOCAL_CHECK_SUMMARY_CHARS - 1]}…"
+
+    @staticmethod
+    def _repair_actions_from_doctor(
+        response: core_v1.EnvironmentDoctorResponseV1,
+        *,
+        execution_mode: ExecutionModeV1 | None,
+    ) -> tuple[core_v1.EnvironmentRepairAction, ...]:
+        selected: set[core_v1.EnvironmentRepairAction] = set()
+        for check in response.checks:
+            if (
+                check.status is core_v1.CheckStatus.OK
+                or check.repair_action not in _AUTOMATIC_REPAIR_ACTIONS
+            ):
+                continue
+            action = _REPAIR_ACTION_BY_CHECK.get(check.kind)
+            if action is None:
+                continue
+            if (
+                action is core_v1.EnvironmentRepairAction.RESTART_MODEL_SERVICE
+                and execution_mode != "self-deployed"
+            ):
+                continue
+            selected.add(action)
+        return tuple(action for action in core_v1.EnvironmentRepairAction if action in selected)
+
+    @staticmethod
+    def _doctor_next_action(response: core_v1.EnvironmentDoctorResponseV1) -> str:
+        for check in response.checks:
+            if check.status is not core_v1.CheckStatus.OK and check.next_action:
+                return DesktopReleaseProvider._bounded_check_summary(check.next_action)
+        return "Resolve the reported checks on the remote server, then run Check again."
+
+    @staticmethod
+    def _validate_remote_repair_continuation(
+        previous: core_v1.OperationV1,
+        observed: core_v1.OperationV1,
+    ) -> None:
+        immutable_fields = (
+            "id",
+            "kind",
+            "descriptor",
+            "request",
+            "logs_ref",
+            "created_at",
+        )
+        for field in immutable_fields:
+            if getattr(observed, field) != getattr(previous, field):
+                raise ProviderStoreError(
+                    f"Core repair changed immutable operation field {field}"
+                )
+        if observed.etag == previous.etag and observed != previous:
+            raise ProviderStoreError(
+                "Core repair changed representation without advancing its ETag"
+            )
+        allowed: dict[core_v1.OperationStatus, frozenset[core_v1.OperationStatus]] = {
+            core_v1.OperationStatus.QUEUED: frozenset(
+                {
+                    core_v1.OperationStatus.QUEUED,
+                    core_v1.OperationStatus.RUNNING,
+                    core_v1.OperationStatus.SUCCEEDED,
+                    core_v1.OperationStatus.FAILED,
+                    core_v1.OperationStatus.CANCELLED,
+                }
+            ),
+            core_v1.OperationStatus.RUNNING: frozenset(
+                {
+                    core_v1.OperationStatus.RUNNING,
+                    core_v1.OperationStatus.SUCCEEDED,
+                    core_v1.OperationStatus.FAILED,
+                    core_v1.OperationStatus.CANCELLED,
+                }
+            ),
+            core_v1.OperationStatus.SUCCEEDED: frozenset(
+                {core_v1.OperationStatus.SUCCEEDED}
+            ),
+            core_v1.OperationStatus.FAILED: frozenset({core_v1.OperationStatus.FAILED}),
+            core_v1.OperationStatus.CANCELLED: frozenset(
+                {core_v1.OperationStatus.CANCELLED}
+            ),
+        }
+        if observed.status not in allowed[previous.status]:
+            raise ProviderStoreError("Core repair operation status moved backwards")
+
     def _publish_project_activation_transition(self, work: _ProjectActivationWork) -> int:
         project = work.reservation.project
         if project is None:
@@ -1561,28 +2061,41 @@ class DesktopReleaseProvider:
         operation_id = cast(str, arguments["operation_id"])
         with self._project_session_lock:
             operation = self._store.get_local_operation(operation_id)
+            if (
+                operation.state in {"queued", "running", "cancelling"}
+                and operation.operation_kind in {"project_doctor", "project_repair"}
+            ):
+                raise LocalOperationCancellationUnavailableError(
+                    operation.operation_kind
+                )
             cancelled = self._store.cancel_local_operation(
                 operation_id,
                 if_match=cast(str, arguments["if_match"]),
             )
             if operation.state in {"queued", "running", "cancelling"}:
-                with self._connection_state_lock:
-                    self._session_generation += 1
-                    if operation.resource.resource_type == "profile":
-                        self._connection_owner = None
-                        self._core_state = CoreConnectionStateV1(
-                            state="disconnected", active_tunnel=False
-                        )
-                    elif operation.operation_kind == "project_activate":
-                        profile_id = self._core_state.profile_id
-                        self._core_session_binding = None
-                        self._core_state = (
-                            self._core_not_started_state(profile_id)
-                            if profile_id is not None
-                            else CoreConnectionStateV1(state="disconnected", active_tunnel=False)
-                        )
+                if (
+                    operation.resource.resource_type == "profile"
+                    or operation.operation_kind == "project_activate"
+                ):
+                    with self._connection_state_lock:
+                        self._session_generation += 1
+                        if operation.resource.resource_type == "profile":
+                            self._connection_owner = None
+                            self._core_state = CoreConnectionStateV1(
+                                state="disconnected", active_tunnel=False
+                            )
+                        elif operation.operation_kind == "project_activate":
+                            profile_id = self._core_state.profile_id
+                            self._core_session_binding = None
+                            self._core_state = (
+                                self._core_not_started_state(profile_id)
+                                if profile_id is not None
+                                else CoreConnectionStateV1(
+                                    state="disconnected", active_tunnel=False
+                                )
+                            )
         if operation.state in {"queued", "running", "cancelling"}:
-            if operation.operation_kind == "project_activate":
+            if operation.resource.resource_type == "project":
                 self._project_executor.cancel(operation.operation_id)
             elif operation.resource.resource_type == "profile":
                 self._disconnect_owned_transport(operation.resource.resource_id)
@@ -1726,6 +2239,17 @@ class DesktopReleaseProvider:
             lambda bridge, project: bridge.list_services(project, **page),
         )
 
+    def _restart_service(self, arguments: Mapping[str, object]) -> object:
+        return self._invoke_active_core(
+            "restartService",
+            lambda bridge, project: bridge.restart_service(
+                project,
+                cast(str, arguments["service_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
+        )
+
     def _get_core_operation(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(
             "getCoreOperation",
@@ -1753,6 +2277,37 @@ class DesktopReleaseProvider:
                 **self._page_arguments(arguments),
             ),
         )
+
+    def _create_diagnostic(self, arguments: Mapping[str, object]) -> object:
+        return self._invoke_active_core(
+            "createDiagnostic",
+            lambda bridge, project: bridge.create_diagnostic(
+                project,
+                cast(core_v1.DiagnosticsRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
+        )
+
+    def _get_diagnostic(self, arguments: Mapping[str, object]) -> object:
+        return self._invoke_active_core(
+            "getDiagnostic",
+            lambda bridge, project: bridge.get_diagnostic(
+                project,
+                cast(str, arguments["diagnostic_id"]),
+            ),
+        )
+
+    def _delete_diagnostic(self, arguments: Mapping[str, object]) -> Response:
+        self._invoke_active_core(
+            "deleteDiagnostic",
+            lambda bridge, project: bridge.delete_diagnostic(
+                project,
+                cast(str, arguments["diagnostic_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            ),
+        )
+        return Response(status_code=204)
 
     def _cleanup_caches(self, arguments: Mapping[str, object]) -> object:
         return self._invoke_active_core(

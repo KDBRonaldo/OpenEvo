@@ -35,14 +35,14 @@ export function SampleScientificProjectView({
   onConnectRemote,
 }: {
   workspace: SampleWorkspace;
-  onConnectRemote: () => void;
+  onConnectRemote?: () => void;
 }) {
   if (workspace === "evolution") return <SampleEvolutionWorkspace />;
   if (workspace === "system") return <SampleAboutWorkspace onConnectRemote={onConnectRemote} />;
   return <SampleResearchWorkspace onConnectRemote={onConnectRemote} />;
 }
 
-function SampleResearchWorkspace({ onConnectRemote }: { onConnectRemote: () => void }) {
+function SampleResearchWorkspace({ onConnectRemote }: { onConnectRemote?: () => void }) {
   const project = SAMPLE_SCIENTIFIC_PROJECT;
   const [selectedSessionId, setSelectedSessionId] = useState(project.sessions.at(-1)?.id ?? "");
   const selected =
@@ -272,7 +272,7 @@ function SampleEvolutionTargetDetail({ target }: { target: SampleEvolutionTarget
   );
 }
 
-function SampleAboutWorkspace({ onConnectRemote }: { onConnectRemote: () => void }) {
+function SampleAboutWorkspace({ onConnectRemote }: { onConnectRemote?: () => void }) {
   return (
     <div className="workspace-stack sample-workspace" data-testid="sample-about-workspace" lang="zh-CN">
       <SampleBanner />
@@ -290,7 +290,9 @@ function SampleAboutWorkspace({ onConnectRemote }: { onConnectRemote: () => void
       </section>
       <section className="sample-next-step">
         <div><PanelLeft size={20} /><div><strong>开始真实项目</strong><p>添加远端工作区后，真实项目将使用独立的受鉴权连接与权威数据。</p></div></div>
-        <button type="button" className="primary-button" onClick={onConnectRemote}><PanelLeft size={16} /> 添加远端工作区</button>
+        {onConnectRemote ? (
+          <button type="button" className="primary-button" onClick={onConnectRemote}><PanelLeft size={16} /> 添加远端工作区</button>
+        ) : null}
       </section>
     </div>
   );

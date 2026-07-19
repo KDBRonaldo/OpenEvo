@@ -36,6 +36,7 @@ from desktop.sidecar.core_bridge_v1 import (
     CoreWorkspaceUploadAbortStateV1,
     CoreWorkspaceUploadFinalizeAuthorityV1,
     CoreWorkspaceUploadFinalizeStateV1,
+    _completed_patch_project_authority,
     revision_manifest_sha256_v1,
 )
 from openevo.backend.contracts.v1 import models as core_v1
@@ -66,6 +67,11 @@ _SQLITE_SYNCHRONOUS_FULL = 2
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _MANAGED_FILES = (DATABASE_FILENAME, OWNER_LOCK_FILENAME, IDENTITY_MARKER_FILENAME)
 _SQLITE_SIDE_FILES = (JOURNAL_FILENAME, WAL_FILENAME, SHM_FILENAME)
+_MAPPING_TRANSITION_RECORD = "CoreProjectMappingTransitionV1"
+_PROJECT_HEAD_TRANSITION_RECORD = "CoreProjectHeadMappingTransitionV1"
+_PROJECT_HEAD_AND_PATCH_TRANSITION_RECORD = (
+    "CoreProjectHeadAndPatchMappingTransitionV1"
+)
 _ModelT = TypeVar("_ModelT", bound=core_v1.ContractModel)
 
 
@@ -884,8 +890,9 @@ def _mapping_from_value(value: object) -> CoreProjectMappingV1:
 
 @dataclass(frozen=True, slots=True)
 class _ProjectHeadSuccessorHistoryAuthority:
-    predecessor_mapping_sha256: str
     proof: CoreProjectHeadSuccessorProofV1
+    predecessor_mapping_sha256: str | None = None
+    predecessor_project_sha256: str | None = None
 
 
 def _project_head_successor_value(
@@ -895,25 +902,49 @@ def _project_head_successor_value(
         raise CoreBridgeStoreContractError("project-head successor authority has the wrong type")
     if type(value.proof) is not CoreProjectHeadSuccessorProofV1:
         raise CoreBridgeStoreContractError("project-head successor proof has the wrong type")
-    return {
+    if (value.predecessor_mapping_sha256 is None) == (
+        value.predecessor_project_sha256 is None
+    ):
+        raise CoreBridgeStoreContractError(
+            "project-head successor authority must bind exactly one predecessor"
+        )
+    proof_value = {
         "head": _model_value(value.proof.head),
-        "predecessor_mapping_sha256": _digest(
-            value.predecessor_mapping_sha256,
-            label="predecessor mapping digest",
-        ),
         "project": _model_value(value.proof.project),
         "revision": _model_value(value.proof.revision),
+    }
+    if value.predecessor_mapping_sha256 is not None:
+        return {
+            **proof_value,
+            "predecessor_mapping_sha256": _digest(
+                value.predecessor_mapping_sha256,
+                label="predecessor mapping digest",
+            ),
+        }
+    return {
+        **proof_value,
+        "predecessor_mapping_sha256": None,
+        "predecessor_project_sha256": _digest(
+            value.predecessor_project_sha256,
+            label="predecessor project digest",
+        ),
     }
 
 
 def _project_head_successor_from_value(
     value: object,
 ) -> _ProjectHeadSuccessorHistoryAuthority:
+    if not isinstance(value, dict):
+        raise CoreBridgeStoreDataCorruptionError(
+            "stored project-head successor authority is not an object"
+        )
+    legacy = "predecessor_project_sha256" not in value
     data = _exact_object(
         value,
         frozenset(
             {
                 "predecessor_mapping_sha256",
+                *(() if legacy else ("predecessor_project_sha256",)),
                 "project",
                 "head",
                 "revision",
@@ -922,11 +953,27 @@ def _project_head_successor_from_value(
         label="project-head successor authority",
     )
     try:
+        predecessor_mapping_sha256 = _optional(
+            data["predecessor_mapping_sha256"],
+            lambda item: _digest(item, label="predecessor mapping digest"),
+        )
+        predecessor_project_sha256 = (
+            None
+            if legacy
+            else _optional(
+                data["predecessor_project_sha256"],
+                lambda item: _digest(item, label="predecessor project digest"),
+            )
+        )
+        if (predecessor_mapping_sha256 is None) == (
+            predecessor_project_sha256 is None
+        ):
+            raise CoreBridgeStoreContractError(
+                "stored successor authority must bind exactly one predecessor"
+            )
         return _ProjectHeadSuccessorHistoryAuthority(
-            predecessor_mapping_sha256=_digest(
-                data["predecessor_mapping_sha256"],
-                label="predecessor mapping digest",
-            ),
+            predecessor_mapping_sha256=predecessor_mapping_sha256,
+            predecessor_project_sha256=predecessor_project_sha256,
             proof=CoreProjectHeadSuccessorProofV1(
                 project=_model(
                     core_v1.ProjectV1,
@@ -943,6 +990,7 @@ def _project_head_successor_from_value(
                     data["revision"],
                     label="successor revision",
                 ),
+                predecessor_project=None,
             ),
         )
     except (ValueError, CoreBridgeStoreContractError) as exc:
@@ -962,16 +1010,26 @@ class _MappingHistoryEntry:
 def _history_value(value: _MappingHistoryEntry) -> dict[str, Any]:
     if value.project_head_successor is not None:
         if value.completed_patch is not None:
-            raise CoreBridgeStoreContractError(
-                "mapping history cannot contain patch and project-head successor authority"
-            )
+            # The 0.1.1 reader rejects this closed record type during startup.
+            # The history append and current mapping update share one transaction,
+            # so the row itself is the durable rollback barrier.
+            return {
+                "completed_patch": _patch_value(value.completed_patch),
+                "create_operation": _create_value(value.create_operation),
+                "mapping": _mapping_value(value.mapping),
+                "project_head_successor": _project_head_successor_value(
+                    value.project_head_successor
+                ),
+                "record_type": _PROJECT_HEAD_AND_PATCH_TRANSITION_RECORD,
+                "schema_version": "1",
+            }
         return {
             "create_operation": _create_value(value.create_operation),
             "mapping": _mapping_value(value.mapping),
             "project_head_successor": _project_head_successor_value(
                 value.project_head_successor
             ),
-            "record_type": "CoreProjectHeadMappingTransitionV1",
+            "record_type": _PROJECT_HEAD_TRANSITION_RECORD,
             "schema_version": "1",
         }
     return {
@@ -980,17 +1038,17 @@ def _history_value(value: _MappingHistoryEntry) -> dict[str, Any]:
         ),
         "create_operation": _create_value(value.create_operation),
         "mapping": _mapping_value(value.mapping),
-        "record_type": "CoreProjectMappingTransitionV1",
+        "record_type": _MAPPING_TRANSITION_RECORD,
         "schema_version": "1",
     }
 
 
 def _history_from_value(value: object) -> _MappingHistoryEntry:
-    if not isinstance(value, dict):
+    if type(value) is not dict:
         raise CoreBridgeStoreDataCorruptionError(
             "stored mapping transition history is not an object"
         )
-    if value.get("record_type") == "CoreProjectHeadMappingTransitionV1":
+    if value.get("record_type") == _PROJECT_HEAD_TRANSITION_RECORD:
         data = _exact_object(
             value,
             frozenset(
@@ -1016,6 +1074,33 @@ def _history_from_value(value: object) -> _MappingHistoryEntry:
                 data["project_head_successor"]
             ),
         )
+    if value.get("record_type") == _PROJECT_HEAD_AND_PATCH_TRANSITION_RECORD:
+        data = _exact_object(
+            value,
+            frozenset(
+                {
+                    "schema_version",
+                    "record_type",
+                    "mapping",
+                    "create_operation",
+                    "completed_patch",
+                    "project_head_successor",
+                }
+            ),
+            label="project-head and patch mapping transition history",
+        )
+        if data["schema_version"] != "1":
+            raise CoreBridgeStoreDataCorruptionError(
+                "stored project-head and patch mapping transition type is invalid"
+            )
+        return _MappingHistoryEntry(
+            mapping=_mapping_from_value(data["mapping"]),
+            create_operation=_create_from_value(data["create_operation"]),
+            completed_patch=_patch_from_value(data["completed_patch"]),
+            project_head_successor=_project_head_successor_from_value(
+                data["project_head_successor"]
+            ),
+        )
     data = _exact_object(
         value,
         frozenset(
@@ -1029,7 +1114,7 @@ def _history_from_value(value: object) -> _MappingHistoryEntry:
         ),
         label="mapping transition history",
     )
-    if data["schema_version"] != "1" or data["record_type"] != "CoreProjectMappingTransitionV1":
+    if data["schema_version"] != "1" or data["record_type"] != _MAPPING_TRANSITION_RECORD:
         raise CoreBridgeStoreDataCorruptionError("stored mapping transition type is invalid")
     return _MappingHistoryEntry(
         mapping=_mapping_from_value(data["mapping"]),
@@ -2559,7 +2644,6 @@ class DesktopCoreBridgeStoreV1:
                         previous,
                         entry.completed_patch,
                         entry.project_head_successor,
-                        allow_legacy_project_head=True,
                     )
                     previous = item
             for project_id, patch in patches.items():
@@ -3054,6 +3138,201 @@ class DesktopCoreBridgeStoreV1:
             self._write_patch(connection, updated, expected=operation)
         return updated
 
+    @staticmethod
+    def _project_create_from_project(project: core_v1.ProjectV1) -> core_v1.ProjectCreateV1:
+        return core_v1.ProjectCreateV1(
+            name=project.name,
+            description=project.description,
+            spec=project.spec,
+            task=project.task,
+            workspace=project.workspace,
+        )
+
+    @classmethod
+    def _first_mapping_predecessor_project(
+        cls,
+        operation: CoreProjectCreateOperationV1,
+        completed_patch: CoreProjectPatchOperationV1 | None,
+    ) -> core_v1.ProjectV1 | None:
+        if completed_patch is not None:
+            return _completed_patch_project_authority(
+                completed_patch,
+                operation.workspace_upload_finalize,
+            )
+        finalize = operation.workspace_upload_finalize
+        if (
+            finalize is not None
+            and finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
+            and finalize.outcome is not None
+            and cls._project_create_from_project(finalize.outcome.project)
+            == operation.project_create
+        ):
+            return finalize.outcome.project
+        return None
+
+    @classmethod
+    def _completed_patch_successor_predecessor(
+        cls,
+        operation: CoreProjectCreateOperationV1,
+        completed_patch: CoreProjectPatchOperationV1,
+        current: CoreProjectMappingV1,
+    ) -> tuple[core_v1.ProjectV1, bool] | None:
+        outcome = completed_patch.outcome
+        if outcome is None:
+            raise CoreBridgeStoreContractError(
+                "completed patch successor authority has no outcome"
+            )
+        latest = _completed_patch_project_authority(
+            completed_patch,
+            operation.workspace_upload_finalize,
+        )
+        assert latest is not None
+        transitions: list[tuple[core_v1.ProjectV1, bool]] = []
+        base_revision = completed_patch.base_project.active_revision
+        outcome_revision = (
+            outcome.active_revision
+            if outcome.active_revision is not None
+            else base_revision
+        )
+        latest_revision = latest.active_revision or outcome_revision
+        if base_revision != outcome_revision:
+            valid_initial_revision = base_revision is None and (
+                outcome_revision is None
+                or (
+                    outcome_revision.project_id == completed_patch.core_project_id
+                    and outcome_revision.generation == 0
+                )
+            )
+            if not valid_initial_revision and (
+                base_revision is None
+                or outcome_revision is None
+                or not cls._revision_is_same_or_successor(
+                    base_revision,
+                    outcome_revision,
+                )
+            ):
+                raise CoreBridgeStoreContractError(
+                    "completed patch revision authority is not adjacent"
+                )
+            if base_revision is not None:
+                transitions.append((completed_patch.base_project, True))
+        if outcome_revision != latest_revision:
+            valid_initial_revision = outcome_revision is None and (
+                latest_revision is None
+                or (
+                    latest_revision.project_id == completed_patch.core_project_id
+                    and latest_revision.generation == 0
+                )
+            )
+            if not valid_initial_revision and (
+                outcome_revision is None
+                or latest_revision is None
+                or not cls._revision_is_same_or_successor(
+                    outcome_revision,
+                    latest_revision,
+                )
+            ):
+                raise CoreBridgeStoreContractError(
+                    "workspace finalize revision authority is not adjacent"
+                )
+            if outcome_revision is not None:
+                transitions.append(
+                    (
+                        outcome
+                        if outcome.active_revision is not None
+                        else completed_patch.base_project,
+                        True,
+                    )
+                )
+        if latest_revision != current.active_revision:
+            if (
+                latest_revision is None
+                or not cls._revision_is_same_or_successor(
+                    latest_revision,
+                    current.active_revision,
+                )
+                or latest.active_revision is None
+            ):
+                raise CoreBridgeStoreContractError(
+                    "completed patch mapping revision authority is not adjacent"
+                )
+            transitions.append((latest, False))
+        if len(transitions) > 1:
+            raise CoreBridgeStoreContractError(
+                "completed patch mapping requires multiple successor proofs"
+            )
+        return None if not transitions else transitions[0]
+
+    @classmethod
+    def _first_unpatched_successor_predecessor(
+        cls,
+        operation: CoreProjectCreateOperationV1,
+        current: CoreProjectMappingV1,
+    ) -> core_v1.ProjectV1 | None:
+        predecessor = cls._first_mapping_predecessor_project(operation, None)
+        if predecessor is None:
+            if current.active_revision.generation != 0:
+                raise CoreBridgeStoreContractError(
+                    "first mapping is not bound to a genesis revision"
+                )
+            return None
+        predecessor_revision = predecessor.active_revision
+        if predecessor_revision is None or predecessor_revision.generation != 0:
+            raise CoreBridgeStoreContractError(
+                "initial workspace publication is not a genesis revision"
+            )
+        if current.active_revision == predecessor_revision:
+            return None
+        if not cls._revision_is_same_or_successor(
+            predecessor_revision,
+            current.active_revision,
+        ):
+            raise CoreBridgeStoreContractError(
+                "initial workspace mapping revision authority is not adjacent"
+            )
+        return predecessor
+
+    @classmethod
+    def _first_mapping_successor_predecessor(
+        cls,
+        operation: CoreProjectCreateOperationV1,
+        completed_patch: CoreProjectPatchOperationV1 | None,
+        current: CoreProjectMappingV1,
+    ) -> tuple[core_v1.ProjectV1, bool] | None:
+        completed_successor = (
+            None
+            if completed_patch is None
+            else cls._completed_patch_successor_predecessor(
+                operation,
+                completed_patch,
+                current,
+            )
+        )
+        initial_finalize_predecessor = cls._first_mapping_predecessor_project(
+            operation,
+            None,
+        )
+        initial_predecessor = (
+            cls._first_unpatched_successor_predecessor(operation, current)
+            if initial_finalize_predecessor is not None or completed_successor is None
+            else None
+        )
+        if initial_predecessor is None:
+            return completed_successor
+        if completed_successor is None:
+            return initial_predecessor, False
+        completed_predecessor, completed_action_mutation = completed_successor
+        if initial_predecessor.active_revision != completed_predecessor.active_revision:
+            raise CoreBridgeStoreContractError(
+                "first mapping requires multiple independent successor proofs"
+            )
+        return (
+            initial_predecessor,
+            completed_action_mutation
+            or completed_patch is not None
+            and completed_patch.base_project == initial_predecessor,
+        )
+
     @classmethod
     def _validate_mapping_transition(
         cls,
@@ -3062,13 +3341,7 @@ class DesktopCoreBridgeStoreV1:
         expected_previous: CoreProjectMappingV1 | None,
         completed_patch: CoreProjectPatchOperationV1 | None,
         project_head_successor: _ProjectHeadSuccessorHistoryAuthority | None,
-        *,
-        allow_legacy_project_head: bool = False,
     ) -> None:
-        if completed_patch is not None and project_head_successor is not None:
-            raise CoreBridgeStoreContractError(
-                "mapping transition has multiple successor authorities"
-            )
         cls._validate_mapping_owner(operation, mapping)
         expected_generation = (
             1 if expected_previous is None else expected_previous.mapping_generation + 1
@@ -3083,11 +3356,51 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreContractError(
                 "mapping generation or predecessor is not the exact successor"
             )
+        completed_successor = (
+            cls._completed_patch_successor_predecessor(
+                operation,
+                completed_patch,
+                mapping,
+            )
+            if completed_patch is not None
+            else None
+        )
+        completed_predecessor_project = (
+            None if completed_successor is None else completed_successor[0]
+        )
+        completed_action_mutation = bool(
+            completed_successor is not None and completed_successor[1]
+        )
+        first_mapping_successor = (
+            cls._first_mapping_successor_predecessor(
+                operation,
+                completed_patch,
+                mapping,
+            )
+            if expected_previous is None
+            else None
+        )
+        first_mapping_predecessor = (
+            None if first_mapping_successor is None else first_mapping_successor[0]
+        )
+        if expected_previous is None and first_mapping_successor is not None:
+            completed_action_mutation = first_mapping_successor[1]
+        required_project_predecessor = (
+            first_mapping_predecessor
+            if expected_previous is None
+            else completed_predecessor_project
+        )
+        if (
+            (completed_patch is not None or expected_previous is None)
+            and (
+            (required_project_predecessor is None)
+            != (project_head_successor is None)
+            )
+        ):
+            raise CoreBridgeStoreContractError(
+                "completed patch verified project-head successor proof presence is invalid"
+            )
         if expected_previous is None:
-            if project_head_successor is not None:
-                raise CoreBridgeStoreContractError(
-                    "first mapping cannot claim a project-head successor"
-                )
             if mapping.request_sha256 != operation.request_sha256:
                 if completed_patch is None:
                     raise CoreBridgeStoreContractError(
@@ -3124,37 +3437,67 @@ class DesktopCoreBridgeStoreV1:
         finalize = operation.workspace_upload_finalize
         if (
             expected_previous is None
+            and completed_patch is None
             and finalize is not None
             and (
                 finalize.state is not CoreWorkspaceUploadFinalizeStateV1.APPLIED
                 or finalize.outcome is None
-                or not cls._project_authorizes_mapping(finalize.outcome.project, mapping)
+                or (
+                    not cls._project_authorizes_mapping(finalize.outcome.project, mapping)
+                    and project_head_successor is None
+                )
             )
         ):
             raise CoreBridgeStoreContractError(
                 "first imported mapping is not bound to the applied finalize outcome"
             )
         if expected_previous is not None:
+            completed_patch_project = completed_predecessor_project
+            completed_patch_latest_project = (
+                None
+                if completed_patch is None
+                else _completed_patch_project_authority(completed_patch, finalize)
+            )
             cls._validate_mapping_monotonicity(
                 expected_previous,
                 mapping,
                 completed_patch=completed_patch,
-                finalize=operation.workspace_upload_finalize,
+                completed_patch_project=completed_patch_project,
+                completed_patch_latest_project=completed_patch_latest_project,
+                completed_action_mutation=completed_action_mutation,
                 project_head_successor=project_head_successor,
-                allow_legacy_project_head=allow_legacy_project_head,
+            )
+        elif project_head_successor is not None:
+            assert required_project_predecessor is not None
+            cls._validate_project_head_successor_authority(
+                None,
+                mapping,
+                project_head_successor,
+                completed_patch=completed_patch,
+                completed_patch_project=required_project_predecessor,
+                completed_patch_latest_project=(
+                    cls._first_mapping_predecessor_project(operation, None)
+                    if completed_patch is None
+                    else _completed_patch_project_authority(
+                        completed_patch,
+                        finalize,
+                    )
+                ),
+                completed_action_mutation=completed_action_mutation,
             )
         if completed_patch is not None:
             assert completed_patch.outcome is not None
             authorities = [completed_patch.outcome]
-            if (
-                finalize is not None
-                and finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
-                and finalize.outcome is not None
-            ):
-                authorities.append(finalize.outcome.project)
-            if not any(
+            finalized_project = _completed_patch_project_authority(
+                completed_patch,
+                finalize,
+            )
+            if finalized_project is not None and finalized_project != completed_patch.outcome:
+                authorities.append(finalized_project)
+            patch_authorizes_mapping = any(
                 cls._project_authorizes_mapping(authority, mapping) for authority in authorities
-            ):
+            )
+            if not patch_authorizes_mapping and project_head_successor is None:
                 raise CoreBridgeStoreContractError(
                     "mapping successor is not bound to the applied patch outcome"
                 )
@@ -3206,38 +3549,168 @@ class DesktopCoreBridgeStoreV1:
         )
 
     @classmethod
-    def _is_legacy_authority_only_successor(
-        cls,
-        previous: CoreProjectMappingV1,
-        current: CoreProjectMappingV1,
-    ) -> bool:
-        return bool(
-            cls._has_project_head_successor_shape(previous, current)
-            and current.project_snapshot == previous.project_snapshot
-            and current.task_snapshot == previous.task_snapshot
-            and current.workspace_snapshot == previous.workspace_snapshot
-        )
-
-    @classmethod
     def _validate_project_head_successor_authority(
         cls,
-        previous: CoreProjectMappingV1,
+        previous: CoreProjectMappingV1 | None,
         current: CoreProjectMappingV1,
         authority: _ProjectHeadSuccessorHistoryAuthority,
+        *,
+        completed_patch: CoreProjectPatchOperationV1 | None,
+        completed_patch_project: core_v1.ProjectV1 | None,
+        completed_patch_latest_project: core_v1.ProjectV1 | None,
+        completed_action_mutation: bool,
     ) -> None:
-        if authority.predecessor_mapping_sha256 != cls._mapping_digest(previous):
+        predecessor_project = completed_patch_project
+        if previous is not None:
+            if (
+                authority.predecessor_mapping_sha256 != cls._mapping_digest(previous)
+                or authority.predecessor_project_sha256 is not None
+            ):
+                raise CoreBridgeStoreContractError(
+                    "project-head successor predecessor mapping digest is invalid"
+                )
+            predecessor_revision = previous.active_revision
+        else:
+            if predecessor_project is None:
+                raise CoreBridgeStoreContractError(
+                    "first mapping successor lacks predecessor project authority"
+                )
+            predecessor_project_sha256 = sha256(
+                _canonical_json_bytes(_model_value(predecessor_project))
+            ).hexdigest()
+            if (
+                authority.predecessor_mapping_sha256 is not None
+                or authority.predecessor_project_sha256
+                != predecessor_project_sha256
+            ):
+                raise CoreBridgeStoreContractError(
+                    "project-head successor predecessor project digest is invalid"
+                )
+            predecessor_revision = predecessor_project.active_revision
+        if predecessor_revision is None:
             raise CoreBridgeStoreContractError(
-                "project-head successor predecessor mapping digest is invalid"
+                "project-head successor predecessor has no active revision"
             )
-        if not cls._has_project_head_successor_shape(previous, current):
+        if completed_patch is None and previous is not None:
+            valid_successor_shape = cls._has_project_head_successor_shape(previous, current)
+        else:
+            current_mutable = current.mutable_authority
+            assert predecessor_project is not None
+            predecessor_mutable = CoreProjectPatchMutableAuthorityV1(
+                status=predecessor_project.status,
+                project_snapshot=predecessor_project.current_project_snapshot,
+                workspace_snapshot=predecessor_project.current_workspace_snapshot,
+                workspace_publication=predecessor_project.workspace_publication,
+                active_revision=predecessor_project.active_revision,
+                registry_digest=predecessor_project.registry_digest,
+                model_preparation=predecessor_project.model_preparation,
+                updated_at=predecessor_project.updated_at,
+                etag=predecessor_project.etag,
+            )
+            predecessor_immutable = CoreProjectPatchImmutableAuthorityV1(
+                project_id=predecessor_project.id,
+                project_create=cls._project_create_from_project(predecessor_project),
+                task_snapshot=predecessor_project.current_task_snapshot,
+                created_at=predecessor_project.created_at,
+            )
+            if completed_patch is not None:
+                latest_project = completed_patch_latest_project
+                latest_immutable = (
+                    None
+                    if latest_project is None
+                    else CoreProjectPatchImmutableAuthorityV1(
+                        project_id=latest_project.id,
+                        project_create=cls._project_create_from_project(latest_project),
+                        task_snapshot=latest_project.current_task_snapshot,
+                        created_at=latest_project.created_at,
+                    )
+                )
+                valid_patch_binding = bool(
+                    latest_project is not None
+                    and completed_patch.new_request_sha256 == current.request_sha256
+                    and completed_patch.new_project_create == current.project_create
+                    and latest_immutable == current.immutable_authority
+                    and (
+                        previous is None
+                        or completed_patch.base_project.active_revision
+                        == previous.active_revision
+                    )
+                )
+            else:
+                latest_project = predecessor_project
+                valid_patch_binding = bool(
+                    predecessor_immutable.project_create == current.project_create
+                    and predecessor_immutable == current.immutable_authority
+                )
+            if completed_action_mutation:
+                valid_mutable_shape = bool(
+                    latest_project is not None
+                    and cls._project_authorizes_mapping(latest_project, current)
+                    and current.project_etag != predecessor_project.etag
+                    and cls._timestamp(current.project_updated_at)
+                    > cls._timestamp(predecessor_project.updated_at)
+                )
+            else:
+                expected_mutable = replace(
+                    predecessor_mutable,
+                    project_snapshot=current_mutable.project_snapshot,
+                    workspace_snapshot=current_mutable.workspace_snapshot,
+                    active_revision=current_mutable.active_revision,
+                    registry_digest=current_mutable.registry_digest,
+                    updated_at=current_mutable.updated_at,
+                    etag=current_mutable.etag,
+                )
+                valid_mutable_shape = bool(
+                    current_mutable == expected_mutable
+                    and current.project_etag != predecessor_project.etag
+                    and cls._timestamp(current.project_updated_at)
+                    > cls._timestamp(predecessor_project.updated_at)
+                )
+            valid_successor_shape = bool(
+                predecessor_revision == predecessor_project.active_revision
+                and valid_patch_binding
+                and current.active_revision != predecessor_revision
+                and cls._revision_is_same_or_successor(
+                    predecessor_revision,
+                    current.active_revision,
+                )
+                and valid_mutable_shape
+            )
+        if not valid_successor_shape:
             raise CoreBridgeStoreContractError(
                 "project-head successor mapping shape is invalid"
             )
         proof = authority.proof
+        if (
+            previous is not None
+            and completed_patch is None
+            and proof.predecessor_project is not None
+        ) or (
+            completed_patch_project is not None
+            and proof.predecessor_project is not None
+            and proof.predecessor_project != completed_patch_project
+        ):
+            raise CoreBridgeStoreContractError(
+                "project-head successor proof predecessor authority is invalid"
+            )
         project = proof.project
         head = proof.head
         revision = proof.revision
         transition = revision.transition
+        head_transition = head.transition
+        if head.successor_revision is None:
+            head_binds_active_revision = bool(
+                head_transition is None and head.updated_at == revision.updated_at
+            )
+        else:
+            head_binds_active_revision = bool(
+                head_transition is not None
+                and head_transition.state is not core_v1.RevisionTransitionState.ACTIVE
+                and head_transition.predecessor_revision == revision.revision
+                and head_transition.successor_revision == head.successor_revision
+                and head_transition.updated_at == head.updated_at
+                and cls._timestamp(head.updated_at) >= cls._timestamp(revision.updated_at)
+            )
         if (
             not cls._project_authorizes_mapping(project, current)
             or project.id != current.core_project_id
@@ -3250,7 +3723,7 @@ class DesktopCoreBridgeStoreV1:
             or head.active_revision != current.active_revision
             or revision.revision != current.active_revision
             or revision.status is not core_v1.RevisionStatus.ACTIVE
-            or revision.predecessor_revision != previous.active_revision
+            or revision.predecessor_revision != predecessor_revision
             or revision.revision.manifest_sha256
             != revision_manifest_sha256_v1(
                 project_id=revision.revision.project_id,
@@ -3263,7 +3736,7 @@ class DesktopCoreBridgeStoreV1:
             )
             or transition is None
             or transition.state is not core_v1.RevisionTransitionState.ACTIVE
-            or transition.predecessor_revision != previous.active_revision
+            or transition.predecessor_revision != predecessor_revision
             or transition.successor_revision != current.active_revision
             or transition.progress_completed != 1
             or transition.progress_total != 1
@@ -3273,8 +3746,8 @@ class DesktopCoreBridgeStoreV1:
             or revision.created_at != revision.updated_at
             or revision.activated_at != revision.updated_at
             or transition.updated_at != revision.updated_at
-            or head.updated_at != revision.updated_at
             or project.updated_at != revision.updated_at
+            or not head_binds_active_revision
             or revision.project_snapshot != current.project_snapshot
             or revision.task_snapshot != current.task_snapshot
             or revision.workspace_snapshot != current.workspace_snapshot
@@ -3399,30 +3872,9 @@ class DesktopCoreBridgeStoreV1:
             etag=project.etag,
         )
         mapping_mutable = mapping.mutable_authority
-        if project_immutable != mapping.immutable_authority:
-            return False
-        if mapping_mutable.active_revision == project_mutable.active_revision:
-            return mapping_mutable == project_mutable
-        project_revision = project_mutable.active_revision
-        mapping_revision = mapping_mutable.active_revision
-        if (
-            project_revision is None
-            or mapping_revision is None
-            or not cls._revision_is_same_or_successor(project_revision, mapping_revision)
-        ):
-            return False
-        expected_successor = replace(
-            project_mutable,
-            active_revision=mapping_revision,
-            registry_digest=mapping_mutable.registry_digest,
-            updated_at=mapping_mutable.updated_at,
-            etag=mapping_mutable.etag,
-        )
         return bool(
-            mapping_mutable == expected_successor
-            and mapping_mutable.etag != project_mutable.etag
-            and cls._timestamp(mapping_mutable.updated_at)
-            > cls._timestamp(project_mutable.updated_at)
+            project_immutable == mapping.immutable_authority
+            and mapping_mutable == project_mutable
         )
 
     @staticmethod
@@ -3439,9 +3891,10 @@ class DesktopCoreBridgeStoreV1:
         current: CoreProjectMappingV1,
         *,
         completed_patch: CoreProjectPatchOperationV1 | None,
-        finalize: CoreWorkspaceUploadFinalizeAuthorityV1 | None,
+        completed_patch_project: core_v1.ProjectV1 | None,
+        completed_patch_latest_project: core_v1.ProjectV1 | None,
+        completed_action_mutation: bool,
         project_head_successor: _ProjectHeadSuccessorHistoryAuthority | None,
-        allow_legacy_project_head: bool,
     ) -> None:
         if not cls._revision_is_same_or_successor(
             previous.active_revision, current.active_revision
@@ -3464,24 +3917,21 @@ class DesktopCoreBridgeStoreV1:
             raise CoreBridgeStoreContractError(
                 "mapping project authority changed without a new ETag"
             )
-        finalize_applied = (
-            finalize is not None
-            and finalize.state is CoreWorkspaceUploadFinalizeStateV1.APPLIED
-            and finalize.outcome is not None
-            and cls._project_authorizes_mapping(finalize.outcome.project, current)
-        )
         if project_head_successor is not None:
             cls._validate_project_head_successor_authority(
                 previous,
                 current,
                 project_head_successor,
+                completed_patch=completed_patch,
+                completed_patch_project=completed_patch_project,
+                completed_patch_latest_project=completed_patch_latest_project,
+                completed_action_mutation=completed_action_mutation,
+            )
+        elif current.active_revision != previous.active_revision:
+            raise CoreBridgeStoreContractError(
+                "mapping revision changed without a verified project-head successor"
             )
         elif completed_patch is None:
-            if allow_legacy_project_head and (
-                finalize_applied
-                or cls._is_legacy_authority_only_successor(previous, current)
-            ):
-                return
             raise CoreBridgeStoreContractError(
                 "mapping changed without an applied outcome or verified project-head successor"
             )
@@ -3503,15 +3953,59 @@ class DesktopCoreBridgeStoreV1:
             _patch_value(completed_patch)
         successor_authority: _ProjectHeadSuccessorHistoryAuthority | None = None
         if project_head_successor is not None:
-            if (
-                type(project_head_successor) is not CoreProjectHeadSuccessorProofV1
-                or expected_previous is None
+            if type(project_head_successor) is not CoreProjectHeadSuccessorProofV1:
+                raise CoreBridgeStoreContractError(
+                    "project-head successor proof has the wrong type"
+                )
+            if expected_previous is None:
+                successor_predecessor = self._first_mapping_successor_predecessor(
+                    operation,
+                    completed_patch,
+                    mapping,
+                )
+                predecessor_project = (
+                    None
+                    if successor_predecessor is None
+                    else successor_predecessor[0]
+                )
+            elif completed_patch is not None:
+                successor_predecessor = self._completed_patch_successor_predecessor(
+                    operation,
+                    completed_patch,
+                    mapping,
+                )
+                predecessor_project = (
+                    None
+                    if successor_predecessor is None
+                    else successor_predecessor[0]
+                )
+            else:
+                predecessor_project = None
+            if predecessor_project is not None and (
+                project_head_successor.predecessor_project != predecessor_project
             ):
                 raise CoreBridgeStoreContractError(
-                    "project-head successor proof lacks an exact predecessor mapping"
+                    "project successor proof lacks exact predecessor project authority"
+                )
+            if predecessor_project is None and (
+                project_head_successor.predecessor_project is not None
+            ):
+                raise CoreBridgeStoreContractError(
+                    "project successor proof rewrites predecessor authority"
                 )
             successor_authority = _ProjectHeadSuccessorHistoryAuthority(
-                predecessor_mapping_sha256=self._mapping_digest(expected_previous),
+                predecessor_mapping_sha256=(
+                    None
+                    if expected_previous is None
+                    else self._mapping_digest(expected_previous)
+                ),
+                predecessor_project_sha256=(
+                    None
+                    if expected_previous is not None or predecessor_project is None
+                    else sha256(
+                        _canonical_json_bytes(_model_value(predecessor_project))
+                    ).hexdigest()
+                ),
                 proof=project_head_successor,
             )
             _project_head_successor_value(successor_authority)

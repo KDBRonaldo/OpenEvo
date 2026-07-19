@@ -3,6 +3,7 @@ import { defineConfig } from "@playwright/test";
 export default defineConfig({
   testDir: "./tests/product-browser",
   testMatch: "**/*.pw.ts",
+  testIgnore: "**/release-readonly.pw.ts",
   outputDir: "./test-results/product-browser",
   fullyParallel: true,
   forbidOnly: Boolean(process.env.CI),
@@ -24,7 +25,7 @@ export default defineConfig({
   projects: [
     { name: "desktop-1440", use: { viewport: { width: 1440, height: 900 } } },
     { name: "desktop-1024", use: { viewport: { width: 1024, height: 768 } } },
-    { name: "minimum-760", use: { viewport: { width: 760, height: 800 } } },
+    { name: "minimum-760", use: { viewport: { width: 760, height: 600 } } },
   ],
   webServer: {
     command: "npm run dev -- --host 127.0.0.1 --port 4174 --strictPort",

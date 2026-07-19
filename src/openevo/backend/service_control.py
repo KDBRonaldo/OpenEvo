@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from openevo.backend.service_supervisor import (
         ServiceExecutionMode,
         ServiceGroupSnapshot,
+        ServiceRunBinding,
+        SupervisorLogEntry,
+        SupervisorServiceSummary,
     )
 
 
@@ -29,7 +32,29 @@ class CoreServiceControl(Protocol):
         total_timeout: float | None = None,
     ) -> ServiceGroupSnapshot: ...
 
-    def list(self) -> tuple[Any, ...]: ...
+    def list(self) -> tuple[SupervisorServiceSummary, ...]: ...
+
+    def get(self, service_id: str) -> SupervisorServiceSummary: ...
+
+    def restart(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary: ...
+
+    def logs(
+        self,
+        service_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[SupervisorLogEntry, ...]: ...
+
+    def run_binding(self) -> ServiceRunBinding: ...
+
+    def cancel(self, *, total_timeout: float | None = None) -> None: ...
 
     def authenticates_run_service(self, headers: Mapping[str, str]) -> bool: ...
 

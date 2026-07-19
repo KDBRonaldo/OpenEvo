@@ -9,9 +9,11 @@ import {
   artifactDiffV1Schema,
   artifactV1Schema,
   desktopStateV1Schema,
+  diagnosticReportV1Schema,
   executionModeCapabilitiesV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
+  operationV1Schema,
   projectCapabilitiesV1Schema,
   projectSourceV1Schema,
   projectValidationV1Schema,
@@ -24,10 +26,14 @@ import {
   type ArtifactContentV1,
   type ArtifactDiffV1,
   type ArtifactV1,
+  type CacheCleanupRequestV1,
   type DesktopStateV1,
+  type DiagnosticCreateV1,
+  type DiagnosticReportV1,
   type HostKeyAcceptV1,
   type LocalOperationV1,
   type LogEntryV1,
+  type OperationV1,
   type ProfileCreateV1,
   type ProfilePatchV1,
   type ProjectCapabilitiesV1,
@@ -61,6 +67,7 @@ const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const ETAG_D = `"${D}"`;
 const NOW = "2026-07-14T12:00:00Z";
+const NEXT = "2026-07-14T12:00:01Z";
 
 export interface FixtureProviderOptions {
   startOnline?: boolean;
@@ -78,6 +85,7 @@ export interface FixtureProviderOptions {
 
 export class FixtureDesktopProductProvider implements DesktopProductProvider {
   readonly providerKind = "contract_simulator" as const;
+  readonly systemMaintenanceAvailable = true;
   private readonly listeners = new Set<(signal: ProductSubscriptionSignal) => void>();
   private readonly timers = new Set<ReturnType<typeof setTimeout>>();
   private connectionFlowGeneration = 0;
@@ -129,6 +137,8 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private readonly projectUpdateActions: string[] = [];
   private readonly projectActivationActions: string[] = [];
   private activeOperation: LocalOperationV1 | null = null;
+  private readonly coreOperations = new Map<string, OperationV1>();
+  private readonly diagnostics = new Map<string, DiagnosticReportV1>();
   private readonly contents = new Map<string, ArtifactContentV1>();
   private readonly diffs = new Map<string, ArtifactDiffV1>();
 
@@ -813,6 +823,190 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     }
     this.emit();
     return structuredClone(cancelled);
+  }
+
+  async getLocalOperation(operationId: string): Promise<LocalOperationV1> {
+    if (this.activeOperation?.operation_id !== operationId) {
+      throw new Error("The local operation is unavailable.");
+    }
+    return structuredClone(this.activeOperation);
+  }
+
+  async doctorProject(
+    projectId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<LocalOperationV1> {
+    const project = this.requireProject(projectId);
+    this.checkIntent(intent, `project:doctor:${projectId}`, project.etag);
+    const baseOperation = this.makeOperation(
+      "project_doctor",
+      "succeeded",
+      "Environment checked",
+      3,
+      3,
+      projectId,
+    );
+    const needsRepair = this.services.some(
+      (service) => service.status !== "running",
+    );
+    const operation = localOperationV1Schema.parse({
+      ...baseOperation,
+      checks: [
+        {
+          check_id: "managed-services",
+          label: "Managed services",
+          status: needsRepair ? "failed" : "passed",
+          summary: needsRepair
+            ? "One or more managed services need repair."
+            : "All managed services are ready.",
+          repair_action: needsRepair ? "openevo_can_retry" : "none",
+        },
+      ],
+    });
+    this.emit();
+    return structuredClone(operation);
+  }
+
+  async repairProject(
+    projectId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<LocalOperationV1> {
+    const project = this.requireProject(projectId);
+    this.checkIntent(intent, `project:repair:${projectId}`, project.etag);
+    const operation = this.makeOperation(
+      "project_repair",
+      "succeeded",
+      "Environment repaired",
+      3,
+      3,
+      projectId,
+    );
+    this.services = this.makeServices(true, false, project);
+    this.emit();
+    return structuredClone(operation);
+  }
+
+  async restartService(
+    serviceId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<OperationV1> {
+    const service = this.services.find((item) => item.id === serviceId);
+    if (!service) throw new Error("The service is unavailable.");
+    this.checkIntent(intent, `service:restart:${serviceId}`, service.etag);
+    const fixture = operationV1Schema.parse({
+      ...structuredClone(CONTRACT_FIXTURE_V1.serviceOperation),
+      id: `core-operation-service-${serviceId}-${++this.operationSequence}`,
+      request: {
+        kind: "service_restart",
+        service_id: serviceId,
+        request: {
+          schema_version: "1",
+          reason: "Requested from OpenEvo Desktop.",
+        },
+      },
+      created_at: NOW,
+      updated_at: NOW,
+      observed_at: NOW,
+    });
+    this.coreOperations.set(fixture.id, fixture);
+    this.emit();
+    return structuredClone(fixture);
+  }
+
+  async getCoreOperation(operationId: string): Promise<OperationV1> {
+    const operation = this.coreOperations.get(operationId);
+    if (!operation) throw new Error("The Core operation is unavailable.");
+    if (!["queued", "running", "cancelling"].includes(operation.status)) {
+      return structuredClone(operation);
+    }
+    const restartedServiceId = operation.request.kind === "service_restart"
+      ? operation.request.service_id
+      : null;
+    const completed = operationV1Schema.parse({
+      ...operation,
+      status: "succeeded",
+      result: operation.kind === "service_restart" && operation.request.kind === "service_restart"
+        ? {
+            kind: "service_restart",
+            service: this.services.find(
+              (service) => service.id === restartedServiceId,
+            ) ?? structuredClone(CONTRACT_FIXTURE_V1.service),
+          }
+        : operation.kind === "cache_cleanup" && operation.request.kind === "cache_cleanup"
+          ? {
+              kind: "cache_cleanup",
+              result: {
+                scopes: operation.request.request.scopes,
+                removed_entries: 4,
+                reclaimed_bytes: 4_096,
+              },
+            }
+          : null,
+      updated_at: NEXT,
+      observed_at: NEXT,
+      finished_at: NEXT,
+      etag: ETAG_B,
+    });
+    this.coreOperations.set(operationId, completed);
+    return structuredClone(completed);
+  }
+
+  async createDiagnostic(
+    input: DiagnosticCreateV1,
+    intent: ProductMutationIntent,
+  ): Promise<DiagnosticReportV1> {
+    this.checkIntent(intent, "diagnostic:create");
+    const diagnostic = diagnosticReportV1Schema.parse({
+      ...structuredClone(CONTRACT_FIXTURE_V1.diagnostic),
+      id: `diagnostic-fixture-${this.diagnostics.size + 1}`,
+      scopes: input.scopes,
+      target: input.target,
+    });
+    this.diagnostics.set(diagnostic.id, diagnostic);
+    this.emit();
+    return this.getDiagnostic(diagnostic.id);
+  }
+
+  async getDiagnostic(diagnosticId: string): Promise<DiagnosticReportV1> {
+    const diagnostic = this.diagnostics.get(diagnosticId);
+    if (!diagnostic) throw new Error("The diagnostic report is unavailable.");
+    if (diagnostic.status === "succeeded" || diagnostic.status === "failed") {
+      return structuredClone(diagnostic);
+    }
+    const completed = diagnosticReportV1Schema.parse({
+      ...diagnostic,
+      status: "succeeded",
+      checks: diagnostic.scopes.map((scope, index) => ({
+        id: `diagnostic-check-${index + 1}`,
+        scope,
+        status: "ok",
+        message: `${scope} checks passed.`,
+        repair_action: "unsupported",
+        logs_ref: null,
+      })),
+      updated_at: NEXT,
+      observed_at: NEXT,
+      finished_at: NEXT,
+      error: null,
+      etag: ETAG_A,
+    });
+    this.diagnostics.set(diagnosticId, completed);
+    return structuredClone(completed);
+  }
+
+  async cleanupCaches(
+    input: CacheCleanupRequestV1,
+    intent: ProductMutationIntent,
+  ): Promise<OperationV1> {
+    this.checkIntent(intent, "maintenance:cache-cleanup");
+    const operation = operationV1Schema.parse({
+      ...structuredClone(CONTRACT_FIXTURE_V1.cacheOperation),
+      id: `core-operation-cache-fixture-${++this.operationSequence}`,
+      request: { kind: "cache_cleanup", request: input },
+    });
+    this.coreOperations.set(operation.id, operation);
+    this.emit();
+    return structuredClone(operation);
   }
 
   async getRunLogs(runId: string): Promise<readonly LogEntryV1[]> {

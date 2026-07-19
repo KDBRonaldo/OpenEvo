@@ -6,12 +6,14 @@ import hashlib
 from io import BytesIO
 from pathlib import Path
 import plistlib
+import re
 import subprocess
 from types import SimpleNamespace
 import tomllib
 from zipfile import ZipFile
 
 import pytest
+import yaml
 
 from desktop.sidecar.release_capabilities import (
     RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
@@ -2259,6 +2261,9 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
 
     text = workflow.read_text(encoding="utf-8")
     candidate_tool_text = candidate_tool.read_text(encoding="utf-8")
+    linux_bundle = text[
+        text.index("  linux-daemon-bundle:") : text.index("  macos-candidate:")
+    ]
     macos_candidate = text[
         text.index("  macos-candidate:") : text.index("  linux-core-candidate:")
     ]
@@ -2272,7 +2277,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     for marker in (
         "workflow_dispatch:",
         "runs-on: macos-14",
-        "runs-on: ubuntu-latest",
+        "runs-on: ubuntu-24.04",
         "timeout-minutes:",
         'test "$GITHUB_REF" = "refs/heads/stable"',
         'RUNNER_ENVIRONMENT: ${{ runner.environment }}',
@@ -2286,8 +2291,10 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "tests/openevo/remote/test_ssh_transport.py",
         "scripts/ci/audit_openevo_identity.py",
         "npm ci",
+        "npx playwright install --with-deps chromium",
+        "npm run test:product-browser",
         "npm audit --audit-level=high",
-        "pip-audit==2.9.0",
+        "uv run pip-audit",
         "--no-emit-project",
         "--pip-requirements",
         "cargo-audit --locked --version 0.22.2",
@@ -2314,8 +2321,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "core-install-artifact.json",
         "release-candidate.json",
         "SHA256SUMS",
-        "actions/upload-artifact@v4",
-        "actions/download-artifact@v4",
+        "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4",
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4",
         "Restore private Core candidate input modes",
         "stat -c '%a' candidate-artifacts/framework-lock.json",
         "retention-days: 14",
@@ -2346,6 +2353,11 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "gh api --method DELETE",
     ):
         assert marker in text
+    assert linux_bundle.index(
+        "- name: Require the reviewed stable source on Linux x86_64"
+    ) < linux_bundle.index("npm ci") < linux_bundle.index(
+        "npx playwright install --with-deps chromium"
+    ) < linux_bundle.index("npm run test:product-browser")
     assert release_test_command in macos_candidate
     assert "lipo -version" not in macos_candidate
     assert "bundle/macos" not in macos_candidate
@@ -2443,15 +2455,17 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     for marker in (
         "unsigned and not notarized",
         "## Supported Workflows",
-        "Codex subscription transcript mode: available in this candidate.",
-        "Self-Deployed Reference mode: unavailable in this candidate.",
+        "Codex subscription transcript mode: packaged and declared in this Preview.",
+        "Candidate-bound real Codex Subscription science E2E: not yet verified",
+        "No real Codex Subscription run claim is made",
+        "Self-Deployed Reference mode: unavailable in this Preview.",
         "## Known Limitations",
-        "Parameter evolution is not included in this candidate.",
+        "Parameter evolution is not included in this Preview.",
         "PyPI is not used for this release.",
         "Only the declared architecture was built.",
         "command-line quarantine removal is validated.",
         "## Validation Results",
-        "Benchmark gates completed by this packaging candidate: 0 of 3.",
+        "Benchmark gates completed by this Preview: 0 of 3.",
         "Textual-memory pass@1 rescue count: pending.",
         "Trajectory-to-skill pass@1 rescue count: pending.",
         "Agent-system pass@1 rescue count: pending.",
@@ -2562,9 +2576,9 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert "Build distributable Core wheel" not in text
     assert "python -m build --wheel" not in text
     assert 'cp "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl candidate-artifacts/' in text
-    assert 'pip install candidate-artifacts/openevo-*.whl' in text
+    assert "--no-deps candidate-artifacts/openevo-*.whl" in text
     assert text.index("openevo_release_candidate.py validate") < text.index(
-        'pip install candidate-artifacts/openevo-*.whl'
+        "--no-deps candidate-artifacts/openevo-*.whl"
     )
     desktop_checks = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     assert '".github/workflows/openevo-desktop-candidate.yml"' in desktop_checks
@@ -2589,14 +2603,16 @@ def test_desktop_candidate_assigns_platform_safe_framework_smoke_modes() -> None
     assert linux_job.count(smoke_command) == 1
     assert "--mode linux-context-projection" in linux_job
     assert "--mode installed-registry" not in linux_job
-    assert linux_job.index("actions/download-artifact@v4") < linux_job.index(smoke_command)
+    assert linux_job.index(
+        "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093"
+    ) < linux_job.index(smoke_command)
     assert linux_job.index("Restore private Core candidate input modes") < linux_job.index(
         smoke_command
     )
     assert linux_job.index("openevo_release_candidate.py validate") < linux_job.index(
         smoke_command
     )
-    assert linux_job.index("pip install candidate-artifacts/openevo-*.whl") < linux_job.index(
+    assert linux_job.index("--no-deps candidate-artifacts/openevo-*.whl") < linux_job.index(
         smoke_command
     )
     assert '"--mode",' in framework_smoke
@@ -2705,6 +2721,182 @@ def test_candidate_cleanup_deletes_only_the_validated_immutable_release_id() -> 
     assert 'gh release delete "$RELEASE_TAG"' not in cleanup
 
 
+def test_candidate_and_preview_publisher_pin_supply_chain_actions_and_rust() -> None:
+    workflow_paths = (
+        Path(".github/workflows/openevo-desktop-candidate.yml"),
+        Path(".github/workflows/openevo-desktop-publish-preview.yml"),
+    )
+    action_pattern = re.compile(
+        r"^\s*-?\s*uses:\s+[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@([0-9a-f]{40})\s+#\s+.+$",
+        flags=re.MULTILINE,
+    )
+    for path in workflow_paths:
+        text = path.read_text(encoding="utf-8")
+        uses_lines = [line for line in text.splitlines() if "uses:" in line]
+        assert uses_lines
+        assert len(action_pattern.findall(text)) == len(uses_lines)
+        assert "@v4" not in text
+        assert "@v5" not in text
+        assert "@v6" not in text
+        assert "@stable" not in text
+
+    candidate = workflow_paths[0].read_text(encoding="utf-8")
+    tool = Path("scripts/ci/openevo_release_candidate.py").read_text(encoding="utf-8")
+    with Path("pyproject.toml").open("rb") as stream:
+        dev_dependencies = tomllib.load(stream)["dependency-groups"]["dev"]
+    assert "toolchain: \"1.95.0\"" in candidate
+    assert 'RUST_TOOLCHAIN_VERSION = "1.95.0"' in tool
+    assert '"rust_toolchain": RUST_TOOLCHAIN_VERSION' in tool
+    assert "uv run pip-audit" in candidate
+    assert "uvx --from pip-audit" not in candidate
+    assert "pip-audit==2.9.0" in dev_dependencies
+
+
+def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> None:
+    workflow = Path(
+        ".github/workflows/openevo-desktop-publish-preview.yml"
+    ).read_text(encoding="utf-8")
+    required_inputs = (
+        "candidate_tag:",
+        "expected_release_id:",
+        "expected_source_sha:",
+        "expected_release_candidate_manifest_sha256:",
+        "candidate_workflow_run_id:",
+        "candidate_workflow_run_attempt:",
+        "confirmation:",
+    )
+    for marker in required_inputs:
+        assert marker in workflow
+
+    assert "workflow_dispatch:" in workflow
+    assert "environment: openevo-preview-publication" in workflow
+    assert "actions: read" in workflow
+    assert workflow.count("contents: write") == 1
+    assert workflow.count("ref: ${{ github.workflow_sha }}") == 2
+    assert "run-id: ${{ inputs.candidate_workflow_run_id }}" in workflow
+    assert "validate-candidate-run" in workflow
+    assert '".github/workflows/openevo-desktop-candidate.yml"' in Path(
+        "scripts/ci/openevo_release_candidate.py"
+    ).read_text(encoding="utf-8")
+    assert "preview-release-snapshot.json" in workflow
+    assert "assert-release-id" in workflow
+    assert workflow.count("write-preview-asset-plan") == 2
+    assert workflow.count("snapshot-preview") == 2
+    assert "prepublication-release-rest.json" in workflow
+    assert "postpublication-release-rest.json" in workflow
+    assert workflow.count("releases/assets/${asset_id}") == 2
+    assert workflow.count('test ! -e "$draft_dir"') == 1
+    assert workflow.count('test ! -e "$public_dir"') == 1
+    assert workflow.count('method="PATCH"') == 1
+    assert workflow.count("b'{\"draft\":false}'") == 1
+    assert (
+        '"repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}"'
+        in workflow
+    )
+    assert "gh release edit" not in workflow
+    assert "gh release upload" not in workflow
+    assert "gh release delete" not in workflow
+    assert "--method DELETE" not in workflow
+    assert "/releases/tags/" not in workflow
+    assert "immutable-releases" not in workflow
+    assert workflow.count('"immutable"') >= 2
+
+    read_only_job = workflow.split("  verify-preview:\n", maxsplit=1)[1].split(
+        "\n  publish-preview:\n", maxsplit=1
+    )[0]
+    write_job = workflow.split("  publish-preview:\n", maxsplit=1)[1].split(
+        "\n  verify-public-preview:\n", maxsplit=1
+    )[0]
+    post_job = workflow.split("  verify-public-preview:\n", maxsplit=1)[1]
+    assert "contents: read" in read_only_job
+    assert "contents: write" not in read_only_job
+    assert "contents: write" in write_job
+    assert "actions/checkout@" not in write_job
+    assert "scripts/ci/" not in write_job
+    assert "data only" in write_job
+    assert 'request_headers["Content-Type"] = "application/json"' in write_job
+    assert "class RejectRedirects(HTTPRedirectHandler)" in write_job
+    assert '"Authorization"' not in write_job.split(
+        'headers={"User-Agent": "openevo-preview-fixed-publisher"}',
+        maxsplit=1,
+    )[1]
+    assert "needs: verify-preview" in write_job
+    assert "contents: read" in post_job
+    assert "contents: write" not in post_job
+    assert "needs: publish-preview" in post_job
+
+    parsed = yaml.safe_load(workflow)
+    publish_steps = parsed["jobs"]["publish-preview"]["steps"]
+    fixed_step = next(
+        step
+        for step in publish_steps
+        if step.get("name")
+        == "Revalidate immutable candidate data and publish by numeric ID"
+    )
+    prefix = "python - <<'PY'\n"
+    assert fixed_step["run"].startswith(prefix)
+    fixed_source, suffix = fixed_step["run"][len(prefix) :].rsplit("\nPY", maxsplit=1)
+    assert suffix.strip() == ""
+    compile(fixed_source, "<fixed-preview-publisher>", "exec")
+
+    prevalidate = workflow.index(
+        "Fail closed unless the draft is the exact reviewed candidate"
+    )
+    tag_absence = workflow.index("Preview tag already exists before publication")
+    publish = workflow.index(
+        "Revalidate immutable candidate data and publish by numeric ID"
+    )
+    postdownload = workflow.index(
+        "Re-read and redownload the immutable public release"
+    )
+    postvalidate = workflow.index(
+        "Verify public metadata, assets, body, and exact tag target"
+    )
+    assert prevalidate < tag_absence < publish < postdownload < postvalidate
+    assert "validate-published-tag" in workflow[postvalidate:]
+
+
+def test_candidate_public_playwright_evidence_excludes_preview_simulator() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    tool = Path("scripts/ci/openevo_release_candidate.py").read_text(encoding="utf-8")
+    preview = workflow.split(
+        "      - name: Gate non-release simulator preview\n", maxsplit=1
+    )[1].split(
+        "      - name: Produce packaged release-composition Playwright report\n",
+        maxsplit=1,
+    )[0]
+    packaged = workflow.split(
+        "      - name: Produce packaged release-composition Playwright report\n",
+        maxsplit=1,
+    )[1].split("      - uses: actions/setup-python", maxsplit=1)[0]
+
+    assert "test:product-browser:preview" in preview
+    assert "PLAYWRIGHT_BLOB_OUTPUT_FILE" not in preview
+    assert "merge-reports" not in preview
+    assert "test:product-browser:preview" not in packaged
+    assert "release-packaged.zip" in packaged
+    assert "merge-reports" in packaged
+    for marker in (
+        '"release-packaged-1440"',
+        '"release-packaged-1024"',
+        '"release-packaged-760"',
+        '"simulator": False',
+        '"provider_kind": "desktop_sidecar"',
+        '"composition": "packaged_web"',
+    ):
+        assert marker in tool
+    for forbidden in (
+        '"desktop-1440"',
+        '"desktop-1024"',
+        '"minimum-760"',
+        '"release-readonly-source"',
+        '"release-readonly-packaged"',
+    ):
+        assert forbidden not in tool
+
+
 def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:
     with Path("pyproject.toml").open("rb") as stream:
         dependencies = tomllib.load(stream)["project"]["dependencies"]
@@ -2768,8 +2960,11 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
 
     assert by_mode["codex_subscription_transcript"].support_state == "supported"
     assert by_mode["self-deployed"].support_state == "unavailable"
-    assert "Codex subscription transcript mode: available in this candidate." in notes
-    assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
+    assert "Codex subscription transcript mode: packaged and declared in this Preview." in notes
+    assert "Candidate-bound real Codex Subscription science E2E: not yet verified" in notes
+    assert "No real Codex Subscription run claim is made" in notes
+    assert "Remote Core" not in notes
+    assert "Self-Deployed Reference mode: unavailable in this Preview." in notes
     assert "canonical External Beta requires both modes" in normalized_readme
     assert (
         "current build exposes a narrow Subscription path for development, "
@@ -2849,6 +3044,15 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         == project_config["project"]["version"]
     )
     assert config["identifier"] == "org.openevo.desktop"
+    assert config["app"]["windows"] == [
+        {
+            "title": "OpenEvo Desktop",
+            "width": 1280,
+            "height": 860,
+            "minWidth": 760,
+            "minHeight": 600,
+        }
+    ]
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
     assert config["build"]["frontendDist"] == "../dist"
     assert config["bundle"]["active"] is True
@@ -3086,20 +3290,20 @@ def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
     readme = Path("README.md")
 
     text = readme.read_text(encoding="utf-8")
-    smoke_section = text[text.index("## Pre-External-Beta Release Smoke") :]
+    release_section = text[text.index("## Preview And External Beta") :]
 
     assert "npm ci" in text
     assert "npm audit --audit-level=high" in text
     assert text.index("npm ci") < text.index("npm audit --audit-level=high")
     assert text.index("npm audit --audit-level=high") < text.index("npm test -- --run")
     assert "npm run typecheck" in text
-    assert smoke_section.startswith("## Pre-External-Beta Release Smoke")
-    assert "maintainer-only" in smoke_section
-    assert "GitHub Release" in smoke_section
-    assert "PyPI" in smoke_section
-    assert "docs/maintainer/productization/spec.md" in smoke_section
-    assert "scripts/ci/smoke_openevo_desktop_wheel.py" not in smoke_section
-    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" not in smoke_section
+    assert release_section.startswith("## Preview And External Beta")
+    assert "GitHub Release" in release_section
+    assert "PyPI" in release_section
+    assert "unsigned, non-gating Preview" in release_section
+    assert "docs/maintainer/productization/spec.md" in release_section
+    assert "scripts/ci/smoke_openevo_desktop_wheel.py" not in release_section
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" not in release_section
     assert "PyPI trusted publishing" not in text
     assert "pypa/gh-action-pypi-publish@release/v1" not in text
 

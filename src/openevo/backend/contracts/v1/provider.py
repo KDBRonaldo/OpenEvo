@@ -19,11 +19,16 @@ import httpx
 
 from openevo import __version__
 from openevo.backend.service_control import CoreServiceControl, CoreServiceControlError
+from openevo.backend.maintenance import CoreMaintenanceOwnerV1
 from openevo.backend.run_admission import install_core_run_admission_endpoint
 from openevo.backend.run_control import (
     RUN_OPERATION_IDS,
     CoreRunControl,
     CoreRunControlError,
+)
+from openevo.backend.science_run_store import (
+    ProjectInFlightCoordinator,
+    ScienceProjectInFlight,
 )
 from openevo.evolution.artifact_payloads import (
     ArtifactPayloadBudgetExceeded,
@@ -78,7 +83,7 @@ if TYPE_CHECKING:
     from openevo.backend.service_supervisor import ServiceRunReadinessCode
 
 
-_FEATURES = [
+_BASE_FEATURES = [
     m.FeatureFlag.PROJECTS,
     m.FeatureFlag.WORKSPACE_SYNC,
     m.FeatureFlag.VERIFIED_CAPABILITIES,
@@ -93,6 +98,38 @@ _RUN_MUTATION_OPERATION_IDS = frozenset(
         "createCoreRunV1",
         "deleteCoreRunV1",
         "retryCoreRunV1",
+    }
+)
+_PROJECT_OWNER_GUARDED_OPERATION_IDS = frozenset(
+    {
+        "abortCoreWorkspaceUploadV1",
+        "createCoreWorkspaceUploadV1",
+        "deleteCoreProjectV1",
+        "finalizeCoreWorkspaceUploadV1",
+        "patchCoreProjectV1",
+        "putCoreWorkspaceUploadChunkV1",
+    }
+)
+_SYSTEM_MAINTENANCE_START_OPERATIONS = frozenset(
+    {
+        "repairCoreEnvironmentV1",
+        "restartCoreServiceV1",
+        "cleanupCoreCachesV1",
+    }
+)
+_MAINTENANCE_OWNER_OPERATION_IDS = frozenset(
+    {
+        "doctorCoreEnvironmentV1",
+        "repairCoreEnvironmentV1",
+        "restartCoreServiceV1",
+        "getCoreServiceLogsV1",
+        "getCoreOperationV1",
+        "cancelCoreOperationV1",
+        "getCoreLogsByRefV1",
+        "createCoreDiagnosticV1",
+        "getCoreDiagnosticV1",
+        "deleteCoreDiagnosticV1",
+        "cleanupCoreCachesV1",
     }
 )
 _RUN_MUTATION_SINGLEFLIGHT_CAPACITY = 256
@@ -137,8 +174,6 @@ _TEXT_ARTIFACT_MIME_TYPES = frozenset(
 
 _UNAVAILABLE_OPERATIONS = frozenset(
     {
-        "doctorCoreEnvironmentV1",
-        "repairCoreEnvironmentV1",
         "listCoreRunsV1",
         "createCoreRunV1",
         "getCoreRunV1",
@@ -149,15 +184,6 @@ _UNAVAILABLE_OPERATIONS = frozenset(
         "getCoreRunLogsV1",
         "getCoreRunContextV1",
         "listCoreRunArtifactsV1",
-        "restartCoreServiceV1",
-        "getCoreServiceLogsV1",
-        "getCoreOperationV1",
-        "cancelCoreOperationV1",
-        "getCoreLogsByRefV1",
-        "createCoreDiagnosticV1",
-        "getCoreDiagnosticV1",
-        "deleteCoreDiagnosticV1",
-        "cleanupCoreCachesV1",
     }
 )
 
@@ -185,6 +211,10 @@ class _RunControlHTTPError(CoreControlHTTPError):
 
 class _ReleaseActivationReadinessHTTPError(CoreControlHTTPError):
     """A repairable release activation prerequisite failed before persistence."""
+
+
+class _ProjectInFlightHTTPError(CoreControlHTTPError):
+    """A transient project owner conflict that must not consume idempotency state."""
 
 
 def _run_control_http_error(exc: CoreRunControlError) -> _RunControlHTTPError:
@@ -471,6 +501,7 @@ class CoreControlProviderV1:
         evolution_artifact_root: str | Path | None = None,
         artifact_loader: Callable[[str], Mapping[str, object]] | None = None,
         clock: Callable[[], datetime] | None = None,
+        _enable_maintenance_owner_for_tests: bool = False,
     ) -> None:
         try:
             token_bytes = bearer_token.encode("ascii")
@@ -480,6 +511,14 @@ class CoreControlProviderV1:
             raise ValueError("Core bearer token must be non-empty and contain no whitespace")
         if evolution_registry is not None:
             require_verified_executable_registry(evolution_registry)
+        resolved_build_channel = (
+            m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
+        )
+        if (
+            _enable_maintenance_owner_for_tests
+            and resolved_build_channel is not m.BuildChannel.TEST
+        ):
+            raise ValueError("the maintenance owner test seam is allowed only in test builds")
         self.store = store
         self._executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="openevo-core-control"
@@ -487,11 +526,33 @@ class CoreControlProviderV1:
         self._close_lock = threading.Lock()
         self._closed = False
         self._run_mutations = _RunMutationSingleFlight(_RUN_MUTATION_SINGLEFLIGHT_CAPACITY)
+        self._run_maintenance_gate = threading.RLock()
         self._run_mutation_drain: tuple[Future[None], ...] | None = None
         self._authorization = b"Bearer " + token_bytes
         self._registry = evolution_registry
         self._service_supervisor = service_supervisor
         self._run_control = run_control
+        coordinator = (
+            None
+            if run_control is None
+            else getattr(run_control, "project_in_flight_coordinator", None)
+        )
+        if coordinator is not None and not isinstance(
+            coordinator, ProjectInFlightCoordinator
+        ):
+            raise ValueError("run control project coordinator is invalid")
+        self._project_in_flight = coordinator
+        self._maintenance = (
+            CoreMaintenanceOwnerV1(
+                store,
+                registry=evolution_registry,
+                service_control=service_supervisor,
+                run_control=run_control,
+                clock=clock,
+            )
+            if _enable_maintenance_owner_for_tests
+            else None
+        )
         self._evolution_artifact_root = (
             None
             if evolution_artifact_root is None
@@ -500,9 +561,7 @@ class CoreControlProviderV1:
         self._artifact_loader = artifact_loader
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._started_at = self._timestamp()
-        self._build_channel = (
-            m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
-        )
+        self._build_channel = resolved_build_channel
         self._version = m.VersionResponseV1(
             preferred_major=1,
             supported_majors=[1],
@@ -511,7 +570,19 @@ class CoreControlProviderV1:
             source_commit=source_commit,
             build_channel=self._build_channel,
             provider_kind=m.ProviderKind.OPENEVO_CORE,
-            features=_FEATURES,
+            features=[
+                *_BASE_FEATURES,
+                *(
+                    [m.FeatureFlag.DIAGNOSTICS]
+                    if (
+                        self._maintenance is not None
+                        and self._maintenance.diagnostics_available
+                        and self._maintenance.service_control_available
+                        and self._maintenance.maintenance_available
+                    )
+                    else []
+                ),
+            ],
         )
         self._handlers = {
             "discoverCoreContractVersionV1": self._version_response,
@@ -539,6 +610,22 @@ class CoreControlProviderV1:
             "getCoreServiceV1": self._get_service,
             "streamCoreEventsV1": self._events,
         }
+        if self._maintenance is not None:
+            self._handlers.update(
+                {
+                    "doctorCoreEnvironmentV1": self._doctor,
+                    "repairCoreEnvironmentV1": self._repair,
+                    "restartCoreServiceV1": self._restart_service,
+                    "getCoreServiceLogsV1": self._service_logs,
+                    "getCoreOperationV1": self._get_operation,
+                    "cancelCoreOperationV1": self._cancel_operation,
+                    "getCoreLogsByRefV1": self._referenced_logs,
+                    "createCoreDiagnosticV1": self._create_diagnostic,
+                    "getCoreDiagnosticV1": self._get_diagnostic,
+                    "deleteCoreDiagnosticV1": self._delete_diagnostic,
+                    "cleanupCoreCachesV1": self._cleanup_caches,
+                }
+            )
 
     def close(self) -> None:
         with self._close_lock:
@@ -572,7 +659,9 @@ class CoreControlProviderV1:
 
     @property
     def operation_ids(self) -> frozenset[str]:
-        return frozenset(self._handlers) | _UNAVAILABLE_OPERATIONS
+        return (
+            frozenset(self._handlers) | _UNAVAILABLE_OPERATIONS | _MAINTENANCE_OWNER_OPERATION_IDS
+        )
 
     def authenticate(self, authorization_values: tuple[bytes, ...]) -> bool:
         return len(authorization_values) == 1 and hmac.compare_digest(
@@ -612,6 +701,7 @@ class CoreControlProviderV1:
             if not (
                 (isinstance(exc, _RunControlHTTPError) and exc.error.retryable)
                 or isinstance(exc, _ReleaseActivationReadinessHTTPError)
+                or isinstance(exc, _ProjectInFlightHTTPError)
             ):
                 self.store.record_failed_idempotency(operation_id, arguments, exc.error)
             raise
@@ -623,6 +713,9 @@ class CoreControlProviderV1:
     def _invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         if operation_id in RUN_OPERATION_IDS and self._run_control is not None:
             try:
+                if operation_id == "createCoreRunV1":
+                    with self._run_maintenance_gate:
+                        return self._run_control.invoke(operation_id, arguments)
                 return self._run_control.invoke(operation_id, arguments)
             except CoreRunControlError as exc:
                 raise _run_control_http_error(exc) from exc
@@ -634,11 +727,37 @@ class CoreControlProviderV1:
         if handler is None:
             self._unavailable(operation_id)
         try:
+            if operation_id in _SYSTEM_MAINTENANCE_START_OPERATIONS:
+                with self._run_maintenance_gate:
+                    return handler(arguments)
+            if (
+                operation_id in _PROJECT_OWNER_GUARDED_OPERATION_IDS
+                and self._project_in_flight is not None
+            ):
+                project_id = cast(str, arguments["project_id"])
+                with self._project_in_flight.guard_project_mutation(
+                    project_id,
+                    exact_replay=lambda: self.store.has_successful_idempotency_replay(
+                        operation_id,
+                        arguments,
+                    ),
+                ):
+                    return handler(arguments)
             return handler(arguments)
         except CoreControlHTTPError:
             raise
         except CoreRunControlError as exc:
             raise _run_control_http_error(exc) from exc
+        except ScienceProjectInFlight as exc:
+            raise _ProjectInFlightHTTPError(
+                409,
+                code="project_in_flight",
+                message="The project has an admitted task or successor transition in flight.",
+                category=m.ErrorCategory.PROJECT,
+                retryable=True,
+                repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                next_action="Wait for the current project task or transition to resolve.",
+            ) from exc
         except ResourceNotFoundError as exc:
             raise _error(
                 404,
@@ -775,6 +894,22 @@ class CoreControlProviderV1:
             queued_runs=queued_runs,
             services=services,
             checked_at=self._timestamp(),
+        )
+
+    def _doctor(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("doctorCoreEnvironmentV1").doctor(
+                cast(m.EnvironmentDoctorRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+        )
+
+    def _repair(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("repairCoreEnvironmentV1").repair(
+                cast(m.EnvironmentRepairRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
         )
 
     def _capabilities(self, arguments: Mapping[str, object]) -> object:
@@ -1368,6 +1503,81 @@ class CoreControlProviderV1:
                 return _model_response(service, etag=service.etag)
         raise ResourceNotFoundError("service", service_id)
 
+    def _restart_service(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("restartCoreServiceV1").restart_service(
+                cast(str, arguments["service_id"]),
+                cast(m.ServiceRestartRequestV1, arguments["request"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+        )
+
+    def _service_logs(self, arguments: Mapping[str, object]) -> m.LogPageV1:
+        return self._maintenance_owner("getCoreServiceLogsV1").service_logs(
+            cast(str, arguments["service_id"]),
+            limit=cast(int, arguments["limit"]),
+            after=cast(str | None, arguments["after"]),
+            sort=cast(str, arguments["sort"]),
+            direction=cast(str, arguments["direction"]),
+        )
+
+    def _get_operation(self, arguments: Mapping[str, object]) -> Response:
+        operation = self._maintenance_owner("getCoreOperationV1").get_operation(
+            cast(str, arguments["operation_id"])
+        )
+        return _model_response(operation, etag=operation.etag)
+
+    def _cancel_operation(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("cancelCoreOperationV1").cancel_operation(
+                cast(str, arguments["operation_id"]),
+                cast(m.OperationCancelRequestV1, arguments["request"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+        )
+
+    def _referenced_logs(self, arguments: Mapping[str, object]) -> m.ReferencedLogPageV1:
+        return self._maintenance_owner("getCoreLogsByRefV1").referenced_logs(
+            cast(str, arguments["logs_ref"]),
+            limit=cast(int, arguments["limit"]),
+            after=cast(str | None, arguments["after"]),
+            sort=cast(str, arguments["sort"]),
+            direction=cast(str, arguments["direction"]),
+        )
+
+    def _create_diagnostic(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("createCoreDiagnosticV1").create_diagnostic(
+                cast(m.DiagnosticsRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+        )
+
+    def _get_diagnostic(self, arguments: Mapping[str, object]) -> Response:
+        diagnostic = self._maintenance_owner("getCoreDiagnosticV1").get_diagnostic(
+            cast(str, arguments["diagnostic_id"])
+        )
+        return _model_response(diagnostic, etag=diagnostic.etag)
+
+    def _delete_diagnostic(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("deleteCoreDiagnosticV1").delete_diagnostic(
+                cast(str, arguments["diagnostic_id"]),
+                if_match=cast(str, arguments["if_match"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+        )
+
+    def _cleanup_caches(self, arguments: Mapping[str, object]) -> Response:
+        return _stored_response(
+            self._maintenance_owner("cleanupCoreCachesV1").cleanup_caches(
+                cast(m.CacheCleanupRequestV1, arguments["request"]),
+                idempotency_key=cast(str, arguments["idempotency_key"]),
+            )
+        )
+
     def _events(self, arguments: Mapping[str, object]) -> StreamingResponse:
         last_event_id = cast(str | None, arguments["last_event_id"])
         initial = self.store.replay_events(last_event_id)
@@ -1423,7 +1633,11 @@ class CoreControlProviderV1:
             )
         ]
         if self._service_supervisor is not None:
-            services.extend(service.to_contract() for service in self._service_supervisor.list())
+            for service in self._service_supervisor.list():
+                contract = service.to_contract()
+                if self._maintenance is None and contract.restartable:
+                    contract = contract.model_copy(update={"restartable": False})
+                services.append(contract)
         return services
 
     def _require_registry(self, purpose: str) -> VerifiedExecutableRegistry:
@@ -1449,6 +1663,11 @@ class CoreControlProviderV1:
             .isoformat(timespec="microseconds")
             .replace("+00:00", "Z")
         )
+
+    def _maintenance_owner(self, operation_id: str) -> CoreMaintenanceOwnerV1:
+        if self._maintenance is None:
+            self._unavailable(operation_id)
+        return self._maintenance
 
     @staticmethod
     def _unavailable(operation_id: str) -> NoReturn:
@@ -1855,12 +2074,22 @@ def create_core_control_app(
     evolution_artifact_root: str | Path | None = None,
     artifact_loader: Callable[[str], Mapping[str, object]] | None = None,
     event_replay_limit: int = 10_000,
+    _enable_maintenance_owner_for_tests: bool = False,
 ) -> FastAPI:
     """Create a provider-backed app without adding a second route table."""
 
     if run_control is not None and run_control_factory is not None:
         raise ValueError("run_control and run_control_factory are mutually exclusive")
-    store = CoreControlStoreV1(state_root, event_replay_limit=event_replay_limit)
+    resolved_build_channel = (
+        m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
+    )
+    if _enable_maintenance_owner_for_tests and resolved_build_channel is not m.BuildChannel.TEST:
+        raise ValueError("the maintenance owner test seam is allowed only in test builds")
+    store = CoreControlStoreV1(
+        state_root,
+        event_replay_limit=event_replay_limit,
+        _enable_maintenance_storage_for_tests=_enable_maintenance_owner_for_tests,
+    )
     provider: CoreControlProviderV1 | None = None
     resolved_run_control = run_control
     resolved_artifact_root = evolution_artifact_root
@@ -1879,12 +2108,13 @@ def create_core_control_app(
             bearer_token=bearer_token,
             build_version=build_version,
             source_commit=source_commit,
-            build_channel=build_channel,
+            build_channel=resolved_build_channel,
             evolution_registry=evolution_registry,
             service_supervisor=service_supervisor,
             run_control=resolved_run_control,
             evolution_artifact_root=resolved_artifact_root,
             artifact_loader=artifact_loader,
+            _enable_maintenance_owner_for_tests=_enable_maintenance_owner_for_tests,
         )
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(
@@ -1967,7 +2197,7 @@ def _category_for_resource(resource_type: str) -> m.ErrorCategory:
         "revision_head",
     }:
         return m.ErrorCategory.PROJECT
-    if resource_type == "service":
+    if resource_type in {"service", "operation", "diagnostic", "logs"}:
         return m.ErrorCategory.SERVICE
     return m.ErrorCategory.INTERNAL
 

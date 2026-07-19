@@ -7,33 +7,64 @@ weaken the canonical release gates.
 
 ## Current Status
 
-Final publication is disabled while productization work tracked by #131/#163 is
-in progress. Do not publish a draft, create a final `v*` tag, or upload to PyPI
-from the disabled placeholder workflows.
+Version `0.1.1` is a public unsigned historical exhibition Preview. Preserve
+its exact source commit, tag, release assets, checksums, and packaging records.
+It predates and does not satisfy the immutable Preview publication policy
+defined below; its GitHub title/body changed when the draft was made public.
+Do not withdraw or replace it merely because it is not a gating candidate.
+
+Version `0.1.2` is the current unsigned exhibition Preview candidate. It is not
+the current public release until the draft produced by the workflow below has
+completed its exact-asset roundtrip, maintainer review, and visibility-only
+publication step.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
 architecture, mounts the exact candidate DMG, launches its real Tauri app,
 copies that app to a temporary installation location, detaches the image, and
 launches the copied app again. It verifies the Tauri executable and sidecar
-Mach-O slices in both launches with `file` and `lipo`, verifies the same
-interim Core wheel on Linux, and creates an unsigned draft prerelease.
-It uploads all assets, downloads them into a clean directory, and validates the
-exact closed manifest before leaving the draft for review. Passing this
-packaging rehearsal does not satisfy the science E2E, benchmark,
-secret-canary/privacy, clean-host Daemon Bundle, or final publication gates.
+Mach-O slices in both launches with `file` and `lipo`, verifies the
+self-contained Linux x86-64 Daemon Bundle and managed runtime, and creates an
+unsigned draft prerelease. It uploads all assets, downloads them into a clean
+directory, and validates the exact closed manifest before leaving the draft for
+review.
 
-PyPI is not part of the unsigned External Beta. The ordinary-user artifact is
-the macOS Desktop DMG; Desktop installs the manifest-matched Daemon Bundle on
-the remote server.
+No checked-in, validator-bound two-session science E2E evidence exists for that
+Preview. Its packaging and managed-runtime smoke do not satisfy G2, G3, G4, G7,
+G12, or the ordinary-user science workflow.
 
-The current packaging-only workflow still emits a Core wheel and
-`core-install-artifact.json` as an implementation rehearsal. Those interim
-assets are not the External Beta Daemon Bundle and cannot satisfy G3, G4, or
-G12. The final candidate workflow must replace that composition with the
-bundle and release-manifest contract below.
+Final External Beta publication remains disabled while productization work
+tracked by #131/#163 is in progress. PyPI is not part of either the Preview or
+External Beta. The ordinary-user artifact is the macOS Desktop DMG; Desktop
+installs the manifest-matched Daemon Bundle on the remote server.
+The current packaging workflow still emits a Core wheel and
+`core-install-artifact.json` as maintainer verification evidence. They are not
+ordinary-user install assets, not a third product surface, and not a substitute
+for the self-contained Daemon Bundle.
 
-## Required Outputs
+## Preview Publication Policy
+
+A reviewed packaging draft may be published as a Preview after its real
+mounted-DMG and detached-copy smoke, Daemon Bundle verification, checksum
+validation, and clean-directory asset roundtrip pass. Publication changes only
+draft visibility: source commit, tag target, assets, checksums, manifest, and
+notes remain byte-for-byte the validated set.
+
+Preview notes must state that the release is unsigned, non-gating, and limited
+to the demonstrated exhibition path. They must enumerate missing gates and must
+not claim G2, G3, G12, full External Beta readiness, signing, notarization, or
+unsupported execution modes. Keep the exact source, tag, assets, checksums, and
+validation record after publication; corrections use a new version rather than
+replacing published bytes.
+
+A Preview created under this policy is not a G1-G12 release candidate. It
+cannot later be relabeled, edited, or reused as the G12 candidate. The final candidate must start again
+with the immutable draft, downloaded attestation, detached evidence index, and
+publication-controller procedure below. Internal tooling may call the Preview
+packaging inventory a candidate; that implementation name does not confer gate
+status.
+
+## External Beta Candidate Outputs
 
 - one Apple Silicon OpenEvo Desktop DMG for the exact architecture declared by
   the canonical release manifest;
@@ -76,8 +107,9 @@ bundle and release-manifest contract below.
    the detached G12 attestation.
 7. Generate and verify the detached final candidate evidence index binding
    G1-G12.
-8. Publish only by changing visibility. Any tag, manifest, note, payload,
-   report, or profile change creates a new candidate at step 1.
+8. Let the publication controller publish only by changing visibility. Any tag,
+   manifest, note, payload, report, or profile change creates a new candidate at
+   step 1.
 
 The remainder of this section documents the current packaging rehearsal where
 it differs from the target process. Its exact Core wheel export runs only on a
@@ -153,24 +185,70 @@ The launcher must also retain its packaged signal-replay guard around both
 `Server.run()` and explicit cleanup. Without it, Uvicorn restores and replays
 Tauri's `SIGTERM`, terminating Python before launcher-owned cleanup runs.
 
-The manual candidate uses the same producer/consumer rule for the complete
+The manual packaging draft uses the same producer/consumer rule for the complete
 release inventory. `release-candidate.json` and `core-install-artifact.json`
-bind the exact Core wheel and framework lock; the former also binds the DMG,
+bind the exact Core wheel and framework lock; the former also binds the
+self-contained Daemon Bundle and manifest, managed runtime identity, DMG,
 `SHA256SUMS`, commit, runner architecture, mounted-DMG/detached-copy native
 evidence, and Python, npm, and Cargo dependency/license/security summaries.
 Those summaries are checked against the candidate checkout's four lock/license
-files. The Python
-export uses `uv export --no-emit-project`; the collector requires the
-`pip-audit` package/version set to equal every applicable exact requirement,
-rejects OpenEvo itself, and records the requirements digest and audited package
-count. `cargo-audit` is pinned to `0.22.2` so the current RustSec CVSS 4.0 data
-is parseable; malformed or incomplete JSON still fails in the collector and no
+files. The Python export uses `uv export --frozen --no-emit-project` with
+SHA-256 hashes. The collector requires every requirement block to be one exact
+pin with at least one valid hash, requires the `pip-audit` package/version set
+to equal every applicable requirement, rejects OpenEvo itself, and records the
+requirements digest and audited package count. The clean-wheel smokes install
+that closure with `pip --require-hashes` before installing the exact OpenEvo
+wheel with `--no-deps`; they never upgrade pip or resolve the wheel's lower
+bounds online. `cargo-audit` is pinned to `0.22.2` so the current RustSec CVSS
+4.0 data is parseable. `pip-audit==2.9.0` and its tool closure are installed
+from the frozen repository `uv.lock`, not resolved by `uvx` during the release
+run. Malformed or incomplete audit JSON still fails in the collector and no
 advisory is ignored. The final draft job alone receives `contents: write`;
 build and Linux verification retain read-only permissions.
 
-The current rehearsal's dependency and security summaries, Core descriptor,
-and release candidate manifest use schema version 2 for those closed
-contracts. Native smoke evidence uses version 3 so every report declares its
+The Linux producer runs the nine contract-simulator preview tests as a separate
+non-release gate. They do not emit a candidate blob and are never merged into
+public evidence. A second invocation runs only the three packaged release
+projects (`release-packaged-1440`, `release-packaged-1024`, and
+`release-packaged-760`) against the release sidecar mock contract and the
+packaged web composition. Playwright's report merger consumes only that
+packaged-release blob and emits one JSON report after the packaged Desktop web
+payload is built. The workflow emits
+`playwright-candidate-evidence.json`. That closed record binds the source commit,
+Actions run ID and attempt, Chromium version, exact test/project list, the
+declared viewport for every project, first-attempt pass status, sanitized
+`playwright-report.json` digest, and the packaged-web build and manifest
+digests. Schema version 2 explicitly records `simulator=false`,
+`provider_kind=desktop_sidecar`, and `composition=packaged_web`. The candidate
+tool strictly parses the packaged-only raw report and emits a
+canonical sanitized report containing only the closed project, viewport, case,
+retry, and status fields. Runner paths, web-server commands, stdout, attachments,
+and other Playwright metadata remain temporary and are not uploaded. The
+sanitized report, copied `packaged-web-manifest.json`, and closed evidence are
+uploaded together. The macOS consumer revalidates all three against the same
+run identity, requires its independently produced packaged-web manifest to
+match, and then adds all three files to `candidate-artifacts`.
+`release-candidate.json`, `SHA256SUMS`, Linux verification, and the downloaded
+draft roundtrip treat these as required roles; missing, extra, rewritten,
+skipped, flaky, retried, or cross-candidate evidence fails closed.
+
+This Playwright result proves only the source-bound packaged Desktop interaction
+and viewport contract represented by those browser tests. It is not evidence
+of a real Codex Subscription science run. Release notes must describe Codex
+Subscription support as packaged and declared, with real-host verification
+still pending, until exact-candidate evidence binds the packaged Desktop, a
+supported remote OpenEvo Daemon, subscription-authenticated Codex, transcript
+capture, two completed science sessions, all required promoted artifacts, and
+their reuse by the successor session. Without that evidence, neither a Preview
+nor a packaging candidate may say that a real Codex Subscription run was
+validated.
+
+The current rehearsal's dependency and security summaries and Core descriptor
+use schema version 2 for those closed contracts. The release candidate manifest
+uses version 6, with explicit Developer ID, ad-hoc bundle signature,
+notarization, quarantine-removal, and Rust-toolchain fields. Candidate
+Playwright evidence uses version 2. Native smoke evidence uses version 3 so
+every report declares its
 `mounted_dmg` or `detached_copy`
 launch origin and binds the source DMG and both packaged binaries by SHA256. The
 unchanged license inventory remains version 1; `framework-lock.json` retains its
@@ -254,7 +332,7 @@ Any product or benchmark failure creates a new candidate after the fix.
 Infrastructure-only retries must be recorded and may not be used to select the
 best stochastic result.
 
-## Current Draft Rehearsal Validation
+## Preview Draft Validation
 
 The current manual workflow creates a uniquely tagged GitHub draft prerelease
 only after its macOS and Linux rehearsal jobs succeed. Cross-job Actions
@@ -265,16 +343,19 @@ verifies:
 
 - asset names and architectures are expected;
 - SHA256 files match downloaded bytes;
-- the interim Core descriptor references the uploaded Core wheel;
-- the DMG version and bundled/fetched descriptor match the candidate commit;
+- the Core descriptor references the uploaded Core wheel;
+- the Daemon Bundle, its manifest, the DMG-embedded copy, and managed runtime
+  identity match the source commit and candidate inventory;
+- the DMG version and bundled/fetched descriptor match the source commit;
 - release notes exactly match the release-tool-owned canonical packaging
   document. The GitHub body adds only a release-tool-generated, 128-bit random
   ownership marker used by failure cleanup. The document states
   unsigned/not-notarized status, available and unavailable execution
   modes, known limitations, `0 of 3` benchmark gates with all three rescue
-  counts `pending`, privacy/security behavior, and install/upgrade/uninstall
-  retention for `~/.openevo/desktop`, the Tauri native host app-data directory
-  for `org.openevo.desktop`, and remote data;
+  counts `pending`, that Codex Subscription is packaged/declared but has no
+  exact-candidate real science E2E verdict, privacy/security behavior, and
+  install/upgrade/uninstall retention for `~/.openevo/desktop`, the Tauri native
+  host app-data directory for `org.openevo.desktop`, and remote data;
 - the GitHub draft title, tag, target commit, body, draft state, and prerelease
   state match the candidate at the discrete API read immediately after asset
   redownload. Its repository-bound API URL supplies the immutable numeric
@@ -282,6 +363,11 @@ verifies:
   an atomic assertion about later workflow completion;
 - no unclassified development, secret, benchmark-private, or source-checkout
   files are present.
+
+The retained canonical Preview snapshot additionally binds the immutable
+numeric release ID, exact body, asset IDs, names, sizes, API SHA256 digests,
+candidate-manifest digest, and candidate workflow run ID/attempt. It is the
+publisher's reviewed baseline, not permission to edit the draft.
 
 Before creation, the workflow validates the exact candidate tag name as a Git
 ref and uses the authenticated, paginated release inventory so private drafts
@@ -298,23 +384,71 @@ metadata only. It does not publish the release.
 
 A GitHub draft remains administratively mutable after the workflow. The
 workflow provides point-in-time verification, not an immutable GitHub object.
-Any later edit, asset replacement, or tag movement invalidates the candidate;
-delete it and run a new candidate rather than attempting to repair or promote
-the edited draft.
+Any later edit, asset replacement, or tag movement invalidates the validation;
+delete it and run a new packaging draft. An unchanged, revalidated draft may be
+published only under the Preview policy above.
+
+## Preview Publisher
+
+Dispatch `Publish validated OpenEvo Desktop Preview` only from `stable` and
+through the protected `openevo-preview-publication` environment. Supply the
+exact candidate tag, numeric release ID, source SHA, `release-candidate.json`
+SHA256, candidate workflow run ID and attempt, plus the explicit confirmation.
+The publisher first runs a read-only verification job. That job checks out the
+workflow's own `github.workflow_sha`, never the candidate source, and requires
+the Actions API to identify that exact run as a successful, completed
+`workflow_dispatch` of
+`.github/workflows/openevo-desktop-candidate.yml` on `stable` at the expected
+source SHA. It then downloads that run's canonical snapshot, re-resolves the
+tag in the authenticated paginated release inventory, and re-reads metadata by
+the expected numeric ID.
+
+Before publication it downloads every draft asset by immutable asset ID into a
+fresh owner-only directory and verifies the manifest, `SHA256SUMS`, title,
+body, prerelease/draft state, target commit, source/run identities, API asset
+digests, and exact closed inventory. It also proves the real Git tag does not
+exist. The protected-environment reviewer must independently verify through
+repository administration that immutable releases remain enabled; the normal
+workflow token intentionally has no repository-administration permission. Any
+failure through this point leaves the draft unpublished.
+
+The protected write job does not check out or execute repository or candidate
+code. It downloads the candidate snapshot as data, repeats the closed identity,
+metadata, API digest, asset-byte and tag-absence checks with fixed standard
+library code embedded in the reviewed workflow, and only then performs the
+single mutation: a REST PATCH to
+`repos/<owner>/<repo>/releases/<numeric-id>` with the exact body
+`{"draft":false}`. The workflow never uploads, replaces, edits, or deletes an
+asset, title, body, target, or tag. A separate read-only job then re-reads the
+same numeric release, requires `immutable=true`, downloads all public assets
+into another fresh directory, repeats the closed validation, and requires the
+new Git tag to point exactly to the source SHA. Post-publication verification
+failure is recorded and requires manual incident handling; automation must not
+delete the now-public release. If an administrator disables immutable releases
+between approval and the visibility PATCH, the fixed write step rejects the
+non-immutable response after publication and the run enters that incident path;
+no broader token is stored in Actions to eliminate this administrator-level
+race.
 
 Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
 compliance and release risk before a candidate reaches `stable`.
 
 ## Publication
 
-Final External Beta publication remains disabled. The packaging-only draft from
-this workflow is review evidence only and must not be edited, retagged, or
-promoted. After the science, benchmark, privacy, signing-policy, and final
-product gates are implemented and
-pass, create a new final candidate from a reviewed `stable` commit. That future
-path must use the exact Daemon Bundle and canonical release manifest, generate
-final release notes and a new checksum/evidence inventory, roundtrip every
-asset again, and publish only those unchanged revalidated bytes.
+New Preview publication is allowed only by the policy above. Version `0.1.1`
+remains published as an explicitly recorded historical exception; it must not
+be cited as policy-compliant publication evidence.
+
+Final External Beta publication remains disabled. After the science, benchmark,
+remaining privacy, and final product gates are implemented and pass, create a
+new final candidate from a reviewed `stable` commit. The current Preview's
+ad-hoc-signature and synthetic quarantine-removal evidence remains
+packaging-profile evidence, not a substitute for those missing gates. That
+candidate must use the exact Daemon Bundle and canonical release manifest,
+generate final release notes and a new checksum/evidence inventory, roundtrip
+every asset again, emit the detached G12 records, and publish only through the
+canonical publication controller. Preview evidence cannot substitute for any
+missing gate.
 
 ## Rollback
 

@@ -1,8 +1,12 @@
 # OpenEvo Architecture Docs
 
 This directory describes the current architecture and External Beta target.
-OpenEvo is still pre-release; target documents must not be read as proof that a
-packaged workflow already exists. The product surfaces are:
+OpenEvo `0.1.1` is an installable historical exhibition Preview with a real
+Desktop DMG, packaged sidecar and renderer, self-contained Daemon Bundle, and
+managed-runtime packaging smoke. It has no checked-in candidate-bound science
+E2E or clean-host evidence. Target documents must not be read as proof that the
+Preview satisfies the full External Beta contract or G1-G12. The product
+surfaces are:
 
 - **OpenEvo Desktop**: the ordinary-user macOS app and local sidecar facade.
 - **OpenEvo Daemon**: the remote Linux backend that owns execution, deployment,
@@ -51,10 +55,11 @@ Terminal Bench maintainer commands and package boundaries are documented in
 
 Pre-release Desktop workflow notes live under `docs/user/`; Daemon target
 contracts live under `docs/core/`. [Desktop Release Packaging](openevo-desktop-release.md)
-separates the currently executable sidecar build from the still-blocked macOS
-DMG release gates. [Desktop Active-Tunnel Core Bridge v1](desktop-core-bridge-v1.md)
-documents the strict project-session bridge and its still-unwired release
-persistence boundary. Older Desktop foundation notes remain implementation
+separates the published unsigned Preview packaging path from the still-open
+External Beta release gates. [Desktop Active-Tunnel Core Bridge v1](desktop-core-bridge-v1.md)
+documents the strict project-session bridge and its still-incomplete authority
+boundary. The next contract-major authority cutover must precede deeper Task,
+Files, or History state. Older Desktop foundation notes remain implementation
 history.
 
 ## Daemon And Core Internals

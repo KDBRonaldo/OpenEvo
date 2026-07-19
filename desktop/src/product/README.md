@@ -245,15 +245,24 @@ drawers lock background scrolling and restore the opener on close. When the
 native folder picker temporarily disables its radio control, keyboard focus is
 restored to that control after the picker settles.
 
-The System view exposes connection and read-only service state. It does not show
-diagnostics, service restart, repair, or workspace-sync controls because the
-release provider has no verified handlers for them. Nonterminal local
-connect/bootstrap/activation operations expose the frozen Local API cancel
-action, interrupt their exact transport/process/tunnel authority, and return to
-the authoritative disconnected or draft state before retry. A ready project
-with an empty service collection or any non-running service fails closed at
-`Start session`; System exposes status refresh plus a full remote-workspace
-Reconnect action instead of treating the degraded environment as runnable.
+The Preview System view exposes connection and authoritative service state.
+The frozen provider boundary contains environment doctor/repair, service
+restart, redacted diagnostics, and cleanup routes, but the production Core does
+not publish their owner yet. The real release provider therefore sets
+`systemMaintenanceAvailable=false`, hides every mutation control, and leaves
+direct route calls fail closed. The contract simulator may opt in to those
+controls for focused development tests; that does not make them a release
+feature. No path exposes workspace sync, arbitrary maintenance scopes, or a
+remote shell.
+Nonterminal local connect/bootstrap/activation operations expose the frozen
+Local API cancel action, interrupt their exact transport/process/tunnel
+authority, and return to the authoritative disconnected or draft state before
+retry. Project doctor and repair cannot claim cancellation of a remote side
+effect, so their Local cancel route fails closed and the renderer hides that
+action. A ready project with an empty service collection or any non-running
+service fails closed at `Start session`; the Preview System view offers
+authoritative status refresh and full remote-workspace reconnect instead of
+treating the degraded environment as runnable.
 
 `App.tsx` owns the release startup state machine. It does not mount the product
 renderer until native bootstrap, Local API negotiation, and provider creation

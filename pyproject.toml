@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "openevo"
-version = "0.1.1"
+version = "0.1.2"
 description = "OpenEvo Desktop and agent evolution orchestration."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -48,6 +48,7 @@ dev = [
     "setuptools>=68",
     "wheel",
     "pyinstaller>=6.11,<7",
+    "pip-audit==2.9.0",
     "twine>=5.0.0",
 ]
 

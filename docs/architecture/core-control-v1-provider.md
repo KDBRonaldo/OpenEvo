@@ -54,6 +54,12 @@ before releasing the threads.
 All unavailable operations use `provider_capability_unavailable`; they never
 return fixture resources or synthetic successful operations.
 
+The repository contains an opt-in maintenance-owner prototype for focused
+contract tests. Production and release construction do not instantiate it,
+do not advertise `DIAGNOSTICS`, and keep every owner-backed route fail closed
+until durable side-effect receipts, lifecycle/replay semantics, run fencing,
+shutdown draining, and complete authority audits are implemented and reviewed.
+
 ## Durable State
 
 The provider owns `<state-root>/core-control-v1/` with an exclusive owner lock:

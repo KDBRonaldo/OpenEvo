@@ -1,4 +1,13 @@
-import { AlertCircle, LoaderCircle, RefreshCw } from "lucide-react";
+import {
+  Activity,
+  AlertCircle,
+  BookOpen,
+  CircleDot,
+  LoaderCircle,
+  RefreshCw,
+  ShieldCheck,
+  Sparkles,
+} from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
@@ -10,6 +19,8 @@ import { Compare } from "./routes/Compare";
 import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { DesktopProductApp } from "./product/DesktopProductApp";
+import { SampleScientificProjectView } from "./product/ScientificProjectSample";
+import { SAMPLE_SCIENTIFIC_PROJECT } from "./product/scientificProjectSampleData";
 import type { DesktopProductProvider } from "./product/provider";
 import {
   createReleaseDesktopProductProvider,
@@ -172,7 +183,116 @@ type ReleaseDesktopStartupState =
       readonly generation: number;
     }
   | { readonly status: "ready"; readonly provider: DesktopProductProvider }
-  | { readonly status: "failed" };
+  | { readonly status: "failed"; readonly stage: "bootstrap" | "readiness" };
+
+type ReadonlySampleWorkspace = "research" | "evolution" | "system";
+
+function ReleaseStartupSample({ onRetry }: { onRetry: () => void }) {
+  const [workspace, setWorkspace] = useState<ReadonlySampleWorkspace>("research");
+  const sampleWorkspaces: ReadonlyArray<{
+    readonly id: ReadonlySampleWorkspace;
+    readonly label: string;
+    readonly icon: typeof BookOpen;
+  }> = [
+    { id: "research", label: "Research", icon: BookOpen },
+    { id: "evolution", label: "Evolution", icon: Sparkles },
+    { id: "system", label: "System", icon: Activity },
+  ];
+
+  const handleWorkspaceKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+      return;
+    }
+    const tabs = Array.from(
+      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
+    );
+    const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
+    if (current < 0 || tabs.length === 0) return;
+    event.preventDefault();
+    const next = event.key === "Home"
+      ? 0
+      : event.key === "End"
+        ? tabs.length - 1
+        : (
+            current
+            + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1)
+            + tabs.length
+          ) % tabs.length;
+    tabs[next]?.focus();
+    tabs[next]?.click();
+  };
+
+  return (
+    <div className="product-shell initial-sync-shell" data-testid="release-startup-sample">
+      <aside className="product-sidebar" aria-label="Primary navigation">
+        <div className="product-brand" aria-label="OpenEvo Desktop">
+          <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
+          <span>OpenEvo</span>
+        </div>
+        <nav
+          className="product-nav"
+          role="tablist"
+          aria-label="内置示例视图"
+          aria-orientation="vertical"
+          onKeyDown={handleWorkspaceKeyDown}
+        >
+          {sampleWorkspaces.map(({ id, label, icon: Icon }) => (
+            <button
+              key={id}
+              type="button"
+              role="tab"
+              className={`product-nav-item ${workspace === id ? "active" : ""}`}
+              aria-selected={workspace === id}
+              tabIndex={workspace === id ? 0 : -1}
+              onClick={() => setWorkspace(id)}
+            >
+              <Icon size={17} /> {label}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-foot">
+          <div className="sidebar-foot-label">Current Project Head</div>
+          <div className="sidebar-revision">
+            <CircleDot size={15} />
+            <span>Project Head {SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}</span>
+          </div>
+        </div>
+      </aside>
+      <div className="product-stage">
+        <header className="product-topbar">
+          <div className="project-switcher-wrap">
+            <label htmlFor="startup-sample-project">Project</label>
+            <div className="project-switcher-control">
+              <select id="startup-sample-project" value="sample" disabled>
+                <option value="sample">[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
+              </select>
+            </div>
+          </div>
+          <span className="sample-topbar-badge">
+            <ShieldCheck size={14} /> 内置示例 · 只读
+          </span>
+        </header>
+        <main className="product-main">
+          <div className="initial-sync-notice" role="alert">
+            <AlertCircle size={18} />
+            <div>
+              <strong>暂时无法连接 OpenEvo Desktop</strong>
+              <span>
+                本机服务尚未就绪。下方内置示例保持只读，不会连接本机服务或远端服务器。
+              </span>
+            </div>
+            <button type="button" className="secondary-button" onClick={onRetry}>
+              <RefreshCw size={15} /> 重试启动
+            </button>
+          </div>
+          <div className="initial-sync-sample">
+            <SampleScientificProjectView workspace={workspace} />
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
 
 export function ReleaseDesktopProductShell({
   createProvider = createReleaseDesktopProductProvider,
@@ -241,7 +361,7 @@ export function ReleaseDesktopProductShell({
           // Native cleanup is bounded; startup remains explicitly retryable.
         }
         if (generation.current === requestGeneration) {
-          setStartup({ status: "failed" });
+          setStartup({ status: "failed", stage: "bootstrap" });
         }
       }
     });
@@ -271,7 +391,7 @@ export function ReleaseDesktopProductShell({
           // Native cleanup is bounded; startup remains explicitly retryable.
         }
         if (generation.current === committingGeneration) {
-          setStartup({ status: "failed" });
+          setStartup({ status: "failed", stage: "readiness" });
         }
       }
     });
@@ -297,22 +417,14 @@ export function ReleaseDesktopProductShell({
   if (startup.status === "ready") {
     return <OpenEvoDesktopOnlyShell provider={startup.provider} />;
   }
+  if (startup.status === "failed") {
+    return <ReleaseStartupSample onRetry={start} />;
+  }
   return (
     <div className="product-boot">
-      {startup.status === "loading" ? (
-        <div className="product-loading-row" role="status" aria-live="polite">
-          <LoaderCircle className="spin" size={18} /> Starting OpenEvo Desktop...
-        </div>
-      ) : (
-        <div className="blocking-state" role="alert">
-          <span className="product-mark large"><AlertCircle size={22} /></span>
-          <h1>OpenEvo Desktop could not start</h1>
-          <p>The local service did not become ready. Retry startup to create a new secure session.</p>
-          <button type="button" className="primary-button" onClick={start}>
-            <RefreshCw size={16} /> Retry startup
-          </button>
-        </div>
-      )}
+      <div className="product-loading-row" role="status" aria-live="polite">
+        <LoaderCircle className="spin" size={18} /> 正在启动 OpenEvo Desktop...
+      </div>
     </div>
   );
 }

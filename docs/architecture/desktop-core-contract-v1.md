@@ -508,13 +508,14 @@ GET    /desktop/v1/events
 
 Routes in this frozen boundary are not automatically release features. The
 current release composition provides sidecar-owned connection, host-key,
-bootstrap, activation, operation cancellation, Core-owned runs, artifact
-inspection, and read-only service observation. It does not install doctor,
-repair, workspace-sync, Local operation-log, service restart, diagnostics, or
-cache-cleanup handlers; the renderer hides those unavailable controls. The
-frozen routes remain schema-only future boundaries and the release provider
-returns `provider_capability_unavailable` if they are called directly. It does
-not synthesize progress or successful diagnostic/service operations.
+bootstrap, activation and operation cancellation; Core-owned runs and artifact
+inspection; and service observation. Strict forwarding routes for restart,
+doctor/repair, diagnostics, referenced logs, and cleanup remain in the frozen
+boundary, but the Preview Core does not publish their production owner. The
+real renderer marks maintenance unavailable and hides those mutation controls;
+direct calls return typed `provider_capability_unavailable`. Workspace sync and
+Local operation-log handlers remain unavailable. The provider never synthesizes
+progress or successful diagnostic/service operations.
 
 Activation completion is published under the project-session transition lock.
 The bridge commit and authoritative online project binding happen before the
@@ -721,7 +722,7 @@ The adapter between the two v1 contracts is deterministic and fail closed:
 | Scratch source | Core creates its signed empty workspace snapshot. |
 | Native-folder `import_id` | Sidecar resolves the private canonical archive and completes the Core upload session; React never handles archive bytes. |
 | Validate current project | Sidecar fetches current Core project refs and verified capabilities, then submits Core project validation. |
-| Run current project | Current v1 sidecar fetches the active revision and may also inspect a reachable successor. Its legacy successor-selection behavior is release-blocking; the canonical path submits only an active Project Head after the not-ready check below. |
+| Run current project | Current v1 sidecar fetches the active revision and may inspect a reachable successor only to prove that the project is not ready. It never submits that successor: the canonical path submits only the active Project Head after the not-ready check below. |
 | Core SSE change | Sidecar validates the complete Core event, updates its remote snapshot cache, and emits only an ETag/digest-bound Local invalidation. |
 
 Missing tunnel, contract mismatch, stale Local ETag, release-unavailable mode,
@@ -1103,9 +1104,11 @@ digest, and corresponding artifact/content identity; a hunk cannot drop or
 cross-wire its document identity.
 
 Timeline and log records preserve remote sequence, attempt, and service
-identity. Service summaries are authoritative read-only observations in the
-current release. Core diagnostics and service mutation owners are unavailable,
-so Desktop neither advertises those feature flags nor renders their controls.
+identity. Service summaries remain authoritative observations from Core. The
+Preview release does not own bounded diagnostics, project doctor/repair,
+managed service restart, referenced maintenance logs, or
+completed-diagnostic cleanup. Desktop hides those controls; the route models
+remain reserved for a later reviewed owner.
 
 Inference services carry `model_preparation` if and only if
 `kind=inference`; environment checks carry it if and only if
@@ -1114,13 +1117,14 @@ target. Global scopes forbid project/run IDs, project scope requires exactly a
 project ID, and run scope requires both project and run IDs. Providers still
 verify that the run belongs to the project.
 
-The frozen schema reserves `OperationV1` shapes for environment repair, service
-restart, and cache cleanup, plus recoverable diagnostic resources. A future
-owner must bind those resources to strong ETags, referenced logs, idempotency,
-and the declared cancellation semantics. The current Core release has no such
-owners: every corresponding route returns `provider_capability_unavailable`,
-and Desktop does not advertise or render them. This reserved schema is not
-evidence that repair, restart, diagnostics, or cache cleanup currently works.
+The frozen `OperationV1` shapes for environment repair, service restart, cache
+cleanup, and recoverable diagnostic resources define the intended boundary.
+The repository has a test-only opt-in owner under active hardening, but release
+construction excludes it until strong ETags, durable side-effect receipts,
+idempotent replay, bounded recovery, lifecycle revocation, run fencing, and
+shutdown semantics are complete. Every maintenance scope currently fails
+closed instead of implying ownership over project inputs, runs, outputs, or
+evolution artifacts.
 
 Core SSE adds artifact, log, operation, successor-transition, and
 revision-activated events. Every non-heartbeat event carries a replay-stable

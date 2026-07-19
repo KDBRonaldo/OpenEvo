@@ -19,7 +19,7 @@ import stat
 import sys
 import threading
 import time
-from typing import Any, Iterator, Literal, TypeVar
+from typing import Any, Iterator, Literal, TypeVar, cast
 
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
@@ -44,7 +44,19 @@ _RecoveryTableName = Literal[
     "failed_idempotency_records",
     "events",
     "metadata",
+    "maintenance_operations",
+    "maintenance_diagnostics",
+    "maintenance_logs",
+    "maintenance_idempotency_records",
 ]
+_MAINTENANCE_RECOVERY_TABLES: frozenset[_RecoveryTableName] = frozenset(
+    {
+        "maintenance_operations",
+        "maintenance_diagnostics",
+        "maintenance_logs",
+        "maintenance_idempotency_records",
+    }
+)
 _EMPTY_WORKSPACE_DIGEST = hashlib.sha256(b"\0" * 1024).hexdigest()
 _IDEMPOTENCY_RETENTION_SECONDS = 7 * 24 * 60 * 60
 _IDEMPOTENCY_LIMIT = 10_000
@@ -65,6 +77,11 @@ _MAX_ARTIFACT_REACHABILITY_ROWS = 128
 _MAX_UPLOADS = 20_000
 _MAX_PUBLICATION_OWNERS = _MAX_UPLOADS + _IDEMPOTENCY_LIMIT
 _MAX_CLEANUP_INTENTS = _MAX_PROJECTS + (2 * _MAX_UPLOADS)
+_MAX_MAINTENANCE_OPERATIONS = 10_000
+_MAX_MAINTENANCE_DIAGNOSTICS = 10_000
+_MAX_MAINTENANCE_LOGS = 50_000
+_MAX_MAINTENANCE_LOGS_PER_REF = 256
+_MAX_MAINTENANCE_IDEMPOTENCY = 10_000
 _MAX_RECOVERY_CLEANUP_NODES = 100_000
 _MAX_RECOVERY_CLEANUP_NAME_BYTES = 16 * 1024 * 1024
 _STORE_ID_BYTES = 32
@@ -160,6 +177,23 @@ _IDEMPOTENCY_OPERATION_SPECS: dict[
     "abortCoreWorkspaceUploadV1": (200, "WorkspaceUploadSessionV1", "upload"),
     "validateCoreProjectV1": (200, "ProjectValidationResponseV1", "project"),
     "activateCoreEvolutionRevisionInternalV1": (200, "ProjectV1", "project"),
+}
+_MAINTENANCE_REQUEST_MODELS: dict[str, type[BaseModel] | None] = {
+    "doctorCoreEnvironmentV1": m.EnvironmentDoctorRequestV1,
+    "repairCoreEnvironmentV1": m.EnvironmentRepairRequestV1,
+    "restartCoreServiceV1": m.ServiceRestartRequestV1,
+    "cancelCoreOperationV1": m.OperationCancelRequestV1,
+    "createCoreDiagnosticV1": m.DiagnosticsRequestV1,
+    "deleteCoreDiagnosticV1": None,
+    "cleanupCoreCachesV1": m.CacheCleanupRequestV1,
+}
+_MAINTENANCE_RESPONSE_MODELS: dict[str, type[BaseModel]] = {
+    model.__name__: model
+    for model in (
+        m.EnvironmentDoctorResponseV1,
+        m.OperationV1,
+        m.DiagnosticV1,
+    )
 }
 
 
@@ -502,6 +536,69 @@ _REVISION_ARTIFACT_AUTHORITIES_SCHEMA = """
             ON DELETE CASCADE
     ) STRICT
 """
+_MAINTENANCE_OPERATIONS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS maintenance_operations (
+        operation_id TEXT PRIMARY KEY,
+        kind TEXT NOT NULL
+            CHECK (kind IN ('environment_repair', 'service_restart', 'cache_cleanup')),
+        logs_ref TEXT NOT NULL UNIQUE,
+        authority_hmac TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    ) STRICT
+"""
+_MAINTENANCE_DIAGNOSTICS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS maintenance_diagnostics (
+        diagnostic_id TEXT PRIMARY KEY,
+        authority_hmac TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    ) STRICT
+"""
+_MAINTENANCE_LOGS_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS maintenance_logs (
+        logs_ref TEXT NOT NULL,
+        sequence INTEGER NOT NULL
+            CHECK (sequence >= 1 AND sequence <= 9007199254740991),
+        log_id TEXT NOT NULL UNIQUE,
+        authority_hmac TEXT NOT NULL,
+        document_json BLOB NOT NULL,
+        occurred_at TEXT NOT NULL,
+        PRIMARY KEY (logs_ref, sequence),
+        FOREIGN KEY (logs_ref) REFERENCES maintenance_operations(logs_ref)
+            ON DELETE CASCADE
+    ) STRICT
+"""
+_MAINTENANCE_IDEMPOTENCY_SCHEMA = """
+    CREATE TABLE IF NOT EXISTS maintenance_idempotency_records (
+        route_operation_id TEXT NOT NULL,
+        resource_scope TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        request_digest TEXT NOT NULL CHECK (length(request_digest) = 64),
+        request_json BLOB NOT NULL,
+        semantic_headers_json BLOB NOT NULL,
+        status_code INTEGER NOT NULL,
+        response_type TEXT NOT NULL
+            CHECK (
+                response_type IN (
+                    'EnvironmentDoctorResponseV1',
+                    'OperationV1',
+                    'DiagnosticV1',
+                    'NoContent'
+                )
+            ),
+        response_json BLOB,
+        etag TEXT,
+        authority_hmac TEXT NOT NULL,
+        created_at_epoch INTEGER NOT NULL,
+        expires_at_epoch INTEGER NOT NULL,
+        PRIMARY KEY (route_operation_id, resource_scope, idempotency_key)
+    ) STRICT
+"""
 _PREVIOUS_SCHEMA = (_STORE_IDENTITY_SCHEMA, *_LEGACY_SCHEMA)
 _REVISION_LEDGER_V1_SCHEMA = (*_PREVIOUS_SCHEMA, _PROJECT_REVISIONS_SCHEMA_V1)
 _ARTIFACT_INSPECTION_V1_SCHEMA = (
@@ -509,7 +606,33 @@ _ARTIFACT_INSPECTION_V1_SCHEMA = (
     _PROJECT_REVISIONS_SCHEMA,
     _REVISION_ACTIVATION_BINDINGS_SCHEMA,
 )
-_SCHEMA = (*_ARTIFACT_INSPECTION_V1_SCHEMA, _REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
+_PRE_MAINTENANCE_SCHEMA = (
+    *_ARTIFACT_INSPECTION_V1_SCHEMA,
+    _REVISION_ARTIFACT_AUTHORITIES_SCHEMA,
+)
+_MAINTENANCE_TABLE_SCHEMA = (
+    _MAINTENANCE_OPERATIONS_SCHEMA,
+    _MAINTENANCE_DIAGNOSTICS_SCHEMA,
+    _MAINTENANCE_LOGS_SCHEMA,
+    _MAINTENANCE_IDEMPOTENCY_SCHEMA,
+)
+_PREVIOUS_SCHEMA_WITH_MAINTENANCE = (
+    *_PREVIOUS_SCHEMA,
+    *_MAINTENANCE_TABLE_SCHEMA,
+)
+_REVISION_LEDGER_V1_SCHEMA_WITH_MAINTENANCE = (
+    *_REVISION_LEDGER_V1_SCHEMA,
+    *_MAINTENANCE_TABLE_SCHEMA,
+)
+_ARTIFACT_INSPECTION_V1_SCHEMA_WITH_MAINTENANCE = (
+    *_ARTIFACT_INSPECTION_V1_SCHEMA,
+    *_MAINTENANCE_TABLE_SCHEMA,
+)
+_TEST_SCHEMA_WITH_MAINTENANCE = (
+    *_PRE_MAINTENANCE_SCHEMA,
+    *_MAINTENANCE_TABLE_SCHEMA,
+)
+_SCHEMA = _PRE_MAINTENANCE_SCHEMA
 
 
 class CoreControlStoreV1:
@@ -521,6 +644,7 @@ class CoreControlStoreV1:
         *,
         event_replay_limit: int = 10_000,
         clock: Callable[[], datetime] | None = None,
+        _enable_maintenance_storage_for_tests: bool = False,
     ) -> None:
         if not 1 <= event_replay_limit <= 10_000:
             raise ValueError("event replay limit must be between 1 and 10000")
@@ -530,6 +654,7 @@ class CoreControlStoreV1:
         self.workspace_root = self.root / "workspace-snapshots"
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._event_replay_limit = event_replay_limit
+        self._maintenance_storage_enabled = _enable_maintenance_storage_for_tests
         self._mutex = threading.RLock()
         self._closed = False
         self._database_fds: dict[str, int] = {}
@@ -1022,9 +1147,15 @@ class CoreControlStoreV1:
 
             row, current = self._project_row(project_id)
             if current.status is not m.ProjectStatus.READY:
-                raise ResourceConflictError("project is not ready for evolution activation")
+                raise ResourceConflictError(
+                    "project_not_ready",
+                    "The project is not ready for evolution activation.",
+                )
             if predecessor.project_id != project_id or current.active_revision != predecessor:
-                raise ResourceConflictError("project revision advanced before activation")
+                raise ResourceConflictError(
+                    "project_revision_advanced",
+                    "The project revision advanced before evolution activation.",
+                )
             now = self._project_mutation_timestamp(current)
             next_version = int(row["resource_version"]) + 1
             project_data = current.model_dump(mode="python", exclude={"etag"})
@@ -1874,6 +2005,60 @@ class CoreControlStoreV1:
                 return error
             return _validate_bytes(m.ApiErrorV1, row["error_json"])
 
+    def has_successful_idempotency_replay(
+        self,
+        operation_id: str,
+        arguments: Mapping[str, object],
+    ) -> bool:
+        """Check an exact successful mutation replay without applying a new mutation."""
+
+        key = cast(str, arguments["idempotency_key"])
+        request = cast(BaseModel | None, arguments.get("request"))
+        project_id = cast(str, arguments["project_id"])
+        response_model: type[BaseModel] | None
+        if operation_id == "patchCoreProjectV1":
+            scope = project_id
+            headers = {"if-match": cast(str, arguments["if_match"])}
+            response_model = m.ProjectV1
+        elif operation_id == "deleteCoreProjectV1":
+            scope = project_id
+            headers = {"if-match": cast(str, arguments["if_match"])}
+            response_model = None
+        elif operation_id == "createCoreWorkspaceUploadV1":
+            scope = project_id
+            headers = {"if-match": cast(str, arguments["if_match"])}
+            response_model = m.WorkspaceUploadSessionV1
+        elif operation_id == "putCoreWorkspaceUploadChunkV1":
+            scope = f"{project_id}:{cast(str, arguments['upload_id'])}"
+            headers = {"if-match": cast(str, arguments["if_match"])}
+            response_model = m.WorkspaceUploadSessionV1
+        elif operation_id == "finalizeCoreWorkspaceUploadV1":
+            scope = f"{project_id}:{cast(str, arguments['upload_id'])}"
+            headers = {
+                "if-match": cast(str, arguments["if_match"]),
+                "if-project-match": cast(str, arguments["if_project_match"]),
+            }
+            response_model = m.WorkspaceUploadFinalizeResponseV1
+        elif operation_id == "abortCoreWorkspaceUploadV1":
+            scope = f"{project_id}:{cast(str, arguments['upload_id'])}"
+            headers = {"if-match": cast(str, arguments["if_match"])}
+            response_model = m.WorkspaceUploadSessionV1
+        else:
+            raise ValueError("operation is not a project mutation with durable replay")
+        envelope = _idempotency_envelope(operation_id, scope, request, headers)
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            return (
+                self._idempotency_replay(
+                    operation_id,
+                    scope,
+                    key,
+                    envelope,
+                    response_model,
+                )
+                is not None
+            )
+
     def record_failed_idempotency(
         self,
         operation_id: str,
@@ -1916,24 +2101,537 @@ class CoreControlStoreV1:
                 ),
             )
 
+    def store_doctor_response(
+        self,
+        request: m.EnvironmentDoctorRequestV1,
+        response: m.EnvironmentDoctorResponseV1,
+        *,
+        idempotency_key: str,
+    ) -> StoredResult:
+        route = "doctorCoreEnvironmentV1"
+        scope = "environment"
+        envelope = _idempotency_envelope(route, scope, request, {})
+        with self._mutex, self._transaction():
+            replay = self._maintenance_idempotency_replay(route, scope, idempotency_key, envelope)
+            if replay is not None:
+                return replay
+            result = StoredResult(200, response)
+            self._store_maintenance_idempotency(route, scope, idempotency_key, envelope, result)
+            return result
+
+    def create_maintenance_operation(
+        self,
+        route_operation_id: str,
+        request: m.OperationRequestV1,
+        *,
+        resource_scope: str,
+        idempotency_key: str,
+        semantic_headers: Mapping[str, str] | None = None,
+    ) -> StoredResult:
+        public_request = request.request
+        headers = dict(semantic_headers or {})
+        envelope = _idempotency_envelope(
+            route_operation_id, resource_scope, public_request, headers
+        )
+        with self._mutex, self._transaction():
+            replay = self._maintenance_idempotency_replay(
+                route_operation_id,
+                resource_scope,
+                idempotency_key,
+                envelope,
+            )
+            if replay is not None:
+                return replay
+            self._require_maintenance_row_capacity(
+                "maintenance_operations", _MAX_MAINTENANCE_OPERATIONS
+            )
+            now = self._timestamp()
+            operation_id = _core_owned_id(
+                self._signing_key,
+                "operation",
+                {
+                    "route_operation_id": route_operation_id,
+                    "resource_scope": resource_scope,
+                    "idempotency_key": idempotency_key,
+                    "request_digest": envelope.digest,
+                },
+            )
+            logs_ref = _core_owned_id(
+                self._signing_key,
+                "logs",
+                {"operation_id": operation_id},
+            )
+            operation = _model_with_etag(
+                m.OperationV1,
+                {
+                    "id": operation_id,
+                    "kind": request.kind,
+                    "descriptor": {
+                        "kind": request.kind,
+                        "cancellable": request.kind is m.OperationKind.ENVIRONMENT_REPAIR,
+                    },
+                    "status": m.OperationStatus.QUEUED,
+                    "request": request,
+                    "result": None,
+                    "cancellation": None,
+                    "logs_ref": logs_ref,
+                    "created_at": now,
+                    "updated_at": now,
+                    "observed_at": now,
+                    "finished_at": None,
+                    "error": None,
+                },
+                version=1,
+            )
+            self._insert_maintenance_operation(operation, version=1)
+            self._append_operation_log(
+                operation,
+                level=m.LogLevel.INFO,
+                message="The Core maintenance operation was accepted.",
+                now=now,
+            )
+            self._append_operation_event(operation, now=now)
+            result = StoredResult(202, operation, operation.etag)
+            self._store_maintenance_idempotency(
+                route_operation_id,
+                resource_scope,
+                idempotency_key,
+                envelope,
+                result,
+            )
+            return result
+
+    def replay_maintenance_operation_request(
+        self,
+        route_operation_id: str,
+        request: m.OperationRequestV1,
+        *,
+        resource_scope: str,
+        idempotency_key: str,
+        semantic_headers: Mapping[str, str] | None = None,
+    ) -> StoredResult | None:
+        envelope = _idempotency_envelope(
+            route_operation_id,
+            resource_scope,
+            request.request,
+            dict(semantic_headers or {}),
+        )
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            replay = self._maintenance_idempotency_replay(
+                route_operation_id,
+                resource_scope,
+                idempotency_key,
+                envelope,
+            )
+            if replay is None:
+                return None
+            operation = cast(m.OperationV1, replay.model)
+            current = self.get_maintenance_operation(operation.id)
+            return StoredResult(
+                replay.status_code,
+                current,
+                current.etag,
+                replayed=True,
+            )
+
+    def get_maintenance_operation(self, operation_id: str) -> m.OperationV1:
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            row = self._connection.execute(
+                "SELECT * FROM maintenance_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFoundError("operation", operation_id)
+            return self._validate_maintenance_operation_row(row)
+
+    def mark_maintenance_operation_running(self, operation_id: str) -> m.OperationV1:
+        return self._transition_maintenance_operation(
+            operation_id,
+            allowed={m.OperationStatus.QUEUED},
+            status=m.OperationStatus.RUNNING,
+            log_message="The Core maintenance operation started.",
+        )
+
+    def complete_maintenance_operation(
+        self,
+        operation_id: str,
+        result: m.OperationResultV1,
+    ) -> m.OperationV1:
+        return self._transition_maintenance_operation(
+            operation_id,
+            allowed={m.OperationStatus.RUNNING},
+            status=m.OperationStatus.SUCCEEDED,
+            result=result,
+            log_message="The Core maintenance operation completed.",
+        )
+
+    def fail_maintenance_operation(
+        self,
+        operation_id: str,
+        error: m.ApiErrorV1,
+    ) -> m.OperationV1:
+        return self._transition_maintenance_operation(
+            operation_id,
+            allowed={
+                m.OperationStatus.QUEUED,
+                m.OperationStatus.RUNNING,
+            },
+            status=m.OperationStatus.FAILED,
+            error=error,
+            log_level=m.LogLevel.ERROR,
+            log_message="The Core maintenance operation failed.",
+        )
+
+    def cancel_maintenance_operation(
+        self,
+        operation_id: str,
+        request: m.OperationCancelRequestV1,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> StoredResult:
+        route = "cancelCoreOperationV1"
+        envelope = _idempotency_envelope(route, operation_id, request, {"if-match": if_match})
+        with self._mutex, self._transaction():
+            replay = self._maintenance_idempotency_replay(
+                route, operation_id, idempotency_key, envelope
+            )
+            if replay is not None:
+                cached = cast(m.OperationV1, replay.model)
+                current = self.get_maintenance_operation(cached.id)
+                return StoredResult(
+                    replay.status_code,
+                    current,
+                    current.etag,
+                    replayed=True,
+                )
+            row = self._maintenance_operation_row(operation_id)
+            current = self._validate_maintenance_operation_row(row)
+            self._require_etag(current.etag, if_match, "operation")
+            if not current.descriptor.cancellable:
+                raise ResourceConflictError(
+                    "operation_kind_not_cancellable",
+                    "The operation descriptor does not permit cancellation.",
+                )
+            if current.status not in {
+                m.OperationStatus.QUEUED,
+                m.OperationStatus.RUNNING,
+            }:
+                raise ResourceConflictError(
+                    "operation_not_cancellable",
+                    "The operation is no longer cancellable.",
+                )
+            now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
+            version = int(row["resource_version"]) + 1
+            data = current.model_dump(mode="python", exclude={"etag"})
+            data.update(
+                status=m.OperationStatus.CANCELLING,
+                cancellation=m.OperationCancellationV1(
+                    reason=request.reason,
+                    requested_at=now,
+                ),
+                updated_at=now,
+                observed_at=now,
+            )
+            updated = _model_with_etag(m.OperationV1, data, version=version)
+            self._update_maintenance_operation(updated, version=version)
+            self._append_operation_log(
+                updated,
+                level=m.LogLevel.INFO,
+                message="Cancellation was requested for the Core maintenance operation.",
+                now=now,
+            )
+            self._append_operation_event(updated, now=now)
+            result = StoredResult(202, updated, updated.etag)
+            self._store_maintenance_idempotency(
+                route,
+                operation_id,
+                idempotency_key,
+                envelope,
+                result,
+            )
+            return result
+
+    def complete_cancelled_maintenance_operation(self, operation_id: str) -> m.OperationV1:
+        return self._transition_maintenance_operation(
+            operation_id,
+            allowed={m.OperationStatus.CANCELLING},
+            status=m.OperationStatus.CANCELLED,
+            log_message="The Core maintenance operation was cancelled.",
+        )
+
+    def create_diagnostic(
+        self,
+        request: m.DiagnosticsRequestV1,
+        *,
+        idempotency_key: str,
+    ) -> StoredResult:
+        route = "createCoreDiagnosticV1"
+        scope = _diagnostic_idempotency_scope(request.target)
+        envelope = _idempotency_envelope(route, scope, request, {})
+        with self._mutex, self._transaction():
+            replay = self._maintenance_idempotency_replay(route, scope, idempotency_key, envelope)
+            if replay is not None:
+                return replay
+            self._require_maintenance_row_capacity(
+                "maintenance_diagnostics", _MAX_MAINTENANCE_DIAGNOSTICS
+            )
+            now = self._timestamp()
+            diagnostic_id = _core_owned_id(
+                self._signing_key,
+                "diagnostic",
+                {
+                    "scope": scope,
+                    "idempotency_key": idempotency_key,
+                    "request_digest": envelope.digest,
+                },
+            )
+            diagnostic = _model_with_etag(
+                m.DiagnosticV1,
+                {
+                    "id": diagnostic_id,
+                    "status": m.DiagnosticStatus.QUEUED,
+                    "scopes": request.scopes,
+                    "target": request.target,
+                    "checks": [],
+                    "created_at": now,
+                    "updated_at": now,
+                    "observed_at": now,
+                    "finished_at": None,
+                    "error": None,
+                },
+                version=1,
+            )
+            self._insert_maintenance_diagnostic(diagnostic, version=1)
+            self._append_diagnostic_event(diagnostic, now=now)
+            result = StoredResult(202, diagnostic, diagnostic.etag)
+            self._store_maintenance_idempotency(route, scope, idempotency_key, envelope, result)
+            return result
+
+    def get_diagnostic(self, diagnostic_id: str) -> m.DiagnosticV1:
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            row = self._connection.execute(
+                "SELECT * FROM maintenance_diagnostics WHERE diagnostic_id = ?",
+                (diagnostic_id,),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFoundError("diagnostic", diagnostic_id)
+            return self._validate_maintenance_diagnostic_row(row)
+
+    def mark_diagnostic_running(self, diagnostic_id: str) -> m.DiagnosticV1:
+        return self._transition_diagnostic(
+            diagnostic_id,
+            allowed={m.DiagnosticStatus.QUEUED},
+            status=m.DiagnosticStatus.RUNNING,
+        )
+
+    def complete_diagnostic(
+        self,
+        diagnostic_id: str,
+        checks: list[m.DiagnosticCheckV1],
+    ) -> m.DiagnosticV1:
+        return self._transition_diagnostic(
+            diagnostic_id,
+            allowed={m.DiagnosticStatus.RUNNING},
+            status=m.DiagnosticStatus.SUCCEEDED,
+            checks=checks,
+        )
+
+    def fail_diagnostic(
+        self,
+        diagnostic_id: str,
+        error: m.ApiErrorV1,
+    ) -> m.DiagnosticV1:
+        return self._transition_diagnostic(
+            diagnostic_id,
+            allowed={
+                m.DiagnosticStatus.QUEUED,
+                m.DiagnosticStatus.RUNNING,
+            },
+            status=m.DiagnosticStatus.FAILED,
+            error=error,
+        )
+
+    def delete_diagnostic(
+        self,
+        diagnostic_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> StoredResult:
+        route = "deleteCoreDiagnosticV1"
+        envelope = _idempotency_envelope(route, diagnostic_id, None, {"if-match": if_match})
+        with self._mutex, self._transaction():
+            replay = self._maintenance_idempotency_replay(
+                route, diagnostic_id, idempotency_key, envelope
+            )
+            if replay is not None:
+                return replay
+            row = self._connection.execute(
+                "SELECT * FROM maintenance_diagnostics WHERE diagnostic_id = ?",
+                (diagnostic_id,),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFoundError("diagnostic", diagnostic_id)
+            diagnostic = self._validate_maintenance_diagnostic_row(row)
+            self._require_etag(diagnostic.etag, if_match, "diagnostic")
+            if diagnostic.status not in {
+                m.DiagnosticStatus.SUCCEEDED,
+                m.DiagnosticStatus.FAILED,
+            }:
+                raise ResourceConflictError(
+                    "diagnostic_not_terminal",
+                    "Only a terminal diagnostic can be deleted.",
+                )
+            deleted = self._connection.execute(
+                "DELETE FROM maintenance_diagnostics WHERE diagnostic_id = ? "
+                "AND resource_version = ?",
+                (diagnostic_id, int(row["resource_version"])),
+            )
+            if deleted.rowcount != 1:
+                raise StoreCorruptionError("diagnostic deletion lost its authority")
+            result = StoredResult(204, None)
+            self._store_maintenance_idempotency(
+                route, diagnostic_id, idempotency_key, envelope, result
+            )
+            return result
+
+    def cleanup_completed_diagnostics(
+        self,
+        *,
+        older_than_days: int,
+        limit: int = 1_000,
+    ) -> tuple[int, int]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("diagnostic cleanup limit is invalid")
+        cutoff = self._clock().astimezone(timezone.utc) - timedelta(days=older_than_days)
+        cutoff_text = cutoff.isoformat(timespec="microseconds").replace("+00:00", "Z")
+        with self._mutex, self._transaction():
+            cursor = self._connection.execute(
+                "SELECT diagnostic_id, document_json FROM maintenance_diagnostics "
+                "WHERE updated_at < ? ORDER BY updated_at, diagnostic_id LIMIT ?",
+                (cutoff_text, limit + 1),
+            )
+            rows = cursor.fetchmany(limit + 1)
+            if cursor.fetchone() is not None:
+                raise StoreCorruptionError("diagnostic cleanup query exceeded its bound")
+            selected = rows[:limit]
+            reclaimed = 0
+            removed = 0
+            for row in selected:
+                diagnostic = _validate_bytes(m.DiagnosticV1, row["document_json"])
+                if diagnostic.status not in {
+                    m.DiagnosticStatus.SUCCEEDED,
+                    m.DiagnosticStatus.FAILED,
+                }:
+                    continue
+                reclaimed += len(bytes(row["document_json"]))
+                self._connection.execute(
+                    "DELETE FROM maintenance_diagnostics WHERE diagnostic_id = ?",
+                    (row["diagnostic_id"],),
+                )
+                removed += 1
+            return removed, reclaimed
+
+    def get_referenced_logs(
+        self,
+        logs_ref: str,
+        *,
+        limit: int,
+        after: str | None,
+        sort: Literal["sequence", "occurred_at"],
+        direction: Literal["asc", "desc"],
+    ) -> m.ReferencedLogPageV1:
+        with self._mutex:
+            operation_row = self._connection.execute(
+                "SELECT operation_id FROM maintenance_operations WHERE logs_ref = ?",
+                (logs_ref,),
+            ).fetchone()
+            if operation_row is None:
+                raise ResourceNotFoundError("logs", logs_ref)
+            items, next_cursor, has_more = self._maintenance_log_page(
+                logs_ref,
+                limit=limit,
+                after=after,
+                sort=sort,
+                direction=direction,
+            )
+            self._verify_lifecycle_storage()
+            return m.ReferencedLogPageV1(
+                logs_ref=logs_ref,
+                items=items,
+                next_cursor=next_cursor,
+                has_more=has_more,
+            )
+
+    def paginate_observed_logs(
+        self,
+        service_id: str,
+        entries: list[m.LogEntryV1],
+        *,
+        limit: int,
+        after: str | None,
+        sort: Literal["sequence", "occurred_at"],
+        direction: Literal["asc", "desc"],
+    ) -> m.LogPageV1:
+        if len(entries) > 10_000 or any(entry.service_id != service_id for entry in entries):
+            raise StoreCorruptionError("observed service log snapshot is invalid")
+        binding = f"service-logs:{service_id}:{sort}:{direction}"
+        boundary = None if after is None else self._decode_cursor(after, binding)
+        values = sorted(
+            entries,
+            key=lambda item: (str(getattr(item, sort)), item.id),
+            reverse=direction == "desc",
+        )
+        if boundary is not None:
+            comparison = (
+                (lambda value: value > boundary)
+                if direction == "asc"
+                else (lambda value: value < boundary)
+            )
+            values = [item for item in values if comparison((str(getattr(item, sort)), item.id))]
+        selected = values[: limit + 1]
+        has_more = len(selected) > limit
+        selected = selected[:limit]
+        next_cursor = None
+        if has_more and selected:
+            final = selected[-1]
+            next_cursor = self._encode_cursor(binding, (str(getattr(final, sort)), final.id))
+        return m.LogPageV1(
+            items=selected,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    def verify_maintenance_authority(self) -> None:
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            self._verify_schema_fingerprint()
+            self._verify_database_integrity()
+
     def append_heartbeat(self, active_run_count: int = 0) -> dict[str, object]:
         with self._mutex, self._transaction():
             now = self._timestamp()
             sequence = self._reserve_event_sequence()
             event_id = self.event_cursor(sequence)
-            frame = m.SseFrameV1.model_validate(
-                {
-                    "id": event_id,
-                    "event": "heartbeat.v1",
-                    "data": {
-                        "schema_version": "1",
+            frame = m.SseFrameV1.model_validate_json(
+                _canonical_bytes(
+                    {
                         "id": event_id,
-                        "sequence": sequence,
-                        "occurred_at": now,
                         "event": "heartbeat.v1",
-                        "payload": {"active_run_count": active_run_count},
-                    },
-                }
+                        "data": {
+                            "schema_version": "1",
+                            "id": event_id,
+                            "sequence": sequence,
+                            "occurred_at": now,
+                            "event": "heartbeat.v1",
+                            "payload": {"active_run_count": active_run_count},
+                        },
+                    }
+                )
             )
             self._finish_event(sequence, frame)
             return frame.model_dump(mode="json")
@@ -1972,6 +2670,811 @@ class CoreControlStoreV1:
                 self._signing_key, body.encode("ascii"), hashlib.sha256
             ).hexdigest()[:24]
             return f"{body}.{signature}"
+
+    def append_service_update(self, service: m.ServiceSummaryV1) -> None:
+        with self._mutex, self._transaction():
+            now = self._timestamp()
+            sequence = self._reserve_event_sequence()
+            event_id = self.event_cursor(sequence)
+            frame = m.SseFrameV1.model_validate_json(
+                _canonical_bytes(
+                    {
+                        "id": event_id,
+                        "event": "service.updated.v1",
+                        "data": {
+                            "schema_version": "1",
+                            "id": event_id,
+                            "sequence": sequence,
+                            "occurred_at": now,
+                            "event": "service.updated.v1",
+                            "change": {
+                                "change_id": _core_owned_id(
+                                    self._signing_key,
+                                    "change",
+                                    {
+                                        "resource_type": "service",
+                                        "resource_id": service.id,
+                                        "resource_etag": service.etag,
+                                    },
+                                ),
+                                "resource_type": "service",
+                                "resource_id": service.id,
+                                "resource_etag": service.etag,
+                            },
+                            "payload": service.model_dump(mode="json"),
+                        },
+                    }
+                )
+            )
+            self._finish_event(sequence, frame)
+
+    def _maintenance_operation_row(self, operation_id: str) -> sqlite3.Row:
+        row = self._connection.execute(
+            "SELECT * FROM maintenance_operations WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise ResourceNotFoundError("operation", operation_id)
+        return row
+
+    def _insert_maintenance_operation(self, operation: m.OperationV1, *, version: int) -> None:
+        document = _model_bytes(operation)
+        authority = self._maintenance_resource_hmac("operation", operation.id, version, document)
+        self._connection.execute(
+            "INSERT INTO maintenance_operations("
+            "operation_id, kind, logs_ref, authority_hmac, document_json, "
+            "resource_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                operation.id,
+                operation.kind.value,
+                operation.logs_ref,
+                authority,
+                document,
+                version,
+                operation.created_at,
+                operation.updated_at,
+            ),
+        )
+
+    def _update_maintenance_operation(self, operation: m.OperationV1, *, version: int) -> None:
+        document = _model_bytes(operation)
+        authority = self._maintenance_resource_hmac("operation", operation.id, version, document)
+        updated = self._connection.execute(
+            "UPDATE maintenance_operations SET authority_hmac = ?, document_json = ?, "
+            "resource_version = ?, updated_at = ? WHERE operation_id = ? "
+            "AND resource_version = ?",
+            (
+                authority,
+                document,
+                version,
+                operation.updated_at,
+                operation.id,
+                version - 1,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StoreCorruptionError("maintenance operation update lost its authority")
+
+    def _validate_maintenance_operation_row(
+        self, row: sqlite3.Row | Mapping[str, Any]
+    ) -> m.OperationV1:
+        operation = _validate_bytes(m.OperationV1, row["document_json"])
+        version = int(row["resource_version"])
+        document = bytes(row["document_json"])
+        data = operation.model_dump(mode="python", exclude={"etag"})
+        if (
+            operation.id != row["operation_id"]
+            or operation.kind.value != row["kind"]
+            or operation.logs_ref != row["logs_ref"]
+            or operation.created_at != row["created_at"]
+            or operation.updated_at != row["updated_at"]
+            or operation.etag != _etag(data, version=version)
+            or _model_bytes(operation) != document
+            or not hmac.compare_digest(
+                row["authority_hmac"],
+                self._maintenance_resource_hmac("operation", operation.id, version, document),
+            )
+        ):
+            raise StoreCorruptionError("maintenance operation row identity is invalid")
+        return operation
+
+    def _transition_maintenance_operation(
+        self,
+        operation_id: str,
+        *,
+        allowed: set[m.OperationStatus],
+        status: m.OperationStatus,
+        result: m.OperationResultV1 | None = None,
+        error: m.ApiErrorV1 | None = None,
+        log_level: m.LogLevel = m.LogLevel.INFO,
+        log_message: str,
+    ) -> m.OperationV1:
+        with self._mutex, self._transaction():
+            row = self._maintenance_operation_row(operation_id)
+            current = self._validate_maintenance_operation_row(row)
+            if current.status not in allowed:
+                raise ResourceConflictError(
+                    "operation_state_changed",
+                    "The maintenance operation state changed before completion.",
+                )
+            now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
+            version = int(row["resource_version"]) + 1
+            data = current.model_dump(mode="python", exclude={"etag"})
+            data.update(
+                status=status,
+                result=result,
+                error=error,
+                updated_at=now,
+                observed_at=now,
+                finished_at=(
+                    now
+                    if status
+                    in {
+                        m.OperationStatus.SUCCEEDED,
+                        m.OperationStatus.FAILED,
+                        m.OperationStatus.CANCELLED,
+                    }
+                    else None
+                ),
+            )
+            if status is m.OperationStatus.CANCELLED:
+                if current.cancellation is None:
+                    raise StoreCorruptionError("cancelled operation has no cancellation authority")
+                data["cancellation"] = current.cancellation
+            updated = _model_with_etag(m.OperationV1, data, version=version)
+            self._update_maintenance_operation(updated, version=version)
+            self._append_operation_log(
+                updated,
+                level=log_level,
+                message=log_message,
+                now=now,
+            )
+            self._append_operation_event(updated, now=now)
+            return updated
+
+    def _insert_maintenance_diagnostic(self, diagnostic: m.DiagnosticV1, *, version: int) -> None:
+        document = _model_bytes(diagnostic)
+        authority = self._maintenance_resource_hmac("diagnostic", diagnostic.id, version, document)
+        self._connection.execute(
+            "INSERT INTO maintenance_diagnostics("
+            "diagnostic_id, authority_hmac, document_json, resource_version, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                diagnostic.id,
+                authority,
+                document,
+                version,
+                diagnostic.created_at,
+                diagnostic.updated_at,
+            ),
+        )
+
+    def _update_maintenance_diagnostic(self, diagnostic: m.DiagnosticV1, *, version: int) -> None:
+        document = _model_bytes(diagnostic)
+        authority = self._maintenance_resource_hmac("diagnostic", diagnostic.id, version, document)
+        updated = self._connection.execute(
+            "UPDATE maintenance_diagnostics SET authority_hmac = ?, document_json = ?, "
+            "resource_version = ?, updated_at = ? WHERE diagnostic_id = ? "
+            "AND resource_version = ?",
+            (
+                authority,
+                document,
+                version,
+                diagnostic.updated_at,
+                diagnostic.id,
+                version - 1,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise StoreCorruptionError("diagnostic update lost its authority")
+
+    def _validate_maintenance_diagnostic_row(
+        self, row: sqlite3.Row | Mapping[str, Any]
+    ) -> m.DiagnosticV1:
+        diagnostic = _validate_bytes(m.DiagnosticV1, row["document_json"])
+        version = int(row["resource_version"])
+        document = bytes(row["document_json"])
+        data = diagnostic.model_dump(mode="python", exclude={"etag"})
+        if (
+            diagnostic.id != row["diagnostic_id"]
+            or diagnostic.created_at != row["created_at"]
+            or diagnostic.updated_at != row["updated_at"]
+            or diagnostic.etag != _etag(data, version=version)
+            or _model_bytes(diagnostic) != document
+            or not hmac.compare_digest(
+                row["authority_hmac"],
+                self._maintenance_resource_hmac("diagnostic", diagnostic.id, version, document),
+            )
+        ):
+            raise StoreCorruptionError("diagnostic row identity is invalid")
+        return diagnostic
+
+    def _transition_diagnostic(
+        self,
+        diagnostic_id: str,
+        *,
+        allowed: set[m.DiagnosticStatus],
+        status: m.DiagnosticStatus,
+        checks: list[m.DiagnosticCheckV1] | None = None,
+        error: m.ApiErrorV1 | None = None,
+    ) -> m.DiagnosticV1:
+        with self._mutex, self._transaction():
+            row = self._connection.execute(
+                "SELECT * FROM maintenance_diagnostics WHERE diagnostic_id = ?",
+                (diagnostic_id,),
+            ).fetchone()
+            if row is None:
+                raise ResourceNotFoundError("diagnostic", diagnostic_id)
+            current = self._validate_maintenance_diagnostic_row(row)
+            if current.status not in allowed:
+                raise ResourceConflictError(
+                    "diagnostic_state_changed",
+                    "The diagnostic state changed before completion.",
+                )
+            now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
+            version = int(row["resource_version"]) + 1
+            data = current.model_dump(mode="python", exclude={"etag"})
+            data.update(
+                status=status,
+                checks=current.checks if checks is None else checks,
+                error=error,
+                updated_at=now,
+                observed_at=now,
+                finished_at=(
+                    now
+                    if status in {m.DiagnosticStatus.SUCCEEDED, m.DiagnosticStatus.FAILED}
+                    else None
+                ),
+            )
+            updated = _model_with_etag(m.DiagnosticV1, data, version=version)
+            self._update_maintenance_diagnostic(updated, version=version)
+            self._append_diagnostic_event(updated, now=now)
+            return updated
+
+    def _append_operation_log(
+        self,
+        operation: m.OperationV1,
+        *,
+        level: m.LogLevel,
+        message: str,
+        now: str,
+    ) -> None:
+        count_row = self._connection.execute(
+            "SELECT COUNT(*) AS count, COALESCE(MAX(sequence), 0) AS maximum "
+            "FROM maintenance_logs WHERE logs_ref = ?",
+            (operation.logs_ref,),
+        ).fetchone()
+        count = int(count_row["count"])
+        if count >= _MAX_MAINTENANCE_LOGS_PER_REF:
+            raise IdempotencyCapacityError("maintenance log capacity is exhausted")
+        self._require_maintenance_row_capacity("maintenance_logs", _MAX_MAINTENANCE_LOGS)
+        sequence = int(count_row["maximum"]) + 1
+        content_sha256 = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        entry = m.LogEntryV1(
+            id=_core_owned_id(
+                self._signing_key,
+                "log",
+                {
+                    "logs_ref": operation.logs_ref,
+                    "sequence": sequence,
+                    "content_sha256": content_sha256,
+                },
+            ),
+            sequence=sequence,
+            occurred_at=now,
+            stream=m.LogStream.CORE,
+            level=level,
+            message=message,
+            service_id="core-control",
+            content_sha256=content_sha256,
+        )
+        document = _model_bytes(entry)
+        authority = self._maintenance_log_hmac(operation.logs_ref, sequence, document)
+        self._connection.execute(
+            "INSERT INTO maintenance_logs("
+            "logs_ref, sequence, log_id, authority_hmac, document_json, occurred_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                operation.logs_ref,
+                sequence,
+                entry.id,
+                authority,
+                document,
+                now,
+            ),
+        )
+        self._append_log_event(entry, now=now)
+
+    def _maintenance_log_page(
+        self,
+        logs_ref: str,
+        *,
+        limit: int,
+        after: str | None,
+        sort: Literal["sequence", "occurred_at"],
+        direction: Literal["asc", "desc"],
+    ) -> tuple[list[m.LogEntryV1], str | None, bool]:
+        binding = f"referenced-logs:{logs_ref}:{sort}:{direction}"
+        boundary = None if after is None else self._decode_cursor(after, binding)
+        sort_expression = "printf('%016d', sequence)" if sort == "sequence" else "occurred_at"
+        comparison = ">" if direction == "asc" else "<"
+        order = "ASC" if direction == "asc" else "DESC"
+        parameters: list[object] = [logs_ref]
+        boundary_clause = ""
+        if boundary is not None:
+            boundary_clause = (
+                f"AND ({sort_expression} {comparison} ? OR "
+                f"({sort_expression} = ? AND log_id {comparison} ?))"
+            )
+            parameters.extend((boundary[0], boundary[0], boundary[1]))
+        parameters.append(limit + 1)
+        cursor = self._connection.execute(
+            "SELECT * FROM maintenance_logs WHERE logs_ref = ? "
+            f"{boundary_clause} ORDER BY {sort_expression} {order}, "
+            f"log_id {order} LIMIT ?",
+            parameters,
+        )
+        rows = cursor.fetchmany(limit + 1)
+        if cursor.fetchone() is not None:
+            raise StoreCorruptionError("maintenance log page exceeded its bound")
+        values = [self._validate_maintenance_log_row(row) for row in rows]
+        has_more = len(values) > limit
+        values = values[:limit]
+        next_cursor = None
+        if has_more and values:
+            final = values[-1]
+            boundary_value = f"{final.sequence:016d}" if sort == "sequence" else final.occurred_at
+            next_cursor = self._encode_cursor(binding, (boundary_value, final.id))
+        return values, next_cursor, has_more
+
+    def _validate_maintenance_log_row(self, row: sqlite3.Row | Mapping[str, Any]) -> m.LogEntryV1:
+        entry = _validate_bytes(m.LogEntryV1, row["document_json"])
+        document = bytes(row["document_json"])
+        sequence = int(row["sequence"])
+        if (
+            entry.id != row["log_id"]
+            or entry.sequence != sequence
+            or entry.occurred_at != row["occurred_at"]
+            or _model_bytes(entry) != document
+            or not hmac.compare_digest(
+                row["authority_hmac"],
+                self._maintenance_log_hmac(row["logs_ref"], sequence, document),
+            )
+        ):
+            raise StoreCorruptionError("maintenance log row identity is invalid")
+        return entry
+
+    def _append_operation_event(self, operation: m.OperationV1, *, now: str) -> None:
+        parent_type = None
+        parent_id = None
+        if isinstance(operation.request, m.ServiceRestartOperationRequestV1):
+            parent_type = "service"
+            parent_id = operation.request.service_id
+        change = {
+            "change_id": _core_owned_id(
+                self._signing_key,
+                "change",
+                {
+                    "resource_type": "operation",
+                    "resource_id": operation.id,
+                    "resource_etag": operation.etag,
+                },
+            ),
+            "resource_type": "operation",
+            "resource_id": operation.id,
+            "resource_etag": operation.etag,
+        }
+        if parent_type is not None:
+            change.update(
+                parent_resource_type=parent_type,
+                parent_resource_id=parent_id,
+            )
+        self._append_maintenance_event(
+            "operation.updated.v1",
+            change=change,
+            payload=operation,
+            now=now,
+        )
+
+    def _append_diagnostic_event(self, diagnostic: m.DiagnosticV1, *, now: str) -> None:
+        change = {
+            "change_id": _core_owned_id(
+                self._signing_key,
+                "change",
+                {
+                    "resource_type": "diagnostic",
+                    "resource_id": diagnostic.id,
+                    "resource_etag": diagnostic.etag,
+                },
+            ),
+            "resource_type": "diagnostic",
+            "resource_id": diagnostic.id,
+            "resource_etag": diagnostic.etag,
+        }
+        if isinstance(diagnostic.target, m.ProjectDiagnosticTargetV1):
+            change.update(
+                parent_resource_type="project",
+                parent_resource_id=diagnostic.target.project_id,
+            )
+        elif isinstance(diagnostic.target, m.RunDiagnosticTargetV1):
+            change.update(
+                parent_resource_type="run",
+                parent_resource_id=diagnostic.target.run_id,
+            )
+        self._append_maintenance_event(
+            "diagnostic.updated.v1",
+            change=change,
+            payload=diagnostic,
+            now=now,
+        )
+
+    def _append_log_event(self, entry: m.LogEntryV1, *, now: str) -> None:
+        self._append_maintenance_event(
+            "log.appended.v1",
+            change={
+                "change_id": _core_owned_id(
+                    self._signing_key,
+                    "change",
+                    {
+                        "resource_type": "log_entry",
+                        "resource_id": entry.id,
+                        "content_sha256": entry.content_sha256,
+                    },
+                ),
+                "resource_type": "log_entry",
+                "resource_id": entry.id,
+                "content_sha256": entry.content_sha256,
+                "parent_resource_type": "service",
+                "parent_resource_id": entry.service_id,
+            },
+            payload=entry,
+            now=now,
+        )
+
+    def _append_maintenance_event(
+        self,
+        event: str,
+        *,
+        change: Mapping[str, object],
+        payload: BaseModel,
+        now: str,
+    ) -> None:
+        sequence = self._reserve_event_sequence()
+        event_id = self.event_cursor(sequence)
+        frame = m.SseFrameV1.model_validate_json(
+            _canonical_bytes(
+                {
+                    "id": event_id,
+                    "event": event,
+                    "data": {
+                        "schema_version": "1",
+                        "id": event_id,
+                        "sequence": sequence,
+                        "occurred_at": now,
+                        "event": event,
+                        "change": dict(change),
+                        "payload": payload.model_dump(mode="json"),
+                    },
+                }
+            )
+        )
+        self._finish_event(sequence, frame)
+
+    def _maintenance_idempotency_replay(
+        self,
+        route_operation_id: str,
+        resource_scope: str,
+        idempotency_key: str,
+        envelope: _IdempotencyRequestEnvelope,
+    ) -> StoredResult | None:
+        row = self._connection.execute(
+            "SELECT * FROM maintenance_idempotency_records "
+            "WHERE route_operation_id = ? AND resource_scope = ? "
+            "AND idempotency_key = ?",
+            (route_operation_id, resource_scope, idempotency_key),
+        ).fetchone()
+        if row is None:
+            return None
+        if not hmac.compare_digest(row["request_digest"], envelope.digest):
+            raise IdempotencyConflictError("idempotency key was reused")
+        result = self._validate_maintenance_idempotency_row(row)
+        return StoredResult(
+            result.status_code,
+            result.model,
+            result.etag,
+            replayed=True,
+        )
+
+    def _store_maintenance_idempotency(
+        self,
+        route_operation_id: str,
+        resource_scope: str,
+        idempotency_key: str,
+        envelope: _IdempotencyRequestEnvelope,
+        result: StoredResult,
+    ) -> None:
+        now = int(time.time())
+        expired = self._connection.execute(
+            "SELECT route_operation_id, resource_scope, idempotency_key "
+            "FROM maintenance_idempotency_records WHERE expires_at_epoch <= ? "
+            "ORDER BY expires_at_epoch LIMIT 128",
+            (now,),
+        ).fetchmany(128)
+        for row in expired:
+            self._connection.execute(
+                "DELETE FROM maintenance_idempotency_records "
+                "WHERE route_operation_id = ? AND resource_scope = ? "
+                "AND idempotency_key = ?",
+                (
+                    row["route_operation_id"],
+                    row["resource_scope"],
+                    row["idempotency_key"],
+                ),
+            )
+        self._require_maintenance_row_capacity(
+            "maintenance_idempotency_records", _MAX_MAINTENANCE_IDEMPOTENCY
+        )
+        response_type = "NoContent"
+        response_json = None
+        etag = result.etag
+        if result.model is not None:
+            response_type = type(result.model).__name__
+            if response_type not in _MAINTENANCE_RESPONSE_MODELS:
+                raise ValueError("maintenance idempotency response type is unsupported")
+            response_json = _model_bytes(result.model)
+        values = {
+            "route_operation_id": route_operation_id,
+            "resource_scope": resource_scope,
+            "idempotency_key": idempotency_key,
+            "request_digest": envelope.digest,
+            "request_json": envelope.request_json,
+            "semantic_headers_json": envelope.semantic_headers_json,
+            "status_code": result.status_code,
+            "response_type": response_type,
+            "response_json": response_json,
+            "etag": etag,
+            "created_at_epoch": now,
+            "expires_at_epoch": now + _IDEMPOTENCY_RETENTION_SECONDS,
+        }
+        authority = self._maintenance_idempotency_hmac(values)
+        self._connection.execute(
+            "INSERT INTO maintenance_idempotency_records("
+            "route_operation_id, resource_scope, idempotency_key, request_digest, "
+            "request_json, semantic_headers_json, status_code, response_type, "
+            "response_json, etag, authority_hmac, created_at_epoch, expires_at_epoch"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                route_operation_id,
+                resource_scope,
+                idempotency_key,
+                envelope.digest,
+                envelope.request_json,
+                envelope.semantic_headers_json,
+                result.status_code,
+                response_type,
+                response_json,
+                etag,
+                authority,
+                now,
+                now + _IDEMPOTENCY_RETENTION_SECONDS,
+            ),
+        )
+
+    def _validate_maintenance_idempotency_row(
+        self, row: sqlite3.Row | Mapping[str, Any]
+    ) -> StoredResult:
+        route = row["route_operation_id"]
+        request_model = _MAINTENANCE_REQUEST_MODELS.get(route)
+        if route not in _MAINTENANCE_REQUEST_MODELS:
+            raise StoreCorruptionError("maintenance idempotency route is invalid")
+        try:
+            request_value = json.loads(bytes(row["request_json"]))
+            header_value = json.loads(bytes(row["semantic_headers_json"]))
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise StoreCorruptionError("maintenance idempotency request is invalid") from exc
+        if (
+            _canonical_bytes(request_value) != bytes(row["request_json"])
+            or _canonical_bytes(header_value) != bytes(row["semantic_headers_json"])
+            or type(header_value) is not dict
+        ):
+            raise StoreCorruptionError("maintenance idempotency request is not canonical")
+        if request_model is None:
+            if request_value is not None:
+                raise StoreCorruptionError("maintenance idempotency request is invalid")
+        else:
+            try:
+                request = request_model.model_validate(request_value)
+            except ValidationError as exc:
+                raise StoreCorruptionError("maintenance idempotency request is invalid") from exc
+            if _canonical_bytes(request.model_dump(mode="json", exclude_unset=True)) != bytes(
+                row["request_json"]
+            ):
+                raise StoreCorruptionError("maintenance idempotency request is not canonical")
+        expected_headers = (
+            {"if-match"}
+            if route
+            in {
+                "restartCoreServiceV1",
+                "cancelCoreOperationV1",
+                "deleteCoreDiagnosticV1",
+            }
+            else set()
+        )
+        if set(header_value) != expected_headers or any(
+            type(value) is not str or not _is_etag(value) for value in header_value.values()
+        ):
+            raise StoreCorruptionError("maintenance idempotency semantic headers are invalid")
+        values = {
+            name: row[name]
+            for name in (
+                "route_operation_id",
+                "resource_scope",
+                "idempotency_key",
+                "request_digest",
+                "request_json",
+                "semantic_headers_json",
+                "status_code",
+                "response_type",
+                "response_json",
+                "etag",
+                "created_at_epoch",
+                "expires_at_epoch",
+            )
+        }
+        if not hmac.compare_digest(
+            row["authority_hmac"], self._maintenance_idempotency_hmac(values)
+        ):
+            raise StoreCorruptionError("maintenance idempotency authority is invalid")
+        expected_digest = _idempotency_request_digest(
+            route,
+            row["resource_scope"],
+            bytes(row["request_json"]),
+            bytes(row["semantic_headers_json"]),
+        )
+        if not hmac.compare_digest(row["request_digest"], expected_digest):
+            raise StoreCorruptionError("maintenance idempotency digest is invalid")
+        response_type = row["response_type"]
+        if response_type == "NoContent":
+            if row["response_json"] is not None or row["etag"] is not None:
+                raise StoreCorruptionError(
+                    "maintenance no-content idempotency response is invalid"
+                )
+            return StoredResult(int(row["status_code"]), None)
+        response_model = _MAINTENANCE_RESPONSE_MODELS.get(response_type)
+        if response_model is None or row["response_json"] is None:
+            raise StoreCorruptionError("maintenance idempotency response is invalid")
+        model = _validate_bytes(response_model, row["response_json"])
+        if _model_bytes(model) != bytes(row["response_json"]):
+            raise StoreCorruptionError("maintenance idempotency response is not canonical")
+        expected_etag = getattr(model, "etag", None)
+        if row["etag"] != expected_etag:
+            raise StoreCorruptionError("maintenance idempotency ETag is invalid")
+        return StoredResult(int(row["status_code"]), model, expected_etag)
+
+    def _maintenance_resource_hmac(
+        self, kind: str, resource_id: str, version: int, document: bytes
+    ) -> str:
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes(
+                {
+                    "domain": "maintenance-resource.v1",
+                    "kind": kind,
+                    "resource_id": resource_id,
+                    "resource_version": version,
+                    "document_sha256": hashlib.sha256(document).hexdigest(),
+                }
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _maintenance_log_hmac(self, logs_ref: str, sequence: int, document: bytes) -> str:
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes(
+                {
+                    "domain": "maintenance-log.v1",
+                    "logs_ref": logs_ref,
+                    "sequence": sequence,
+                    "document_sha256": hashlib.sha256(document).hexdigest(),
+                }
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _maintenance_idempotency_hmac(self, values: Mapping[str, object]) -> str:
+        canonical = {
+            key: (
+                None
+                if value is None
+                else (
+                    hashlib.sha256(bytes(value)).hexdigest()
+                    if isinstance(value, (bytes, bytearray))
+                    else value
+                )
+            )
+            for key, value in values.items()
+        }
+        return hmac.new(
+            self._signing_key,
+            _canonical_bytes(
+                {
+                    "domain": "maintenance-idempotency.v1",
+                    "values": canonical,
+                }
+            ),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _require_maintenance_row_capacity(self, table: str, limit: int) -> None:
+        count = self._connection.execute(f"SELECT COUNT(*) AS count FROM {table}").fetchone()
+        if count is None or int(count["count"]) >= limit:
+            raise IdempotencyCapacityError("maintenance storage capacity is exhausted")
+
+    def _recover_interrupted_maintenance(
+        self,
+        operations: list[tuple[m.OperationV1, int]],
+        diagnostics: list[tuple[m.DiagnosticV1, int]],
+    ) -> None:
+        for current, current_version in operations:
+            now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
+            version = current_version + 1
+            data = current.model_dump(mode="python", exclude={"etag"})
+            if current.status is m.OperationStatus.CANCELLING:
+                data.update(
+                    status=m.OperationStatus.CANCELLED,
+                    updated_at=now,
+                    observed_at=now,
+                    finished_at=now,
+                )
+                level = m.LogLevel.WARNING
+                message = "Core recovered the interrupted maintenance cancellation as cancelled."
+            else:
+                data.update(
+                    status=m.OperationStatus.FAILED,
+                    result=None,
+                    cancellation=None,
+                    updated_at=now,
+                    observed_at=now,
+                    finished_at=now,
+                    error=_maintenance_recovery_error(
+                        current.id,
+                        code="maintenance_operation_interrupted",
+                        message=(
+                            "Core restarted before the maintenance operation "
+                            "published a terminal result."
+                        ),
+                    ),
+                )
+                level = m.LogLevel.ERROR
+                message = "Core recovered the interrupted maintenance operation as failed."
+            recovered = _model_with_etag(m.OperationV1, data, version=version)
+            self._update_maintenance_operation(recovered, version=version)
+            self._append_operation_log(
+                recovered,
+                level=level,
+                message=message,
+                now=now,
+            )
+            self._append_operation_event(recovered, now=now)
+        for current, current_version in diagnostics:
+            now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
+            version = current_version + 1
+            data = current.model_dump(mode="python", exclude={"etag"})
+            data.update(
+                status=m.DiagnosticStatus.FAILED,
+                updated_at=now,
+                observed_at=now,
+                finished_at=now,
+                error=_maintenance_recovery_error(
+                    current.id,
+                    code="diagnostic_interrupted",
+                    message=("Core restarted before the diagnostic published a terminal result."),
+                ),
+            )
+            recovered = _model_with_etag(m.DiagnosticV1, data, version=version)
+            self._update_maintenance_diagnostic(recovered, version=version)
+            self._append_diagnostic_event(recovered, now=now)
 
     def _new_project(
         self,
@@ -3232,7 +4735,7 @@ class CoreControlStoreV1:
         return payload["boundary"][0], payload["boundary"][1]
 
     def _recovery_table_specs(self) -> tuple[_RecoveryTableSpec, ...]:
-        return (
+        core_specs = (
             _RecoveryTableSpec("metadata", ("key", "value"), 1),
             _RecoveryTableSpec(
                 "workspace_publication_owners",
@@ -3353,6 +4856,62 @@ class CoreControlStoreV1:
                 _MAX_CLEANUP_INTENTS,
             ),
         )
+        maintenance_specs = (
+            _RecoveryTableSpec(
+                "maintenance_operations",
+                (
+                    "operation_id",
+                    "kind",
+                    "logs_ref",
+                    "authority_hmac",
+                    "document_json",
+                    "created_at",
+                    "updated_at",
+                ),
+                _MAX_MAINTENANCE_OPERATIONS,
+            ),
+            _RecoveryTableSpec(
+                "maintenance_diagnostics",
+                (
+                    "diagnostic_id",
+                    "authority_hmac",
+                    "document_json",
+                    "created_at",
+                    "updated_at",
+                ),
+                _MAX_MAINTENANCE_DIAGNOSTICS,
+            ),
+            _RecoveryTableSpec(
+                "maintenance_logs",
+                (
+                    "logs_ref",
+                    "log_id",
+                    "authority_hmac",
+                    "document_json",
+                    "occurred_at",
+                ),
+                _MAX_MAINTENANCE_LOGS,
+            ),
+            _RecoveryTableSpec(
+                "maintenance_idempotency_records",
+                (
+                    "route_operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "request_json",
+                    "semantic_headers_json",
+                    "response_type",
+                    "response_json",
+                    "etag",
+                    "authority_hmac",
+                ),
+                _MAX_MAINTENANCE_IDEMPOTENCY,
+            ),
+        )
+        return (
+            (*core_specs, *maintenance_specs) if self._maintenance_storage_enabled else core_specs
+        )
 
     def _migration_recovery_table_specs(
         self,
@@ -3362,6 +4921,13 @@ class CoreControlStoreV1:
     ) -> tuple[_RecoveryTableSpec, ...]:
         specs: list[_RecoveryTableSpec] = []
         for spec in self._recovery_table_specs():
+            if spec.table in {
+                "maintenance_operations",
+                "maintenance_diagnostics",
+                "maintenance_logs",
+                "maintenance_idempotency_records",
+            }:
+                continue
             if spec.table == "revision_artifact_authorities":
                 continue
             if spec.table == "revision_activation_bindings" and not include_activation_bindings:
@@ -3443,8 +5009,7 @@ class CoreControlStoreV1:
         seen_bytes = 0
         while True:
             length_columns = [
-                f"length(CAST({column} AS BLOB)) AS {column}_byte_length"
-                for column in bounded
+                f"length(CAST({column} AS BLOB)) AS {column}_byte_length" for column in bounded
             ]
             metadata = self._connection.execute(
                 f"SELECT rowid AS _migration_rowid"
@@ -3492,9 +5057,7 @@ class CoreControlStoreV1:
                     or (expected_length is not None and row[column] is None)
                     for column, expected_length in expected_lengths.items()
                 ):
-                    raise StoreCorruptionError(
-                        f"Core Control {spec.table} migration scan changed"
-                    )
+                    raise StoreCorruptionError(f"Core Control {spec.table} migration scan changed")
                 yield row
         if seen != expected.rows or seen_bytes != expected.blob_bytes:
             raise StoreCorruptionError(f"Core Control {spec.table} migration scan changed")
@@ -3505,6 +5068,8 @@ class CoreControlStoreV1:
         *,
         columns: tuple[str, ...],
     ):
+        if not self._maintenance_storage_enabled and table in _MAINTENANCE_RECOVERY_TABLES:
+            return
         specs = {spec.table: spec for spec in self._recovery_table_specs()}
         spec = specs.get(table)
         expected = self._startup_budget_snapshot.tables.get(table)
@@ -3900,6 +5465,101 @@ class CoreControlStoreV1:
                 previous_event_sequence = cursor_sequence
                 recovered_events.append(frame)
             self._validate_revision_event_closure(recovered_events, revisions_by_id)
+            operations_by_logs_ref: dict[str, m.OperationV1] = {}
+            interrupted_operations: list[tuple[m.OperationV1, int]] = []
+            for row in self._recovery_rows(
+                "maintenance_operations",
+                columns=(
+                    "operation_id",
+                    "kind",
+                    "logs_ref",
+                    "authority_hmac",
+                    "document_json",
+                    "resource_version",
+                    "created_at",
+                    "updated_at",
+                ),
+            ):
+                operation = self._validate_maintenance_operation_row(row)
+                if operation.logs_ref in operations_by_logs_ref:
+                    raise StoreCorruptionError("maintenance operation log authority is ambiguous")
+                operations_by_logs_ref[operation.logs_ref] = operation
+                if operation.status in {
+                    m.OperationStatus.QUEUED,
+                    m.OperationStatus.RUNNING,
+                    m.OperationStatus.CANCELLING,
+                }:
+                    interrupted_operations.append((operation, int(row["resource_version"])))
+            interrupted_diagnostics: list[tuple[m.DiagnosticV1, int]] = []
+            for row in self._recovery_rows(
+                "maintenance_diagnostics",
+                columns=(
+                    "diagnostic_id",
+                    "authority_hmac",
+                    "document_json",
+                    "resource_version",
+                    "created_at",
+                    "updated_at",
+                ),
+            ):
+                diagnostic = self._validate_maintenance_diagnostic_row(row)
+                if (
+                    isinstance(
+                        diagnostic.target,
+                        (m.ProjectDiagnosticTargetV1, m.RunDiagnosticTargetV1),
+                    )
+                    and diagnostic.target.project_id not in projects_by_id
+                ):
+                    raise StoreCorruptionError("diagnostic project authority is unavailable")
+                if diagnostic.status in {
+                    m.DiagnosticStatus.QUEUED,
+                    m.DiagnosticStatus.RUNNING,
+                }:
+                    interrupted_diagnostics.append((diagnostic, int(row["resource_version"])))
+            last_log_sequence: dict[str, int] = {}
+            for row in self._recovery_rows(
+                "maintenance_logs",
+                columns=(
+                    "logs_ref",
+                    "sequence",
+                    "log_id",
+                    "authority_hmac",
+                    "document_json",
+                    "occurred_at",
+                ),
+            ):
+                if row["logs_ref"] not in operations_by_logs_ref:
+                    raise StoreCorruptionError("maintenance log has no operation authority")
+                entry = self._validate_maintenance_log_row(row)
+                if entry.service_id != "core-control":
+                    raise StoreCorruptionError("maintenance log service identity is invalid")
+                expected_sequence = last_log_sequence.get(row["logs_ref"], 0) + 1
+                if entry.sequence != expected_sequence:
+                    raise StoreCorruptionError("maintenance log sequence is not contiguous")
+                last_log_sequence[row["logs_ref"]] = entry.sequence
+            for row in self._recovery_rows(
+                "maintenance_idempotency_records",
+                columns=(
+                    "route_operation_id",
+                    "resource_scope",
+                    "idempotency_key",
+                    "request_digest",
+                    "request_json",
+                    "semantic_headers_json",
+                    "status_code",
+                    "response_type",
+                    "response_json",
+                    "etag",
+                    "authority_hmac",
+                    "created_at_epoch",
+                    "expires_at_epoch",
+                ),
+            ):
+                self._validate_maintenance_idempotency_row(row)
+            self._recover_interrupted_maintenance(
+                interrupted_operations,
+                interrupted_diagnostics,
+            )
             valid_successes: set[tuple[str, str, str]] = set()
             idempotency_publications: set[str] = set()
             for row in self._recovery_rows(
@@ -4521,11 +6181,21 @@ class CoreControlStoreV1:
         empty_fingerprint = _expected_schema_fingerprint(())
         legacy_fingerprint = _expected_schema_fingerprint(_LEGACY_SCHEMA)
         previous_fingerprint = _expected_schema_fingerprint(_PREVIOUS_SCHEMA)
+        previous_with_maintenance_fingerprint = _expected_schema_fingerprint(
+            _PREVIOUS_SCHEMA_WITH_MAINTENANCE
+        )
         revision_ledger_v1_fingerprint = _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA)
+        revision_ledger_v1_with_maintenance_fingerprint = _expected_schema_fingerprint(
+            _REVISION_LEDGER_V1_SCHEMA_WITH_MAINTENANCE
+        )
         artifact_inspection_v1_fingerprint = _expected_schema_fingerprint(
             _ARTIFACT_INSPECTION_V1_SCHEMA
         )
-        current_fingerprint = _expected_schema_fingerprint(_SCHEMA)
+        artifact_inspection_v1_with_maintenance_fingerprint = _expected_schema_fingerprint(
+            _ARTIFACT_INSPECTION_V1_SCHEMA_WITH_MAINTENANCE
+        )
+        pre_maintenance_fingerprint = _expected_schema_fingerprint(_PRE_MAINTENANCE_SCHEMA)
+        test_current_fingerprint = _expected_schema_fingerprint(_TEST_SCHEMA_WITH_MAINTENANCE)
         if fingerprint == empty_fingerprint:
             if hasattr(self, "_marker_fd"):
                 raise StoreCorruptionError(
@@ -4546,7 +6216,10 @@ class CoreControlStoreV1:
             self._require_unbound_managed_roots_empty()
             _after_unbound_managed_inventory("initial")
             self._create_pending_store_identity(include_base_schema=False)
-        elif fingerprint == previous_fingerprint:
+        elif fingerprint == previous_fingerprint or (
+            self._maintenance_storage_enabled
+            and fingerprint == previous_with_maintenance_fingerprint
+        ):
             row = self._read_store_identity_row()
             self._require_store_identity_root(row)
             self._store_id = row["store_id"]
@@ -4556,7 +6229,13 @@ class CoreControlStoreV1:
                 self._connection.execute(_PROJECT_REVISIONS_SCHEMA)
                 self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
                 self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
-        elif fingerprint == revision_ledger_v1_fingerprint:
+                if self._maintenance_storage_enabled:
+                    for statement in _MAINTENANCE_TABLE_SCHEMA:
+                        self._connection.execute(statement)
+        elif fingerprint == revision_ledger_v1_fingerprint or (
+            self._maintenance_storage_enabled
+            and fingerprint == revision_ledger_v1_with_maintenance_fingerprint
+        ):
             row = self._read_store_identity_row()
             self._require_store_identity_root(row)
             self._store_id = row["store_id"]
@@ -4564,7 +6243,10 @@ class CoreControlStoreV1:
                 self._verify_bound_store_identity(row)
             self._signing_key = self._load_or_create_signing_key()
             self._migrate_revision_ledger_v1_schema()
-        elif fingerprint == artifact_inspection_v1_fingerprint:
+        elif fingerprint == artifact_inspection_v1_fingerprint or (
+            self._maintenance_storage_enabled
+            and fingerprint == artifact_inspection_v1_with_maintenance_fingerprint
+        ):
             row = self._read_store_identity_row()
             self._require_store_identity_root(row)
             self._store_id = row["store_id"]
@@ -4572,7 +6254,18 @@ class CoreControlStoreV1:
                 self._verify_bound_store_identity(row)
             self._signing_key = self._load_or_create_signing_key()
             self._migrate_revision_artifact_authority_schema()
-        elif fingerprint != current_fingerprint:
+        elif fingerprint == pre_maintenance_fingerprint:
+            row = self._read_store_identity_row()
+            self._require_store_identity_root(row)
+            self._store_id = row["store_id"]
+            if row["binding_state"] == "bound":
+                self._verify_bound_store_identity(row)
+            if self._maintenance_storage_enabled:
+                with self._transaction():
+                    for statement in _MAINTENANCE_TABLE_SCHEMA:
+                        self._connection.execute(statement)
+                    self._verify_schema_fingerprint()
+        elif not (self._maintenance_storage_enabled and fingerprint == test_current_fingerprint):
             raise StoreCorruptionError(
                 "Core Control schema fingerprint is incompatible with an allowed migration"
             )
@@ -4630,6 +6323,9 @@ class CoreControlStoreV1:
             self._connection.execute("DROP TABLE project_revisions_v1")
             self._connection.execute(_REVISION_ACTIVATION_BINDINGS_SCHEMA)
             self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
+            if self._maintenance_storage_enabled:
+                for statement in _MAINTENANCE_TABLE_SCHEMA:
+                    self._connection.execute(statement)
             self._backfill_revision_artifact_authorities(
                 migration_budget,
                 activation_bindings_existed=False,
@@ -4646,6 +6342,9 @@ class CoreControlStoreV1:
                 )
             )
             self._connection.execute(_REVISION_ARTIFACT_AUTHORITIES_SCHEMA)
+            if self._maintenance_storage_enabled:
+                for statement in _MAINTENANCE_TABLE_SCHEMA:
+                    self._connection.execute(statement)
             self._backfill_revision_artifact_authorities(
                 migration_budget,
                 activation_bindings_existed=True,
@@ -4743,9 +6442,7 @@ class CoreControlStoreV1:
             publication_owners[owner_row["snapshot_id"]] = owner
 
         validated_records: dict[tuple[str, str, str], tuple[sqlite3.Row, BaseModel | None]] = {}
-        candidates_by_revision: dict[
-            str, list[tuple[sqlite3.Row, BaseModel | None]]
-        ] = {}
+        candidates_by_revision: dict[str, list[tuple[sqlite3.Row, BaseModel | None]]] = {}
         for key, record_row in idempotency_rows.items():
             model = _validate_idempotency_row(
                 record_row,
@@ -4863,15 +6560,11 @@ class CoreControlStoreV1:
                     "revision artifact authority migration response closure is invalid"
                 )
             stored_activation_digest = self._connection.execute(
-                "SELECT activation_request_digest FROM project_revisions "
-                "WHERE revision_id = ?",
+                "SELECT activation_request_digest FROM project_revisions WHERE revision_id = ?",
                 (revision.revision.id,),
             ).fetchone()
-            if (
-                stored_activation_digest is None
-                or not hmac.compare_digest(
-                    stored_activation_digest[0], record_row["request_digest"]
-                )
+            if stored_activation_digest is None or not hmac.compare_digest(
+                stored_activation_digest[0], record_row["request_digest"]
             ):
                 raise StoreCorruptionError(
                     "revision artifact authority migration request binding is invalid"
@@ -4928,14 +6621,18 @@ class CoreControlStoreV1:
     def _create_pending_store_identity(self, *, include_base_schema: bool) -> None:
         store_id = secrets.token_hex(_STORE_ID_BYTES)
         with self._transaction():
+            active_schema = (
+                _TEST_SCHEMA_WITH_MAINTENANCE if self._maintenance_storage_enabled else _SCHEMA
+            )
             statements = (
-                _SCHEMA
+                active_schema
                 if include_base_schema
                 else (
                     _STORE_IDENTITY_SCHEMA,
                     _PROJECT_REVISIONS_SCHEMA,
                     _REVISION_ACTIVATION_BINDINGS_SCHEMA,
                     _REVISION_ARTIFACT_AUTHORITIES_SCHEMA,
+                    *(_MAINTENANCE_TABLE_SCHEMA if self._maintenance_storage_enabled else ()),
                 )
             )
             for statement in statements:
@@ -5285,7 +6982,10 @@ class CoreControlStoreV1:
         )
 
     def _verify_schema_fingerprint(self) -> None:
-        if _schema_fingerprint(self._connection) != _expected_schema_fingerprint():
+        expected_schema = (
+            _TEST_SCHEMA_WITH_MAINTENANCE if self._maintenance_storage_enabled else _SCHEMA
+        )
+        if _schema_fingerprint(self._connection) != _expected_schema_fingerprint(expected_schema):
             raise StoreCorruptionError(
                 "Core Control schema fingerprint is incompatible with an allowed migration"
             )
@@ -5404,13 +7104,30 @@ class CoreControlStoreV1:
                 schema_row = connection.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
                 _after_sqlite_recovery()
                 self._reconcile_rollback_journal_authority()
-                if schema_row is not None and _schema_fingerprint(connection) not in {
+                allowed_fingerprints = {
                     _expected_schema_fingerprint(_LEGACY_SCHEMA),
                     _expected_schema_fingerprint(_PREVIOUS_SCHEMA),
                     _expected_schema_fingerprint(_REVISION_LEDGER_V1_SCHEMA),
                     _expected_schema_fingerprint(_ARTIFACT_INSPECTION_V1_SCHEMA),
-                    _expected_schema_fingerprint(_SCHEMA),
-                }:
+                    _expected_schema_fingerprint(_PRE_MAINTENANCE_SCHEMA),
+                }
+                if self._maintenance_storage_enabled:
+                    allowed_fingerprints.update(
+                        {
+                            _expected_schema_fingerprint(_PREVIOUS_SCHEMA_WITH_MAINTENANCE),
+                            _expected_schema_fingerprint(
+                                _REVISION_LEDGER_V1_SCHEMA_WITH_MAINTENANCE
+                            ),
+                            _expected_schema_fingerprint(
+                                _ARTIFACT_INSPECTION_V1_SCHEMA_WITH_MAINTENANCE
+                            ),
+                            _expected_schema_fingerprint(_TEST_SCHEMA_WITH_MAINTENANCE),
+                        }
+                    )
+                if (
+                    schema_row is not None
+                    and _schema_fingerprint(connection) not in allowed_fingerprints
+                ):
                     raise StoreCorruptionError(
                         "Core Control schema fingerprint is incompatible; "
                         "no allowed migration matches"
@@ -5561,6 +7278,33 @@ class _Transaction:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{secrets.token_hex(16)}"
+
+
+def _diagnostic_idempotency_scope(target: m.DiagnosticTargetV1) -> str:
+    if isinstance(target, m.GlobalDiagnosticTargetV1):
+        return "diagnostics:global"
+    if isinstance(target, m.ProjectDiagnosticTargetV1):
+        return f"diagnostics:project:{target.project_id}"
+    return f"diagnostics:run:{target.project_id}:{target.run_id}"
+
+
+def _maintenance_recovery_error(
+    resource_id: str,
+    *,
+    code: str,
+    message: str,
+) -> m.ApiErrorV1:
+    return m.ApiErrorV1(
+        request_id=f"{resource_id}-recovery",
+        code=code,
+        http_status=503,
+        message=message,
+        severity=m.ErrorSeverity.BLOCKING,
+        category=m.ErrorCategory.SERVICE,
+        retryable=True,
+        repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry the maintenance action after Core is ready.",
+    )
 
 
 def _schema_fingerprint(connection: sqlite3.Connection) -> bytes:

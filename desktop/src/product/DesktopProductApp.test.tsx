@@ -4,7 +4,12 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DesktopApiError } from "../api/v1/client";
-import { apiErrorV1Schema, type ProjectSourceV1, type RunV1 } from "../api/v1/schemas";
+import {
+  apiErrorV1Schema,
+  type LocalOperationV1,
+  type ProjectSourceV1,
+  type RunV1,
+} from "../api/v1/schemas";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
 import {
@@ -37,7 +42,7 @@ describe("DesktopProductApp", () => {
     document.body.innerHTML = "";
   });
 
-  it("reports the initial product snapshot lifecycle without error details", async () => {
+  it("keeps the renderer-owned sample visible and real mutations closed after initial sync failure", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     provider.failNextRefresh();
     const onInitialSnapshotFailed = vi.fn();
@@ -61,8 +66,64 @@ describe("DesktopProductApp", () => {
 
     expect(onInitialSnapshotFailed).toHaveBeenCalledTimes(1);
     expect(onReady).not.toHaveBeenCalled();
-    expect(screenText()).toContain("OpenEvo Desktop is unavailable");
+    expect(screenText()).toContain("Remote projects could not be synchronized");
+    expect(screenText()).toContain("酶动力学模型复核");
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
+    expect(document.querySelector<HTMLSelectElement>("#project-switcher")?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
+    expect(document.querySelector(".initial-sync-sample")).not.toBeNull();
+    expect(document.querySelector(".initial-sync-sample[inert]")).toBeNull();
+    await clickButton("Task 1");
+    expect(screenText()).toContain("线性化拟合对高浓度点产生系统性偏差");
+    await clickButton("Evolution");
+    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
+    await clickButton("轨迹到技能");
+    await clickButton("可读产物");
+    expect(screenText()).toContain("SKILL.md");
+    expect(screenText()).not.toContain("Add workspace");
     expect(screenText()).not.toContain("internal refresh details");
+
+    await clickButton("Try again");
+    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).toBeNull();
+    expect(screenText()).toContain("Protein Design");
+    expect(screenText()).toContain("Cross-session changes");
+    expect(onReady).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps sample and real project identities isolated while switching between them", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderProduct(provider);
+
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Project switcher was not found.");
+    const sampleOption = Array.from(switcher.options).find(
+      (option) => option.textContent?.includes("[只读] 酶动力学模型复核"),
+    );
+    const realOption = Array.from(switcher.options).find(
+      (option) => option.dataset.projectId === "project-fixture-1",
+    );
+    if (!sampleOption || !realOption) {
+      throw new Error("Sample and real project options must both be discoverable.");
+    }
+    expect(sampleOption.value).not.toBe(realOption.value);
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).toBeNull();
+
+    await act(async () => {
+      switcher.value = sampleOption.value;
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
+    expect(switcher.value).toBe(sampleOption.value);
+    expect(Array.from(switcher.options).some((option) => option.value === realOption.value)).toBe(true);
+
+    await act(async () => {
+      switcher.value = realOption.value;
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).toBeNull();
+    expect(screenText()).toContain("Protein Design");
+    expect(switcher.value).toBe(realOption.value);
   });
 
   it("reports readiness once after the initial product snapshot commits", async () => {
@@ -100,6 +161,8 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Cross-session changes");
     await clickButton("System");
     expect(screenText()).toContain("Remote environment");
+    expect(screenText()).toContain("Current Project Head");
+    expect(screenText()).not.toContain("Current revision");
     await clickButton("Research");
     expect(screenText()).toContain("Session history");
   });
@@ -1980,10 +2043,15 @@ describe("DesktopProductApp", () => {
     expect(document.activeElement).toBe(folder);
   });
 
-  it("keeps services read-only and does not render unavailable diagnostics or restart controls", async () => {
+  it("exposes typed diagnostics and confirmed recovery actions for degraded services", async () => {
+    vi.useFakeTimers();
     provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
     const refresh = vi.spyOn(provider, "refresh");
-    const reconnect = vi.spyOn(provider, "connectProfile");
+    const doctor = vi.spyOn(provider, "doctorProject");
+    const diagnostics = vi.spyOn(provider, "createDiagnostic");
+    const restart = vi.spyOn(provider, "restartService");
+    const repair = vi.spyOn(provider, "repairProject");
+    const cleanup = vi.spyOn(provider, "cleanupCaches");
     root = await renderProduct(provider);
 
     expect(screenText()).toContain("Remote services need attention");
@@ -1992,16 +2060,492 @@ describe("DesktopProductApp", () => {
     await clickButton("Open System");
     await clickButton("System");
     expect(button("Reconnect").disabled).toBe(false);
-    expect(optionalButton("Run diagnostics")).toBeNull();
-    expect(document.querySelector('button[aria-label="Run diagnostics"]')).toBeNull();
-    expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
+    expect(button("Diagnostics").disabled).toBe(false);
+    expect(document.querySelector('button[aria-label^="Restart "]')).not.toBeNull();
     expect(screenText()).toContain("Needs attention");
+
+    await clickButton("Check");
+    expect(doctor).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Check remote environment");
+    expect(screenText()).toContain("Complete");
+
+    await clickButton("Diagnostics");
+    expect(diagnostics).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Remote diagnostics");
+    expect(screenText()).toContain("Environment");
+
+    await clickAria("Restart OpenEvo runtime");
+    expect(screenText()).toContain("Restart OpenEvo runtime?");
+    expect(restart).not.toHaveBeenCalled();
+    await clickButton("Confirm");
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Restart OpenEvo runtime");
+    expect(button("Repair").disabled).toBe(true);
+    await advance(750);
+
+    await clickButton("Repair");
+    expect(screenText()).toContain("Repair the remote environment?");
+    await clickButton("Confirm");
+    expect(repair).toHaveBeenCalledTimes(1);
+
+    await clickButton("Clean diagnostic history");
+    expect(screenText()).toContain("Clean diagnostic history?");
+    expect(cleanup).not.toHaveBeenCalled();
+    await clickButton("Confirm");
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(cleanup).toHaveBeenCalledWith(
+      {
+        schema_version: "1",
+        scopes: ["completed_diagnostics"],
+        older_than_days: 30,
+      },
+      expect.objectContaining({ actionId: expect.any(String) }),
+    );
+    await advance(750);
+
     const refreshesBeforeAction = refresh.mock.calls.length;
     await clickButton("Refresh status");
     expect(refresh.mock.calls.length).toBeGreaterThan(refreshesBeforeAction);
-    await clickButton("Reconnect");
-    expect(reconnect).toHaveBeenCalledTimes(1);
   });
+
+  it("keeps the release System view read-only when maintenance authority is unavailable", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    Object.defineProperty(provider, "systemMaintenanceAvailable", {
+      configurable: true,
+      value: false,
+    });
+    root = await renderProduct(provider);
+
+    await clickButton("System");
+
+    expect(screenText()).toContain("Remote services need attention");
+    expect(screenText()).toContain("Automated maintenance is unavailable in this Preview.");
+    expect(optionalButton("Check")).toBeNull();
+    expect(optionalButton("Diagnostics")).toBeNull();
+    expect(optionalButton("Repair")).toBeNull();
+    expect(optionalButton("Clean diagnostic history")).toBeNull();
+    expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
+    expect(screenText()).toContain("OpenEvo runtime");
+    expect(button("Refresh status").disabled).toBe(false);
+  });
+
+  it("polls a local maintenance operation from queued through running to succeeded", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    const originalDoctor = provider.doctorProject.bind(provider);
+    let completed: Awaited<ReturnType<typeof provider.doctorProject>> | null = null;
+    let lookupCount = 0;
+    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
+      completed = await originalDoctor(...arguments_);
+      return {
+        ...completed,
+        state: "queued",
+        checks: [],
+        result: null,
+        started_at: null,
+        finished_at: null,
+      };
+    });
+    const lookup = vi.spyOn(provider, "getLocalOperation").mockImplementation(async () => {
+      if (!completed) throw new Error("The completed maintenance result is unavailable.");
+      lookupCount += 1;
+      return lookupCount === 1
+        ? {
+            ...completed,
+            state: "running",
+            checks: [],
+            result: null,
+            finished_at: null,
+          }
+        : completed;
+    });
+    root = await renderProduct(provider);
+
+    await clickButton("System");
+    await clickButton("Check");
+    expect(screenText()).toContain("Queued");
+    expect(lookup).not.toHaveBeenCalled();
+
+    await advance(755);
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(screenText()).toContain("Running");
+    expect(document.querySelector(".system-activity-state-icon.running")).not.toBeNull();
+
+    await clickButton("Research");
+    await advance(755);
+    expect(lookup).toHaveBeenCalledTimes(2);
+    await clickButton("System");
+    expect(screenText()).toContain("Complete");
+    expect(document.querySelector(".system-activity-state-icon.succeeded")).not.toBeNull();
+  });
+
+  it.each(["failed", "cancelled"] as const)(
+    "renders a %s maintenance outcome without success treatment",
+    async (outcome) => {
+      provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+      const originalDoctor = provider.doctorProject.bind(provider);
+      const typedError = apiErrorV1Schema.parse({
+        schema_version: "1",
+        request_id: "request-system-maintenance-failed",
+        code: "maintenance_failed",
+        http_status: 503,
+        message: "The remote maintenance operation failed.",
+        severity: "blocking",
+        category: "service",
+        retryable: true,
+        repair_action: "user_action_required",
+        next_action: "Review System diagnostics before retrying.",
+        details: {},
+        logs_ref: null,
+      });
+      vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
+        const completed = await originalDoctor(...arguments_);
+        return {
+          ...completed,
+          state: outcome,
+          checks: [],
+          result: null,
+          error: outcome === "failed" ? typedError : null,
+        };
+      });
+      root = await renderProduct(provider);
+
+      await clickButton("System");
+      await clickButton("Check");
+
+      const activity = document.querySelector<HTMLElement>(".system-activity");
+      expect(activity?.textContent).toContain(outcome === "failed" ? "Failed" : "Cancelled");
+      expect(activity?.textContent).not.toContain("completed");
+      expect(activity?.querySelector(".system-activity-state-icon.succeeded")).toBeNull();
+      expect(activity?.querySelector(`.system-activity-state-icon.${outcome}`)).not.toBeNull();
+      if (outcome === "failed") {
+        expect(activity?.textContent).toContain("The remote maintenance operation failed.");
+        expect(activity?.textContent).toContain("Next action:");
+        expect(activity?.textContent).toContain("Review System diagnostics before retrying.");
+        expect(button("Repair").disabled).toBe(true);
+        expect(button("Repair").title).toContain("required user or reconnection action");
+      }
+    },
+  );
+
+  it("renders cancelling before a cancelled maintenance outcome", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    const originalDoctor = provider.doctorProject.bind(provider);
+    let completed: LocalOperationV1 | null = null;
+    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
+      completed = await originalDoctor(...arguments_);
+      return {
+        ...completed,
+        state: "cancelling",
+        checks: [],
+        result: null,
+        finished_at: null,
+      };
+    });
+    vi.spyOn(provider, "getLocalOperation").mockImplementation(async () => {
+      if (!completed) throw new Error("The completed maintenance result is unavailable.");
+      return {
+        ...completed,
+        state: "cancelled",
+        checks: [],
+        result: null,
+        error: null,
+      };
+    });
+    root = await renderProduct(provider);
+
+    await clickButton("System");
+    await clickButton("Check");
+    expect(screenText()).toContain("Cancelling");
+    expect(document.querySelector(".system-activity-state-icon.cancelling")).not.toBeNull();
+
+    await advance(755);
+    const activity = document.querySelector<HTMLElement>(".system-activity");
+    expect(activity?.textContent).toContain("Cancelled");
+    expect(activity?.textContent).not.toContain("completed");
+    expect(activity?.querySelector(".system-activity-state-icon.cancelled")).not.toBeNull();
+  });
+
+  it("does not render a timed-out maintenance poll as completed", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    const originalDoctor = provider.doctorProject.bind(provider);
+    let running: LocalOperationV1 | null = null;
+    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
+      const completed = await originalDoctor(...arguments_);
+      running = {
+        ...completed,
+        state: "running",
+        checks: [],
+        result: null,
+        finished_at: null,
+      };
+      return running;
+    });
+    const lookup = vi.spyOn(provider, "getLocalOperation").mockImplementation(async () => {
+      if (!running) throw new Error("The running maintenance result is unavailable.");
+      return running;
+    });
+    root = await renderProduct(provider);
+
+    await clickButton("System");
+    await clickButton("Check");
+    for (let attempt = 0; attempt < 480; attempt += 1) {
+      await advance(755);
+    }
+
+    const activity = document.querySelector<HTMLElement>(".system-activity");
+    expect(lookup).toHaveBeenCalledTimes(480);
+    expect(screenText()).toContain("The remote operation is still running.");
+    expect(activity?.textContent).toContain("Running");
+    expect(activity?.textContent).not.toContain("completed");
+    expect(activity?.querySelector(".system-activity-state-icon.running")).not.toBeNull();
+    expect(activity?.querySelector(".system-activity-state-icon.succeeded")).toBeNull();
+  });
+
+  it("traps confirmation focus, closes on Escape, and restores both dangerous-action triggers", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+    root = await renderProduct(provider);
+    await clickButton("System");
+
+    const restart = document.querySelector<HTMLButtonElement>('button[aria-label="Restart OpenEvo runtime"]');
+    if (!restart) throw new Error("Restart action was not found.");
+    restart.focus();
+    await clickElement(restart);
+
+    let dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    if (!dialog) throw new Error("Restart confirmation was not found.");
+    const cancel = Array.from(dialog.querySelectorAll<HTMLButtonElement>("button"))
+      .find((item) => item.textContent?.trim() === "Cancel");
+    const confirm = Array.from(dialog.querySelectorAll<HTMLButtonElement>("button"))
+      .find((item) => item.textContent?.trim() === "Confirm");
+    expect(dialog.getAttribute("aria-modal")).toBe("true");
+    expect(document.activeElement).toBe(cancel);
+    confirm?.focus();
+    if (!confirm) throw new Error("Confirm action was not found.");
+    await pressKey(confirm, "Tab");
+    expect(document.activeElement).toBe(cancel);
+    await pressKey(cancel!, "Escape");
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(document.activeElement).toBe(restart);
+
+    const cleanup = button("Clean diagnostic history");
+    cleanup.focus();
+    await clickElement(cleanup);
+    dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
+    expect(dialog?.textContent).toContain("Clean diagnostic history?");
+    const cleanupCancel = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+      .find((item) => item.textContent?.trim() === "Cancel");
+    if (!cleanupCancel) throw new Error("Cache cleanup cancel action was not found.");
+    await pressKey(cleanupCancel, "Escape");
+    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+    expect(document.activeElement).toBe(cleanup);
+  });
+
+  it("gates Start, selection, settings, and lifecycle mutations while System maintenance is busy", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const originalDoctor = provider.doctorProject.bind(provider);
+    const releaseDoctor = deferred<undefined>();
+    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
+      await releaseDoctor.promise;
+      return originalDoctor(...arguments_);
+    });
+    root = await renderProduct(provider);
+
+    await clickButton("System");
+    await clickButton("Check");
+
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    expect(switcher?.disabled).toBe(true);
+    expect(button("Edit").disabled).toBe(true);
+    expect(button("Repair").disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]')?.disabled).toBe(true);
+
+    await clickButton("Research");
+    expect(button("Start session").disabled).toBe(true);
+    expect(button("Start session").title).toContain("Wait for System maintenance to finish");
+    expect(switcher?.disabled).toBe(true);
+
+    await act(async () => releaseDoctor.resolve(undefined));
+    await flush();
+    expect(button("Start session").disabled).toBe(false);
+    expect(switcher?.disabled).toBe(false);
+  });
+
+  it.each(["stale", "error"] as const)(
+    "disables every System maintenance mutation when the snapshot stream is %s",
+    async (streamState) => {
+      provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
+      const doctor = vi.spyOn(provider, "doctorProject");
+      const diagnostics = vi.spyOn(provider, "createDiagnostic");
+      const restart = vi.spyOn(provider, "restartService");
+      const repair = vi.spyOn(provider, "repairProject");
+      const cleanup = vi.spyOn(provider, "cleanupCaches");
+      root = await renderProduct(provider);
+
+      await clickButton("System");
+      await clickButton("Check");
+      expect(button("Repair").disabled).toBe(false);
+      await clickAria("Restart OpenEvo runtime");
+      expect(document.querySelector('[role="alertdialog"]')).not.toBeNull();
+
+      if (streamState === "stale") {
+        await act(async () => provider?.markStreamStale());
+      } else {
+        provider.failNextRefresh();
+        await act(async () => provider?.resetEventCursor());
+      }
+      await flush();
+
+      expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+      expect(button("Check").disabled).toBe(true);
+      expect(button("Diagnostics").disabled).toBe(true);
+      expect(button("Repair").disabled).toBe(true);
+      expect(button("Clean diagnostic history").disabled).toBe(true);
+      const restartButton = document.querySelector<HTMLButtonElement>(
+        'button[aria-label="Restart OpenEvo runtime"]',
+      );
+      expect(restartButton?.disabled).toBe(true);
+      expect(button("Refresh status").disabled).toBe(false);
+      expect(button("Reconnect").disabled).toBe(false);
+
+      await clickElement(button("Repair"));
+      await clickElement(button("Clean diagnostic history"));
+      if (restartButton) await clickElement(restartButton);
+      expect(document.querySelector('[role="alertdialog"]')).toBeNull();
+      expect(doctor).toHaveBeenCalledTimes(1);
+      expect(diagnostics).not.toHaveBeenCalled();
+      expect(restart).not.toHaveBeenCalled();
+      expect(repair).not.toHaveBeenCalled();
+      expect(cleanup).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["project identity", "revision generation"] as const)(
+    "releases the global maintenance lock when authoritative %s changes",
+    async (authorityChange) => {
+      provider = createFixtureDesktopProductProvider({ startOnline: true });
+      const originalDoctor = provider.doctorProject.bind(provider);
+      const releaseDoctor = deferred<undefined>();
+      vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
+        await releaseDoctor.promise;
+        return originalDoctor(...arguments_);
+      });
+      root = await renderProduct(provider);
+      const current = await provider.refresh();
+      if (current.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+      const currentProject = current.snapshot.projects[0];
+      const remote = currentProject?.remote;
+      const activeRevision = remote?.active_revision;
+      if (!currentProject || !remote || !activeRevision) {
+        throw new Error("Expected an active project revision.");
+      }
+
+      await clickButton("System");
+      await clickButton("Check");
+      const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+      expect(switcher?.disabled).toBe(true);
+
+      const nextCoreProjectId = authorityChange === "project identity"
+        ? `${remote.core_project_id}-replacement`
+        : remote.core_project_id;
+      const changedProject = {
+        ...currentProject,
+        remote: {
+          ...remote,
+          core_project_id: nextCoreProjectId,
+          active_revision: {
+            ...activeRevision,
+            id: authorityChange === "project identity"
+              ? `${activeRevision.id}-replacement`
+              : activeRevision.id,
+            project_id: nextCoreProjectId,
+            generation: authorityChange === "revision generation"
+              ? activeRevision.generation + 1
+              : activeRevision.generation,
+          },
+        },
+      };
+      vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+        status: "fresh",
+        snapshot: {
+          ...current.snapshot,
+          state: authorityChange === "project identity"
+            ? {
+                ...current.snapshot.state,
+                active_project: current.snapshot.state.active_project
+                  ? {
+                      ...current.snapshot.state.active_project,
+                      project_id: `${current.snapshot.state.active_project.project_id}-replacement`,
+                    }
+                  : null,
+              }
+            : current.snapshot.state,
+          projects: current.snapshot.projects.map((project) =>
+            project.project_id === changedProject.project_id ? changedProject : project),
+        },
+      });
+
+      await act(async () => provider?.emitAuthoritativeRefresh());
+      await flush();
+
+      expect(switcher?.disabled).toBe(false);
+      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(false);
+      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(false);
+
+      await act(async () => releaseDoctor.resolve(undefined));
+      await flush();
+      expect(switcher?.disabled).toBe(false);
+    },
+  );
+
+  it.each(["project_doctor", "project_repair"] as const)(
+    "does not offer global cancellation for an active %s operation",
+    async (operationKind) => {
+      provider = createFixtureDesktopProductProvider({ startOnline: true });
+      const initial = await provider.refresh();
+      if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+      const project = initial.snapshot.projects[0];
+      if (!project) throw new Error("Expected a project fixture.");
+      const activeOperation: LocalOperationV1 = {
+        schema_version: "1",
+        operation_id: `operation-${operationKind}`,
+        operation_kind: operationKind,
+        state: "running",
+        resource: { resource_type: "project", resource_id: project.project_id },
+        progress: { current: 1, total: 2, label: "Remote maintenance is running" },
+        checks: [],
+        result: null,
+        error: null,
+        created_at: "2025-01-01T00:00:00Z",
+        started_at: "2025-01-01T00:00:01Z",
+        finished_at: null,
+        etag: "\"operation-maintenance-running\"",
+      };
+      const cancelOperation = vi.spyOn(provider, "cancelOperation");
+      vi.spyOn(provider, "refresh").mockResolvedValue({
+        ...initial,
+        snapshot: { ...initial.snapshot, activeOperation },
+      });
+
+      root = await renderProduct(provider);
+
+      expect(screenText()).toContain("Remote maintenance is running");
+      expect(optionalButton("Cancel operation")).toBeNull();
+      expect(button("Start session").disabled).toBe(true);
+      expect(button("Start session").title).toContain("Wait for System maintenance to finish");
+      expect(document.querySelector<HTMLSelectElement>("#project-switcher")?.disabled).toBe(true);
+      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
+      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
+      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]')?.disabled).toBe(true);
+      await clickButton("System");
+      expect(button("Repair").disabled).toBe(true);
+      expect(cancelOperation).not.toHaveBeenCalled();
+    },
+  );
 
   it("fails closed when a ready project has no authoritative service status", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });

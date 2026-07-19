@@ -886,7 +886,9 @@ def test_bootstrap_uploads_exact_core_wheel_when_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     wheel_dir = tmp_path / "dist"
-    wheel = _write_openevo_wheel(wheel_dir / "openevo-0.1.0-py3-none-any.whl")
+    wheel = _write_openevo_wheel(
+        wheel_dir / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl"
+    )
     monkeypatch.setattr(sidecar_api, "discover_local_openevo_wheel", lambda: wheel)
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
@@ -918,11 +920,11 @@ def test_bootstrap_uploads_exact_core_wheel_when_available(
     )
     remote_wheel = (
         "/home/alice/.openevo/runs/protein-design/"
-        "folding-baseline/wheels/openevo-0.1.0-py3-none-any.whl"
+        f"folding-baseline/wheels/openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl"
     )
     assert ensure_step["remediation_kind"] == "upload_exact_openevo_wheel"
     assert remote_wheel in ensure_step["command"]
-    assert "expected = '0.1.0'" in ensure_step["command"]
+    assert f"expected = '{sidecar_api.OPENEVO_VERSION}'" in ensure_step["command"]
     assert "pip install --user --upgrade openevo" not in ensure_step["command"]
 
 
@@ -930,7 +932,9 @@ def test_bootstrap_reports_sanitized_exact_core_wheel_upload_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wheel = _write_openevo_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    wheel = _write_openevo_wheel(
+        tmp_path / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl"
+    )
     monkeypatch.setattr(sidecar_api, "discover_local_openevo_wheel", lambda: wheel)
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile(
@@ -966,7 +970,9 @@ def test_bootstrap_runs_preflight_before_exact_core_wheel_upload(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    wheel = _write_openevo_wheel(tmp_path / "openevo-0.1.0-py3-none-any.whl")
+    wheel = _write_openevo_wheel(
+        tmp_path / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl"
+    )
     monkeypatch.setattr(sidecar_api, "discover_local_openevo_wheel", lambda: wheel)
     project = ScienceProjectConfig.model_validate(_science_project_payload())
     profile = _remote_profile()
@@ -1000,7 +1006,9 @@ def test_wheel_discovery_ignores_untrusted_cwd_dist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     dist = tmp_path / "dist"
-    _write_openevo_wheel(dist / "openevo-0.1.0-py3-none-any.whl")
+    _write_openevo_wheel(
+        dist / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl"
+    )
     monkeypatch.chdir(tmp_path)
 
     assert sidecar_api.discover_local_openevo_wheel() is None
@@ -1018,17 +1026,19 @@ def test_wheel_discovery_requires_matching_openevo_metadata(
 ) -> None:
     trusted = tmp_path / "trusted"
     invalid = _write_openevo_wheel(
-        trusted / "openevo-0.1.0-py3-none-any.whl",
+        trusted / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl",
         metadata_name="not-openevo",
     )
-    valid = _write_openevo_wheel(trusted / "openevo-0.1.0-local-py3-none-any.whl")
+    valid = _write_openevo_wheel(
+        trusted / f"openevo-{sidecar_api.OPENEVO_VERSION}-local-py3-none-any.whl"
+    )
     monkeypatch.setattr(sidecar_api, "_openevo_wheel_search_dirs", lambda: (trusted,))
 
     assert sidecar_api.discover_local_openevo_wheel() == valid
     invalid.unlink()
     valid.unlink()
     _write_openevo_wheel(
-        trusted / "openevo-0.1.0-py3-none-any.whl",
+        trusted / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl",
         metadata_version="0.2.0",
     )
 
@@ -1040,7 +1050,9 @@ def test_core_artifact_endpoint_reports_exact_packaged_wheel_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     trusted = tmp_path / "trusted"
-    wheel = _write_openevo_wheel(trusted / "openevo-0.1.0-py3-none-any.whl")
+    wheel = _write_openevo_wheel(
+        trusted / f"openevo-{sidecar_api.OPENEVO_VERSION}-py3-none-any.whl"
+    )
     monkeypatch.setattr(sidecar_api, "_openevo_wheel_search_dirs", lambda: (trusted,))
 
     response = TestClient(create_sidecar_app()).get("/openevo-api/desktop/core-artifact")
@@ -1051,13 +1063,13 @@ def test_core_artifact_endpoint_reports_exact_packaged_wheel_identity(
     assert payload == {
         "available": True,
         "distribution": "openevo",
-        "distribution_version": "0.1.0",
+        "distribution_version": sidecar_api.OPENEVO_VERSION,
         "wheel_filename": wheel.name,
         "distribution_digest": digest,
         "framework_lock": {
             "schema_version": "1",
             "distribution": "openevo",
-            "distribution_version": "0.1.0",
+            "distribution_version": sidecar_api.OPENEVO_VERSION,
             "distribution_digest": digest,
             "wheel_filename": wheel.name,
         },
@@ -3272,12 +3284,12 @@ def _write_openevo_wheel(
     path: Path,
     *,
     metadata_name: str = "openevo",
-    metadata_version: str = "0.1.0",
+    metadata_version: str = sidecar_api.OPENEVO_VERSION,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with ZipFile(path, "w") as wheel:
         wheel.writestr(
-            "openevo-0.1.0.dist-info/METADATA",
+            f"openevo-{metadata_version}.dist-info/METADATA",
             "\n".join(
                 [
                     "Metadata-Version: 2.4",
@@ -3570,9 +3582,17 @@ class _ApiDryRunTransport:
                 ),
             )
         if "importlib.metadata" in command and "version('openevo')" in command:
-            return RemoteCommandResult(command=command, return_code=0, stdout="0.1.0\n")
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"{sidecar_api.OPENEVO_VERSION}\n",
+            )
         if "openevo-backend --version" in command:
-            return RemoteCommandResult(command=command, return_code=0, stdout="openevo 0.1.0\n")
+            return RemoteCommandResult(
+                command=command,
+                return_code=0,
+                stdout=f"openevo {sidecar_api.OPENEVO_VERSION}\n",
+            )
         if "openevo-backend --help" in command:
             return RemoteCommandResult(command=command, return_code=0, stdout="help")
         return RemoteCommandResult(command=command, return_code=0, stdout="ok")

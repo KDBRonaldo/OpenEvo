@@ -186,7 +186,7 @@ def test_release_process_matches_final_inventory_and_non_circular_order() -> Non
         "supported-environment and known-limitation statements",
         "detached G12 attestation",
         "detached final candidate evidence index",
-        "current packaging-only workflow still emits a Core wheel",
+        "current packaging workflow still emits a Core wheel",
     ):
         assert marker in normalized
 

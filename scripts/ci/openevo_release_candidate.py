@@ -13,7 +13,7 @@ import re
 import stat
 import sys
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zipfile import BadZipFile, ZipFile
 
 
@@ -21,12 +21,16 @@ MANIFEST_NAME = "release-candidate.json"
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
+PLAYWRIGHT_EVIDENCE_NAME = "playwright-candidate-evidence.json"
+PLAYWRIGHT_REPORT_NAME = "playwright-report.json"
+PACKAGED_WEB_MANIFEST_NAME = "packaged-web-manifest.json"
 DAEMON_BUNDLE_NAME = "openevo-daemon-linux-x86_64"
 DAEMON_MANIFEST_NAME = "openevo-daemon-bundle.json"
 DAEMON_MOUNTED_EVIDENCE_NAME = "daemon-mounted-resource.json"
 DAEMON_COPY_EVIDENCE_NAME = "daemon-copy-resource.json"
 DAEMON_RESOURCE_ROOT = "Contents/Resources/openevo-daemon"
 MINIMUM_MACOS_VERSION = "12.0"
+RUST_TOOLCHAIN_VERSION = "1.95.0"
 TAURI_EXECUTABLE_NAME = "openevo-desktop"
 CORE_PYTHON_REQUIRES = ">=3.11"
 CORE_SUPPORTED_PLATFORMS = ("linux-x86_64",)
@@ -57,6 +61,31 @@ ARCHITECTURE_SLICES = {"aarch64": "arm64", "x64": "x86_64"}
 SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}")
 DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}")
 OWNERSHIP_TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}")
+CHROMIUM_VERSION_PATTERN = re.compile(r"[0-9]+(?:\.[0-9]+){1,3}")
+PLAYWRIGHT_VIEWPORTS = {
+    "release-packaged-1440": {"height": 900, "width": 1440},
+    "release-packaged-1024": {"height": 768, "width": 1024},
+    "release-packaged-760": {"height": 600, "width": 760},
+}
+PLAYWRIGHT_REQUIRED_CASES = frozenset(
+    (
+        project,
+        file,
+        title,
+    )
+    for projects, file, title in (
+        (
+            (
+                "release-packaged-1440",
+                "release-packaged-1024",
+                "release-packaged-760",
+            ),
+            "release-readonly.pw.ts",
+            "first launch uses the release sidecar composition and keeps its sample read-only",
+        ),
+    )
+    for project in projects
+)
 REQUIRED_INPUT_ROLES = (
     ("desktop_dmg", None),
     ("core_wheel", None),
@@ -73,6 +102,9 @@ REQUIRED_INPUT_ROLES = (
     ("app_bundle_smoke", "app-bundle-smoke.json"),
     ("dmg_copy_smoke", "dmg-copy-smoke.json"),
     ("managed_runtime_source", MANAGED_RUNTIME_SOURCE_NAME),
+    ("playwright_evidence", PLAYWRIGHT_EVIDENCE_NAME),
+    ("playwright_report", PLAYWRIGHT_REPORT_NAME),
+    ("packaged_web_manifest", PACKAGED_WEB_MANIFEST_NAME),
 )
 FINAL_ROLES = tuple(role for role, _name in REQUIRED_INPUT_ROLES) + (
     "core_descriptor",
@@ -87,6 +119,51 @@ DRAFT_RELEASE_METADATA_KEYS = {
     "tagName",
     "targetCommitish",
     "url",
+}
+PREVIEW_RELEASE_METADATA_KEYS = {
+    "assets",
+    "body",
+    "draft",
+    "html_url",
+    "id",
+    "immutable",
+    "name",
+    "prerelease",
+    "tag_name",
+    "target_commitish",
+}
+PREVIEW_RELEASE_ASSET_KEYS = {
+    "digest",
+    "id",
+    "name",
+    "size",
+    "state",
+}
+PREVIEW_RELEASE_SNAPSHOT_KEYS = {
+    "assets",
+    "body",
+    "candidate_workflow",
+    "draft",
+    "manifest_sha256",
+    "prerelease",
+    "release_id",
+    "repository",
+    "schema_version",
+    "source_commit",
+    "tag",
+    "target_commitish",
+    "title",
+}
+CANDIDATE_WORKFLOW_RUN_KEYS = {
+    "conclusion",
+    "event",
+    "head_branch",
+    "head_sha",
+    "id",
+    "path",
+    "repository",
+    "run_attempt",
+    "status",
 }
 
 
@@ -231,6 +308,431 @@ def _managed_runtime_manifest() -> dict[str, object]:
     }
 
 
+def _validate_packaged_web_manifest(path: Path) -> dict[str, object]:
+    manifest = _load_json(path)
+    if type(manifest) is not dict or set(manifest) != {
+        "build_digest",
+        "files",
+        "schema_version",
+    }:
+        raise CandidateError("packaged web manifest does not use the closed schema")
+    files = manifest.get("files")
+    if (
+        manifest.get("schema_version") != "1"
+        or type(files) is not list
+        or not files
+    ):
+        raise CandidateError("packaged web manifest is invalid")
+    normalized_files: list[dict[str, object]] = []
+    paths: set[str] = set()
+    for entry in files:
+        if type(entry) is not dict or set(entry) != {"byte_size", "path", "sha256"}:
+            raise CandidateError("packaged web manifest file entry is invalid")
+        relative_path = entry.get("path")
+        byte_size = entry.get("byte_size")
+        if (
+            type(relative_path) is not str
+            or not relative_path
+            or not relative_path.isascii()
+            or relative_path.startswith("/")
+            or "\\" in relative_path
+            or any(part in {"", ".", ".."} for part in relative_path.split("/"))
+            or relative_path in paths
+        ):
+            raise CandidateError("packaged web manifest paths are invalid")
+        if type(byte_size) is not int or byte_size < 1:
+            raise CandidateError("packaged web manifest file size is invalid")
+        digest = _require_digest(entry.get("sha256"), "packaged web file digest")
+        paths.add(relative_path)
+        normalized_files.append(
+            {"path": relative_path, "sha256": digest, "byte_size": byte_size}
+        )
+    if normalized_files != sorted(normalized_files, key=lambda entry: str(entry["path"])):
+        raise CandidateError("packaged web manifest file order is not canonical")
+    expected_build_digest = hashlib.sha256(
+        json.dumps(
+            normalized_files,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if manifest.get("build_digest") != expected_build_digest:
+        raise CandidateError("packaged web build digest is invalid")
+    return manifest
+
+
+def _playwright_test_results(report_path: Path) -> list[dict[str, object]]:
+    report = _load_json(report_path)
+    if type(report) is not dict:
+        raise CandidateError("Playwright report must be a JSON object")
+    config = report.get("config")
+    suites = report.get("suites")
+    stats = report.get("stats")
+    errors = report.get("errors")
+    if (
+        type(config) is not dict
+        or type(suites) is not list
+        or not suites
+        or type(stats) is not dict
+        or errors != []
+    ):
+        raise CandidateError("Playwright report is incomplete or contains errors")
+    projects = config.get("projects")
+    if type(projects) is not list:
+        raise CandidateError("Playwright report project inventory is invalid")
+    project_ids: list[str] = []
+    for project in projects:
+        if type(project) is not dict:
+            raise CandidateError("Playwright report project entry is invalid")
+        project_id = project.get("name")
+        if (
+            type(project_id) is not str
+            or project.get("id") not in {None, project_id}
+            or project_id not in PLAYWRIGHT_VIEWPORTS
+            or project_id in project_ids
+        ):
+            raise CandidateError("Playwright report project identity is invalid")
+        project_ids.append(project_id)
+    if set(project_ids) != set(PLAYWRIGHT_VIEWPORTS):
+        raise CandidateError("Playwright report does not cover the closed viewport matrix")
+
+    results: list[dict[str, object]] = []
+    seen: set[tuple[str, int, str, str]] = set()
+    for suite in suites:
+        if type(suite) is not dict or type(suite.get("specs")) is not list:
+            raise CandidateError("Playwright report suite is invalid")
+        for spec in suite["specs"]:
+            if type(spec) is not dict:
+                raise CandidateError("Playwright report test specification is invalid")
+            file = spec.get("file")
+            line = spec.get("line")
+            title = spec.get("title")
+            tests = spec.get("tests")
+            if (
+                spec.get("ok") is not True
+                or type(file) is not str
+                or not file
+                or not file.isascii()
+                or Path(file).name != file
+                or not file.endswith(".pw.ts")
+                or type(line) is not int
+                or line < 1
+                or type(title) is not str
+                or not title
+                or len(title) > 512
+                or type(tests) is not list
+                or len(tests) != 1
+            ):
+                raise CandidateError("Playwright test specification did not pass the closed contract")
+            test = tests[0]
+            if type(test) is not dict:
+                raise CandidateError("Playwright test result is invalid")
+            project_id = test.get("projectName")
+            attempts = test.get("results")
+            if (
+                type(project_id) is not str
+                or project_id not in PLAYWRIGHT_VIEWPORTS
+                or test.get("projectId") not in {None, project_id}
+                or test.get("expectedStatus") != "passed"
+                or test.get("status") != "expected"
+                or test.get("annotations") != []
+                or type(attempts) is not list
+                or len(attempts) != 1
+                or type(attempts[0]) is not dict
+                or attempts[0].get("status") != "passed"
+                or attempts[0].get("retry") != 0
+            ):
+                raise CandidateError("Playwright test result is not a first-attempt pass")
+            identity = (file, line, title, project_id)
+            if identity in seen:
+                raise CandidateError("Playwright report contains a duplicate test result")
+            seen.add(identity)
+            results.append(
+                {
+                    "file": file,
+                    "line": line,
+                    "project": project_id,
+                    "retry": 0,
+                    "status": "passed",
+                    "title": title,
+                    "viewport": PLAYWRIGHT_VIEWPORTS[project_id],
+                }
+            )
+    results.sort(
+        key=lambda entry: (
+            str(entry["file"]),
+            int(entry["line"]),
+            str(entry["title"]),
+            str(entry["project"]),
+        )
+    )
+    if not results:
+        raise CandidateError("Playwright report contains no test results")
+    observed_cases = {
+        (str(entry["project"]), str(entry["file"]), str(entry["title"]))
+        for entry in results
+    }
+    if observed_cases != PLAYWRIGHT_REQUIRED_CASES:
+        raise CandidateError("Playwright report does not cover the exact candidate test matrix")
+    expected_count = len(results)
+    if (
+        stats.get("expected") != expected_count
+        or stats.get("skipped") != 0
+        or stats.get("unexpected") != 0
+        or stats.get("flaky") != 0
+    ):
+        raise CandidateError("Playwright aggregate status is not a complete pass")
+    return results
+
+
+def _sanitized_playwright_report(
+    tests: list[dict[str, object]],
+) -> dict[str, object]:
+    return {
+        "composition": "packaged_web",
+        "projects": [
+            {
+                "name": name,
+                "viewport": PLAYWRIGHT_VIEWPORTS[name],
+            }
+            for name in sorted(PLAYWRIGHT_VIEWPORTS)
+        ],
+        "provider_kind": "desktop_sidecar",
+        "schema_version": 2,
+        "simulator": False,
+        "status": "passed",
+        "summary": {
+            "expected": len(PLAYWRIGHT_REQUIRED_CASES),
+            "flaky": 0,
+            "skipped": 0,
+            "unexpected": 0,
+        },
+        "tests": tests,
+    }
+
+
+def _validate_sanitized_playwright_report(
+    report_path: Path,
+) -> list[dict[str, object]]:
+    report = _load_json(report_path)
+    if type(report) is not dict or set(report) != {
+        "composition",
+        "projects",
+        "provider_kind",
+        "schema_version",
+        "simulator",
+        "status",
+        "summary",
+        "tests",
+    }:
+        raise CandidateError("sanitized Playwright report does not use the closed schema")
+    if report_path.read_bytes() != _canonical_json(report):
+        raise CandidateError("sanitized Playwright report is not canonical")
+    expected_projects = [
+        {"name": name, "viewport": PLAYWRIGHT_VIEWPORTS[name]}
+        for name in sorted(PLAYWRIGHT_VIEWPORTS)
+    ]
+    if (
+        report.get("schema_version") != 2
+        or report.get("simulator") is not False
+        or report.get("provider_kind") != "desktop_sidecar"
+        or report.get("composition") != "packaged_web"
+        or report.get("status") != "passed"
+        or report.get("projects") != expected_projects
+        or report.get("summary")
+        != {
+            "expected": len(PLAYWRIGHT_REQUIRED_CASES),
+            "flaky": 0,
+            "skipped": 0,
+            "unexpected": 0,
+        }
+    ):
+        raise CandidateError("sanitized Playwright report identity or status is invalid")
+    tests = report.get("tests")
+    if type(tests) is not list or len(tests) != len(PLAYWRIGHT_REQUIRED_CASES):
+        raise CandidateError("sanitized Playwright report test inventory is incomplete")
+    normalized: list[dict[str, object]] = []
+    for entry in tests:
+        if type(entry) is not dict or set(entry) != {
+            "file",
+            "line",
+            "project",
+            "retry",
+            "status",
+            "title",
+            "viewport",
+        }:
+            raise CandidateError("sanitized Playwright test entry is invalid")
+        project = entry.get("project")
+        file = entry.get("file")
+        line = entry.get("line")
+        title = entry.get("title")
+        if (
+            type(project) is not str
+            or project not in PLAYWRIGHT_VIEWPORTS
+            or type(file) is not str
+            or not file.isascii()
+            or Path(file).name != file
+            or not file.endswith(".pw.ts")
+            or type(line) is not int
+            or line < 1
+            or type(title) is not str
+            or not title
+            or len(title) > 512
+            or entry.get("retry") != 0
+            or entry.get("status") != "passed"
+            or entry.get("viewport") != PLAYWRIGHT_VIEWPORTS[project]
+        ):
+            raise CandidateError("sanitized Playwright test entry is invalid")
+        normalized.append(entry)
+    expected_order = sorted(
+        normalized,
+        key=lambda entry: (
+            str(entry["file"]),
+            int(entry["line"]),
+            str(entry["title"]),
+            str(entry["project"]),
+        ),
+    )
+    observed_cases = {
+        (str(entry["project"]), str(entry["file"]), str(entry["title"]))
+        for entry in normalized
+    }
+    if normalized != expected_order or observed_cases != PLAYWRIGHT_REQUIRED_CASES:
+        raise CandidateError("sanitized Playwright report does not cover the exact test matrix")
+    return normalized
+
+
+def _expected_playwright_evidence(
+    *,
+    report_path: Path,
+    packaged_web_manifest_path: Path,
+    source_commit: str,
+    run_id: int,
+    run_attempt: int,
+    browser_version: str,
+) -> dict[str, object]:
+    if SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
+        raise CandidateError("Playwright source commit must be one full lowercase Git commit")
+    if type(run_id) is not int or run_id < 1 or type(run_attempt) is not int or run_attempt < 1:
+        raise CandidateError("Playwright run identity must contain positive integers")
+    if (
+        type(browser_version) is not str
+        or CHROMIUM_VERSION_PATTERN.fullmatch(browser_version) is None
+    ):
+        raise CandidateError("Playwright Chromium version is invalid")
+    manifest = _validate_packaged_web_manifest(packaged_web_manifest_path)
+    return {
+        "browser": {"name": "chromium", "version": browser_version},
+        "composition": "packaged_web",
+        "packaged_web": {
+            "build_digest": manifest["build_digest"],
+            "manifest": _file_entry(
+                "packaged_web_manifest",
+                packaged_web_manifest_path,
+            ),
+        },
+        "provider_kind": "desktop_sidecar",
+        "report": _file_entry("playwright_report", report_path),
+        "run": {"attempt": run_attempt, "id": run_id},
+        "schema_version": 2,
+        "simulator": False,
+        "source_commit": source_commit,
+        "status": "passed",
+        "tests": _validate_sanitized_playwright_report(report_path),
+    }
+
+
+def write_playwright_candidate_evidence(
+    path: Path,
+    *,
+    raw_report_path: Path,
+    sanitized_report_path: Path,
+    packaged_web_manifest_path: Path,
+    source_commit: str,
+    run_id: int,
+    run_attempt: int,
+    browser_version: str,
+) -> None:
+    tests = _playwright_test_results(raw_report_path)
+    _write_new(
+        sanitized_report_path,
+        _canonical_json(_sanitized_playwright_report(tests)),
+    )
+    evidence = _expected_playwright_evidence(
+        report_path=sanitized_report_path,
+        packaged_web_manifest_path=packaged_web_manifest_path,
+        source_commit=source_commit,
+        run_id=run_id,
+        run_attempt=run_attempt,
+        browser_version=browser_version,
+    )
+    _write_new(path, _canonical_json(evidence))
+
+
+def _validate_playwright_candidate_evidence(
+    evidence_path: Path,
+    *,
+    report_path: Path,
+    packaged_web_manifest_path: Path,
+    expected_source_commit: str | None = None,
+    expected_run_id: int | None = None,
+    expected_run_attempt: int | None = None,
+) -> None:
+    evidence = _load_json(evidence_path)
+    if type(evidence) is not dict or set(evidence) != {
+        "browser",
+        "composition",
+        "packaged_web",
+        "provider_kind",
+        "report",
+        "run",
+        "schema_version",
+        "simulator",
+        "source_commit",
+        "status",
+        "tests",
+    }:
+        raise CandidateError("Playwright evidence does not use the closed candidate schema")
+    browser = evidence.get("browser")
+    run = evidence.get("run")
+    if (
+        evidence.get("schema_version") != 2
+        or evidence.get("simulator") is not False
+        or evidence.get("provider_kind") != "desktop_sidecar"
+        or evidence.get("composition") != "packaged_web"
+        or evidence.get("status") != "passed"
+        or type(browser) is not dict
+        or set(browser) != {"name", "version"}
+        or browser.get("name") != "chromium"
+        or type(run) is not dict
+        or set(run) != {"attempt", "id"}
+    ):
+        raise CandidateError("Playwright evidence identity or status is invalid")
+    source_commit = evidence.get("source_commit")
+    if (
+        type(source_commit) is not str
+        or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None
+        or expected_source_commit is not None
+        and source_commit != expected_source_commit
+        or expected_run_id is not None
+        and run.get("id") != expected_run_id
+        or expected_run_attempt is not None
+        and run.get("attempt") != expected_run_attempt
+    ):
+        raise CandidateError("Playwright evidence is bound to a different candidate run")
+    expected = _expected_playwright_evidence(
+        report_path=report_path,
+        packaged_web_manifest_path=packaged_web_manifest_path,
+        source_commit=source_commit,
+        run_id=run.get("id"),
+        run_attempt=run.get("attempt"),
+        browser_version=browser.get("version"),
+    )
+    if evidence != expected or evidence_path.read_bytes() != _canonical_json(evidence):
+        raise CandidateError("Playwright evidence does not match its report and packaged web build")
+
+
 def render_candidate_release_notes(
     *,
     source_commit: str,
@@ -245,19 +747,20 @@ def render_candidate_release_notes(
         raise CandidateError("candidate architecture must be an actual supported architecture")
     return "\n".join(
         (
-            f"# OpenEvo Desktop {version} unsigned draft prerelease",
+            f"# OpenEvo Desktop {version} Preview",
             "",
             f"Source commit: {source_commit}",
             f"Architecture: {architecture}",
             f"Minimum macOS: {MINIMUM_MACOS_VERSION}",
             "",
-            "This candidate is Developer ID unsigned and not notarized. Its app bundle is ad-hoc signed for integrity, and the documented browser-quarantine removal path is validated by this packaging workflow.",
+            "This Preview is Developer ID unsigned and not notarized. Its app bundle is ad-hoc signed for integrity, and the documented browser-quarantine removal path is validated by the packaging workflow.",
             "",
             "## Supported Workflows",
             "",
-            "Codex subscription transcript mode: available in this candidate.",
-            "It runs subscription-authenticated Codex on the remote server with transcript capture and non-parametric evolution.",
-            "Self-Deployed Reference mode: unavailable in this candidate.",
+            "Codex subscription transcript mode: packaged and declared in this Preview.",
+            "Candidate-bound real Codex Subscription science E2E: not yet verified on a supported remote host.",
+            "No real Codex Subscription run claim is made by this packaging workflow. Such a claim remains blocked until exact-candidate evidence records the packaged Desktop, a real remote OpenEvo Daemon, subscription-authenticated Codex, transcript capture, two science sessions, and promoted-artifact reuse.",
+            "Self-Deployed Reference mode: unavailable in this Preview.",
             "The shipped Desktop release authority blocks saving or running that mode; its Core-side reference architecture is not a Desktop product claim.",
             f"Managed Science runtime archive: {MANAGED_RUNTIME_ARCHIVE_NAME}.",
             f"Managed Science runtime archive size: {MANAGED_RUNTIME_ARCHIVE_SIZE}.",
@@ -267,20 +770,20 @@ def render_candidate_release_notes(
             "",
             "## Known Limitations",
             "",
-            "Parameter evolution is not included in this candidate.",
+            "Parameter evolution is not included in this Preview.",
             "PyPI is not used for this release.",
             "Only the declared architecture was built.",
             "The interactive Privacy & Security allow flow is not automated; command-line quarantine removal is validated.",
-            "This packaging-only draft does not satisfy the science E2E, benchmark, secret-canary/privacy, signing, notarization, or final-publication gates.",
+            "This packaging-only Preview does not satisfy the science E2E, benchmark, secret-canary/privacy, signing, notarization, or final External Beta gates.",
             "",
             "## Validation Results",
             "",
-            "Benchmark gates completed by this packaging candidate: 0 of 3.",
+            "Benchmark gates completed by this Preview: 0 of 3.",
             "Textual-memory pass@1 rescue count: pending.",
             "Trajectory-to-skill pass@1 rescue count: pending.",
             "Agent-system pass@1 rescue count: pending.",
-            "No benchmark performance claim is made by this draft.",
-            "The exact Core wheel, candidate DMG, its mounted app and detached copy, embedded subscription Science runtime, source evidence, dependency evidence, and downloaded draft assets are validated by this workflow.",
+            "No benchmark performance claim is made by this Preview.",
+            "The exact Core wheel, Preview DMG, its mounted app and detached copy, embedded subscription Science runtime, declared subscription capability, packaged Desktop web build, packaged release-composition Playwright interaction result, source evidence, dependency evidence, and downloaded release assets are validated by the packaging workflow.",
             "",
             "## Security And Privacy",
             "",
@@ -292,8 +795,8 @@ def render_candidate_release_notes(
             "## Install, Upgrade, And Uninstall",
             "",
             'Install: copy OpenEvo Desktop to Applications, run `xattr -dr com.apple.quarantine "/Applications/OpenEvo Desktop.app"`, then open it. This workflow validates synthetic browser quarantine, that documented removal command, the ad-hoc app signature, and launch; the interactive Privacy & Security UI remains unvalidated.',
-            "Upgrade: this draft has no automatic updater; quit the app and replace it with a newer reviewed DMG. Remote Core upgrade compatibility is not proven by this packaging-only candidate.",
-            "Uninstall: quit OpenEvo Desktop and remove it from Applications. Local Desktop data under ~/.openevo/desktop is retained unless deleted separately. The Tauri native host app data directory for org.openevo.desktop, including run-retry recovery state, is also retained unless deleted separately. Remote Core state, task data, model downloads, and runtime caches are also retained.",
+            "Upgrade: this Preview has no automatic updater; quit the app and replace it with a newer reviewed DMG. OpenEvo Daemon upgrade compatibility is not proven by this packaging-only Preview.",
+            "Uninstall: quit OpenEvo Desktop and remove it from Applications. Local Desktop data under ~/.openevo/desktop is retained unless deleted separately. The Tauri native host app data directory for org.openevo.desktop, including run-retry recovery state, is also retained unless deleted separately. OpenEvo Daemon state, task data, model downloads, and runtime caches are also retained.",
             "",
         )
     )
@@ -1041,6 +1544,12 @@ def create_candidate_manifest(
     )
     if _load_json(paths["managed_runtime_source"]) != _managed_runtime_source_evidence():
         raise CandidateError("managed runtime source evidence is invalid")
+    _validate_playwright_candidate_evidence(
+        paths["playwright_evidence"],
+        report_path=paths["playwright_report"],
+        packaged_web_manifest_path=paths["packaged_web_manifest"],
+        expected_source_commit=source_commit,
+    )
     _validate_release_notes(
         paths["release_notes"],
         source_commit=source_commit,
@@ -1090,14 +1599,17 @@ def create_candidate_manifest(
             "minimum_system_version": MINIMUM_MACOS_VERSION,
             "native_architectures": native_architectures,
             "rust_target": rust_target,
+            "rust_toolchain": RUST_TOOLCHAIN_VERSION,
         },
         "managed_runtime": _managed_runtime_manifest(),
         "release": {
-            "channel": "unsigned-draft-prerelease",
+            "app_bundle_signature": "adhoc",
+            "channel": "unsigned-preview",
+            "developer_id_signed": False,
             "notarized": False,
-            "signed": False,
+            "quarantine_removal_tested": True,
         },
-        "schema_version": 4,
+        "schema_version": 6,
         "source_commit": source_commit,
         "version": version,
     }
@@ -1140,7 +1652,7 @@ def _validate_candidate_manifest(
     core = manifest.get("core")
     daemon = manifest.get("daemon")
     files = manifest.get("files")
-    if manifest.get("schema_version") != 4:
+    if manifest.get("schema_version") != 6:
         raise CandidateError("candidate manifest schema version is invalid")
     if type(source_commit) is not str or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("candidate source commit is invalid")
@@ -1148,15 +1660,22 @@ def _validate_candidate_manifest(
         raise CandidateError("candidate source commit does not match the expected checkout")
     if type(version) is not str or not version:
         raise CandidateError("candidate version is invalid")
-    if release != {"channel": "unsigned-draft-prerelease", "notarized": False, "signed": False}:
+    if release != {
+        "app_bundle_signature": "adhoc",
+        "channel": "unsigned-preview",
+        "developer_id_signed": False,
+        "notarized": False,
+        "quarantine_removal_tested": True,
+    }:
         raise CandidateError(
-            "candidate release must remain unsigned, not notarized, and prerelease"
+            "candidate release signature, notarization, or quarantine evidence is invalid"
         )
     if type(macos) is not dict or set(macos) != {
         "architecture",
         "minimum_system_version",
         "native_architectures",
         "rust_target",
+        "rust_toolchain",
     }:
         raise CandidateError("candidate macOS identity is invalid")
     architecture = macos.get("architecture")
@@ -1165,6 +1684,7 @@ def _validate_candidate_manifest(
     if (
         macos.get("rust_target") != ARCHITECTURE_TARGETS[architecture]
         or macos.get("minimum_system_version") != MINIMUM_MACOS_VERSION
+        or macos.get("rust_toolchain") != RUST_TOOLCHAIN_VERSION
     ):
         raise CandidateError("candidate macOS target identity is inconsistent")
     native_architectures = macos.get("native_architectures")
@@ -1306,6 +1826,14 @@ def _validate_candidate_manifest(
         != _managed_runtime_source_evidence()
     ):
         raise CandidateError("managed runtime source evidence is invalid")
+    _validate_playwright_candidate_evidence(
+        root / str(by_role["playwright_evidence"]["filename"]),
+        report_path=root / str(by_role["playwright_report"]["filename"]),
+        packaged_web_manifest_path=root / str(
+            by_role["packaged_web_manifest"]["filename"]
+        ),
+        expected_source_commit=source_commit,
+    )
     _validate_release_notes(
         root / str(by_role["release_notes"]["filename"]),
         source_commit=source_commit,
@@ -1344,6 +1872,433 @@ def validate_candidate_manifest(
     return []
 
 
+def _require_positive_int(value: object, subject: str) -> int:
+    if type(value) is not int or value < 1:
+        raise CandidateError(f"{subject} must be a positive integer")
+    return value
+
+
+def _validate_repository(repository: str) -> None:
+    parts = repository.split("/")
+    if (
+        len(parts) != 2
+        or not all(parts)
+        or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_."
+            for character in repository.replace("/", "")
+        )
+    ):
+        raise CandidateError("Expected GitHub repository is invalid")
+
+
+def _normalized_preview_metadata(
+    metadata_path: Path,
+    *,
+    expected_repository: str,
+    expected_release_id: int,
+    expected_tag: str,
+    expected_target: str,
+    expected_title: str,
+    expected_draft: bool,
+) -> dict[str, object]:
+    _validate_repository(expected_repository)
+    _require_positive_int(expected_release_id, "Expected release ID")
+    if SOURCE_COMMIT_PATTERN.fullmatch(expected_target) is None:
+        raise CandidateError("Expected Preview target must be one full lowercase Git commit")
+    metadata = _load_json(metadata_path)
+    if type(metadata) is not dict or set(metadata) != PREVIEW_RELEASE_METADATA_KEYS:
+        raise CandidateError("Preview release metadata does not use the closed REST schema")
+    if (
+        metadata.get("id") != expected_release_id
+        or metadata.get("tag_name") != expected_tag
+        or metadata.get("target_commitish") != expected_target
+        or metadata.get("name") != expected_title
+        or metadata.get("draft") is not expected_draft
+        or metadata.get("immutable") is not (not expected_draft)
+        or metadata.get("prerelease") is not True
+        or type(metadata.get("body")) is not str
+    ):
+        raise CandidateError("Preview release identity, metadata, or visibility is invalid")
+
+    html_url = metadata.get("html_url")
+    if type(html_url) is not str:
+        raise CandidateError("Preview release HTML URL is invalid")
+    parsed_url = urlsplit(html_url)
+    expected_prefix = f"/{expected_repository}/releases/tag/"
+    slug = parsed_url.path[len(expected_prefix) :]
+    if (
+        parsed_url.scheme != "https"
+        or parsed_url.netloc.casefold() != "github.com"
+        or not parsed_url.path.startswith(expected_prefix)
+        or not slug
+        or "/" in slug
+        or parsed_url.query
+        or parsed_url.fragment
+        or not expected_draft
+        and slug != quote(expected_tag, safe="._-")
+    ):
+        raise CandidateError("Preview release HTML URL is invalid")
+
+    assets = metadata.get("assets")
+    if type(assets) is not list or not assets:
+        raise CandidateError("Preview release asset inventory is empty")
+    normalized_assets: list[dict[str, object]] = []
+    asset_ids: set[int] = set()
+    names: set[str] = set()
+    for asset in assets:
+        if type(asset) is not dict or set(asset) != PREVIEW_RELEASE_ASSET_KEYS:
+            raise CandidateError("Preview release asset metadata is not closed")
+        asset_id = _require_positive_int(asset.get("id"), "Preview release asset ID")
+        name = _require_safe_basename(asset.get("name"), "Preview release asset name")
+        size = asset.get("size")
+        digest = asset.get("digest")
+        if (
+            asset_id in asset_ids
+            or name in names
+            or type(size) is not int
+            or size < 1
+            or asset.get("state") != "uploaded"
+            or type(digest) is not str
+            or not digest.startswith("sha256:")
+            or DIGEST_PATTERN.fullmatch(digest.removeprefix("sha256:")) is None
+        ):
+            raise CandidateError("Preview release asset identity or upload state is invalid")
+        asset_ids.add(asset_id)
+        names.add(name)
+        normalized_assets.append(
+            {
+                "id": asset_id,
+                "name": name,
+                "sha256": digest.removeprefix("sha256:"),
+                "size": size,
+            }
+        )
+    normalized_assets.sort(key=lambda entry: str(entry["name"]))
+    return {
+        "assets": normalized_assets,
+        "body": metadata["body"],
+        "draft": expected_draft,
+        "prerelease": True,
+        "release_id": expected_release_id,
+        "target_commitish": expected_target,
+        "title": expected_title,
+    }
+
+
+def _load_preview_snapshot(path: Path) -> dict[str, object]:
+    snapshot = _load_json(path)
+    if (
+        type(snapshot) is not dict
+        or set(snapshot) != PREVIEW_RELEASE_SNAPSHOT_KEYS
+        or snapshot.get("schema_version") != 1
+        or path.read_bytes() != _canonical_json(snapshot)
+    ):
+        raise CandidateError("Preview release snapshot does not use the canonical closed schema")
+    _validate_repository(str(snapshot.get("repository")))
+    _require_positive_int(snapshot.get("release_id"), "Preview snapshot release ID")
+    if (
+        type(snapshot.get("tag")) is not str
+        or not snapshot["tag"]
+        or type(snapshot.get("source_commit")) is not str
+        or SOURCE_COMMIT_PATTERN.fullmatch(snapshot["source_commit"]) is None
+        or snapshot.get("target_commitish") != snapshot.get("source_commit")
+        or type(snapshot.get("manifest_sha256")) is not str
+        or DIGEST_PATTERN.fullmatch(snapshot["manifest_sha256"]) is None
+        or type(snapshot.get("title")) is not str
+        or not snapshot["title"]
+        or type(snapshot.get("body")) is not str
+        or snapshot.get("draft") is not True
+        or snapshot.get("prerelease") is not True
+    ):
+        raise CandidateError("Preview release snapshot identity is invalid")
+    workflow = snapshot.get("candidate_workflow")
+    if type(workflow) is not dict or set(workflow) != {"run_attempt", "run_id"}:
+        raise CandidateError("Preview release snapshot workflow identity is invalid")
+    _require_positive_int(workflow.get("run_id"), "Preview snapshot workflow run ID")
+    _require_positive_int(workflow.get("run_attempt"), "Preview snapshot workflow run attempt")
+    assets = snapshot.get("assets")
+    if type(assets) is not list or not assets:
+        raise CandidateError("Preview release snapshot asset inventory is empty")
+    expected_order = sorted(assets, key=lambda entry: str(entry.get("name", "")))
+    if assets != expected_order:
+        raise CandidateError("Preview release snapshot assets are not canonically ordered")
+    ids: set[int] = set()
+    names: set[str] = set()
+    for asset in assets:
+        if type(asset) is not dict or set(asset) != {"id", "name", "sha256", "size"}:
+            raise CandidateError("Preview release snapshot asset entry is invalid")
+        asset_id = _require_positive_int(asset.get("id"), "Preview snapshot asset ID")
+        name = _require_safe_basename(asset.get("name"), "Preview snapshot asset name")
+        if (
+            asset_id in ids
+            or name in names
+            or type(asset.get("size")) is not int
+            or asset["size"] < 1
+            or type(asset.get("sha256")) is not str
+            or DIGEST_PATTERN.fullmatch(asset["sha256"]) is None
+        ):
+            raise CandidateError("Preview release snapshot asset identity is invalid")
+        ids.add(asset_id)
+        names.add(name)
+    return snapshot
+
+
+def _candidate_preview_identity(
+    candidate_root: Path,
+    *,
+    expected_source_commit: str,
+    expected_manifest_sha256: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+) -> tuple[dict[str, object], list[dict[str, object]], Path]:
+    manifest_path = candidate_root / MANIFEST_NAME
+    if not _is_regular_file(manifest_path):
+        raise CandidateError("Downloaded Preview is missing release-candidate.json")
+    if _sha256(manifest_path) != _require_digest(
+        expected_manifest_sha256,
+        "Expected release-candidate manifest digest",
+    ):
+        raise CandidateError("release-candidate manifest digest does not match the expected digest")
+    errors = validate_candidate_manifest(
+        manifest_path,
+        expected_source_commit=expected_source_commit,
+    )
+    if errors:
+        raise CandidateError("; ".join(errors))
+    manifest = _load_json(manifest_path)
+    files = manifest["files"]
+    by_role = {entry["role"]: entry for entry in files}
+    evidence = _load_json(candidate_root / by_role["playwright_evidence"]["filename"])
+    if evidence.get("run") != {"attempt": expected_run_attempt, "id": expected_run_id}:
+        raise CandidateError("Candidate Playwright evidence belongs to another workflow run")
+    expected_assets = [
+        {
+            "name": entry["filename"],
+            "sha256": entry["sha256"],
+            "size": entry["byte_size"],
+        }
+        for entry in files
+    ]
+    expected_assets.append(
+        {
+            "name": MANIFEST_NAME,
+            "sha256": expected_manifest_sha256,
+            "size": manifest_path.stat().st_size,
+        }
+    )
+    expected_assets.sort(key=lambda entry: str(entry["name"]))
+    return manifest, expected_assets, candidate_root / by_role["release_notes"]["filename"]
+
+
+def _validate_preview_body(body: str, release_notes: Path) -> None:
+    try:
+        notes = release_notes.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("Release notes are unreadable") from exc
+    prefix = notes.rstrip("\n") + "\n\n<!-- openevo-draft-owner:"
+    suffix = " -->"
+    normalized = body.rstrip("\n")
+    if not normalized.startswith(prefix) or not normalized.endswith(suffix):
+        raise CandidateError("Preview release body does not match the canonical candidate notes")
+    token = normalized[len(prefix) : -len(suffix)]
+    expected = render_draft_release_body(
+        release_notes=notes,
+        ownership_token=token,
+    )
+    if normalized != expected.rstrip("\n"):
+        raise CandidateError("Preview release body does not match the canonical candidate notes")
+
+
+def write_preview_release_snapshot(
+    output: Path,
+    *,
+    metadata_path: Path,
+    candidate_root: Path,
+    baseline_path: Path | None,
+    expected_repository: str,
+    expected_release_id: int,
+    expected_tag: str,
+    expected_source_commit: str,
+    expected_manifest_sha256: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+    expected_draft: bool,
+) -> None:
+    manifest, expected_assets, release_notes = _candidate_preview_identity(
+        candidate_root,
+        expected_source_commit=expected_source_commit,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_run_id=expected_run_id,
+        expected_run_attempt=expected_run_attempt,
+    )
+    expected_title = f"OpenEvo Desktop {manifest['version']} Preview"
+    normalized = _normalized_preview_metadata(
+        metadata_path,
+        expected_repository=expected_repository,
+        expected_release_id=expected_release_id,
+        expected_tag=expected_tag,
+        expected_target=expected_source_commit,
+        expected_title=expected_title,
+        expected_draft=expected_draft,
+    )
+    observed_assets = normalized["assets"]
+    assert isinstance(observed_assets, list)
+    if [
+        {key: asset[key] for key in ("name", "sha256", "size")}
+        for asset in observed_assets
+    ] != expected_assets:
+        raise CandidateError("Preview release assets do not exactly match the candidate manifest")
+    for asset in observed_assets:
+        path = candidate_root / str(asset["name"])
+        if (
+            not _is_regular_file(path)
+            or path.stat().st_size != asset["size"]
+            or _sha256(path) != asset["sha256"]
+        ):
+            raise CandidateError(f"Downloaded Preview asset is invalid: {asset['name']}")
+    body = str(normalized["body"])
+    _validate_preview_body(body, release_notes)
+    snapshot = {
+        "assets": observed_assets,
+        "body": body,
+        "candidate_workflow": {
+            "run_attempt": expected_run_attempt,
+            "run_id": expected_run_id,
+        },
+        "draft": expected_draft,
+        "manifest_sha256": expected_manifest_sha256,
+        "prerelease": True,
+        "release_id": expected_release_id,
+        "repository": expected_repository,
+        "schema_version": 1,
+        "source_commit": expected_source_commit,
+        "tag": expected_tag,
+        "target_commitish": expected_source_commit,
+        "title": expected_title,
+    }
+    if baseline_path is not None:
+        baseline = _load_preview_snapshot(baseline_path)
+        expected = dict(baseline)
+        expected["draft"] = expected_draft
+        if snapshot != expected:
+            raise CandidateError("Preview release metadata or assets changed after draft validation")
+    _write_private_new(output, _canonical_json(snapshot))
+
+
+def write_preview_asset_plan(
+    output: Path,
+    *,
+    metadata_path: Path,
+    baseline_path: Path,
+    expected_draft: bool,
+) -> None:
+    baseline = _load_preview_snapshot(baseline_path)
+    normalized = _normalized_preview_metadata(
+        metadata_path,
+        expected_repository=str(baseline["repository"]),
+        expected_release_id=int(baseline["release_id"]),
+        expected_tag=str(baseline["tag"]),
+        expected_target=str(baseline["source_commit"]),
+        expected_title=str(baseline["title"]),
+        expected_draft=expected_draft,
+    )
+    expected = dict(baseline)
+    expected["draft"] = expected_draft
+    for field in (
+        "assets",
+        "body",
+        "draft",
+        "prerelease",
+        "release_id",
+        "target_commitish",
+        "title",
+    ):
+        if normalized[field] != expected[field]:
+            raise CandidateError("Preview release metadata or asset identities changed")
+    plan = "".join(f"{asset['id']}\t{asset['name']}\n" for asset in normalized["assets"])
+    _write_private_new(output, plan.encode("utf-8"))
+
+
+def assert_release_id_inventory(
+    inventory_path: Path,
+    *,
+    expected_tag: str,
+    expected_release_id: int,
+) -> None:
+    _require_positive_int(expected_release_id, "Expected release ID")
+    try:
+        lines = inventory_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("GitHub release ID inventory is unreadable") from exc
+    matches: list[int] = []
+    for line_number, line in enumerate(lines, start=1):
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise CandidateError(
+                f"GitHub release ID inventory line {line_number} is invalid"
+            ) from exc
+        if (
+            type(entry) is not dict
+            or set(entry) != {"id", "tag_name"}
+            or type(entry.get("tag_name")) is not str
+        ):
+            raise CandidateError(f"GitHub release ID inventory line {line_number} is invalid")
+        release_id = _require_positive_int(entry.get("id"), "GitHub release inventory ID")
+        if entry["tag_name"] == expected_tag:
+            matches.append(release_id)
+    if matches != [expected_release_id]:
+        raise CandidateError("Candidate tag does not resolve to the expected numeric release ID")
+
+
+def validate_candidate_workflow_run(
+    metadata_path: Path,
+    *,
+    expected_repository: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+    expected_source_commit: str,
+) -> None:
+    _validate_repository(expected_repository)
+    _require_positive_int(expected_run_id, "Expected candidate workflow run ID")
+    _require_positive_int(expected_run_attempt, "Expected candidate workflow run attempt")
+    if SOURCE_COMMIT_PATTERN.fullmatch(expected_source_commit) is None:
+        raise CandidateError("Expected candidate workflow source commit is invalid")
+    metadata = _load_json(metadata_path)
+    if type(metadata) is not dict or set(metadata) != CANDIDATE_WORKFLOW_RUN_KEYS:
+        raise CandidateError("Candidate workflow run metadata does not use the closed schema")
+    expected = {
+        "conclusion": "success",
+        "event": "workflow_dispatch",
+        "head_branch": "stable",
+        "head_sha": expected_source_commit,
+        "id": expected_run_id,
+        "path": ".github/workflows/openevo-desktop-candidate.yml",
+        "repository": expected_repository,
+        "run_attempt": expected_run_attempt,
+        "status": "completed",
+    }
+    if metadata != expected:
+        raise CandidateError("Candidate workflow run identity or result is invalid")
+
+
+def validate_published_tag_target(
+    inventory_path: Path,
+    *,
+    expected_tag: str,
+    expected_source_commit: str,
+) -> None:
+    if SOURCE_COMMIT_PATTERN.fullmatch(expected_source_commit) is None:
+        raise CandidateError("Expected published source commit is invalid")
+    try:
+        lines = inventory_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise CandidateError("Published tag inventory is unreadable") from exc
+    expected_line = f"{expected_source_commit}\trefs/tags/{expected_tag}"
+    if lines != [expected_line]:
+        raise CandidateError("Published Preview tag does not point to the expected source commit")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1352,6 +2307,15 @@ def main(argv: list[str] | None = None) -> int:
     write_notes.add_argument("--source-commit", required=True)
     write_notes.add_argument("--version", required=True)
     write_notes.add_argument("--architecture", required=True)
+    write_playwright = subparsers.add_parser("write-playwright-evidence")
+    write_playwright.add_argument("output", type=Path)
+    write_playwright.add_argument("--raw-report", type=Path, required=True)
+    write_playwright.add_argument("--sanitized-report-output", type=Path, required=True)
+    write_playwright.add_argument("--packaged-web-manifest", type=Path, required=True)
+    write_playwright.add_argument("--source-commit", required=True)
+    write_playwright.add_argument("--run-id", type=int, required=True)
+    write_playwright.add_argument("--run-attempt", type=int, required=True)
+    write_playwright.add_argument("--browser-version", required=True)
     write_draft_body = subparsers.add_parser("write-draft-body")
     write_draft_body.add_argument("output", type=Path)
     write_draft_body.add_argument("--release-notes", type=Path, required=True)
@@ -1370,6 +2334,13 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("manifest", type=Path)
     validate.add_argument("--expected-source-commit")
     validate.add_argument("--expected-core-platform")
+    validate_playwright = subparsers.add_parser("validate-playwright-evidence")
+    validate_playwright.add_argument("evidence", type=Path)
+    validate_playwright.add_argument("--report", type=Path, required=True)
+    validate_playwright.add_argument("--packaged-web-manifest", type=Path, required=True)
+    validate_playwright.add_argument("--expected-source-commit")
+    validate_playwright.add_argument("--expected-run-id", type=int)
+    validate_playwright.add_argument("--expected-run-attempt", type=int)
     validate_draft = subparsers.add_parser("validate-draft")
     validate_draft.add_argument("metadata", type=Path)
     validate_draft.add_argument("--release-notes", type=Path, required=True)
@@ -1379,6 +2350,38 @@ def main(argv: list[str] | None = None) -> int:
     validate_draft.add_argument("--expected-repository", required=True)
     validate_draft.add_argument("--expected-owner", required=True)
     validate_draft.add_argument("--release-id-output", type=Path)
+    snapshot_preview = subparsers.add_parser("snapshot-preview")
+    snapshot_preview.add_argument("output", type=Path)
+    snapshot_preview.add_argument("--metadata", type=Path, required=True)
+    snapshot_preview.add_argument("--candidate-root", type=Path, required=True)
+    snapshot_preview.add_argument("--baseline", type=Path)
+    snapshot_preview.add_argument("--expected-repository", required=True)
+    snapshot_preview.add_argument("--expected-release-id", type=int, required=True)
+    snapshot_preview.add_argument("--expected-tag", required=True)
+    snapshot_preview.add_argument("--expected-source-commit", required=True)
+    snapshot_preview.add_argument("--expected-manifest-sha256", required=True)
+    snapshot_preview.add_argument("--expected-run-id", type=int, required=True)
+    snapshot_preview.add_argument("--expected-run-attempt", type=int, required=True)
+    snapshot_preview.add_argument("--state", choices=("draft", "public"), required=True)
+    asset_plan = subparsers.add_parser("write-preview-asset-plan")
+    asset_plan.add_argument("output", type=Path)
+    asset_plan.add_argument("--metadata", type=Path, required=True)
+    asset_plan.add_argument("--baseline", type=Path, required=True)
+    asset_plan.add_argument("--state", choices=("draft", "public"), required=True)
+    assert_release_id = subparsers.add_parser("assert-release-id")
+    assert_release_id.add_argument("inventory", type=Path)
+    assert_release_id.add_argument("--expected-tag", required=True)
+    assert_release_id.add_argument("--expected-release-id", type=int, required=True)
+    validate_tag = subparsers.add_parser("validate-published-tag")
+    validate_tag.add_argument("inventory", type=Path)
+    validate_tag.add_argument("--expected-tag", required=True)
+    validate_tag.add_argument("--expected-source-commit", required=True)
+    validate_run = subparsers.add_parser("validate-candidate-run")
+    validate_run.add_argument("metadata", type=Path)
+    validate_run.add_argument("--expected-repository", required=True)
+    validate_run.add_argument("--expected-run-id", type=int, required=True)
+    validate_run.add_argument("--expected-run-attempt", type=int, required=True)
+    validate_run.add_argument("--expected-source-commit", required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == "write-notes":
@@ -1387,6 +2390,19 @@ def main(argv: list[str] | None = None) -> int:
                 source_commit=args.source_commit,
                 version=args.version,
                 architecture=args.architecture,
+            )
+            print(args.output)
+            return 0
+        if args.command == "write-playwright-evidence":
+            write_playwright_candidate_evidence(
+                args.output,
+                raw_report_path=args.raw_report,
+                sanitized_report_path=args.sanitized_report_output,
+                packaged_web_manifest_path=args.packaged_web_manifest,
+                source_commit=args.source_commit,
+                run_id=args.run_id,
+                run_attempt=args.run_attempt,
+                browser_version=args.browser_version,
             )
             print(args.output)
             return 0
@@ -1416,6 +2432,17 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(path)
             return 0
+        if args.command == "validate-playwright-evidence":
+            _validate_playwright_candidate_evidence(
+                args.evidence,
+                report_path=args.report,
+                packaged_web_manifest_path=args.packaged_web_manifest,
+                expected_source_commit=args.expected_source_commit,
+                expected_run_id=args.expected_run_id,
+                expected_run_attempt=args.expected_run_attempt,
+            )
+            print(f"OpenEvo Playwright evidence validation passed: {args.evidence}")
+            return 0
         if args.command == "validate-draft":
             release_id = validated_draft_release_id(
                 args.metadata,
@@ -1432,6 +2459,58 @@ def main(argv: list[str] | None = None) -> int:
                     f"{release_id}\n".encode("ascii"),
                 )
             print(f"OpenEvo draft release metadata validation passed: {args.metadata}")
+            return 0
+        if args.command == "snapshot-preview":
+            write_preview_release_snapshot(
+                args.output,
+                metadata_path=args.metadata,
+                candidate_root=args.candidate_root,
+                baseline_path=args.baseline,
+                expected_repository=args.expected_repository,
+                expected_release_id=args.expected_release_id,
+                expected_tag=args.expected_tag,
+                expected_source_commit=args.expected_source_commit,
+                expected_manifest_sha256=args.expected_manifest_sha256,
+                expected_run_id=args.expected_run_id,
+                expected_run_attempt=args.expected_run_attempt,
+                expected_draft=args.state == "draft",
+            )
+            print(args.output)
+            return 0
+        if args.command == "write-preview-asset-plan":
+            write_preview_asset_plan(
+                args.output,
+                metadata_path=args.metadata,
+                baseline_path=args.baseline,
+                expected_draft=args.state == "draft",
+            )
+            print(args.output)
+            return 0
+        if args.command == "assert-release-id":
+            assert_release_id_inventory(
+                args.inventory,
+                expected_tag=args.expected_tag,
+                expected_release_id=args.expected_release_id,
+            )
+            print(f"GitHub release ID is validated: {args.expected_release_id}")
+            return 0
+        if args.command == "validate-published-tag":
+            validate_published_tag_target(
+                args.inventory,
+                expected_tag=args.expected_tag,
+                expected_source_commit=args.expected_source_commit,
+            )
+            print(f"Published tag target is validated: {args.expected_tag}")
+            return 0
+        if args.command == "validate-candidate-run":
+            validate_candidate_workflow_run(
+                args.metadata,
+                expected_repository=args.expected_repository,
+                expected_run_id=args.expected_run_id,
+                expected_run_attempt=args.expected_run_attempt,
+                expected_source_commit=args.expected_source_commit,
+            )
+            print(f"Candidate workflow run is validated: {args.expected_run_id}")
             return 0
         errors = validate_candidate_manifest(
             args.manifest,

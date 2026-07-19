@@ -1,33 +1,66 @@
 # OpenEvo Desktop Quickstart
 
-This guide runs one science session, lets OpenEvo produce cross-session text
-artifacts, and then runs a second session with the committed result.
+This guide describes the `0.1.2` exhibition candidate. Follow it only after the
+`0.1.2` GitHub Release is public. The Preview publication workflow verifies the
+exact packaged applications and assets, but it does not establish the canonical
+two-session science gate or general host support.
 
 ## Before You Start
 
 You need:
 
-- a Mac and remote Linux server listed as supported in the release notes;
+- an Apple Silicon Mac running macOS 12 or later;
+- a remote Linux x86-64 server reachable over SSH and matching the exhibition
+  Docker user-container assumptions;
 - the release DMG and its published checksum;
 - an SSH key available through the macOS SSH agent;
-- Docker Engine available to your remote SSH user;
+- Docker Engine configured so your remote SSH user can run user containers;
 - Codex CLI installed and signed in to a subscription as that same remote user.
 
 See [Remote server setup](remote-server-setup.md) before connecting.
 
 ## Install The Unsigned DMG
 
-1. Download the Preview DMG and checksum from
-   [GitHub Releases](https://github.com/CompLifeLab-ZJU/OpenEvo/releases).
-2. Verify that the DMG checksum matches the release checksum.
+1. Confirm that the public release title is **OpenEvo Desktop 0.1.2 Preview**,
+   then download `OpenEvo-Desktop-0.1.2-aarch64.dmg` and `SHA256SUMS` from that
+   same immutable
+   [GitHub Release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases).
+2. Verify the exact DMG checksum recorded by that release:
+
+   ```bash
+   grep '  OpenEvo-Desktop-0.1.2-aarch64.dmg$' SHA256SUMS \
+     | shasum -a 256 -c -
+   ```
+
 3. Open the DMG and move **OpenEvo Desktop** to **Applications**.
 4. Try to open OpenEvo Desktop. macOS will warn that it cannot verify the
    developer because this Preview is unsigned and not notarized.
-5. Open **System Settings > Privacy & Security**, find the blocked OpenEvo
-   message, choose **Open Anyway**, and confirm only if the release identity is
-   the one you verified.
+5. After verifying the checksum, quit the app and clear quarantine from only the
+   installed application:
+
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/OpenEvo Desktop.app"
+   ```
+
+6. Reopen **OpenEvo Desktop**. If command-line recovery is unavailable, use
+   **System Settings > Privacy & Security > Open Anyway** for this verified app.
 
 The wording and location of **Open Anyway** can vary by macOS version.
+Do not clear quarantine from a parent directory or from an unverified download.
+
+## Explore The Built-In Project
+
+Before a server is configured, Desktop opens the read-only **酶动力学模型复核**
+example. Use **Research** to inspect three synthetic task sessions, their
+de-identified reasoning and tool summaries, and the progression from baseline
+failure to a validated result. Use **Evolution** to inspect textual-memory,
+trajectory-to-skill, and agent-system histories plus their readable
+`memory.md`, `SKILL.md`, and `AGENTS.md` outputs.
+
+The example is always labelled **内置示例 · 只读**. It is synthetic Desktop
+content, does not represent a completed remote run, and performs no SSH,
+Daemon, Core, or network action. It remains available in the project selector
+after real projects are created.
 
 ## Connect The Server
 
@@ -44,10 +77,13 @@ Desktop uses the SSH agent already running on the Mac. This Preview does not
 accept an SSH password, a private-key file, or a passphrase in the app.
 
 During connection and activation, Desktop transfers and verifies the
-version-matched OpenEvo Daemon and managed science runtime. Do not install the
-Daemon with `pip` and do not upload a runtime image. A normal first preparation
-can take time. **Cancel operation** stops that connection or preparation
-attempt and leaves it retryable.
+version-matched self-contained OpenEvo Daemon Bundle and managed science
+runtime. The current Preview does not prepare Docker or Codex: the remote SSH
+user must already be able to run Docker user containers, and Codex must already
+be installed and signed in for that user. Do not install the Daemon with `pip`
+and do not upload a runtime image. A normal first preparation can take time.
+**Cancel operation** stops that connection or preparation attempt and leaves it
+retryable.
 
 ## Create A Project
 
@@ -70,19 +106,18 @@ Activation checks the remote Codex installation, subscription login, Docker
 Engine, managed science runtime, and Daemon services. It does not install or
 sign in to Codex. Follow any typed remediation shown by Desktop, then retry.
 
-## Run Two Sessions
+## Try The Exhibition Workflow
 
 1. Start the first session and follow its timeline and transcript.
-2. Wait until the session finishes and the successor revision is active.
+2. Wait until the session and its reported evolution work finish.
 3. Open **Evolution** to inspect the selected memory, skill, and agent-system
    artifacts and their changes.
 4. Start a second session in the same project.
 
-Evolution never changes the session that produced it. Session N captures a
-transcript and produces the selected artifacts only after it finishes. Session
-N+1 uses the complete committed successor revision. If that successor is still
-being prepared, Desktop waits or blocks submission instead of running with a
-partial or stale revision.
+The canonical product requires evolution to affect only later sessions and
+requires Desktop to block stale or partial successor state. The `0.1.2` v1
+Preview does not yet prove that complete authority contract. Do not use it for
+work that depends on atomic cross-session guarantees.
 
 Transcript mode does not provide token IDs, loss masks, or token-level
 log-probability metrics.

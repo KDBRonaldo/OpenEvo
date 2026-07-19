@@ -17,6 +17,7 @@ import {
   type DesktopProductProvider,
   type ProjectSourceSelectionIntent,
   type ReleaseDesktopProductProvider,
+  withOperationContinuationAuthority,
 } from "./provider";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
 
@@ -188,8 +189,9 @@ export async function createReleaseDesktopProductProvider(
       });
     }
     assertReleaseProvider(provider);
+    const authoritativeProvider = withOperationContinuationAuthority(provider);
     reportStageBestEffort(reportStage, "provider_adapter_ready");
-    return provider;
+    return authoritativeProvider;
   } catch (error) {
     reportStageBestEffort(reportStage, "provider_adapter_failed");
     throw error;
@@ -278,5 +280,18 @@ function assertReleaseProvider(
   }
   if (typeof provider.getRunRetryRecovery !== "function") {
     throw new DesktopContractError("Release provider adapter is missing durable run retry recovery");
+  }
+  const requiredSystemActions: ReadonlyArray<keyof DesktopProductProvider> = [
+    "getLocalOperation",
+    "doctorProject",
+    "repairProject",
+    "restartService",
+    "getCoreOperation",
+    "createDiagnostic",
+    "getDiagnostic",
+    "cleanupCaches",
+  ];
+  if (requiredSystemActions.some((action) => typeof provider[action] !== "function")) {
+    throw new DesktopContractError("Release provider adapter is missing System recovery capabilities");
   }
 }

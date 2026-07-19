@@ -7,7 +7,9 @@ import {
   artifactContentV1Schema,
   artifactDiffV1Schema,
   artifactV1Schema,
+  cacheCleanupRequestV1Schema,
   desktopStateV1Schema,
+  diagnosticCreateV1Schema,
   diagnosticReportV1Schema,
   localOperationV1Schema,
   logEntryV1Schema,
@@ -24,14 +26,21 @@ import {
   type LocalOperationV1,
 } from "../api/v1/schemas";
 import { LocalApiDesktopProductProvider } from "./localApiProvider";
-import { DesktopProductAmbiguousMutationError } from "./provider";
+import {
+  DesktopProductAmbiguousMutationError,
+  OperationContinuationAuthority,
+} from "./provider";
 import type { ProductRunRetryRecoveryStore } from "./runRetryRecovery";
 
 const A = "a".repeat(64);
 const B = "b".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
+const ETAG_C = `"${"c".repeat(64)}"`;
+const ETAG_D = `"${"d".repeat(64)}"`;
 const NOW = "2026-07-14T12:00:00Z";
+const LATER = "2026-07-14T12:00:01Z";
+const LATEST = "2026-07-14T12:00:02Z";
 
 describe("LocalApiDesktopProductProvider", () => {
   it("fails closed without persistent retry recovery and preserves an invalid saved record", () => {
@@ -330,6 +339,295 @@ describe("LocalApiDesktopProductProvider", () => {
       etag: ETAG_B,
     })).rejects.toThrow("unknown network outcome");
     expect(unknown.createRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("maps System recovery mutations to their exact Local API authorities", async () => {
+    const client = mockClient();
+    const doctorOperation = localOperation("project_doctor", "project", "project-fixture-1");
+    client.doctorProject = vi.fn().mockResolvedValue(doctorOperation);
+    client.getOperation = vi.fn().mockResolvedValue(doctorOperation);
+    client.repairProject = vi.fn().mockResolvedValue(
+      localOperation("project_repair", "project", "project-fixture-1", "operation-repair-fixture-1"),
+    );
+    client.cleanupMaintenanceCache = vi.fn().mockResolvedValue(
+      operationV1Schema.parse(CONTRACT_FIXTURE_V1.cacheOperation),
+    );
+    client.getCoreOperation = vi.fn().mockResolvedValue(
+      operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation),
+    );
+    const provider = createProvider(client);
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("expected a fresh fixture");
+    const streamEpoch = refreshed.snapshot.stream.epoch;
+    const projectIntent = {
+      actionId: "renderer-system-project-0001",
+      streamEpoch,
+      etag: ETAG_B,
+    };
+
+    await provider.doctorProject("project-fixture-1", projectIntent);
+    expect(client.doctorProject).toHaveBeenCalledWith(
+      "project-fixture-1",
+      { idempotencyKey: projectIntent.actionId, ifMatch: ETAG_B },
+    );
+    await expect(provider.getLocalOperation("operation-fixture-1")).resolves.toMatchObject({
+      operation_id: "operation-fixture-1",
+    });
+    expect(client.getOperation).toHaveBeenCalledWith("operation-fixture-1");
+
+    const afterDoctor = await provider.refresh();
+    if (afterDoctor.status !== "fresh") throw new Error("expected a fresh fixture");
+    const repairIntent = {
+      actionId: "renderer-system-repair-0001",
+      streamEpoch: afterDoctor.snapshot.stream.epoch,
+      etag: ETAG_B,
+    };
+    await provider.repairProject("project-fixture-1", repairIntent);
+    expect(client.repairProject).toHaveBeenCalledWith(
+      "project-fixture-1",
+      { idempotencyKey: repairIntent.actionId, ifMatch: ETAG_B },
+    );
+
+    const afterRepair = await provider.refresh();
+    if (afterRepair.status !== "fresh") throw new Error("expected a fresh fixture");
+    const serviceIntent = {
+      actionId: "renderer-system-service-0001",
+      streamEpoch: afterRepair.snapshot.stream.epoch,
+      etag: ETAG_B,
+    };
+    await provider.restartService("service-control-fixture-1", serviceIntent);
+    expect(client.restartService).toHaveBeenCalledWith(
+      "service-control-fixture-1",
+      { idempotencyKey: serviceIntent.actionId, ifMatch: ETAG_B },
+    );
+
+    const coreOperation = await provider.getCoreOperation("core-operation-service-fixture-1");
+    expect(coreOperation.id).toBe("core-operation-service-fixture-1");
+
+    const afterService = await provider.refresh();
+    if (afterService.status !== "fresh") throw new Error("expected a fresh fixture");
+    const diagnosticIntent = {
+      actionId: "renderer-system-diagnostic-0001",
+      streamEpoch: afterService.snapshot.stream.epoch,
+    };
+    const diagnosticRequest = diagnosticCreateV1Schema.parse(CONTRACT_FIXTURE_V1.diagnosticRequest);
+    await provider.createDiagnostic(diagnosticRequest, diagnosticIntent);
+    expect(client.createDiagnostic).toHaveBeenCalledWith(
+      diagnosticRequest,
+      { idempotencyKey: diagnosticIntent.actionId },
+    );
+    await expect(provider.getDiagnostic("diagnostic-fixture-1")).resolves.toMatchObject({
+      id: "diagnostic-fixture-1",
+    });
+
+    const afterDiagnostic = await provider.refresh();
+    if (afterDiagnostic.status !== "fresh") throw new Error("expected a fresh fixture");
+    const cleanupIntent = {
+      actionId: "renderer-system-cleanup-0001",
+      streamEpoch: afterDiagnostic.snapshot.stream.epoch,
+    };
+    const cleanupRequest = cacheCleanupRequestV1Schema.parse(CONTRACT_FIXTURE_V1.cacheCleanupRequest);
+    await provider.cleanupCaches(cleanupRequest, cleanupIntent);
+    expect(client.cleanupMaintenanceCache).toHaveBeenCalledWith(
+      cleanupRequest,
+      { idempotencyKey: cleanupIntent.actionId },
+    );
+  });
+
+  it("rejects same-ETag mutation and immutable identity cross-wiring", () => {
+    const authority = new OperationContinuationAuthority();
+    const running = localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation);
+    authority.observeLocal(running);
+
+    const sameEtagMutation = localOperationV1Schema.parse({
+      ...running,
+      progress: { ...running.progress, current: 3 },
+    });
+    expect(() => authority.observeLocal(sameEtagMutation)).toThrow(/without changing ETag/i);
+
+    const crossWired = localOperationV1Schema.parse({
+      ...running,
+      resource: { resource_type: "project", resource_id: "project-cross-wired" },
+      etag: ETAG_B,
+    });
+    expect(() => authority.observeLocal(crossWired)).toThrow(/immutable identity/i);
+  });
+
+  it("rejects an exact Local operation representation after a newer ETag was observed", () => {
+    const authority = new OperationContinuationAuthority();
+    const first = localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation);
+    const second = localOperationV1Schema.parse({
+      ...first,
+      progress: { ...first.progress!, current: first.progress!.current + 1 },
+      etag: ETAG_B,
+    });
+
+    authority.observeLocal(first);
+    authority.observeLocal(second);
+
+    expect(() => authority.observeLocal(first)).toThrow(/superseded ETag/i);
+  });
+
+  it("rejects backward states, terminal rewrites, and invalid remote time shapes", () => {
+    const authority = new OperationContinuationAuthority();
+    const queued = operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation);
+    const running = operationV1Schema.parse({
+      ...queued,
+      status: "running",
+      updated_at: LATER,
+      observed_at: LATER,
+      etag: ETAG_B,
+    });
+    authority.observeCore(queued);
+    authority.observeCore(running);
+
+    const backwards = operationV1Schema.parse({
+      ...queued,
+      updated_at: LATEST,
+      observed_at: LATEST,
+      etag: ETAG_C,
+    });
+    expect(() => authority.observeCore(backwards)).toThrow(/backwards/i);
+
+    const terminal = operationV1Schema.parse({
+      ...running,
+      status: "succeeded",
+      result: {
+        kind: "service_restart",
+        service: serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service),
+      },
+      updated_at: LATEST,
+      observed_at: LATEST,
+      finished_at: LATEST,
+      etag: ETAG_C,
+    });
+    authority.observeCore(terminal);
+    const rewrittenTerminal = operationV1Schema.parse({
+      ...terminal,
+      result: {
+        kind: "service_restart",
+        service: {
+          ...serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service),
+          status_message: "Rewritten terminal result.",
+        },
+      },
+      etag: ETAG_D,
+    });
+    expect(() => authority.observeCore(rewrittenTerminal)).toThrow(/terminal representation/i);
+
+    const invalidTime = operationV1Schema.parse({
+      ...queued,
+      id: "core-operation-invalid-time",
+      updated_at: LATER,
+      observed_at: NOW,
+      etag: ETAG_D,
+    });
+    expect(() => authority.observeCore(invalidTime)).toThrow(/observed_at/i);
+  });
+
+  it("accepts legal Local, Core, and diagnostic progressions", () => {
+    const authority = new OperationContinuationAuthority();
+    const localRunning = localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation);
+    const localTerminal = localOperationV1Schema.parse({
+      ...localRunning,
+      state: "succeeded",
+      progress: localRunning.progress === null
+        ? null
+        : { ...localRunning.progress, current: localRunning.progress.total },
+      finished_at: LATER,
+      etag: ETAG_B,
+    });
+    expect(authority.observeLocal(localRunning).state).toBe("running");
+    expect(authority.observeLocal(localTerminal).state).toBe("succeeded");
+
+    const coreQueued = operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation);
+    const coreRunning = operationV1Schema.parse({
+      ...coreQueued,
+      status: "running",
+      updated_at: LATER,
+      observed_at: LATER,
+      etag: ETAG_B,
+    });
+    const coreTerminal = operationV1Schema.parse({
+      ...coreRunning,
+      status: "succeeded",
+      result: {
+        kind: "service_restart",
+        service: serviceV1Schema.parse(CONTRACT_FIXTURE_V1.service),
+      },
+      updated_at: LATEST,
+      observed_at: LATEST,
+      finished_at: LATEST,
+      etag: ETAG_C,
+    });
+    expect(authority.observeCore(coreQueued).status).toBe("queued");
+    expect(authority.observeCore(coreRunning).status).toBe("running");
+    expect(authority.observeCore(coreTerminal).status).toBe("succeeded");
+
+    const diagnosticRunning = diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic);
+    const diagnosticTerminal = diagnosticReportV1Schema.parse({
+      ...diagnosticRunning,
+      status: "succeeded",
+      updated_at: LATER,
+      observed_at: LATER,
+      finished_at: LATER,
+      etag: ETAG_C,
+    });
+    expect(authority.observeDiagnostic(diagnosticRunning).status).toBe("running");
+    expect(authority.observeDiagnostic(diagnosticTerminal).status).toBe("succeeded");
+  });
+
+  it("does not update continuation authority after a failed request", async () => {
+    const client = mockClient();
+    const queued = operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation);
+    const running = operationV1Schema.parse({
+      ...queued,
+      status: "running",
+      updated_at: LATER,
+      observed_at: LATER,
+      etag: ETAG_B,
+    });
+    client.getCoreOperation = vi.fn()
+      .mockResolvedValueOnce(queued)
+      .mockRejectedValueOnce(new TypeError("poll transport failed"))
+      .mockResolvedValueOnce(running);
+    const provider = createProvider(client);
+
+    await expect(provider.getCoreOperation(queued.id)).resolves.toMatchObject({ status: "queued" });
+    await expect(provider.getCoreOperation(queued.id)).rejects.toThrow("poll transport failed");
+    await expect(provider.getCoreOperation(queued.id)).resolves.toMatchObject({ status: "running" });
+  });
+
+  it("bounds resource and per-resource ETag continuation caches", () => {
+    const authority = new OperationContinuationAuthority({
+      maxResources: 2,
+      maxEtagsPerResource: 2,
+    });
+    const base = localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation);
+    authority.observeLocal(base);
+    authority.observeLocal(localOperationV1Schema.parse({
+      ...base,
+      operation_id: "operation-cache-2",
+    }));
+    authority.observeLocal(localOperationV1Schema.parse({
+      ...base,
+      operation_id: "operation-cache-3",
+    }));
+    expect(authority.cachedResourceCount).toBe(2);
+
+    authority.observeLocal(localOperationV1Schema.parse({
+      ...base,
+      operation_id: "operation-cache-3",
+      progress: { ...base.progress!, current: 3 },
+      etag: ETAG_B,
+    }));
+    authority.observeLocal(localOperationV1Schema.parse({
+      ...base,
+      operation_id: "operation-cache-3",
+      progress: { ...base.progress!, current: 4 },
+      etag: ETAG_C,
+    }));
+    expect(authority.cachedRepresentationCount).toBeLessThanOrEqual(4);
   });
 
   it("replays an ambiguous run retry with its exact stale renderer intent", async () => {
@@ -1085,11 +1383,14 @@ function mockClient(): DesktopApiClientV1 & Record<string, ReturnType<typeof vi.
     cancelRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
     retryRun: vi.fn().mockResolvedValue(runV1Schema.parse(CONTRACT_FIXTURE_V1.run)),
     cancelOperation: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
+    doctorProject: vi.fn().mockResolvedValue(localOperation("project_doctor", "project", "project-fixture-1")),
+    getCoreOperation: vi.fn().mockResolvedValue(operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation)),
     createDiagnostic: vi.fn().mockResolvedValue(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic)),
     getDiagnostic: vi.fn().mockResolvedValue(diagnosticReportV1Schema.parse(CONTRACT_FIXTURE_V1.diagnostic)),
     artifactContent: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.artifactContent),
     artifactDiff: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.artifactDiff),
     repairProject: vi.fn().mockResolvedValue(localOperationV1Schema.parse(CONTRACT_FIXTURE_V1.operation)),
+    cleanupMaintenanceCache: vi.fn().mockResolvedValue(operationV1Schema.parse(CONTRACT_FIXTURE_V1.cacheOperation)),
     eventStreamRequest: vi.fn().mockResolvedValue({ url: "http://127.0.0.1/events", headers: {} }),
   } as unknown as DesktopApiClientV1 & Record<string, ReturnType<typeof vi.fn>>;
 }

@@ -1,0 +1,568 @@
+name: Publish validated OpenEvo Desktop Preview
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_tag:
+        description: Exact validated draft Preview tag
+        required: true
+      expected_release_id:
+        description: Exact numeric GitHub release ID from candidate verification
+        required: true
+      expected_source_sha:
+        description: Exact 40-character candidate source commit
+        required: true
+      expected_release_candidate_manifest_sha256:
+        description: Exact SHA-256 of release-candidate.json
+        required: true
+      candidate_workflow_run_id:
+        description: Candidate workflow run ID that produced the draft
+        required: true
+      candidate_workflow_run_attempt:
+        description: Candidate workflow run attempt that produced the draft
+        required: true
+      confirmation:
+        description: Type publish-preview to authorize the visibility change
+        required: true
+
+permissions: {}
+
+concurrency:
+  group: openevo-desktop-preview-publisher-${{ inputs.candidate_tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-preview:
+    name: Revalidate Preview with read-only authority
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the workflow policy revision, never candidate code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          path: publication-policy
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.15"
+
+      - name: Validate explicit publication authority
+        env:
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_workflow_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_workflow_run_id }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          POLICY_SHA: ${{ github.workflow_sha }}
+        run: |
+          test "$GITHUB_REF" = "refs/heads/stable"
+          test "$(git -C publication-policy rev-parse HEAD)" = "$POLICY_SHA"
+          [[ "$POLICY_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$CANDIDATE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          test "$CONFIRMATION" = "publish-preview"
+          git check-ref-format "refs/tags/$CANDIDATE_TAG"
+
+      - name: Verify the exact successful candidate workflow run
+        env:
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_workflow_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_workflow_run_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${CANDIDATE_RUN_ID}" \
+            --jq '{id,run_attempt,event,status,conclusion,head_branch,head_sha,path,repository:.repository.full_name}' \
+            > "$RUNNER_TEMP/candidate-workflow-run.json"
+          python publication-policy/scripts/ci/openevo_release_candidate.py validate-candidate-run \
+            "$RUNNER_TEMP/candidate-workflow-run.json" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-run-id "$CANDIDATE_RUN_ID" \
+            --expected-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --expected-source-commit "$EXPECTED_SOURCE_SHA"
+
+      - name: Download candidate-owned draft verification snapshot
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: openevo-desktop-draft-verification-${{ inputs.expected_source_sha }}-${{ inputs.candidate_workflow_run_id }}-${{ inputs.candidate_workflow_run_attempt }}
+          path: ${{ runner.temp }}/candidate-verification
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_workflow_run_id }}
+
+      - name: Resolve and re-read the exact numeric draft release
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test -f "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json"
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | {id: .id, tag_name: .tag_name}' \
+            > "$RUNNER_TEMP/release-id-inventory.jsonl"
+          python publication-policy/scripts/ci/openevo_release_candidate.py assert-release-id \
+            "$RUNNER_TEMP/release-id-inventory.jsonl" \
+            --expected-tag "$CANDIDATE_TAG" \
+            --expected-release-id "$EXPECTED_RELEASE_ID"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
+            --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
+            > "$RUNNER_TEMP/draft-release-rest.json"
+
+      - name: Download every draft asset by immutable asset ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          umask 077
+          python publication-policy/scripts/ci/openevo_release_candidate.py write-preview-asset-plan \
+            "$RUNNER_TEMP/draft-asset-plan.tsv" \
+            --metadata "$RUNNER_TEMP/draft-release-rest.json" \
+            --baseline "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
+            --state draft
+          draft_dir="$RUNNER_TEMP/downloaded-draft-preview"
+          test ! -e "$draft_dir"
+          mkdir -m 700 "$draft_dir"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            test ! -e "$draft_dir/$asset_name"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "$draft_dir/$asset_name"
+            chmod 0600 "$draft_dir/$asset_name"
+          done < "$RUNNER_TEMP/draft-asset-plan.tsv"
+
+      - name: Fail closed unless the draft is the exact reviewed candidate
+        env:
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_workflow_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_workflow_run_id }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
+            --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
+            > "$RUNNER_TEMP/prepublication-release-rest.json"
+          python publication-policy/scripts/ci/openevo_release_candidate.py snapshot-preview \
+            "$RUNNER_TEMP/prepublication-preview-snapshot.json" \
+            --metadata "$RUNNER_TEMP/prepublication-release-rest.json" \
+            --candidate-root "$RUNNER_TEMP/downloaded-draft-preview" \
+            --baseline "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-release-id "$EXPECTED_RELEASE_ID" \
+            --expected-tag "$CANDIDATE_TAG" \
+            --expected-source-commit "$EXPECTED_SOURCE_SHA" \
+            --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256" \
+            --expected-run-id "$CANDIDATE_RUN_ID" \
+            --expected-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --state draft
+
+          set +e
+          git -C publication-policy ls-remote --exit-code --refs origin "refs/tags/$CANDIDATE_TAG" \
+            > "$RUNNER_TEMP/prepublication-tag.txt"
+          tag_status=$?
+          set -e
+          if [ "$tag_status" -eq 0 ]; then
+            echo "Preview tag already exists before publication: $CANDIDATE_TAG" >&2
+            exit 1
+          fi
+          if [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove Preview tag absence: $CANDIDATE_TAG" >&2
+            exit 1
+          fi
+
+      - name: Retain read-only prepublication verification
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-desktop-preview-prepublication-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/prepublication-preview-snapshot.json
+            ${{ runner.temp }}/prepublication-tag.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-preview:
+    name: Apply the fixed visibility mutation
+    needs: verify-preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: openevo-preview-publication
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.15"
+
+      - name: Download the candidate-owned verification snapshot as data only
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: openevo-desktop-draft-verification-${{ inputs.expected_source_sha }}-${{ inputs.candidate_workflow_run_id }}-${{ inputs.candidate_workflow_run_attempt }}
+          path: ${{ runner.temp }}/candidate-verification
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_workflow_run_id }}
+
+      - name: Revalidate immutable candidate data and publish by numeric ID
+        env:
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_workflow_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_workflow_run_id }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          CONFIRMATION: ${{ inputs.confirmation }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          GH_TOKEN: ${{ github.token }}
+          SNAPSHOT_PATH: ${{ runner.temp }}/candidate-verification/preview-release-snapshot.json
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          from urllib.error import HTTPError
+          from urllib.parse import quote, urlsplit
+          from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
+
+          repository = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          release_id_text = os.environ["EXPECTED_RELEASE_ID"]
+          tag = os.environ["CANDIDATE_TAG"]
+          source = os.environ["EXPECTED_SOURCE_SHA"]
+          manifest_sha256 = os.environ["EXPECTED_MANIFEST_SHA256"]
+          run_id_text = os.environ["CANDIDATE_RUN_ID"]
+          run_attempt_text = os.environ["CANDIDATE_RUN_ATTEMPT"]
+          if os.environ["CONFIRMATION"] != "publish-preview":
+              raise SystemExit("Explicit Preview publication confirmation is missing")
+          if not re.fullmatch(r"[1-9][0-9]*", release_id_text):
+              raise SystemExit("Release ID is invalid")
+          if not re.fullmatch(r"[1-9][0-9]*", run_id_text):
+              raise SystemExit("Candidate run ID is invalid")
+          if not re.fullmatch(r"[1-9][0-9]*", run_attempt_text):
+              raise SystemExit("Candidate run attempt is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", source):
+              raise SystemExit("Candidate source SHA is invalid")
+          if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256):
+              raise SystemExit("Candidate manifest SHA-256 is invalid")
+          if not tag or len(tag) > 200 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]+", tag):
+              raise SystemExit("Candidate tag is invalid")
+
+          release_id = int(release_id_text)
+          run_id = int(run_id_text)
+          run_attempt = int(run_attempt_text)
+          snapshot_path = Path(os.environ["SNAPSHOT_PATH"])
+          snapshot_bytes = snapshot_path.read_bytes()
+          snapshot = json.loads(snapshot_bytes)
+          canonical = (json.dumps(snapshot, separators=(",", ":"), sort_keys=True) + "\n").encode()
+          if snapshot_bytes != canonical:
+              raise SystemExit("Candidate snapshot is not canonical JSON")
+          expected_snapshot_keys = {
+              "assets", "body", "candidate_workflow", "draft", "manifest_sha256",
+              "prerelease", "release_id", "repository", "schema_version",
+              "source_commit", "tag", "target_commitish", "title",
+          }
+          if type(snapshot) is not dict or set(snapshot) != expected_snapshot_keys:
+              raise SystemExit("Candidate snapshot schema is invalid")
+          expected_identity = {
+              "draft": True,
+              "manifest_sha256": manifest_sha256,
+              "prerelease": True,
+              "release_id": release_id,
+              "repository": repository,
+              "schema_version": 1,
+              "source_commit": source,
+              "tag": tag,
+              "target_commitish": source,
+          }
+          if any(snapshot.get(key) != value for key, value in expected_identity.items()):
+              raise SystemExit("Candidate snapshot identity does not match publication inputs")
+          if snapshot.get("candidate_workflow") != {
+              "run_attempt": run_attempt,
+              "run_id": run_id,
+          }:
+              raise SystemExit("Candidate snapshot workflow identity is invalid")
+          if type(snapshot.get("title")) is not str or not snapshot["title"]:
+              raise SystemExit("Candidate snapshot title is invalid")
+          if type(snapshot.get("body")) is not str or not snapshot["body"]:
+              raise SystemExit("Candidate snapshot body is invalid")
+          assets = snapshot.get("assets")
+          if type(assets) is not list or not assets:
+              raise SystemExit("Candidate snapshot asset inventory is empty")
+          if assets != sorted(assets, key=lambda entry: str(entry.get("name", ""))):
+              raise SystemExit("Candidate snapshot assets are not canonically ordered")
+          expected_assets = []
+          seen_ids: set[int] = set()
+          seen_names: set[str] = set()
+          for asset in assets:
+              if type(asset) is not dict or set(asset) != {"id", "name", "sha256", "size"}:
+                  raise SystemExit("Candidate snapshot asset schema is invalid")
+              asset_id = asset.get("id")
+              name = asset.get("name")
+              digest = asset.get("sha256")
+              size = asset.get("size")
+              if (
+                  type(asset_id) is not int
+                  or asset_id < 1
+                  or asset_id in seen_ids
+                  or type(name) is not str
+                  or not name
+                  or name in {".", ".."}
+                  or "/" in name
+                  or "\\" in name
+                  or name in seen_names
+                  or type(size) is not int
+                  or size < 1
+                  or type(digest) is not str
+                  or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+              ):
+                  raise SystemExit("Candidate snapshot asset identity is invalid")
+              seen_ids.add(asset_id)
+              seen_names.add(name)
+              expected_assets.append(asset)
+
+          api_root = f"https://api.github.com/repos/{repository}"
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "User-Agent": "openevo-preview-fixed-publisher",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def api_json(path: str, *, method: str = "GET", body: bytes | None = None) -> object:
+              request_headers = dict(headers)
+              if body is not None:
+                  request_headers["Content-Type"] = "application/json"
+              request = Request(
+                  f"{api_root}{path}",
+                  data=body,
+                  method=method,
+                  headers=request_headers,
+              )
+              with urlopen(request, timeout=60) as response:
+                  return json.load(response)
+
+          class RejectRedirects(HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  return None
+
+          def open_asset(asset_id: int):
+              request = Request(
+                  f"{api_root}/releases/assets/{asset_id}",
+                  headers={**headers, "Accept": "application/octet-stream"},
+              )
+              try:
+                  return build_opener(RejectRedirects).open(request, timeout=60)
+              except HTTPError as exc:
+                  if exc.code not in {301, 302, 303, 307, 308}:
+                      raise
+                  location = exc.headers.get("Location")
+                  if type(location) is not str:
+                      raise SystemExit("Release asset redirect is missing")
+                  parsed = urlsplit(location)
+                  if (
+                      parsed.scheme != "https"
+                      or not parsed.netloc
+                      or parsed.username is not None
+                      or parsed.password is not None
+                      or parsed.fragment
+                  ):
+                      raise SystemExit("Release asset redirect is invalid")
+                  return urlopen(
+                      Request(
+                          location,
+                          headers={"User-Agent": "openevo-preview-fixed-publisher"},
+                      ),
+                      timeout=180,
+                  )
+
+          try:
+              api_json(f"/git/ref/tags/{quote(tag, safe='')}")
+          except HTTPError as exc:
+              if exc.code != 404:
+                  raise
+          else:
+              raise SystemExit("Preview tag already exists before publication")
+
+          def assert_release(payload: object, *, draft: bool, immutable: bool) -> None:
+              if type(payload) is not dict:
+                  raise SystemExit("Release metadata is invalid")
+              identity = {
+                  "body": snapshot["body"],
+                  "draft": draft,
+                  "id": release_id,
+                  "immutable": immutable,
+                  "name": snapshot["title"],
+                  "prerelease": True,
+                  "tag_name": tag,
+                  "target_commitish": source,
+              }
+              if any(payload.get(key) != value for key, value in identity.items()):
+                  raise SystemExit("Release metadata changed after candidate verification")
+              observed = []
+              raw_assets = payload.get("assets")
+              if type(raw_assets) is not list:
+                  raise SystemExit("Release asset inventory is invalid")
+              for asset in raw_assets:
+                  if type(asset) is not dict or asset.get("state") != "uploaded":
+                      raise SystemExit("Release asset is not uploaded")
+                  digest = asset.get("digest")
+                  if type(digest) is not str or not digest.startswith("sha256:"):
+                      raise SystemExit("Release asset API digest is unavailable")
+                  observed.append({
+                      "id": asset.get("id"),
+                      "name": asset.get("name"),
+                      "sha256": digest.removeprefix("sha256:"),
+                      "size": asset.get("size"),
+                  })
+              if sorted(observed, key=lambda entry: str(entry["name"])) != expected_assets:
+                  raise SystemExit("Release asset inventory changed after candidate verification")
+
+          draft_release = api_json(f"/releases/{release_id}")
+          assert_release(draft_release, draft=True, immutable=False)
+          for asset in expected_assets:
+              digest = hashlib.sha256()
+              size = 0
+              with open_asset(asset["id"]) as response:
+                  while chunk := response.read(1024 * 1024):
+                      digest.update(chunk)
+                      size += len(chunk)
+              if size != asset["size"] or digest.hexdigest() != asset["sha256"]:
+                  raise SystemExit(f"Release asset bytes changed: {asset['name']}")
+
+          published = api_json(
+              f"/releases/{release_id}",
+              method="PATCH",
+              body=b'{"draft":false}',
+          )
+          assert_release(published, draft=False, immutable=True)
+          receipt = {
+              "immutable": True,
+              "release_id": release_id,
+              "source_commit": source,
+              "tag": tag,
+          }
+          output = Path(os.environ["RUNNER_TEMP"]) / "publish-visibility-receipt.json"
+          output.write_bytes(
+              (json.dumps(receipt, separators=(",", ":"), sort_keys=True) + "\n").encode()
+          )
+          PY
+
+      - name: Retain the fixed mutation receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-desktop-preview-mutation-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/publish-visibility-receipt.json
+          if-no-files-found: warn
+          retention-days: 30
+
+  verify-public-preview:
+    name: Verify the immutable public Preview
+    needs: publish-preview
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Check out the workflow policy revision, never candidate code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          fetch-depth: 0
+          path: publication-policy
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.15"
+
+      - name: Download candidate-owned publication baseline
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: openevo-desktop-draft-verification-${{ inputs.expected_source_sha }}-${{ inputs.candidate_workflow_run_id }}-${{ inputs.candidate_workflow_run_attempt }}
+          path: ${{ runner.temp }}/candidate-verification
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_workflow_run_id }}
+
+      - name: Re-read and redownload the immutable public release
+        env:
+          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
+            --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
+            > "$RUNNER_TEMP/public-release-rest.json"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"immutable\"])' "$RUNNER_TEMP/public-release-rest.json")" = "True"
+          python publication-policy/scripts/ci/openevo_release_candidate.py write-preview-asset-plan \
+            "$RUNNER_TEMP/public-asset-plan.tsv" \
+            --metadata "$RUNNER_TEMP/public-release-rest.json" \
+            --baseline "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
+            --state public
+          public_dir="$RUNNER_TEMP/downloaded-public-preview"
+          test ! -e "$public_dir"
+          mkdir -m 700 "$public_dir"
+          while IFS=$'\t' read -r asset_id asset_name; do
+            test ! -e "$public_dir/$asset_name"
+            gh api \
+              -H "Accept: application/octet-stream" \
+              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              > "$public_dir/$asset_name"
+            chmod 0600 "$public_dir/$asset_name"
+          done < "$RUNNER_TEMP/public-asset-plan.tsv"
+
+      - name: Verify public metadata, assets, body, and exact tag target
+        env:
+          CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_workflow_run_attempt }}
+          CANDIDATE_RUN_ID: ${{ inputs.candidate_workflow_run_id }}
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
+            --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
+            > "$RUNNER_TEMP/postpublication-release-rest.json"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"immutable\"])' "$RUNNER_TEMP/postpublication-release-rest.json")" = "True"
+          python publication-policy/scripts/ci/openevo_release_candidate.py snapshot-preview \
+            "$RUNNER_TEMP/postpublication-preview-snapshot.json" \
+            --metadata "$RUNNER_TEMP/postpublication-release-rest.json" \
+            --candidate-root "$RUNNER_TEMP/downloaded-public-preview" \
+            --baseline "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
+            --expected-repository "$GITHUB_REPOSITORY" \
+            --expected-release-id "$EXPECTED_RELEASE_ID" \
+            --expected-tag "$CANDIDATE_TAG" \
+            --expected-source-commit "$EXPECTED_SOURCE_SHA" \
+            --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256" \
+            --expected-run-id "$CANDIDATE_RUN_ID" \
+            --expected-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
+            --state public
+          git -C publication-policy ls-remote --exit-code --refs origin "refs/tags/$CANDIDATE_TAG" \
+            > "$RUNNER_TEMP/postpublication-tag.txt"
+          python publication-policy/scripts/ci/openevo_release_candidate.py validate-published-tag \
+            "$RUNNER_TEMP/postpublication-tag.txt" \
+            --expected-tag "$CANDIDATE_TAG" \
+            --expected-source-commit "$EXPECTED_SOURCE_SHA"
+
+      - name: Retain immutable publication verification
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-desktop-preview-publication-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/postpublication-preview-snapshot.json
+            ${{ runner.temp }}/postpublication-tag.txt
+          if-no-files-found: warn
+          retention-days: 30

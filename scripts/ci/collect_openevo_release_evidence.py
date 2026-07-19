@@ -8,6 +8,7 @@ import hashlib
 from importlib import metadata
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tomllib
@@ -19,6 +20,11 @@ from packaging.utils import canonicalize_name
 
 class EvidenceError(RuntimeError):
     pass
+
+
+_HASH_OPTION = re.compile(
+    r"^    --hash=sha256:(?P<digest>[0-9a-fA-F]{64})(?P<continued> \\)?$"
+)
 
 
 def _sha256(path: Path) -> str:
@@ -53,28 +59,60 @@ def _npm_vulnerabilities(report: Any) -> int:
 
 def _exported_requirements(payload: str) -> dict[str, str]:
     requirements: dict[str, str] = {}
-    for raw_line in payload.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+    seen_packages: set[str] = set()
+    seen_hashes: set[str] = set()
+    lines = payload.splitlines()
+    if "\r" in payload:
+        raise EvidenceError("exported Python requirements use invalid line endings")
+    index = 0
+    while index < len(lines):
+        requirement_line = lines[index]
+        index += 1
+        if not requirement_line:
             continue
+        if (
+            requirement_line != requirement_line.strip()
+            or not requirement_line.endswith(" \\")
+        ):
+            raise EvidenceError("exported Python requirement block is invalid")
+        requirement_text = requirement_line[:-2]
         try:
-            requirement = Requirement(line)
+            requirement = Requirement(requirement_text)
         except InvalidRequirement as exc:
             raise EvidenceError("exported Python requirement is invalid") from exc
         name = canonicalize_name(requirement.name)
         if name == "openevo":
             raise EvidenceError("exported Python requirements must exclude the OpenEvo project")
-        if requirement.marker is not None and not requirement.marker.evaluate():
-            continue
         specifiers = list(requirement.specifier)
         if requirement.url is not None or requirement.extras or len(specifiers) != 1:
             raise EvidenceError("exported Python requirement must be one exact third-party pin")
         specifier = specifiers[0]
         if specifier.operator != "==" or specifier.version.endswith(".*"):
             raise EvidenceError("exported Python requirement must use one exact version")
-        if name in requirements:
+        if name in seen_packages:
             raise EvidenceError("exported Python requirements contain a duplicate package")
-        requirements[name] = specifier.version
+        seen_packages.add(name)
+
+        hashes: set[str] = set()
+        while True:
+            if index >= len(lines):
+                raise EvidenceError("exported Python requirement hash block is incomplete")
+            hash_line = lines[index]
+            index += 1
+            match = _HASH_OPTION.fullmatch(hash_line)
+            if match is None:
+                raise EvidenceError("exported Python requirement contains an invalid option")
+            digest = match.group("digest").lower()
+            if digest in hashes or digest in seen_hashes:
+                raise EvidenceError("exported Python requirements contain a duplicate hash")
+            hashes.add(digest)
+            seen_hashes.add(digest)
+            if match.group("continued") is None:
+                break
+        if not hashes:
+            raise EvidenceError("exported Python requirement has no SHA-256 hash")
+        if requirement.marker is None or requirement.marker.evaluate():
+            requirements[name] = specifier.version
     if not requirements:
         raise EvidenceError("exported Python requirements contain no third-party packages")
     return requirements

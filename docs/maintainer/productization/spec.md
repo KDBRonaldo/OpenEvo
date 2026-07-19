@@ -1631,11 +1631,14 @@ artifact checksums
 ```
 
 The static release manifest does not bind an observed host path, container ID,
-mount ID, bind-root inode, or session inode. Those identities exist only after
-deployment and MUST be captured and pinned by runtime preflight and admission,
-then carried by the applicable execution receipt. The receipt binds the
-observed identities to the manifest-bound profile constraints and release
-identity.
+mount ID, bind-root inode, or session inode. Admission pins the verified
+release-host profile, runtime constraints, deployment identity, and other
+stable launch inputs shared by all attempts. Attempt-specific observed
+container, mount, bind-root, and session identities exist only after an attempt
+starts and MUST be captured by runtime preflight and carried by that attempt's
+immutable execution receipt. The receipt proves that those observed identities
+satisfied the admission's manifest-bound profile constraints and release
+identity; they are not copied into the shared admission record.
 
 No manifest, checksum inventory, evidence index, or attestation includes its
 own digest. An outer inventory may bind an inner object; self-referential hash

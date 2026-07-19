@@ -37,10 +37,12 @@ import type {
   ArtifactContentV1,
   ArtifactDiffV1,
   ArtifactV1,
+  DiagnosticReportV1,
   ExecutionModeCapabilitiesV1,
   ExecutionModeCapabilityV1,
   LogEntryV1,
   LocalOperationV1,
+  OperationV1,
   ProfileCreateV1,
   ProjectCapabilitiesV1,
   ProjectPatchV1,
@@ -80,6 +82,8 @@ type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revisi
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
+const SYSTEM_OPERATION_REFRESH_INTERVAL_MS = 750;
+const SYSTEM_OPERATION_REFRESH_LIMIT = 480;
 const PENDING_RETRY_REFRESH_LIMIT = 60;
 const REQUIRED_EVOLUTION_TARGETS = ["text_memory", "skill_bundle", "agent_system"] as const;
 const SAMPLE_PROJECT_OPTION_KEY = "sample";
@@ -192,6 +196,7 @@ export function DesktopProductApp({
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<ActionErrorState | null>(null);
   const [actionRecovery, setActionRecovery] = useState<ActionRecovery>(null);
+  const [localMaintenanceBusy, setLocalMaintenanceBusy] = useState(false);
   const readyReported = useRef(false);
   const authoritativeSnapshotPublished = useRef(false);
   const initialSnapshotFailureReported = useRef(false);
@@ -521,18 +526,19 @@ export function DesktopProductApp({
   }, [onReady, snapshot]);
 
   if (!snapshot) {
+    if (loadError) {
+      return (
+        <InitialSnapshotFailure
+          workspace={workspace}
+          error={loadError}
+          onWorkspaceChange={setWorkspace}
+          onRetry={() => void refresh("manual")}
+        />
+      );
+    }
     return (
       <div className="product-boot" data-testid="product-loading">
-        {loadError ? (
-          <BlockingState
-            title="OpenEvo Desktop is unavailable"
-            detail={loadError}
-            actionLabel="Try again"
-            onAction={() => void refresh("manual")}
-          />
-        ) : (
-          <div className="product-loading-row"><LoaderCircle className="spin" size={18} /> Loading workspace...</div>
-        )}
+        <div className="product-loading-row"><LoaderCircle className="spin" size={18} /> Loading workspace...</div>
       </div>
     );
   }
@@ -547,7 +553,6 @@ export function DesktopProductApp({
   const projectServices = projectSessionReady ? snapshot.services : [];
   const servicesNeedAttention = projectSessionReady
     && (projectServices.length === 0 || projectServices.some((service) => service.status !== "running"));
-  const canCreateProject = profile?.connection_state === "connected";
   const profilesWithoutProjects = snapshot.profiles.filter(
     (candidate) => !snapshot.projects.some(
       (candidateProject) => candidateProject.profile_id === candidate.profile_id,
@@ -559,8 +564,17 @@ export function DesktopProductApp({
     : null;
   const activeOperationRunning = snapshot.activeOperation !== null
     && !["succeeded", "failed", "cancelled"].includes(snapshot.activeOperation.state);
+  const recoveredMaintenanceBusy = activeOperationRunning
+    && selectedOperation !== null
+    && ["project_doctor", "project_repair"].includes(selectedOperation.operation_kind);
+  const maintenanceBusy = localMaintenanceBusy || recoveredMaintenanceBusy;
+  const canCreateProject = profile?.connection_state === "connected" && !maintenanceBusy;
+  const selectedOperationCanCancel = selectedOperation !== null
+    && !["project_doctor", "project_repair"].includes(selectedOperation.operation_kind);
   const lifecycleMutationBusy =
-    actionState === "working" || (activeOperationRunning && selectedOperation === null);
+    maintenanceBusy
+    || actionState === "working"
+    || (activeOperationRunning && selectedOperation === null);
   const visibleActionError =
     actionError?.selectionIdentity === selectionIdentity ? actionError : null;
   const coreCanActivateProject = connection.profile_id === profile?.profile_id
@@ -570,13 +584,17 @@ export function DesktopProductApp({
   const canShowActivation = coreCanActivateProject
     && profile?.connection_state === "connected"
     && snapshot.state.contract.compatible;
-  const activationReason = getProjectActivationReason(snapshot, project, profile, actionState);
-  const startReason = getStartReason(snapshot, project, profile, projectServices, activeRun, actionState);
+  const activationReason = maintenanceBusy
+    ? "Wait for System maintenance to finish."
+    : getProjectActivationReason(snapshot, project, profile, actionState);
+  const startReason = maintenanceBusy
+    ? "Wait for System maintenance to finish."
+    : getStartReason(snapshot, project, profile, projectServices, activeRun, actionState);
   const canStart = startReason === null;
 
   const cancelActiveOperation = async () => {
     const operation = selectedOperation;
-    if (!operation || cancellingOperation) return;
+    if (!operation || cancellingOperation || maintenanceBusy) return;
     const errorOwner = reserveActionErrorOwner();
     setCancellingOperation(true);
     try {
@@ -600,7 +618,7 @@ export function DesktopProductApp({
   };
 
   const retryFailedRun = (run: RunV1): void => {
-    if (actionState === "working") return;
+    if (actionState === "working" || maintenanceBusy) return;
     const retryRun = provider.retryRun;
     if (!retryRun) {
       void act(() => Promise.reject(new DesktopProductProviderUnavailableError()));
@@ -665,7 +683,11 @@ export function DesktopProductApp({
   };
 
   return (
-    <div className="product-shell">
+    <div
+      className="product-shell"
+      data-provider-kind={provider.providerKind}
+      data-system-maintenance-available={String(provider.systemMaintenanceAvailable)}
+    >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
           <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
@@ -677,7 +699,7 @@ export function DesktopProductApp({
           <NavButton icon={Activity} label="System" active={workspace === "system"} onClick={() => setWorkspace("system")} />
         </nav>
         <div className="sidebar-foot">
-          <div className="sidebar-foot-label">Current revision</div>
+          <div className="sidebar-foot-label">Current Project Head</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
             <span>{viewingSample ? `Project Head ${SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}` : revisionLabel(project, projectRuns)}</span>
@@ -721,7 +743,7 @@ export function DesktopProductApp({
                     ? { kind: "workspace", profileId: selectedProfile.profile_id }
                     : null);
                 }}
-                disabled={actionState === "working"}
+                disabled={lifecycleMutationBusy}
               >
                 <optgroup label="内置示例">
                   <option value={SAMPLE_PROJECT_OPTION_KEY}>[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
@@ -768,10 +790,11 @@ export function DesktopProductApp({
                   ? { kind: "create" }
                   : { kind: "edit", profileId: profile.profile_id },
               )}
+              disabled={maintenanceBusy}
             >
               <PanelLeft size={17} />
             </IconButton>
-            <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={viewingSample || !project}><Settings size={17} /></IconButton>
+            <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={viewingSample || !project || maintenanceBusy}><Settings size={17} /></IconButton>
           </div>
         </header>
 
@@ -795,7 +818,9 @@ export function DesktopProductApp({
           {!viewingSample && selectedOperation && !["succeeded", "failed", "cancelled"].includes(selectedOperation.state) ? (
             <section className="operation-cancel-bar" aria-live="polite">
               <div><LoaderCircle className="spin" size={17} /><span>{selectedOperation.progress?.label ?? "Local operation in progress"}</span></div>
-              <button className="secondary-button" type="button" onClick={() => void cancelActiveOperation()} disabled={cancellingOperation}><Square size={14} /> {cancellingOperation ? "Cancelling..." : "Cancel operation"}</button>
+              {selectedOperationCanCancel ? (
+                <button className="secondary-button" type="button" onClick={() => void cancelActiveOperation()} disabled={cancellingOperation || maintenanceBusy}><Square size={14} /> {cancellingOperation ? "Cancelling..." : "Cancel operation"}</button>
+              ) : null}
             </section>
           ) : null}
           {!viewingSample ? (
@@ -819,7 +844,7 @@ export function DesktopProductApp({
           {!viewingSample && project && !projectSessionReady && canShowActivation ? (
             <ProjectActivationGate
               project={project}
-              busy={actionState === "working"}
+              busy={lifecycleMutationBusy}
               disabledReason={activationReason}
               onActivate={() => void act(() => provider.activateProject(project.project_id, resourceIntent(snapshot, project.etag)))}
             />
@@ -847,8 +872,8 @@ export function DesktopProductApp({
               modelService={projectServices.find((service) => service.kind === "inference") ?? null}
               canStart={canStart}
               startReason={startReason}
-              busy={actionState === "working"}
-              onStart={() => project && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), { kind: "readmit_run", projectId: project.project_id })}
+              busy={lifecycleMutationBusy}
+              onStart={() => project && !maintenanceBusy && void act(() => provider.startRun({ ...resourceIntent(snapshot, project.etag), projectId: project.project_id }), { kind: "readmit_run", projectId: project.project_id })}
               onRetry={retryFailedRun}
               onCancel={() => activeRun && void act(() => provider.cancelRun(activeRun.id, resourceIntent(snapshot, activeRun.etag)))}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
@@ -873,21 +898,30 @@ export function DesktopProductApp({
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
             />
           ) : null}
-          {!viewingSample && workspace === "system" ? (
-            <SystemWorkspace
-              snapshot={snapshot}
-              profile={profile}
-              services={projectServices}
-              projectSessionReady={projectSessionReady}
-              busy={lifecycleMutationBusy}
-              onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
-              onConfigure={() => setConnectionSettingsMode(
-                profile
-                  ? { kind: "edit", profileId: profile.profile_id }
-                  : { kind: "create" },
-              )}
-              onRefresh={() => void refresh("manual")}
-            />
+          {!viewingSample ? (
+            <div hidden={workspace !== "system"}>
+              <SystemWorkspace
+                snapshot={snapshot}
+                project={project}
+                profile={profile}
+                services={projectServices}
+                maintenanceAvailable={provider.systemMaintenanceAvailable}
+                projectSessionReady={projectSessionReady}
+                busy={lifecycleMutationBusy}
+                maintenanceBusy={maintenanceBusy}
+                provider={provider}
+                onConnect={() => profile && void act(() => provider.connectProfile(profile.profile_id, resourceIntent(snapshot, profile.etag)))}
+                onConfigure={() => setConnectionSettingsMode(
+                  profile
+                    ? { kind: "edit", profileId: profile.profile_id }
+                    : { kind: "create" },
+                )}
+                onRefresh={async () => {
+                  await refresh("manual");
+                }}
+                onMaintenanceBusyChange={setLocalMaintenanceBusy}
+              />
+            </div>
           ) : null}
         </main>
       </div>
@@ -900,7 +934,7 @@ export function DesktopProductApp({
           executionModeCapabilities={snapshot.executionModeCapabilities}
           capability={settingsCapability}
           capabilities={readyCapabilities(settingsCapability, settingsProject)}
-          busy={actionState === "working"}
+          busy={lifecycleMutationBusy}
           onClose={() => {
             const pending = pendingProjectActivation.current;
             if (pending) {
@@ -1012,7 +1046,7 @@ export function DesktopProductApp({
           profile={connectionSettingsProfile}
           observedProfiles={snapshot.profiles}
           streamEpoch={snapshot.stream.status === "fresh" ? snapshot.stream.epoch : null}
-          busy={actionState === "working"}
+          busy={lifecycleMutationBusy}
           errorMessage={visibleActionError?.message ?? null}
           onDismissError={() => { setActionError(null); setActionRecovery(null); }}
           onClose={() => setConnectionSettingsMode(null)}
@@ -1082,6 +1116,77 @@ export function DesktopProductApp({
           }}
         />
       ) : null}
+    </div>
+  );
+}
+
+function InitialSnapshotFailure({
+  workspace,
+  error,
+  onWorkspaceChange,
+  onRetry,
+}: {
+  workspace: Workspace;
+  error: string;
+  onWorkspaceChange: (workspace: Workspace) => void;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="product-shell initial-sync-shell" data-testid="initial-sync-failure">
+      <aside className="product-sidebar" aria-label="Primary navigation">
+        <div className="product-brand" aria-label="OpenEvo Desktop">
+          <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
+          <span>OpenEvo</span>
+        </div>
+        <nav className="product-nav">
+          <NavButton icon={BookOpen} label="Research" active={workspace === "research"} onClick={() => onWorkspaceChange("research")} />
+          <NavButton icon={Sparkles} label="Evolution" active={workspace === "evolution"} onClick={() => onWorkspaceChange("evolution")} />
+          <NavButton icon={Activity} label="System" active={workspace === "system"} onClick={() => onWorkspaceChange("system")} />
+        </nav>
+        <div className="sidebar-foot">
+          <div className="sidebar-foot-label">Current Project Head</div>
+          <div className="sidebar-revision">
+            <CircleDot size={15} />
+            <span>Project Head {SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}</span>
+          </div>
+        </div>
+      </aside>
+      <div className="product-stage">
+        <header className="product-topbar">
+          <div className="project-switcher-wrap">
+            <label htmlFor="project-switcher">Project</label>
+            <div className="project-switcher-control">
+              <select id="project-switcher" value={SAMPLE_PROJECT_OPTION_KEY} disabled>
+                <option value={SAMPLE_PROJECT_OPTION_KEY}>[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
+              </select>
+              <ChevronDown size={15} aria-hidden="true" />
+            </div>
+            <IconButton label="Create project" onClick={() => undefined} disabled><Plus size={17} /></IconButton>
+          </div>
+          <div className="topbar-actions">
+            <span className="sample-topbar-badge"><AlertCircle size={14} /> Sync unavailable</span>
+            <IconButton label="Remote workspace settings" onClick={() => undefined} disabled><PanelLeft size={17} /></IconButton>
+            <IconButton label="Project settings" onClick={() => undefined} disabled><Settings size={17} /></IconButton>
+          </div>
+        </header>
+        <main className="product-main">
+          <div className="initial-sync-notice" role="alert">
+            <AlertCircle size={18} />
+            <div>
+              <strong>Remote projects could not be synchronized</strong>
+              <span>{error} The built-in project remains available in read-only mode.</span>
+            </div>
+            <button type="button" className="secondary-button" onClick={onRetry}>
+              <RefreshCw size={15} /> Try again
+            </button>
+          </div>
+          <div className="initial-sync-sample">
+            <SampleScientificProjectView
+              workspace={workspace}
+            />
+          </div>
+        </main>
+      </div>
     </div>
   );
 }
@@ -1985,7 +2090,57 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
   );
 }
 
-function SystemWorkspace({ snapshot, profile, services, projectSessionReady, busy, onConnect, onConfigure, onRefresh }: { snapshot: DesktopProductSnapshot; profile: RemoteProfileV1 | null; services: readonly ServiceV1[]; projectSessionReady: boolean; busy: boolean; onConnect: () => void; onConfigure: () => void; onRefresh: () => void }) {
+type SystemConfirmation =
+  | { readonly kind: "repair" }
+  | { readonly kind: "restart"; readonly service: ServiceV1 }
+  | { readonly kind: "cleanup" };
+
+type SystemActivity =
+  | {
+      readonly kind: "local";
+      readonly title: string;
+      readonly operation: LocalOperationV1;
+    }
+  | {
+      readonly kind: "core";
+      readonly title: string;
+      readonly operation: OperationV1;
+    }
+  | {
+      readonly kind: "diagnostic";
+      readonly title: string;
+      readonly report: DiagnosticReportV1;
+    };
+
+function SystemWorkspace({
+  snapshot,
+  project,
+  profile,
+  services,
+  maintenanceAvailable,
+  projectSessionReady,
+  busy,
+  maintenanceBusy,
+  provider,
+  onConnect,
+  onConfigure,
+  onRefresh,
+  onMaintenanceBusyChange,
+}: {
+  snapshot: DesktopProductSnapshot;
+  project: ProjectV1 | null;
+  profile: RemoteProfileV1 | null;
+  services: readonly ServiceV1[];
+  maintenanceAvailable: boolean;
+  projectSessionReady: boolean;
+  busy: boolean;
+  maintenanceBusy: boolean;
+  provider: DesktopProductProvider;
+  onConnect: () => void;
+  onConfigure: () => void;
+  onRefresh: () => Promise<void>;
+  onMaintenanceBusyChange: (busy: boolean) => void;
+}) {
   const core = snapshot.state.core;
   const profileOwnsCore =
     profile !== null && core.profile_id === profile.profile_id;
@@ -1994,9 +2149,293 @@ function SystemWorkspace({ snapshot, profile, services, projectSessionReady, bus
   const readyServices = services.filter((service) => service.status === "running").length;
   const servicesNeedAttention = projectSessionReady
     && (services.length === 0 || services.some((service) => service.status !== "running"));
+  const [confirmation, setConfirmation] = useState<SystemConfirmation | null>(null);
+  const [activity, setActivity] = useState<SystemActivity | null>(null);
+  const [lastDoctorOperation, setLastDoctorOperation] = useState<LocalOperationV1 | null>(null);
+  const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
+  const maintenanceGeneration = useRef(0);
+  const ownsMaintenanceBusy = useRef(false);
+  const confirmationTrigger = useRef<HTMLElement | null>(null);
+  const activityProjectId = project?.project_id ?? null;
+  const activityCoreProjectId = project?.remote?.core_project_id ?? null;
+  const activityRevisionGeneration =
+    project?.remote?.active_revision?.generation ?? null;
+  const authoritativeProjectId =
+    snapshot.state.active_project?.project_id ?? null;
+  const authoritativeProjectProfileId =
+    snapshot.state.active_project?.profile_id ?? null;
+  const authoritativeProjectEtag =
+    snapshot.state.active_project?.project_etag ?? null;
+  const releaseMaintenanceBusy = useCallback((): void => {
+    if (!ownsMaintenanceBusy.current) return;
+    ownsMaintenanceBusy.current = false;
+    onMaintenanceBusyChange(false);
+  }, [onMaintenanceBusyChange]);
+  const beginMaintenance = (): number => {
+    const generation = maintenanceGeneration.current + 1;
+    maintenanceGeneration.current = generation;
+    if (!ownsMaintenanceBusy.current) {
+      ownsMaintenanceBusy.current = true;
+      onMaintenanceBusyChange(true);
+    }
+    setConfirmation(null);
+    setMaintenanceError(null);
+    return generation;
+  };
+  useEffect(() => {
+    maintenanceGeneration.current += 1;
+    releaseMaintenanceBusy();
+    setConfirmation(null);
+    setActivity(null);
+    setLastDoctorOperation(null);
+    setMaintenanceError(null);
+    return () => {
+      maintenanceGeneration.current += 1;
+      releaseMaintenanceBusy();
+    };
+  }, [
+    activityCoreProjectId,
+    activityProjectId,
+    activityRevisionGeneration,
+    authoritativeProjectEtag,
+    authoritativeProjectId,
+    authoritativeProjectProfileId,
+    releaseMaintenanceBusy,
+  ]);
+
+  const canOperate =
+    maintenanceAvailable
+    && snapshot.stream.status === "fresh"
+    && projectSessionReady
+    && project !== null
+    && !busy
+    && !maintenanceBusy;
+  const repairAuthority = systemRepairAuthority(lastDoctorOperation);
+  const canRepair = canOperate && repairAuthority.enabled;
+  useEffect(() => {
+    if (!canOperate) setConfirmation(null);
+  }, [canOperate]);
+  const openConfirmation = (next: SystemConfirmation): void => {
+    if (!canOperate) return;
+    confirmationTrigger.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setConfirmation(next);
+  };
+
+  const runLocalOperation = async (
+    title: string,
+    start: () => Promise<LocalOperationV1>,
+  ): Promise<void> => {
+    const generation = beginMaintenance();
+    try {
+      let operation = await start();
+      if (maintenanceGeneration.current !== generation) return;
+      setActivity({ kind: "local", title, operation });
+      if (operation.operation_kind === "project_doctor") {
+        setLastDoctorOperation(operation);
+      }
+      for (
+        let attempt = 0;
+        !isLocalOperationTerminal(operation.state) && attempt < SYSTEM_OPERATION_REFRESH_LIMIT;
+        attempt += 1
+      ) {
+        await waitForSystemRefresh();
+        if (maintenanceGeneration.current !== generation) return;
+        operation = await provider.getLocalOperation(operation.operation_id);
+        if (maintenanceGeneration.current !== generation) return;
+        setActivity({ kind: "local", title, operation });
+        if (operation.operation_kind === "project_doctor") {
+          setLastDoctorOperation(operation);
+        }
+      }
+      if (!isLocalOperationTerminal(operation.state)) {
+        throw new DesktopProductUserError(
+          "The remote operation is still running. Refresh System to check its latest state.",
+        );
+      }
+      await onRefresh();
+      if (
+        operation.operation_kind === "project_repair"
+        && operation.state === "succeeded"
+      ) {
+        setLastDoctorOperation(null);
+      }
+    } catch (error) {
+      if (maintenanceGeneration.current === generation) {
+        setMaintenanceError(userMessage(error));
+      }
+    } finally {
+      if (maintenanceGeneration.current === generation) {
+        releaseMaintenanceBusy();
+      }
+    }
+  };
+
+  const runCoreOperation = async (
+    title: string,
+    start: () => Promise<OperationV1>,
+  ): Promise<void> => {
+    const generation = beginMaintenance();
+    try {
+      let operation = await start();
+      if (maintenanceGeneration.current !== generation) return;
+      setActivity({ kind: "core", title, operation });
+      for (
+        let attempt = 0;
+        !isCoreOperationTerminal(operation.status) && attempt < SYSTEM_OPERATION_REFRESH_LIMIT;
+        attempt += 1
+      ) {
+        await waitForSystemRefresh();
+        if (maintenanceGeneration.current !== generation) return;
+        operation = await provider.getCoreOperation(operation.id);
+        if (maintenanceGeneration.current !== generation) return;
+        setActivity({ kind: "core", title, operation });
+      }
+      if (!isCoreOperationTerminal(operation.status)) {
+        throw new DesktopProductUserError(
+          "The remote operation is still running. Refresh System to check its latest state.",
+        );
+      }
+      await onRefresh();
+    } catch (error) {
+      if (maintenanceGeneration.current === generation) {
+        setMaintenanceError(userMessage(error));
+      }
+    } finally {
+      if (maintenanceGeneration.current === generation) {
+        releaseMaintenanceBusy();
+      }
+    }
+  };
+
+  const runDiagnostics = async (): Promise<void> => {
+    if (!project?.remote) return;
+    const generation = beginMaintenance();
+    try {
+      let report = await provider.createDiagnostic(
+        {
+          schema_version: "1",
+          scopes: ["environment", "services", "registry", "storage"],
+          target: { kind: "global" },
+        },
+        mutationIntent(snapshot),
+      );
+      if (maintenanceGeneration.current !== generation) return;
+      setActivity({ kind: "diagnostic", title: "Remote diagnostics", report });
+      for (
+        let attempt = 0;
+        !isDiagnosticTerminal(report.status) && attempt < SYSTEM_OPERATION_REFRESH_LIMIT;
+        attempt += 1
+      ) {
+        await waitForSystemRefresh();
+        if (maintenanceGeneration.current !== generation) return;
+        report = await provider.getDiagnostic(report.id);
+        if (maintenanceGeneration.current !== generation) return;
+        setActivity({ kind: "diagnostic", title: "Remote diagnostics", report });
+      }
+      if (!isDiagnosticTerminal(report.status)) {
+        throw new DesktopProductUserError(
+          "Diagnostics are still running. Refresh System to check the report.",
+        );
+      }
+      await onRefresh();
+    } catch (error) {
+      if (maintenanceGeneration.current === generation) {
+        setMaintenanceError(userMessage(error));
+      }
+    } finally {
+      if (maintenanceGeneration.current === generation) {
+        releaseMaintenanceBusy();
+      }
+    }
+  };
+
+  const confirmAction = (): void => {
+    const pending = confirmation;
+    if (!pending || !project || !canOperate) return;
+    if (pending.kind === "repair") {
+      if (!repairAuthority.enabled) return;
+      void runLocalOperation(
+        "Repair remote environment",
+        () => provider.repairProject(
+          project.project_id,
+          resourceIntent(snapshot, project.etag),
+        ),
+      );
+      return;
+    }
+    if (pending.kind === "restart") {
+      void runCoreOperation(
+        `Restart ${pending.service.display_name}`,
+        () => provider.restartService(
+          pending.service.id,
+          resourceIntent(snapshot, pending.service.etag),
+        ),
+      );
+      return;
+    }
+    void runCoreOperation(
+      "Clean diagnostic history",
+      () => provider.cleanupCaches(
+        {
+          schema_version: "1",
+          scopes: ["completed_diagnostics"],
+          older_than_days: 30,
+        },
+        mutationIntent(snapshot),
+      ),
+    );
+  };
+
   return (
-    <div className="workspace-stack" data-testid="system-workspace">
-      <div className="workspace-heading"><div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, service status, and model availability.</p></div></div>
+    <>
+    <div
+      className="workspace-stack"
+      data-testid="system-workspace"
+      inert={confirmation ? true : undefined}
+      aria-hidden={confirmation ? true : undefined}
+    >
+      <div className="workspace-heading">
+        <div><p className="eyebrow">System</p><h1>Remote environment</h1><p>Connection, service health, diagnostics, and recovery.</p></div>
+        {maintenanceAvailable ? <div className="workspace-heading-actions">
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => {
+              if (!canOperate || !project) return;
+              void runLocalOperation(
+                "Check remote environment",
+                () => provider.doctorProject(
+                  project.project_id,
+                  resourceIntent(snapshot, project.etag),
+                ),
+              );
+            }}
+            disabled={!canOperate}
+          >
+            <ShieldCheck size={15} /> Check
+          </button>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => {
+              if (canOperate) void runDiagnostics();
+            }}
+            disabled={!canOperate}
+          >
+            <FileText size={15} /> Diagnostics
+          </button>
+        </div> : null}
+      </div>
+      {maintenanceError ? (
+        <InlineNotice
+          tone="error"
+          title="System action could not be completed"
+          detail={maintenanceError}
+          onDismiss={() => setMaintenanceError(null)}
+        />
+      ) : null}
+      {activity ? <SystemActivityView activity={activity} /> : null}
       <div className="system-grid">
         <section className="product-panel connection-panel">
           <div className="panel-heading"><div><span className="panel-kicker">Connection</span><h2>{profile?.name ?? "No remote workspace"}</h2></div><StatePill state={displayedCoreState} /></div>
@@ -2007,32 +2446,391 @@ function SystemWorkspace({ snapshot, profile, services, projectSessionReady, bus
             <div><dt>Project access</dt><dd>{projectSessionReady ? "Ready" : "Unavailable"}</dd></div>
           </dl>
           <div className="system-button-row">
-            <button className="secondary-button" type="button" onClick={onConfigure}><Settings size={15} /> {profile ? "Edit" : "Add workspace"}</button>
+            <button className="secondary-button" type="button" onClick={onConfigure} disabled={busy || maintenanceBusy}><Settings size={15} /> {profile ? "Edit" : "Add workspace"}</button>
             {profile && (displayedCoreState !== "online" || servicesNeedAttention) ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || (profileOwnsCore && isConnectionBusy(core.state)) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
+            {project && maintenanceAvailable ? (
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => openConfirmation({ kind: "repair" })}
+                disabled={!canRepair}
+                title={repairAuthority.title}
+              >
+                <Wrench size={15} /> Repair
+              </button>
+            ) : null}
           </div>
         </section>
       </div>
       <section className="services-section">
-        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><div className="section-heading-actions"><span>{readyServices} of {services.length} ready</span><button type="button" className="text-button" onClick={onRefresh} disabled={busy}><RefreshCw size={14} /> Refresh status</button></div></div>
-        {servicesNeedAttention ? <InlineNotice tone="warning" title="Remote services need attention" detail="Refresh the status. If the issue persists, reconnect the remote workspace." /> : null}
+        <div className="section-heading"><div><Activity size={17} /><h2>Services</h2></div><div className="section-heading-actions"><span>{readyServices} of {services.length} ready</span><button type="button" className="text-button" onClick={() => void onRefresh()} disabled={busy || maintenanceBusy}><RefreshCw size={14} /> Refresh status</button></div></div>
+        {servicesNeedAttention ? (
+          <InlineNotice
+            tone="warning"
+            title="Remote services need attention"
+            detail={maintenanceAvailable
+              ? "Run a check, repair the environment, or restart an affected service."
+              : "Reconnect the remote workspace. Automated maintenance is unavailable in this Preview."}
+          />
+        ) : null}
         <div className="service-list">
-          {services.map((service) => <ServiceRow key={service.id} service={service} />)}
+          {services.map((service) => (
+            <ServiceRow
+              key={service.id}
+              service={service}
+              disabled={!canOperate}
+              onRestart={maintenanceAvailable && service.restartable
+                ? () => openConfirmation({ kind: "restart", service })
+                : null}
+            />
+          ))}
           {!services.length ? <div className="empty-row">Services are unavailable for this project.</div> : null}
+        </div>
+      </section>
+      {maintenanceAvailable ? <section className="services-section">
+        <div className="section-heading">
+          <div><Wrench size={17} /><h2>Data management</h2></div>
+        </div>
+        <div className="maintenance-row">
+          <div>
+            <strong>Diagnostic history</strong>
+            <span>Remove completed diagnostic reports older than 30 days. Project inputs, runs, outputs, and active evolution artifacts are retained.</span>
+          </div>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => openConfirmation({ kind: "cleanup" })}
+            disabled={!canOperate}
+          >
+            <Wrench size={15} /> Clean diagnostic history
+          </button>
+        </div>
+      </section> : null}
+    </div>
+    {confirmation ? (
+      <SystemConfirmationDialog
+        confirmation={confirmation}
+        confirmDisabled={!canOperate}
+        returnFocus={confirmationTrigger.current}
+        onCancel={() => setConfirmation(null)}
+        onConfirm={confirmAction}
+      />
+    ) : null}
+    </>
+  );
+}
+
+function ServiceRow({
+  service,
+  disabled,
+  onRestart,
+}: {
+  service: ServiceV1;
+  disabled: boolean;
+  onRestart: (() => void) | null;
+}) {
+  return (
+    <div className="service-row">
+      <span className={`service-indicator ${service.status}`} />
+      <div><strong>{service.display_name}</strong><span>{service.status_message ?? stateLabel(service.status)}</span></div>
+      <StatePill state={service.status} />
+      {onRestart ? (
+        <IconButton
+          label={`Restart ${service.display_name}`}
+          onClick={onRestart}
+          disabled={disabled}
+        >
+          <RotateCcw size={15} />
+        </IconButton>
+      ) : null}
+    </div>
+  );
+}
+
+type SystemActivityState =
+  | LocalOperationV1["state"]
+  | OperationV1["status"]
+  | DiagnosticReportV1["status"];
+
+function SystemActivityView({ activity }: { activity: SystemActivity }) {
+  const state = systemActivityState(activity);
+  const error = activity.kind === "local"
+    ? activity.operation.error
+    : activity.kind === "core"
+      ? activity.operation.error
+      : activity.report.error;
+  const checks = activity.kind === "local"
+    ? activity.operation.checks.map((check) => ({
+        id: check.check_id,
+        label: check.label,
+        status: check.status,
+        message: check.summary,
+        repairAction: check.repair_action,
+      }))
+    : activity.kind === "diagnostic"
+      ? activity.report.checks.map((check) => ({
+          id: check.id,
+          label: diagnosticScopeLabel(check.scope),
+          status: check.status,
+          message: check.message,
+          repairAction: check.repair_action,
+        }))
+      : [];
+  return (
+    <section className="system-activity" aria-live="polite">
+      <div className="system-activity-heading">
+        <div>
+          <SystemActivityStateIcon state={state} />
+          <strong>{activity.title}</strong>
+        </div>
+        <StatePill state={state} />
+      </div>
+      {error ? (
+        <div className="system-activity-error" role="alert">
+          <strong>{error.message}</strong>
+          <span><b>Next action:</b> {error.next_action}</span>
+        </div>
+      ) : null}
+      {checks.length > 0 ? (
+        <div className="system-check-list">
+          {checks.map((check) => (
+            <div key={check.id}>
+              <StatePill state={check.status} />
+              <strong>{check.label}</strong>
+              <div className="system-check-detail">
+                <span>{check.message}</span>
+                {repairActionGuidance(check.repairAction) ? (
+                  <small>Next action: {repairActionGuidance(check.repairAction)}</small>
+                ) : null}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <p className="system-activity-message">
+          {systemActivityMessage(state)}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function SystemActivityStateIcon({ state }: { state: SystemActivityState }) {
+  switch (state) {
+    case "queued":
+      return <CircleDot className="system-activity-state-icon queued" size={16} />;
+    case "running":
+      return <LoaderCircle className="system-activity-state-icon running spin" size={16} />;
+    case "cancelling":
+      return <LoaderCircle className="system-activity-state-icon cancelling spin" size={16} />;
+    case "succeeded":
+      return <CheckCircle2 className="system-activity-state-icon succeeded" size={16} />;
+    case "failed":
+      return <XCircle className="system-activity-state-icon failed" size={16} />;
+    case "cancelled":
+      return <XCircle className="system-activity-state-icon cancelled" size={16} />;
+    default:
+      return assertNever(state);
+  }
+}
+
+function systemActivityState(activity: SystemActivity): SystemActivityState {
+  if (activity.kind === "local") return activity.operation.state;
+  return activity.kind === "core" ? activity.operation.status : activity.report.status;
+}
+
+function systemActivityMessage(state: SystemActivityState): string {
+  switch (state) {
+    case "queued":
+      return "The remote operation is queued.";
+    case "running":
+      return "Waiting for the remote operation to finish.";
+    case "cancelling":
+      return "Cancellation is in progress.";
+    case "succeeded":
+      return "The remote operation completed without additional findings.";
+    case "failed":
+      return "The remote operation failed.";
+    case "cancelled":
+      return "The remote operation was cancelled.";
+    default:
+      return assertNever(state);
+  }
+}
+
+function isCoreOperationTerminal(status: OperationV1["status"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled";
+}
+
+function isLocalOperationTerminal(status: LocalOperationV1["state"]): boolean {
+  return status === "succeeded" || status === "failed" || status === "cancelled";
+}
+
+function isDiagnosticTerminal(status: DiagnosticReportV1["status"]): boolean {
+  return status === "succeeded" || status === "failed";
+}
+
+function isSystemActivityTerminal(activity: SystemActivity): boolean {
+  if (activity.kind === "local") {
+    return isLocalOperationTerminal(activity.operation.state);
+  }
+  return activity.kind === "core"
+    ? isCoreOperationTerminal(activity.operation.status)
+    : isDiagnosticTerminal(activity.report.status);
+}
+
+type SystemRepairAction =
+  | LocalOperationV1["checks"][number]["repair_action"]
+  | DiagnosticReportV1["checks"][number]["repair_action"];
+
+function systemRepairAuthority(
+  operation: LocalOperationV1 | null,
+): { readonly enabled: boolean; readonly title: string } {
+  if (operation === null || operation.operation_kind !== "project_doctor") {
+    return {
+      enabled: false,
+      title: "Run Check first so OpenEvo can identify supported repair actions.",
+    };
+  }
+  if (!isLocalOperationTerminal(operation.state)) {
+    return {
+      enabled: false,
+      title: "Wait for the environment check to finish.",
+    };
+  }
+  const automatedCheck = operation.checks.some(
+    (check) =>
+      (check.status === "warning" || check.status === "failed")
+      && check.repair_action === "openevo_can_retry",
+  );
+  const automatedError = operation.error !== null
+    && [
+      "openevo_can_retry",
+      "openevo_can_install",
+      "openevo_can_reconfigure",
+    ].includes(operation.error.repair_action);
+  if (automatedCheck || automatedError) {
+    return {
+      enabled: true,
+      title: "Apply the repair actions exposed by OpenEvo.",
+    };
+  }
+  const externalActionRequired = operation.error !== null
+    && operation.error.repair_action === "user_action_required";
+  return {
+    enabled: false,
+    title: operation.checks.some((check) =>
+      check.repair_action === "user_input_required"
+      || check.repair_action === "reconnect_required")
+      || externalActionRequired
+      ? "Complete the required user or reconnection action shown in the check results."
+      : "The latest check did not expose an automated repair action.",
+  };
+}
+
+function repairActionGuidance(action: SystemRepairAction): string | null {
+  switch (action) {
+    case "openevo_can_retry":
+      return "OpenEvo can apply this repair.";
+    case "openevo_can_install":
+      return "OpenEvo can install the missing dependency.";
+    case "openevo_can_reconfigure":
+      return "OpenEvo can update the managed configuration.";
+    case "user_input_required":
+    case "user_action_required":
+      return "Complete the required server action, then run Check again.";
+    case "reconnect_required":
+      return "Reconnect the remote workspace, then run Check again.";
+    case "none":
+    case "unsupported":
+      return null;
+    default:
+      return assertNever(action);
+  }
+}
+
+function SystemConfirmationDialog({
+  confirmation,
+  confirmDisabled,
+  returnFocus,
+  onCancel,
+  onConfirm,
+}: {
+  confirmation: SystemConfirmation;
+  confirmDisabled: boolean;
+  returnFocus: HTMLElement | null;
+  onCancel: () => void;
+  onConfirm: () => void;
+}) {
+  const dialogRef = useDialogFocus(onCancel, returnFocus);
+  return (
+    <div
+      className="system-confirmation-backdrop"
+      role="presentation"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          event.preventDefault();
+          onCancel();
+        }
+      }}
+    >
+      <section
+        ref={dialogRef}
+        className="system-confirmation"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="system-confirmation-title"
+        aria-describedby="system-confirmation-detail"
+        tabIndex={-1}
+      >
+        <div>
+          <strong id="system-confirmation-title">{systemConfirmationTitle(confirmation)}</strong>
+          <span id="system-confirmation-detail">{systemConfirmationDetail(confirmation)}</span>
+        </div>
+        <div className="system-button-row">
+          <button type="button" className="secondary-button" onClick={onCancel}>Cancel</button>
+          <button type="button" className="danger-button" onClick={onConfirm} disabled={confirmDisabled}>
+            {confirmation.kind === "cleanup" ? <Wrench size={15} /> : <RotateCcw size={15} />}
+            Confirm
+          </button>
         </div>
       </section>
     </div>
   );
 }
 
-function ServiceRow({ service }: { service: ServiceV1 }) {
-  return (
-    <div className="service-row">
-      <span className={`service-indicator ${service.status}`} />
-      <div><strong>{service.display_name}</strong><span>{service.status_message ?? stateLabel(service.status)}</span></div>
-      <StatePill state={service.status} />
-      <span className="service-spacer" />
-    </div>
-  );
+function waitForSystemRefresh(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, SYSTEM_OPERATION_REFRESH_INTERVAL_MS);
+  });
+}
+
+function systemConfirmationTitle(confirmation: SystemConfirmation): string {
+  if (confirmation.kind === "repair") return "Repair the remote environment?";
+  if (confirmation.kind === "cleanup") return "Clean diagnostic history?";
+  return `Restart ${confirmation.service.display_name}?`;
+}
+
+function systemConfirmationDetail(confirmation: SystemConfirmation): string {
+  if (confirmation.kind === "repair") {
+    return "OpenEvo will apply only the repair actions exposed by the remote Daemon. Running research sessions are not modified.";
+  }
+  if (confirmation.kind === "cleanup") {
+    return "Completed diagnostic reports older than 30 days may be removed. Project inputs, runs, outputs, and current evolution artifacts are retained.";
+  }
+  return "The selected managed service may be briefly unavailable. Other services and project data are retained.";
+}
+
+function diagnosticScopeLabel(scope: DiagnosticReportV1["scopes"][number]): string {
+  const labels: Record<DiagnosticReportV1["scopes"][number], string> = {
+    environment: "Environment",
+    project: "Project",
+    run: "Session",
+    services: "Services",
+    registry: "Evolution registry",
+    storage: "Storage",
+  };
+  return labels[scope];
 }
 
 function RemoteWorkspaceDrawer({
@@ -3260,12 +4058,13 @@ function handleTablistKeyDown(event: React.KeyboardEvent<HTMLElement>) {
   if (next?.getAttribute("role") === "radio") next.click();
 }
 
-function useDialogFocus(onClose: () => void) {
+function useDialogFocus(onClose: () => void, returnFocus: HTMLElement | null = null) {
   const dialogRef = useRef<HTMLElement | null>(null);
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   useEffect(() => {
-    const previous = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previous = returnFocus
+      ?? (document.activeElement instanceof HTMLElement ? document.activeElement : null);
     const dialog = dialogRef.current;
     const focusable = dialog?.querySelector<HTMLElement>("button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex='0']");
     (focusable ?? dialog)?.focus();
@@ -3291,8 +4090,12 @@ function useDialogFocus(onClose: () => void) {
       document.removeEventListener("keydown", handleKeyDown);
       previous?.focus();
     };
-  }, []);
+  }, [returnFocus]);
   return dialogRef;
+}
+
+function assertNever(value: never): never {
+  throw new Error(`Unexpected value: ${String(value)}`);
 }
 
 function missingCredentialReason(profile: RemoteProfileV1): string | null {

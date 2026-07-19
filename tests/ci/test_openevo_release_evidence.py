@@ -7,6 +7,27 @@ from pathlib import Path
 import pytest
 
 
+HASH_ONE = "1" * 64
+HASH_TWO = "2" * 64
+HASH_THREE = "3" * 64
+
+
+def _hashed_requirement(
+    name: str,
+    version: str,
+    *hashes: str,
+    marker: str | None = None,
+) -> str:
+    requirement = f"{name}=={version}"
+    if marker is not None:
+        requirement += f" ; {marker}"
+    lines = [f"{requirement} \\"]
+    for index, digest in enumerate(hashes):
+        continuation = " \\" if index < len(hashes) - 1 else ""
+        lines.append(f"    --hash=sha256:{digest}{continuation}")
+    return "\n".join(lines) + "\n"
+
+
 def _load_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/collect_openevo_release_evidence.py"
     spec = importlib.util.spec_from_file_location("collect_openevo_release_evidence", path)
@@ -18,7 +39,9 @@ def _load_module():
 
 def test_audit_parsers_count_actionable_vulnerabilities() -> None:
     evidence = _load_module()
-    requirements = "one==1.0\ntwo==2.0\n"
+    requirements = _hashed_requirement("one", "1.0", HASH_ONE) + _hashed_requirement(
+        "two", "2.0", HASH_TWO
+    )
 
     assert evidence._npm_vulnerabilities(
         {"metadata": {"vulnerabilities": {"high": 2, "critical": 1}}}
@@ -68,7 +91,8 @@ def test_audit_parsers_fail_closed_on_missing_totals() -> None:
                 ],
                 "fixes": [],
             },
-            "one==1.0\ntwo==2.0\n",
+            _hashed_requirement("one", "1.0", HASH_ONE)
+            + _hashed_requirement("two", "2.0", HASH_TWO),
         )
     with pytest.raises(evidence.EvidenceError):
         evidence._cargo_vulnerabilities({"vulnerabilities": {}})
@@ -98,7 +122,12 @@ def test_cargo_audit_report_rejects_ignored_advisories() -> None:
                 ],
                 "fixes": [],
             },
-            'openevo==0.1.0 ; python_version < "0"\n',
+            _hashed_requirement(
+                "openevo",
+                "0.1.0",
+                HASH_ONE,
+                marker='python_version < "0"',
+            ),
         ),
         (
             {
@@ -108,7 +137,7 @@ def test_cargo_audit_report_rejects_ignored_advisories() -> None:
                 ],
                 "fixes": [],
             },
-            "one==1.0\n",
+            _hashed_requirement("one", "1.0", HASH_ONE),
         ),
         (
             {
@@ -117,7 +146,7 @@ def test_cargo_audit_report_rejects_ignored_advisories() -> None:
                 ],
                 "fixes": [],
             },
-            "one==1.0\n",
+            _hashed_requirement("one", "1.0", HASH_ONE),
         ),
         (
             {
@@ -126,7 +155,7 @@ def test_cargo_audit_report_rejects_ignored_advisories() -> None:
                 ],
                 "fixes": [{"name": "one"}],
             },
-            "one==1.0\n",
+            _hashed_requirement("one", "1.0", HASH_ONE),
         ),
     ],
 )
@@ -138,6 +167,92 @@ def test_pip_audit_report_must_cover_exact_third_party_export(
 
     with pytest.raises(evidence.EvidenceError):
         evidence._pip_vulnerabilities(report, requirements)
+
+
+def test_exported_requirements_validate_every_block_before_evaluating_markers() -> None:
+    evidence = _load_module()
+    requirements = _hashed_requirement("one", "1.0", HASH_ONE, HASH_TWO)
+    requirements += _hashed_requirement(
+        "inactive",
+        "2.0",
+        HASH_THREE,
+        marker='python_version < "0"',
+    )
+
+    assert evidence._exported_requirements(requirements) == {"one": "1.0"}
+
+
+@pytest.mark.parametrize(
+    ("requirements", "error"),
+    [
+        ("one==1.0\n", "block"),
+        ("one==1.0 \\\n", "hash block is incomplete"),
+        ("one>=1.0 \\\n    --hash=sha256:" + HASH_ONE + "\n", "exact version"),
+        ("one[extra]==1.0 \\\n    --hash=sha256:" + HASH_ONE + "\n", "exact third-party"),
+        (
+            "one==1.0 \\\n    --index-url=https://example.invalid/simple\n",
+            "invalid option",
+        ),
+        (
+            "one==1.0 \\\n    --hash=sha256:not-a-hash\n",
+            "invalid option",
+        ),
+        (
+            _hashed_requirement("one", "1.0", HASH_ONE, HASH_ONE),
+            "duplicate hash",
+        ),
+        (
+            _hashed_requirement("one", "1.0", HASH_ONE)
+            + _hashed_requirement(
+                "One",
+                "2.0",
+                HASH_TWO,
+                marker='python_version < "0"',
+            ),
+            "duplicate package",
+        ),
+        (
+            _hashed_requirement("one", "1.0", HASH_ONE)
+            + _hashed_requirement("two", "2.0", HASH_ONE),
+            "duplicate hash",
+        ),
+    ],
+)
+def test_exported_requirements_reject_unbound_or_ambiguous_inputs(
+    requirements: str,
+    error: str,
+) -> None:
+    evidence = _load_module()
+
+    with pytest.raises(evidence.EvidenceError, match=error):
+        evidence._exported_requirements(requirements)
+
+
+def test_candidate_workflow_pins_runtimes_and_hash_bound_wheel_smokes() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert workflow.count("runs-on: ubuntu-24.04") == 3
+    assert "runs-on: ubuntu-latest" not in workflow
+    assert workflow.count('node-version: "22.23.1"') == 2
+    assert workflow.count('python-version: "3.11.15"') == 4
+    assert 'node-version: "22"' not in workflow
+    assert 'python-version: "3.11"' not in workflow
+    assert "--no-hashes" not in workflow
+    assert "pip install --upgrade pip" not in workflow
+    assert workflow.count("--require-hashes") == 3
+    assert workflow.count("--requirement candidate-artifacts/python-requirements.txt") == 3
+    assert workflow.count("--no-deps") == 2
+
+    macos_job, linux_jobs = workflow.split("  linux-core-candidate:\n", maxsplit=1)
+    linux_job = linux_jobs.split("  draft-prerelease-roundtrip:\n", maxsplit=1)[0]
+    for job in (macos_job, linux_job):
+        dependency_install = job.index(
+            "--requirement candidate-artifacts/python-requirements.txt"
+        )
+        wheel_install = job.index("--no-deps")
+        assert dependency_install < wheel_install
 
 
 def test_collector_binds_pip_audit_to_exported_requirements(
@@ -156,7 +271,10 @@ def test_collector_binds_pip_audit_to_exported_requirements(
     (repo / "desktop/src-tauri/Cargo.lock").write_text("lock\n", encoding="utf-8")
     (repo / "LICENSE").write_text("license\n", encoding="utf-8")
     requirements = tmp_path / "requirements.txt"
-    requirements.write_text("one==1.0\n", encoding="utf-8")
+    requirements.write_text(
+        _hashed_requirement("one", "1.0", HASH_ONE),
+        encoding="utf-8",
+    )
     npm_audit = tmp_path / "npm.json"
     npm_audit.write_text(
         '{"metadata":{"vulnerabilities":{"high":0,"critical":0}}}\n',

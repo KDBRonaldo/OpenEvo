@@ -6,12 +6,16 @@ import {
   projectCreateV1Schema,
   projectPatchV1Schema,
   projectSourceV1Schema,
+  type CacheCleanupRequestV1,
   type ApiErrorV1,
   type ArtifactContentV1,
   type ArtifactDiffV1,
   type ArtifactV1,
+  type DiagnosticCreateV1,
+  type DiagnosticReportV1,
   type LocalOperationV1,
   type LogEntryV1,
+  type OperationV1,
   type PageV1,
   type ProjectCapabilitiesV1,
   type ProjectSourceV1,
@@ -24,6 +28,7 @@ import { parseEventStreamFailure, parseSseFrame } from "../api/v1/sse";
 import {
   DesktopProductAmbiguousMutationError,
   DesktopProductUserError,
+  OperationContinuationAuthority,
   ProductRefreshOrder,
   type DesktopProductSnapshot,
   type ProductMutationIntent,
@@ -98,11 +103,13 @@ class RefreshBudget {
 
 export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProvider {
   readonly providerKind = "desktop_sidecar" as const;
+  readonly systemMaintenanceAvailable = false;
 
   private readonly client: DesktopApiClientV1;
   private readonly native: LocalApiNativeBridge;
   private readonly fetch: FetchLike;
   private readonly reconnectDelaysMs: readonly number[];
+  private readonly continuationAuthority = new OperationContinuationAuthority();
   private readonly refreshOrder = new ProductRefreshOrder();
   private readonly listeners = new Set<(signal: ProductSubscriptionSignal) => void>();
   private snapshot: DesktopProductSnapshot | null = null;
@@ -217,7 +224,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     const operation = await this.client.connectProfile(profileId, actionOptions(intent));
     assertLocalOperation(operation, "profile_connect", "profile", profileId);
     this.invalidate();
-    return operation;
+    return this.continuationAuthority.observeLocal(operation);
   }
 
   async acceptHostKey(
@@ -229,7 +236,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     const operation = await this.client.acceptProfileHostKey(profileId, input, actionOptions(intent));
     assertLocalOperation(operation, "host_key_accept", "profile", profileId);
     this.invalidate();
-    return operation;
+    return this.continuationAuthority.observeLocal(operation);
   }
 
   async createProject(input: Parameters<DesktopApiClientV1["createProject"]>[0], intent: ProductMutationIntent): Promise<ProjectV1> {
@@ -262,7 +269,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
     const operation = await this.client.activateProject(projectId, actionOptions(intent));
     assertLocalOperation(operation, "project_activate", "project", projectId);
     this.invalidate();
-    return operation;
+    return this.continuationAuthority.observeLocal(operation);
   }
 
   async selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1> {
@@ -450,7 +457,100 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
       throw new DesktopContractError("Operation cancellation returned the wrong operation");
     }
     this.invalidate();
-    return operation;
+    return this.continuationAuthority.observeLocal(operation);
+  }
+
+  async getLocalOperation(operationId: string): Promise<LocalOperationV1> {
+    const operation = await this.client.getOperation(operationId);
+    if (operation.operation_id !== operationId) {
+      throw new DesktopContractError("Local operation lookup returned the wrong operation");
+    }
+    return this.continuationAuthority.observeLocal(operation);
+  }
+
+  async doctorProject(
+    projectId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<LocalOperationV1> {
+    this.assertIntent(intent);
+    const operation = await this.client.doctorProject(projectId, actionOptions(intent));
+    assertLocalOperation(operation, "project_doctor", "project", projectId);
+    this.invalidate();
+    return this.continuationAuthority.observeLocal(operation);
+  }
+
+  async repairProject(
+    projectId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<LocalOperationV1> {
+    this.assertIntent(intent);
+    const operation = await this.client.repairProject(projectId, actionOptions(intent));
+    assertLocalOperation(operation, "project_repair", "project", projectId);
+    this.invalidate();
+    return this.continuationAuthority.observeLocal(operation);
+  }
+
+  async restartService(
+    serviceId: string,
+    intent: ProductResourceMutationIntent,
+  ): Promise<OperationV1> {
+    this.assertIntent(intent);
+    const operation = await this.client.restartService(serviceId, actionOptions(intent));
+    assertCoreOperation(operation, "service_restart");
+    if (operation.request.kind !== "service_restart" || operation.request.service_id !== serviceId) {
+      throw new DesktopContractError("Service restart returned an operation for another service");
+    }
+    this.invalidate();
+    return this.continuationAuthority.observeCore(operation);
+  }
+
+  async getCoreOperation(operationId: string): Promise<OperationV1> {
+    const operation = await this.client.getCoreOperation(operationId);
+    if (operation.id !== operationId) {
+      throw new DesktopContractError("Core operation lookup returned the wrong operation");
+    }
+    return this.continuationAuthority.observeCore(operation);
+  }
+
+  async createDiagnostic(
+    input: DiagnosticCreateV1,
+    intent: ProductMutationIntent,
+  ): Promise<DiagnosticReportV1> {
+    this.assertIntent(intent);
+    const diagnostic = await this.client.createDiagnostic(input, {
+      idempotencyKey: intent.actionId,
+    });
+    if (JSON.stringify(diagnostic.scopes) !== JSON.stringify(input.scopes)
+      || JSON.stringify(diagnostic.target) !== JSON.stringify(input.target)) {
+      throw new DesktopContractError("Diagnostic report does not match the requested scope");
+    }
+    this.invalidate();
+    return this.continuationAuthority.observeDiagnostic(diagnostic);
+  }
+
+  async getDiagnostic(diagnosticId: string): Promise<DiagnosticReportV1> {
+    const diagnostic = await this.client.getDiagnostic(diagnosticId);
+    if (diagnostic.id !== diagnosticId) {
+      throw new DesktopContractError("Diagnostic lookup returned the wrong report");
+    }
+    return this.continuationAuthority.observeDiagnostic(diagnostic);
+  }
+
+  async cleanupCaches(
+    input: CacheCleanupRequestV1,
+    intent: ProductMutationIntent,
+  ): Promise<OperationV1> {
+    this.assertIntent(intent);
+    const operation = await this.client.cleanupMaintenanceCache(input, {
+      idempotencyKey: intent.actionId,
+    });
+    assertCoreOperation(operation, "cache_cleanup");
+    if (operation.request.kind !== "cache_cleanup"
+      || JSON.stringify(operation.request.request) !== JSON.stringify(input)) {
+      throw new DesktopContractError("Cache cleanup operation does not match the request");
+    }
+    this.invalidate();
+    return this.continuationAuthority.observeCore(operation);
   }
 
   private async loadSnapshot(): Promise<Omit<DesktopProductSnapshot, "stream">> {
@@ -578,7 +678,10 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
       }
       return operation;
     });
-    return operations.find((operation) => !["succeeded", "failed", "cancelled"].includes(operation.state)) ?? null;
+    const active = operations.find(
+      (operation) => !["succeeded", "failed", "cancelled"].includes(operation.state),
+    );
+    return active === undefined ? null : this.continuationAuthority.observeLocal(active);
   }
 
   private async loadProjectAuthority(
@@ -1012,6 +1115,19 @@ function assertLocalOperation(
     if (!matchesResult) {
       throw new DesktopContractError("Desktop action result does not match its resource");
     }
+  }
+}
+
+function assertCoreOperation(
+  operation: OperationV1,
+  kind: OperationV1["kind"],
+): void {
+  if (
+    operation.kind !== kind
+    || operation.descriptor.kind !== kind
+    || operation.request.kind !== kind
+  ) {
+    throw new DesktopContractError("Core action returned an operation of another kind");
   }
 }
 

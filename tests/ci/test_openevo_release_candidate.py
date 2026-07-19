@@ -58,7 +58,15 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
     notes = _release_notes_text()
 
     assert notes.endswith("\n")
-    assert "Self-Deployed Reference mode: unavailable in this candidate." in notes
+    assert notes.startswith("# OpenEvo Desktop 0.1.0 Preview\n")
+    assert "draft" not in notes.casefold()
+    assert "Codex subscription transcript mode: packaged and declared in this Preview." in notes
+    assert "Candidate-bound real Codex Subscription science E2E: not yet verified" in notes
+    assert "No real Codex Subscription run claim is made" in notes
+    assert "real remote OpenEvo Daemon" in notes
+    assert "Remote Core" not in notes
+    assert "Codex subscription transcript mode: available in this candidate." not in notes
+    assert "Self-Deployed Reference mode: unavailable in this Preview." in notes
     assert "openevo-science-runtime-0.1.1-linux-amd64.tar.gz" in notes
     assert "Managed Science runtime source asset ID: 481361975." in notes
     assert "Credential-canary verification for release assets: pending." in notes
@@ -91,6 +99,78 @@ def test_candidate_workflow_closes_managed_subscription_runtime_release() -> Non
     ):
         assert value in workflow
     assert workflow.count("self-deployed") == 0
+
+
+def test_candidate_workflow_roundtrips_closed_playwright_evidence() -> None:
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+    linux = workflow[
+        workflow.index("  linux-daemon-bundle:") : workflow.index("  macos-candidate:")
+    ]
+    macos = workflow[
+        workflow.index("  macos-candidate:") : workflow.index("  linux-core-candidate:")
+    ]
+    artifact_name = (
+        "openevo-desktop-playwright-${{ github.sha }}-"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+
+    for marker in (
+        "Gate non-release simulator preview",
+        "CI=1 npm run test:product-browser:preview",
+        "Produce packaged release-composition Playwright report",
+        'PLAYWRIGHT_BLOB_OUTPUT_FILE="$blob_dir/release-packaged.zip"',
+        "npm run test:product-browser:release-readonly -- --reporter=blob",
+        'PLAYWRIGHT_JSON_OUTPUT_NAME="$RUNNER_TEMP/playwright-raw-report.json"',
+        'npx playwright merge-reports --reporter=json "$blob_dir"',
+        "write-playwright-evidence",
+        '--raw-report "$RUNNER_TEMP/playwright-raw-report.json"',
+        '--sanitized-report-output "$evidence_dir/playwright-report.json"',
+        "validate-playwright-evidence",
+        "--source-commit \"$GITHUB_SHA\"",
+        "--run-id \"$GITHUB_RUN_ID\"",
+        "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+        "playwright-candidate-evidence.json",
+        "playwright-report.json",
+        "packaged-web-manifest.json",
+        artifact_name,
+    ):
+        assert marker in linux
+    preview_step = linux[
+        linux.index("      - name: Gate non-release simulator preview") :
+        linux.index("      - name: Produce packaged release-composition Playwright report")
+    ]
+    release_step = linux[
+        linux.index("      - name: Produce packaged release-composition Playwright report") :
+        linux.index("      - uses: actions/setup-python")
+    ]
+    assert "PLAYWRIGHT_BLOB_OUTPUT_FILE" not in preview_step
+    assert "merge-reports" not in preview_step
+    assert "test:product-browser:preview" not in release_step
+    assert linux.index("npm run test:product-browser:preview") < linux.index(
+        "npm run test:product-browser:release-readonly"
+    ) < linux.index("npx playwright merge-reports") < linux.index(
+        "write-playwright-evidence"
+    ) < linux.index(
+        "Upload immutable candidate Playwright evidence"
+    )
+    for marker in (
+        artifact_name,
+        "Revalidate candidate Playwright evidence on macOS",
+        "validate-playwright-evidence",
+        "cmp \"$RUNNER_TEMP/openevo-desktop-playwright/packaged-web-manifest.json\"",
+        "candidate-artifacts/",
+    ):
+        assert marker in macos
+    copy_step = macos[macos.index("      - name: Copy exact candidate bytes") :]
+    assert macos.index("Download exact candidate Playwright evidence") < macos.index(
+        "Revalidate candidate Playwright evidence on macOS"
+    ) < macos.index("Build unsigned Desktop DMG")
+    assert copy_step.index("playwright-candidate-evidence.json") < copy_step.index(
+        "openevo_release_candidate.py create"
+    )
+    assert "path: candidate-artifacts/*" in macos
 
 
 @pytest.mark.parametrize(
@@ -278,7 +358,7 @@ def _draft_release_metadata(*, body: str) -> dict[str, object]:
         "body": body,
         "isDraft": True,
         "isPrerelease": True,
-        "name": "OpenEvo Desktop 0.1.0 unsigned candidate",
+        "name": "OpenEvo Desktop 0.1.0 Preview",
         "tagName": "openevo-desktop-v0.1.0-exhibition.123.2",
         "targetCommitish": "8e45af371eef49a86530a849041f7dcf047620ec",
         "url": (
@@ -314,7 +394,7 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
         "--expected-target",
         "8e45af371eef49a86530a849041f7dcf047620ec",
         "--expected-title",
-        "OpenEvo Desktop 0.1.0 unsigned candidate",
+        "OpenEvo Desktop 0.1.0 Preview",
         "--expected-repository",
         "CompLifeLab-ZJU/OpenEvo",
         "--expected-owner",
@@ -329,7 +409,7 @@ def test_draft_release_metadata_binds_review_facing_fields(tmp_path: Path) -> No
             release_notes=notes,
             expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
             expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
-            expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+            expected_title="OpenEvo Desktop 0.1.0 Preview",
             expected_repository="CompLifeLab-ZJU/OpenEvo",
             expected_owner="d" * 32,
         )
@@ -388,7 +468,7 @@ def test_draft_release_metadata_rejects_review_surface_mutation(
         release_notes=notes,
         expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
         expected_target="8e45af371eef49a86530a849041f7dcf047620ec",
-        expected_title="OpenEvo Desktop 0.1.0 unsigned candidate",
+        expected_title="OpenEvo Desktop 0.1.0 Preview",
         expected_repository="CompLifeLab-ZJU/OpenEvo",
         expected_owner="d" * 32,
     )
@@ -417,11 +497,13 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         == []
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 4
+    assert payload["schema_version"] == 6
     assert payload["release"] == {
-        "channel": "unsigned-draft-prerelease",
+        "app_bundle_signature": "adhoc",
+        "channel": "unsigned-preview",
+        "developer_id_signed": False,
         "notarized": False,
-        "signed": False,
+        "quarantine_removal_tested": True,
     }
     assert payload["macos"] == {
         "architecture": "aarch64",
@@ -431,6 +513,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
             "native_executable": ["arm64"],
         },
         "rust_target": "aarch64-apple-darwin",
+        "rust_toolchain": "1.95.0",
     }
     by_role = {entry["role"]: entry for entry in payload["files"]}
     assert by_role["desktop_dmg"]["filename"] == paths["dmg"].name
@@ -449,6 +532,12 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     assert by_role["app_bundle_smoke"]["filename"] == "app-bundle-smoke.json"
     assert by_role["dmg_copy_smoke"]["filename"] == "dmg-copy-smoke.json"
     assert by_role["managed_runtime_source"]["filename"] == "managed-runtime-source.json"
+    assert by_role["playwright_evidence"]["filename"] == candidate.PLAYWRIGHT_EVIDENCE_NAME
+    assert by_role["playwright_report"]["filename"] == candidate.PLAYWRIGHT_REPORT_NAME
+    assert (
+        by_role["packaged_web_manifest"]["filename"]
+        == candidate.PACKAGED_WEB_MANIFEST_NAME
+    )
     assert payload["core"]["registry_digest"] == "a" * 64
     assert payload["daemon"]["artifact_sha256"] == by_role["daemon_bundle"]["sha256"]
     assert payload["daemon"]["manifest_sha256"] == by_role["daemon_manifest"]["sha256"]
@@ -470,6 +559,40 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "python_requires": ">=3.11",
         "supported_platforms": ["linux-x86_64"],
     }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("signed", False),
+        ("developer_id_signed", True),
+        ("app_bundle_signature", "developer_id"),
+        ("notarized", True),
+        ("quarantine_removal_tested", False),
+    ],
+)
+def test_candidate_manifest_rejects_ambiguous_or_false_signature_claims(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["release"][field] = value
+    _write_json(manifest, payload)
+
+    errors = candidate.validate_candidate_manifest(manifest)
+
+    assert errors
 
 
 def test_candidate_manifest_rejects_daemon_for_other_registry(tmp_path: Path) -> None:
@@ -579,15 +702,17 @@ def test_managed_runtime_source_binds_prerelease_asset_and_download(
     "required_marker",
     [
         "## Supported Workflows",
-        "Codex subscription transcript mode: available in this candidate.",
-        "Self-Deployed Reference mode: unavailable in this candidate.",
+        "Codex subscription transcript mode: packaged and declared in this Preview.",
+        "Candidate-bound real Codex Subscription science E2E: not yet verified",
+        "No real Codex Subscription run claim is made",
+        "Self-Deployed Reference mode: unavailable in this Preview.",
         "## Known Limitations",
-        "Parameter evolution is not included in this candidate.",
+        "Parameter evolution is not included in this Preview.",
         "PyPI is not used for this release.",
         "Only the declared architecture was built.",
         "command-line quarantine removal is validated.",
         "## Validation Results",
-        "Benchmark gates completed by this packaging candidate: 0 of 3.",
+        "Benchmark gates completed by this Preview: 0 of 3.",
         "Textual-memory pass@1 rescue count: pending.",
         "Trajectory-to-skill pass@1 rescue count: pending.",
         "Agent-system pass@1 rescue count: pending.",
@@ -650,6 +775,197 @@ def test_candidate_manifest_rejects_managed_runtime_source_mutation(tmp_path: Pa
     _write_json(source, payload)
 
     with pytest.raises(candidate.CandidateError, match="runtime source evidence"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+
+def test_playwright_candidate_evidence_binds_report_web_build_and_run(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+
+    evidence = json.loads(paths["evidence"].read_text(encoding="utf-8"))
+
+    assert evidence["schema_version"] == 2
+    assert evidence["simulator"] is False
+    assert evidence["provider_kind"] == "desktop_sidecar"
+    assert evidence["composition"] == "packaged_web"
+    assert evidence["source_commit"] == "8e45af371eef49a86530a849041f7dcf047620ec"
+    assert evidence["run"] == {"attempt": 2, "id": 123456}
+    assert evidence["browser"] == {"name": "chromium", "version": "149.0.7827.55"}
+    assert evidence["status"] == "passed"
+    assert len(evidence["tests"]) == 3
+    assert {entry["project"] for entry in evidence["tests"]} == {
+        "release-packaged-1440",
+        "release-packaged-1024",
+        "release-packaged-760",
+    }
+    assert evidence["packaged_web"]["manifest"]["sha256"] == _sha256(
+        paths["web_manifest"]
+    )
+    assert evidence["report"]["sha256"] == _sha256(paths["report"])
+    sanitized_report = paths["report"].read_text(encoding="utf-8")
+    assert "/home/runner" not in sanitized_report
+    assert "npm run" not in sanitized_report
+    assert "rootDir" not in sanitized_report
+    assert "webServer" not in sanitized_report
+    candidate._validate_playwright_candidate_evidence(
+        paths["evidence"],
+        report_path=paths["report"],
+        packaged_web_manifest_path=paths["web_manifest"],
+        expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        expected_run_id=123456,
+        expected_run_attempt=2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    [
+        ("source_commit", "f" * 40, "different candidate run"),
+        ("status", "pending", "identity or status"),
+    ],
+)
+def test_playwright_candidate_evidence_rejects_rewritten_identity_or_status(
+    tmp_path: Path,
+    field: str,
+    value: str,
+    error: str,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+    evidence = json.loads(paths["evidence"].read_text(encoding="utf-8"))
+    evidence[field] = value
+    _write_json(paths["evidence"], evidence)
+
+    with pytest.raises(candidate.CandidateError, match=error):
+        candidate._validate_playwright_candidate_evidence(
+            paths["evidence"],
+            report_path=paths["report"],
+            packaged_web_manifest_path=paths["web_manifest"],
+            expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error"),
+    [
+        ("skipped", "first-attempt pass"),
+        ("retry", "first-attempt pass"),
+        ("flaky", "aggregate status"),
+    ],
+)
+def test_playwright_candidate_evidence_rejects_non_clean_results(
+    tmp_path: Path,
+    mutation: str,
+    error: str,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+    report = json.loads(paths["raw_report"].read_text(encoding="utf-8"))
+    test = report["suites"][0]["specs"][0]["tests"][0]
+    if mutation == "skipped":
+        test["status"] = "skipped"
+    elif mutation == "retry":
+        test["results"][0]["retry"] = 1
+    else:
+        report["stats"]["flaky"] = 1
+    _write_json(paths["raw_report"], report)
+
+    with pytest.raises(candidate.CandidateError, match=error):
+        candidate._playwright_test_results(paths["raw_report"])
+
+
+def test_playwright_candidate_evidence_rejects_simulator_project(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+    report = json.loads(paths["raw_report"].read_text(encoding="utf-8"))
+    report["config"]["projects"][0] = {
+        "id": "desktop-1440",
+        "name": "desktop-1440",
+    }
+    _write_json(paths["raw_report"], report)
+
+    with pytest.raises(candidate.CandidateError, match="project identity"):
+        candidate._playwright_test_results(paths["raw_report"])
+
+
+def test_playwright_candidate_evidence_rejects_web_build_digest_mutation(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+    manifest = json.loads(paths["web_manifest"].read_text(encoding="utf-8"))
+    manifest["build_digest"] = "f" * 64
+    _write_json(paths["web_manifest"], manifest)
+
+    with pytest.raises(candidate.CandidateError, match="build digest"):
+        candidate._validate_playwright_candidate_evidence(
+            paths["evidence"],
+            report_path=paths["report"],
+            packaged_web_manifest_path=paths["web_manifest"],
+        )
+
+
+def test_playwright_candidate_evidence_requires_exact_packaged_release_matrix(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+    report = json.loads(paths["report"].read_text(encoding="utf-8"))
+    report["tests"].pop()
+    _write_json(paths["report"], report)
+
+    with pytest.raises(candidate.CandidateError, match="test inventory"):
+        candidate._validate_playwright_candidate_evidence(
+            paths["evidence"],
+            report_path=paths["report"],
+            packaged_web_manifest_path=paths["web_manifest"],
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("simulator", True),
+        ("provider_kind", "contract_simulator"),
+        ("composition", "source_preview"),
+    ],
+)
+def test_playwright_candidate_evidence_rejects_false_release_provenance(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    candidate = _load_module()
+    paths = _write_playwright_inputs(tmp_path)
+    evidence = json.loads(paths["evidence"].read_text(encoding="utf-8"))
+    evidence[field] = value
+    _write_json(paths["evidence"], evidence)
+
+    with pytest.raises(candidate.CandidateError, match="identity or status"):
+        candidate._validate_playwright_candidate_evidence(
+            paths["evidence"],
+            report_path=paths["report"],
+            packaged_web_manifest_path=paths["web_manifest"],
+        )
+
+
+def test_candidate_manifest_requires_playwright_evidence_role(tmp_path: Path) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    (tmp_path / candidate.PLAYWRIGHT_EVIDENCE_NAME).unlink()
+
+    with pytest.raises(candidate.CandidateError, match="Candidate input is missing"):
         candidate.create_candidate_manifest(
             tmp_path,
             source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
@@ -926,6 +1242,198 @@ def test_candidate_manifest_rejects_unclassified_directory(tmp_path: Path) -> No
     assert any("non-regular" in error for error in errors)
 
 
+def test_preview_snapshot_revalidates_unchanged_public_release(
+    tmp_path: Path,
+) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+    public_metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    public_metadata["draft"] = False
+    public_metadata["immutable"] = True
+    public_metadata["html_url"] = (
+        "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/"
+        "openevo-desktop-v0.1.0-exhibition.123.2"
+    )
+    public_path = tmp_path / "public-release.json"
+    _write_json(public_path, public_metadata)
+
+    candidate.write_preview_release_snapshot(
+        tmp_path / "public-snapshot.json",
+        metadata_path=public_path,
+        candidate_root=fixture["candidate_root"],
+        baseline_path=fixture["snapshot"],
+        expected_repository="CompLifeLab-ZJU/OpenEvo",
+        expected_release_id=356072935,
+        expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+        expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        expected_manifest_sha256=fixture["manifest_sha256"],
+        expected_run_id=123456,
+        expected_run_attempt=2,
+        expected_draft=False,
+    )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("body", "reviewer edited the draft"),
+        ("name", "Edited Preview title"),
+        ("target_commitish", "f" * 40),
+        ("id", 356072936),
+        ("immutable", True),
+    ],
+)
+def test_preview_asset_plan_rejects_mutated_draft_metadata(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    metadata[field] = replacement
+    mutated = tmp_path / "mutated-draft.json"
+    _write_json(mutated, metadata)
+
+    with pytest.raises(candidate.CandidateError):
+        candidate.write_preview_asset_plan(
+            tmp_path / "asset-plan.tsv",
+            metadata_path=mutated,
+            baseline_path=fixture["snapshot"],
+            expected_draft=True,
+        )
+
+
+def test_preview_asset_plan_rejects_replaced_asset_identity(tmp_path: Path) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+    metadata = json.loads(fixture["metadata"].read_text(encoding="utf-8"))
+    metadata["assets"][0]["digest"] = "sha256:" + "f" * 64
+    mutated = tmp_path / "mutated-assets.json"
+    _write_json(mutated, metadata)
+
+    with pytest.raises(candidate.CandidateError, match="asset identities changed"):
+        candidate.write_preview_asset_plan(
+            tmp_path / "asset-plan.tsv",
+            metadata_path=mutated,
+            baseline_path=fixture["snapshot"],
+            expected_draft=True,
+        )
+
+
+def test_preview_snapshot_rejects_wrong_expected_manifest_digest(tmp_path: Path) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+
+    with pytest.raises(candidate.CandidateError, match="manifest digest"):
+        candidate.write_preview_release_snapshot(
+            tmp_path / "wrong-digest-snapshot.json",
+            metadata_path=fixture["metadata"],
+            candidate_root=fixture["candidate_root"],
+            baseline_path=fixture["snapshot"],
+            expected_repository="CompLifeLab-ZJU/OpenEvo",
+            expected_release_id=356072935,
+            expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+            expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            expected_manifest_sha256="f" * 64,
+            expected_run_id=123456,
+            expected_run_attempt=2,
+            expected_draft=True,
+        )
+
+
+def test_preview_snapshot_rejects_changed_downloaded_asset(tmp_path: Path) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+    (fixture["candidate_root"] / "release-notes.md").write_text(
+        "changed after upload\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(candidate.CandidateError, match="digest mismatch"):
+        candidate.write_preview_release_snapshot(
+            tmp_path / "changed-asset-snapshot.json",
+            metadata_path=fixture["metadata"],
+            candidate_root=fixture["candidate_root"],
+            baseline_path=fixture["snapshot"],
+            expected_repository="CompLifeLab-ZJU/OpenEvo",
+            expected_release_id=356072935,
+            expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+            expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            expected_manifest_sha256=fixture["manifest_sha256"],
+            expected_run_id=123456,
+            expected_run_attempt=2,
+            expected_draft=True,
+        )
+
+
+def test_release_inventory_rejects_wrong_numeric_release_id(tmp_path: Path) -> None:
+    candidate = _load_module()
+    inventory = tmp_path / "release-ids.jsonl"
+    inventory.write_text(
+        '{"id":356072936,"tag_name":"openevo-desktop-v0.1.0-exhibition.123.2"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(candidate.CandidateError, match="numeric release ID"):
+        candidate.assert_release_id_inventory(
+            inventory,
+            expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+            expected_release_id=356072935,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("path", ".github/workflows/unrelated.yml"),
+        ("head_sha", "f" * 40),
+        ("run_attempt", 3),
+        ("conclusion", "failure"),
+    ],
+)
+def test_preview_publisher_rejects_wrong_candidate_workflow_run(
+    tmp_path: Path,
+    field: str,
+    replacement: object,
+) -> None:
+    candidate = _load_module()
+    metadata = {
+        "conclusion": "success",
+        "event": "workflow_dispatch",
+        "head_branch": "stable",
+        "head_sha": "8e45af371eef49a86530a849041f7dcf047620ec",
+        "id": 123456,
+        "path": ".github/workflows/openevo-desktop-candidate.yml",
+        "repository": "CompLifeLab-ZJU/OpenEvo",
+        "run_attempt": 2,
+        "status": "completed",
+    }
+    metadata[field] = replacement
+    path = tmp_path / "candidate-run.json"
+    _write_json(path, metadata)
+
+    with pytest.raises(candidate.CandidateError, match="run identity or result"):
+        candidate.validate_candidate_workflow_run(
+            path,
+            expected_repository="CompLifeLab-ZJU/OpenEvo",
+            expected_run_id=123456,
+            expected_run_attempt=2,
+            expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        )
+
+
+def test_postpublication_tag_must_point_to_exact_source(tmp_path: Path) -> None:
+    candidate = _load_module()
+    inventory = tmp_path / "published-tag.txt"
+    inventory.write_text(
+        f"{'f' * 40}\trefs/tags/openevo-desktop-v0.1.0-exhibition.123.2\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(candidate.CandidateError, match="expected source commit"):
+        candidate.validate_published_tag_target(
+            inventory,
+            expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+            expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        )
+
+
 def _write_candidate_inputs(
     root: Path,
     *,
@@ -1135,12 +1643,205 @@ def _write_candidate_inputs(
         root / candidate.MANAGED_RUNTIME_SOURCE_NAME,
         candidate._managed_runtime_source_evidence(),
     )
+    _write_playwright_inputs(root, retain_raw=False)
     return {
         "wheel": wheel,
         "framework_lock": framework_lock,
         "dmg": dmg,
         "daemon_bundle": daemon_bundle,
         "daemon_manifest": daemon_manifest,
+    }
+
+
+def _write_preview_release_fixture(
+    root: Path,
+) -> tuple[object, dict[str, object]]:
+    candidate = _load_module()
+    candidate_root = root / "candidate"
+    candidate_root.mkdir()
+    _write_candidate_inputs(candidate_root)
+    manifest = candidate.create_candidate_manifest(
+        candidate_root,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+    manifest_sha256 = _sha256(manifest)
+    assets = [
+        {
+            "digest": f"sha256:{_sha256(path)}",
+            "id": 400000000 + index,
+            "name": path.name,
+            "size": path.stat().st_size,
+            "state": "uploaded",
+        }
+        for index, path in enumerate(sorted(candidate_root.iterdir()), start=1)
+    ]
+    body = candidate.render_draft_release_body(
+        release_notes=(candidate_root / "release-notes.md").read_text(encoding="utf-8"),
+        ownership_token="d" * 32,
+    )
+    metadata = root / "draft-release-rest.json"
+    _write_json(
+        metadata,
+        {
+            "assets": assets,
+            "body": body,
+            "draft": True,
+            "html_url": (
+                "https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/"
+                "untagged-7a9ca728f876fa16a90d"
+            ),
+            "id": 356072935,
+            "immutable": False,
+            "name": "OpenEvo Desktop 0.1.0 Preview",
+            "prerelease": True,
+            "tag_name": "openevo-desktop-v0.1.0-exhibition.123.2",
+            "target_commitish": "8e45af371eef49a86530a849041f7dcf047620ec",
+        },
+    )
+    snapshot = root / "preview-release-snapshot.json"
+    candidate.write_preview_release_snapshot(
+        snapshot,
+        metadata_path=metadata,
+        candidate_root=candidate_root,
+        baseline_path=None,
+        expected_repository="CompLifeLab-ZJU/OpenEvo",
+        expected_release_id=356072935,
+        expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+        expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        expected_manifest_sha256=manifest_sha256,
+        expected_run_id=123456,
+        expected_run_attempt=2,
+        expected_draft=True,
+    )
+    return candidate, {
+        "candidate_root": candidate_root,
+        "manifest_sha256": manifest_sha256,
+        "metadata": metadata,
+        "snapshot": snapshot,
+    }
+
+
+def _write_playwright_inputs(
+    root: Path,
+    *,
+    retain_raw: bool = True,
+) -> dict[str, Path]:
+    candidate = _load_module()
+    raw_report = root / "raw-playwright-report.json"
+    specs: list[dict[str, object]] = []
+    lines = {
+        (
+            "scientific-project-sample.pw.ts",
+            "first-run sample is accessible, keyboard-operable, and viewport-safe",
+        ): 9,
+        (
+            "system-recovery.pw.ts",
+            "System recovery is keyboard-operable, accessible, and viewport-safe",
+        ): 11,
+        (
+            "system-recovery.pw.ts",
+            "System remains reachable at the minimum width and a constrained window height",
+        ): 66,
+        (
+            "release-readonly.pw.ts",
+            "first launch uses the release sidecar composition and keeps its sample read-only",
+        ): 33,
+    }
+    for project, file, title in sorted(candidate.PLAYWRIGHT_REQUIRED_CASES):
+        specs.append(
+            {
+                "column": 1,
+                "file": file,
+                "id": f"{project}-{len(specs)}",
+                "line": lines[(file, title)],
+                "ok": True,
+                "tags": [],
+                "tests": [
+                    {
+                        "annotations": [],
+                        "expectedStatus": "passed",
+                        "projectId": project,
+                        "projectName": project,
+                        "results": [{"retry": 0, "status": "passed"}],
+                        "status": "expected",
+                        "timeout": 30000,
+                    }
+                ],
+                "title": title,
+            }
+        )
+    _write_json(
+        raw_report,
+        {
+            "config": {
+                "rootDir": "/home/runner/work/private-checkout/desktop/tests/product-browser",
+                "projects": [
+                    {"id": project, "name": project}
+                    for project in candidate.PLAYWRIGHT_VIEWPORTS
+                ],
+                "webServer": {
+                    "command": "npm run dev -- --host 127.0.0.1",
+                    "url": "http://127.0.0.1:4174/",
+                },
+            },
+            "errors": [],
+            "stats": {
+                "expected": len(specs),
+                "flaky": 0,
+                "skipped": 0,
+                "unexpected": 0,
+            },
+            "suites": [
+                {
+                    "file": "candidate-matrix",
+                    "specs": specs,
+                    "title": "candidate-matrix",
+                }
+            ],
+        },
+    )
+    web_manifest = root / candidate.PACKAGED_WEB_MANIFEST_NAME
+    web_files = [
+        {
+            "path": "index.html",
+            "sha256": hashlib.sha256(b"<html>OpenEvo</html>").hexdigest(),
+            "byte_size": len(b"<html>OpenEvo</html>"),
+        }
+    ]
+    build_digest = hashlib.sha256(
+        json.dumps(web_files, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+    _write_json(
+        web_manifest,
+        {
+            "build_digest": build_digest,
+            "files": web_files,
+            "schema_version": "1",
+        },
+    )
+    evidence = root / candidate.PLAYWRIGHT_EVIDENCE_NAME
+    report = root / candidate.PLAYWRIGHT_REPORT_NAME
+    candidate.write_playwright_candidate_evidence(
+        evidence,
+        raw_report_path=raw_report,
+        sanitized_report_path=report,
+        packaged_web_manifest_path=web_manifest,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        run_id=123456,
+        run_attempt=2,
+        browser_version="149.0.7827.55",
+    )
+    if not retain_raw:
+        raw_report.unlink()
+    return {
+        "evidence": evidence,
+        "raw_report": raw_report,
+        "report": report,
+        "web_manifest": web_manifest,
     }
 
 

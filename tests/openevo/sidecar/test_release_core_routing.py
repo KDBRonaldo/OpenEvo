@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import hashlib
 from pathlib import Path
-from unittest.mock import Mock
+import time
+from unittest.mock import Mock, call
 
 from fastapi.responses import Response, StreamingResponse
 from fastapi.testclient import TestClient
@@ -16,11 +18,15 @@ from desktop.sidecar.event_broker_v1 import (
     DesktopEventBrokerV1,
     DesktopEventCursorExpiredError,
 )
-from desktop.sidecar.provider_store import DesktopProviderStore, ETagConflictError
+from desktop.sidecar.provider_store import (
+    DesktopProviderStore,
+    ETagConflictError,
+    ProviderStoreError,
+)
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import (
     DesktopReleaseProvider,
-    ProviderCapabilityUnavailableError,
+    LocalOperationCancellationUnavailableError,
 )
 from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
@@ -109,6 +115,76 @@ def _page_arguments() -> dict[str, object]:
     }
 
 
+def _activate_routing_project(
+    store: DesktopProviderStore,
+    project: local_v1.ProjectV1,
+) -> local_v1.ProjectV1:
+    action = {
+        "route": f"/desktop/v1/projects/{project.project_id}/activate",
+        "operation_kind": "project_activate",
+        "project_id": project.project_id,
+        "key": "project-activate-degraded-routing-0001",
+        "body": {},
+        "if_match": project.etag,
+    }
+    reservation = store.begin_project_runtime_action(**action)
+    store.start_project_runtime_action(reservation=reservation, **action)
+    core_project_id = f"core-{project.project_id}"
+    store.complete_project_runtime_action(
+        reservation=reservation,
+        remote_state=local_v1.RemoteProjectStateV1(
+            core_project_id=core_project_id,
+            status="ready",
+            active_revision=core_v1.RevisionRefV1(
+                id="core-revision-degraded-routing-0001",
+                project_id=core_project_id,
+                generation=1,
+                manifest_sha256="a" * 64,
+            ),
+            registry_digest="b" * 64,
+            model_preparation=core_v1.ModelPreparationV1(
+                model_ref="gpt-5.5",
+                status=core_v1.ModelPreparationStatus.READY,
+                updated_at=NOW,
+            ),
+            observed_at=NOW,
+            etag=ETAG_A,
+        ),
+        **action,
+    )
+    return store.get_project(project.project_id)
+
+
+def _set_degraded_runtime(
+    provider: DesktopReleaseProvider,
+    project: local_v1.ProjectV1,
+    *,
+    binding: CoreRuntimeSessionBinding | None = None,
+    active_tunnel: bool = True,
+    generation: int = 1,
+) -> None:
+    provider._session_generation = generation
+    provider._core_session_binding = binding or CoreRuntimeSessionBinding(
+        project=project,
+        generation=generation,
+    )
+    provider._core_state = local_v1.CoreConnectionStateV1(
+        state="degraded",
+        profile_id=project.profile_id,
+        active_tunnel=active_tunnel,
+        core=local_v1.CoreCompatibilityV1(
+            contract_digest="d" * 64,
+            core_version="0.1.0",
+        ),
+        failure=local_v1.ConnectionFailureV1(
+            code="service_degraded",
+            message="One remote service needs attention.",
+            retryable=True,
+            next_action="Open System to inspect and repair the service.",
+        ),
+    )
+
+
 def _bind_app_project(app: object) -> local_v1.ProjectV1:
     provider = app.state.desktop_release_provider  # type: ignore[attr-defined]
     store = provider._store
@@ -139,6 +215,120 @@ def _bind_app_project(app: object) -> local_v1.ProjectV1:
         generation=1,
     )
     return project
+
+
+def test_degraded_exact_runtime_binding_stays_ready_for_system_routes(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, draft = _provider(tmp_path, bridge)
+    project = _activate_routing_project(store, draft)
+    del provider._active_project_for_runtime
+    _set_degraded_runtime(provider, project)
+    services = object()
+    restarted = object()
+    diagnostic = object()
+    bridge.list_services.return_value = services
+    bridge.restart_service.return_value = restarted
+    bridge.create_diagnostic.return_value = diagnostic
+    request = core_v1.DiagnosticsRequestV1(
+        scopes=[core_v1.DiagnosticScope.PROJECT],
+        target=core_v1.ProjectDiagnosticTargetV1(
+            kind=core_v1.DiagnosticTargetKind.PROJECT,
+            project_id=project.remote.core_project_id,
+        ),
+    )
+    try:
+        state = provider.invoke("getDesktopState", {})
+        assert isinstance(state, local_v1.DesktopStateV1)
+        assert state.core.state == "degraded"
+        assert state.active_project is not None
+        assert state.active_project.connection_state == "ready"
+
+        assert provider.invoke("listServices", _page_arguments()) is services
+        assert (
+            provider.invoke(
+                "restartService",
+                {
+                    "service_id": "service-1",
+                    "if_match": ETAG_A,
+                    "idempotency_key": "restart-degraded-routing-0001",
+                },
+            )
+            is restarted
+        )
+        assert (
+            provider.invoke(
+                "createDiagnostic",
+                {
+                    "request": request,
+                    "idempotency_key": "diagnostic-degraded-routing-0001",
+                },
+            )
+            is diagnostic
+        )
+        bridge.list_services.assert_called_once_with(project, **_page_arguments())
+        bridge.restart_service.assert_called_once_with(
+            project,
+            "service-1",
+            if_match=ETAG_A,
+            idempotency_key="restart-degraded-routing-0001",
+        )
+        bridge.create_diagnostic.assert_called_once_with(
+            project,
+            request,
+            idempotency_key="diagnostic-degraded-routing-0001",
+        )
+    finally:
+        provider.close()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ("binding", "project", "profile", "etag", "generation", "tunnel"),
+)
+def test_degraded_runtime_binding_mismatch_is_offline_and_fails_closed(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, draft = _provider(tmp_path, bridge)
+    project = _activate_routing_project(store, draft)
+    del provider._active_project_for_runtime
+    binding_project = project
+    binding_generation = 1
+    binding: CoreRuntimeSessionBinding | None = None
+    if mismatch == "project":
+        binding_project = project.model_copy(update={"project_id": "project-other"})
+    elif mismatch == "profile":
+        binding_project = project.model_copy(update={"profile_id": "profile-other"})
+    elif mismatch == "etag":
+        binding_project = project.model_copy(update={"etag": '"' + "e" * 64 + '"'})
+    elif mismatch == "generation":
+        binding_generation = 2
+    if mismatch != "binding":
+        binding = CoreRuntimeSessionBinding(
+            project=binding_project,
+            generation=binding_generation,
+        )
+    _set_degraded_runtime(
+        provider,
+        project,
+        binding=binding,
+        active_tunnel=mismatch != "tunnel",
+    )
+    if mismatch == "binding":
+        provider._core_session_binding = None
+    try:
+        state = provider.invoke("getDesktopState", {})
+        assert isinstance(state, local_v1.DesktopStateV1)
+        assert state.active_project is not None
+        assert state.active_project.connection_state == "offline"
+        with pytest.raises(ProviderStoreError):
+            provider.invoke("listServices", _page_arguments())
+        bridge.list_services.assert_not_called()
+    finally:
+        provider.close()
 
 
 def test_release_provider_forwards_core_owned_read_routes(tmp_path: Path) -> None:
@@ -207,8 +397,18 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
     bridge.create_run.return_value = result
     bridge.cancel_run.return_value = result
     bridge.retry_run.return_value = result
+    bridge.restart_service.return_value = result
+    bridge.create_diagnostic.return_value = result
+    bridge.get_diagnostic.return_value = result
     bridge.cache_cleanup.return_value = result
     retry_request = local_v1.RunRetryV1(terminal_attempt_id="attempt-terminal-1")
+    diagnostic_request = core_v1.DiagnosticsRequestV1(
+        scopes=[core_v1.DiagnosticScope.PROJECT],
+        target=core_v1.ProjectDiagnosticTargetV1(
+            kind=core_v1.DiagnosticTargetKind.PROJECT,
+            project_id="core-project-1",
+        ),
+    )
     cache_request = core_v1.CacheCleanupRequestV1(
         scopes=[core_v1.CacheScope.BUILD_ARTIFACTS],
         older_than_days=30,
@@ -250,6 +450,28 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
         )
         assert (
             provider.invoke(
+                "restartService",
+                {
+                    "service_id": "service-1",
+                    "idempotency_key": "service-restart-routing-0001",
+                    "if_match": ETAG_A,
+                },
+            )
+            is result
+        )
+        assert (
+            provider.invoke(
+                "createDiagnostic",
+                {
+                    "request": diagnostic_request,
+                    "idempotency_key": "diagnostic-create-routing-0001",
+                },
+            )
+            is result
+        )
+        assert provider.invoke("getDiagnostic", {"diagnostic_id": "diagnostic-1"}) is result
+        assert (
+            provider.invoke(
                 "cleanupCaches",
                 {
                     "request": cache_request,
@@ -261,6 +483,15 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
 
         deleted_run = provider.invoke("deleteRun", {"run_id": "run-1", "if_match": ETAG_A})
         assert isinstance(deleted_run, Response) and deleted_run.status_code == 204
+        deleted_diagnostic = provider.invoke(
+            "deleteDiagnostic",
+            {
+                "diagnostic_id": "diagnostic-1",
+                "idempotency_key": "diagnostic-delete-routing-0001",
+                "if_match": ETAG_A,
+            },
+        )
+        assert isinstance(deleted_diagnostic, Response) and deleted_diagnostic.status_code == 204
 
         bridge.create_run.assert_called_once_with(
             project, idempotency_key="run-create-routing-0001"
@@ -278,12 +509,354 @@ def test_release_provider_forwards_core_owned_mutations(tmp_path: Path) -> None:
             if_match=ETAG_A,
             idempotency_key="run-retry-routing-0001",
         )
+        bridge.restart_service.assert_called_once_with(
+            project,
+            "service-1",
+            if_match=ETAG_A,
+            idempotency_key="service-restart-routing-0001",
+        )
+        bridge.create_diagnostic.assert_called_once_with(
+            project,
+            diagnostic_request,
+            idempotency_key="diagnostic-create-routing-0001",
+        )
+        bridge.get_diagnostic.assert_called_once_with(project, "diagnostic-1")
+        bridge.delete_diagnostic.assert_called_once_with(
+            project,
+            "diagnostic-1",
+            if_match=ETAG_A,
+            idempotency_key="diagnostic-delete-routing-0001",
+        )
         bridge.cache_cleanup.assert_called_once_with(
             project,
             cache_request,
             idempotency_key="cache-cleanup-routing-0001",
         )
         bridge.delete_run.assert_called_once_with(project, "run-1", if_match=ETAG_A)
+    finally:
+        provider.close()
+
+
+def test_release_provider_runs_project_doctor_and_repair_through_active_core(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    doctor_response = core_v1.EnvironmentDoctorResponseV1(
+        status=core_v1.DoctorStatus.DEGRADED,
+        checks=[
+            core_v1.EnvironmentCheckV1(
+                id="registry",
+                kind=core_v1.EnvironmentCheckKind.REGISTRY,
+                status=core_v1.CheckStatus.WARNING,
+                message="Registry repair is available.",
+                repair_action=core_v1.RepairAction.OPENEVO_CAN_RECONFIGURE,
+                next_action="Run project repair.",
+            )
+        ],
+        checked_at=NOW,
+    )
+    repair_request = core_v1.EnvironmentRepairRequestV1(
+        execution_mode=core_v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+        actions=[core_v1.EnvironmentRepairAction.REPAIR_REGISTRY_INSTALL],
+    )
+    repair_operation = core_v1.OperationV1(
+        id="operation-project-repair-1",
+        kind=core_v1.OperationKind.ENVIRONMENT_REPAIR,
+        descriptor=core_v1.OperationDescriptorV1(
+            kind=core_v1.OperationKind.ENVIRONMENT_REPAIR,
+            cancellable=True,
+        ),
+        status=core_v1.OperationStatus.QUEUED,
+        request=core_v1.EnvironmentRepairOperationRequestV1(
+            kind=core_v1.OperationKind.ENVIRONMENT_REPAIR,
+            request=repair_request,
+        ),
+        logs_ref="logs-project-repair-1",
+        created_at=NOW,
+        updated_at=NOW,
+        observed_at=NOW,
+        etag=ETAG_A,
+    )
+    completed_repair = core_v1.OperationV1(
+        id=repair_operation.id,
+        kind=repair_operation.kind,
+        descriptor=repair_operation.descriptor,
+        status=core_v1.OperationStatus.SUCCEEDED,
+        request=repair_operation.request,
+        result=core_v1.EnvironmentRepairOperationResultV1(
+            kind=core_v1.OperationKind.ENVIRONMENT_REPAIR,
+            response=core_v1.EnvironmentRepairResponseV1(
+                status=core_v1.DoctorStatus.OK,
+                results=[
+                    core_v1.RepairActionResultV1(
+                        action=action,
+                        status=core_v1.CheckStatus.OK,
+                        message="Repair completed.",
+                    )
+                    for action in repair_request.actions
+                ],
+                checked_at=NOW,
+            ),
+        ),
+        logs_ref=repair_operation.logs_ref,
+        created_at=NOW,
+        updated_at=NOW,
+        observed_at=NOW,
+        finished_at=NOW,
+        etag='"' + "b" * 64 + '"',
+    )
+    post_doctor_response = core_v1.EnvironmentDoctorResponseV1(
+        status=core_v1.DoctorStatus.OK,
+        checks=[],
+        checked_at=NOW,
+    )
+    bridge.doctor_project.side_effect = [
+        doctor_response,
+        doctor_response,
+        post_doctor_response,
+    ]
+    bridge.repair_project.return_value = repair_operation
+    bridge.get_operation.return_value = completed_repair
+
+    def wait_for_terminal(operation_id: str) -> local_v1.LocalOperationV1:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            operation = store.get_local_operation(operation_id)
+            if operation.state in {"succeeded", "failed", "cancelled"}:
+                return operation
+            time.sleep(0.01)
+        pytest.fail("project maintenance operation did not finish")
+
+    try:
+        doctor_response_body = provider.invoke(
+            "doctorProject",
+            {
+                "project_id": project.project_id,
+                "idempotency_key": "project-doctor-routing-0001",
+                "if_match": project.etag,
+            },
+        )
+        assert isinstance(doctor_response_body, Response)
+        doctor = local_v1.LocalOperationV1.model_validate_json(doctor_response_body.body)
+        doctor = wait_for_terminal(doctor.operation_id)
+        assert doctor.state == "succeeded"
+        assert doctor.operation_kind == "project_doctor"
+        assert doctor.checks == (
+            local_v1.NormalizedCheckV1(
+                check_id="registry",
+                label="Registry",
+                status="warning",
+                summary="Registry repair is available.",
+                repair_action="openevo_can_retry",
+            ),
+        )
+
+        repair_response_body = provider.invoke(
+            "repairProject",
+            {
+                "project_id": project.project_id,
+                "idempotency_key": "project-repair-routing-0001",
+                "if_match": project.etag,
+            },
+        )
+        assert isinstance(repair_response_body, Response)
+        repair = local_v1.LocalOperationV1.model_validate_json(repair_response_body.body)
+        repair = wait_for_terminal(repair.operation_id)
+        assert repair.state == "succeeded"
+        assert repair.operation_kind == "project_repair"
+
+        replay_response = provider.invoke(
+            "repairProject",
+            {
+                "project_id": project.project_id,
+                "idempotency_key": "project-repair-routing-0001",
+                "if_match": project.etag,
+            },
+        )
+        assert isinstance(replay_response, Response)
+        replay = local_v1.LocalOperationV1.model_validate_json(replay_response.body)
+        assert replay == repair
+
+        preflight_key = hashlib.sha256(
+            b"project-repair-routing-0001\0repair-doctor"
+        ).hexdigest()
+        postflight_key = hashlib.sha256(
+            b"project-repair-routing-0001\0repair-post-doctor"
+        ).hexdigest()
+        assert bridge.doctor_project.call_args_list == [
+            call(
+                project,
+                idempotency_key="project-doctor-routing-0001",
+            ),
+            call(project, idempotency_key=preflight_key),
+            call(project, idempotency_key=postflight_key),
+        ]
+        bridge.repair_project.assert_called_once_with(
+            project,
+            actions=(core_v1.EnvironmentRepairAction.REPAIR_REGISTRY_INSTALL,),
+            idempotency_key="project-repair-routing-0001",
+        )
+        bridge.get_operation.assert_called_once_with(
+            project,
+            repair_operation.id,
+        )
+    finally:
+        provider.close()
+
+
+def test_project_doctor_persists_typed_core_failure_under_local_operation_identity(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    error = core_v1.ApiErrorV1(
+        request_id="core-doctor-request-1",
+        code="registry_attestation_unavailable",
+        http_status=503,
+        message="The verified registry is unavailable.",
+        severity=ErrorSeverity.BLOCKING,
+        category=ErrorCategory.ENVIRONMENT,
+        retryable=True,
+        repair_action=RepairAction.OPENEVO_CAN_RETRY,
+        next_action="Retry project doctor.",
+    )
+    bridge.doctor_project.side_effect = DesktopCoreBridgeErrorV1(error)
+    try:
+        response = provider.invoke(
+            "doctorProject",
+            {
+                "project_id": project.project_id,
+                "idempotency_key": "project-doctor-failure-0001",
+                "if_match": project.etag,
+            },
+        )
+        assert isinstance(response, Response)
+        accepted = local_v1.LocalOperationV1.model_validate_json(response.body)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            failed = store.get_local_operation(accepted.operation_id)
+            if failed.state == "failed":
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail("project doctor failure did not become durable")
+
+        assert failed.error == error.model_copy(update={"request_id": accepted.operation_id})
+        replay = provider.invoke(
+            "doctorProject",
+            {
+                "project_id": project.project_id,
+                "idempotency_key": "project-doctor-failure-0001",
+                "if_match": project.etag,
+            },
+        )
+        assert isinstance(replay, Response)
+        assert local_v1.LocalOperationV1.model_validate_json(replay.body) == failed
+        bridge.doctor_project.assert_called_once()
+    finally:
+        provider.close()
+
+
+def test_project_repair_selects_only_core_authorized_mode_safe_actions() -> None:
+    response = core_v1.EnvironmentDoctorResponseV1(
+        status=core_v1.DoctorStatus.NEEDS_USER_ACTION,
+        checks=[
+            core_v1.EnvironmentCheckV1(
+                id="network",
+                kind=core_v1.EnvironmentCheckKind.NETWORK,
+                status=core_v1.CheckStatus.WARNING,
+                message="Retry is available.",
+                repair_action=RepairAction.OPENEVO_CAN_RETRY,
+            ),
+            core_v1.EnvironmentCheckV1(
+                id="model",
+                kind=core_v1.EnvironmentCheckKind.MODEL_SERVICE,
+                status=core_v1.CheckStatus.BLOCKING,
+                message="Model service is unavailable.",
+                repair_action=RepairAction.OPENEVO_CAN_RETRY,
+                model_preparation=core_v1.ModelPreparationV1(
+                    model_ref="org/model",
+                    status=core_v1.ModelPreparationStatus.UNRESOLVED,
+                    updated_at=NOW,
+                ),
+            ),
+            core_v1.EnvironmentCheckV1(
+                id="registry",
+                kind=core_v1.EnvironmentCheckKind.REGISTRY,
+                status=core_v1.CheckStatus.BLOCKING,
+                message="Maintainer intervention is required.",
+                repair_action=RepairAction.USER_ACTION_REQUIRED,
+            ),
+            core_v1.EnvironmentCheckV1(
+                id="storage",
+                kind=core_v1.EnvironmentCheckKind.STORAGE,
+                status=core_v1.CheckStatus.OK,
+                message="Storage is healthy.",
+                repair_action=RepairAction.OPENEVO_CAN_RECONFIGURE,
+            ),
+        ],
+        checked_at=NOW,
+    )
+
+    assert DesktopReleaseProvider._repair_actions_from_doctor(
+        response,
+        execution_mode="codex_subscription_transcript",
+    ) == (core_v1.EnvironmentRepairAction.RETRY_NETWORK,)
+    assert DesktopReleaseProvider._repair_actions_from_doctor(
+        response,
+        execution_mode="self-deployed",
+    ) == (
+        core_v1.EnvironmentRepairAction.RETRY_NETWORK,
+        core_v1.EnvironmentRepairAction.RESTART_MODEL_SERVICE,
+    )
+
+
+def test_doctor_summary_projection_is_bounded_and_visibly_truncated() -> None:
+    message = "x" * 4096
+    response = core_v1.EnvironmentDoctorResponseV1(
+        status=core_v1.DoctorStatus.DEGRADED,
+        checks=[
+            core_v1.EnvironmentCheckV1(
+                id="network",
+                kind=core_v1.EnvironmentCheckKind.NETWORK,
+                status=core_v1.CheckStatus.WARNING,
+                message=message,
+                repair_action=RepairAction.OPENEVO_CAN_RETRY,
+            )
+        ],
+        checked_at=NOW,
+    )
+
+    (check,) = DesktopReleaseProvider._normalize_doctor_checks(response)
+    assert len(check.summary) == 512
+    assert check.summary == ("x" * 511) + "…"
+
+
+def test_project_maintenance_cannot_claim_local_only_cancellation(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    reservation = store.begin_project_runtime_action(
+        route=f"/desktop/v1/projects/{project.project_id}/repair",
+        operation_kind="project_repair",
+        project_id=project.project_id,
+        key="project-repair-no-local-cancel-0001",
+        body={},
+        if_match=project.etag,
+    )
+    try:
+        with pytest.raises(LocalOperationCancellationUnavailableError):
+            provider.invoke(
+                "cancelLocalOperation",
+                {
+                    "operation_id": reservation.operation.operation_id,
+                    "if_match": reservation.operation.etag,
+                },
+            )
+        assert (
+            store.get_local_operation(reservation.operation.operation_id).state
+            == "queued"
+        )
     finally:
         provider.close()
 
@@ -310,27 +883,6 @@ def test_release_provider_allows_supported_subscription_retry(tmp_path: Path) ->
         )
         bridge.retry_run.assert_called_once()
         assert bridge.retry_run.call_args.args[0] == project
-    finally:
-        provider.close()
-
-
-@pytest.mark.parametrize(
-    "operation_id",
-    ("restartService", "createDiagnostic", "getDiagnostic", "deleteDiagnostic"),
-)
-def test_release_provider_does_not_install_unavailable_core_handlers(
-    tmp_path: Path,
-    operation_id: str,
-) -> None:
-    bridge = Mock(spec=DesktopCoreBridgeV1)
-    provider, _, _ = _provider(tmp_path, bridge)
-    try:
-        with pytest.raises(ProviderCapabilityUnavailableError):
-            provider.invoke(operation_id, {})
-        bridge.restart_service.assert_not_called()
-        bridge.create_diagnostic.assert_not_called()
-        bridge.get_diagnostic.assert_not_called()
-        bridge.delete_diagnostic.assert_not_called()
     finally:
         provider.close()
 
@@ -572,6 +1124,165 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         )
         assert response.status_code == 503
         assert response.json() == error.model_dump(mode="json")
+
+
+def test_release_app_publishes_recovery_and_diagnostic_routes_with_session_auth(
+    tmp_path: Path,
+) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    restart_request = core_v1.ServiceRestartRequestV1(reason="Requested from OpenEvo Desktop.")
+    restart_operation = core_v1.OperationV1(
+        id="operation-service-restart-1",
+        kind=core_v1.OperationKind.SERVICE_RESTART,
+        descriptor=core_v1.OperationDescriptorV1(
+            kind=core_v1.OperationKind.SERVICE_RESTART,
+            cancellable=False,
+        ),
+        status=core_v1.OperationStatus.QUEUED,
+        request=core_v1.ServiceRestartOperationRequestV1(
+            kind=core_v1.OperationKind.SERVICE_RESTART,
+            service_id="service-1",
+            request=restart_request,
+        ),
+        logs_ref="logs-service-restart-1",
+        created_at=NOW,
+        updated_at=NOW,
+        observed_at=NOW,
+        etag=ETAG_A,
+    )
+    diagnostic_request = core_v1.DiagnosticsRequestV1(
+        scopes=[core_v1.DiagnosticScope.PROJECT],
+        target=core_v1.ProjectDiagnosticTargetV1(
+            kind=core_v1.DiagnosticTargetKind.PROJECT,
+            project_id="core-project-1",
+        ),
+    )
+    diagnostic = core_v1.DiagnosticV1(
+        id="diagnostic-1",
+        status=core_v1.DiagnosticStatus.QUEUED,
+        scopes=diagnostic_request.scopes,
+        target=diagnostic_request.target,
+        checks=[],
+        created_at=NOW,
+        updated_at=NOW,
+        observed_at=NOW,
+        etag=ETAG_A,
+    )
+    cache_request = core_v1.CacheCleanupRequestV1(
+        scopes=[core_v1.CacheScope.BUILD_ARTIFACTS],
+        older_than_days=30,
+    )
+    cache_operation = core_v1.OperationV1(
+        id="operation-cache-cleanup-1",
+        kind=core_v1.OperationKind.CACHE_CLEANUP,
+        descriptor=core_v1.OperationDescriptorV1(
+            kind=core_v1.OperationKind.CACHE_CLEANUP,
+            cancellable=False,
+        ),
+        status=core_v1.OperationStatus.QUEUED,
+        request=core_v1.CacheCleanupOperationRequestV1(
+            kind=core_v1.OperationKind.CACHE_CLEANUP,
+            request=cache_request,
+        ),
+        logs_ref="logs-cache-cleanup-1",
+        created_at=NOW,
+        updated_at=NOW,
+        observed_at=NOW,
+        etag=ETAG_A,
+    )
+    bridge.restart_service.return_value = restart_operation
+    bridge.create_diagnostic.return_value = diagnostic
+    bridge.get_diagnostic.return_value = diagnostic
+    bridge.delete_diagnostic.return_value = None
+    bridge.cache_cleanup.return_value = cache_operation
+    token = "desktop-session-token-recovery-00000001"
+    app = create_release_desktop_local_api_app(
+        state_root=tmp_path / "recovery-routes",
+        session_token=token,
+        instance_id="7" * 32,
+        readiness_key=b"w" * 32,
+        source_commit="1234567",
+        build_channel="test",
+        remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
+        core_bridge=bridge,
+    )
+    project = _bind_app_project(app)
+    session = {"X-OpenEvo-Desktop-Session": token}
+
+    with TestClient(app) as client:
+        unauthenticated = client.post(
+            "/desktop/v1/services/service-1/restart",
+            headers={
+                "If-Match": ETAG_A,
+                "Idempotency-Key": "service-restart-http-0001",
+            },
+        )
+        restarted = client.post(
+            "/desktop/v1/services/service-1/restart",
+            headers={
+                **session,
+                "If-Match": ETAG_A,
+                "Idempotency-Key": "service-restart-http-0001",
+            },
+        )
+        created = client.post(
+            "/desktop/v1/diagnostics",
+            headers={
+                **session,
+                "Idempotency-Key": "diagnostic-create-http-0001",
+            },
+            json=diagnostic_request.model_dump(mode="json"),
+        )
+        fetched = client.get(
+            "/desktop/v1/diagnostics/diagnostic-1",
+            headers=session,
+        )
+        deleted = client.delete(
+            "/desktop/v1/diagnostics/diagnostic-1",
+            headers={
+                **session,
+                "If-Match": ETAG_A,
+                "Idempotency-Key": "diagnostic-delete-http-0001",
+            },
+        )
+        cleaned = client.post(
+            "/desktop/v1/maintenance/cache-cleanup",
+            headers={
+                **session,
+                "Idempotency-Key": "cache-cleanup-http-0001",
+            },
+            json=cache_request.model_dump(mode="json"),
+        )
+
+    assert unauthenticated.status_code == 401
+    assert restarted.status_code == created.status_code == cleaned.status_code == 202
+    assert restarted.json()["id"] == restart_operation.id
+    assert created.json()["id"] == fetched.json()["id"] == diagnostic.id
+    assert deleted.status_code == 204 and deleted.content == b""
+    assert cleaned.json()["id"] == cache_operation.id
+    bridge.restart_service.assert_called_once_with(
+        project,
+        "service-1",
+        if_match=ETAG_A,
+        idempotency_key="service-restart-http-0001",
+    )
+    bridge.create_diagnostic.assert_called_once_with(
+        project,
+        diagnostic_request,
+        idempotency_key="diagnostic-create-http-0001",
+    )
+    bridge.get_diagnostic.assert_called_once_with(project, diagnostic.id)
+    bridge.delete_diagnostic.assert_called_once_with(
+        project,
+        diagnostic.id,
+        if_match=ETAG_A,
+        idempotency_key="diagnostic-delete-http-0001",
+    )
+    bridge.cache_cleanup.assert_called_once_with(
+        project,
+        cache_request,
+        idempotency_key="cache-cleanup-http-0001",
+    )
 
 
 def test_release_app_retry_body_is_closed_and_forwarded(tmp_path: Path) -> None:

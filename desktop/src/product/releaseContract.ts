@@ -11,5 +11,8 @@ export const DESKTOP_PRODUCT_RELEASE_CONTRACT = defineDesktopProductReleaseContr
     | "operation_events"
     | "run_observability"
     | "artifact_inspection"
+    | "service_control"
+    | "diagnostics"
+    | "maintenance"
   )[],
 });

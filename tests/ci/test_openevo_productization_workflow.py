@@ -37,13 +37,14 @@ def test_plan_covers_productization_workstreams_and_release_gates() -> None:
         "D",
         "E",
     ]
+    normalized = " ".join(text.split()).lower()
     required_markers = (
-        "G7",
-        "self-contained Daemon bundle",
-        "packaged Desktop",
-        "Immediate Execution Order",
+        "g7",
+        "self-contained daemon bundle",
+        "packaged macos application",
+        "immediate execution order",
     )
-    missing = [marker for marker in required_markers if marker not in text]
+    missing = [marker for marker in required_markers if marker not in normalized]
     assert missing == []
 
 

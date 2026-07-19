@@ -51,6 +51,7 @@ from desktop.sidecar.release_provider import (
     EvolutionConfigurationPendingError,
     ExecutionModeReleaseUnavailableError,
     InvalidNativeChallengeError,
+    LocalOperationCancellationUnavailableError,
     ProviderCapabilityUnavailableError,
 )
 from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
@@ -486,6 +487,24 @@ def create_release_desktop_local_api_app(
             category="service",
             repair_action="none",
             next_action="Reconnect and activate the saved project.",
+        )
+
+    @register_release_handler(
+        app.exception_handler, LocalOperationCancellationUnavailableError
+    )
+    async def handle_local_operation_cancellation_unavailable(
+        request: Request, exc: LocalOperationCancellationUnavailableError
+    ) -> JSONResponse:
+        del exc
+        return _error_response(
+            request,
+            status_code=409,
+            code="operation_cancellation_unavailable",
+            message="This maintenance operation cannot be cancelled safely.",
+            category="operation",
+            retryable=False,
+            repair_action="none",
+            next_action="Wait for the operation to finish, then run Check again.",
         )
 
     @register_release_handler(app.exception_handler, EvolutionConfigurationPendingError)

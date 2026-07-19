@@ -459,11 +459,17 @@ def registry(tmp_path_factory: pytest.TempPathFactory):
     return verified_builtin_registry(tmp_path_factory.mktemp("science-owner-registry"))
 
 
-def _project(store: CoreControlStoreV1, registry: object) -> m.ProjectV1:
+def _project(
+    store: CoreControlStoreV1,
+    registry: object,
+    *,
+    idempotency_key: str = "create-science-owner-project",
+    name: str = "Durable science owner",
+) -> m.ProjectV1:
     result = store.create_project(
         m.ProjectCreateV1.model_validate(
             {
-                "name": "Durable science owner",
+                "name": name,
                 "spec": {
                     "execution_mode": "codex_subscription_transcript",
                     "capture_mode": "transcript",
@@ -478,7 +484,7 @@ def _project(store: CoreControlStoreV1, registry: object) -> m.ProjectV1:
                 "workspace": {"kind": "scratch", "display_name": "Scratch"},
             }
         ),
-        idempotency_key="create-science-owner-project",
+        idempotency_key=idempotency_key,
         registry_digest=registry.snapshot.registry_digest,
     )
     assert isinstance(result.model, m.ProjectV1)
@@ -835,6 +841,13 @@ def _seed_run(
     assert replay is None
     assert admission is not None
     persisted_run_id = admission.run_id
+    queued_reason = owner_module._execution_queue_reason()
+    attempt = owner_module._queued_attempt(
+        run_id=persisted_run_id,
+        number=1,
+        now=timestamp,
+        queued_reason=queued_reason,
+    )
     queued = owner_module._run_model(
         {
             "id": persisted_run_id,
@@ -846,16 +859,16 @@ def _seed_run(
             "execution_mode": m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
             "capture_mode": m.CaptureMode.TRANSCRIPT,
             "status": m.RunStatus.QUEUED,
-            "queued_reason": m.QueuedReasonV1(
-                code=m.QueuedReasonCode.ADMISSION_PENDING,
-                summary="Seeded for recovery.",
-                retry_after_seconds=1,
-            ),
-            "attempt_count": 0,
+            "queued_reason": queued_reason,
+            "current_attempt_id": attempt.id,
+            "current_attempt": attempt,
+            "attempt_count": 1,
+            "pinned_revision": request.required_revision.revision,
             "required_revision": request.required_revision,
             "created_at": timestamp,
             "updated_at": timestamp,
-            "attempts": [],
+            "admitted_at": timestamp,
+            "attempts": [attempt],
         },
         version=1,
     )
@@ -895,8 +908,20 @@ def test_create_is_idempotent_and_rejects_a_valid_mismatched_reuse(
     try:
         request = _run_request(project)
         created = _invoke_create(owner, request, "create-key")
+        assert created.status is m.RunStatus.QUEUED
+        assert created.queued_reason is not None
+        assert created.queued_reason.code is m.QueuedReasonCode.CAPACITY
+        assert created.admitted_at is not None
+        assert created.pinned_revision == request.required_revision.revision
+        assert created.attempt_count == 1
+        assert created.current_attempt == created.attempts[0]
+        assert created.current_attempt is not None
+        assert created.current_attempt.status is m.RunStatus.QUEUED
         replay = _invoke_create(owner, request, "create-key")
         assert replay.id == created.id
+        assert replay.admitted_at == created.admitted_at
+        assert replay.pinned_revision == created.pinned_revision
+        assert replay.current_attempt_id == created.current_attempt_id
         assert len(owner._ledger.list_runs()) == 1
 
         selected = _wait_for_status(owner, created.id, m.RunStatus.PREPARING)
@@ -1008,6 +1033,122 @@ def test_concurrent_new_create_has_one_readiness_owner_and_one_durable_run(
         store.close()
 
 
+def test_concurrent_distinct_creates_for_one_project_have_one_durable_owner(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+    services.block_all_ensures = True
+    services.ensure_allowed.clear()
+    owner = _owner(
+        tmp_path / "owner",
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    results: list[m.RunV1] = []
+    errors: list[CoreRunControlError] = []
+
+    def create(key: str) -> None:
+        try:
+            results.append(_invoke_create(owner, _run_request(project), key))
+        except CoreRunControlError as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=create, args=("distinct-create-a",))
+    second = threading.Thread(target=create, args=("distinct-create-b",))
+    try:
+        first.start()
+        assert services.ensure_entered.wait(5)
+        second.start()
+        second.join(5)
+        assert not second.is_alive()
+        assert len(errors) == 1
+        assert errors[0].code == "run_project_in_flight"
+        assert errors[0].retryable is True
+        services.ensure_allowed.set()
+        first.join(5)
+        assert not first.is_alive()
+        assert len(results) == 1
+        assert len(owner._ledger.list_runs()) == 1
+    finally:
+        services.ensure_allowed.set()
+        first.join(5)
+        second.join(5)
+        owner.close()
+        store.close()
+
+
+def test_distinct_projects_can_complete_create_admission_concurrently(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    first_project = _project(store, registry)
+    second_project = _project(
+        store,
+        registry,
+        idempotency_key="create-science-owner-project-two",
+        name="Durable science owner two",
+    )
+    services = _FakeServiceOwner(_binding(registry))
+    original_ensure = services.ensure
+    both_entered = threading.Event()
+    release_admission = threading.Event()
+    admission_lock = threading.Lock()
+    admission_calls = 0
+    runner_release = threading.Event()
+
+    def concurrent_ensure(*args: object, **kwargs: object) -> ServiceGroupSnapshot:
+        nonlocal admission_calls
+        if threading.current_thread().name != "openevo-science-run-owner":
+            with admission_lock:
+                admission_calls += 1
+                if admission_calls == 2:
+                    both_entered.set()
+            assert release_admission.wait(5)
+        return original_ensure(*args, **kwargs)
+
+    def block_runner(**_kwargs: object) -> dict[str, Any]:
+        assert runner_release.wait(5)
+        return _completed_result()
+
+    services.ensure = concurrent_ensure  # type: ignore[method-assign]
+    owner = _owner(tmp_path / "owner", store, registry, services, block_runner)
+    results: list[m.RunV1] = []
+    errors: list[BaseException] = []
+
+    def create(project: m.ProjectV1, key: str) -> None:
+        try:
+            results.append(_invoke_create(owner, _run_request(project), key))
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=create, args=(first_project, "project-a-run"))
+    second = threading.Thread(target=create, args=(second_project, "project-b-run"))
+    try:
+        first.start()
+        second.start()
+        assert both_entered.wait(5)
+        release_admission.set()
+        first.join(5)
+        second.join(5)
+        assert errors == []
+        assert {run.project_id for run in results} == {
+            first_project.id,
+            second_project.id,
+        }
+        assert len(owner._ledger.list_runs()) == 2
+    finally:
+        release_admission.set()
+        runner_release.set()
+        first.join(5)
+        second.join(5)
+        owner.close()
+        store.close()
+
+
 def test_pending_create_identity_survives_restart_and_rejects_mismatched_reuse(
     tmp_path: Path,
     registry: object,
@@ -1028,6 +1169,11 @@ def test_pending_create_identity_survives_restart_and_rejects_mismatched_reuse(
 
     restarted = ScienceRunStore(state_root)
     try:
+        with pytest.raises(owner_module.ScienceProjectInFlight):
+            restarted.begin_create_run(
+                request=request,
+                idempotency_key="different-after-restart",
+            )
         replay, recovered = restarted.begin_create_run(
             request=request,
             idempotency_key="sigterm-create",
@@ -1198,6 +1344,11 @@ def test_create_fails_before_persistence_when_subscription_prerequisite_is_missi
         assert error.value.code == f"run_{readiness_code.value}"
         assert "secret probe output" not in str(error.value)
         assert owner._ledger.list_runs() == []
+        with sqlite3.connect(owner._ledger.database) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+            assert (
+                connection.execute("SELECT COUNT(*) FROM pending_run_creates").fetchone()[0] == 0
+            )
         assert runner_calls == []
         assert services.ensure_calls == 1
     finally:
@@ -1254,9 +1405,14 @@ def test_run_transitions_queued_preparing_running_succeeded_with_ordered_evidenc
     try:
         queued = _invoke_create(owner, _run_request(project), "lifecycle")
         assert queued.status is m.RunStatus.QUEUED
+        assert queued.admitted_at is not None
+        assert queued.pinned_revision == project.active_revision
+        assert queued.attempt_count == 1
         assert services.ensure_calls >= 1
         preparing = _wait_for_status(owner, queued.id, m.RunStatus.PREPARING)
+        assert preparing.admitted_at == queued.admitted_at
         assert preparing.pinned_revision == project.active_revision
+        assert preparing.current_attempt_id == queued.current_attempt_id
         services.ensure_allowed.set()
         assert runner_entered.wait(5)
         running = _wait_for_status(owner, queued.id, m.RunStatus.RUNNING)
@@ -1334,7 +1490,7 @@ def test_generation_replacement_after_execution_ensure_fails_before_admission_or
         store.close()
 
 
-def test_cancelled_queued_run_is_not_selected_after_current_worker_releases(
+def test_second_project_run_is_not_queued_while_first_run_is_in_flight(
     tmp_path: Path, registry: object
 ) -> None:
     store = CoreControlStoreV1(tmp_path / "projects")
@@ -1354,15 +1510,14 @@ def test_cancelled_queued_run_is_not_selected_after_current_worker_releases(
         first = _invoke_create(owner, _run_request(project), "worker-first")
         assert first_entered.wait(5)
         _wait_for_status(owner, first.id, m.RunStatus.RUNNING)
-        second = _invoke_create(owner, _run_request(project), "worker-second")
-        assert second.status is m.RunStatus.QUEUED
-        cancelled = _cancel(owner, second, "cancel-second")
-        assert cancelled.status is m.RunStatus.CANCELLED
+        with pytest.raises(CoreRunControlError) as conflict:
+            _invoke_create(owner, _run_request(project), "worker-second")
+        assert conflict.value.code == "run_project_in_flight"
+        assert conflict.value.retryable is True
+        assert len(owner._ledger.list_runs()) == 1
 
         first_allowed.set()
         _wait_for_status(owner, first.id, m.RunStatus.SUCCEEDED)
-        time.sleep(0.05)
-        assert _get_run(owner, second.id).status is m.RunStatus.CANCELLED
         assert len(runner.calls) == 1
     finally:
         first_allowed.set()
@@ -1504,6 +1659,16 @@ def test_retry_enforces_etag_attempt_binding_and_idempotent_replay(
         accepted = _response_model(accepted_response)
         assert accepted.status is m.RunStatus.QUEUED
         assert accepted.attempt_count == 2
+        assert accepted.admitted_at == failed.admitted_at
+        assert accepted.pinned_revision == failed.pinned_revision
+        assert accepted.project_snapshot == failed.project_snapshot
+        assert accepted.task_snapshot == failed.task_snapshot
+        assert accepted.workspace_snapshot == failed.workspace_snapshot
+        assert accepted.queued_reason is not None
+        assert accepted.queued_reason.code is m.QueuedReasonCode.CAPACITY
+        assert accepted.attempts[:-1] == failed.attempts
+        assert accepted.current_attempt is not None
+        assert accepted.current_attempt.id != failed.current_attempt_id
         assert retry_entered.wait(5)
 
         replay_response = owner.invoke("retryCoreRunV1", arguments)
@@ -1522,8 +1687,47 @@ def test_retry_enforces_etag_attempt_binding_and_idempotent_replay(
         retry_allowed.set()
         succeeded = _wait_for_status(owner, created.id, m.RunStatus.SUCCEEDED)
         assert succeeded.attempt_count == 2
+        assert succeeded.admitted_at == failed.admitted_at
+        assert succeeded.pinned_revision == failed.pinned_revision
     finally:
         retry_allowed.set()
+        owner.close()
+        store.close()
+
+
+def test_retryable_failed_run_holds_project_until_terminal_close(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    services = _FakeServiceOwner(_binding(registry))
+
+    def fail(**_kwargs: object) -> dict[str, Any]:
+        raise RuntimeError("injected retryable failure")
+
+    owner = _owner(tmp_path / "owner", store, registry, services, fail)
+    try:
+        created = _invoke_create(owner, _run_request(project), "failed-owner")
+        failed = _wait_for_status(owner, created.id, m.RunStatus.FAILED)
+        assert failed.current_error is not None
+        assert failed.current_error.retryable is True
+        with pytest.raises(CoreRunControlError) as conflict:
+            _invoke_create(owner, _run_request(project), "blocked-by-failed-owner")
+        assert conflict.value.code == "run_project_in_flight"
+
+        response = owner.invoke(
+            "deleteCoreRunV1",
+            {
+                "run_id": failed.id,
+                "if_match": failed.etag,
+                "idempotency_key": "close-failed-owner",
+            },
+        )
+        assert isinstance(response, Response)
+        assert response.status_code == 204
+        replacement = _invoke_create(owner, _run_request(project), "after-failed-close")
+        assert replacement.project_id == project.id
+    finally:
         owner.close()
         store.close()
 
@@ -1586,12 +1790,75 @@ def test_retry_timeline_failure_rolls_back_run_and_idempotency(
         accepted = _response_model(owner.invoke("retryCoreRunV1", arguments))
         assert accepted.status is m.RunStatus.QUEUED
         assert accepted.attempt_count == failed.attempt_count + 1
+        assert accepted.admitted_at == failed.admitted_at
+        assert accepted.pinned_revision == failed.pinned_revision
         retry_entries = [
             entry for entry in owner._ledger.timeline(failed.id) if entry.title == "Retry queued"
         ]
         assert len(retry_entries) == 1
     finally:
         retry_allowed.set()
+        services.ensure_allowed.set()
+        owner.close()
+        store.close()
+
+
+def test_restart_resumes_queued_retry_under_original_admission(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    request = _run_request(project)
+    state_root = tmp_path / "owner"
+    run_id = _seed_run(state_root, request, status=m.RunStatus.PREPARING)
+    timestamp = "2026-07-15T12:00:01.000000Z"
+    ledger = ScienceRunStore(state_root / "science-runs")
+    failed = ledger.mutate_run(
+        run_id,
+        lambda run, version: owner_module._transition_run(
+            run,
+            m.RunStatus.FAILED,
+            version=version,
+            now=timestamp,
+            error=owner_module._api_error(
+                "science_run_failed",
+                "The remote science run did not complete.",
+                retryable=True,
+            ),
+        ),
+    )
+    retried = ledger.mutate_run(
+        run_id,
+        lambda run, version: owner_module._retry_model(
+            run,
+            version=version,
+            now="2026-07-15T12:00:02.000000Z",
+        ),
+    )
+    ledger.close()
+    assert retried.status is m.RunStatus.QUEUED
+    assert retried.admitted_at == failed.admitted_at
+    assert retried.pinned_revision == failed.pinned_revision
+
+    services = _FakeServiceOwner(_binding(registry))
+    services.ensure_allowed.clear()
+    owner = _owner(
+        state_root,
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    try:
+        recovered = _wait_for_status(owner, run_id, m.RunStatus.PREPARING)
+        assert recovered.admitted_at == failed.admitted_at
+        assert recovered.pinned_revision == failed.pinned_revision
+        assert recovered.attempt_count == 2
+        assert recovered.attempts[0] == failed.attempts[0]
+        assert recovered.current_attempt_id == retried.current_attempt_id
+        assert recovered.current_attempt is not None
+        assert recovered.current_attempt.status is m.RunStatus.PREPARING
+    finally:
         services.ensure_allowed.set()
         owner.close()
         store.close()
@@ -2088,6 +2355,52 @@ def test_invalid_artifact_projection_cannot_advance_successor_revision(
         assert store.get_revision_head(project.id).active_revision == predecessor
         assert owner._ledger.artifacts_for_run(created.id) == []
         assert owner._ledger.revision_context(project.id, predecessor.id) == {}
+    finally:
+        owner.close()
+        store.close()
+
+
+def test_restart_finalization_predecessor_mismatch_becomes_terminal_failed(
+    tmp_path: Path, registry: object
+) -> None:
+    store = CoreControlStoreV1(tmp_path / "projects")
+    project = _project(store, registry)
+    assert project.active_revision is not None
+    request = _run_request(project)
+    owner_root = tmp_path / "owner"
+    run_id = _seed_run(owner_root, request, status=m.RunStatus.PREPARING)
+    ledger = ScienceRunStore(owner_root / "science-runs")
+    ledger.mutate_run(
+        run_id,
+        lambda run, version: owner_module._transition_run(
+            run,
+            m.RunStatus.RUNNING,
+            version=version,
+            now="2026-07-15T12:00:01.000000Z",
+        ),
+    )
+    ledger.store_result(run_id, _completed_result())
+    ledger.close()
+    store.activate_evolution_revision(
+        project.id,
+        predecessor=project.active_revision,
+        run_id="different-transition",
+        context_artifact_ids={},
+    )
+
+    services = _FakeServiceOwner(_binding(registry))
+    owner = _owner(
+        owner_root,
+        store,
+        registry,
+        services,
+        lambda *_args, **_kwargs: _completed_result(),
+    )
+    try:
+        failed = _wait_for_status(owner, run_id, m.RunStatus.FAILED)
+        assert failed.current_error is not None
+        assert failed.current_error.code == "run_successor_conflict"
+        assert failed.current_error.retryable is False
     finally:
         owner.close()
         store.close()

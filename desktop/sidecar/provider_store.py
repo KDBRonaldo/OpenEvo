@@ -4337,6 +4337,7 @@ class DesktopProviderStore:
         body: BaseModel | Mapping[str, object],
         if_match: str,
         remote_state: RemoteProjectStateV1 | None,
+        checks: tuple[NormalizedCheckV1, ...] | None = None,
         activation_precommit: Callable[[ProjectV1], None] | None = None,
     ) -> LocalOperationV1:
         validated_remote: RemoteProjectStateV1 | None = None
@@ -4359,6 +4360,10 @@ class DesktopProviderStore:
         elif activation_precommit is not None:
             raise ContractValidationError(
                 "non-activation project completion cannot use an activation precommit"
+            )
+        if checks and operation_kind not in {"project_doctor", "project_repair"}:
+            raise ContractValidationError(
+                "only project maintenance completion can publish normalized checks"
             )
         identity = self._project_action_identity(
             route=route,
@@ -4407,6 +4412,7 @@ class DesktopProviderStore:
                 status_code=202,
                 result=result,
                 error=None,
+                checks=operation.checks if checks is None else checks,
             )
 
     def fail_project_runtime_action(
@@ -4452,6 +4458,7 @@ class DesktopProviderStore:
                 status_code=error.http_status,
                 result=result,
                 error=error,
+                checks=operation.checks,
             )
 
     def observe_project_runtime_action(
@@ -4631,6 +4638,7 @@ class DesktopProviderStore:
         status_code: int,
         result: LocalOperationResultV1 | None,
         error: ApiErrorV1 | None,
+        checks: tuple[NormalizedCheckV1, ...],
     ) -> LocalOperationV1:
         version = cast(int, row["resource_version"]) + 1
         timestamp = self._timestamp()
@@ -4641,6 +4649,7 @@ class DesktopProviderStore:
                 "state": state,
                 "result": result,
                 "error": error,
+                "checks": checks,
                 "finished_at": timestamp,
                 "etag": self._etag("operation", operation.operation_id, version),
             },

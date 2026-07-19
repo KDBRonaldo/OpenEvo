@@ -59,6 +59,13 @@ newer edit changes only project/task fields and keeps the imported workspace;
 `patch=applied` plus `finalize=unknown` cannot strand the project or be bypassed
 by a newer workspace selection.
 
+For patch, finalize, and abort alike, only that exact idempotent replay response
+may move durable `unknown` authority forward. A typed Core conflict, including
+retention expiry after the resource changed, is returned unchanged and leaves
+the operation `unknown`. A current project, revision, upload, or publication GET
+cannot establish which idempotency key produced the observed state and is never
+used as substitute success evidence.
+
 Each Local project may also have one durable patch operation. It stores the
 canonical old and new `ProjectCreateV1` intents and digests, canonical
 `ProjectPatchV1` and digest, deterministic key, Core project identity, complete
@@ -178,6 +185,16 @@ share one transaction; rollback preserves the prior mapping and patch. An exact
 retry recognizes the fully committed state after an ambiguous commit without
 adding another history row, but fails if a later pending patch now owns the
 project transition.
+
+The new reader accepts 0.1.1 mapping-transition rows in their exact original
+closed encoding and does not synthesize predecessor-project authority while
+loading them. The first transition that requires both completed-patch and
+project-head-successor authority is encoded as
+`CoreProjectHeadAndPatchMappingTransitionV1`. The history append, current
+mapping replacement, and applied-patch deletion are atomic, so that row is also
+the rollback barrier: a 0.1.1 reader rejects its unknown closed record type
+during startup recovery before serving a bridge action. The new reader retains
+and validates the row across restart; any row or digest tamper fails closed.
 
 Fresh identity bootstrap uses an explicit database `pending` to `bound`
 protocol. Schema, the generation-zero store identity, and empty authority are
@@ -394,9 +411,14 @@ operations and referenced logs, diagnostics, maintenance, and events have
 strict `CoreControlClientV1` bridge methods. Every method accepts the complete
 saved Local `ProjectV1` and verifies it against the active generation before
 transport, but bridge availability alone does not make a release feature. The
-current release provider exposes read-only services and omits diagnostic,
-maintenance, and service-mutation handlers because their Core owners return
-typed unavailable responses. The provider holds its project-session transition lock from
+current bridge implements strict forwarding methods for Core-owned diagnostics,
+project doctor/repair, managed service restart, referenced logs, and
+completed-diagnostic cleanup in addition to service observations. The Preview
+Core release composition does not publish those maintenance owners, so the real
+renderer provider marks maintenance unavailable and hides their mutation
+controls; direct calls return typed `provider_capability_unavailable`.
+Unsupported cache scopes and unavailable owners never fall back to SSH or local
+simulation. The provider holds its project-session transition lock from
 that Local lookup through result delivery, so an active-project edit cannot
 retire and replace the session while an old request is being returned. Core DTOs
 are returned unchanged. The strict client
@@ -414,12 +436,14 @@ Packaged startup composes `DesktopCoreSshBridgeAdapterV1`,
 `DesktopEventBrokerV1`, and the Core event relay through the single owner in
 `release_runtime.py`. The exact embedded wheel/framework-lock pair is verified
 before construction, and the dedicated bridge state is rooted under the private
-Desktop provider state. The provider advertises exactly `remote_profiles`,
-`project_validation`, `operation_events`, `run_observability`, and
-`artifact_inspection` when both the owned bridge and broker are present. It does
-not advertise `service_control` or `diagnostics`. A missing or invalid
-asset pair, bridge, broker, or active project fails closed; there is no reduced
-release composition or direct-backend fallback.
+Desktop provider state. When both the owned bridge and broker are present, the
+Preview sidecar advertises exactly `remote_profiles`, `project_validation`,
+`operation_events`, `run_observability`, and `artifact_inspection`.
+`service_control`, `diagnostics`, and `maintenance` remain reserved Local API
+enum values and are not advertised while the connected Core has no production
+maintenance owner. A missing or invalid asset pair, bridge, broker, or active
+project fails closed; there is no reduced release composition or direct-backend
+fallback.
 
 The relay opens Core SSE with the complete active Local project binding. It
 advances the Core cursor but drops heartbeat frames and publishes one complete

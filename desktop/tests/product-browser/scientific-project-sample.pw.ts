@@ -39,7 +39,9 @@ test("first-run sample is accessible, keyboard-operable, and viewport-safe", asy
   await assertViewportSafety(page);
   await assertAccessibility(page);
   await page.evaluate(() => window.scrollTo(0, 0));
-  await expect(page).toHaveScreenshot("scientific-project-evolution.png");
+  await expect(page).toHaveScreenshot("scientific-project-evolution.png", {
+    fullPage: true,
+  });
 });
 
 async function assertAccessibility(page: import("@playwright/test").Page): Promise<void> {

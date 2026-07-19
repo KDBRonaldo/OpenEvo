@@ -80,18 +80,21 @@ describe("ReleaseDesktopProductShell", () => {
       });
     const stop = vi.fn(async () => { lifecycle.push("stop"); });
     const reportStage = vi.fn(async (stage: string) => { lifecycle.push(stage); });
+    const reportReady = vi.fn().mockResolvedValue(undefined);
 
     root = await renderReleaseShell(
       factory,
       stop,
-      vi.fn().mockResolvedValue(undefined),
+      reportReady,
       reportStage,
     );
-    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
+    expect(document.body.textContent).toContain("暂时无法连接 OpenEvo Desktop");
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
     expect(document.body.textContent).not.toContain("secret bootstrap detail");
     expect(factory).toHaveBeenCalledTimes(1);
+    expect(reportReady).not.toHaveBeenCalled();
 
-    const retry = button("Retry startup");
+    const retry = button("重试启动");
     await act(async () => {
       retry.click();
       await Promise.resolve();
@@ -105,6 +108,47 @@ describe("ReleaseDesktopProductShell", () => {
     const firstStart = lifecycle.indexOf("start-1");
     const secondStart = lifecycle.indexOf("start-2");
     expect(lifecycle.slice(firstStart + 1, secondStart)).toContain("stop");
+  });
+
+  it("keeps the startup fallback renderer-owned and read-only", async () => {
+    const factory = vi.fn(async () => {
+      throw new Error("native sidecar unavailable");
+    });
+    const stop = vi.fn(async () => {});
+    const reportReady = vi.fn(async () => {});
+
+    root = await renderReleaseShell(factory, stop, reportReady);
+
+    expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
+    expect(button("重试启动").disabled).toBe(false);
+    expect(reportReady).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("内置示例 · 只读");
+    expect(document.body.textContent).toContain("不会连接本机服务或远端服务器");
+    expect(document.body.textContent).not.toContain("Renderer sample");
+    expect(document.body.textContent).not.toContain("provider");
+    expect(
+      [...document.querySelectorAll("button")].some((candidate) =>
+        /Add workspace|Create project/i.test(candidate.textContent ?? "")
+      ),
+    ).toBe(false);
+
+    await act(async () => {
+      button("Evolution").click();
+    });
+    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
+    await act(async () => {
+      button("System").click();
+    });
+    expect(document.querySelector('[data-testid="sample-about-workspace"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("静态、只读、不会运行");
+    await act(async () => {
+      button("Research").click();
+    });
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
+
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(reportReady).not.toHaveBeenCalled();
   });
 
   it("serializes StrictMode bootstrap through a fresh native lifecycle", async () => {
@@ -195,7 +239,7 @@ describe("ReleaseDesktopProductShell", () => {
       await Promise.resolve();
     });
     expect(stop.mock.calls.length).toBeGreaterThan(stopsBeforeSupersession);
-    expect(document.body.textContent).toContain("Starting OpenEvo Desktop");
+    expect(document.body.textContent).toContain("正在启动 OpenEvo Desktop");
 
     await act(async () => {
       first.resolve(staleProvider);
@@ -211,7 +255,7 @@ describe("ReleaseDesktopProductShell", () => {
     staleProvider.dispose();
   });
 
-  it("does not expose the product shell when native renderer readiness fails", async () => {
+  it("keeps the renderer-owned read-only sample when native renderer readiness fails", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const factory = vi.fn(async () => provider!);
     const stop = vi.fn(async () => {});
@@ -223,8 +267,11 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(reportReady).toHaveBeenCalledTimes(1);
     expect(stop).toHaveBeenCalledTimes(2);
-    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
-    expect(document.body.textContent).not.toContain("Research brief");
+    expect(document.body.textContent).toContain("暂时无法连接 OpenEvo Desktop");
+    expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("内置示例 · 只读");
+    expect(document.body.textContent).toContain("不会连接本机服务或远端服务器");
     expect(document.body.textContent).not.toContain("native renderer contract mismatch");
   });
 
@@ -263,7 +310,8 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(factory).not.toHaveBeenCalled();
     expect(reportStage).not.toHaveBeenCalledWith("provider_create_failed");
-    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
+    expect(document.body.textContent).toContain("暂时无法连接 OpenEvo Desktop");
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
     expect(document.body.textContent).not.toContain("native stop unavailable");
   });
 });

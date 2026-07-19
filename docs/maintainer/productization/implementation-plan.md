@@ -38,19 +38,37 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-The exhibition requires the packaged Desktop path first. Current priority is:
+Version `0.1.1` is a public, installable historical exhibition Preview. It
+proves the real mounted and copied DMG, packaged sidecar and renderer, a
+self-contained Daemon Bundle, and managed-runtime packaging smoke. It has no
+checked-in candidate-bound science E2E or clean-host matrix evidence, and it
+predates the current immutable Preview publication policy. It is intentionally
+unsigned and non-gating. It does not prove G2, G3, G12, or any full science
+workflow, and it is not the candidate that will be promoted through G1-G12.
+System, Files, and History remain incomplete; the v2 authority cutover, G4, and
+G7-G12 remain open.
 
-1. make the real mounted and copied DMG reach the product shell on a clean Mac;
-2. rehearse the ordinary-user Subscription science-task path on the existing
-   exhibition server as non-gating integration evidence;
-3. complete the visible Desktop Files, History, System, recovery, and diagnostics
-   workflows required for that path;
-4. finish the self-contained Daemon bundle and clean-host preparation;
-5. prove the clean-host Subscription gate, then close Self-Deployed, atomic
-   cross-session evolution, benchmark, security, and release-evidence gaps.
+Current priority is:
+
+1. cut and validate the next unsigned Preview with the read-only first-launch
+   science example and the real Codex Subscription Desktop/Daemon path;
+2. assign the clean-host workstream owner and complete a G3-shaped rehearsal,
+   including mediated Subscription authentication and the direct/proxy matrix;
+3. complete and independently review the durable System recovery owner;
+4. cut product authority over to the next negotiated API contract major before
+   extending deep Task, Files, or History state;
+5. complete the Desktop System, Files, History, diagnostics, and recovery views;
+6. close Self-Deployed, atomic cross-session evolution, benchmark, security,
+   lifecycle, and release-evidence gates.
 
 This order changes implementation scheduling only. It does not reduce any
 blocking requirement in the canonical specification.
+
+The Preview is suitable only for a controlled packaging exhibition. A full
+External Beta must support the canonical ordinary-user lifecycle, both
+execution modes, clean-host and network matrices, authoritative recovery and
+maintenance views, protected performance, security, upgrade/rollback, and one
+immutable G1-G12 candidate.
 
 ## Critical Contract Migration
 
@@ -102,16 +120,25 @@ artifacts, revisions, recovery, and both execution modes.
 
 **Current state:** a real versioned control API, durable project/run stores,
 remote bootstrap, tunnel routing, Subscription prerequisite checks, and child
-service supervision exist. The shipped bundle is not yet self-contained, raw
-Subscription credential isolation is incomplete, Self-Deployed is unavailable,
-and upgrade/rollback and maintenance operations are incomplete.
+service supervision exist. The `0.1.1` Preview ships a self-contained Daemon
+Bundle and has packaging plus managed-runtime smoke evidence. It has no
+checked-in candidate-bound Docker plus Codex science rehearsal or clean-host
+matrix evidence. Clean-host preparation and lifecycle evidence, mediated
+Subscription authentication, the direct/proxy matrix, Self-Deployed,
+upgrade/rollback, and release-grade maintenance operations remain incomplete.
+An opt-in maintenance owner exists for focused contract development, but
+release construction intentionally leaves it disabled and fail closed while
+its durable receipt, replay, concurrency, shutdown, and authority-audit
+semantics remain under review.
 
 **Owning issues:** #159, #160, #167, and #168.
 
-**Next work:** finish the exact offline Daemon bundle and install descriptor,
-then close clean Subscription deployment, credential isolation, doctor/repair,
-upgrade/rollback, and Self-Deployed preparation. These changes prove G3, G4,
-G8, G9, and the Daemon portions of G11.
+**Next work:** establish one owner for the complete G3 clean-host matrix and
+close clean Subscription deployment, mediated authentication, proxy behavior,
+and lifecycle evidence. Then complete and independently review doctor/repair,
+upgrade/rollback, and
+Self-Deployed preparation. These changes prove G3, G4, G8, G9, and the Daemon
+portions of G11.
 
 ## C. Desktop Product Maturity
 
@@ -120,16 +147,21 @@ the packaged macOS application.
 
 **Current state:** release-mode server/project setup, host-key review, remote
 capabilities, task execution, retry/cancel, timeline/transcript, and evolution
-inspection are implemented. The latest real DMG candidate still fails during
-renderer/provider bootstrap, and Files, History, System maintenance, Keychain
-credential choices, and several recovery flows remain incomplete.
+inspection are implemented. First launch opens a read-only synthetic enzyme
+kinetics project that demonstrates three cross-session tasks and textual-memory,
+trajectory-to-skill, and agent-system evolution without creating authoritative
+or remote state. The public `0.1.1` Preview launches from the real DMG with its
+packaged renderer and sidecar. G2 clean-user lifecycle evidence, Files, History,
+System maintenance, mediated credential choices, and several recovery flows
+remain incomplete.
 
 **Owning issues:** #158, #163, and #203.
 
-**Next work:** issue #203 is the immediate blocker. First make the exact packaged
-app pass clean first-run and relaunch. Then consume the migrated contract,
-finish the real Subscription E2E, and complete the missing ordinary-user views
-and recovery actions required by G2 and G10.
+**Next work:** complete the narrow System recovery slice, then consume the
+migrated authority contract before deepening Task, Files, or History state.
+First validate the current read-only example and fail-closed System surface in
+the packaged Preview. Finish the missing ordinary-user views and full clean-user
+lifecycle required by G2 and G10.
 
 ## D. Repository, Documentation, And Release Engineering
 
@@ -140,13 +172,16 @@ GitHub releases present one coherent Desktop-plus-Daemon product.
 `benchmarks/` boundaries and one canonical product specification. Some active
 documentation, issue state, package inventory, release metadata, dependency
 evidence, and cleanup work still reflect intermediate implementation states.
+The exact source, tag, assets, and checksums for the public `0.1.1` Preview must
+remain available as non-gating release records.
 
 **Owning issues:** #131 and #193.
 
 **Next work:** update documentation alongside each completed workflow; remove
-obsolete active paths rather than adding wrappers; and make the draft-release
-workflow bind the exact DMG, Daemon bundle, manifest, checksums, source, and
-evidence required by G1 and G12. PyPI remains outside this release.
+obsolete active paths rather than adding wrappers; keep Preview publication
+truthful about its missing gates; and make the final candidate workflow bind the
+exact DMG, Daemon Bundle, manifest, checksums, source, and evidence required by
+G1 and G12. PyPI remains outside this release.
 
 ## E. Release Candidate Validation
 
@@ -155,7 +190,8 @@ evidence required by G1 and G12. PyPI remains outside this release.
 **Current state:** component and subsystem tests exist, but there is no candidate
 with complete clean-host Desktop/Daemon evidence, both execution modes, all
 evolution gates, protected performance, recovery/security matrices, and
-downloaded draft-release verification.
+downloaded draft-release verification. The published `0.1.1` Preview is not
+such a candidate and cannot be reused as one.
 
 **Owning issue:** #131.
 
@@ -168,15 +204,18 @@ independently review product/spec compliance and release risk/evidence.
 
 ## Immediate Execution Order
 
-1. Resolve #203 and prove G2 with a real mounted and copied DMG.
-2. Implement and adopt the critical contract migration before adding more
-   business UI to the frozen v1 model.
-3. Rehearse the packaged Desktop-to-Daemon Subscription workflow on the existing
-   exhibition server; record it as integration evidence, not G3.
-4. Complete the Desktop views and recovery actions needed for the exhibition and
-   G10.
-5. Ship the self-contained Daemon bundle, exact install provenance, and
-   clean-host automated preparation, then prove G3.
+1. Cut and validate the next unsigned Preview containing the first-launch
+   science example and real Codex Subscription Desktop/Daemon workflow.
+2. Give the clean-host workstream one owner and rehearse fresh-host Daemon
+   installation, mediated Codex Subscription authentication, Docker execution,
+   and the supported direct/proxy matrix. This is non-gating integration
+   evidence, not G3 proof.
+3. Complete and independently review the System recovery owner around
+   authoritative status, diagnostics, reconnect, and bounded repair.
+4. Implement and adopt the critical v2 authority migration before extending
+   deep Task, Files, or History state on the frozen v1 model.
+5. Complete the Desktop System, Files, History, diagnostics, and recovery views,
+   then prove the full G2 clean-user lifecycle and G10 product quality.
 6. Complete the Self-Deployed reference profile and end-to-end path for G4.
 7. Unify product run admission, workspace result, sealed dataset, evolution
    transition, materialization, and successor project-head commit for G5, G6,
@@ -184,6 +223,8 @@ independently review product/spec compliance and release risk/evidence.
 8. Run the three independent protected-performance gates for G7.
 9. Finish security, data lifecycle, upgrade/rollback, documentation, repository,
    dependency, and draft-release evidence for G9, G11, and G12.
+10. Freeze one immutable candidate and run canonical G1-G12, including the final
+   G3 proof, against that exact candidate.
 
 Every PR follows `AGENTS.md`, links its issue, states protected-algorithm impact,
 records focused and broad verification, and documents user-visible behavior.

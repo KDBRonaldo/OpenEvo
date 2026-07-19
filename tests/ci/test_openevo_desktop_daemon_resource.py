@@ -219,7 +219,7 @@ def test_release_workflow_uses_verified_linux_artifact_without_fallback() -> Non
     )
 
     assert "linux-daemon-bundle:" in linux_job
-    assert "runs-on: ubuntu-latest" in linux_job
+    assert "runs-on: ubuntu-24.04" in linux_job
     assert "test \"$(uname -m)\" = \"x86_64\"" in linux_job
     assert "openevo_desktop_daemon_resource.py build" in linux_job
     assert linux_job.count(artifact_name) == 1

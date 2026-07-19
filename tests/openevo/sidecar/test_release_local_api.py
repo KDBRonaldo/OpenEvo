@@ -37,6 +37,7 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleSnapshot,
     RemoteLifecycleSupersededError,
 )
+from openevo import __version__ as OPENEVO_VERSION
 from openevo.deployment.host_keys import HostKeyCandidate
 
 
@@ -830,6 +831,53 @@ def test_release_local_operation_cancel_is_wired_and_replayable(
         assert provider._store.get_project(project.project_id).state == "draft"
 
 
+def test_release_local_operation_cancel_rejects_unbound_remote_maintenance(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path / "state")
+    with TestClient(app) as client:
+        profile = _create_profile(
+            client,
+            name="Maintenance server",
+            key="create-profile-maintenance-cancel-0001",
+        ).json()
+        provider = app.state.desktop_release_provider
+        project = provider._store.create_project(
+            local_v1.ProjectCreateV1.model_validate(
+                _project(profile["profile_id"], name="Maintenance project")
+            ),
+            idempotency_key="seed-maintenance-project-0001",
+        )
+        reservation = provider._store.begin_project_runtime_action(
+            route=f"/desktop/v1/projects/{project.project_id}/repair",
+            operation_kind="project_repair",
+            project_id=project.project_id,
+            key="reserve-maintenance-repair-0001",
+            body={},
+            if_match=project.etag,
+        )
+        operation = reservation.operation
+
+        response = client.post(
+            f"/desktop/v1/operations/{operation.operation_id}/cancel",
+            headers={
+                **SESSION_HEADERS,
+                "If-Match": operation.etag,
+                "Idempotency-Key": "cancel-maintenance-repair-0001",
+            },
+        )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "operation_cancellation_unavailable"
+        assert response.json()["next_action"] == (
+            "Wait for the operation to finish, then run Check again."
+        )
+        assert (
+            provider._store.get_local_operation(operation.operation_id).state
+            == "queued"
+        )
+
+
 def test_running_profile_connect_cancel_interrupts_lifecycle_and_is_replayable(
     tmp_path: Path,
 ) -> None:
@@ -910,7 +958,7 @@ def test_running_profile_connect_cancel_interrupts_lifecycle_and_is_replayable(
         )
 
 
-def test_release_execution_mode_gate_rejects_retry_and_dead_controls_fail_closed(
+def test_release_execution_mode_gate_rejects_unsupported_retry_before_core(
     tmp_path: Path,
 ) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
@@ -945,26 +993,11 @@ def test_release_execution_mode_gate_rejects_retry_and_dead_controls_fail_closed
         retry_replay = client.post(
             "/desktop/v1/runs/run-1/retry", headers=headers, json=retry_body
         )
-        restart = client.post("/desktop/v1/services/service-1/restart", headers=headers)
-        diagnostic = client.post(
-            "/desktop/v1/diagnostics",
-            headers={
-                **SESSION_HEADERS,
-                "Idempotency-Key": "unavailable-diagnostic-mutation-0001",
-            },
-            json={
-                "scopes": ["project"],
-                "target": {"kind": "project", "project_id": "core-project-1"},
-            },
-        )
 
         for response in (retry, retry_replay):
             assert response.status_code == 409
             assert response.json()["code"] == "self_deployed_release_unavailable"
             assert response.json()["category"] == "run"
-        for response in (restart, diagnostic):
-            assert response.status_code == 503
-            assert response.json()["code"] == "provider_capability_unavailable"
         assert bridge.method_calls == []
 
 
@@ -1027,7 +1060,7 @@ def test_release_discovery_health_and_desktop_session_auth(
             "preferred_major": 1,
             "supported_majors": [1],
             "openapi_sha256": DESKTOP_OPENAPI_SHA256,
-            "build_version": "0.1.0",
+            "build_version": OPENEVO_VERSION,
             "source_commit": SOURCE_COMMIT,
             "build_channel": "test",
             "provider_kind": "desktop_sidecar",

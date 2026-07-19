@@ -1,9 +1,9 @@
 # Remote Server Setup
 
 OpenEvo Desktop connects to a remote Linux server and installs OpenEvo Daemon
-under the selected SSH account. Use only a host profile listed in the Preview
-release notes. The packaged managed science runtime is Linux amd64, so an
-arbitrary Linux host is not implied to be supported.
+under the selected SSH account. The packaged managed science runtime is Linux
+amd64. The `0.1.2` Preview has no general clean-host matrix; the requirements
+below describe the exhibition profile, not general Linux support.
 
 ## Server Requirements
 
@@ -12,7 +12,8 @@ Before opening Desktop, confirm that:
 - the server is reachable over SSH from the Mac;
 - your remote account can write to its home directory;
 - your Mac can authenticate to that account through its SSH agent;
-- Docker Engine is installed and usable by that account;
+- Docker Engine is installed and exposes the Docker API to that account using
+  the exhibition user-container profile;
 - the server has enough home-directory and container storage for the project,
   Daemon, runtime, transcripts, and artifacts;
 - required outbound HTTPS access works directly or through the configured

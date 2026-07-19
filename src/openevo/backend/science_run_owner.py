@@ -18,12 +18,15 @@ from fastapi.responses import JSONResponse, Response
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v1.store import (
     CoreControlStoreV1,
+    ResourceConflictError,
     ResourceNotFoundError,
 )
 from openevo.backend.run_control import CoreRunControlError
 from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.science_run_store import (
+    ProjectInFlightCoordinator,
+    ScienceProjectInFlight,
     ScienceRunConflict,
     ScienceRunIdempotencyConflict,
     ScienceRunNotFound,
@@ -101,6 +104,10 @@ class _RunCancelled(RuntimeError):
     pass
 
 
+class _RunFinalizationConflict(ScienceRunConflict):
+    pass
+
+
 class CoreScienceRunOwner:
     """Own the frozen Core run routes and execute one science run at a time."""
 
@@ -140,6 +147,7 @@ class CoreScienceRunOwner:
         self._poll_interval = poll_interval_seconds
         self._max_poll_attempts = max_poll_attempts
         self._ledger = ScienceRunStore(Path(state_root) / "science-runs")
+        self._project_in_flight = ProjectInFlightCoordinator(self._ledger)
         self._output_root = Path(state_root) / "science-run-output"
         self._output_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._condition = threading.Condition()
@@ -196,6 +204,13 @@ class CoreScienceRunOwner:
                 409,
                 False,
             ) from exc
+        except ScienceProjectInFlight as exc:
+            raise _owner_error(
+                "run_project_in_flight",
+                "The project already has an admitted task or successor transition.",
+                409,
+                True,
+            ) from exc
         except ScienceRunConflict as exc:
             raise _owner_error("run_conflict", str(exc), 409, False) from exc
         except (ScienceRunStoreError, ValueError) as exc:
@@ -219,6 +234,10 @@ class CoreScienceRunOwner:
                 503,
                 True,
             ) from exc
+
+    @property
+    def project_in_flight_coordinator(self) -> ProjectInFlightCoordinator:
+        return self._project_in_flight
 
     async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
         task_id = check.task_id
@@ -283,7 +302,11 @@ class CoreScienceRunOwner:
         try:
             project = self._validate_create_request(request)
             self._ensure_services(project)
-            with self._lifecycle_lock, self._pin_create_authority(request) as authority:
+            with (
+                self._lifecycle_lock,
+                self._project_in_flight.locked(),
+                self._pin_create_authority(request) as authority,
+            ):
                 project = self._validate_create_authority(request, *authority)
                 input_context = self._ledger.revision_context(
                     request.project_id,
@@ -291,6 +314,13 @@ class CoreScienceRunOwner:
                 )
                 now = self._timestamp()
                 run_id = admission.run_id
+                queued_reason = _execution_queue_reason()
+                attempt = _queued_attempt(
+                    run_id=run_id,
+                    number=1,
+                    now=now,
+                    queued_reason=queued_reason,
+                )
                 run = _run_model(
                     {
                         "id": run_id,
@@ -302,17 +332,17 @@ class CoreScienceRunOwner:
                         "execution_mode": project.spec.execution_mode,
                         "capture_mode": project.spec.capture_mode,
                         "status": m.RunStatus.QUEUED,
-                        "queued_reason": m.QueuedReasonV1(
-                            code=m.QueuedReasonCode.ADMISSION_PENDING,
-                            summary="Core is admitting the saved project revision.",
-                            retry_after_seconds=1,
-                        ),
-                        "attempt_count": 0,
+                        "queued_reason": queued_reason,
+                        "current_attempt_id": attempt.id,
+                        "current_attempt": attempt,
+                        "attempt_count": 1,
+                        "pinned_revision": request.required_revision.revision,
                         "required_revision": request.required_revision,
                         "revision_transition": authority[2].transition,
                         "created_at": now,
                         "updated_at": now,
-                        "attempts": [],
+                        "admitted_at": now,
+                        "attempts": [attempt],
                     },
                     version=1,
                 )
@@ -450,6 +480,8 @@ class CoreScienceRunOwner:
                 raise ScienceRunConflict("run retry does not bind the terminal attempt")
             if current.attempt_count >= 100:
                 raise ScienceRunConflict("science run retry capacity is exhausted")
+            if current.admitted_at is None or current.pinned_revision is None:
+                raise ScienceRunConflict("science run retry requires its immutable admission")
             return _retry_model(current, version=version, now=now)
 
         updated, replayed = self._ledger.apply_mutation(
@@ -460,6 +492,7 @@ class CoreScienceRunOwner:
             expected_etag=cast(str, arguments["if_match"]),
             status_code=202,
             transform=retry,
+            claim_project=True,
             timeline_builders=(
                 lambda accepted, sequence: self._timeline_entry(
                     accepted,
@@ -751,6 +784,16 @@ class CoreScienceRunOwner:
             self._finalize_completed_result(run_id, result, cancellation=cancellation)
         except _RunCancelled:
             self._complete_or_defer_cancellation(run_id, rollout)
+        except _RunFinalizationConflict as exc:
+            self._finish_failed(
+                run_id,
+                _owner_error(
+                    "run_successor_conflict",
+                    str(exc),
+                    409,
+                    False,
+                ),
+            )
         except BaseException as exc:
             if cancellation.is_set():
                 self._complete_or_defer_cancellation(run_id, rollout)
@@ -857,6 +900,17 @@ class CoreScienceRunOwner:
         except _RunCancelled:
             self._finish_cancelled(run_id)
             return True
+        except _RunFinalizationConflict as exc:
+            self._finish_failed(
+                run_id,
+                _owner_error(
+                    "run_successor_conflict",
+                    str(exc),
+                    409,
+                    False,
+                ),
+            )
+            return True
         except BaseException:
             return False
 
@@ -867,7 +921,7 @@ class CoreScienceRunOwner:
         *,
         cancellation: threading.Event,
     ) -> None:
-        with self._lifecycle_lock:
+        with self._lifecycle_lock, self._project_in_flight.locked():
             run = self._ledger.get_run(run_id)
             if run.status is m.RunStatus.SUCCEEDED:
                 return
@@ -891,34 +945,37 @@ class CoreScienceRunOwner:
             project = self._project_store.get_project(run.project_id)
             predecessor = request.required_revision.revision
             active_revision = project.active_revision
-            if active_revision is None or (
-                active_revision != predecessor
-                and active_revision.generation != predecessor.generation + 1
-            ):
-                raise ScienceRunConflict(
+            if active_revision is None:
+                raise _RunFinalizationConflict(
                     "project revision advanced before run finalization completed"
                 )
-            preflight_revision = m.RevisionRefV1(
-                id=f"preflight-{run_id}",
-                project_id=run.project_id,
-                generation=predecessor.generation + 1,
-                manifest_sha256="0" * 64,
-            )
-            _project_artifacts(
-                result,
-                project=project,
-                revision=preflight_revision,
-                run_id=run_id,
-            )
-            successor = self._project_store.activate_evolution_revision(
-                run.project_id,
-                predecessor=predecessor,
-                run_id=run_id,
-                context_artifact_ids=context,
-            )
+            if active_revision == predecessor:
+                preflight_revision = m.RevisionRefV1(
+                    id=f"preflight-{run_id}",
+                    project_id=run.project_id,
+                    generation=predecessor.generation + 1,
+                    manifest_sha256="0" * 64,
+                )
+                _project_artifacts(
+                    result,
+                    project=project,
+                    revision=preflight_revision,
+                    run_id=run_id,
+                )
+            try:
+                successor = self._project_store.activate_evolution_revision(
+                    run.project_id,
+                    predecessor=predecessor,
+                    run_id=run_id,
+                    context_artifact_ids=context,
+                )
+            except ResourceConflictError as exc:
+                raise _RunFinalizationConflict(
+                    "project revision advanced before run finalization completed"
+                ) from exc
             project = self._project_store.get_project(run.project_id)
             if project.active_revision != successor.revision:
-                raise ScienceRunConflict(
+                raise _RunFinalizationConflict(
                     "project revision advanced before run finalization completed"
                 )
             artifacts = _project_artifacts(
@@ -1679,22 +1736,16 @@ def _transition_run(
 
 
 def _retry_model(run: m.RunV1, *, version: int, now: str) -> m.RunV1:
-    queued_reason = m.QueuedReasonV1(
-        code=m.QueuedReasonCode.ADMISSION_PENDING,
-        summary="Core is admitting the retry attempt.",
-        retry_after_seconds=1,
+    queued_reason = _execution_queue_reason()
+    attempt = _queued_attempt(
+        run_id=run.id,
+        number=len(run.attempts) + 1,
+        now=now,
+        queued_reason=queued_reason,
     )
     attempts = [
         *run.attempts,
-        m.AttemptV1(
-            id=f"attempt-{secrets.token_hex(16)}",
-            run_id=run.id,
-            number=len(run.attempts) + 1,
-            status=m.RunStatus.QUEUED,
-            queued_reason=queued_reason,
-            created_at=now,
-            updated_at=now,
-        ),
+        attempt,
     ]
     data = run.model_dump(mode="python", exclude={"etag", "attempts"})
     data.update(
@@ -1704,14 +1755,38 @@ def _retry_model(run: m.RunV1, *, version: int, now: str) -> m.RunV1:
         current_attempt=attempts[-1],
         attempt_count=len(attempts),
         current_error=None,
-        pinned_revision=None,
-        admitted_at=None,
         started_at=None,
         finished_at=None,
         updated_at=now,
         attempts=attempts,
     )
     return _run_model(data, version=version)
+
+
+def _execution_queue_reason() -> m.QueuedReasonV1:
+    return m.QueuedReasonV1(
+        code=m.QueuedReasonCode.CAPACITY,
+        summary="The admitted run is waiting for execution capacity.",
+        retry_after_seconds=1,
+    )
+
+
+def _queued_attempt(
+    *,
+    run_id: str,
+    number: int,
+    now: str,
+    queued_reason: m.QueuedReasonV1,
+) -> m.AttemptV1:
+    return m.AttemptV1(
+        id=f"attempt-{secrets.token_hex(16)}",
+        run_id=run_id,
+        number=number,
+        status=m.RunStatus.QUEUED,
+        queued_reason=queued_reason,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 def _run_model(data: Mapping[str, object], *, version: int) -> m.RunV1:

@@ -1,6 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { FetchLike } from "../api/v1/client";
 import { CONTRACT_FIXTURE_V1 } from "../api/v1/fixtures";
+import { operationV1Schema } from "../api/v1/schemas";
+import { createFixtureDesktopProductProvider } from "./fixtureProvider";
 import {
   ProductRefreshOrder,
   defineDesktopProductReleaseContract,
@@ -134,6 +136,7 @@ describe("Desktop product provider boundary", () => {
       },
     });
     expect(provider.providerKind).toBe("desktop_sidecar");
+    expect(provider.systemMaintenanceAvailable).toBe(false);
   });
 
   it("requires and restores the native retry journal for the release provider", async () => {
@@ -457,6 +460,77 @@ describe("Desktop product provider boundary", () => {
       },
       adapterFactory: () => ({ ...unavailableDesktopProductProvider, getRunRetryRecovery: undefined }),
     })).rejects.toThrow(/durable run retry recovery/i);
+  });
+
+  it("rejects a release adapter without the frozen System recovery contract", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
+        selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
+        settleProjectSource: vi.fn(),
+      },
+      adapterFactory: () => ({
+        ...unavailableDesktopProductProvider,
+        createDiagnostic: undefined,
+      } as unknown as typeof unavailableDesktopProductProvider),
+    })).rejects.toThrow(/System recovery capabilities/i);
+  });
+
+  it("automatically applies continuation authority to a custom release adapter", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
+    const queued = operationV1Schema.parse(CONTRACT_FIXTURE_V1.serviceOperation);
+    const staleEtagMutation = operationV1Schema.parse({
+      ...queued,
+      status: "running",
+      updated_at: "2026-07-14T12:00:01Z",
+      observed_at: "2026-07-14T12:00:01Z",
+    });
+    const getCoreOperation = vi.fn()
+      .mockResolvedValueOnce(queued)
+      .mockResolvedValueOnce(staleEtagMutation);
+    const provider = await createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
+        selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
+        settleProjectSource: vi.fn(),
+      },
+      adapterFactory: () => ({
+        ...unavailableDesktopProductProvider,
+        getCoreOperation,
+      }),
+    });
+
+    await expect(provider.getCoreOperation(queued.id)).resolves.toMatchObject({ status: "queued" });
+    await expect(provider.getCoreOperation(queued.id)).rejects.toThrow(/without changing ETag/i);
+  });
+
+  it("keeps fixture Core operations observable from queued to terminal", async () => {
+    const provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("expected a fresh fixture");
+    const service = refreshed.snapshot.services.find((item) => item.id === "service-runtime-fixture");
+    if (!service) throw new Error("expected the fixture runtime service");
+
+    const operation = await provider.restartService(service.id, {
+      actionId: "fixture-service-restart-0001",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+      etag: service.etag,
+    });
+    expect(operation.status).toBe("queued");
+    await expect(provider.getCoreOperation(operation.id)).resolves.toMatchObject({
+      id: operation.id,
+      status: "succeeded",
+    });
+    provider.dispose();
   });
 
   it("rejects native source responses outside ProjectSourceV1 or cross-wired to another source kind", async () => {

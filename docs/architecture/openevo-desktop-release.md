@@ -3,7 +3,8 @@
 > Pre-release status: final External Beta publication remains disabled. The
 > stable-only manual workflow builds and validates an unsigned candidate, leaves
 > it as a draft GitHub prerelease after upload/download verification, and never
-> signs, notarizes, or publishes that draft.
+> Developer ID signs or notarizes it. A separate manually controlled workflow
+> may publish an unchanged, revalidated draft as a non-gating Preview.
 
 The canonical release requirements live in
 `docs/maintainer/productization/spec.md`. This document defines the packaging
@@ -105,18 +106,36 @@ The repository currently provides:
   manifest member, download every asset into an empty directory, revalidate the
   closed inventory, compare all bytes, and validate the review-facing draft
   fields and the per-attempt random ownership marker. A separate
-  run-attempt-qualified Actions artifact retains that point-in-time metadata
-  record. The successful draft has a `tagName` but does not create a remote Git
-  tag;
+  run-attempt-qualified Actions artifact retains a canonical snapshot binding
+  the numeric release ID, body, asset IDs/sizes/digests, manifest digest, and
+  candidate run identity. The successful draft has a `tagName` but does not
+  create a remote Git tag;
+- `.github/workflows/openevo-desktop-publish-preview.yml`, a separate
+  `workflow_dispatch` publisher protected by the
+  `openevo-preview-publication` environment. It requires the exact tag,
+  numeric release ID, source SHA, candidate-manifest SHA256, and candidate run
+  ID/attempt. It re-reads the release by numeric ID, downloads every asset by
+  immutable asset ID into a fresh directory, and first verifies that the
+  Actions run was the successful candidate workflow on `stable` at the exact
+  source SHA. It revalidates the canonical snapshot, body, checksums, manifest,
+  target, title, prerelease/draft state, and exact asset inventory before
+  proving the real Git tag is absent. Its only release mutation is a numeric-ID
+  REST PATCH containing
+  `{"draft":false}`. It then performs a second fresh download and validation
+  and requires the newly visible tag to point to the exact source SHA. A
+  post-publication validation failure is retained for incident handling; the
+  workflow does not delete or rewrite the public release;
 - a disabled `.github/workflows/openevo-release-artifact.yml` placeholder that
   publishes nothing.
 
 The candidate workflow proves the native packaging, exact-byte transfer, Core
 service, minimal dependency/license/security, and draft-asset roundtrip named
 above. It does not complete the ordinary science E2E, benchmark gates,
-secret-canary/privacy suite, code signing, notarization, or final publication,
-and the draft's candidate tag name is not a real Git tag or public release
-authorization.
+secret-canary/privacy suite, or final External Beta publication. It does verify
+the ad-hoc app-bundle signature and the synthetic quarantine-removal path; the
+draft's candidate tag name is not a real Git tag or public release
+authorization. Developer ID signing and notarization are not requirements for
+the current release profile.
 
 ### Native host trust boundary, phase one
 
@@ -888,17 +907,24 @@ PyPI is not part of the External Beta release. This rehearsal inventory is not
 the final release inventory; the canonical inventory replaces the wheel and
 descriptor with the exact Daemon Bundle and release manifest.
 
-The dependency/security summaries, Core descriptor, and release candidate
-manifest use version 2. Native smoke evidence uses version 3 to bind its launch
-origin, exact source-DMG SHA256, and both packaged binary SHA256 values. The
-unchanged license inventory and framework lock keep their existing versions.
+The dependency/security summaries and Core descriptor use version 2. The
+release candidate manifest uses version 6 and distinguishes
+`developer_id_signed=false`, `app_bundle_signature="adhoc"`,
+`notarized=false`, and `quarantine_removal_tested=true`; it also records the
+exact Rust toolchain. Packaged Playwright report/evidence uses version 2 and
+declares `simulator=false`, `provider_kind="desktop_sidecar"`, and
+`composition="packaged_web"`. Native smoke evidence uses version 3 to bind its
+launch origin, exact source-DMG SHA256, and both packaged binary SHA256 values.
+The unchanged license inventory and framework lock keep their existing
+versions.
 
 ## Build Inputs
 
 The release build must use locked and reviewed inputs:
 
 - `npm ci` and `desktop/package-lock.json`;
-- Rust stable with `desktop/src-tauri/Cargo.lock` and `cargo --locked`;
+- exact Rust `1.95.0`, selected by a commit-pinned toolchain Action, with
+  `desktop/src-tauri/Cargo.lock` and `cargo --locked`;
 - the supported Python version and sidecar build dependencies resolved by
   `uv sync --frozen` from `uv.lock`; this includes `build`, `setuptools`, and
   `wheel`, and the Core wheel build disables build isolation so it cannot resolve
@@ -952,12 +978,17 @@ The replacement workflow must:
    versions, commits, checksums, title, tag name, target commit, body, draft
    state, prerelease state, ownership, and immutable numeric release ID at a
    discrete API read; persist cleanup authority once in an owner-only file;
-8. retain the point-in-time draft verification record as a run-attempt-qualified
-   Actions artifact, prove no real Git tag was created, and leave the candidate
-   as an unpublished review draft.
+8. retain the canonical numeric-release/asset snapshot as a
+   run-attempt-qualified Actions artifact, prove no real Git tag was created,
+   and leave the candidate as an unpublished review draft;
+9. only after review, dispatch the independent Preview publisher with the exact
+   snapshot identities. It must revalidate a fresh draft download before the
+   visibility-only numeric-ID PATCH, then re-download and revalidate the public
+   release and exact source tag without automatic public-release cleanup.
 
-Final publication remains disabled. The manual candidate workflow implements
-the packaging-level draft roundtrip. If the job fails or is cancelled before
+Final External Beta publication remains disabled. The manual candidate
+workflow implements the packaging-level draft roundtrip. If the job fails or
+is cancelled before
 its final verification marker, cleanup first verifies the exact draft metadata
 and random ownership marker, then retries deletion by that draft's immutable
 numeric release ID rather than resolving the mutable tag again. Cleanup
@@ -985,9 +1016,11 @@ new candidate.
 - The unsigned/not-notarized warning and manual Gatekeeper launch procedure
   must match behavior observed from the copied app.
 
-The current packaging-only candidate launches a copied app without simulating
-browser-download quarantine. It therefore records the Privacy & Security allow
-flow as pending and does not satisfy that final Gatekeeper requirement.
+The current packaging-only candidate applies synthetic browser-download
+quarantine to the detached copy, verifies the attribute, executes the
+documented recursive removal command, revalidates the complete ad-hoc
+signature, and launches those exact bytes. The interactive Privacy & Security
+allow flow remains unautomated; that narrower UI path is still pending.
 
 ## Current Rehearsal Validation
 

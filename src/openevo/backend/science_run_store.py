@@ -112,6 +112,7 @@ _MAX_ARTIFACTS_PER_RUN = 1_024
 _MAX_ADMISSION_ROWS = 100_000
 _MAX_ADMISSIONS_PER_RUN = 4_096
 _ACTIVE_STATUSES = frozenset({m.RunStatus.PREPARING, m.RunStatus.RUNNING, m.RunStatus.CANCELLING})
+_IN_FLIGHT_STATUSES = _ACTIVE_STATUSES | {m.RunStatus.QUEUED}
 
 
 class ScienceRunStoreError(RuntimeError):
@@ -127,6 +128,10 @@ class ScienceRunConflict(ScienceRunStoreError):
 
 
 class ScienceRunIdempotencyConflict(ScienceRunConflict):
+    pass
+
+
+class ScienceProjectInFlight(ScienceRunConflict):
     pass
 
 
@@ -151,6 +156,41 @@ class RolloutTaskAdmissionAuthority:
     registry_digest: str
     framework_lock_digest: str
     payload_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectInFlightOwner:
+    project_id: str
+    run_id: str
+    source: str
+
+
+class ProjectInFlightCoordinator:
+    """Process-local ordering around the durable science-run project authority."""
+
+    def __init__(self, store: ScienceRunStore) -> None:
+        self._store = store
+
+    @contextmanager
+    def locked(self) -> Iterator[None]:
+        with self._store.coordination_lock():
+            yield
+
+    @contextmanager
+    def guard_project_mutation(
+        self,
+        project_id: str,
+        *,
+        exact_replay: Callable[[], bool],
+    ) -> Iterator[None]:
+        with self._store.coordination_lock():
+            if not exact_replay():
+                owner = self._store.project_in_flight_owner(project_id)
+                if owner is not None:
+                    raise ScienceProjectInFlight(
+                        "project has an admitted task or successor transition in flight"
+                    )
+            yield
 
 
 class ScienceRunStore:
@@ -230,6 +270,19 @@ class ScienceRunStore:
                                 request_digest=request_digest,
                                 request_json=request_json,
                             )
+                            owner = _project_in_flight_owner(
+                                connection,
+                                request.project_id,
+                            )
+                            if owner is not None and (
+                                durable_pending is None
+                                or owner.run_id != durable_pending
+                                or owner.source != "pending_create"
+                            ):
+                                raise ScienceProjectInFlight(
+                                    "project has an admitted task or successor transition "
+                                    "in flight"
+                                )
                             if durable_pending is None:
                                 count = int(
                                     connection.execute(
@@ -574,6 +627,7 @@ class ScienceRunStore:
         status_code: int,
         transform: Callable[[m.RunV1, int], m.RunV1 | None],
         deleted: bool = False,
+        claim_project: bool = False,
         timeline_builders: Sequence[Callable[[m.RunV1, int], m.TimelineEntryV1]] = (),
     ) -> tuple[m.RunV1 | None, bool]:
         with self._lock, self._transaction() as connection:
@@ -600,6 +654,16 @@ class ScienceRunStore:
             current = _model(m.RunV1, run_row["run_json"])
             if current.etag != expected_etag:
                 raise ScienceRunPreconditionFailed("science run ETag changed")
+            if claim_project:
+                owner = _project_in_flight_owner(
+                    connection,
+                    current.project_id,
+                    allowed_run_id=run_id,
+                )
+                if owner is not None:
+                    raise ScienceProjectInFlight(
+                        "project has another admitted task or successor transition in flight"
+                    )
             version = int(run_row["resource_version"]) + 1
             response = transform(current, version)
             if timeline_builders:
@@ -961,6 +1025,15 @@ class ScienceRunStore:
     def queued_run_ids(self) -> list[str]:
         return [run.id for run in self.list_runs() if run.status is m.RunStatus.QUEUED]
 
+    @contextmanager
+    def coordination_lock(self) -> Iterator[None]:
+        with self._lock:
+            yield
+
+    def project_in_flight_owner(self, project_id: str) -> ProjectInFlightOwner | None:
+        with self._lock, self._reader() as connection:
+            return _project_in_flight_owner(connection, project_id)
+
     def _prepare_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         metadata = self.root.stat(follow_symlinks=False)
@@ -1020,6 +1093,18 @@ class ScienceRunStore:
                 ).fetchone()
                 if overlap is not None:
                     raise ScienceRunStoreError("pending science run authority overlaps a run")
+            projects = connection.execute(
+                "SELECT project_id FROM pending_run_creates "
+                "UNION SELECT project_id FROM runs LIMIT ?",
+                (_MAX_RUNS + 1,),
+            ).fetchall()
+            if len(projects) > _MAX_RUNS:
+                raise ScienceRunStoreError("science run project inventory exceeds its bound")
+            for project in projects:
+                project_id = project["project_id"]
+                if not isinstance(project_id, str) or not project_id:
+                    raise ScienceRunStoreError("science run project identity is invalid")
+                _project_in_flight_owner(connection, project_id)
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -1162,6 +1247,63 @@ def _pending_create_run(
     return run_id
 
 
+def _project_in_flight_owner(
+    connection: sqlite3.Connection,
+    project_id: str,
+    *,
+    allowed_run_id: str | None = None,
+) -> ProjectInFlightOwner | None:
+    pending = connection.execute(
+        "SELECT run_id FROM pending_run_creates WHERE project_id = ? LIMIT 2",
+        (project_id,),
+    ).fetchall()
+    owners = [
+        ProjectInFlightOwner(
+            project_id=project_id,
+            run_id=str(row["run_id"]),
+            source="pending_create",
+        )
+        for row in pending
+        if row["run_id"] != allowed_run_id
+    ]
+    rows = connection.execute(
+        "SELECT run_id, run_json FROM runs "
+        "WHERE project_id = ? AND deleted = 0 ORDER BY run_id LIMIT ?",
+        (project_id, _MAX_RUNS + 1),
+    ).fetchall()
+    if len(rows) > _MAX_RUNS:
+        raise ScienceRunStoreError("science run project inventory exceeds its bound")
+    for row in rows:
+        run = _model(m.RunV1, row["run_json"])
+        if run.id != row["run_id"] or run.project_id != project_id:
+            raise ScienceRunStoreError("science run project authority is invalid")
+        if run.id != allowed_run_id and _run_retains_project_authority(run):
+            owners.append(
+                ProjectInFlightOwner(
+                    project_id=project_id,
+                    run_id=run.id,
+                    source="run",
+                )
+            )
+    if len(owners) > 1:
+        raise ScienceRunStoreError("project has multiple science run authorities")
+    return None if not owners else owners[0]
+
+
+def _run_retains_project_authority(run: m.RunV1) -> bool:
+    if run.status in _IN_FLIGHT_STATUSES:
+        return True
+    return bool(
+        run.status is m.RunStatus.FAILED
+        and run.current_error is not None
+        and run.current_error.retryable
+        and run.current_attempt_id is not None
+        and run.admitted_at is not None
+        and run.pinned_revision is not None
+        and run.attempt_count < 100
+    )
+
+
 def _require_live_run(connection: sqlite3.Connection, run_id: str) -> m.RunV1:
     row = connection.execute(
         "SELECT run_json, deleted FROM runs WHERE run_id = ?", (run_id,)
@@ -1248,6 +1390,9 @@ def _object_value(payload: bytes | str, *, label: str) -> dict[str, object]:
 
 
 __all__ = [
+    "ProjectInFlightCoordinator",
+    "ProjectInFlightOwner",
+    "ScienceProjectInFlight",
     "ScienceRunConflict",
     "ScienceRunCreateAdmission",
     "ScienceRunIdempotencyConflict",

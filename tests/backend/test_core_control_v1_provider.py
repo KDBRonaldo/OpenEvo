@@ -44,6 +44,10 @@ from openevo.backend.contracts.v1.store import (
 )
 from openevo.evolution.artifact_payloads import ArtifactPayloadService
 from openevo.backend.run_control import RUN_OPERATION_IDS, CoreRunControlError
+from openevo.backend.science_run_store import (
+    ProjectInFlightCoordinator,
+    ScienceRunStore,
+)
 from openevo.backend.service_supervisor import (
     ServiceComponent,
     ServiceExecutionMode,
@@ -51,6 +55,7 @@ from openevo.backend.service_supervisor import (
     ServiceRunReadinessCode,
     ServiceStatus,
     SupervisorError,
+    SupervisorLogEntry,
     SupervisorServiceSummary,
 )
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
@@ -198,6 +203,7 @@ def _app(
     artifact_loader=None,
     event_replay_limit: int = 10_000,
     build_channel: str = "test",
+    enable_maintenance_owner_for_tests: bool = False,
 ):
     return create_core_control_app(
         state_root=state_root,
@@ -212,6 +218,7 @@ def _app(
         evolution_artifact_root=evolution_artifact_root,
         artifact_loader=artifact_loader,
         event_replay_limit=event_replay_limit,
+        _enable_maintenance_owner_for_tests=enable_maintenance_owner_for_tests,
     )
 
 
@@ -2502,10 +2509,7 @@ def test_release_subscription_create_and_patch_bind_managed_service_readiness(
 
     assert patched.status_code == 200
     assert patched.json()["current_task_snapshot"] == project["current_task_snapshot"]
-    assert (
-        patched.json()["current_workspace_snapshot"]
-        == project["current_workspace_snapshot"]
-    )
+    assert patched.json()["current_workspace_snapshot"] == project["current_workspace_snapshot"]
     assert [call["execution_mode"] for call in supervisor.ensure_calls] == [
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
@@ -3537,9 +3541,10 @@ def test_artifact_authority_migration_fails_closed_without_durable_binding(
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("DROP TABLE revision_artifact_authorities")
         connection.execute("DELETE FROM idempotency_records")
-        assert connection.execute(
-            "SELECT COUNT(*) FROM revision_activation_bindings"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT COUNT(*) FROM revision_activation_bindings").fetchone()[0]
+            == 0
+        )
 
     with pytest.raises(
         StoreCorruptionError,
@@ -3548,10 +3553,13 @@ def test_artifact_authority_migration_fails_closed_without_durable_binding(
         CoreControlStoreV1(tmp_path)
 
     with sqlite3.connect(database) as connection:
-        assert connection.execute(
-            "SELECT COUNT(*) FROM sqlite_schema "
-            "WHERE type = 'table' AND name = 'revision_artifact_authorities'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM sqlite_schema "
+                "WHERE type = 'table' AND name = 'revision_artifact_authorities'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_revision_ledger_migration_rejects_ambiguous_retained_response_closure(
@@ -3615,8 +3623,7 @@ def test_artifact_authority_migration_rejects_oversize_before_revision_decode(
     with sqlite3.connect(database) as connection:
         connection.execute("DROP TABLE revision_artifact_authorities")
         connection.execute(
-            "UPDATE project_revisions SET document_json = zeroblob(?) "
-            "WHERE revision_id = ?",
+            "UPDATE project_revisions SET document_json = zeroblob(?) WHERE revision_id = ?",
             (store_module._MAX_STARTUP_VALUE_BYTES + 1, project["active_revision"]["id"]),
         )
 
@@ -3724,9 +3731,7 @@ def test_revision_ledger_backfill_cannot_exceed_startup_recovery_budget(
             ).fetchall()
         }
         assert "revision_activation_bindings" not in table_names
-        columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(project_revisions)")
-        }
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(project_revisions)")}
         assert "activation_request_digest" not in columns
 
 
@@ -4216,6 +4221,7 @@ def test_fresh_database_cannot_claim_existing_managed_workspace(tmp_path: Path) 
     upload_root = root / "workspace-uploads"
     workspace_root = root / "workspace-snapshots"
     upload_root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
     workspace_root.mkdir(mode=0o700)
     orphan = workspace_root / "workspace-snapshot-existing"
     orphan.mkdir(mode=0o700)
@@ -4642,6 +4648,7 @@ def test_legacy_store_with_managed_state_is_not_claimed(tmp_path: Path) -> None:
     root = tmp_path / "core-control-v1"
     workspace_root = root / "workspace-snapshots"
     workspace_root.mkdir(parents=True, mode=0o700)
+    root.chmod(0o700)
     orphan = workspace_root / "workspace-snapshot-existing"
     orphan.mkdir(mode=0o700)
     keep = orphan / "keep.txt"
@@ -5155,8 +5162,130 @@ def test_sync_store_work_does_not_block_health_on_the_asgi_event_loop(
     assert elapsed < 0.5
 
 
-def test_services_are_observed_and_unowned_actions_fail_closed(tmp_path: Path) -> None:
-    with TestClient(_app(tmp_path)) as client:
+def test_default_provider_disables_all_maintenance_owner_routes(
+    tmp_path: Path,
+) -> None:
+    etag = '"' + ("0" * 64) + '"'
+    with TestClient(_app(tmp_path, build_channel="release")) as client:
+        assert "diagnostics" not in client.get("/version").json()["features"]
+        routes = [
+            (
+                "POST",
+                "/v1/environment/doctor",
+                {"Idempotency-Key": "default-doctor"},
+                {
+                    "schema_version": "1",
+                    "execution_mode": "codex_subscription_transcript",
+                    "checks": ["registry"],
+                },
+            ),
+            (
+                "POST",
+                "/v1/environment/repair",
+                {"Idempotency-Key": "default-repair"},
+                {
+                    "schema_version": "1",
+                    "execution_mode": "codex_subscription_transcript",
+                    "actions": ["reconcile_managed_state"],
+                },
+            ),
+            (
+                "POST",
+                "/v1/services/core-control/restart",
+                {"Idempotency-Key": "default-restart", "If-Match": etag},
+                {"schema_version": "1", "reason": "default owner must be disabled"},
+            ),
+            ("GET", "/v1/services/core-control/logs", {}, None),
+            ("GET", "/v1/operations/default-operation", {}, None),
+            (
+                "POST",
+                "/v1/operations/default-operation/cancel",
+                {"Idempotency-Key": "default-cancel-operation", "If-Match": etag},
+                {"schema_version": "1", "reason": "user_requested"},
+            ),
+            ("GET", "/v1/logs/default-log", {}, None),
+            (
+                "POST",
+                "/v1/diagnostics",
+                {"Idempotency-Key": "default-create-diagnostic"},
+                {
+                    "schema_version": "1",
+                    "scopes": ["services"],
+                    "target": {"kind": "global"},
+                },
+            ),
+            ("GET", "/v1/diagnostics/default-diagnostic", {}, None),
+            (
+                "DELETE",
+                "/v1/diagnostics/default-diagnostic",
+                {"Idempotency-Key": "default-delete-diagnostic", "If-Match": etag},
+                None,
+            ),
+            (
+                "POST",
+                "/v1/maintenance/cache-cleanup",
+                {"Idempotency-Key": "default-cache-cleanup"},
+                {
+                    "schema_version": "1",
+                    "scopes": ["completed_diagnostics"],
+                    "older_than_days": 7,
+                },
+            ),
+        ]
+        for method, path, headers, payload in routes:
+            request_kwargs: dict[str, object] = {"headers": {**AUTH, **headers}}
+            if payload is not None:
+                request_kwargs["json"] = payload
+            response = client.request(method, path, **request_kwargs)
+            assert response.status_code == 503, (method, path, response.text)
+            error = ApiErrorV1.model_validate_json(response.content)
+            assert error.http_status == 503
+            assert error.code == "provider_capability_unavailable"
+            assert error.repair_action is m.RepairAction.UNSUPPORTED
+
+
+def test_default_provider_keeps_release_store_schema_rollback_compatible(
+    tmp_path: Path,
+) -> None:
+    with TestClient(_app(tmp_path, build_channel="release")):
+        pass
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert store_module._schema_fingerprint(
+            connection
+        ) == store_module._expected_schema_fingerprint(store_module._PRE_MAINTENANCE_SCHEMA)
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")
+        }
+    assert not tables.intersection(
+        {
+            "maintenance_operations",
+            "maintenance_diagnostics",
+            "maintenance_logs",
+            "maintenance_idempotency_records",
+        }
+    )
+
+
+def test_maintenance_owner_test_seam_rejects_non_test_builds(tmp_path: Path) -> None:
+    with pytest.raises(
+        ValueError,
+        match="maintenance owner test seam is allowed only in test builds",
+    ):
+        _app(
+            tmp_path,
+            build_channel="release",
+            enable_maintenance_owner_for_tests=True,
+        )
+
+
+def test_opted_in_system_owner_without_supervisor_is_truthful_and_fails_closed(
+    tmp_path: Path,
+) -> None:
+    with TestClient(_app(tmp_path, enable_maintenance_owner_for_tests=True)) as client:
+        assert "diagnostics" not in client.get("/version").json()["features"]
         services = client.get("/v1/services", headers=AUTH)
         assert services.status_code == 200
         assert [item["id"] for item in services.json()["items"]] == ["core-control"]
@@ -5174,7 +5303,7 @@ def test_services_are_observed_and_unowned_actions_fail_closed(tmp_path: Path) -
             json={"schema_version": "1", "reason": "test"},
         )
         assert restart.status_code == 503
-        assert restart.json()["code"] == "provider_capability_unavailable"
+        assert restart.json()["code"] == "core_service_supervisor_failed"
         doctor = client.post(
             "/v1/environment/doctor",
             headers={**AUTH, "Idempotency-Key": "doctor-environment-0001"},
@@ -5184,8 +5313,20 @@ def test_services_are_observed_and_unowned_actions_fail_closed(tmp_path: Path) -
                 "checks": ["registry"],
             },
         )
-        assert doctor.status_code == 503
-        assert doctor.json()["code"] == "provider_capability_unavailable"
+        assert doctor.status_code == 200
+        assert doctor.json()["status"] == "needs_user_action"
+        assert doctor.json()["checks"] == [
+            {
+                "id": "environment-registry",
+                "kind": "registry",
+                "status": "unavailable",
+                "message": "The verified executable registry is unavailable.",
+                "repair_action": "user_action_required",
+                "next_action": "Restore the exact release registry installation.",
+                "logs_ref": None,
+                "model_preparation": None,
+            }
+        ]
         run = client.post(
             "/v1/runs",
             headers={**AUTH, "Idempotency-Key": "create-run-unowned"},
@@ -5200,6 +5341,7 @@ def test_services_are_observed_and_unowned_actions_fail_closed(tmp_path: Path) -
 class _RecordingServiceSupervisor:
     def __init__(self) -> None:
         self.close_calls = 0
+        self.restart_calls: list[tuple[str, str]] = []
         self._services = (
             SupervisorServiceSummary(
                 id="evolution-backend",
@@ -5220,6 +5362,67 @@ class _RecordingServiceSupervisor:
 
     def list(self) -> tuple[SupervisorServiceSummary, ...]:
         return self._services
+
+    def get(self, service_id: str) -> SupervisorServiceSummary:
+        for service in self._services:
+            if service.id == service_id:
+                return service
+        raise SupervisorError("unknown service")
+
+    def restart(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary:
+        del total_timeout
+        self.restart_calls.append((service_id, operation_id))
+        current = self.get(service_id)
+        restarted = SupervisorServiceSummary(
+            id=current.id,
+            display_name=current.display_name,
+            component=current.component,
+            status=ServiceStatus.RUNNING,
+            restartable=current.restartable,
+            status_message="Restarted and ready.",
+            error_code=None,
+            updated_at="2026-07-14T00:00:02Z",
+            observed_at="2026-07-14T00:00:03Z",
+            identity_digest="c" * 64,
+            pid=2345,
+            port=current.port,
+            etag='"' + "d" * 64 + '"',
+        )
+        self._services = (restarted,)
+        return restarted
+
+    def logs(
+        self,
+        service_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[SupervisorLogEntry, ...]:
+        self.get(service_id)
+        entries = (
+            SupervisorLogEntry(
+                id="service-log-1",
+                sequence=1,
+                occurred_at="2026-07-14T00:00:00Z",
+                level="info",
+                message="Managed service ready.",
+                service_id=service_id,
+                content_sha256=hashlib.sha256(b"Managed service ready.").hexdigest(),
+            ),
+        )
+        return tuple(entry for entry in entries if entry.sequence > after_sequence)[:limit]
+
+    def run_binding(self):
+        return object()
+
+    def cancel(self, *, total_timeout: float | None = None) -> None:
+        del total_timeout
 
     def close(self) -> None:
         self.close_calls += 1
@@ -5281,6 +5484,313 @@ class _ActivationServiceSupervisor(_RecordingServiceSupervisor):
         )
 
 
+def test_default_provider_projects_managed_services_as_read_only(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    with TestClient(
+        _app(
+            tmp_path,
+            build_channel="release",
+            service_supervisor=supervisor,
+        )
+    ) as client:
+        response = client.get("/v1/services", headers=AUTH)
+
+    assert response.status_code == 200
+    managed = next(
+        service for service in response.json()["items"] if service["id"] == "evolution-backend"
+    )
+    assert managed["restartable"] is False
+    assert supervisor.restart_calls == []
+
+
+def test_complete_system_owner_negotiates_and_returns_terminal_repair(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner_for_tests=True,
+        )
+    ) as client:
+        assert "diagnostics" in client.get("/version").json()["features"]
+        doctor = client.post(
+            "/v1/environment/doctor",
+            headers={**AUTH, "Idempotency-Key": "system-doctor-default"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "codex_subscription_transcript",
+                "checks": [],
+            },
+        )
+        assert doctor.status_code == 200, doctor.text
+        kinds = [check["kind"] for check in doctor.json()["checks"]]
+        assert "model_service" not in kinds
+        assert "codex_subscription" in kinds
+
+        self_deployed_doctor = client.post(
+            "/v1/environment/doctor",
+            headers={**AUTH, "Idempotency-Key": "system-doctor-self-deployed"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "self-deployed",
+                "checks": [],
+            },
+        )
+        assert self_deployed_doctor.status_code == 200, self_deployed_doctor.text
+        self_deployed_kinds = [check["kind"] for check in self_deployed_doctor.json()["checks"]]
+        assert "model_service" in self_deployed_kinds
+        assert "codex_subscription" not in self_deployed_kinds
+
+        inapplicable = client.post(
+            "/v1/environment/doctor",
+            headers={**AUTH, "Idempotency-Key": "system-doctor-inapplicable"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "self-deployed",
+                "checks": ["codex_subscription"],
+            },
+        )
+        assert inapplicable.status_code == 200, inapplicable.text
+        assert inapplicable.json()["status"] == "needs_user_action"
+        assert inapplicable.json()["checks"][0]["status"] == "unavailable"
+
+        repair = client.post(
+            "/v1/environment/repair",
+            headers={**AUTH, "Idempotency-Key": "system-repair-terminal"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "codex_subscription_transcript",
+                "actions": [
+                    "reconcile_managed_state",
+                    "restart_container_runtime",
+                ],
+            },
+        )
+        assert repair.status_code == 202, repair.text
+        operation = repair.json()
+        assert operation["status"] == "succeeded"
+        assert operation["result"]["response"]["status"] == "needs_user_action"
+        assert [result["status"] for result in operation["result"]["response"]["results"]] == [
+            "ok",
+            "unavailable",
+        ]
+        fetched = client.get(f"/v1/operations/{operation['id']}", headers=AUTH)
+        assert fetched.json() == operation
+        assert fetched.headers["etag"] == operation["etag"]
+        logs = client.get(f"/v1/logs/{operation['logs_ref']}", headers=AUTH)
+        assert logs.status_code == 200
+        assert len(logs.json()["items"]) == 3
+
+
+def test_service_restart_is_etag_bound_idempotent_and_uses_supervisor(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner_for_tests=True,
+        )
+    ) as client:
+        assert "diagnostics" in client.get("/version").json()["features"]
+        service = client.get("/v1/services/evolution-backend", headers=AUTH)
+        initial_etag = service.headers["etag"]
+        headers = {
+            **AUTH,
+            "Idempotency-Key": "restart-evolution-backend",
+            "If-Match": initial_etag,
+        }
+        first = client.post(
+            "/v1/services/evolution-backend/restart",
+            headers=headers,
+            json={"schema_version": "1", "reason": "Recover service readiness."},
+        )
+        assert first.status_code == 202, first.text
+        assert first.json()["status"] == "succeeded"
+        assert first.json()["result"]["service"]["id"] == "evolution-backend"
+        assert len(supervisor.restart_calls) == 1
+
+        replay = client.post(
+            "/v1/services/evolution-backend/restart",
+            headers=headers,
+            json={"schema_version": "1", "reason": "Recover service readiness."},
+        )
+        assert replay.status_code == 202
+        assert replay.json() == first.json()
+        assert len(supervisor.restart_calls) == 1
+
+        stale = client.post(
+            "/v1/services/evolution-backend/restart",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "restart-evolution-backend-stale",
+                "If-Match": initial_etag,
+            },
+            json={"schema_version": "1", "reason": "A different restart."},
+        )
+        assert stale.status_code == 412
+        service_logs = client.get("/v1/services/evolution-backend/logs", headers=AUTH)
+        assert service_logs.status_code == 200
+        assert service_logs.json()["items"][0]["service_id"] == "evolution-backend"
+
+
+def test_missing_run_owner_disables_suite_and_blocks_maintenance(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            enable_maintenance_owner_for_tests=True,
+        )
+    ) as client:
+        assert "diagnostics" not in client.get("/version").json()["features"]
+        service = client.get("/v1/services/evolution-backend", headers=AUTH).json()
+        restart = client.post(
+            "/v1/services/evolution-backend/restart",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "restart-without-run-owner",
+                "If-Match": service["etag"],
+            },
+            json={"schema_version": "1", "reason": "No run owner is installed."},
+        )
+        assert restart.status_code == 202
+        assert restart.json()["status"] == "failed"
+        assert restart.json()["error"]["code"] == "run_owner_unavailable"
+        assert supervisor.restart_calls == []
+
+
+def test_diagnostic_crud_and_unsupported_cache_scope_are_truthful(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            registry=registry,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner_for_tests=True,
+        )
+    ) as client:
+        created = client.post(
+            "/v1/diagnostics",
+            headers={**AUTH, "Idempotency-Key": "global-diagnostic-1"},
+            json={
+                "schema_version": "1",
+                "scopes": ["services", "storage"],
+                "target": {"kind": "global"},
+            },
+        )
+        assert created.status_code == 202, created.text
+        diagnostic = created.json()
+        assert diagnostic["status"] == "succeeded"
+        assert diagnostic["checks"]
+        fetched = client.get(f"/v1/diagnostics/{diagnostic['id']}", headers=AUTH)
+        assert fetched.headers["etag"] == diagnostic["etag"]
+
+        stale_delete = client.delete(
+            f"/v1/diagnostics/{diagnostic['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-global-diagnostic-stale",
+                "If-Match": '"' + ("0" * 64) + '"',
+            },
+        )
+        assert stale_delete.status_code == 412
+        deleted = client.delete(
+            f"/v1/diagnostics/{diagnostic['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-global-diagnostic",
+                "If-Match": diagnostic["etag"],
+            },
+        )
+        assert deleted.status_code == 204
+        replay = client.delete(
+            f"/v1/diagnostics/{diagnostic['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "delete-global-diagnostic",
+                "If-Match": diagnostic["etag"],
+            },
+        )
+        assert replay.status_code == 204
+
+        cleanup = client.post(
+            "/v1/maintenance/cache-cleanup",
+            headers={**AUTH, "Idempotency-Key": "unsupported-cache-cleanup"},
+            json={
+                "schema_version": "1",
+                "scopes": ["build_artifacts", "completed_diagnostics"],
+                "older_than_days": 7,
+            },
+        )
+        assert cleanup.status_code == 202
+        assert cleanup.json()["status"] == "failed"
+        assert cleanup.json()["error"]["code"] == "cache_scope_unsupported"
+
+
+def test_interrupted_maintenance_operation_recovers_as_failed(
+    tmp_path: Path,
+) -> None:
+    store = CoreControlStoreV1(
+        tmp_path,
+        _enable_maintenance_storage_for_tests=True,
+    )
+    request = m.EnvironmentRepairOperationRequestV1(
+        kind=m.OperationKind.ENVIRONMENT_REPAIR,
+        request=m.EnvironmentRepairRequestV1(
+            execution_mode=m.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+            actions=[m.EnvironmentRepairAction.RECONCILE_MANAGED_STATE],
+        ),
+    )
+    created = store.create_maintenance_operation(
+        "repairCoreEnvironmentV1",
+        request,
+        resource_scope="environment",
+        idempotency_key="interrupted-repair",
+    )
+    operation = created.model
+    assert isinstance(operation, m.OperationV1)
+    store.mark_maintenance_operation_running(operation.id)
+    store.close()
+
+    recovered = CoreControlStoreV1(
+        tmp_path,
+        _enable_maintenance_storage_for_tests=True,
+    )
+    try:
+        terminal = recovered.get_maintenance_operation(operation.id)
+        assert terminal.status is m.OperationStatus.FAILED
+        assert terminal.error is not None
+        assert terminal.error.code == "maintenance_operation_interrupted"
+        frames = recovered.replay_events(None)
+        assert any(
+            frame["event"] == "operation.updated.v1"
+            and frame["data"]["payload"]["status"] == "failed"
+            for frame in frames
+        )
+    finally:
+        recovered.close()
+
+
 class _RecordingRunControl:
     def __init__(self) -> None:
         self.close_calls = 0
@@ -5300,6 +5810,11 @@ class _RecordingRunControl:
 
     def close(self) -> None:
         self.close_calls += 1
+
+
+class _QuiescentRunControl(_RecordingRunControl):
+    def counts(self) -> tuple[int, int]:
+        return (0, 0)
 
 
 class _ArtifactRunControl(_RecordingRunControl):
@@ -5326,6 +5841,94 @@ class _ArtifactRunControl(_RecordingRunControl):
             if artifact_type is None or artifact.artifact_type is artifact_type
         ]
         return m.ArtifactPageV1(items=values, next_cursor=None, has_more=False)
+
+
+def test_maintenance_is_terminally_blocked_by_active_or_queued_runs(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    run_control = _RecordingRunControl()
+    with TestClient(
+        _app(
+            tmp_path,
+            service_supervisor=supervisor,
+            run_control=run_control,
+            enable_maintenance_owner_for_tests=True,
+        )
+    ) as client:
+        repair = client.post(
+            "/v1/environment/repair",
+            headers={**AUTH, "Idempotency-Key": "repair-blocked-by-runs"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "codex_subscription_transcript",
+                "actions": ["reconcile_managed_state"],
+            },
+        )
+        assert repair.status_code == 202
+        assert repair.json()["status"] == "failed"
+        assert repair.json()["error"]["code"] == "maintenance_blocked_by_runs"
+
+        service = client.get("/v1/services/evolution-backend", headers=AUTH).json()
+        restart = client.post(
+            "/v1/services/evolution-backend/restart",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "restart-blocked-by-runs",
+                "If-Match": service["etag"],
+            },
+            json={"schema_version": "1", "reason": "Blocked by run ownership."},
+        )
+        assert restart.status_code == 202
+        assert restart.json()["status"] == "failed"
+        assert restart.json()["error"]["code"] == "maintenance_blocked_by_runs"
+        assert supervisor.restart_calls == []
+
+
+def test_maintenance_document_tampering_fails_closed_on_restart(
+    tmp_path: Path,
+) -> None:
+    with TestClient(_app(tmp_path, enable_maintenance_owner_for_tests=True)) as client:
+        repair = client.post(
+            "/v1/environment/repair",
+            headers={**AUTH, "Idempotency-Key": "repair-for-corruption"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "codex_subscription_transcript",
+                "actions": ["reconcile_managed_state"],
+            },
+        )
+        assert repair.status_code == 202
+        operation_id = repair.json()["id"]
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT document_json, resource_version FROM maintenance_operations "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        operation = m.OperationV1.model_validate_json(row[0])
+        data = operation.model_dump(mode="python", exclude={"etag"})
+        data["observed_at"] = data["updated_at"].replace("2026", "2027", 1)
+        tampered = store_module._model_with_etag(
+            m.OperationV1,
+            data,
+            version=int(row[1]),
+        )
+        connection.execute(
+            "UPDATE maintenance_operations SET document_json = ? WHERE operation_id = ?",
+            (
+                store_module._model_bytes(tampered),
+                operation_id,
+            ),
+        )
+
+    with pytest.raises(StoreCorruptionError, match="maintenance operation row"):
+        CoreControlStoreV1(
+            tmp_path,
+            _enable_maintenance_storage_for_tests=True,
+        )
 
 
 def _artifact_payload(
@@ -5708,6 +6311,122 @@ def test_run_control_factory_receives_and_shares_the_provider_store(tmp_path: Pa
         assert stores == [app.state.core_control_provider.store]
 
     assert run_control.close_calls == 1
+
+
+def test_project_mutation_is_blocked_by_durable_run_owner_across_restart(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    run_state = tmp_path / "run-authority"
+
+    class CoordinatedRunControl:
+        def __init__(self) -> None:
+            self.ledger = ScienceRunStore(run_state)
+            self.project_in_flight_coordinator = ProjectInFlightCoordinator(self.ledger)
+
+        def invoke(self, _operation_id: str, _arguments: Mapping[str, object]) -> object:
+            raise AssertionError("run routes are not used by this test")
+
+        def counts(self) -> tuple[int, int]:
+            return (0, 0)
+
+        def close(self) -> None:
+            self.ledger.close()
+
+    request: m.RunCreateV1
+    first_control = CoordinatedRunControl()
+    with TestClient(_app(tmp_path, registry=registry, run_control=first_control)) as client:
+        project, etag = _create_project(client, _project_create())
+        replay_headers = {
+            **AUTH,
+            "Idempotency-Key": "patch-before-run-owner",
+            "If-Match": etag,
+        }
+        patched = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers=replay_headers,
+            json={"schema_version": "1", "name": "Patched before admission"},
+        )
+        assert patched.status_code == 200, patched.text
+        project = patched.json()
+        model = m.ProjectV1.model_validate_json(json.dumps(project))
+        assert model.active_revision is not None
+        assert model.registry_digest is not None
+        assert model.current_workspace_snapshot is not None
+        request = m.RunCreateV1(
+            project_id=model.id,
+            project_snapshot=model.current_project_snapshot,
+            task_snapshot=model.current_task_snapshot,
+            workspace_snapshot=model.current_workspace_snapshot,
+            expected_registry_digest=model.registry_digest,
+            required_revision=m.ReachableRequiredRevisionRefV1(
+                revision=model.active_revision,
+                reachable_from_revision_id=model.active_revision.id,
+                relation=m.RequiredRevisionRelation.ACTIVE,
+            ),
+        )
+        replay, admission = first_control.ledger.begin_create_run(
+            request=request,
+            idempotency_key="crash-pending-create",
+        )
+        assert replay is None
+        assert admission is not None
+
+        exact_replay = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers=replay_headers,
+            json={"schema_version": "1", "name": "Patched before admission"},
+        )
+        assert exact_replay.status_code == 200
+        assert exact_replay.json() == project
+        blocked = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-blocked-by-run-owner",
+                "If-Match": project["etag"],
+            },
+            json={"schema_version": "1", "name": "Must not persist"},
+        )
+        assert blocked.status_code == 409
+        assert blocked.json()["code"] == "project_in_flight"
+        assert blocked.json()["retryable"] is True
+        assert client.get(f"/v1/projects/{project['id']}", headers=AUTH).json() == project
+        failed_rows = client.app.state.core_control_provider.store._connection.execute(
+            "SELECT COUNT(*) FROM failed_idempotency_records "
+            "WHERE operation_id = 'patchCoreProjectV1'"
+        ).fetchone()[0]
+        assert failed_rows == 0
+
+    restarted_control = CoordinatedRunControl()
+    with TestClient(_app(tmp_path, registry=registry, run_control=restarted_control)) as client:
+        blocked = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-blocked-after-restart",
+                "If-Match": project["etag"],
+            },
+            json={"schema_version": "1", "name": "Still must not persist"},
+        )
+        assert blocked.status_code == 409
+        replay, recovered = restarted_control.ledger.begin_create_run(
+            request=request,
+            idempotency_key="crash-pending-create",
+        )
+        assert replay is None
+        assert recovered is not None
+        restarted_control.ledger.abort_create_run(recovered)
+        released = client.patch(
+            f"/v1/projects/{project['id']}",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "patch-after-owner-release",
+                "If-Match": project["etag"],
+            },
+            json={"schema_version": "1", "name": "Released"},
+        )
+        assert released.status_code == 200, released.text
 
 
 def test_run_control_factory_and_instance_are_mutually_exclusive(tmp_path: Path) -> None:
@@ -7776,6 +8495,7 @@ def test_workspace_verifier_rejects_noncanonical_ustar(tmp_path: Path) -> None:
     archive[0] = ord("X")
     archive_path = tmp_path / "bad.tar"
     archive_path.write_bytes(archive)
+    archive_path.chmod(0o600)
     declaration = _project_create(archive=bytes(archive))["workspace"]["archive"]
     model = WorkspaceArchiveDeclarationV1.model_validate_json(json.dumps(declaration))
     with pytest.raises(WorkspaceArchiveError, match="checksum"):
