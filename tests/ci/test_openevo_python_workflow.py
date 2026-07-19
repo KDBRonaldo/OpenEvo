@@ -163,7 +163,13 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert '"scripts/ci/smoke_openevo_desktop_sidecar.py"' in text
     assert '"scripts/ci/write_sha256.py"' in text
     assert 'node-version: "22"' in text
-    assert "dtolnay/rust-toolchain@stable" in text
+    assert text.count("dtolnay/rust-toolchain@stable") == 2
+    rust_setup_blocks = text.split("dtolnay/rust-toolchain@stable")[1:]
+    assert len(rust_setup_blocks) == 2
+    for block in rust_setup_blocks:
+        setup = block.split("\n\n", maxsplit=1)[0]
+        assert "with:" in setup
+        assert "components: rustfmt, clippy" in setup
     assert 'python-version: "3.11"' in text
     assert "astral-sh/setup-uv@v6" in text
     assert "name: Install packaged sidecar build dependencies" in text

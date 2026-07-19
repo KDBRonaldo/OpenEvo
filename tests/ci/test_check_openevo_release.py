@@ -2309,6 +2309,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "framework-lock.json",
         "--framework-lock",
         "openevo-core-service",
+        "components: rustfmt, clippy",
         'cargo metadata --locked --format-version 1 > "$metadata"',
         "cargo fmt --check",
         "cargo clippy --locked --release --all-targets -- -D warnings",
@@ -2360,6 +2361,15 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "npx playwright install --with-deps chromium"
     ) < linux_bundle.index("npm run test:product-browser")
     assert release_test_command in macos_candidate
+    rust_setup = macos_candidate[
+        macos_candidate.index(
+            "      - uses: dtolnay/rust-toolchain@"
+        ) : macos_candidate.index(
+            "      - name: Install locked build dependencies"
+        )
+    ]
+    assert 'toolchain: "1.95.0"' in rust_setup
+    assert "components: rustfmt, clippy" in rust_setup
     assert "lipo -version" not in macos_candidate
     assert "bundle/macos" not in macos_candidate
     assert 'RUNNER_ENVIRONMENT: ${{ runner.environment }}' in linux_candidate

@@ -44,6 +44,8 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: actions/setup-python@v5
         with:
@@ -189,6 +191,8 @@ jobs:
           cache-dependency-path: desktop/package-lock.json
 
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - uses: actions/setup-python@v5
         with:
