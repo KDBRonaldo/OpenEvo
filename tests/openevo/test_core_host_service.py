@@ -1478,6 +1478,46 @@ def test_compatibility_v3_reader_stops_v2_daemon_and_upgrades_its_floor(
     assert upgraded_ledger["lifecycle_compatibility"] == 3
 
 
+def test_compatibility_v4_reader_stops_v3_daemon_and_upgrades_its_floor(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+    predecessor = service.observe_core_service_predecessor(
+        service_root=root,
+        process_controller=controller,
+    )
+
+    upgraded = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        replace_mismatched=True,
+        expected_predecessor=predecessor,
+        daemon_bundle_identity=DAEMON_V4,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        upgraded_ledger = pinned.read_json("service.json")
+
+    assert upgraded.attached is False
+    assert upgraded.generation != old.generation
+    assert upgraded.lifecycle_compatibility == 4
+    assert upgraded_ledger["schema_version"] == 5
+    assert upgraded_ledger["lifecycle_compatibility"] == 4
+
+
 def test_dead_newer_daemon_floor_rejects_stale_desktop_downgrade(
     tmp_path: Path,
     service_fakes: tuple[FakeController, list[FakeChild]],
