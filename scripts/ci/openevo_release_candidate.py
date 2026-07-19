@@ -2043,6 +2043,49 @@ def _load_preview_snapshot(path: Path) -> dict[str, object]:
     return snapshot
 
 
+def validate_preview_release_snapshot_identity(
+    snapshot_path: Path,
+    *,
+    expected_repository: str,
+    expected_release_id: int,
+    expected_tag: str,
+    expected_source_commit: str,
+    expected_manifest_sha256: str,
+    expected_run_id: int,
+    expected_run_attempt: int,
+) -> None:
+    _validate_repository(expected_repository)
+    _require_positive_int(expected_release_id, "Expected release ID")
+    _require_positive_int(expected_run_id, "Expected candidate workflow run ID")
+    _require_positive_int(expected_run_attempt, "Expected candidate workflow run attempt")
+    if SOURCE_COMMIT_PATTERN.fullmatch(expected_source_commit) is None:
+        raise CandidateError("Expected Preview source commit is invalid")
+    _require_digest(
+        expected_manifest_sha256,
+        "Expected release-candidate manifest digest",
+    )
+    snapshot = _load_preview_snapshot(snapshot_path)
+    expected_identity = {
+        "draft": True,
+        "manifest_sha256": expected_manifest_sha256,
+        "prerelease": True,
+        "release_id": expected_release_id,
+        "repository": expected_repository,
+        "source_commit": expected_source_commit,
+        "tag": expected_tag,
+        "target_commitish": expected_source_commit,
+    }
+    if any(snapshot.get(key) != value for key, value in expected_identity.items()):
+        raise CandidateError("Preview release snapshot identity does not match publication inputs")
+    if snapshot.get("candidate_workflow") != {
+        "run_attempt": expected_run_attempt,
+        "run_id": expected_run_id,
+    }:
+        raise CandidateError(
+            "Preview release snapshot workflow identity does not match publication inputs"
+        )
+
+
 def _candidate_preview_identity(
     candidate_root: Path,
     *,
@@ -2368,6 +2411,15 @@ def main(argv: list[str] | None = None) -> int:
     asset_plan.add_argument("--metadata", type=Path, required=True)
     asset_plan.add_argument("--baseline", type=Path, required=True)
     asset_plan.add_argument("--state", choices=("draft", "public"), required=True)
+    validate_snapshot = subparsers.add_parser("validate-preview-snapshot")
+    validate_snapshot.add_argument("snapshot", type=Path)
+    validate_snapshot.add_argument("--expected-repository", required=True)
+    validate_snapshot.add_argument("--expected-release-id", type=int, required=True)
+    validate_snapshot.add_argument("--expected-tag", required=True)
+    validate_snapshot.add_argument("--expected-source-commit", required=True)
+    validate_snapshot.add_argument("--expected-manifest-sha256", required=True)
+    validate_snapshot.add_argument("--expected-run-id", type=int, required=True)
+    validate_snapshot.add_argument("--expected-run-attempt", type=int, required=True)
     assert_release_id = subparsers.add_parser("assert-release-id")
     assert_release_id.add_argument("inventory", type=Path)
     assert_release_id.add_argument("--expected-tag", required=True)
@@ -2485,6 +2537,19 @@ def main(argv: list[str] | None = None) -> int:
                 expected_draft=args.state == "draft",
             )
             print(args.output)
+            return 0
+        if args.command == "validate-preview-snapshot":
+            validate_preview_release_snapshot_identity(
+                args.snapshot,
+                expected_repository=args.expected_repository,
+                expected_release_id=args.expected_release_id,
+                expected_tag=args.expected_tag,
+                expected_source_commit=args.expected_source_commit,
+                expected_manifest_sha256=args.expected_manifest_sha256,
+                expected_run_id=args.expected_run_id,
+                expected_run_attempt=args.expected_run_attempt,
+            )
+            print(f"OpenEvo Preview snapshot validation passed: {args.snapshot}")
             return 0
         if args.command == "assert-release-id":
             assert_release_id_inventory(

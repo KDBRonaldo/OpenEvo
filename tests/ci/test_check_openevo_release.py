@@ -2849,13 +2849,11 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
         "scripts/ci/openevo_release_candidate.py"
     ).read_text(encoding="utf-8")
     assert "preview-release-snapshot.json" in workflow
-    assert "assert-release-id" in workflow
-    assert workflow.count("write-preview-asset-plan") == 2
-    assert workflow.count("snapshot-preview") == 2
-    assert "prepublication-release-rest.json" in workflow
+    assert "validate-preview-snapshot" in workflow
+    assert workflow.count("write-preview-asset-plan") == 1
+    assert workflow.count("snapshot-preview") == 1
     assert "postpublication-release-rest.json" in workflow
-    assert workflow.count("releases/assets/${asset_id}") == 2
-    assert workflow.count('test ! -e "$draft_dir"') == 1
+    assert workflow.count("releases/assets/${asset_id}") == 1
     assert workflow.count('test ! -e "$public_dir"') == 1
     assert workflow.count('method="PATCH"') == 1
     assert workflow.count("b'{\"draft\":false}'") == 1
@@ -2880,6 +2878,10 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     post_job = workflow.split("  verify-public-preview:\n", maxsplit=1)[1]
     assert "contents: read" in read_only_job
     assert "contents: write" not in read_only_job
+    assert "validate-preview-snapshot" in read_only_job
+    assert "/releases?" not in read_only_job
+    assert "/releases/${EXPECTED_RELEASE_ID}" not in read_only_job
+    assert "releases/assets/" not in read_only_job
     assert "contents: write" in write_job
     assert "actions/checkout@" not in write_job
     assert "scripts/ci/" not in write_job
@@ -2909,20 +2911,24 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert suffix.strip() == ""
     compile(fixed_source, "<fixed-preview-publisher>", "exec")
 
-    prevalidate = workflow.index(
-        "Fail closed unless the draft is the exact reviewed candidate"
+    read_only_validate = workflow.index(
+        "Validate the candidate-owned draft verification snapshot"
     )
     tag_absence = workflow.index("Preview tag already exists before publication")
-    publish = workflow.index(
-        "Revalidate immutable candidate data and publish by numeric ID"
+    publish = workflow.index("Revalidate immutable candidate data and publish by numeric ID")
+    write_draft_read = write_job.index(
+        'draft_release = api_json(f"/releases/{release_id}")'
     )
+    write_asset_hash = write_job.index("with open_asset(asset[\"id\"]) as response:")
+    write_patch = write_job.index('body=b\'{"draft":false}\'')
     postdownload = workflow.index(
         "Re-read and redownload the immutable public release"
     )
     postvalidate = workflow.index(
         "Verify public metadata, assets, body, and exact tag target"
     )
-    assert prevalidate < tag_absence < publish < postdownload < postvalidate
+    assert read_only_validate < tag_absence < publish < postdownload < postvalidate
+    assert write_draft_read < write_asset_hash < write_patch
     assert "validate-published-tag" in workflow[postvalidate:]
 
 

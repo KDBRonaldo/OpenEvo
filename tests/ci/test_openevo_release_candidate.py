@@ -1362,6 +1362,62 @@ def test_preview_snapshot_rejects_changed_downloaded_asset(tmp_path: Path) -> No
         )
 
 
+def test_preview_snapshot_identity_validation_accepts_exact_candidate(
+    tmp_path: Path,
+) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+
+    candidate.validate_preview_release_snapshot_identity(
+        fixture["snapshot"],
+        expected_repository="CompLifeLab-ZJU/OpenEvo",
+        expected_release_id=356072935,
+        expected_tag="openevo-desktop-v0.1.0-exhibition.123.2",
+        expected_source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        expected_manifest_sha256=fixture["manifest_sha256"],
+        expected_run_id=123456,
+        expected_run_attempt=2,
+    )
+
+
+@pytest.mark.parametrize(
+    ("argument", "replacement"),
+    [
+        ("expected_repository", "CompLifeLab-ZJU/Other"),
+        ("expected_release_id", 356072936),
+        ("expected_tag", "openevo-desktop-v0.1.0-other.123.2"),
+        ("expected_source_commit", "f" * 40),
+        ("expected_manifest_sha256", "f" * 64),
+        ("expected_run_id", 123457),
+        ("expected_run_attempt", 3),
+    ],
+)
+def test_preview_snapshot_identity_validation_rejects_mismatched_input(
+    tmp_path: Path,
+    argument: str,
+    replacement: object,
+) -> None:
+    candidate, fixture = _write_preview_release_fixture(tmp_path)
+    arguments: dict[str, object] = {
+        "expected_repository": "CompLifeLab-ZJU/OpenEvo",
+        "expected_release_id": 356072935,
+        "expected_tag": "openevo-desktop-v0.1.0-exhibition.123.2",
+        "expected_source_commit": "8e45af371eef49a86530a849041f7dcf047620ec",
+        "expected_manifest_sha256": fixture["manifest_sha256"],
+        "expected_run_id": 123456,
+        "expected_run_attempt": 2,
+    }
+    arguments[argument] = replacement
+
+    with pytest.raises(
+        candidate.CandidateError,
+        match="snapshot identity|workflow identity",
+    ):
+        candidate.validate_preview_release_snapshot_identity(
+            fixture["snapshot"],
+            **arguments,
+        )
+
+
 def test_release_inventory_rejects_wrong_numeric_release_id(tmp_path: Path) -> None:
     candidate = _load_module()
     inventory = tmp_path / "release-ids.jsonl"

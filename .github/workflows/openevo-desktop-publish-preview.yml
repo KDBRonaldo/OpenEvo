@@ -99,47 +99,7 @@ jobs:
           github-token: ${{ github.token }}
           run-id: ${{ inputs.candidate_workflow_run_id }}
 
-      - name: Resolve and re-read the exact numeric draft release
-        env:
-          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
-          EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          test -f "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json"
-          gh api --paginate "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-            --jq '.[] | {id: .id, tag_name: .tag_name}' \
-            > "$RUNNER_TEMP/release-id-inventory.jsonl"
-          python publication-policy/scripts/ci/openevo_release_candidate.py assert-release-id \
-            "$RUNNER_TEMP/release-id-inventory.jsonl" \
-            --expected-tag "$CANDIDATE_TAG" \
-            --expected-release-id "$EXPECTED_RELEASE_ID"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
-            --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
-            > "$RUNNER_TEMP/draft-release-rest.json"
-
-      - name: Download every draft asset by immutable asset ID
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          umask 077
-          python publication-policy/scripts/ci/openevo_release_candidate.py write-preview-asset-plan \
-            "$RUNNER_TEMP/draft-asset-plan.tsv" \
-            --metadata "$RUNNER_TEMP/draft-release-rest.json" \
-            --baseline "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
-            --state draft
-          draft_dir="$RUNNER_TEMP/downloaded-draft-preview"
-          test ! -e "$draft_dir"
-          mkdir -m 700 "$draft_dir"
-          while IFS=$'\t' read -r asset_id asset_name; do
-            test ! -e "$draft_dir/$asset_name"
-            gh api \
-              -H "Accept: application/octet-stream" \
-              "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-              > "$draft_dir/$asset_name"
-            chmod 0600 "$draft_dir/$asset_name"
-          done < "$RUNNER_TEMP/draft-asset-plan.tsv"
-
-      - name: Fail closed unless the draft is the exact reviewed candidate
+      - name: Validate the candidate-owned draft verification snapshot
         env:
           CANDIDATE_RUN_ATTEMPT: ${{ inputs.candidate_workflow_run_attempt }}
           CANDIDATE_RUN_ID: ${{ inputs.candidate_workflow_run_id }}
@@ -147,28 +107,21 @@ jobs:
           EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
           EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
-          GH_TOKEN: ${{ github.token }}
         run: |
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
-            --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
-            > "$RUNNER_TEMP/prepublication-release-rest.json"
-          python publication-policy/scripts/ci/openevo_release_candidate.py snapshot-preview \
-            "$RUNNER_TEMP/prepublication-preview-snapshot.json" \
-            --metadata "$RUNNER_TEMP/prepublication-release-rest.json" \
-            --candidate-root "$RUNNER_TEMP/downloaded-draft-preview" \
-            --baseline "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
+          test -f "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json"
+          python publication-policy/scripts/ci/openevo_release_candidate.py validate-preview-snapshot \
+            "$RUNNER_TEMP/candidate-verification/preview-release-snapshot.json" \
             --expected-repository "$GITHUB_REPOSITORY" \
             --expected-release-id "$EXPECTED_RELEASE_ID" \
             --expected-tag "$CANDIDATE_TAG" \
             --expected-source-commit "$EXPECTED_SOURCE_SHA" \
             --expected-manifest-sha256 "$EXPECTED_MANIFEST_SHA256" \
             --expected-run-id "$CANDIDATE_RUN_ID" \
-            --expected-run-attempt "$CANDIDATE_RUN_ATTEMPT" \
-            --state draft
+            --expected-run-attempt "$CANDIDATE_RUN_ATTEMPT"
 
           set +e
           git -C publication-policy ls-remote --exit-code --refs origin "refs/tags/$CANDIDATE_TAG" \
-            > "$RUNNER_TEMP/prepublication-tag.txt"
+            > "$RUNNER_TEMP/read-only-tag.txt"
           tag_status=$?
           set -e
           if [ "$tag_status" -eq 0 ]; then
@@ -180,13 +133,11 @@ jobs:
             exit 1
           fi
 
-      - name: Retain read-only prepublication verification
+      - name: Retain read-only candidate verification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: openevo-desktop-preview-prepublication-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: |
-            ${{ runner.temp }}/prepublication-preview-snapshot.json
-            ${{ runner.temp }}/prepublication-tag.txt
+          name: openevo-desktop-preview-read-only-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/read-only-tag.txt
           if-no-files-found: error
           retention-days: 30
 
