@@ -125,11 +125,12 @@ jobs:
           tag_status=$?
           set -e
           if [ "$tag_status" -eq 0 ]; then
-            echo "Preview tag already exists before publication: $CANDIDATE_TAG" >&2
-            exit 1
-          fi
-          if [ "$tag_status" -ne 2 ]; then
-            echo "Could not prove Preview tag absence: $CANDIDATE_TAG" >&2
+            python publication-policy/scripts/ci/openevo_release_candidate.py validate-published-tag \
+              "$RUNNER_TEMP/read-only-tag.txt" \
+              --expected-tag "$CANDIDATE_TAG" \
+              --expected-source-commit "$EXPECTED_SOURCE_SHA"
+          elif [ "$tag_status" -ne 2 ]; then
+            echo "Could not prove Preview tag state: $CANDIDATE_TAG" >&2
             exit 1
           fi
 
@@ -338,14 +339,6 @@ jobs:
                       timeout=180,
                   )
 
-          try:
-              api_json(f"/git/ref/tags/{quote(tag, safe='')}")
-          except HTTPError as exc:
-              if exc.code != 404:
-                  raise
-          else:
-              raise SystemExit("Preview tag already exists before publication")
-
           def assert_release(payload: object, *, draft: bool, immutable: bool) -> None:
               if type(payload) is not dict:
                   raise SystemExit("Release metadata is invalid")
@@ -380,8 +373,36 @@ jobs:
               if sorted(observed, key=lambda entry: str(entry["name"])) != expected_assets:
                   raise SystemExit("Release asset inventory changed after candidate verification")
 
-          draft_release = api_json(f"/releases/{release_id}")
-          assert_release(draft_release, draft=True, immutable=False)
+          def assert_tag_target(*, must_exist: bool) -> None:
+              try:
+                  tag_ref = api_json(f"/git/ref/tags/{quote(tag, safe='')}")
+              except HTTPError as exc:
+                  if not must_exist and exc.code == 404:
+                      return
+                  raise
+              if not must_exist:
+                  raise SystemExit("Preview tag already exists before publication")
+              if (
+                  type(tag_ref) is not dict
+                  or tag_ref.get("ref") != f"refs/tags/{tag}"
+                  or type(tag_ref.get("object")) is not dict
+                  or tag_ref["object"].get("type") != "commit"
+                  or tag_ref["object"].get("sha") != source
+              ):
+                  raise SystemExit("Preview tag does not point to the candidate source commit")
+
+          release = api_json(f"/releases/{release_id}")
+          if type(release) is not dict:
+              raise SystemExit("Release metadata is invalid")
+          if release.get("draft") is False:
+              assert_release(release, draft=False, immutable=True)
+              assert_tag_target(must_exist=True)
+              publication_mode = "already_public"
+          else:
+              assert_release(release, draft=True, immutable=False)
+              assert_tag_target(must_exist=False)
+              publication_mode = "published_now"
+
           for asset in expected_assets:
               digest = hashlib.sha256()
               size = 0
@@ -392,14 +413,17 @@ jobs:
               if size != asset["size"] or digest.hexdigest() != asset["sha256"]:
                   raise SystemExit(f"Release asset bytes changed: {asset['name']}")
 
-          published = api_json(
-              f"/releases/{release_id}",
-              method="PATCH",
-              body=b'{"draft":false}',
-          )
-          assert_release(published, draft=False, immutable=True)
+          if publication_mode == "published_now":
+              published = api_json(
+                  f"/releases/{release_id}",
+                  method="PATCH",
+                  body=b'{"draft":false}',
+              )
+              assert_release(published, draft=False, immutable=True)
+              assert_tag_target(must_exist=True)
           receipt = {
               "immutable": True,
+              "publication_mode": publication_mode,
               "release_id": release_id,
               "source_commit": source,
               "tag": tag,
@@ -455,7 +479,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
             --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
             > "$RUNNER_TEMP/public-release-rest.json"
-          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"immutable\"])' "$RUNNER_TEMP/public-release-rest.json")" = "True"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["immutable"])' "$RUNNER_TEMP/public-release-rest.json")" = "True"
           python publication-policy/scripts/ci/openevo_release_candidate.py write-preview-asset-plan \
             "$RUNNER_TEMP/public-asset-plan.tsv" \
             --metadata "$RUNNER_TEMP/public-release-rest.json" \
@@ -486,7 +510,7 @@ jobs:
           gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" \
             --jq '{id,tag_name,target_commitish,name,body,draft,prerelease,html_url,immutable,assets:[.assets[]|{id,name,size,state,digest}]}' \
             > "$RUNNER_TEMP/postpublication-release-rest.json"
-          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))[\"immutable\"])' "$RUNNER_TEMP/postpublication-release-rest.json")" = "True"
+          test "$(python -c 'import json,sys; print(json.load(open(sys.argv[1]))["immutable"])' "$RUNNER_TEMP/postpublication-release-rest.json")" = "True"
           python publication-policy/scripts/ci/openevo_release_candidate.py snapshot-preview \
             "$RUNNER_TEMP/postpublication-preview-snapshot.json" \
             --metadata "$RUNNER_TEMP/postpublication-release-rest.json" \

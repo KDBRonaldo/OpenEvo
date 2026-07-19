@@ -2857,6 +2857,12 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert workflow.count('test ! -e "$public_dir"') == 1
     assert workflow.count('method="PATCH"') == 1
     assert workflow.count("b'{\"draft\":false}'") == 1
+    assert 'publication_mode = "already_public"' in workflow
+    assert 'publication_mode = "published_now"' in workflow
+    assert "assert_tag_target(must_exist=True)" in workflow
+    assert "assert_tag_target(must_exist=False)" in workflow
+    assert 'json.load(open(sys.argv[1]))["immutable"]' in workflow
+    assert '\\\"immutable\\\"' not in workflow
     assert (
         '"repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}"'
         in workflow
@@ -2914,21 +2920,28 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     read_only_validate = workflow.index(
         "Validate the candidate-owned draft verification snapshot"
     )
-    tag_absence = workflow.index("Preview tag already exists before publication")
     publish = workflow.index("Revalidate immutable candidate data and publish by numeric ID")
-    write_draft_read = write_job.index(
-        'draft_release = api_json(f"/releases/{release_id}")'
+    write_tag_validator = write_job.index("def assert_tag_target")
+    write_release_read = write_job.index(
+        'release = api_json(f"/releases/{release_id}")'
     )
     write_asset_hash = write_job.index("with open_asset(asset[\"id\"]) as response:")
     write_patch = write_job.index('body=b\'{"draft":false}\'')
+    public_retry = write_job.index('publication_mode = "already_public"')
     postdownload = workflow.index(
         "Re-read and redownload the immutable public release"
     )
     postvalidate = workflow.index(
         "Verify public metadata, assets, body, and exact tag target"
     )
-    assert read_only_validate < tag_absence < publish < postdownload < postvalidate
-    assert write_draft_read < write_asset_hash < write_patch
+    assert read_only_validate < publish < postdownload < postvalidate
+    assert (
+        write_tag_validator
+        < write_release_read
+        < public_retry
+        < write_asset_hash
+        < write_patch
+    )
     assert "validate-published-tag" in workflow[postvalidate:]
 
 
