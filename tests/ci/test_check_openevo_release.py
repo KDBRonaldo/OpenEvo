@@ -2309,6 +2309,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "framework-lock.json",
         "--framework-lock",
         "openevo-core-service",
+        'cargo metadata --locked --format-version 1 > "$metadata"',
         "cargo fmt --check",
         "cargo clippy --locked --release --all-targets -- -D warnings",
         release_test_command,
@@ -2369,9 +2370,68 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert macos_candidate.count(
         "scripts/ci/smoke_openevo_desktop_bundle.py"
     ) == 2
-    assert macos_candidate.index("- name: Check release-mode Tauri host") < (
+    assert macos_candidate.index(
+        "- name: Validate locked release-mode Tauri dependency graph"
+    ) < (
         macos_candidate.index(release_test_command)
     ) < macos_candidate.index("- name: Build unsigned Desktop DMG")
+    expected_tauri_steps = (
+        (
+            "Validate locked release-mode Tauri dependency graph",
+            5,
+            'cargo metadata --locked --format-version 1 > "$metadata"',
+        ),
+        ("Check release-mode Tauri formatting", 5, "cargo fmt --check"),
+        (
+            "Compile release-mode Tauri host",
+            30,
+            "cargo check --locked --release --all-targets",
+        ),
+        (
+            "Lint release-mode Tauri host",
+            30,
+            "cargo clippy --locked --release --all-targets -- -D warnings",
+        ),
+        ("Test release-mode Tauri host", 45, release_test_command),
+        (
+            "Exercise packaged native sidecar launch",
+            10,
+            "tests::packaged_external_bin_native_launch_smoke",
+        ),
+    )
+    for index, (name, timeout, command) in enumerate(expected_tauri_steps):
+        start = macos_candidate.index(f"      - name: {name}\n")
+        end = (
+            macos_candidate.index("      - name:", start + 1)
+            if index + 1 < len(expected_tauri_steps)
+            else macos_candidate.index(
+                "      - name: Build unsigned Desktop DMG for the runner architecture\n",
+                start,
+            )
+        )
+        step = macos_candidate[start:end]
+        assert "working-directory: desktop/src-tauri" in step
+        assert f"timeout-minutes: {timeout}" in step
+        assert command in step
+    metadata_step = macos_candidate[
+        macos_candidate.index(
+            "      - name: Validate locked release-mode Tauri dependency graph\n"
+        ) : macos_candidate.index(
+            "      - name: Check release-mode Tauri formatting\n"
+        )
+    ]
+    assert 'metadata="$RUNNER_TEMP/openevo-cargo-metadata.json"' in metadata_step
+    assert "json.load(open(sys.argv[1], encoding=\"utf-8\"))" in metadata_step
+    assert 'payload.get("packages")' in metadata_step
+    assert 'payload.get("workspace_members")' in metadata_step
+    build_step = macos_candidate[
+        macos_candidate.index(
+            "      - name: Build unsigned Desktop DMG for the runner architecture\n"
+        ) :
+        macos_candidate.index("      - name: Require native binary inspection tools\n")
+    ]
+    assert "timeout-minutes: 30" in build_step
+    assert "npm run tauri:build -- --ci" in build_step
 
     shipped_app_smoke = macos_candidate.split(
         "      - name: Mount, launch, copy, detach, and relaunch the exact DMG app\n",

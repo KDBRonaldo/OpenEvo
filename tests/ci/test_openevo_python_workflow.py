@@ -183,9 +183,83 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
     assert "npm run build:sidecar" in text
     assert text.index("npm run build:sidecar") < text.index("cargo test --locked")
     assert "working-directory: desktop/src-tauri" in text
-    assert "cargo metadata --locked --format-version 1" in text
+    assert (
+        'cargo metadata --locked --format-version 1 > "$metadata"'
+        in text
+    )
+    assert 'metadata="$RUNNER_TEMP/openevo-cargo-metadata.json"' in text
+    assert "json.load(open(sys.argv[1], encoding=\"utf-8\"))" in text
     assert "cargo test --locked" in text
-    macos_job = text.split("  macos-native-launch-smoke:\n", maxsplit=1)[1]
+    linux_job, macos_job = text.split("  macos-native-launch-smoke:\n", maxsplit=1)
+    expected_linux_steps = (
+        (
+            "Validate locked OpenEvo Desktop Tauri dependency graph",
+            5,
+            'cargo metadata --locked --format-version 1 > "$metadata"',
+        ),
+        ("Check OpenEvo Desktop Tauri formatting", 5, "cargo fmt --check"),
+        (
+            "Compile OpenEvo Desktop Tauri host",
+            30,
+            "cargo check --locked --release --all-targets",
+        ),
+        (
+            "Lint OpenEvo Desktop Tauri host",
+            30,
+            "cargo clippy --locked --release --all-targets -- -D warnings",
+        ),
+        (
+            "Test OpenEvo Desktop Tauri host",
+            45,
+            "cargo test --locked --release",
+        ),
+        (
+            "Exercise packaged OpenEvo Desktop native sidecar launch",
+            10,
+            "tests::packaged_external_bin_native_launch_smoke",
+        ),
+        (
+            "Build and inspect release-mode OpenEvo Desktop Tauri host",
+            30,
+            "cargo build --locked --release",
+        ),
+    )
+    for index, (name, timeout, command) in enumerate(expected_linux_steps):
+        start = linux_job.index(f"      - name: {name}\n")
+        end = (
+            linux_job.index("      - name:", start + 1)
+            if index + 1 < len(expected_linux_steps)
+            else linux_job.index("      - name: Remove generated sidecar inventory\n", start)
+        )
+        step = linux_job[start:end]
+        assert "working-directory: desktop/src-tauri" in step
+        assert f"timeout-minutes: {timeout}" in step
+        assert command in step
+    assert "timeout-minutes: 90" in macos_job.split("    steps:\n", maxsplit=1)[0]
+    expected_macos_rust_steps = (
+        (
+            "Test macOS release-mode Tauri host",
+            45,
+            "cargo test --locked --release -- --test-threads=1",
+        ),
+        (
+            "Exercise macOS private executable handoff",
+            10,
+            "tests::macos_release_spawns_from_the_populated_private_path",
+        ),
+        (
+            "Exercise packaged macOS externalBin launch",
+            10,
+            "tests::packaged_external_bin_native_launch_smoke",
+        ),
+    )
+    for name, timeout, command in expected_macos_rust_steps:
+        start = macos_job.index(f"      - name: {name}\n")
+        end = macos_job.index("      - name:", start + 1)
+        step = macos_job[start:end]
+        assert "working-directory: desktop/src-tauri" in step
+        assert f"timeout-minutes: {timeout}" in step
+        assert command in step
     workspace_step, remaining_macos = macos_job.split(
         "      - name: Exercise macOS fixed SSH executable and process authority\n",
         maxsplit=1,

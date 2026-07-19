@@ -406,18 +406,49 @@ jobs:
             --registry-digest "$OPENEVO_REGISTRY_DIGEST" \
             --output-dir desktop/src-tauri/release-resources/openevo-daemon
 
-      - name: Check release-mode Tauri host
+      - name: Validate locked release-mode Tauri dependency graph
         working-directory: desktop/src-tauri
+        timeout-minutes: 5
         run: |
-          cargo metadata --locked --format-version 1
-          cargo fmt --check
-          cargo check --locked --release --all-targets
-          cargo clippy --locked --release --all-targets -- -D warnings
-          cargo test --locked --release -- --test-threads=1
-          cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+          metadata="$RUNNER_TEMP/openevo-cargo-metadata.json"
+          cargo metadata --locked --format-version 1 > "$metadata"
+          python - "$metadata" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not payload.get("packages") or not payload.get("workspace_members"):
+              raise SystemExit("cargo metadata omitted packages or workspace members")
+          PY
+
+      - name: Check release-mode Tauri formatting
+        working-directory: desktop/src-tauri
+        timeout-minutes: 5
+        run: cargo fmt --check
+
+      - name: Compile release-mode Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 30
+        run: cargo check --locked --release --all-targets
+
+      - name: Lint release-mode Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 30
+        run: cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Test release-mode Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 45
+        run: cargo test --locked --release -- --test-threads=1
+
+      - name: Exercise packaged native sidecar launch
+        working-directory: desktop/src-tauri
+        timeout-minutes: 10
+        run: cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
 
       - name: Build unsigned Desktop DMG for the runner architecture
         working-directory: desktop
+        timeout-minutes: 30
         run: npm run tauri:build -- --ci --config src-tauri/tauri.release.conf.json
 
       - name: Require native binary inspection tools

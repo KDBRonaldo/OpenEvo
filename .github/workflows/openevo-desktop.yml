@@ -107,18 +107,56 @@ jobs:
             tests/openevo/remote/test_system_executables.py::test_packaged_sidecar_dispatches_owned_subprocess_birth_to_held_executable \
             -q
 
-      - name: Check OpenEvo Desktop Tauri host
+      - name: Validate locked OpenEvo Desktop Tauri dependency graph
         working-directory: desktop/src-tauri
+        timeout-minutes: 5
         run: |
-          cargo metadata --locked --format-version 1
-          cargo fmt --check
+          metadata="$RUNNER_TEMP/openevo-cargo-metadata.json"
+          cargo metadata --locked --format-version 1 > "$metadata"
+          python - "$metadata" <<'PY'
+          import json
+          import sys
+
+          payload = json.load(open(sys.argv[1], encoding="utf-8"))
+          if not payload.get("packages") or not payload.get("workspace_members"):
+              raise SystemExit("cargo metadata omitted packages or workspace members")
+          PY
+
+      - name: Check OpenEvo Desktop Tauri formatting
+        working-directory: desktop/src-tauri
+        timeout-minutes: 5
+        run: cargo fmt --check
+
+      - name: Compile OpenEvo Desktop Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 30
+        run: |
           cargo check --locked --all-targets
           cargo check --locked --release --all-targets
+
+      - name: Lint OpenEvo Desktop Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 30
+        run: |
           cargo clippy --locked --all-targets -- -D warnings
           cargo clippy --locked --release --all-targets -- -D warnings
+
+      - name: Test OpenEvo Desktop Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 45
+        run: |
           cargo test --locked
           cargo test --locked --release
-          cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+
+      - name: Exercise packaged OpenEvo Desktop native sidecar launch
+        working-directory: desktop/src-tauri
+        timeout-minutes: 10
+        run: cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+
+      - name: Build and inspect release-mode OpenEvo Desktop Tauri host
+        working-directory: desktop/src-tauri
+        timeout-minutes: 30
+        run: |
           cargo build --locked --release
           if strings target/release/openevo-desktop | grep -Fq 'desktop.server.launcher'; then
             echo 'release binary contains the debug source launcher fallback' >&2
@@ -140,6 +178,7 @@ jobs:
   macos-native-launch-smoke:
     name: macOS FD-bound packaged sidecar launch smoke
     runs-on: macos-14
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -218,12 +257,20 @@ jobs:
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
-      - name: Exercise macOS private executable and FD handoff lifecycle
+      - name: Test macOS release-mode Tauri host
         working-directory: desktop/src-tauri
-        run: |
-          cargo test --locked --release -- --test-threads=1
-          cargo test --locked tests::macos_release_spawns_from_the_populated_private_path -- --exact
-          cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
+        timeout-minutes: 45
+        run: cargo test --locked --release -- --test-threads=1
+
+      - name: Exercise macOS private executable handoff
+        working-directory: desktop/src-tauri
+        timeout-minutes: 10
+        run: cargo test --locked tests::macos_release_spawns_from_the_populated_private_path -- --exact
+
+      - name: Exercise packaged macOS externalBin launch
+        working-directory: desktop/src-tauri
+        timeout-minutes: 10
+        run: cargo test --locked tests::packaged_external_bin_native_launch_smoke -- --ignored --exact
 
       - name: Exercise packaged fixed-executable birth dispatch
         run: |
