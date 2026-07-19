@@ -236,7 +236,12 @@ def test_candidate_workflow_pins_runtimes_and_hash_bound_wheel_smokes() -> None:
     assert workflow.count("runs-on: ubuntu-24.04") == 3
     assert "runs-on: ubuntu-latest" not in workflow
     assert workflow.count('node-version: "22.23.1"') == 2
-    assert workflow.count('python-version: "3.11.15"') == 4
+    assert workflow.count('python-version: "3.11.15"') == 3
+    assert workflow.count('python-version: "3.11.9"') == 1
+    macos_job = workflow.split("  macos-candidate:\n", maxsplit=1)[1].split(
+        "  linux-core-candidate:\n", maxsplit=1
+    )[0]
+    assert 'python-version: "3.11.9"' in macos_job
     assert 'node-version: "22"' not in workflow
     assert 'python-version: "3.11"' not in workflow
     assert "--no-hashes" not in workflow
