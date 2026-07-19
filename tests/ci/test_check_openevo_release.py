@@ -2897,6 +2897,18 @@ def test_candidate_public_playwright_evidence_excludes_preview_simulator() -> No
         assert forbidden not in tool
 
 
+def test_desktop_visual_gates_use_one_bounded_cross_runner_tolerance() -> None:
+    preview = Path("desktop/playwright.config.ts").read_text(encoding="utf-8")
+    packaged = Path("desktop/playwright.release-readonly.config.ts").read_text(
+        encoding="utf-8"
+    )
+
+    for config in (preview, packaged):
+        assert config.count("maxDiffPixelRatio: 0.035") == 1
+        assert config.count('animations: "disabled"') == 1
+        assert "maxDiffPixelRatio: 0.04" not in config
+
+
 def test_python_runtime_dependencies_pin_security_fixed_minimums() -> None:
     with Path("pyproject.toml").open("rb") as stream:
         dependencies = tomllib.load(stream)["project"]["dependencies"]

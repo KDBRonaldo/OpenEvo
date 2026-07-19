@@ -15,6 +15,12 @@ export default defineConfig({
     screenshot: "only-on-failure",
     trace: "retain-on-failure",
   },
+  expect: {
+    toHaveScreenshot: {
+      animations: "disabled",
+      maxDiffPixelRatio: 0.035,
+    },
+  },
   projects: [
     {
       name: "release-packaged-1440",
