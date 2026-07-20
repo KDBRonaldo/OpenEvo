@@ -3131,6 +3131,86 @@ def test_restart_once_started_receipt_replay_never_executes_again(
         replay.close()
 
 
+def test_restart_once_completion_publication_failure_resyncs_completed_receipt(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        _ensure_subscription(supervisor)
+        expected = supervisor.get("gateway")
+        original = supervisor._root.atomic_write
+        injected = False
+
+        def publish_then_fail(name: str, payload: bytes) -> None:
+            nonlocal injected
+            original(name, payload)
+            ledger = json.loads(payload)
+            attempts = ledger.get("restart_attempts", [])
+            if not injected and any(
+                item.get("operation_id") == "durable-published-completion"
+                and item.get("state") == "completed"
+                for item in attempts
+            ):
+                injected = True
+                raise OSError("post-publication fsync observation failure")
+
+        monkeypatch.setattr(supervisor._root, "atomic_write", publish_then_fail)
+        result = supervisor.restart_once(
+            "gateway",
+            operation_id="durable-published-completion",
+            expected_service_etag=expected.etag,
+        )
+        assert result.id == "gateway"
+        assert len(backend.spawned) >= 2
+        receipt = supervisor.list_restart_attempts()
+        assert len(receipt) == 1
+        assert receipt[0].state is ServiceRestartAttemptState.COMPLETED
+    finally:
+        supervisor.close()
+
+
+def test_restart_once_ack_publication_failure_resyncs_deleted_receipt(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        _ensure_subscription(supervisor)
+        expected = supervisor.get("gateway")
+        supervisor.restart_once(
+            "gateway",
+            operation_id="durable-published-ack",
+            expected_service_etag=expected.etag,
+        )
+        original = supervisor._root.atomic_write
+        injected = False
+
+        def publish_then_fail(name: str, payload: bytes) -> None:
+            nonlocal injected
+            original(name, payload)
+            ledger = json.loads(payload)
+            attempts = ledger.get("restart_attempts", [])
+            if not injected and not any(
+                item.get("operation_id") == "durable-published-ack"
+                for item in attempts
+            ):
+                injected = True
+                raise OSError("post-publication fsync observation failure")
+
+        monkeypatch.setattr(supervisor._root, "atomic_write", publish_then_fail)
+        supervisor.acknowledge_restart_attempt(
+            "durable-published-ack",
+            service_id="gateway",
+            expected_service_etag=expected.etag,
+        )
+        assert supervisor.list_restart_attempts() == ()
+    finally:
+        supervisor.close()
+
+
 def test_restart_once_receipt_capacity_is_released_only_by_ack(
     tmp_path: Path,
     framework_lock: Path,

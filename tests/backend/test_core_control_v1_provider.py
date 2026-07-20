@@ -6119,6 +6119,37 @@ def test_service_restart_started_receipt_recovers_unknown_without_retry(
     finally:
         store.close()
 
+    second = _RecordingServiceSupervisor(
+        restart_attempts=(
+            _restart_attempt(
+                operation.id,
+                expected_etag,
+                state=ServiceRestartAttemptState.STARTED,
+            ),
+        )
+    )
+    with TestClient(
+        _app(
+            tmp_path,
+            service_supervisor=second,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    ):
+        assert second.restart_calls == []
+        assert second.acknowledge_calls == [
+            (operation.id, "evolution-backend", expected_etag)
+        ]
+
+    store = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        recovered_again = store.get_maintenance_operation(operation.id)
+        assert recovered_again.status is m.OperationStatus.FAILED
+        assert recovered_again.error is not None
+        assert recovered_again.error.code == "service_restart_outcome_unknown"
+    finally:
+        store.close()
+
 
 def test_service_restart_completed_receipt_completes_atomically_and_acks(
     tmp_path: Path,

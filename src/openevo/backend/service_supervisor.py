@@ -2780,10 +2780,18 @@ class CoreServiceSupervisor:
             attempt.service = frozen
             try:
                 self._persist()
-            except BaseException:
-                attempt.state = ServiceRestartAttemptState.STARTED
-                attempt.service = None
-                raise
+            except BaseException as original_error:
+                self._resync_ledger_after_persist_failure()
+                persisted = self._restart_attempt_or_none(operation_id)
+                if (
+                    persisted is not None
+                    and persisted.service_id == service_id
+                    and persisted.expected_service_etag == expected_service_etag
+                    and persisted.state is ServiceRestartAttemptState.COMPLETED
+                    and persisted.service is not None
+                ):
+                    return self._restart_service_summary(persisted.service)
+                raise original_error.with_traceback(original_error.__traceback__)
             return result
 
     def list_restart_attempts(self) -> tuple[ServiceRestartAttempt, ...]:
@@ -2814,9 +2822,17 @@ class CoreServiceSupervisor:
             del self._ledger.restart_attempts[index]
             try:
                 self._persist()
-            except BaseException:
-                self._ledger.restart_attempts.insert(index, attempt)
-                raise
+            except BaseException as original_error:
+                self._resync_ledger_after_persist_failure()
+                persisted = self._restart_attempt_or_none(operation_id)
+                if persisted is None:
+                    return
+                self._require_matching_restart_attempt(
+                    persisted,
+                    service_id=service_id,
+                    expected_service_etag=expected_service_etag,
+                )
+                raise original_error.with_traceback(original_error.__traceback__)
 
     def logs(
         self,
@@ -3875,6 +3891,34 @@ class CoreServiceSupervisor:
         if len(payload) > _MAX_LEDGER_BYTES:
             raise SupervisorStateError("service ledger exceeds its byte limit")
         self._root.atomic_write("ledger.json", payload)
+
+    def _resync_ledger_after_persist_failure(self) -> None:
+        """Adopt only a fully validated ledger after an ambiguous atomic write."""
+        payload = self._root.read("ledger.json", max_bytes=_MAX_LEDGER_BYTES)
+        if payload is None:
+            raise SupervisorStateError(
+                "service ledger disappeared after an ambiguous state publication"
+            )
+        try:
+            raw = json.loads(payload.decode("utf-8"))
+            if _canonical_bytes(raw) != payload:
+                raise ValueError("ledger is not canonical JSON")
+            ledger = _Ledger.model_validate(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as exc:
+            raise SupervisorStateError(
+                "service ledger cannot be trusted after an ambiguous state publication"
+            ) from exc
+        self._validate_loaded_ledger(ledger)
+        expected_release = _LedgerRelease(
+            install_digest=self._release_identity.install_digest,
+            registry_digest=self._release_identity.registry_digest,
+            framework_lock_digest=self._framework_lock_digest,
+        )
+        if ledger.release != expected_release:
+            raise SupervisorStateError(
+                "service ledger release identity changed after an ambiguous state publication"
+            )
+        self._ledger = ledger
 
     @staticmethod
     def _ledger_restart_service(

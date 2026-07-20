@@ -402,21 +402,27 @@ class CoreMaintenanceOwnerV1:
                 service_id=request.service_id,
                 expected_service_etag=expected_etag,
             )
-            if operation.status is not m.OperationStatus.SUCCEEDED:
+            if operation.status is m.OperationStatus.FAILED:
+                if attempt.state is not ServiceRestartAttemptState.STARTED:
+                    raise CoreServiceControlError(
+                        "failed service restart operation has a completed receipt"
+                    )
+            elif operation.status is m.OperationStatus.SUCCEEDED:
+                if (
+                    attempt.state is not ServiceRestartAttemptState.COMPLETED
+                    or attempt.service is None
+                    or not isinstance(
+                        operation.result,
+                        m.ServiceRestartOperationResultV1,
+                    )
+                    or operation.result.service != attempt.service.to_contract()
+                ):
+                    raise CoreServiceControlError(
+                        "service restart receipt conflicts with its terminal operation"
+                    )
+            else:
                 raise CoreServiceControlError(
-                    "service restart receipt has no matching successful operation"
-                )
-            if (
-                attempt.state is not ServiceRestartAttemptState.COMPLETED
-                or attempt.service is None
-                or not isinstance(
-                    operation.result,
-                    m.ServiceRestartOperationResultV1,
-                )
-                or operation.result.service != attempt.service.to_contract()
-            ):
-                raise CoreServiceControlError(
-                    "service restart receipt conflicts with its terminal operation"
+                    "service restart receipt has no matching terminal operation"
                 )
             service_control.acknowledge_restart_attempt(
                 operation_id,
