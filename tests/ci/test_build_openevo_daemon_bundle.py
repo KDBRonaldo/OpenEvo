@@ -585,7 +585,7 @@ def test_service_failure_is_rendered_as_closed_json(
 
 
 def test_daemon_bundle_declares_process_group_lifecycle_compatibility() -> None:
-    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 4
+    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 5
 
 
 def test_bundle_smoke_uses_bounded_parent_extraction_lifecycle(
