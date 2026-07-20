@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from openevo.codex_models import validate_codex_model_ref
 from openevo.evolution.framework import ProjectEvolutionTargetMap
 from openevo.projects.science.models import ScienceTaskConfig
 
@@ -67,7 +68,31 @@ class EvolutionProjectValidationRequest(BaseModel):
     execution_mode: ExecutionMode
     expected_registry_digest: str = Field(pattern=r"[0-9a-f]{64}")
     agent_model: str = Field(min_length=1, max_length=4096)
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     targets: ProjectEvolutionTargetMap
+
+    @field_validator("agent_model")
+    @classmethod
+    def _validate_subscription_codex_model(cls, value: str, info) -> str:
+        execution_mode = info.data.get("execution_mode")
+        if execution_mode == "codex_subscription_transcript":
+            return validate_codex_model_ref(
+                value,
+                field_name="agent_model",
+                max_length=4096,
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _scope_reasoning_effort(self) -> EvolutionProjectValidationRequest:
+        if (
+            self.execution_mode != "codex_subscription_transcript"
+            and self.reasoning_effort is not None
+        ):
+            raise ValueError(
+                "reasoning_effort is only valid for Codex subscription execution"
+            )
+        return self
 
 
 class EvolutionProjectValidationResponse(BaseModel):

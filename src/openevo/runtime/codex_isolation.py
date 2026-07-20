@@ -14,6 +14,7 @@ from openevo.runtime.managed import (
     MANAGED_CODEX_DEFAULT_MODEL,
     MANAGED_CODEX_HOME,
     MANAGED_CODEX_PACKAGE_ROOT,
+    MANAGED_CODEX_READINESS_WORKSPACE,
     MANAGED_CODEX_VERSION,
     MANAGED_HOME,
     MANAGED_PATH,
@@ -29,6 +30,7 @@ CODEX_SUBSCRIPTION_CONTRACT_KEY: Final[str] = "credential_isolation"
 CODEX_SUBSCRIPTION_READINESS_KEY: Final[str] = "credential_isolation_receipt"
 CODEX_SUBSCRIPTION_CANARY_OK: Final[str] = "openevo-codex-subscription-real-exec-ready-v1"
 CODEX_SUBSCRIPTION_REFRESH_PERSISTENCE: Final[str] = "unsupported_read_only_auth_overlay"
+CODEX_SUBSCRIPTION_CANARY_CWD: Final[str] = MANAGED_CODEX_READINESS_WORKSPACE
 _CANARY_RESULT: Final[str] = "isolated"
 _CANARY_NONCE_BYTES: Final[int] = 16
 _EVOLUTION_ROOT: Final[str] = "/openevo/session/evolution"
@@ -124,6 +126,11 @@ _POLICY_SPEC: Final[dict[str, object]] = {
     "credential_tool_filesystem_access": "deny",
     "credential_refresh_persistence": CODEX_SUBSCRIPTION_REFRESH_PERSISTENCE,
     "readiness_command": "codex exec",
+    "readiness_context": {
+        "working_directory": CODEX_SUBSCRIPTION_CANARY_CWD,
+        "project_instructions": "absent",
+        "evolution_skills": "not_installed",
+    },
     "readiness_evidence": "completed_command_execution_event",
     "readiness_canaries": [
         "exact_codex_version",
@@ -463,6 +470,31 @@ def codex_subscription_exec_canary_command(
         f"test -d {shlex.quote(MANAGED_CODEX_PACKAGE_ROOT)}",
         f"test -r {shlex.quote(auth_file)}",
         f"/bin/cat {shlex.quote(auth_file)} >/dev/null",
+        f"test -d {shlex.quote(CODEX_SUBSCRIPTION_CANARY_CWD)}",
+        f"test ! -L {shlex.quote(CODEX_SUBSCRIPTION_CANARY_CWD)}",
+        (
+            f'test "$(stat -c %u {shlex.quote(CODEX_SUBSCRIPTION_CANARY_CWD)})" = '
+            '"$(id -u)"'
+        ),
+        f'test "$(stat -c %a {shlex.quote(CODEX_SUBSCRIPTION_CANARY_CWD)})" = 700',
+        (
+            'test -z "$(find '
+            f"{shlex.quote(CODEX_SUBSCRIPTION_CANARY_CWD)} "
+            '-mindepth 1 -maxdepth 1 -print -quit)"'
+        ),
+        *(
+            f"test ! -e {shlex.quote(directory + '/' + filename)}"
+            for directory in (
+                CODEX_SUBSCRIPTION_CANARY_CWD,
+                MANAGED_HOME,
+                "/openevo/session",
+                "/openevo",
+                "",
+                MANAGED_CODEX_HOME,
+            )
+            for filename in ("AGENTS.override.md", "AGENTS.md")
+        ),
+        f"test ! -e {shlex.quote(MANAGED_HOME + '/.agents/skills')}",
         f"rm -f -- {cleanup_paths}",
         "canary_passed=0",
     ]
@@ -858,6 +890,7 @@ def _require_cli_value(value: str, *, owner: str) -> str:
 
 __all__ = [
     "CODEX_SUBSCRIPTION_CANARY_OK",
+    "CODEX_SUBSCRIPTION_CANARY_CWD",
     "CODEX_SUBSCRIPTION_CODEX_VERSION",
     "CODEX_SUBSCRIPTION_CONTRACT_KEY",
     "CODEX_SUBSCRIPTION_PERMISSION_PROFILE",

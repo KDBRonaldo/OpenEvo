@@ -182,7 +182,7 @@ release-composition payload after the vLLM/model-preparer implementation ships.
 
 The Desktop release Core client accepts only `provider_kind=openevo_core`,
 `build_channel=release`, and the frozen Core Control API v1 OpenAPI digest
-`006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed`.
+`2c68afc2b6490bf83a20b294b88398ac53fad4a7c449a66b687a13d71a87ef50`.
 It pins the complete first accepted version response. Every bearer-authenticated
 `/v1` request requires that pin and fails before transport without it.
 
@@ -270,8 +270,8 @@ same OS user: such a process can race pathname checks or modify owner-readable
 state. Desktop relies on the macOS user-account boundary and the owner-only
 state directory for that threat boundary.
 
-Schema v6 has an exact canonical `sqlite_schema` fingerprint and retains exact
-v1-v5 historical fingerprints. Each historical layout and migration ledger is
+Schema v7 has an exact canonical `sqlite_schema` fingerprint and retains exact
+v1-v6 historical fingerprints. Each historical layout and migration ledger is
 validated before the next transactional migration; DDL, ledger, project-copy,
 authority publication, and `user_version` changes share one crash transaction.
 Forged ledgers, near-match schemas, unknown views/triggers/indexes, and partial
@@ -288,9 +288,14 @@ contains exact idempotency/cursor row counts, a generation, and four modular
 remote-content accumulators. Canonical row triggers update it transactionally
 and require exactly one affected authority row; its seal is a domain-separated
 HMAC under the owner-only signing key. The migration ledger becomes immutable
-after v6 publication. The v5 to v6 migration uses bounded length-guarded reads
+after v7 publication. The v5 to v6 migration uses bounded length-guarded reads
 to add `evolution_configuration_state="configured"` to every existing project
-and stored `ProjectV1` replay without inspecting its target map. The authority
+and stored `ProjectV1` replay without inspecting its target map. The v6 to v7
+migration uses the same bounded read discipline to replace only the historical
+subscription value `codex_model="gpt-5"` with the supported product default
+`gpt-5.5`, then validates and canonically serializes the complete project and
+stored replay. Provider-qualified or otherwise invalid model values are not
+guessed or rewritten; they fail closed under the current contract. The authority
 singleton rejects every later insert and delete, so `DELETE`
 followed by insert and `INSERT OR REPLACE` are rejected even when SQLite
 recursive triggers are off. Rollback restores data and authority together.
@@ -319,7 +324,7 @@ If either configured limit is lower, open raises
 state. Repeated incompatible opens therefore cannot enter a rollback-only cleanup
 loop. Reopening with each limit at least equal to persisted usage is the recovery
 path; later successful writes can commit bounded cleanup. Startup and
-v4 -> v5 -> v6
+v4 -> v5 -> v6 -> v7
 migration may perform one bounded reconciliation of actual table totals, remote
 lengths/tokens, exact idempotency/cursor counts, and live reservations before any
 remote payload is decoded. After creating the singleton and migration row,
@@ -535,10 +540,11 @@ information; unauthenticated HTTP(S) proxy URLs and `no_proxy` remain supported.
 Profile creation defaults an omitted port to `22`, authentication kind to
 `ssh_agent`, and proxy configuration to an empty proxy. Execution settings
 default omitted capture fields to `capture_mode="transcript"` and
-`token_level_metrics_available=false`. Subscription execution carries only
-`codex_model`; self-deployed execution remains a valid persisted v1 shape and
-carries only the bounded, trimmed user-provided Hugging Face `hf_model`. The
-current release capability marks that shape unavailable. The sidecar maps
+`token_level_metrics_available=false`. Subscription execution carries a valid
+`codex_model`, no `hf_model`, and may carry the optional Codex
+`reasoning_effort`; self-deployed execution remains a valid persisted v1 shape
+and carries only the bounded, trimmed user-provided Hugging Face `hf_model`.
+The current release capability marks that shape unavailable. The sidecar maps
 `hf_model` to Core's
 stable `agent_model_ref` boundary. `proxy.no_proxy` follows the common ordered
 collection rule: React sends a JSON array, the request boundary validates each

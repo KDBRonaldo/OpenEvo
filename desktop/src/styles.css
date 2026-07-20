@@ -1454,6 +1454,18 @@ pre.json {
   font-size: 12px;
 }
 
+.artifact-load-error {
+  display: grid;
+  justify-items: start;
+  gap: 10px;
+  padding: 12px;
+}
+
+.artifact-load-error .inline-notice {
+  width: 100%;
+  margin: 0;
+}
+
 .artifact-document {
   min-height: 310px;
   margin: 0;

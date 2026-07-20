@@ -38,6 +38,7 @@ from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
+from openevo.codex_models import validate_codex_model_ref
 from openevo.backend.service_control import (
     CoreServiceControlError,
     ServiceRestartAttempt,
@@ -342,9 +343,10 @@ class ManagedScienceRuntimeRequest:
     def __post_init__(self) -> None:
         if self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values()):
             raise ValueError("subscription runtime_image is not a managed Science image")
-        model = self.codex_model.strip()
-        if not model or len(model) > 256 or any(ord(char) < 0x20 for char in model):
-            raise ValueError("subscription codex_model is invalid")
+        model = validate_codex_model_ref(
+            self.codex_model,
+            field_name="subscription codex_model",
+        )
         object.__setattr__(self, "codex_model", model)
 
 

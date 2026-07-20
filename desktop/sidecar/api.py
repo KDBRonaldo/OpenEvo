@@ -610,6 +610,7 @@ def create_sidecar_app(
             "execution_mode": project.execution.mode,
             "expected_registry_digest": capabilities.registry_digest,
             "agent_model": agent_model,
+            "reasoning_effort": project.execution.reasoning_effort,
             "targets": project.evolution.model_dump(mode="json")["targets"],
         }
         with backend_client_context(required_session) as backend_client:

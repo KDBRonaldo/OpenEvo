@@ -80,6 +80,8 @@ def compile_science_execution(
         "auth_mode": "subscription" if subscription else "proxy",
         "capture_mode": capture_mode.value,
     }
+    if subscription and project.spec.reasoning_effort is not None:
+        agent_settings["reasoning_effort"] = project.spec.reasoning_effort
     if credential_isolation is not None:
         agent_settings[CODEX_SUBSCRIPTION_CONTRACT_KEY] = credential_isolation
     agent = {

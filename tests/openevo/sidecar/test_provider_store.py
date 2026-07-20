@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 import errno
+from hashlib import sha256
 import hmac
 import json
 import os
@@ -82,7 +83,7 @@ def _project(profile_id: str, *, name: str = "Protein design") -> dict[str, obje
         "source": {"kind": "scratch", "display_name": "New project"},
         "execution": {
             "mode": "codex_subscription_transcript",
-            "codex_model": "gpt-5",
+            "codex_model": "gpt-5.3-codex-spark",
         },
         "evolution": {
             "targets": {
@@ -296,7 +297,7 @@ def _remote_project_state(
         ),
         registry_digest="b" * 64 if ready else None,
         model_preparation=core_v1.ModelPreparationV1(
-            model_ref="gpt-5-codex",
+            model_ref="gpt-5.3-codex-spark",
             status=(
                 core_v1.ModelPreparationStatus.READY
                 if ready
@@ -415,6 +416,98 @@ def _initialize_empty_v4_provider_store(root: Path) -> tuple[int, int]:
     return usage
 
 
+def _downgrade_provider_store_to_v6(root: Path) -> None:
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        for table, _columns in provider_store_module._RECOVERY_USAGE_SPECIFICATIONS:
+            for operation in ("insert", "update", "delete"):
+                connection.execute(f"DROP TRIGGER provider_usage_{table}_{operation}")
+        for trigger_name in (
+            "provider_storage_usage_no_insert",
+            "provider_storage_usage_no_delete",
+            "schema_migrations_no_insert",
+            "schema_migrations_no_update",
+            "schema_migrations_no_delete",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v7")
+        connection.execute(provider_store_module._SCHEMA_V6[0])
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, applied_at)
+            SELECT version, applied_at FROM schema_migrations_v7
+            WHERE version <= 6 ORDER BY version
+            """
+        )
+        connection.execute("DROP TABLE schema_migrations_v7")
+        total_rows, total_bytes = DesktopProviderStore._recovery_usage(connection)
+        connection.execute(
+            """
+            UPDATE provider_storage_usage
+            SET total_rows = ?, total_bytes = ?, authority_tag = X''
+            WHERE singleton = 1
+            """,
+            (total_rows, total_bytes),
+        )
+        for statement in (
+            *provider_store_module._PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5,
+            provider_store_module._PROVIDER_USAGE_INSERT_GUARD_V6,
+            provider_store_module._PROVIDER_USAGE_DELETE_GUARD_V5,
+            provider_store_module._SCHEMA_MIGRATION_INSERT_GUARD_V6,
+            provider_store_module._SCHEMA_MIGRATION_UPDATE_GUARD_V5,
+            provider_store_module._SCHEMA_MIGRATION_DELETE_GUARD_V5,
+        ):
+            connection.execute(statement)
+        connection.execute("PRAGMA user_version = 6")
+        _reseal_provider_usage(connection, root)
+
+
+def _replace_v6_project_model(
+    connection: sqlite3.Connection,
+    root: Path,
+    *,
+    project_id: str,
+    idempotency_key: str,
+    model: str,
+    update_replay: bool = True,
+) -> None:
+    document = json.loads(
+        bytes(
+            connection.execute(
+                "SELECT document_json FROM projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()[0]
+        )
+    )
+    document["execution"]["codex_model"] = model
+    updated = connection.execute(
+        "UPDATE projects SET document_json = ? WHERE project_id = ?",
+        (provider_store_module._canonical_json_bytes(document), project_id),
+    )
+    assert updated.rowcount == 1
+    if update_replay:
+        replay = json.loads(
+            bytes(
+                connection.execute(
+                    """
+                    SELECT response_bytes FROM idempotency_records
+                    WHERE response_type = 'ProjectV1' AND idempotency_key = ?
+                    """,
+                    (idempotency_key,),
+                ).fetchone()[0]
+            )
+        )
+        replay["execution"]["codex_model"] = model
+        updated = connection.execute(
+            """
+            UPDATE idempotency_records SET response_bytes = ?
+            WHERE response_type = 'ProjectV1' AND idempotency_key = ?
+            """,
+            (provider_store_module._canonical_json_bytes(replay), idempotency_key),
+        )
+        assert updated.rowcount == 1
+    _reseal_provider_usage(connection, root)
+
+
 def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     root = tmp_path / "state"
     store = DesktopProviderStore(root)
@@ -429,7 +522,7 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
     }
     assert all(path.stat().st_mode & 0o777 == 0o600 for path in managed_files)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (7,)
     assert tuple(store._connection.execute("PRAGMA journal_mode").fetchone()) == ("delete",)
     assert tuple(store._connection.execute("PRAGMA max_page_count").fetchone()) == (
         store._max_page_count,
@@ -442,13 +535,13 @@ def test_initializes_versioned_private_sqlite_store(tmp_path: Path) -> None:
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
     assert tuple(
         store._connection.execute(
             "SELECT total_rows, remote_payload_count, remote_payload_bytes, "
             "length(authority_tag) FROM provider_storage_usage"
         ).fetchone()
-    ) == (9, 0, 0, 32)
+    ) == (10, 0, 0, 32)
     assert not (root / "provider.sqlite3-wal").exists()
     assert not (root / "provider.sqlite3-shm").exists()
 
@@ -806,7 +899,7 @@ def test_rejects_unknown_schema_version(tmp_path: Path) -> None:
         DesktopProviderStore(root)
 
 
-def test_migrates_a_canonical_v1_store_to_v6(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v1_store_to_v7(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -826,18 +919,18 @@ def test_migrates_a_canonical_v1_store_to_v6(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (7,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
     profile = _create_profile(store, key="post-migration-create")
     assert store.get_profile(profile.profile_id) == profile
 
 
-def test_migrates_a_canonical_v2_store_to_v6(tmp_path: Path) -> None:
+def test_migrates_a_canonical_v2_store_to_v7(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)
     os.chmod(root, 0o700)
@@ -893,13 +986,13 @@ def test_migrates_a_canonical_v2_store_to_v6(tmp_path: Path) -> None:
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (7,)
     assert [
         tuple(row)
         for row in store._connection.execute(
             "SELECT version FROM schema_migrations ORDER BY version"
         ).fetchall()
-    ] == [(1,), (2,), (3,), (4,), (5,), (6,)]
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
     assert [row[1] for row in store._connection.execute("PRAGMA table_info(projects)")] == [
         "project_id",
         "profile_id",
@@ -940,6 +1033,232 @@ def test_migrates_a_canonical_v2_store_to_v6(tmp_path: Path) -> None:
             "UPDATE projects SET remote_state_json = zeroblob(?) WHERE project_id = ?",
             (provider_store_module.MAX_REMOTE_PROJECT_STATE_BYTES + 1, "project-v2"),
         )
+
+
+def test_v6_to_v7_migrates_exact_legacy_codex_model_and_project_replay(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store, key="v7-profile-create-0001")
+    legacy_request = _project(profile.profile_id, name="Legacy Codex model")
+    legacy_request["execution"] = {
+        "mode": "codex_subscription_transcript",
+        "codex_model": "gpt-5.5",
+    }
+    legacy_key = "v7-legacy-project-create-0001"
+    legacy = store.create_project(legacy_request, idempotency_key=legacy_key)
+    current_request = _project(profile.profile_id, name="Current Codex model")
+    current_key = "v7-current-project-create-0001"
+    current = store.create_project(current_request, idempotency_key=current_key)
+    store.close()
+    _downgrade_provider_store_to_v6(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        _replace_v6_project_model(
+            connection,
+            root,
+            project_id=legacy.project_id,
+            idempotency_key=legacy_key,
+            model="gpt-5",
+        )
+
+    migrated = DesktopProviderStore(root)
+    assert tuple(migrated._connection.execute("PRAGMA user_version").fetchone()) == (7,)
+    assert [
+        tuple(row)
+        for row in migrated._connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall()
+    ] == [(1,), (2,), (3,), (4,), (5,), (6,), (7,)]
+    migrated_legacy = migrated.get_project(legacy.project_id)
+    assert migrated_legacy.execution.model_dump(mode="json")["codex_model"] == "gpt-5.5"
+    assert migrated.create_project(legacy_request, idempotency_key=legacy_key) == migrated_legacy
+    assert (
+        migrated.get_project(current.project_id).execution.model_dump(mode="json")["codex_model"]
+        == "gpt-5.3-codex-spark"
+    )
+    assert migrated.create_project(current_request, idempotency_key=current_key) == (
+        migrated.get_project(current.project_id)
+    )
+
+
+def test_v6_to_v7_rejects_provider_qualified_legacy_placeholder(tmp_path: Path) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store, key="v7-invalid-profile-create-0001")
+    request = _project(profile.profile_id, name="Invalid provider-qualified model")
+    request["execution"] = {
+        "mode": "codex_subscription_transcript",
+        "codex_model": "gpt-5.5",
+    }
+    idempotency_key = "v7-invalid-project-create-0001"
+    project = store.create_project(request, idempotency_key=idempotency_key)
+    store.close()
+    _downgrade_provider_store_to_v6(root)
+    historical_request = ProjectCreateV1.model_validate(request).model_dump(mode="json")
+    historical_request["execution"]["codex_model"] = "openai/gpt-5"
+    historical_request["execution"].pop("reasoning_effort", None)
+    historical_request.pop("evolution_configuration_state")
+    historical_request_digest = sha256(
+        provider_store_module._canonical_json_bytes(historical_request)
+    ).hexdigest()
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        _replace_v6_project_model(
+            connection,
+            root,
+            project_id=project.project_id,
+            idempotency_key=idempotency_key,
+            model="openai/gpt-5",
+        )
+        connection.execute(
+            """
+            UPDATE idempotency_records SET request_digest = ?
+            WHERE response_type = 'ProjectV1' AND idempotency_key = ?
+            """,
+            (historical_request_digest, idempotency_key),
+        )
+        _reseal_provider_usage(connection, root)
+
+    with pytest.raises(
+        ProviderDataCorruptionError,
+        match="stored data violates ProjectCreateV1",
+    ):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        stored = json.loads(
+            connection.execute(
+                "SELECT document_json FROM projects WHERE project_id = ?",
+                (project.project_id,),
+            ).fetchone()[0]
+        )
+        assert stored["execution"]["codex_model"] == "openai/gpt-5"
+
+
+def test_v6_to_v7_rejects_low_capacity_before_migration_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store, key="v7-capacity-profile-create-0001")
+    store.create_project(
+        _project(profile.profile_id),
+        idempotency_key="v7-capacity-project-create-0001",
+    )
+    store.close()
+    _downgrade_provider_store_to_v6(root)
+
+    def unexpected_migration(_document: dict[str, object]) -> bool:
+        raise AssertionError("capacity failure reached project migration traversal")
+
+    monkeypatch.setattr(
+        provider_store_module,
+        "_rewrite_historical_codex_placeholder",
+        unexpected_migration,
+    )
+    with pytest.raises(
+        provider_store_module.ProviderCapacityConfigurationError,
+        match="idempotency record capacity is lower than persisted usage",
+    ):
+        DesktopProviderStore(root, max_idempotency_records=1)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+
+
+def test_v6_to_v7_rejects_oversize_project_before_json_decode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store, key="v7-bound-profile-create-0001")
+    project = store.create_project(
+        _project(profile.profile_id),
+        idempotency_key="v7-bound-project-create-0001",
+    )
+    store.close()
+    _downgrade_provider_store_to_v6(root)
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        document_bytes = connection.execute(
+            "SELECT length(CAST(document_json AS BLOB)) FROM projects WHERE project_id = ?",
+            (project.project_id,),
+        ).fetchone()[0]
+
+    def unexpected_decode(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise AssertionError("oversize project reached JSON decoding")
+
+    monkeypatch.setattr(provider_store_module, "MAX_DOCUMENT_BYTES", document_bytes - 1)
+    monkeypatch.setattr(provider_store_module, "_decode_json_object", unexpected_decode)
+    with pytest.raises(ProviderDataCorruptionError, match="document size is invalid"):
+        DesktopProviderStore(root)
+
+
+def test_v6_to_v7_migration_is_one_crash_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state"
+    store = DesktopProviderStore(root)
+    profile = _create_profile(store, key="v7-crash-profile-create-0001")
+    request = _project(profile.profile_id, name="Crash-safe migration")
+    request["execution"] = {
+        "mode": "codex_subscription_transcript",
+        "codex_model": "gpt-5.5",
+    }
+    idempotency_key = "v7-crash-project-create-0001"
+    project = store.create_project(request, idempotency_key=idempotency_key)
+    store.close()
+    _downgrade_provider_store_to_v6(root)
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        _replace_v6_project_model(
+            connection,
+            root,
+            project_id=project.project_id,
+            idempotency_key=idempotency_key,
+            model="gpt-5",
+        )
+
+    original = DesktopProviderStore._migrate_v6_to_v7
+
+    def crash_after_migration(
+        self: DesktopProviderStore,
+        connection: sqlite3.Connection,
+    ) -> None:
+        original(self, connection)
+        raise RuntimeError("injected v7 migration crash")
+
+    monkeypatch.setattr(DesktopProviderStore, "_migrate_v6_to_v7", crash_after_migration)
+    with pytest.raises(RuntimeError, match="v7 migration crash"):
+        DesktopProviderStore(root)
+
+    with sqlite3.connect(root / "provider.sqlite3") as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (6,)
+        assert connection.execute(
+            "SELECT version FROM schema_migrations ORDER BY version"
+        ).fetchall() == [(1,), (2,), (3,), (4,), (5,), (6,)]
+        assert provider_store_module._schema_rows(connection) == (
+            provider_store_module._EXPECTED_SCHEMA_V6_ROWS
+        )
+        stored = json.loads(
+            bytes(
+                connection.execute(
+                    "SELECT document_json FROM projects WHERE project_id = ?",
+                    (project.project_id,),
+                ).fetchone()[0]
+            )
+        )
+        assert stored["execution"]["codex_model"] == "gpt-5"
+
+    monkeypatch.setattr(DesktopProviderStore, "_migrate_v6_to_v7", original)
+    migrated = DesktopProviderStore(root)
+    assert (
+        migrated.get_project(project.project_id).execution.model_dump(mode="json")["codex_model"]
+        == "gpt-5.5"
+    )
 
 
 def test_migrates_v3_remote_payload_usage_into_provider_authority(
@@ -992,7 +1311,7 @@ def test_migrates_v3_remote_payload_usage_into_provider_authority(
 
     store = DesktopProviderStore(root)
 
-    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (6,)
+    assert tuple(store._connection.execute("PRAGMA user_version").fetchone()) == (7,)
     assert tuple(
         store._connection.execute(
             "SELECT remote_payload_count, remote_payload_bytes, length(authority_tag) "
@@ -1146,7 +1465,7 @@ def test_v4_to_v5_migration_validates_final_write_budget_before_seal(
     monkeypatch.setattr(provider_store_module, budget_name, original_budget)
     monkeypatch.setattr(DesktopProviderStore, "_seal_provider_storage_usage", original_seal)
     reopened = DesktopProviderStore(root)
-    assert tuple(reopened._connection.execute("PRAGMA user_version").fetchone()) == (6,)
+    assert tuple(reopened._connection.execute("PRAGMA user_version").fetchone()) == (7,)
 
 
 def test_v3_usage_migration_applies_recovery_budget_before_payload_scan(

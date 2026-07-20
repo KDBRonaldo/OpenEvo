@@ -20,7 +20,12 @@ import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { DesktopProductApp } from "./product/DesktopProductApp";
 import { SampleScientificProjectView } from "./product/ScientificProjectSample";
-import { SAMPLE_SCIENTIFIC_PROJECT } from "./product/scientificProjectSampleData";
+import {
+  SAMPLE_SCIENTIFIC_PROJECT,
+  SAMPLE_SCIENTIFIC_PROJECTS,
+  sampleScientificProject,
+  type SampleScientificProjectId,
+} from "./product/scientificProjectSampleData";
 import type { DesktopProductProvider } from "./product/provider";
 import {
   createReleaseDesktopProductProvider,
@@ -187,8 +192,12 @@ type ReleaseDesktopStartupState =
 
 type ReadonlySampleWorkspace = "research" | "evolution" | "system";
 
-function ReleaseStartupSample({ onRetry }: { onRetry: () => void }) {
+function ReleaseStartupSample({ onRetry, startupPending = false }: { onRetry: () => void; startupPending?: boolean }) {
   const [workspace, setWorkspace] = useState<ReadonlySampleWorkspace>("research");
+  const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
+    SAMPLE_SCIENTIFIC_PROJECT.id,
+  );
+  const selectedSample = sampleScientificProject(selectedSampleId);
   const sampleWorkspaces: ReadonlyArray<{
     readonly id: ReadonlySampleWorkspace;
     readonly label: string;
@@ -259,7 +268,7 @@ function ReleaseStartupSample({ onRetry }: { onRetry: () => void }) {
           <div className="sidebar-foot-label">Current Project Head</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>Project Head {SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}</span>
+            <span>Project Head {selectedSample.activeProjectHeadGeneration}</span>
           </div>
         </div>
       </aside>
@@ -268,8 +277,21 @@ function ReleaseStartupSample({ onRetry }: { onRetry: () => void }) {
           <div className="project-switcher-wrap">
             <label htmlFor="startup-sample-project">Project</label>
             <div className="project-switcher-control">
-              <select id="startup-sample-project" value="sample" disabled>
-                <option value="sample">[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
+              <select
+                id="startup-sample-project"
+                value={selectedSample.id}
+                onChange={(event) => {
+                  const selected = SAMPLE_SCIENTIFIC_PROJECTS.find(
+                    (sample) => sample.id === event.target.value,
+                  );
+                  if (selected) setSelectedSampleId(selected.id);
+                }}
+              >
+                {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
+                  <option key={sample.id} value={sample.id}>
+                    [只读] {sample.name}
+                  </option>
+                ))}
               </select>
             </div>
           </div>
@@ -281,17 +303,23 @@ function ReleaseStartupSample({ onRetry }: { onRetry: () => void }) {
           <div className="initial-sync-notice" role="alert">
             <AlertCircle size={18} />
             <div>
-              <strong>暂时无法连接 OpenEvo Desktop</strong>
+              <strong>{startupPending ? "正在启动 OpenEvo Desktop" : "暂时无法连接 OpenEvo Desktop"}</strong>
               <span>
-                本机服务尚未就绪。下方内置示例保持只读，不会连接本机服务或远端服务器。
+                本机服务尚未就绪。下方两个内置 synthetic 示例保持只读，不会连接本机服务或远端服务器。
               </span>
             </div>
-            <button type="button" className="secondary-button" onClick={onRetry}>
-              <RefreshCw size={15} /> 重试启动
-            </button>
+            {startupPending ? (
+              <span className="product-loading-row" role="status" aria-live="polite">
+                <LoaderCircle className="spin" size={16} /> 正在连接本机服务
+              </span>
+            ) : (
+              <button type="button" className="secondary-button" onClick={onRetry}>
+                <RefreshCw size={15} /> 重试启动
+              </button>
+            )}
           </div>
           <div className="initial-sync-sample">
-            <SampleScientificProjectView workspace={workspace} />
+            <SampleScientificProjectView workspace={workspace} project={selectedSample} />
           </div>
         </main>
       </div>
@@ -425,13 +453,7 @@ export function ReleaseDesktopProductShell({
   if (startup.status === "failed") {
     return <ReleaseStartupSample onRetry={start} />;
   }
-  return (
-    <div className="product-boot">
-      <div className="product-loading-row" role="status" aria-live="polite">
-        <LoaderCircle className="spin" size={18} /> 正在启动 OpenEvo Desktop...
-      </div>
-    </div>
-  );
+  return <ReleaseStartupSample onRetry={start} startupPending />;
 }
 
 // Keep this build-time branch at the entrypoint so Vite can drop shared

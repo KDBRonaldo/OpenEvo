@@ -51,6 +51,7 @@ describe("product preview scenarios", () => {
         capture_mode: "transcript",
         token_level_metrics_available: false,
         codex_model: "gpt-5.5",
+        reasoning_effort: "high",
         hf_model: null,
       });
       expect(refreshed.snapshot.executionModeCapabilities.modes).toEqual(expect.arrayContaining([

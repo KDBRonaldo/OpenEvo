@@ -539,6 +539,9 @@ def _safe_archive_member_name(value: str) -> str:
 
 MANAGED_HOME: Final[str] = "/openevo/session/home"
 MANAGED_WORKSPACE: Final[str] = "/openevo/session/workspace"
+MANAGED_CODEX_READINESS_WORKSPACE: Final[str] = (
+    f"{MANAGED_HOME}/.openevo-codex-readiness"
+)
 MANAGED_CODEX_HOME: Final[str] = "/openevo/credentials/codex"
 MANAGED_CODEX_PACKAGE_ROOT: Final[str] = "/opt/codex"
 MANAGED_CODEX_BINARY: Final[str] = f"{MANAGED_CODEX_PACKAGE_ROOT}/bin/codex"
@@ -556,9 +559,11 @@ MANAGED_SUBSCRIPTION_ENV: Final[dict[str, str]] = {
 }
 MANAGED_SUBSCRIPTION_ENV_KEYS: Final[frozenset[str]] = frozenset(MANAGED_SUBSCRIPTION_ENV)
 MANAGED_SUBSCRIPTION_PREPARE_COMMAND: Final[str] = (
-    f"mkdir -p {MANAGED_HOME}/.codex {MANAGED_WORKSPACE} "
+    f"mkdir -p {MANAGED_HOME}/.codex {MANAGED_CODEX_READINESS_WORKSPACE} "
+    f"{MANAGED_WORKSPACE} "
     "/openevo/session/logs/agent && "
     f"chmod 700 {MANAGED_HOME} {MANAGED_HOME}/.codex "
+    f"{MANAGED_CODEX_READINESS_WORKSPACE} "
     "/openevo/session/logs /openevo/session/logs/agent"
 )
 
@@ -753,6 +758,7 @@ def require_managed_runtime_binding(
 
 __all__ = [
     "MANAGED_CODEX_HOME",
+    "MANAGED_CODEX_READINESS_WORKSPACE",
     "MANAGED_CODEX_BINARY",
     "MANAGED_CODEX_PACKAGE_ROOT",
     "MANAGED_CODEX_VERSION",

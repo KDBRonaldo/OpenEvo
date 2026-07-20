@@ -761,6 +761,7 @@ def _map_project_create_v1(project: local_v1.ProjectV1) -> core_v1.ProjectCreate
         capture_mode=core_v1.CaptureMode.TRANSCRIPT,
         harness_id="codex",
         agent_model_ref=model_ref,
+        reasoning_effort=execution.reasoning_effort,
         evolution=core_v1.EvolutionConfigV1.model_validate(
             project.evolution.model_dump(mode="json"), strict=True
         ),

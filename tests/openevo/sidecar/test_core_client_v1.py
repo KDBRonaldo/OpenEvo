@@ -859,7 +859,7 @@ def test_project_bootstrap_accepts_ready_scratch_generation_zero_response() -> N
         execution_mode=v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
         capture_mode=v1.CaptureMode.TRANSCRIPT,
         harness_id="codex",
-        agent_model_ref="gpt-5",
+        agent_model_ref="gpt-5.3-codex-spark",
         evolution=v1.EvolutionConfigV1(targets={}),
     )
     workspace = v1.ScratchWorkspaceSpecV1(
@@ -892,7 +892,7 @@ def test_project_bootstrap_accepts_ready_scratch_generation_zero_response() -> N
                 manifest_sha256="9" * 64,
             ),
             "model_preparation": v1.ModelPreparationV1(
-                model_ref="gpt-5",
+                model_ref="gpt-5.3-codex-spark",
                 status=v1.ModelPreparationStatus.READY,
                 updated_at="2026-07-14T12:00:00Z",
             ),

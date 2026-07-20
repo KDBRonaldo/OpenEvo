@@ -122,6 +122,25 @@ def test_desktop_project_config_draft_defaults_subscription_codex_model() -> Non
     assert project.execution.hf_model is None
 
 
+@pytest.mark.parametrize(
+    "codex_model",
+    [
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ],
+)
+def test_desktop_project_config_draft_rejects_unsupported_gpt5_codex_model(
+    codex_model: str,
+) -> None:
+    with pytest.raises(ValidationError, match="bare gpt-5 is unsupported"):
+        DesktopProjectConfigDraft.model_validate(
+            VALID_DRAFT | {"codex_model": codex_model}
+        )
+
+
 def test_desktop_project_config_draft_builds_self_deployed() -> None:
     draft = DesktopProjectConfigDraft.model_validate(
         VALID_DRAFT

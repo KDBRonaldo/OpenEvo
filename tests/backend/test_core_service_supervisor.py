@@ -435,6 +435,26 @@ def _ensure_subscription_binding(
     )
 
 
+@pytest.mark.parametrize(
+    "codex_model",
+    [
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ],
+)
+def test_managed_science_runtime_request_rejects_unsupported_gpt5_model(
+    codex_model: str,
+) -> None:
+    with pytest.raises(ValueError, match="bare gpt-5 is unsupported"):
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.1",
+            codex_model=codex_model,
+        )
+
+
 def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identity(
     tmp_path: Path,
     framework_lock: Path,

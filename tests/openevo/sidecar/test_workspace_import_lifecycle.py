@@ -191,7 +191,7 @@ def _create_project(
             "source": source,
             "execution": {
                 "mode": "codex_subscription_transcript",
-                "codex_model": "gpt-5",
+                "codex_model": "gpt-5.3-codex-spark",
             },
             "evolution": {"targets": {}},
         },
@@ -233,7 +233,7 @@ def test_picker_discard_and_failed_save_remove_pending_imports(tmp_path: Path) -
                 "source": source,
                 "execution": {
                     "mode": "codex_subscription_transcript",
-                    "codex_model": "gpt-5",
+                    "codex_model": "gpt-5.3-codex-spark",
                 },
                 "evolution": {"targets": {}},
             },

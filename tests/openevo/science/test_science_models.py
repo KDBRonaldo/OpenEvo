@@ -162,6 +162,7 @@ def test_managed_local_inference_accepts_hf_model() -> None:
     assert config.execution.mode == "self-deployed"
     assert config.execution.hf_model == "Qwen/Qwen3-Coder-30B-A3B-Instruct"
     assert config.execution.codex_model is None
+    assert config.execution.reasoning_effort is None
     assert config.evolution.targets["parametric_memory"].enabled is False
 
 
@@ -211,6 +212,58 @@ def test_managed_local_inference_rejects_explicit_null_codex_model() -> None:
     with pytest.raises(
         ValidationError,
         match="execution.codex_model is only valid for subscription transcript mode",
+    ):
+        ScienceProjectConfig.model_validate(payload)
+
+
+def test_subscription_accepts_reasoning_effort() -> None:
+    payload = _minimal_payload() | {
+        "execution": {
+            "mode": "codex_subscription_transcript",
+            "codex_model": "gpt-5.3-codex-spark",
+            "reasoning_effort": "xhigh",
+        }
+    }
+
+    config = ScienceProjectConfig.model_validate(payload)
+
+    assert config.execution.reasoning_effort == "xhigh"
+
+
+@pytest.mark.parametrize(
+    "codex_model",
+    [
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ],
+)
+def test_subscription_rejects_unsupported_gpt5_codex_model(codex_model: str) -> None:
+    payload = _minimal_payload() | {
+        "execution": {
+            "mode": "codex_subscription_transcript",
+            "codex_model": codex_model,
+        }
+    }
+
+    with pytest.raises(ValidationError, match="bare gpt-5 is unsupported"):
+        ScienceProjectConfig.model_validate(payload)
+
+
+def test_managed_local_inference_rejects_reasoning_effort() -> None:
+    payload = _minimal_payload() | {
+        "execution": {
+            "mode": "self-deployed",
+            "hf_model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "reasoning_effort": "high",
+        }
+    }
+
+    with pytest.raises(
+        ValidationError,
+        match="execution.reasoning_effort is only valid for subscription",
     ):
         ScienceProjectConfig.model_validate(payload)
 

@@ -34,7 +34,9 @@ describe("AppShell", () => {
   it("renders OpenEvo Desktop without shared dashboard navigation in desktop-only mode", () => {
     const html = renderShell("/openevo", true);
 
-    expect(html).toContain("Loading workspace");
+    expect(html).toContain("Synchronizing your projects");
+    expect(html).toContain("酶动力学模型复核");
+    expect(html).toContain("蛋白质稳定性证据整合");
     expect(html).not.toContain("OpenEvo Observability");
     expect(html).not.toContain('href="/tasks"');
     expect(html).not.toContain(">Dashboard<");
@@ -43,7 +45,7 @@ describe("AppShell", () => {
   it("renders OpenEvo Desktop at the root path in desktop-only mode", () => {
     const html = renderShell("/", true);
 
-    expect(html).toContain("Loading workspace");
+    expect(html).toContain("Synchronizing your projects");
     expect(html).not.toContain("Not found");
   });
 });
@@ -64,6 +66,88 @@ describe("ReleaseDesktopProductShell", () => {
       root = null;
     }
     document.body.innerHTML = "";
+  });
+
+  it("exposes both renderer-owned samples while native sidecar startup is pending", async () => {
+    const pending = deferred<FixtureDesktopProductProvider>();
+    provider = createFixtureDesktopProductProvider({ newUser: true });
+    root = await renderReleaseShell(() => pending.promise, vi.fn(async () => {}), vi.fn(async () => {}));
+
+    expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("正在启动 OpenEvo Desktop");
+    const switcher = document.querySelector<HTMLSelectElement>("#startup-sample-project");
+    if (!switcher) throw new Error("Pending startup sample switcher was not found.");
+    expect(switcher.disabled).toBe(false);
+    expect(Array.from(switcher.options)).toHaveLength(2);
+    const proteinOption = Array.from(switcher.options).find((option) =>
+      option.textContent?.includes("蛋白质稳定性证据整合")
+    );
+    if (!proteinOption) throw new Error("Pending startup protein sample was not found.");
+    await act(async () => {
+      switcher.value = proteinOption.value;
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("内置 synthetic 数据");
+    expect([...document.querySelectorAll("button")].some((item) =>
+      item.textContent?.includes("重试启动")
+    )).toBe(false);
+
+    await act(async () => {
+      pending.resolve(provider!);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+  });
+
+  it("keeps both renderer-owned samples interactive while the first provider snapshot is pending", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const initial = await provider.refresh();
+    const pendingRefresh = deferred<typeof initial>();
+    const refresh = vi.spyOn(provider, "refresh").mockReturnValueOnce(pendingRefresh.promise);
+    const factory = vi.fn(async () => provider!);
+    const reportReady = vi.fn(async () => {});
+
+    root = await renderReleaseShell(factory, vi.fn(async () => {}), reportReady);
+
+    expect(factory).toHaveBeenCalledTimes(1);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(reportReady).not.toHaveBeenCalled();
+    expect(document.querySelector('[data-testid="initial-sync-pending"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("Synchronizing your projects");
+    expect(document.body.textContent).toContain("酶动力学模型复核");
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Pending snapshot sample switcher was not found.");
+    expect(switcher.disabled).toBe(false);
+    expect(Array.from(switcher.options).filter((option) =>
+      option.textContent?.includes("[只读]")
+    )).toHaveLength(2);
+    const proteinOption = Array.from(switcher.options).find((option) =>
+      option.textContent?.includes("蛋白质稳定性证据整合")
+    );
+    if (!proteinOption) throw new Error("Pending snapshot protein sample was not found.");
+    await act(async () => {
+      switcher.value = proteinOption.value;
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("蛋白质稳定性证据整合");
+    expect(document.body.textContent).toContain("内置 synthetic 数据");
+
+    await act(async () => {
+      button("Evolution").click();
+    });
+    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("从轨迹到 Evolution Revision ER-PS-3");
+
+    await act(async () => {
+      pendingRefresh.resolve(initial);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.querySelector('[data-testid="initial-sync-pending"]')).toBeNull();
+    expect(document.body.textContent).toContain("Cross-session changes");
+    expect(reportReady).toHaveBeenCalledTimes(1);
   });
 
   it("restarts native bootstrap after a failed release startup", async () => {
@@ -133,10 +217,28 @@ describe("ReleaseDesktopProductShell", () => {
       ),
     ).toBe(false);
 
+    const sampleSwitcher = document.querySelector<HTMLSelectElement>("#startup-sample-project");
+    if (!sampleSwitcher) throw new Error("Startup sample switcher was not found.");
+    expect(Array.from(sampleSwitcher.options).filter((option) =>
+      option.textContent?.includes("[只读]")
+    )).toHaveLength(2);
+    const proteinOption = Array.from(sampleSwitcher.options).find((option) =>
+      option.textContent?.includes("蛋白质稳定性证据整合")
+    );
+    if (!proteinOption) throw new Error("Protein stability startup sample was not found.");
+    await act(async () => {
+      sampleSwitcher.value = proteinOption.value;
+      sampleSwitcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(document.body.textContent).toContain("内置 synthetic 数据");
+    expect(document.body.textContent).toContain("ER-PS-3");
+
     await act(async () => {
       button("Evolution").click();
     });
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
+    await act(async () => button("版本差异").click());
+    expect(document.body.textContent).toContain("ER-PS-2 → ER-PS-3");
     await act(async () => {
       button("System").click();
     });

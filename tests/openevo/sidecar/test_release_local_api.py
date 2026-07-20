@@ -224,7 +224,7 @@ def _project(profile_id: str, *, name: str = "Protein design") -> dict[str, obje
         "source": {"kind": "scratch", "display_name": "New project"},
         "execution": {
             "mode": "codex_subscription_transcript",
-            "codex_model": "gpt-5",
+            "codex_model": "gpt-5.3-codex-spark",
         },
         "evolution": {"targets": {}},
     }

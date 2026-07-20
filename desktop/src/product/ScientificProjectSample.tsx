@@ -5,6 +5,7 @@ import {
   Check,
   CheckCircle2,
   CircleDot,
+  FileDiff,
   FileText,
   FlaskConical,
   FolderOpen,
@@ -24,6 +25,7 @@ import {
   type SampleEvolutionTarget,
   type SampleEvolutionTargetId,
   type SampleOutcome,
+  type SampleScientificProject,
   type SampleSession,
   type SampleTraceKind,
 } from "./scientificProjectSampleData";
@@ -33,24 +35,26 @@ type SampleWorkspace = "research" | "evolution" | "system";
 export function SampleScientificProjectView({
   workspace,
   onConnectRemote,
+  project = SAMPLE_SCIENTIFIC_PROJECT,
 }: {
   workspace: SampleWorkspace;
   onConnectRemote?: () => void;
+  project?: SampleScientificProject;
 }) {
-  if (workspace === "evolution") return <SampleEvolutionWorkspace />;
-  if (workspace === "system") return <SampleAboutWorkspace onConnectRemote={onConnectRemote} />;
-  return <SampleResearchWorkspace onConnectRemote={onConnectRemote} />;
+  if (workspace === "evolution") return <SampleEvolutionWorkspace project={project} />;
+  if (workspace === "system") return <SampleAboutWorkspace project={project} onConnectRemote={onConnectRemote} />;
+  return <SampleResearchWorkspace project={project} onConnectRemote={onConnectRemote} />;
 }
 
-function SampleResearchWorkspace({ onConnectRemote }: { onConnectRemote?: () => void }) {
-  const project = SAMPLE_SCIENTIFIC_PROJECT;
+function SampleResearchWorkspace({ project, onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
   const [selectedSessionId, setSelectedSessionId] = useState(project.sessions.at(-1)?.id ?? "");
+  useEffect(() => setSelectedSessionId(project.sessions.at(-1)?.id ?? ""), [project.id]);
   const selected =
     project.sessions.find((session) => session.id === selectedSessionId) ?? project.sessions[0];
 
   return (
     <div className="workspace-stack sample-workspace" data-testid="sample-research-workspace" lang="zh-CN">
-      <SampleBanner onConnectRemote={onConnectRemote} />
+      <SampleBanner project={project} onConnectRemote={onConnectRemote} />
       <div className="workspace-heading sample-heading">
         <div>
           <p className="eyebrow">Scientific project tour</p>
@@ -174,8 +178,7 @@ function SampleSessionDetail({ session }: { session: SampleSession }) {
   );
 }
 
-function SampleEvolutionWorkspace() {
-  const project = SAMPLE_SCIENTIFIC_PROJECT;
+function SampleEvolutionWorkspace({ project }: { project: SampleScientificProject }) {
   const [selectedTargetId, setSelectedTargetId] = useState<SampleEvolutionTargetId>("text_memory");
   const selected =
     project.evolutionTargets.find((target) => target.id === selectedTargetId) ??
@@ -183,7 +186,7 @@ function SampleEvolutionWorkspace() {
 
   return (
     <div className="workspace-stack sample-workspace" data-testid="sample-evolution-workspace" lang="zh-CN">
-      <SampleBanner />
+      <SampleBanner project={project} />
       <div className="workspace-heading sample-heading">
         <div>
           <p className="eyebrow">Cross-session evolution</p>
@@ -219,14 +222,14 @@ function SampleEvolutionWorkspace() {
             </button>
           ))}
         </aside>
-        <SampleEvolutionTargetDetail target={selected} />
+        <SampleEvolutionTargetDetail target={selected} activeEvolutionRevision={project.activeEvolutionRevision} />
       </div>
     </div>
   );
 }
 
-function SampleEvolutionTargetDetail({ target }: { target: SampleEvolutionTarget }) {
-  const [view, setView] = useState<"process" | "artifact">("process");
+function SampleEvolutionTargetDetail({ target, activeEvolutionRevision }: { target: SampleEvolutionTarget; activeEvolutionRevision: string }) {
+  const [view, setView] = useState<"process" | "artifact" | "diff">("process");
   useEffect(() => setView("process"), [target.id]);
 
   return (
@@ -237,16 +240,17 @@ function SampleEvolutionTargetDetail({ target }: { target: SampleEvolutionTarget
           <h2>{target.label}</h2>
           <p>{target.description}</p>
         </div>
-        <div className="artifact-meta"><span>Evolution Revision {SAMPLE_SCIENTIFIC_PROJECT.activeEvolutionRevision}</span><span><CheckCircle2 size={13} /> Active</span></div>
+        <div className="artifact-meta"><span>Evolution Revision {activeEvolutionRevision}</span><span><CheckCircle2 size={13} /> Active</span></div>
       </div>
       <div className="segmented-control" role="tablist" aria-label={`${target.label}视图`} onKeyDown={handleSampleTabKeyDown}>
         <button id="sample-evolution-process-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "process"} tabIndex={view === "process" ? 0 : -1} className={view === "process" ? "active" : ""} onClick={() => setView("process")}><Sparkles size={14} /> 演化过程</button>
         <button id="sample-evolution-artifact-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "artifact"} tabIndex={view === "artifact" ? 0 : -1} className={view === "artifact" ? "active" : ""} onClick={() => setView("artifact")}><FileText size={14} /> 可读产物</button>
+        <button id="sample-evolution-diff-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "diff"} tabIndex={view === "diff" ? 0 : -1} className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}><FileDiff size={14} /> 版本差异</button>
       </div>
       <div
         id="sample-evolution-view-panel"
         role="tabpanel"
-        aria-labelledby={view === "process" ? "sample-evolution-process-tab" : "sample-evolution-artifact-tab"}
+        aria-labelledby={view === "process" ? "sample-evolution-process-tab" : view === "artifact" ? "sample-evolution-artifact-tab" : "sample-evolution-diff-tab"}
       >
         {view === "process" ? (
           <ol className="sample-evolution-steps">
@@ -261,10 +265,23 @@ function SampleEvolutionTargetDetail({ target }: { target: SampleEvolutionTarget
               </li>
             ))}
           </ol>
-        ) : (
+        ) : view === "artifact" ? (
           <div className="sample-artifact-document">
             <div><FileText size={15} /><strong>{target.artifact.title}</strong><span>只读预览</span></div>
             <pre>{target.artifact.content}</pre>
+          </div>
+        ) : (
+          <div className="diff-view sample-artifact-diff" aria-label={`${target.artifact.title} 版本差异`}>
+            <div className="diff-document-heading">
+              <span>modified</span>
+              <h3>{target.artifact.title} · {target.artifact.previousRevision} → {target.artifact.currentRevision}</h3>
+            </div>
+            {target.artifact.diff.map((line, index) => (
+              <div key={`${line.kind}-${index}`} className={`diff-line ${line.kind}`}>
+                <span>{line.kind === "added" ? "+" : "-"}</span>
+                <code>{line.text}</code>
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -272,10 +289,10 @@ function SampleEvolutionTargetDetail({ target }: { target: SampleEvolutionTarget
   );
 }
 
-function SampleAboutWorkspace({ onConnectRemote }: { onConnectRemote?: () => void }) {
+function SampleAboutWorkspace({ project, onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
   return (
     <div className="workspace-stack sample-workspace" data-testid="sample-about-workspace" lang="zh-CN">
-      <SampleBanner />
+      <SampleBanner project={project} />
       <div className="workspace-heading sample-heading">
         <div>
           <p className="eyebrow">About this sample</p>
@@ -298,10 +315,10 @@ function SampleAboutWorkspace({ onConnectRemote }: { onConnectRemote?: () => voi
   );
 }
 
-function SampleBanner({ onConnectRemote }: { onConnectRemote?: () => void }) {
+function SampleBanner({ project, onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
   return (
     <section className="sample-banner" aria-label="内置示例说明">
-      <div><Info size={17} /><p><strong>内置示例 · 只读</strong><span>合成内容，仅用于浏览产品；Add a remote workspace 后才会连接或执行真实任务。</span></p></div>
+      <div><Info size={17} /><p><strong>{project.badge}</strong><span>合成内容，仅用于浏览产品；Add a remote workspace 后才会连接或执行真实任务。</span></p></div>
       {onConnectRemote ? <button type="button" className="text-button" onClick={onConnectRemote}>Add workspace <ArrowRight size={14} /></button> : null}
     </section>
   );

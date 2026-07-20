@@ -69,6 +69,11 @@ def _agent_payload(project: ScienceProjectConfig) -> dict[str, Any]:
             "settings": {
                 "auth_mode": "subscription",
                 "capture_mode": "transcript",
+                **(
+                    {"reasoning_effort": project.execution.reasoning_effort}
+                    if project.execution.reasoning_effort is not None
+                    else {}
+                ),
             },
             "env": managed_env,
         }

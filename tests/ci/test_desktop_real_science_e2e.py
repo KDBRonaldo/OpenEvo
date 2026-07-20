@@ -57,7 +57,7 @@ def _revision(identifier: str, generation: int) -> dict[str, object]:
     }
 
 
-def _workflow(module: ModuleType):
+def _workflow(module: ModuleType, *, smoke: bool = False):
     return module.DesktopScienceWorkflow(
         object(),
         host="compute.example.org",
@@ -65,12 +65,14 @@ def _workflow(module: ModuleType):
         user="researcher",
         host_key_algorithm="ssh-ed25519",
         expected_host_key_fingerprint="SHA256:" + "A" * 43 + "=",
-        codex_model="gpt-5",
+        codex_model="gpt-5.3-codex-spark",
+        reasoning_effort="high",
         task_title="Structural test",
         task_objective="No real execution occurs in this structural test.",
         poll_seconds=0.01,
         activation_timeout_seconds=1,
         run_timeout_seconds=1,
+        smoke=smoke,
     )
 
 
@@ -93,6 +95,39 @@ def test_structural_check_is_explicitly_not_an_e2e_run(tmp_path: Path) -> None:
     assert "E2E was not run" in result.stdout
     assert "passed; bounded evidence" not in result.stdout
     assert not output.exists()
+
+
+def test_smoke_and_structural_check_are_closed_mutually_exclusive_modes(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "must-not-exist.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/e2e/desktop_real_science_e2e.py",
+            "--smoke",
+            "--structural-check",
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr
+    assert not output.exists()
+
+
+def test_smoke_does_not_add_the_evolution_context_canary() -> None:
+    module = _load_runner()
+
+    full = _workflow(module)
+    smoke = _workflow(module, smoke=True)
+
+    assert module.CONTEXT_CANARY_INSTRUCTION in full._task_objective
+    assert module.CONTEXT_CANARY_INSTRUCTION not in smoke._task_objective
 
 
 def test_native_frame_uses_the_closed_credential_protocol() -> None:
@@ -354,9 +389,7 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
         runtime_archive.resolve()
     )
     assert command[command.index("--core-wheel") + 1] == str(core_wheel.resolve())
-    assert command[command.index("--framework-lock") + 1] == str(
-        framework_lock.resolve()
-    )
+    assert command[command.index("--framework-lock") + 1] == str(framework_lock.resolve())
     assert command[command.index("--daemon-bundle") + 1] == str(daemon_bundle.resolve())
     assert command[command.index("--daemon-manifest") + 1] == str(daemon_manifest.resolve())
     assert command.count("--release-build") == 1
@@ -531,7 +564,7 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
         evidence={},
         run={
             "pinned_revision": successor,
-            "required_revision": {"revision": successor},
+            "required_revision": {"relation": "active", "revision": successor},
         },
         context={
             "artifacts": [
@@ -551,14 +584,26 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
         runtime_context_receipt_sha256=receipt_sha256,
     )
 
+    workflow._prepare_followup_successor(
+        first,
+        {"remote": {"status": "ready", "active_revision": successor}},
+    )
     reuse = workflow._assert_successor_reuse(first, second)
 
+    assert reuse["followup_admitted_after_successor_active"] is True
     assert reuse["session_1_excluded_own_successor"] is True
     assert reuse["session_2_pinned_session_1_successor"] is True
     assert reuse["session_1_artifacts_reused"] is True
     assert reuse["session_2_runtime_injection_verified"] is True
-    assert reuse["session_2_harness_context_consumed"] is True
     assert reuse["runtime_context_receipt_sha256"] == receipt_sha256
+    workflow._expected_followup_successor = None
+    with pytest.raises(module.E2EFailure, match="followup_successor_not_prepared"):
+        workflow._assert_successor_reuse(first, second)
+    workflow._expected_followup_successor = successor
+    second.run["required_revision"] = {"relation": "queued", "revision": successor}
+    with pytest.raises(module.E2EFailure, match="followup_revision_not_active"):
+        workflow._assert_successor_reuse(first, second)
+    second.run["required_revision"] = {"relation": "active", "revision": successor}
     second.run["pinned_revision"] = _revision("revision-2", 2)
     with pytest.raises(module.E2EFailure, match="second_session_did_not_pin_successor"):
         workflow._assert_successor_reuse(first, second)
@@ -602,7 +647,7 @@ def test_successor_reuse_rejects_session_one_consuming_its_own_output() -> None:
         evidence={},
         run={
             "pinned_revision": successor,
-            "required_revision": {"revision": successor},
+            "required_revision": {"relation": "active", "revision": successor},
         },
         context={
             "artifacts": [
@@ -629,6 +674,10 @@ def test_successor_reuse_rejects_session_one_consuming_its_own_output() -> None:
         runtime_context_receipt_sha256="f" * 64,
     )
 
+    workflow._prepare_followup_successor(
+        first,
+        {"remote": {"status": "ready", "active_revision": successor}},
+    )
     with pytest.raises(module.E2EFailure, match="first_session_consumed_own_successor"):
         workflow._assert_successor_reuse(first, second)
 
@@ -644,10 +693,17 @@ def test_successful_session_requires_real_harness_execution_phase() -> None:
             },
             "logs": {"count": 1},
         },
-        run={"status": "succeeded", "pinned_revision": revision},
+        run={
+            "status": "succeeded",
+            "pinned_revision": revision,
+            "execution_mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+        },
         context={
             "capture_mode": "transcript",
             "token_level_metrics_available": False,
+            "codex_model": "gpt-5.3-codex-spark",
+            "reasoning_effort": "high",
         },
         artifacts=tuple(
             {
@@ -665,6 +721,215 @@ def test_successful_session_requires_real_harness_execution_phase() -> None:
 
     with pytest.raises(module.E2EFailure, match="terminal_evidence_missing"):
         workflow._assert_successful_session(observation, ordinal=1)
+
+
+def test_successful_session_requires_typed_transcript_dataset_artifacts() -> None:
+    module = _load_runner()
+    workflow = _workflow(module)
+    predecessor = _revision("revision-0", 0)
+    successor = _revision("revision-1", 1)
+
+    def observation(*, artifact_type: str, source_dataset_ids: list[str]):
+        return module.SessionObservation(
+            evidence={
+                "timeline": {
+                    "phase_values": ["execution", "evolution", "revision", "terminal"],
+                },
+                "logs": {"count": 1},
+            },
+            run={
+                "status": "succeeded",
+                "pinned_revision": predecessor,
+                "execution_mode": "codex_subscription_transcript",
+                "capture_mode": "transcript",
+            },
+            context={
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+            },
+            artifacts=tuple(
+                {
+                    "id": f"artifact-{target_id}",
+                    "artifact_type": artifact_type if target_id == "text_memory" else target_id,
+                    "target_id": target_id,
+                    "produced_revision": successor,
+                    "membership_revisions": [successor],
+                    "selected": True,
+                    "release_enabled": True,
+                    "content_sha256": "a" * 64,
+                    "byte_size": 1,
+                    "lineage": {
+                        "method_id": f"method-{target_id}",
+                        "job_id": f"job-{target_id}",
+                        "source_dataset_ids": (
+                            source_dataset_ids
+                            if target_id == "text_memory"
+                            else ["dataset-transcript"]
+                        ),
+                        "source_artifact_ids": [],
+                    },
+                }
+                for target_id in module.REQUIRED_TARGET_IDS
+            ),
+            document_sha256_by_target={
+                target_id: "b" * 64 for target_id in module.REQUIRED_TARGET_IDS
+            },
+            runtime_context_receipt_sha256=None,
+        )
+
+    valid = observation(
+        artifact_type="text_memory",
+        source_dataset_ids=["dataset-transcript"],
+    )
+    workflow._assert_successful_session(valid, ordinal=1)
+    assert valid.evidence["transcript_dataset_lineage_verified"] is True
+
+    with pytest.raises(
+        module.E2EFailure,
+        match="typed_transcript_artifact_contract_mismatch",
+    ):
+        workflow._assert_successful_session(
+            observation(
+                artifact_type="skill_bundle",
+                source_dataset_ids=["dataset-transcript"],
+            ),
+            ordinal=1,
+        )
+    with pytest.raises(
+        module.E2EFailure,
+        match="typed_transcript_artifact_contract_mismatch",
+    ):
+        workflow._assert_successful_session(
+            observation(artifact_type="text_memory", source_dataset_ids=[]),
+            ordinal=1,
+        )
+
+
+def test_followup_accepts_the_durable_predecessor_projection() -> None:
+    module = _load_runner()
+    workflow = _workflow(module)
+    predecessor = _revision("revision-0", 0)
+    successor = _revision("revision-1", 1)
+    first = module.SessionObservation(
+        evidence={},
+        run={"pinned_revision": predecessor},
+        context={},
+        artifacts=tuple(
+            {
+                "target_id": target_id,
+                "produced_revision": successor,
+            }
+            for target_id in module.REQUIRED_TARGET_IDS
+        ),
+        document_sha256_by_target={},
+        runtime_context_receipt_sha256=None,
+    )
+
+    workflow._prepare_followup_successor(
+        first,
+        {"remote": {"status": "ready", "active_revision": successor}},
+    )
+    workflow._prepare_followup_successor(
+        first,
+        {"remote": {"status": "ready", "active_revision": predecessor}},
+    )
+
+    with pytest.raises(module.E2EFailure, match="followup_project_authority_invalid"):
+        workflow._prepare_followup_successor(
+            first,
+            {
+                "remote": {
+                    "status": "ready",
+                    "active_revision": _revision("revision-2", 2),
+                }
+            },
+        )
+
+
+def test_artifact_content_retries_only_the_transient_publication_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+
+    class Api:
+        calls = 0
+
+        def request(self, *_args: object, **kwargs: object) -> dict[str, object]:
+            self.calls += 1
+            if self.calls < 3:
+                raise module.E2EFailure(
+                    str(kwargs["stage"]),
+                    "artifact_content_invalid",
+                    http_status=422,
+                )
+            return {"artifact_id": "artifact-1"}
+
+    workflow = _workflow(module)
+    workflow._api = Api()
+    sleeps: list[float] = []
+    monkeypatch.setattr(module.time, "sleep", sleeps.append)
+
+    assert workflow._artifact_content("artifact-1", ordinal=2) == {
+        "artifact_id": "artifact-1"
+    }
+    assert sleeps == list(module.ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS[:2])
+
+
+def test_artifact_content_does_not_retry_other_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+
+    class Api:
+        def request(self, *_args: object, **kwargs: object) -> dict[str, object]:
+            raise module.E2EFailure(
+                str(kwargs["stage"]),
+                "artifact_content_oversize",
+                http_status=422,
+            )
+
+    workflow = _workflow(module)
+    workflow._api = Api()
+    monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(module.E2EFailure, match="artifact_content_oversize"):
+        workflow._artifact_content("artifact-1", ordinal=2)
+
+
+def test_smoke_session_requires_execution_without_evolution_outputs() -> None:
+    module = _load_runner()
+    workflow = _workflow(module, smoke=True)
+    workflow._disabled_target_ids = frozenset({"skill_bundle"})
+    revision = _revision("revision-0", 0)
+    observation = module.SessionObservation(
+        evidence={
+            "timeline": {"phase_values": ["execution", "terminal"]},
+            "logs": {"count": 1},
+        },
+        run={"status": "succeeded", "pinned_revision": revision},
+        context={
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "artifacts": [],
+            "adapters": [],
+        },
+        artifacts=(),
+        document_sha256_by_target={},
+        runtime_context_receipt_sha256=None,
+    )
+
+    workflow._assert_smoke_session(observation)
+
+    observation = module.SessionObservation(
+        evidence=observation.evidence,
+        run=observation.run,
+        context=observation.context,
+        artifacts=({"id": "unexpected-artifact", "target_id": "skill_bundle"},),
+        document_sha256_by_target=observation.document_sha256_by_target,
+        runtime_context_receipt_sha256=observation.runtime_context_receipt_sha256,
+    )
+    with pytest.raises(module.E2EFailure, match="smoke_evolution_artifact_present"):
+        workflow._assert_smoke_session(observation)
 
 
 @pytest.mark.parametrize(
@@ -746,7 +1011,6 @@ def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
         "reuse": {
             "session_1_excluded_own_successor": True,
             "session_2_runtime_injection_verified": True,
-            "session_2_harness_context_consumed": True,
             "session_2_lineage_verified": True,
             "runtime_context_receipt_sha256": digest,
         },
@@ -759,6 +1023,33 @@ def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
             "sidecar_shutdown_succeeded": True,
             "core_ownership_release_requested": True,
         },
+    }
+
+    module._audit_evidence(payload, private_values=())
+
+
+def test_closed_evidence_schema_accepts_single_session_smoke_shape() -> None:
+    module = _load_runner()
+    digest = "a" * 64
+    payload = {
+        "run_mode": "single_session_smoke",
+        "verification_scope": [
+            "desktop_sidecar",
+            "ssh_bootstrap",
+            "daemon_core",
+            "codex_subscription_transcript",
+        ],
+        "session_count": 1,
+        "evolution_targets_enabled": False,
+        "evolution_e2e_verified": False,
+        "codex_subscription_transcript_verified": True,
+        "project": {
+            "target_ids": [],
+            "disabled_target_ids": list(module.REQUIRED_TARGET_IDS),
+            "method_ids": {},
+            "registry_digest": digest,
+        },
+        "sessions": [{"ordinal": 1, "artifact_count": 0}],
     }
 
     module._audit_evidence(payload, private_values=())
@@ -905,6 +1196,14 @@ def test_capability_selection_enables_all_three_remote_supported_methods() -> No
     project = {
         "etag": '"' + "1" * 64 + '"',
         "state": "active",
+        "execution": {
+            "mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "codex_model": "gpt-5.3-codex-spark",
+            "reasoning_effort": "high",
+            "hf_model": None,
+        },
         "remote": {
             "status": "ready",
             "active_revision": _revision("r0", 0),
@@ -1037,6 +1336,129 @@ def test_capability_selection_enables_all_three_remote_supported_methods() -> No
         }
 
 
+def test_smoke_disables_every_remote_capability_target_before_run() -> None:
+    module = _load_runner()
+    project = {
+        "etag": '"' + "1" * 64 + '"',
+        "state": "active",
+        "execution": {
+            "mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "codex_model": "gpt-5.3-codex-spark",
+            "reasoning_effort": "high",
+            "hf_model": None,
+        },
+        "remote": {
+            "status": "ready",
+            "active_revision": _revision("r0", 0),
+            "registry_digest": "a" * 64,
+        },
+        "evolution": {"targets": {}},
+    }
+    target_ids = [*module.REQUIRED_TARGET_IDS, "future_target"]
+
+    class FakeApi:
+        patched: dict[str, object] | None = None
+
+        def request(self, method: str, route: str, **kwargs: object):
+            if method == "GET" and route.endswith("/capabilities"):
+                return {
+                    "project_etag": project["etag"],
+                    "capabilities": {
+                        "registry_digest": "a" * 64,
+                        "targets": [{"target_id": target_id} for target_id in target_ids],
+                    },
+                }
+            if method == "PATCH":
+                self.patched = kwargs["body"]  # type: ignore[assignment]
+                return {"etag": '"' + "2" * 64 + '"'}
+            if method == "POST" and route.endswith("/activate"):
+                return {"operation_id": "activate", "state": "succeeded"}
+            if method == "GET" and "/projects/" in route:
+                targets = self.patched["evolution"]["targets"]  # type: ignore[index]
+                return {
+                    **project,
+                    "etag": '"' + "2" * 64 + '"',
+                    "evolution": {"targets": targets},
+                }
+            raise AssertionError((method, route))
+
+    api = FakeApi()
+    workflow = _workflow(module, smoke=True)
+    workflow._api = api
+    workflow.project_id = "project-real-e2e"
+
+    capabilities, disabled_target_ids = workflow._disable_and_activate_targets(project)
+
+    assert capabilities["registry_digest"] == "a" * 64
+    assert disabled_target_ids == sorted(target_ids)
+    assert api.patched == {
+        "evolution": {
+            "targets": {
+                target_id: {"enabled": False, "method": None, "config": {}}
+                for target_id in sorted(target_ids)
+            }
+        }
+    }
+
+
+def test_smoke_workflow_runs_exactly_one_session_and_labels_scope() -> None:
+    module = _load_runner()
+    workflow = _workflow(module, smoke=True)
+    workflow.project_id = "project-real-e2e"
+    revision = _revision("revision-0", 0)
+    project = {"etag": '"' + "1" * 64 + '"'}
+    capabilities = {"registry_digest": "a" * 64, "targets": []}
+    observation = module.SessionObservation(
+        evidence={"ordinal": 1},
+        run={"status": "succeeded", "pinned_revision": revision},
+        context={
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "artifacts": [],
+            "adapters": [],
+        },
+        artifacts=(),
+        document_sha256_by_target={},
+        runtime_context_receipt_sha256=None,
+    )
+    created_ordinals: list[int] = []
+
+    workflow._create_and_confirm_profile = lambda: {"profile_id": "profile"}
+    workflow._create_and_activate_project = lambda _profile: project
+    workflow._disable_and_activate_targets = lambda _project: (
+        capabilities,
+        ["agent_system", "skill_bundle", "text_memory"],
+    )
+    workflow._get_project = lambda: project
+    workflow._validate_project = lambda _project: {
+        "registry_digest": "a" * 64,
+        "checks": ["remote"],
+    }
+
+    def create_run(_project: dict[str, object], *, ordinal: int):
+        created_ordinals.append(ordinal)
+        return observation.run
+
+    workflow._create_run = create_run
+    workflow._wait_run = lambda run, *, ordinal: run
+    workflow._observe_session = lambda _run, *, ordinal: observation
+    workflow._assert_smoke_session = lambda observed: None
+
+    evidence = workflow.run()
+
+    assert created_ordinals == [1]
+    assert evidence["run_mode"] == "single_session_smoke"
+    assert evidence["session_count"] == 1
+    assert evidence["evolution_targets_enabled"] is False
+    assert evidence["evolution_e2e_verified"] is False
+    assert evidence["codex_subscription_transcript_verified"] is True
+    assert evidence["sessions"] == [{"ordinal": 1}]
+    assert evidence["project"]["target_ids"] == []  # type: ignore[index]
+    assert evidence["project"]["method_ids"] == {}  # type: ignore[index]
+
+
 def test_capability_selection_rejects_unsupported_agent_system_auto() -> None:
     module = _load_runner()
     project = {"etag": '"' + "1" * 64 + '"'}
@@ -1166,6 +1588,81 @@ def test_timeout_arguments_require_finite_positive_values(value: str) -> None:
 
     with pytest.raises(SystemExit):
         module._parser().parse_args(["--poll-seconds", value])
+
+
+@pytest.mark.parametrize(
+    ("argument", "value"),
+    [
+        ("--poll-seconds", "31"),
+        ("--progress-seconds", "61"),
+        ("--activation-timeout-seconds", "1801"),
+        ("--run-timeout-seconds", "10801"),
+        ("--build-timeout-seconds", "2401"),
+        ("--overall-timeout-seconds", "21601"),
+    ],
+)
+def test_timeout_arguments_have_closed_upper_bounds(argument: str, value: str) -> None:
+    module = _load_runner()
+
+    with pytest.raises(SystemExit):
+        module._parser().parse_args([argument, value])
+
+
+def test_release_model_profile_rejects_other_codex_quota(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    common = [
+        "--host",
+        "172.17.0.10",
+        "--user",
+        "openevo",
+        "--expected-host-key-fingerprint",
+        "SHA256:gWwUMfG3M8znKorAt75ZwhPErkeG8aojtCjJ8kaNl3U",
+        "--sidecar",
+        "sidecar",
+        "--core-wheel",
+        "openevo.whl",
+        "--framework-lock",
+        "framework-lock.json",
+        "--daemon-bundle",
+        "openevo-daemon-linux-x86_64",
+        "--daemon-manifest",
+        "openevo-daemon-bundle.json",
+        "--managed-runtime-archive",
+        "managed-runtime.tar",
+    ]
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/openevo-e2e-agent.sock")
+
+    module._validate_runtime_arguments(module._parser().parse_args(common))
+    with pytest.raises(module.E2EFailure, match="release_model_profile_required"):
+        module._validate_runtime_arguments(
+            module._parser().parse_args([*common, "--codex-model", "gpt-5"])
+        )
+    with pytest.raises(SystemExit):
+        module._parser().parse_args([*common, "--reasoning-effort", "medium"])
+
+
+def test_progress_reporter_is_redacted_and_deadline_is_fail_closed(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    module = _load_runner()
+    reporter = module.ProgressReporter(
+        interval_seconds=60,
+        overall_timeout_seconds=0.01,
+    )
+
+    reporter.emit("session_1_poll", "running", force=True)
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "stage=session_1_poll state=running" in output.err
+    assert "remaining_seconds=" in output.err
+
+    time.sleep(0.02)
+    with pytest.raises(module.E2EFailure, match="overall_timeout"):
+        reporter.remaining("session_1_poll")
+    reporter.stop_deadline_enforcement()
+    assert reporter.remaining("cleanup") == float("inf")
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")

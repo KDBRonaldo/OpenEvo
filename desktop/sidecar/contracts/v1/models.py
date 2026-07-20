@@ -22,6 +22,7 @@ from pydantic import (
 )
 from typing_extensions import TypeAliasType
 
+from openevo.codex_models import validate_codex_model_ref
 from openevo.backend.contracts.v1 import models as _core_contract
 from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
 
@@ -637,15 +638,29 @@ class ExecutionSettingsV1(StrictModel):
     capture_mode: Literal["transcript"] = "transcript"
     token_level_metrics_available: Literal[False] = False
     codex_model: AgentModelRefText | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     hf_model: HuggingFaceModel | None = None
 
     @model_validator(mode="after")
     def _mode_fields(self) -> ExecutionSettingsV1:
         if self.mode == "codex_subscription_transcript":
             if self.codex_model is None or self.hf_model is not None:
-                raise ValueError("subscription mode requires only codex_model")
-        elif self.hf_model is None or self.codex_model is not None:
-            raise ValueError("self-deployed mode requires only hf_model")
+                raise ValueError(
+                    "subscription mode requires codex_model, forbids hf_model, "
+                    "and may include reasoning_effort"
+                )
+            validate_codex_model_ref(
+                self.codex_model,
+                field_name="subscription codex_model",
+            )
+        elif (
+            self.hf_model is None
+            or self.codex_model is not None
+            or self.reasoning_effort is not None
+        ):
+            raise ValueError(
+                "self-deployed mode requires only hf_model and no reasoning_effort"
+            )
         return self
 
 

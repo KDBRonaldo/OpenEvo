@@ -30,7 +30,7 @@ import sys
 from tempfile import TemporaryDirectory, TemporaryFile
 import time
 from types import ModuleType
-from typing import Any, BinaryIO, Iterator, Mapping, Sequence
+from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import OpenerDirector, ProxyHandler, Request, build_opener
@@ -49,6 +49,15 @@ MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 128 * 1024
 MAX_EVIDENCE_ITEMS = 64
 REQUIRED_TARGET_IDS = ("agent_system", "skill_bundle", "text_memory")
+RELEASE_CODEX_MODEL = "gpt-5.3-codex-spark"
+RELEASE_REASONING_EFFORT = "high"
+MAX_POLL_SECONDS = 30.0
+MAX_PROGRESS_SECONDS = 60.0
+ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS = (0.25, 0.75, 1.5, 3.0)
+MAX_ACTIVATION_TIMEOUT_SECONDS = 1800.0
+MAX_RUN_TIMEOUT_SECONDS = 10800.0
+MAX_BUILD_TIMEOUT_SECONDS = 2400.0
+MAX_OVERALL_TIMEOUT_SECONDS = 21600.0
 RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v3: "
 CONTEXT_CANARY_INSTRUCTION = (
     "\n\nOpenEvo E2E context canary v1: when OPENEVO_MEMORY_FILE, "
@@ -93,6 +102,7 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "kind",
         "issue",
         "real_process_boundary",
+        "run_mode",
         "outcome",
         "started_at",
         "finished_at",
@@ -130,10 +140,18 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "execution_mode",
         "capture_mode",
         "token_level_metrics_available",
+        "codex_model",
+        "reasoning_effort",
         "target_ids",
         "method_ids",
         "registry_digest",
         "validation_check_count",
+        "verification_scope",
+        "session_count",
+        "evolution_targets_enabled",
+        "evolution_e2e_verified",
+        "codex_subscription_transcript_verified",
+        "disabled_target_ids",
         "sessions",
         "ordinal",
         "run_id_sha256",
@@ -162,6 +180,7 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "produced_revision",
         "release_enabled",
         "source_artifact_count",
+        "source_dataset_count",
         "artifact_count",
         "artifact_evidence_truncated",
         "artifact_inspections",
@@ -175,12 +194,13 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "adapter_count",
         "reuse",
         "successor_generation_delta",
+        "followup_admitted_after_successor_active",
         "session_1_excluded_own_successor",
         "session_2_pinned_session_1_successor",
         "session_1_artifacts_reused",
         "session_2_runtime_injection_verified",
-        "session_2_harness_context_consumed",
         "session_2_lineage_verified",
+        "transcript_dataset_lineage_verified",
         "reused_artifact_count",
         "successor_revision",
         "cleanup",
@@ -219,6 +239,63 @@ class E2EFailure(RuntimeError):
         self.stage = stage
         self.code = code
         self.http_status = http_status
+
+
+class ProgressReporter:
+    """Emit fixed, credential-free progress and enforce one overall deadline."""
+
+    def __init__(
+        self,
+        *,
+        interval_seconds: float,
+        overall_timeout_seconds: float,
+    ) -> None:
+        self._interval = interval_seconds
+        self._started = time.monotonic()
+        self._deadline = self._started + overall_timeout_seconds
+        self._last_emit = float("-inf")
+        self._last_observation: tuple[str, str] | None = None
+        self._enforce_deadline = True
+
+    def remaining(self, stage: str) -> float:
+        if not self._enforce_deadline:
+            return float("inf")
+        remaining = self._deadline - time.monotonic()
+        if remaining <= 0:
+            raise E2EFailure(stage, "overall_timeout")
+        return remaining
+
+    def phase_deadline(self, stage: str, timeout_seconds: float) -> float:
+        return time.monotonic() + min(timeout_seconds, self.remaining(stage))
+
+    def stop_deadline_enforcement(self) -> None:
+        self._enforce_deadline = False
+
+    def heartbeat(self, stage: str, state: object) -> None:
+        if time.monotonic() - self._last_emit >= self._interval:
+            self.emit(stage, state, force=True)
+
+    def emit(self, stage: str, state: object, *, force: bool = False) -> None:
+        now = time.monotonic()
+        safe_stage = _safe_code(stage)
+        safe_state = _safe_code(state)
+        observation = (safe_stage, safe_state)
+        if (
+            force
+            or observation != self._last_observation
+            or now - self._last_emit >= self._interval
+        ):
+            remaining = max(0, math.ceil(self._deadline - now))
+            elapsed = max(0, math.floor(now - self._started))
+            print(
+                "Desktop real-science E2E progress "
+                f"stage={safe_stage} state={safe_state} "
+                f"elapsed_seconds={elapsed} remaining_seconds={remaining}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._last_emit = now
+            self._last_observation = observation
 
 
 @dataclass(frozen=True)
@@ -421,10 +498,17 @@ class SessionObservation:
 
 
 class LocalApi:
-    def __init__(self, base_url: str, session_token: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        session_token: str,
+        *,
+        progress: ProgressReporter | None = None,
+    ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session_token = session_token
         self._opener: OpenerDirector = build_opener(ProxyHandler({}))
+        self._progress = progress
 
     def request(
         self,
@@ -438,6 +522,9 @@ class LocalApi:
         authenticated: bool = True,
         expected_empty_body: bool = False,
     ) -> dict[str, Any] | None:
+        if self._progress is not None:
+            self._progress.remaining(stage)
+            self._progress.heartbeat(stage, "requesting")
         request_headers = dict(headers or {})
         if authenticated:
             request_headers[DESKTOP_SESSION_HEADER] = self._session_token
@@ -465,6 +552,8 @@ class LocalApi:
             payload = _read_bounded(exc)
         except (OSError, URLError) as exc:
             raise E2EFailure(stage, "desktop_local_api_unreachable") from exc
+        if self._progress is not None:
+            self._progress.remaining(stage)
         if status not in statuses:
             remote_code = _remote_error_code(payload)
             raise E2EFailure(stage, remote_code, http_status=status)
@@ -525,11 +614,14 @@ class DesktopScienceWorkflow:
         host_key_algorithm: str,
         expected_host_key_fingerprint: str,
         codex_model: str,
+        reasoning_effort: str,
         task_title: str,
         task_objective: str,
         poll_seconds: float,
         activation_timeout_seconds: float,
         run_timeout_seconds: float,
+        smoke: bool = False,
+        progress: ProgressReporter | None = None,
     ) -> None:
         self._api = api
         self._host = host
@@ -538,20 +630,62 @@ class DesktopScienceWorkflow:
         self._host_key_algorithm = host_key_algorithm
         self._expected_host_key_fingerprint = expected_host_key_fingerprint
         self._codex_model = codex_model
+        self._reasoning_effort = reasoning_effort
         self._task_title = task_title
-        self._task_objective = task_objective.rstrip() + CONTEXT_CANARY_INSTRUCTION
+        self._smoke = smoke
+        self._task_objective = task_objective.rstrip()
+        if not smoke:
+            self._task_objective += CONTEXT_CANARY_INSTRUCTION
         self._poll_seconds = poll_seconds
         self._activation_timeout = activation_timeout_seconds
         self._run_timeout = run_timeout_seconds
+        self._progress = progress
         self._nonce = secrets.token_hex(12)
         self.profile_id: str | None = None
         self.project_id: str | None = None
         self._method_ids: dict[str, str] = {}
+        self._disabled_target_ids: frozenset[str] = frozenset()
+        self._expected_followup_successor: dict[str, Any] | None = None
         self._active_run: dict[str, Any] | None = None
 
     def run(self) -> dict[str, object]:
+        self._emit_progress("workflow", "started", force=True)
         profile = self._create_and_confirm_profile()
         project = self._create_and_activate_project(profile)
+        if self._smoke:
+            capabilities, disabled_target_ids = self._disable_and_activate_targets(project)
+            project = self._get_project()
+            validation = self._validate_project(project)
+            if validation.get("registry_digest") != capabilities["registry_digest"]:
+                raise E2EFailure("project_validation", "registry_digest_changed")
+
+            run = self._create_run(project, ordinal=1)
+            run = self._wait_run(run, ordinal=1)
+            observation = self._observe_session(run, ordinal=1)
+            self._assert_smoke_session(observation)
+            self._emit_progress("workflow", "succeeded", force=True)
+            return {
+                "run_mode": "single_session_smoke",
+                "verification_scope": [
+                    "desktop_sidecar",
+                    "ssh_bootstrap",
+                    "daemon_core",
+                    "codex_subscription_transcript",
+                ],
+                "session_count": 1,
+                "evolution_targets_enabled": False,
+                "evolution_e2e_verified": False,
+                "codex_subscription_transcript_verified": True,
+                "remote": self._remote_evidence(),
+                "project": self._project_evidence(
+                    capabilities=capabilities,
+                    validation=validation,
+                    target_ids=[],
+                    disabled_target_ids=disabled_target_ids,
+                ),
+                "sessions": [observation.evidence],
+            }
+
         capabilities = self._select_and_activate_targets(project)
         project = self._get_project()
         validation = self._validate_project(project)
@@ -564,39 +698,91 @@ class DesktopScienceWorkflow:
         self._assert_successful_session(first, ordinal=1)
 
         current_project = self._get_project()
+        self._prepare_followup_successor(first, current_project)
         second_run = self._create_run(current_project, ordinal=2)
         second_run = self._wait_run(second_run, ordinal=2)
         second = self._observe_session(second_run, ordinal=2)
         self._assert_successful_session(second, ordinal=2)
         reuse = self._assert_successor_reuse(first, second)
+        self._emit_progress("workflow", "succeeded", force=True)
 
         return {
-            "remote": {
-                "host_sha256": _digest_text(self._host),
-                "port": self._port,
-                "user_sha256": _digest_text(self._user),
-                "host_key_fingerprint_sha256": _digest_text(self._expected_host_key_fingerprint),
-            },
-            "project": {
-                "project_id_sha256": _digest_text(self.project_id or ""),
-                "execution_mode": "codex_subscription_transcript",
-                "capture_mode": "transcript",
-                "token_level_metrics_available": False,
-                "target_ids": list(REQUIRED_TARGET_IDS),
-                "method_ids": dict(sorted(self._method_ids.items())),
-                "registry_digest": capabilities["registry_digest"],
-                "validation_check_count": len(validation.get("checks", [])),
-            },
+            "run_mode": "two_session_subscription_release",
+            "verification_scope": [
+                "desktop_sidecar",
+                "ssh_bootstrap",
+                "daemon_core",
+                "codex_subscription_transcript",
+                "cross_session_evolution",
+            ],
+            "session_count": 2,
+            "evolution_targets_enabled": True,
+            "evolution_e2e_verified": True,
+            "codex_subscription_transcript_verified": True,
+            "remote": self._remote_evidence(),
+            "project": self._project_evidence(
+                capabilities=capabilities,
+                validation=validation,
+                target_ids=list(REQUIRED_TARGET_IDS),
+            ),
             "sessions": [first.evidence, second.evidence],
             "reuse": reuse,
         }
 
-    def cleanup(self) -> dict[str, bool]:
-        run_cleanup = self._cancel_active_run()
+    def _emit_progress(self, stage: str, state: object, *, force: bool = False) -> None:
+        if self._progress is not None:
+            self._progress.emit(stage, state, force=force)
+
+    def _remote_evidence(self) -> dict[str, object]:
         return {
+            "host_sha256": _digest_text(self._host),
+            "port": self._port,
+            "user_sha256": _digest_text(self._user),
+            "host_key_fingerprint_sha256": _digest_text(self._expected_host_key_fingerprint),
+        }
+
+    def _project_evidence(
+        self,
+        *,
+        capabilities: Mapping[str, object],
+        validation: Mapping[str, object],
+        target_ids: list[str],
+        disabled_target_ids: list[str] | None = None,
+    ) -> dict[str, object]:
+        evidence: dict[str, object] = {
+            "project_id_sha256": _digest_text(self.project_id or ""),
+            "execution_mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "codex_model": self._codex_model,
+            "reasoning_effort": self._reasoning_effort,
+            "target_ids": target_ids,
+            "method_ids": dict(sorted(self._method_ids.items())),
+            "registry_digest": capabilities["registry_digest"],
+            "validation_check_count": len(validation.get("checks", [])),
+        }
+        if disabled_target_ids is not None:
+            evidence["disabled_target_ids"] = disabled_target_ids
+        return evidence
+
+    def cleanup(self) -> dict[str, bool]:
+        self._emit_progress("cleanup", "started", force=True)
+        run_cleanup = self._cancel_active_run()
+        result = {
             **run_cleanup,
             "desktop_disconnect_succeeded": self._disconnect(),
         }
+        self._emit_progress(
+            "cleanup",
+            (
+                "succeeded"
+                if result["active_run_cleanup_succeeded"]
+                and result["desktop_disconnect_succeeded"]
+                else "failed"
+            ),
+            force=True,
+        )
+        return result
 
     def _cancel_active_run(self) -> dict[str, bool]:
         outcome = {
@@ -637,6 +823,7 @@ class DesktopScienceWorkflow:
             self._active_run = cancelling
             deadline = time.monotonic() + 120.0
             while cancelling.get("status") not in TERMINAL_RUN_STATES:
+                self._emit_progress("cleanup_run_cancel", cancelling.get("status"))
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     outcome["active_run_cleanup_succeeded"] = False
@@ -775,6 +962,7 @@ class DesktopScienceWorkflow:
                     "capture_mode": "transcript",
                     "token_level_metrics_available": False,
                     "codex_model": self._codex_model,
+                    "reasoning_effort": self._reasoning_effort,
                 },
                 "evolution": {
                     "targets": {
@@ -818,27 +1006,27 @@ class DesktopScienceWorkflow:
         _require_operation_success(operation, stage)
         project = self._get_project()
         remote = project.get("remote")
+        execution = project.get("execution")
         if project.get("state") != "active" or not isinstance(remote, dict):
             raise E2EFailure(stage, "project_not_active")
+        if (
+            not isinstance(execution, dict)
+            or execution.get("mode") != "codex_subscription_transcript"
+            or execution.get("capture_mode") != "transcript"
+            or execution.get("token_level_metrics_available") is not False
+            or execution.get("codex_model") != self._codex_model
+            or execution.get("reasoning_effort") != self._reasoning_effort
+            or execution.get("hf_model") is not None
+        ):
+            raise E2EFailure(stage, "codex_runtime_settings_not_persisted")
         if remote.get("status") != "ready" or not isinstance(remote.get("active_revision"), dict):
             raise E2EFailure(stage, "remote_project_not_ready")
         return project
 
     def _select_and_activate_targets(self, project: dict[str, Any]) -> dict[str, Any]:
-        capabilities = self._api.request(
-            "GET",
-            f"/desktop/v1/projects/{self.project_id}/capabilities",
-            stage="project_capabilities",
-        )
-        assert capabilities is not None
-        body = capabilities.get("capabilities")
-        if not isinstance(body, dict) or not _is_sha256(body.get("registry_digest")):
-            raise E2EFailure("project_capabilities", "invalid_registry_digest")
-        targets = body.get("targets")
-        if not isinstance(targets, list):
-            raise E2EFailure("project_capabilities", "invalid_target_inventory")
-        if capabilities.get("project_etag") != project.get("etag"):
-            raise E2EFailure("project_capabilities", "project_etag_mismatch")
+        body = self._get_capabilities(project)
+        targets = body["targets"]
+        assert isinstance(targets, list)
         target_map = {item.get("target_id"): item for item in targets if isinstance(item, dict)}
         selections: dict[str, dict[str, object]] = {}
         for target_id in REQUIRED_TARGET_IDS:
@@ -948,6 +1136,69 @@ class DesktopScienceWorkflow:
             raise E2EFailure("project_target_activate", "registry_digest_changed")
         return body
 
+    def _get_capabilities(self, project: Mapping[str, object]) -> dict[str, Any]:
+        capabilities = self._api.request(
+            "GET",
+            f"/desktop/v1/projects/{self.project_id}/capabilities",
+            stage="project_capabilities",
+        )
+        assert capabilities is not None
+        body = capabilities.get("capabilities")
+        if not isinstance(body, dict) or not _is_sha256(body.get("registry_digest")):
+            raise E2EFailure("project_capabilities", "invalid_registry_digest")
+        targets = body.get("targets")
+        if not isinstance(targets, list):
+            raise E2EFailure("project_capabilities", "invalid_target_inventory")
+        if capabilities.get("project_etag") != project.get("etag"):
+            raise E2EFailure("project_capabilities", "project_etag_mismatch")
+        return body
+
+    def _disable_and_activate_targets(
+        self,
+        project: dict[str, Any],
+    ) -> tuple[dict[str, Any], list[str]]:
+        capabilities = self._get_capabilities(project)
+        targets = capabilities["targets"]
+        assert isinstance(targets, list)
+        target_ids = sorted(
+            item["target_id"]
+            for item in targets
+            if isinstance(item, dict)
+            and isinstance(item.get("target_id"), str)
+            and item["target_id"]
+        )
+        if len(target_ids) != len(targets) or len(set(target_ids)) != len(target_ids):
+            raise E2EFailure("project_capabilities", "invalid_target_inventory")
+        self._disabled_target_ids = frozenset(target_ids)
+        selections = {
+            target_id: {"enabled": False, "method": None, "config": {}} for target_id in target_ids
+        }
+        patched = self._api.request(
+            "PATCH",
+            f"/desktop/v1/projects/{self.project_id}",
+            stage="project_target_disable",
+            headers={"If-Match": _etag(project, "project_target_disable")},
+            body={"evolution": {"targets": selections}},
+        )
+        assert patched is not None
+        activated = self._activate_project(patched, stage="project_target_disable_activate")
+        if _nested(activated, "remote", "registry_digest") != capabilities["registry_digest"]:
+            raise E2EFailure("project_target_disable_activate", "registry_digest_changed")
+        active_targets = _nested(activated, "evolution", "targets")
+        if (
+            not isinstance(active_targets, dict)
+            or set(active_targets) != set(target_ids)
+            or any(
+                not isinstance(selection, dict) or selection.get("enabled") is not False
+                for selection in active_targets.values()
+            )
+        ):
+            raise E2EFailure(
+                "project_target_disable_activate",
+                "evolution_targets_not_disabled",
+            )
+        return capabilities, target_ids
+
     def _validate_project(self, project: dict[str, Any]) -> dict[str, Any]:
         validation = self._api.request(
             "POST",
@@ -986,19 +1237,26 @@ class DesktopScienceWorkflow:
 
     def _wait_run(self, run: dict[str, Any], *, ordinal: int) -> dict[str, Any]:
         run_id = _text(run, "id", f"session_{ordinal}_poll")
-        deadline = time.monotonic() + self._run_timeout
+        stage = f"session_{ordinal}_poll"
+        deadline = (
+            time.monotonic() + self._run_timeout
+            if self._progress is None
+            else self._progress.phase_deadline(stage, self._run_timeout)
+        )
         while run.get("status") not in TERMINAL_RUN_STATES:
+            self._emit_progress(stage, run.get("status"))
             if time.monotonic() >= deadline:
-                raise E2EFailure(f"session_{ordinal}_poll", "run_timeout")
-            time.sleep(self._poll_seconds)
+                raise E2EFailure(stage, "run_timeout")
+            time.sleep(min(self._poll_seconds, max(0.0, deadline - time.monotonic())))
             observed = self._api.request(
                 "GET",
                 f"/desktop/v1/runs/{run_id}",
-                stage=f"session_{ordinal}_poll",
+                stage=stage,
             )
             assert observed is not None
             run = observed
             self._active_run = run
+        self._emit_progress(stage, run.get("status"), force=True)
         self._active_run = None
         return run
 
@@ -1041,11 +1299,7 @@ class DesktopScienceWorkflow:
                 f"/desktop/v1/artifacts/{artifact_id}",
                 stage=f"session_{ordinal}_artifact_detail",
             )
-            content = self._api.request(
-                "GET",
-                f"/desktop/v1/artifacts/{artifact_id}/content",
-                stage=f"session_{ordinal}_artifact_content",
-            )
+            content = self._artifact_content(artifact_id, ordinal=ordinal)
             assert detail is not None and content is not None
             if detail.get("id") != artifact_id or content.get("artifact_id") != artifact_id:
                 raise E2EFailure(
@@ -1138,6 +1392,14 @@ class DesktopScienceWorkflow:
         if not isinstance(run.get("pinned_revision"), dict):
             raise E2EFailure(f"session_{ordinal}_terminal", "revision_not_pinned")
         if (
+            run.get("execution_mode") != "codex_subscription_transcript"
+            or run.get("capture_mode") != "transcript"
+        ):
+            raise E2EFailure(
+                f"session_{ordinal}_terminal",
+                "subscription_execution_contract_mismatch",
+            )
+        if (
             observation.context.get("capture_mode") != "transcript"
             or observation.context.get("token_level_metrics_available") is not False
         ):
@@ -1167,6 +1429,39 @@ class DesktopScienceWorkflow:
             )
         if set(observation.document_sha256_by_target) != set(REQUIRED_TARGET_IDS):
             raise E2EFailure(f"session_{ordinal}_artifacts", "artifact_inspection_incomplete")
+        for target_id, items in artifacts_by_target.items():
+            artifact = items[0]
+            produced_revision = artifact.get("produced_revision")
+            membership_revisions = artifact.get("membership_revisions")
+            lineage = artifact.get("lineage")
+            source_dataset_ids = (
+                lineage.get("source_dataset_ids") if isinstance(lineage, dict) else None
+            )
+            if (
+                artifact.get("artifact_type") != target_id
+                or artifact.get("selected") is not True
+                or artifact.get("release_enabled") is not True
+                or not _is_sha256(artifact.get("content_sha256"))
+                or not isinstance(artifact.get("byte_size"), int)
+                or artifact["byte_size"] <= 0
+                or not isinstance(membership_revisions, list)
+                or produced_revision not in membership_revisions
+                or not isinstance(lineage, dict)
+                or not isinstance(lineage.get("method_id"), str)
+                or not lineage["method_id"]
+                or not isinstance(lineage.get("job_id"), str)
+                or not lineage["job_id"]
+                or not isinstance(source_dataset_ids, list)
+                or not source_dataset_ids
+                or any(
+                    not isinstance(dataset_id, str) or not dataset_id
+                    for dataset_id in source_dataset_ids
+                )
+            ):
+                raise E2EFailure(
+                    f"session_{ordinal}_artifacts",
+                    "typed_transcript_artifact_contract_mismatch",
+                )
         revisions = {
             json.dumps(artifact.get("produced_revision"), sort_keys=True)
             for items in artifacts_by_target.values()
@@ -1174,6 +1469,45 @@ class DesktopScienceWorkflow:
         }
         if len(revisions) != 1:
             raise E2EFailure(f"session_{ordinal}_artifacts", "output_revision_inconsistent")
+        observation.evidence["transcript_dataset_lineage_verified"] = True
+
+    def _assert_smoke_session(self, observation: SessionObservation) -> None:
+        run = observation.run
+        if run.get("status") != "succeeded":
+            error = run.get("current_error")
+            code = error.get("code") if isinstance(error, dict) else "run_not_succeeded"
+            raise E2EFailure("session_1_terminal", _safe_code(code))
+        if not isinstance(run.get("pinned_revision"), dict):
+            raise E2EFailure("session_1_terminal", "revision_not_pinned")
+        if (
+            observation.context.get("capture_mode") != "transcript"
+            or observation.context.get("token_level_metrics_available") is not False
+        ):
+            raise E2EFailure("session_1_context", "capture_contract_mismatch")
+        timeline_evidence = observation.evidence.get("timeline")
+        phases = (
+            set(timeline_evidence.get("phase_values", []))
+            if isinstance(timeline_evidence, dict)
+            else set()
+        )
+        if "execution" not in phases or "terminal" not in phases:
+            raise E2EFailure("session_1_timeline", "terminal_evidence_missing")
+        logs_evidence = observation.evidence.get("logs")
+        if not isinstance(logs_evidence, dict) or logs_evidence.get("count", 0) < 1:
+            raise E2EFailure("session_1_logs", "logs_missing")
+        if (
+            any(
+                artifact.get("target_id") in self._disabled_target_ids
+                for artifact in observation.artifacts
+                if isinstance(artifact, dict)
+            )
+            or observation.document_sha256_by_target
+        ):
+            raise E2EFailure("session_1_artifacts", "smoke_evolution_artifact_present")
+        context_artifacts = observation.context.get("artifacts")
+        adapters = observation.context.get("adapters")
+        if context_artifacts != [] or adapters != []:
+            raise E2EFailure("session_1_context", "smoke_evolution_context_present")
 
     def _assert_successor_reuse(
         self,
@@ -1210,8 +1544,19 @@ class DesktopScienceWorkflow:
             raise E2EFailure("successor_reuse", "successor_artifact_not_selected")
         if successor["generation"] != first_pin["generation"] + 1:
             raise E2EFailure("successor_reuse", "successor_generation_invalid")
+        if self._expected_followup_successor != successor:
+            raise E2EFailure(
+                "successor_reuse",
+                "followup_successor_not_prepared",
+            )
+        required_revision = _nested(second.run, "required_revision")
+        if (
+            not isinstance(required_revision, dict)
+            or required_revision.get("relation") != "active"
+        ):
+            raise E2EFailure("successor_reuse", "followup_revision_not_active")
         required = _revision(
-            _nested(second.run, "required_revision", "revision"),
+            required_revision.get("revision"),
             "reuse_second_required",
         )
         if second_pin != successor or required != successor:
@@ -1271,16 +1616,83 @@ class DesktopScienceWorkflow:
             raise E2EFailure("successor_reuse", "runtime_context_receipt_mismatch")
         return {
             "successor_generation_delta": 1,
+            "followup_admitted_after_successor_active": True,
             "session_1_excluded_own_successor": True,
             "session_2_pinned_session_1_successor": True,
             "session_1_artifacts_reused": True,
             "session_2_runtime_injection_verified": True,
-            "session_2_harness_context_consumed": True,
             "session_2_lineage_verified": True,
             "runtime_context_receipt_sha256": receipt_sha256,
             "reused_artifact_count": len(reused),
             "successor_revision": _revision_evidence(successor, "successor_reuse"),
         }
+
+    def _prepare_followup_successor(
+        self,
+        first: SessionObservation,
+        project: Mapping[str, object],
+    ) -> None:
+        first_pin = _revision(
+            first.run.get("pinned_revision"),
+            "followup_admission_predecessor",
+        )
+        produced_revisions = {
+            json.dumps(artifact.get("produced_revision"), sort_keys=True)
+            for artifact in first.artifacts
+            if artifact.get("target_id") in REQUIRED_TARGET_IDS
+        }
+        if len(produced_revisions) != 1:
+            raise E2EFailure(
+                "followup_admission",
+                "successor_output_revision_inconsistent",
+            )
+        successor = _revision(
+            next(
+                artifact.get("produced_revision")
+                for artifact in first.artifacts
+                if artifact.get("target_id") in REQUIRED_TARGET_IDS
+            ),
+            "followup_admission_successor",
+        )
+        observed_active = _revision(
+            _nested(project, "remote", "active_revision"),
+            "followup_admission_active_revision",
+        )
+        if (
+            _nested(project, "remote", "status") != "ready"
+            or successor["generation"] != first_pin["generation"] + 1
+            or observed_active not in (first_pin, successor)
+        ):
+            raise E2EFailure(
+                "followup_admission",
+                "followup_project_authority_invalid",
+            )
+        # The Local Project projection is a durable last observation and may still
+        # show the predecessor here. The second Core admission below is the
+        # authoritative proof that the successor became active before follow-up.
+        self._expected_followup_successor = dict(successor)
+
+    def _artifact_content(self, artifact_id: str, *, ordinal: int) -> dict[str, Any]:
+        stage = f"session_{ordinal}_artifact_content"
+        for attempt in range(len(ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS) + 1):
+            try:
+                content = self._api.request(
+                    "GET",
+                    f"/desktop/v1/artifacts/{artifact_id}/content",
+                    stage=stage,
+                )
+                assert content is not None
+                return content
+            except E2EFailure as exc:
+                if (
+                    exc.code != "artifact_content_invalid"
+                    or exc.http_status != 422
+                    or attempt == len(ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS)
+                ):
+                    raise
+                self._emit_progress(stage, "waiting")
+                time.sleep(ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS[attempt])
+        raise AssertionError("artifact content retry loop did not return")
 
     def _wait_operation(
         self,
@@ -1290,11 +1702,16 @@ class DesktopScienceWorkflow:
         timeout_seconds: float,
     ) -> dict[str, Any]:
         operation_id = _text(operation, "operation_id", stage)
-        deadline = time.monotonic() + timeout_seconds
+        deadline = (
+            time.monotonic() + timeout_seconds
+            if self._progress is None
+            else self._progress.phase_deadline(stage, timeout_seconds)
+        )
         while operation.get("state") not in TERMINAL_OPERATION_STATES:
+            self._emit_progress(stage, operation.get("state"))
             if time.monotonic() >= deadline:
                 raise E2EFailure(stage, "operation_timeout")
-            time.sleep(self._poll_seconds)
+            time.sleep(min(self._poll_seconds, max(0.0, deadline - time.monotonic())))
             observed = self._api.request(
                 "GET",
                 f"/desktop/v1/operations/{operation_id}",
@@ -1302,6 +1719,7 @@ class DesktopScienceWorkflow:
             )
             assert observed is not None
             operation = observed
+        self._emit_progress(stage, operation.get("state"), force=True)
         return operation
 
     def _get_profile(self) -> dict[str, Any]:
@@ -1335,6 +1753,7 @@ def _build_assets(
     daemon_manifest: Path,
     *,
     timeout_seconds: float,
+    progress: ProgressReporter | None = None,
 ) -> ReleaseAssets:
     root.mkdir(parents=True, exist_ok=True)
     managed_runtime_archive = Path(os.path.abspath(managed_runtime_archive))
@@ -1375,6 +1794,7 @@ def _build_assets(
             process,
             process_group_id=process_group_id,
             timeout_seconds=timeout_seconds,
+            progress=progress,
         )
         if returncode != 0:
             raise E2EFailure("release_assets", "sidecar_build_failed")
@@ -1554,7 +1974,12 @@ def _wheel_identity(wheel: Path) -> tuple[str, str]:
     return name, version
 
 
-def _launch_sidecar(assets: ReleaseAssets, root: Path) -> NativeSidecar:
+def _launch_sidecar(
+    assets: ReleaseAssets,
+    root: Path,
+    *,
+    progress: ProgressReporter | None = None,
+) -> NativeSidecar:
     if os.name != "posix":
         raise E2EFailure("native_launch", "posix_process_boundary_required")
     root.mkdir(parents=True, exist_ok=True)
@@ -1649,17 +2074,31 @@ def _launch_sidecar(assets: ReleaseAssets, root: Path) -> NativeSidecar:
         process_log=process_log,
     )
     try:
-        _wait_sidecar_ready(native)
+        _wait_sidecar_ready(native, progress=progress)
     except BaseException:
         native.terminate()
         raise
     return native
 
 
-def _wait_sidecar_ready(native: NativeSidecar) -> None:
-    api = LocalApi(native.base_url, native.credentials.session_token)
-    deadline = time.monotonic() + 60
+def _wait_sidecar_ready(
+    native: NativeSidecar,
+    *,
+    progress: ProgressReporter | None = None,
+) -> None:
+    api = LocalApi(
+        native.base_url,
+        native.credentials.session_token,
+        progress=progress,
+    )
+    deadline = (
+        time.monotonic() + 60
+        if progress is None
+        else progress.phase_deadline("native_readiness", 60)
+    )
     while time.monotonic() < deadline:
+        if progress is not None:
+            progress.emit("native_readiness", "waiting")
         if _process_exited_without_reap(native.process):
             raise E2EFailure("native_launch", "sidecar_exited_before_readiness")
         challenge = secrets.token_hex(32)
@@ -1690,6 +2129,8 @@ def _wait_sidecar_ready(native: NativeSidecar) -> None:
             and health.get("instance_id") == native.credentials.instance_id
             and hmac.compare_digest(str(health.get("instance_proof", "")), expected)
         ):
+            if progress is not None:
+                progress.emit("native_readiness", "succeeded", force=True)
             return
         time.sleep(0.25)
     raise E2EFailure("native_launch", "sidecar_readiness_timeout")
@@ -1954,6 +2395,7 @@ def _event_inventory(
 def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, object]:
     lineage = artifact.get("lineage")
     source_artifact_ids = lineage.get("source_artifact_ids") if isinstance(lineage, dict) else None
+    source_dataset_ids = lineage.get("source_dataset_ids") if isinstance(lineage, dict) else None
     return {
         "artifact_id_sha256": _digest_text(_text(artifact, "id", stage)),
         "artifact_type": artifact.get("artifact_type"),
@@ -1965,6 +2407,9 @@ def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, 
         "release_enabled": artifact.get("release_enabled"),
         "source_artifact_count": len(source_artifact_ids)
         if isinstance(source_artifact_ids, list)
+        else -1,
+        "source_dataset_count": len(source_dataset_ids)
+        if isinstance(source_dataset_ids, list)
         else -1,
         "produced_revision": _revision_evidence(artifact.get("produced_revision"), stage),
     }
@@ -2214,14 +2659,30 @@ def _wait_for_build_process_group(
     *,
     process_group_id: int,
     timeout_seconds: float,
+    progress: ProgressReporter | None = None,
 ) -> int:
-    if not _wait_exited_without_reap(process, timeout_seconds=timeout_seconds):
+    deadline = (
+        time.monotonic() + timeout_seconds
+        if progress is None
+        else progress.phase_deadline("release_assets", timeout_seconds)
+    )
+    try:
+        while not _process_exited_without_reap(process):
+            if progress is not None:
+                progress.emit("release_assets", "building")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise E2EFailure("release_assets", "sidecar_build_timeout")
+            time.sleep(min(0.25, remaining))
+    except BaseException:
         _terminate_process_group(
             process,
             process_group_id=process_group_id,
             graceful_timeout_seconds=0,
         )
-        raise E2EFailure("release_assets", "sidecar_build_timeout")
+        raise
+    if progress is not None:
+        progress.emit("release_assets", "built", force=True)
     if not _terminate_process_group(
         process,
         process_group_id=process_group_id,
@@ -2308,9 +2769,7 @@ def _validate_runtime_arguments(args: argparse.Namespace) -> None:
         raise E2EFailure("arguments", "core_release_pair_required")
     if args.core_wheel is None or args.framework_lock is None:
         raise E2EFailure("arguments", "core_release_pair_required")
-    if args.sidecar is not None and (
-        args.core_wheel is None or args.framework_lock is None
-    ):
+    if args.sidecar is not None and (args.core_wheel is None or args.framework_lock is None):
         raise E2EFailure("arguments", "release_asset_triplet_required")
     if args.daemon_bundle is None or args.daemon_manifest is None:
         raise E2EFailure("arguments", "daemon_release_pair_required")
@@ -2324,6 +2783,11 @@ def _validate_runtime_arguments(args: argparse.Namespace) -> None:
         raise E2EFailure("arguments", "host_key_fingerprint_invalid")
     if not os.environ.get("SSH_AUTH_SOCK"):
         raise E2EFailure("arguments", "ssh_agent_unavailable")
+    if (
+        getattr(args, "codex_model", None) != RELEASE_CODEX_MODEL
+        or getattr(args, "reasoning_effort", None) != RELEASE_REASONING_EFFORT
+    ):
+        raise E2EFailure("arguments", "release_model_profile_required")
 
 
 def _positive_finite_seconds(value: str) -> float:
@@ -2334,6 +2798,16 @@ def _positive_finite_seconds(value: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a finite positive number")
     return parsed
+
+
+def _seconds_at_most(maximum: float) -> Callable[[str], float]:
+    def parse(value: str) -> float:
+        parsed = _positive_finite_seconds(value)
+        if parsed > maximum:
+            raise argparse.ArgumentTypeError(f"must be no greater than {maximum:g}")
+        return parsed
+
+    return parse
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2367,7 +2841,12 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("desktop-real-science-e2e-evidence.json"),
     )
-    parser.add_argument("--codex-model", default="gpt-5.3-codex-spark")
+    parser.add_argument("--codex-model", default=RELEASE_CODEX_MODEL)
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=(RELEASE_REASONING_EFFORT,),
+        default=RELEASE_REASONING_EFFORT,
+    )
     parser.add_argument("--task-title", default="Release Desktop science E2E")
     parser.add_argument(
         "--task-objective",
@@ -2376,23 +2855,46 @@ def _parser() -> argparse.ArgumentParser:
             "and complete without requesting user input."
         ),
     )
-    parser.add_argument("--poll-seconds", type=_positive_finite_seconds, default=2.0)
+    parser.add_argument(
+        "--poll-seconds",
+        type=_seconds_at_most(MAX_POLL_SECONDS),
+        default=2.0,
+    )
+    parser.add_argument(
+        "--progress-seconds",
+        type=_seconds_at_most(MAX_PROGRESS_SECONDS),
+        default=30.0,
+    )
     parser.add_argument(
         "--activation-timeout-seconds",
-        type=_positive_finite_seconds,
+        type=_seconds_at_most(MAX_ACTIVATION_TIMEOUT_SECONDS),
         default=1200.0,
     )
     parser.add_argument(
         "--run-timeout-seconds",
-        type=_positive_finite_seconds,
+        type=_seconds_at_most(MAX_RUN_TIMEOUT_SECONDS),
         default=7200.0,
     )
     parser.add_argument(
         "--build-timeout-seconds",
-        type=_positive_finite_seconds,
+        type=_seconds_at_most(MAX_BUILD_TIMEOUT_SECONDS),
         default=1800.0,
     )
     parser.add_argument(
+        "--overall-timeout-seconds",
+        type=_seconds_at_most(MAX_OVERALL_TIMEOUT_SECONDS),
+        default=MAX_OVERALL_TIMEOUT_SECONDS,
+    )
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--smoke",
+        action="store_true",
+        help=(
+            "Run exactly one real Codex subscription transcript session with every "
+            "remote evolution target disabled. This is not evolution E2E evidence."
+        ),
+    )
+    mode.add_argument(
         "--structural-check",
         action="store_true",
         help="Check runner/release structure only; does not run E2E or write evidence.",
@@ -2415,7 +2917,17 @@ def main(argv: list[str] | None = None) -> int:
     def interrupt_for_cleanup(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
 
+    def overall_timeout(_signum: int, _frame: object) -> None:
+        raise E2EFailure("overall", "overall_timeout")
+
     signal.signal(signal.SIGTERM, interrupt_for_cleanup)
+    signal.signal(signal.SIGALRM, overall_timeout)
+    signal.setitimer(signal.ITIMER_REAL, args.overall_timeout_seconds)
+    progress = ProgressReporter(
+        interval_seconds=args.progress_seconds,
+        overall_timeout_seconds=args.overall_timeout_seconds,
+    )
+    progress.emit("runner", "started", force=True)
 
     started_at = _utc_now()
     evidence: dict[str, object] = {
@@ -2426,6 +2938,21 @@ def main(argv: list[str] | None = None) -> int:
         "outcome": "failed",
         "started_at": started_at,
     }
+    if args.smoke:
+        evidence.update(
+            {
+                "run_mode": "single_session_smoke",
+                "verification_scope": [
+                    "desktop_sidecar",
+                    "ssh_bootstrap",
+                    "daemon_core",
+                    "codex_subscription_transcript",
+                ],
+                "session_count": 1,
+                "evolution_targets_enabled": False,
+                "evolution_e2e_verified": False,
+            }
+        )
     private_values = [os.environ.get("SSH_AUTH_SOCK", "")]
     native: NativeSidecar | None = None
     assets: ReleaseAssets | None = None
@@ -2453,8 +2980,10 @@ def main(argv: list[str] | None = None) -> int:
                     args.daemon_bundle,
                     args.daemon_manifest,
                     timeout_seconds=args.build_timeout_seconds,
+                    progress=progress,
                 )
             else:
+                progress.emit("release_assets", "inspecting", force=True)
                 assets = _inspect_release_assets(
                     args.sidecar,
                     args.core_wheel,
@@ -2463,10 +2992,15 @@ def main(argv: list[str] | None = None) -> int:
                     args.daemon_bundle,
                     args.daemon_manifest,
                 )
+                progress.emit("release_assets", "verified", force=True)
             evidence["release_assets"] = assets.evidence
-            native = _launch_sidecar(assets, root / "native")
+            native = _launch_sidecar(assets, root / "native", progress=progress)
             private_values.extend(native.credentials.private_values())
-            api = LocalApi(native.base_url, native.credentials.session_token)
+            api = LocalApi(
+                native.base_url,
+                native.credentials.session_token,
+                progress=progress,
+            )
             evidence["desktop"] = _release_identity(api)
             workflow = DesktopScienceWorkflow(
                 api,
@@ -2476,11 +3010,14 @@ def main(argv: list[str] | None = None) -> int:
                 host_key_algorithm=args.host_key_algorithm,
                 expected_host_key_fingerprint=args.expected_host_key_fingerprint,
                 codex_model=args.codex_model,
+                reasoning_effort=args.reasoning_effort,
                 task_title=args.task_title,
                 task_objective=args.task_objective,
                 poll_seconds=args.poll_seconds,
                 activation_timeout_seconds=args.activation_timeout_seconds,
                 run_timeout_seconds=args.run_timeout_seconds,
+                smoke=args.smoke,
+                progress=progress,
             )
             evidence.update(workflow.run())
             evidence["outcome"] = "passed"
@@ -2498,6 +3035,8 @@ def main(argv: list[str] | None = None) -> int:
                 "code": "unexpected_runner_failure",
             }
         finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            progress.stop_deadline_enforcement()
             if workflow is not None:
                 cleanup.update(workflow.cleanup())
             if native is not None:
@@ -2532,7 +3071,14 @@ def main(argv: list[str] | None = None) -> int:
     if evidence_write_failed:
         return 1
     if exit_code == 0:
-        print("Desktop real-science E2E passed; bounded evidence written.")
+        if args.smoke:
+            print(
+                "Desktop real-science single-session smoke passed; "
+                "Desktop/SSH/Daemon/Core/Codex subscription transcript verified, "
+                "evolution E2E was not run; bounded evidence written."
+            )
+        else:
+            print("Desktop real-science E2E passed; bounded evidence written.")
     else:
         failure = evidence.get("failure")
         code = failure.get("code") if isinstance(failure, dict) else "unknown_failure"

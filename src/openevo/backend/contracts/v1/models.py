@@ -17,10 +17,12 @@ from pydantic import (
     Field,
     RootModel,
     StringConstraints,
+    ValidationInfo,
     field_validator,
     model_validator,
 )
 
+from openevo.codex_models import codex_cli_model_name, validate_codex_model_ref
 from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
 from openevo.evolution.framework.plan import ProjectEvolutionTargetMap
 from openevo.evolution.framework.profiles import ReleaseExecutionMode
@@ -293,6 +295,7 @@ class HealthResponseV1(ContractModel):
 
 
 ExecutionMode = ReleaseExecutionMode
+CodexReasoningEffort = Literal["low", "medium", "high", "xhigh"]
 
 
 class CaptureMode(StrEnum):
@@ -745,15 +748,41 @@ class ProjectSpecV1(ContractModel):
             "received from Desktop hf_model; it is not a managed-model resource ID."
         )
     )
+    reasoning_effort: CodexReasoningEffort | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Codex reasoning effort for subscription execution. Null preserves "
+            "compatibility with projects created before this setting was exposed."
+        ),
+    )
     evolution: EvolutionConfigV1
 
     @model_validator(mode="after")
-    def _subscription_requires_transcript(self) -> ProjectSpecV1:
+    def _subscription_requires_transcript(self, info: ValidationInfo) -> ProjectSpecV1:
         if (
             self.execution_mode is ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
             and self.capture_mode is not CaptureMode.TRANSCRIPT
         ):
             raise ValueError("subscription execution requires transcript capture")
+        historical_placeholder_recovery = (
+            info.context is not None
+            and info.context.get("_openevo_historical_codex_model_recovery") is True
+            and codex_cli_model_name(self.agent_model_ref) == "gpt-5"
+        )
+        if (
+            self.execution_mode is ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+            and not historical_placeholder_recovery
+        ):
+            validate_codex_model_ref(
+                self.agent_model_ref,
+                field_name="subscription agent_model_ref",
+            )
+        if (
+            self.execution_mode is not ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+            and self.reasoning_effort is not None
+        ):
+            raise ValueError("reasoning_effort is only valid for Codex subscription execution")
         return self
 
 

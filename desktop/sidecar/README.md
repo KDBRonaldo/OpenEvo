@@ -420,6 +420,14 @@ rolls the transaction back to the reopenable v4 layout. Oversized,
 configuration-incompatible, noncanonical, trigger-tampered, partially replayed,
 or equal-length rewritten state fails closed.
 
+The v5 -> v6 migration adds the explicit evolution-configuration state to
+projects and `ProjectV1` idempotency replays. The v6 -> v7 migration replaces
+only the historical subscription value `codex_model="gpt-5"` with `gpt-5.5`;
+other invalid model references are not inferred or rewritten. Both migrations
+probe row counts and BLOB lengths before exact-length guarded reads, validate
+the complete closed models, rebuild and reseal storage usage, and publish DDL,
+ledger row, and `user_version` in the same rollback transaction.
+
 The authority assumes the owner-only signing key remains confidential and is not
 an external monotonic anchor. An offline attacker who restores a complete earlier
 database snapshot, or who reads the key and coherently rewrites every authenticated
@@ -1007,7 +1015,7 @@ Environment proxy discovery and redirects are disabled. Discovery calls are
 unauthenticated, while every `/v1` request attaches the bearer only to the
 fixed origin. The client first validates and pins one release `openevo_core`
 `/version` response whose OpenAPI digest is exactly
-`006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed`.
+`2c68afc2b6490bf83a20b294b88398ac53fad4a7c449a66b687a13d71a87ef50`.
 Every authenticated `/v1` call fails before transport until that negotiation
 succeeds; simulator, scaffold, dry-run, development, and changed release
 identities are rejected. Mutations require their contract-declared idempotency

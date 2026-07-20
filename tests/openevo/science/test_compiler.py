@@ -121,6 +121,21 @@ def test_subscription_project_compiles_to_transcript_experiment_config() -> None
     assert not hasattr(compiled, "artifacts")
 
 
+def test_subscription_project_forwards_explicit_reasoning_effort() -> None:
+    compiled = compile_science_project(
+        _project(
+            execution={
+                "mode": "codex_subscription_transcript",
+                "codex_model": "gpt-5.3-codex-spark",
+                "reasoning_effort": "xhigh",
+            }
+        )
+    )
+
+    assert compiled.agent.model == "gpt-5.3-codex-spark"
+    assert compiled.agent.settings["reasoning_effort"] == "xhigh"
+
+
 def test_local_inference_compiles_to_transcript_proxy_auth_and_hf_model_metadata_env() -> None:
     compiled = compile_science_project(
         _project(

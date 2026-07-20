@@ -140,7 +140,7 @@ def test_execution_envelope_separates_config_and_legacy_adapter_is_exact(
         target_id="agent_system",
         method_id="agent_system_reflector",
         method_identity_digest="c" * 64,
-        user_config={"reflector_llm": {"model": "gpt-5"}},
+        user_config={"reflector_llm": {"model": "gpt-5.5"}},
         core_config={"round_index": 2, "task_id": "task-1"},
         input_bindings=(
             ResolvedMethodInputBinding(
@@ -184,7 +184,7 @@ def test_execution_envelope_separates_config_and_legacy_adapter_is_exact(
     legacy_job = observed["job"]
     assert isinstance(legacy_job, WorkerClaimedJob)
     assert legacy_job.config == {
-        "reflector_llm": {"model": "gpt-5"},
+        "reflector_llm": {"model": "gpt-5.5"},
         "round_index": 2,
         "task_id": "task-1",
     }

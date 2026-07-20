@@ -79,6 +79,7 @@ export interface FixtureProviderOptions {
   newUser?: boolean;
   releaseExecutionModes?: boolean;
   projectExecutionMode?: ProjectV1["execution"]["mode"];
+  projectReasoningEffort?: ProjectV1["execution"]["reasoning_effort"];
   projectId?: string;
   includeParametricMemory?: boolean;
 }
@@ -171,7 +172,11 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     this.profiles = newUser ? [] : [this.makeProfile(online ? "connected" : "disconnected")];
     this.projects = newUser
       ? []
-      : [this.makeProjectFixture(options.projectExecutionMode, options.projectId)];
+      : [this.makeProjectFixture(
+          options.projectExecutionMode,
+          options.projectId,
+          options.projectReasoningEffort,
+        )];
     this.state = newUser ? this.makeNewUserState() : this.makeState(online ? "online" : "offline");
     this.capabilities = online
       ? this.makeCapabilities(
@@ -1449,6 +1454,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
   private makeProjectFixture(
     executionMode: ProjectV1["execution"]["mode"] = "self-deployed",
     projectId?: string,
+    reasoningEffort?: ProjectV1["execution"]["reasoning_effort"],
   ): ProjectV1 {
     const project = structuredClone(CONTRACT_FIXTURE_V1.project);
     const desktopProjectId = projectId ?? project.project_id;
@@ -1463,6 +1469,9 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         capture_mode: "transcript",
         token_level_metrics_available: false,
         codex_model: subscription ? modelRef : null,
+        reasoning_effort: subscription
+          ? reasoningEffort === undefined ? "high" : reasoningEffort
+          : null,
         hf_model: subscription ? null : modelRef,
       },
       remote: project.remote ? {
@@ -2458,6 +2467,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
         capture_mode: "transcript",
         token_level_metrics_available: false,
         codex_model: "gpt-5.5",
+        reasoning_effort: "high",
         hf_model: null,
       },
       evolution: { targets: {} },

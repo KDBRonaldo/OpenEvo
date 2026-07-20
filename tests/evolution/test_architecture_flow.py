@@ -185,7 +185,7 @@ def test_transcript_to_resolved_text_memory_architecture_flow(
         trajectory=trajectory,
         node_id="node-architecture-flow",
         metadata={
-            "agent": {"harness": "codex", "model_name": "gpt-5"},
+            "agent": {"harness": "codex", "model_name": "gpt-5.5"},
             "policy_version": "policy_architecture_flow",
             "rollout_step": 1,
         },

@@ -49,7 +49,7 @@ from desktop.sidecar.contracts.v1.models import (
 from desktop.sidecar.workspace_identity import project_id_for_native_import
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 DATABASE_FILENAME = "provider.sqlite3"
 JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
 WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
@@ -965,12 +965,8 @@ _SCHEMA_V5 = (
     _SCHEMA_MIGRATION_DELETE_GUARD_V5,
 )
 
-_PROVIDER_USAGE_INSERT_GUARD_V6 = _PROVIDER_USAGE_INSERT_GUARD_V5.replace(
-    ">= 5", ">= 6"
-)
-_SCHEMA_MIGRATION_INSERT_GUARD_V6 = _SCHEMA_MIGRATION_INSERT_GUARD_V5.replace(
-    ">= 5", ">= 6"
-)
+_PROVIDER_USAGE_INSERT_GUARD_V6 = _PROVIDER_USAGE_INSERT_GUARD_V5.replace(">= 5", ">= 6")
+_SCHEMA_MIGRATION_INSERT_GUARD_V6 = _SCHEMA_MIGRATION_INSERT_GUARD_V5.replace(">= 5", ">= 6")
 _SCHEMA_V6 = (
     """
     CREATE TABLE schema_migrations (
@@ -991,6 +987,32 @@ _SCHEMA_V6 = (
     _PROVIDER_USAGE_INSERT_GUARD_V6,
     _PROVIDER_USAGE_DELETE_GUARD_V5,
     _SCHEMA_MIGRATION_INSERT_GUARD_V6,
+    _SCHEMA_MIGRATION_UPDATE_GUARD_V5,
+    _SCHEMA_MIGRATION_DELETE_GUARD_V5,
+)
+
+_PROVIDER_USAGE_INSERT_GUARD_V7 = _PROVIDER_USAGE_INSERT_GUARD_V5.replace(">= 5", ">= 7")
+_SCHEMA_MIGRATION_INSERT_GUARD_V7 = _SCHEMA_MIGRATION_INSERT_GUARD_V5.replace(">= 5", ">= 7")
+_SCHEMA_V7 = (
+    """
+    CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version BETWEEN 1 AND 7),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    _SCHEMA_V3[1],
+    _PROJECTS_TABLE_V5,
+    _SCHEMA_V3[3],
+    _IDEMPOTENCY_RECORDS_TABLE_V5,
+    *_SCHEMA_V3[5:16],
+    "CREATE INDEX idempotency_expiry_idx ON "
+    "idempotency_records(cleanup_eligible, expires_at_epoch)",
+    _SCHEMA_V3[17],
+    _PROVIDER_STORAGE_USAGE_TABLE_V5,
+    *_PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5,
+    _PROVIDER_USAGE_INSERT_GUARD_V7,
+    _PROVIDER_USAGE_DELETE_GUARD_V5,
+    _SCHEMA_MIGRATION_INSERT_GUARD_V7,
     _SCHEMA_MIGRATION_UPDATE_GUARD_V5,
     _SCHEMA_MIGRATION_DELETE_GUARD_V5,
 )
@@ -1049,12 +1071,53 @@ def _canonical_json_bytes(value: Any) -> bytes:
         raise ContractValidationError("value is not canonical JSON data") from exc
 
 
+def _rewrite_historical_codex_placeholder(document: dict[str, Any]) -> bool:
+    execution = document.get("execution")
+    if (
+        type(execution) is dict
+        and execution.get("mode") == "codex_subscription_transcript"
+        and execution.get("codex_model") == "gpt-5"
+    ):
+        execution["codex_model"] = "gpt-5.5"
+        return True
+    return False
+
+
+def _project_create_idempotency_value(request: ProjectCreateV1) -> dict[str, Any]:
+    value = cast(dict[str, Any], request.model_dump(mode="json"))
+    execution = cast(dict[str, Any], value["execution"])
+    if execution.get("reasoning_effort") is None:
+        execution.pop("reasoning_effort", None)
+    if request.evolution_configuration_state == "configured":
+        value.pop("evolution_configuration_state")
+    return value
+
+
+def _project_create_from_response(project: ProjectV1) -> ProjectCreateV1:
+    return ProjectCreateV1.model_validate(
+        {
+            "name": project.name,
+            "profile_id": project.profile_id,
+            "task": project.task.model_dump(mode="json"),
+            "source": project.source.model_dump(mode="json"),
+            "execution": project.execution.model_dump(mode="json"),
+            "evolution": project.evolution.model_dump(mode="json"),
+            "evolution_configuration_state": project.evolution_configuration_state,
+        }
+    )
+
+
 _EXPECTED_SCHEMA_V1_ROWS, _EXPECTED_SCHEMA_V1_DIGEST = _expected_schema(_SCHEMA_V1)
 _EXPECTED_SCHEMA_V2_ROWS, _EXPECTED_SCHEMA_V2_DIGEST = _expected_schema(_SCHEMA_V2)
 _EXPECTED_SCHEMA_V3_ROWS, _EXPECTED_SCHEMA_V3_DIGEST = _expected_schema(_SCHEMA_V3)
 _EXPECTED_SCHEMA_V4_ROWS, _EXPECTED_SCHEMA_V4_DIGEST = _expected_schema(_SCHEMA_V4)
 _EXPECTED_SCHEMA_V5_ROWS, _EXPECTED_SCHEMA_V5_DIGEST = _expected_schema(_SCHEMA_V5)
-_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = _expected_schema(_SCHEMA_V6)
+_EXPECTED_SCHEMA_V6_ROWS, _EXPECTED_SCHEMA_V6_DIGEST = _expected_schema(_SCHEMA_V6)
+_EXPECTED_SCHEMA_V7_ROWS, _EXPECTED_SCHEMA_V7_DIGEST = _expected_schema(_SCHEMA_V7)
+_EXPECTED_SCHEMA_ROWS, _EXPECTED_SCHEMA_DIGEST = (
+    _EXPECTED_SCHEMA_V7_ROWS,
+    _EXPECTED_SCHEMA_V7_DIGEST,
+)
 
 
 def _decode_json_object(raw: bytes, *, label: str) -> dict[str, Any]:
@@ -1799,10 +1862,10 @@ class DesktopProviderStore:
             ) from exc
         self._validate_private_file_stat(DATABASE_FILENAME, opened_stat)
         managed_stat = self._verify_private_file(DATABASE_FILENAME)
-        if (
-            (opened_stat.st_dev, opened_stat.st_ino) != self._database_identity
-            or (managed_stat.st_dev, managed_stat.st_ino) != self._database_identity
-        ):
+        if (opened_stat.st_dev, opened_stat.st_ino) != self._database_identity or (
+            managed_stat.st_dev,
+            managed_stat.st_ino,
+        ) != self._database_identity:
             raise ProviderStateRootError("SQLite opened an unexpected provider database inode")
 
     def _load_or_create_cursor_key(self) -> bytes:
@@ -1967,7 +2030,7 @@ class DesktopProviderStore:
                 }
                 if existing:
                     raise ProviderSchemaError("unversioned provider database is not empty")
-                for statement in _SCHEMA_V6:
+                for statement in _SCHEMA_V7:
                     connection.execute(statement)
                 timestamp = self._timestamp()
                 self._insert_provider_storage_usage(
@@ -1992,6 +2055,7 @@ class DesktopProviderStore:
                         (4, timestamp),
                         (5, timestamp),
                         (6, timestamp),
+                        (7, timestamp),
                     ),
                 )
                 self._validate_unsealed_write_budget(connection)
@@ -2054,10 +2118,20 @@ class DesktopProviderStore:
                     label="v5",
                 )
                 self._validate_migration_rows(connection, expected_version=5)
+            elif version == 6:
+                self._validate_schema_version(
+                    connection,
+                    rows=_EXPECTED_SCHEMA_V6_ROWS,
+                    digest=_EXPECTED_SCHEMA_V6_DIGEST,
+                    label="v6",
+                )
+                self._validate_migration_rows(connection, expected_version=6)
             elif version != SCHEMA_VERSION:
                 raise ProviderSchemaError(f"unsupported provider schema version {version}")
             if 1 <= version <= 5:
                 self._migrate_v5_to_v6(connection)
+            if 1 <= version <= 6:
+                self._migrate_v6_to_v7(connection)
             self._validate_schema(connection)
             self._verify_storage_files()
             connection.commit()
@@ -2362,15 +2436,15 @@ class DesktopProviderStore:
             label="v5",
         )
         self._validate_migration_rows(connection, expected_version=5)
-        self._validate_provider_storage_usage_authority(connection)
+        usage_values, _ = self._validate_provider_storage_usage_authority(connection)
+        self._validate_write_budget_values(usage_values)
+        self._validate_configured_record_capacities(usage_values)
         self._validate_recovery_budget(connection)
         self._reconcile_provider_storage_usage(connection)
 
         for table, _columns in _RECOVERY_USAGE_SPECIFICATIONS:
             for operation in ("insert", "update", "delete"):
-                connection.execute(
-                    f"DROP TRIGGER provider_usage_{table}_{operation}"
-                )
+                connection.execute(f"DROP TRIGGER provider_usage_{table}_{operation}")
         for trigger_name in (
             "provider_storage_usage_no_insert",
             "provider_storage_usage_no_delete",
@@ -2423,6 +2497,7 @@ class DesktopProviderStore:
                     "v5 project unexpectedly contains evolution setup state"
                 )
             document["evolution_configuration_state"] = "configured"
+            _rewrite_historical_codex_placeholder(document)
             migrated = _validate_json_model(ProjectCreateV1, document)
             updated = connection.execute(
                 "UPDATE projects SET document_json = ? WHERE project_id = ?",
@@ -2490,6 +2565,7 @@ class DesktopProviderStore:
                     "v5 project replay unexpectedly contains evolution setup state"
                 )
             response["evolution_configuration_state"] = "configured"
+            _rewrite_historical_codex_placeholder(response)
             migrated_response = _validate_json_model(ProjectV1, response)
             updated = connection.execute(
                 """
@@ -2504,9 +2580,7 @@ class DesktopProviderStore:
                 ),
             )
             if updated.rowcount != 1:
-                raise ProviderDataCorruptionError(
-                    "project replay migration identity changed"
-                )
+                raise ProviderDataCorruptionError("project replay migration identity changed")
 
         connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v5")
         connection.execute(_SCHEMA_V6[0])
@@ -2521,9 +2595,7 @@ class DesktopProviderStore:
         connection.execute(_PROVIDER_STORAGE_USAGE_TABLE_V5)
 
         total_rows, total_bytes = self._recovery_usage(connection)
-        remote_count, maximum_bytes, remote_bytes = self._remote_state_recovery_usage(
-            connection
-        )
+        remote_count, maximum_bytes, remote_bytes = self._remote_state_recovery_usage(connection)
         self._validate_remote_state_recovery_usage(
             payload_count=remote_count,
             maximum_bytes=maximum_bytes,
@@ -2541,12 +2613,8 @@ class DesktopProviderStore:
             remote_accumulators=self._remote_content_accumulators(connection),
             profile_reservations=profile_reservations,
             project_reservations=project_reservations,
-            idempotency_record_count=self._table_record_count(
-                connection, "idempotency_records"
-            ),
-            pagination_cursor_count=self._table_record_count(
-                connection, "pagination_cursors"
-            ),
+            idempotency_record_count=self._table_record_count(connection, "idempotency_records"),
+            pagination_cursor_count=self._table_record_count(connection, "pagination_cursors"),
             generation=0,
         )
         for statement in (
@@ -2566,13 +2634,222 @@ class DesktopProviderStore:
         self._seal_provider_storage_usage(connection)
         connection.execute("PRAGMA user_version = 6")
 
+    def _migrate_v6_to_v7(self, connection: sqlite3.Connection) -> None:
+        self._validate_schema_version(
+            connection,
+            rows=_EXPECTED_SCHEMA_V6_ROWS,
+            digest=_EXPECTED_SCHEMA_V6_DIGEST,
+            label="v6",
+        )
+        self._validate_migration_rows(connection, expected_version=6)
+        usage_values, _ = self._validate_provider_storage_usage_authority(connection)
+        self._validate_write_budget_values(usage_values)
+        self._validate_configured_record_capacities(usage_values)
+        self._validate_recovery_budget(connection)
+        self._reconcile_provider_storage_usage(connection)
+
+        for table, _columns in _RECOVERY_USAGE_SPECIFICATIONS:
+            for operation in ("insert", "update", "delete"):
+                connection.execute(f"DROP TRIGGER provider_usage_{table}_{operation}")
+        for trigger_name in (
+            "provider_storage_usage_no_insert",
+            "provider_storage_usage_no_delete",
+            "schema_migrations_no_insert",
+            "schema_migrations_no_update",
+            "schema_migrations_no_delete",
+        ):
+            connection.execute(f"DROP TRIGGER {trigger_name}")
+
+        project_rows = connection.execute(
+            """
+            SELECT project_id, length(CAST(document_json AS BLOB)) AS document_bytes
+            FROM projects
+            ORDER BY project_id
+            LIMIT ?
+            """,
+            (MAX_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(project_rows) > MAX_RECOVERY_ROWS:
+            raise ProviderDataCorruptionError(
+                "project migration row count exceeds the recovery limit"
+            )
+        for identity in project_rows:
+            project_id = cast(str, identity["project_id"])
+            document_bytes = identity["document_bytes"]
+            if (
+                type(document_bytes) is not int
+                or document_bytes < 2
+                or document_bytes > MAX_DOCUMENT_BYTES
+            ):
+                raise ProviderDataCorruptionError("project migration document size is invalid")
+            row = connection.execute(
+                """
+                SELECT CASE
+                    WHEN length(CAST(document_json AS BLOB)) = ? THEN document_json
+                    ELSE NULL
+                END AS document_json
+                FROM projects
+                WHERE project_id = ?
+                """,
+                (document_bytes, project_id),
+            ).fetchone()
+            if row is None or type(row["document_json"]) is not bytes:
+                raise ProviderDataCorruptionError(
+                    "project migration document changed while reading"
+                )
+            document = _decode_json_object(bytes(row["document_json"]), label="project")
+            _rewrite_historical_codex_placeholder(document)
+            migrated = _validate_json_model(ProjectCreateV1, document)
+            updated = connection.execute(
+                "UPDATE projects SET document_json = ? WHERE project_id = ?",
+                (_canonical_json_bytes(migrated.model_dump(mode="json")), project_id),
+            )
+            if updated.rowcount != 1:
+                raise ProviderDataCorruptionError("project migration identity changed")
+
+        response_rows = connection.execute(
+            """
+            SELECT principal, method, route, resource_scope, idempotency_key,
+                   length(CAST(response_bytes AS BLOB)) AS response_length
+            FROM idempotency_records
+            WHERE response_type = 'ProjectV1'
+            ORDER BY principal, method, route, resource_scope, idempotency_key
+            LIMIT ?
+            """,
+            (MAX_RECOVERY_ROWS + 1,),
+        ).fetchall()
+        if len(response_rows) > MAX_RECOVERY_ROWS:
+            raise ProviderDataCorruptionError(
+                "project replay migration row count exceeds the recovery limit"
+            )
+        for identity in response_rows:
+            response_length = identity["response_length"]
+            if (
+                type(response_length) is not int
+                or response_length < 2
+                or response_length > MAX_RESPONSE_BYTES
+            ):
+                raise ProviderDataCorruptionError(
+                    "project replay migration response size is invalid"
+                )
+            key = tuple(
+                cast(str, identity[column])
+                for column in (
+                    "principal",
+                    "method",
+                    "route",
+                    "resource_scope",
+                    "idempotency_key",
+                )
+            )
+            row = connection.execute(
+                """
+                SELECT CASE
+                    WHEN length(CAST(response_bytes AS BLOB)) = ? THEN response_bytes
+                    ELSE NULL
+                END AS response_bytes
+                FROM idempotency_records
+                WHERE principal = ? AND method = ? AND route = ?
+                  AND resource_scope = ? AND idempotency_key = ?
+                """,
+                (response_length, *key),
+            ).fetchone()
+            if row is None or type(row["response_bytes"]) is not bytes:
+                raise ProviderDataCorruptionError(
+                    "project replay migration response changed while reading"
+                )
+            response = _decode_json_object(
+                bytes(row["response_bytes"]), label="project idempotency response"
+            )
+            _rewrite_historical_codex_placeholder(response)
+            migrated_response = _validate_json_model(ProjectV1, response)
+            migrated_request_digest: str | None = None
+            if (
+                key[0] == LOCAL_PRINCIPAL
+                and key[1] == "POST"
+                and key[2] == "/desktop/v1/projects"
+                and key[3] == "projects"
+            ):
+                migrated_request = _project_create_from_response(migrated_response)
+                migrated_request_digest = sha256(
+                    _canonical_json_bytes(_project_create_idempotency_value(migrated_request))
+                ).hexdigest()
+            updated = connection.execute(
+                """
+                UPDATE idempotency_records
+                SET response_bytes = ?,
+                    request_digest = coalesce(?, request_digest)
+                WHERE principal = ? AND method = ? AND route = ?
+                  AND resource_scope = ? AND idempotency_key = ?
+                """,
+                (
+                    _canonical_json_bytes(migrated_response.model_dump(mode="json")),
+                    migrated_request_digest,
+                    *key,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ProviderDataCorruptionError("project replay migration identity changed")
+
+        connection.execute("ALTER TABLE schema_migrations RENAME TO schema_migrations_v6")
+        connection.execute(_SCHEMA_V7[0])
+        connection.execute(
+            """
+            INSERT INTO schema_migrations(version, applied_at)
+            SELECT version, applied_at FROM schema_migrations_v6 ORDER BY version
+            """
+        )
+        connection.execute("DROP TABLE schema_migrations_v6")
+        connection.execute("DROP TABLE provider_storage_usage")
+        connection.execute(_PROVIDER_STORAGE_USAGE_TABLE_V5)
+
+        total_rows, total_bytes = self._recovery_usage(connection)
+        remote_count, maximum_bytes, remote_bytes = self._remote_state_recovery_usage(connection)
+        self._validate_remote_state_recovery_usage(
+            payload_count=remote_count,
+            maximum_bytes=maximum_bytes,
+            payload_bytes=remote_bytes,
+        )
+        profile_reservations, project_reservations = self._validate_live_action_authorities(
+            connection
+        )
+        self._insert_provider_storage_usage(
+            connection,
+            total_rows=total_rows,
+            total_bytes=total_bytes,
+            remote_payload_count=remote_count,
+            remote_payload_bytes=remote_bytes,
+            remote_accumulators=self._remote_content_accumulators(connection),
+            profile_reservations=profile_reservations,
+            project_reservations=project_reservations,
+            idempotency_record_count=self._table_record_count(connection, "idempotency_records"),
+            pagination_cursor_count=self._table_record_count(connection, "pagination_cursors"),
+            generation=0,
+        )
+        for statement in (
+            *_PROVIDER_USAGE_MAINTENANCE_TRIGGERS_V5,
+            _PROVIDER_USAGE_INSERT_GUARD_V7,
+            _PROVIDER_USAGE_DELETE_GUARD_V5,
+            _SCHEMA_MIGRATION_INSERT_GUARD_V7,
+            _SCHEMA_MIGRATION_UPDATE_GUARD_V5,
+            _SCHEMA_MIGRATION_DELETE_GUARD_V5,
+        ):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (7, ?)",
+            (self._timestamp(),),
+        )
+        self._validate_unsealed_write_budget(connection)
+        self._seal_provider_storage_usage(connection)
+        connection.execute("PRAGMA user_version = 7")
+
     @staticmethod
     def _validate_schema(connection: sqlite3.Connection) -> None:
         DesktopProviderStore._validate_schema_version(
             connection,
             rows=_EXPECTED_SCHEMA_ROWS,
             digest=_EXPECTED_SCHEMA_DIGEST,
-            label="v6",
+            label="v7",
         )
 
     @staticmethod
@@ -3639,11 +3916,7 @@ class DesktopProviderStore:
         def mutation(transaction: ProviderMutation) -> tuple[int, BaseModel]:
             return 201, transaction._create_project(validated)
 
-        request_value = validated.model_dump(mode="json")
-        # Preserve the canonical v5 configured-project replay identity while
-        # keeping an explicit pending state distinct for the new setup wizard.
-        if validated.evolution_configuration_state == "configured":
-            request_value.pop("evolution_configuration_state")
+        request_value = _project_create_idempotency_value(validated)
         result = self._execute_idempotent(
             method="POST",
             route="/desktop/v1/projects",
@@ -4548,9 +4821,7 @@ class DesktopProviderStore:
         ):
             return None
         if admission_guard is not None:
-            project = self._project_from_row(
-                self._require_project_row(connection, identity[2])
-            )
+            project = self._project_from_row(self._require_project_row(connection, identity[2]))
             admission_guard(project)
         if row["request_digest"] != identity[4]:
             raise IdempotencyConflictError(

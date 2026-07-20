@@ -15,6 +15,7 @@ from pydantic import (
 )
 import yaml
 
+from openevo.codex_models import validate_codex_model_ref
 from openevo.projects.science import ScienceProjectConfig, load_science_project_config
 from openevo.projects.science.models import EvolutionTargetsConfig
 from openevo.deployment.profile import (
@@ -62,6 +63,7 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
     hf_home: str | None = None
     execution_mode: DesktopExecutionMode = "codex_subscription_transcript"
     codex_model: str | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     hf_model: str | None = None
     evolution: EvolutionTargetsConfig = Field(default_factory=EvolutionTargetsConfig)
 
@@ -75,7 +77,12 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
         )
         data = data | {"execution_mode": mode}
         if mode == "codex_subscription_transcript" and "codex_model" not in data:
-            return data | {"codex_model": "gpt-5.5"}
+            return data | {
+                "codex_model": "gpt-5.5",
+                "reasoning_effort": data.get("reasoning_effort", "high"),
+            }
+        if mode == "codex_subscription_transcript" and "reasoning_effort" not in data:
+            return data | {"reasoning_effort": "high"}
         return data
 
     @field_validator(
@@ -108,6 +115,8 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
         text = value.strip()
         if not text:
             raise ValueError(f"{info.field_name} must be a non-empty string")
+        if info.field_name == "codex_model":
+            return validate_codex_model_ref(text, field_name="codex_model")
         return text
 
     @model_validator(mode="after")
@@ -144,6 +153,8 @@ class DesktopProjectConfigDraft(_StrictFrozenModel):
                 raise ValueError("codex_model is only valid for subscription mode")
             if self.hf_model is None:
                 raise ValueError("hf_model is required for self-deployed mode")
+            if self.reasoning_effort is not None:
+                raise ValueError("reasoning_effort is only valid for subscription mode")
         return self
 
 
@@ -277,6 +288,7 @@ def _execution_payload(draft: DesktopProjectConfigDraft) -> dict[str, Any]:
     return {
         "mode": "codex_subscription_transcript",
         "codex_model": draft.codex_model,
+        "reasoning_effort": draft.reasoning_effort,
     }
 
 

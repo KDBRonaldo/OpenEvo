@@ -9,8 +9,10 @@ import {
   type FixtureDesktopProductProvider,
 } from "./fixtureProvider";
 import {
+  PROTEIN_STABILITY_SAMPLE_PROJECT,
   SAMPLE_SCIENTIFIC_PROJECT,
   SAMPLE_SCIENTIFIC_PROJECT_ID,
+  SAMPLE_SCIENTIFIC_PROJECTS,
 } from "./scientificProjectSampleData";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -32,6 +34,41 @@ describe("built-in scientific project sample", () => {
     }
     vi.useRealTimers();
     document.body.innerHTML = "";
+  });
+
+  it("ships two complete renderer-owned synthetic projects with three artifact carriers", () => {
+    expect(SAMPLE_SCIENTIFIC_PROJECTS).toHaveLength(2);
+    expect(new Set(SAMPLE_SCIENTIFIC_PROJECTS.map((project) => project.id)).size).toBe(2);
+    for (const project of SAMPLE_SCIENTIFIC_PROJECTS) {
+      expect(project.sessions).toHaveLength(3);
+      expect(project.sessions.map((session) => session.pinnedProjectHeadGeneration)).toEqual([0, 1, 2]);
+      expect(project.sessions.map((session) => session.successorProjectHeadGeneration)).toEqual([1, 2, 3]);
+      for (const [index, session] of project.sessions.entries()) {
+        expect(session.timeline.length).toBeGreaterThanOrEqual(4);
+        expect(session.trace.some((entry) => entry.kind === "reasoning_summary")).toBe(true);
+        expect(session.trace.some((entry) => entry.kind === "tool_call")).toBe(true);
+        expect(session.trace.some((entry) => entry.kind === "tool_result")).toBe(true);
+        const nextSession = project.sessions[index + 1];
+        if (nextSession) {
+          expect(nextSession.pinnedProjectHeadGeneration).toBe(session.successorProjectHeadGeneration);
+          expect(nextSession.pinnedEvolutionRevision).toBe(session.successorEvolutionRevision);
+        }
+      }
+      expect(project.sessions[1]?.contextUsed).toEqual(["text_memory", "skill_bundle", "agent_system"]);
+      expect(project.sessions[2]?.contextUsed).toEqual(["text_memory", "skill_bundle", "agent_system"]);
+      expect(project.evolutionTargets.map((target) => target.id).sort()).toEqual([
+        "agent_system",
+        "skill_bundle",
+        "text_memory",
+      ]);
+      for (const target of project.evolutionTargets) {
+        expect(target.steps).toHaveLength(3);
+        expect(target.artifact.content.length).toBeGreaterThan(80);
+        expect(target.artifact.diff.map((line) => line.kind)).toEqual(["removed", "added"]);
+      }
+    }
+    expect(PROTEIN_STABILITY_SAMPLE_PROJECT.sessions[0]?.outcome).toBe("needs_revision");
+    expect(PROTEIN_STABILITY_SAMPLE_PROJECT.sessions[2]?.successorEvolutionRevision).toBe("ER-PS-3");
   });
 
   it("opens the read-only sample on first launch and browses its scientific progression", async () => {

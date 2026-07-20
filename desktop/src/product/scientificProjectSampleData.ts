@@ -1,5 +1,11 @@
 // Renderer-owned product-tour content. It never enters provider or Core state.
-export const SAMPLE_SCIENTIFIC_PROJECT_ID = "desktop-sample-enzyme-kinetics";
+export const ENZYME_KINETICS_SAMPLE_PROJECT_ID = "desktop-sample-enzyme-kinetics";
+export const PROTEIN_STABILITY_SAMPLE_PROJECT_ID = "desktop-sample-protein-stability";
+export const SAMPLE_SCIENTIFIC_PROJECT_ID = ENZYME_KINETICS_SAMPLE_PROJECT_ID;
+
+export type SampleScientificProjectId =
+  | typeof ENZYME_KINETICS_SAMPLE_PROJECT_ID
+  | typeof PROTEIN_STABILITY_SAMPLE_PROJECT_ID;
 
 export type SampleOutcome = "needs_revision" | "partial" | "validated";
 export type SampleTraceKind = "reasoning_summary" | "tool_call" | "tool_result";
@@ -50,6 +56,12 @@ export interface SampleEvolutionStep {
 export interface SampleArtifactDocument {
   readonly title: string;
   readonly content: string;
+  readonly previousRevision: string;
+  readonly currentRevision: string;
+  readonly diff: readonly {
+    readonly kind: "removed" | "added";
+    readonly text: string;
+  }[];
 }
 
 export interface SampleEvolutionTarget {
@@ -63,7 +75,7 @@ export interface SampleEvolutionTarget {
 }
 
 export interface SampleScientificProject {
-  readonly id: typeof SAMPLE_SCIENTIFIC_PROJECT_ID;
+  readonly id: SampleScientificProjectId;
   readonly name: string;
   readonly badge: string;
   readonly summary: string;
@@ -355,6 +367,12 @@ export const SAMPLE_SCIENTIFIC_PROJECT: SampleScientificProject = {
 
 ## 下次会话
 - 新增观测后重新计算参数区间，不沿用旧置信区间。`,
+        previousRevision: "ER-2",
+        currentRevision: "ER-3",
+        diff: [
+          { kind: "removed", text: "高浓度残差提示底物抑制，结论仍待留出验证。" },
+          { kind: "added", text: "底物抑制模型留出相对误差为 4.7%，残差不再呈浓度趋势。" },
+        ],
       },
     },
     {
@@ -396,6 +414,12 @@ export const SAMPLE_SCIENTIFIC_PROJECT: SampleScientificProject = {
 4. 若高浓度残差持续同向，比较底物抑制候选模型。
 5. 使用任务开始前固定的留出点做模型选择。
 6. 报告参数区间、留出误差、适用范围和未解决限制。`,
+        previousRevision: "ER-2",
+        currentRevision: "ER-3",
+        diff: [
+          { kind: "removed", text: "发现结构残差后记录候选机制。" },
+          { kind: "added", text: "使用任务开始前固定的留出点比较候选模型并报告不确定性。" },
+        ],
       },
     },
     {
@@ -437,7 +461,214 @@ export const SAMPLE_SCIENTIFIC_PROJECT: SampleScientificProject = {
 - 模型比较必须使用预先固定的留出观测。
 - 最终答复必须包含参数区间、验证指标和适用范围。
 - 任一检查失败时，明确标记结论未通过，不补造结果。`,
+        previousRevision: "ER-2",
+        currentRevision: "ER-3",
+        diff: [
+          { kind: "removed", text: "基础模型存在结构残差时显式比较机制候选。" },
+          { kind: "added", text: "最终结论必须同时给出固定留出指标、不确定性和适用范围。" },
+        ],
       },
     },
   ],
 };
+
+export const PROTEIN_STABILITY_SAMPLE_PROJECT: SampleScientificProject = {
+  id: PROTEIN_STABILITY_SAMPLE_PROJECT_ID,
+  name: "蛋白质稳定性证据整合",
+  badge: "内置示例 · 合成数据 · 只读",
+  summary:
+    "用合成 DSF 与 SEC 观测，从受板次和缓冲液混杂的失败排序，逐步得到有条件边界的 L42F 稳定性结论。",
+  sourceLabel: "内置 synthetic 数据 · 48 条 DSF 曲线 + 12 条 SEC 汇总",
+  executionLabel: "Codex subscription",
+  captureLabel: "Transcript",
+  activeProjectHeadGeneration: 3,
+  activeEvolutionRevision: "ER-PS-3",
+  sessions: [
+    {
+      id: "protein-session-01",
+      sequence: 1,
+      title: "审查合并后的热转移排序",
+      objective: "比较野生型与 L42F 的表观 Tm，并确认板次、缓冲液和重复结构是否支持直接排序。",
+      occurredAt: "2026-06-22 09:10",
+      duration: "4 分 12 秒",
+      outcome: "needs_revision",
+      outcomeLabel: "结论未通过",
+      finding: "构建体与板次、pH 条件共线，跨板绝对荧光也未校准；合并后的热转移排序不能支持稳定性结论。",
+      pinnedProjectHeadGeneration: 0,
+      successorProjectHeadGeneration: 1,
+      pinnedEvolutionRevision: "ER-PS-0",
+      successorEvolutionRevision: "ER-PS-1",
+      contextUsed: [],
+      timeline: [
+        { id: "ps1-admitted", title: "任务已固定", detail: "固定 Project Head 0、Evolution Revision ER-PS-0 和 synthetic 输入摘要。", state: "completed" },
+        { id: "ps1-audit", title: "实验设计审计", detail: "发现构建体、板次和缓冲液条件无法在合并表中分离。", state: "attention" },
+        { id: "ps1-curves", title: "曲线质量检查", detail: "12 条曲线存在聚集前兆，跨板荧光尺度不一致。", state: "attention" },
+        { id: "ps1-closed", title: "失败证据已封存", detail: "拒绝构建体排序，并提交包含 ER-PS-1 的 Project Head 1。", state: "completed" },
+      ],
+      trace: [
+        { id: "ps1-r1", kind: "reasoning_summary", title: "推理摘要", summary: "先验证实验设计能否区分构建体效应，再检查曲线形状；不把表观 Tm 自动等同于稳定性。" },
+        { id: "ps1-t1", kind: "tool_call", title: "读取实验设计", tool: "Plate metadata review", summary: "汇总构建体、板次、pH、重复和对照覆盖情况，不展示文件路径或命令。" },
+        { id: "ps1-t2", kind: "tool_call", title: "检查 DSF 曲线", tool: "Curve quality review", summary: "检查 48 条 synthetic 曲线的基线、转变区和聚集前兆。" },
+        { id: "ps1-o1", kind: "tool_result", title: "安全结果摘要", summary: "混杂与尺度差异足以推翻原排序；当前不支持推荐任何构建体。" },
+      ],
+    },
+    {
+      id: "protein-session-02",
+      sequence: 2,
+      title: "执行板内归一化与重复拟合",
+      objective: "按匹配的 pH 7.4 板次归一化，估计重复感知的热转移效应，并检查聚集是否阻断解释。",
+      occurredAt: "2026-06-23 10:05",
+      duration: "5 分 31 秒",
+      outcome: "partial",
+      outcomeLabel: "暂定结果，待正交验证",
+      finding: "L42F 的板内 ΔTm 为 2.8 C，但转变附近出现聚集信号；该结果只能标记为暂定，不能形成构建体推荐。",
+      pinnedProjectHeadGeneration: 1,
+      successorProjectHeadGeneration: 2,
+      pinnedEvolutionRevision: "ER-PS-1",
+      successorEvolutionRevision: "ER-PS-2",
+      contextUsed: ["text_memory", "skill_bundle", "agent_system"],
+      timeline: [
+        { id: "ps2-admitted", title: "Project Head 1 已固定", detail: "从 ER-PS-1 加载混杂事实、板内分析技能和禁止过度结论的指令。", state: "completed" },
+        { id: "ps2-normalized", title: "板内归一化完成", detail: "仅在匹配的 pH 7.4 板次内比较构建体和对照。", state: "completed" },
+        { id: "ps2-fit", title: "重复拟合完成", detail: "L42F 的 ΔTm 估计稳定，但聚集标记仍然存在。", state: "attention" },
+        { id: "ps2-closed", title: "暂定证据已封存", detail: "要求 SEC 单体保留率验证，并提交包含 ER-PS-2 的 Project Head 2。", state: "completed" },
+      ],
+      trace: [
+        { id: "ps2-r1", kind: "reasoning_summary", title: "推理摘要", summary: "遵循 ER-PS-1：板内归一化、重复感知拟合、曲线形状审查，任一聚集警告都会阻止推荐。" },
+        { id: "ps2-t1", kind: "tool_call", title: "归一化板内对照", tool: "Plate normalization", summary: "按板次和缓冲液匹配对照，保留每个重复的身份。" },
+        { id: "ps2-t2", kind: "tool_call", title: "拟合热转移效应", tool: "Replicate-aware fit", summary: "估计 ΔTm 与 bootstrap 区间，并输出曲线质量标记。" },
+        { id: "ps2-o1", kind: "tool_result", title: "安全结果摘要", summary: "ΔTm 为 2.8 C，但聚集前兆使结论保持暂定；下一会话必须引入正交 assay。" },
+      ],
+    },
+    {
+      id: "protein-session-03",
+      sequence: 3,
+      title: "用 SEC 正交验证稳定性",
+      objective: "在盲化构建体匹配后整合 DSF 与 SEC 单体保留率，并按预先声明的规则判断是否支持 L42F。",
+      occurredAt: "2026-06-24 11:20",
+      duration: "6 分 08 秒",
+      outcome: "validated",
+      outcomeLabel: "条件化结论通过",
+      finding: "在测试的 pH 7.4 条件下，L42F ΔTm 为 3.1 C（95% 区间 2.4–3.8 C），SEC 单体保留率为 92%，野生型为 87%；其他缓冲液和长期储存仍未验证。",
+      pinnedProjectHeadGeneration: 2,
+      successorProjectHeadGeneration: 3,
+      pinnedEvolutionRevision: "ER-PS-2",
+      successorEvolutionRevision: "ER-PS-3",
+      contextUsed: ["text_memory", "skill_bundle", "agent_system"],
+      timeline: [
+        { id: "ps3-admitted", title: "Project Head 2 已固定", detail: "从 ER-PS-2 加载暂定效应、正交验证技能和报告边界。", state: "completed" },
+        { id: "ps3-joined", title: "盲化 assay 已匹配", detail: "按构建体和批次连接 DSF 重复与 SEC 汇总。", state: "completed" },
+        { id: "ps3-validated", title: "预声明规则通过", detail: "热转移与单体保留率方向一致，区间和适用条件完整。", state: "completed" },
+        { id: "ps3-closed", title: "下一项目头已就绪", detail: "提交包含 ER-PS-3 的 Project Head 3；下一 session 使用该新 revision。", state: "completed" },
+      ],
+      trace: [
+        { id: "ps3-r1", kind: "reasoning_summary", title: "推理摘要", summary: "不重新定义通过标准；按盲化映射整合两个 assay，并把结论限制在已测试的 pH 7.4 条件。" },
+        { id: "ps3-t1", kind: "tool_call", title: "连接正交证据", tool: "Evidence join", summary: "连接构建体匹配的 synthetic DSF 与 SEC 摘要，保留批次和重复身份。" },
+        { id: "ps3-t2", kind: "tool_call", title: "检查接受规则", tool: "Validation checklist", summary: "检查效应区间、assay 一致性、单体保留率和适用范围。" },
+        { id: "ps3-o1", kind: "tool_result", title: "安全结果摘要", summary: "L42F 在 pH 7.4 条件下获得支持；未声称其他缓冲液或长期储存稳定性。" },
+      ],
+    },
+  ],
+  evolutionTargets: [
+    {
+      id: "text_memory",
+      label: "文本记忆",
+      shortLabel: "Memory",
+      methodLabel: "Textual memory",
+      description: "保存实验设计限制、失败结论、暂定效应和最终适用范围。",
+      steps: [
+        { sessionId: "protein-session-01", evolutionRevision: "ER-PS-1", input: "Confounded baseline transcript", change: "记录板次、pH 与构建体共线，禁止复用合并排序。", status: "active" },
+        { sessionId: "protein-session-02", evolutionRevision: "ER-PS-2", input: "Plate-aware fit transcript", change: "保存 2.8 C 暂定效应与聚集警告，并要求 SEC 验证。", status: "active" },
+        { sessionId: "protein-session-03", evolutionRevision: "ER-PS-3", input: "Orthogonal validation transcript", change: "记录 3.1 C 区间、单体保留率和 pH 7.4 适用边界。", status: "active" },
+      ],
+      artifact: {
+        title: "memory.md",
+        content: `# 蛋白质稳定性项目记忆
+
+## 已验证事实
+- 在 pH 7.4 条件下，L42F ΔTm 为 3.1 C（95% 区间 2.4–3.8 C）。
+- synthetic SEC 汇总显示 L42F 单体保留率 92%，野生型 87%。
+
+## 限制
+- 不跨未匹配板次合并绝对荧光。
+- 其他缓冲液和长期储存稳定性尚未验证。
+
+## 下一会话
+- 使用 Project Head 3 与 Evolution Revision ER-PS-3；新增批次后重新验证区间和单体保留率。`,
+        previousRevision: "ER-PS-2",
+        currentRevision: "ER-PS-3",
+        diff: [
+          { kind: "removed", text: "L42F 板内 ΔTm 为 2.8 C，聚集未解决，结论暂定。" },
+          { kind: "added", text: "L42F ΔTm 为 3.1 C（95% 区间 2.4–3.8 C），SEC 单体保留率为 92%。" },
+        ],
+      },
+    },
+    {
+      id: "skill_bundle",
+      label: "轨迹到技能",
+      shortLabel: "Skill",
+      methodLabel: "Trajectory-to-skill",
+      description: "把板内 DSF 分析与构建体匹配的 SEC 验证提炼成可重复流程。",
+      steps: [
+        { sessionId: "protein-session-01", evolutionRevision: "ER-PS-1", input: "Rejected ranking trajectory", change: "生成实验设计审计与板内归一化步骤。", status: "active" },
+        { sessionId: "protein-session-02", evolutionRevision: "ER-PS-2", input: "Replicate-aware fit trajectory", change: "加入重复拟合、曲线形状与聚集标记。", status: "active" },
+        { sessionId: "protein-session-03", evolutionRevision: "ER-PS-3", input: "DSF and SEC synthesis trajectory", change: "加入盲化映射、assay 一致性和条件化报告。", status: "active" },
+      ],
+      artifact: {
+        title: "SKILL.md",
+        content: `# Protein Stability Evidence Review
+
+1. 审计构建体、重复、板次、缓冲液与 assay 身份。
+2. 仅在匹配板次内归一化 DSF 对照并拟合重复感知的 ΔTm。
+3. 检查聚集或非两态曲线；存在警告时保持暂定。
+4. 只连接盲化且构建体匹配的 SEC 汇总。
+5. 要求热转移与单体保留率方向一致。
+6. 报告效应、区间、assay 一致性、测试条件和下一项证伪实验。`,
+        previousRevision: "ER-PS-2",
+        currentRevision: "ER-PS-3",
+        diff: [
+          { kind: "removed", text: "聚集未解决时要求后续正交 assay。" },
+          { kind: "added", text: "连接盲化 SEC 汇总，并要求热转移与单体保留率方向一致。" },
+        ],
+      },
+    },
+    {
+      id: "agent_system",
+      label: "Agent 系统",
+      shortLabel: "Agent system",
+      methodLabel: "Agent-system evolution",
+      description: "把禁止混杂排序、正交验证和适用范围纪律写入下一会话指令。",
+      steps: [
+        { sessionId: "protein-session-01", evolutionRevision: "ER-PS-1", input: "Unsupported conclusion", change: "禁止跨未匹配板次比较或把表观 Tm 当作稳定性结论。", status: "active" },
+        { sessionId: "protein-session-02", evolutionRevision: "ER-PS-2", input: "Aggregation warning", change: "有聚集警告时必须标记暂定并要求正交验证。", status: "active" },
+        { sessionId: "protein-session-03", evolutionRevision: "ER-PS-3", input: "Scoped validated result", change: "要求结论包含区间、assay 一致性与测试条件。", status: "active" },
+      ],
+      artifact: {
+        title: "AGENTS.md",
+        content: `# 蛋白质稳定性分析约束
+
+- 不跨未匹配板次或缓冲液比较绝对荧光。
+- 不把表观 Tm 单独解释为稳定性或构建体推荐。
+- 稳定性结论必须同时有重复感知的 DSF 与构建体匹配的 SEC 证据。
+- 最终结果必须包含效应区间、assay 一致性、测试条件和未验证范围。
+- 下一会话使用 Project Head 3 中独立标识的 Evolution Revision ER-PS-3。`,
+        previousRevision: "ER-PS-2",
+        currentRevision: "ER-PS-3",
+        diff: [
+          { kind: "removed", text: "聚集未解决时不得推荐构建体。" },
+          { kind: "added", text: "稳定性结论必须同时有重复感知的 DSF 与构建体匹配的 SEC 证据。" },
+        ],
+      },
+    },
+  ],
+};
+
+export const SAMPLE_SCIENTIFIC_PROJECTS: readonly SampleScientificProject[] = [
+  SAMPLE_SCIENTIFIC_PROJECT,
+  PROTEIN_STABILITY_SAMPLE_PROJECT,
+];
+
+export function sampleScientificProject(projectId: SampleScientificProjectId): SampleScientificProject {
+  return SAMPLE_SCIENTIFIC_PROJECTS.find((project) => project.id === projectId)
+    ?? SAMPLE_SCIENTIFIC_PROJECT;
+}

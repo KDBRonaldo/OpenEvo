@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 
+from openevo.codex_models import codex_cli_model_name, validate_codex_model_ref
 from openevo.harness.base import BaseHarness
 from openevo.harness.models import AgentSpec
 from openevo.harness.presets._subscription import (
@@ -20,6 +21,7 @@ from openevo.runtime.base import (
     RUNTIME_SESSION_DIR,
 )
 from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_CANARY_CWD,
     CODEX_SUBSCRIPTION_CANARY_OK,
     codex_subscription_cli_flags,
     codex_subscription_exec_canary_command,
@@ -30,7 +32,6 @@ from openevo.runtime.managed import (
     MANAGED_CODEX_BINARY,
     MANAGED_CODEX_DEFAULT_MODEL,
     MANAGED_CODEX_HOME,
-    MANAGED_WORKSPACE,
 )
 from openevo.runtime.models import ExecInput
 
@@ -246,7 +247,22 @@ class CodexHarness(BaseHarness):
                 f"{toml_content}\nOPENEVO_CFG"
             )
 
-        # Copy skills
+        if auth_mode == AUTH_MODE_SUBSCRIPTION:
+            result = await runtime.exec(
+                codex_subscription_exec_canary_command(
+                    model=_validated_cli_model_name(self.model_name),
+                    allow_internet=self._subscription_allow_internet,
+                ),
+                cwd=CODEX_SUBSCRIPTION_CANARY_CWD,
+            )
+            if (
+                result.return_code != 0
+                or (result.stdout or "").strip() != CODEX_SUBSCRIPTION_CANARY_OK
+            ):
+                raise RuntimeError("Codex subscription credential isolation could not be proven")
+
+        # Runtime-provided skills are untrusted task context. Subscription
+        # readiness must be proven before Codex can discover them.
         for skills_path in self.effective_skill_paths():
             skill_source = shlex.quote(skills_path.rstrip("/") + "/.")
             result = await runtime.exec(
@@ -257,18 +273,6 @@ class CodexHarness(BaseHarness):
                 raise RuntimeError("Codex skill installation failed")
 
         if auth_mode == AUTH_MODE_SUBSCRIPTION:
-            result = await runtime.exec(
-                codex_subscription_exec_canary_command(
-                    model=_cli_model_name(self.model_name),
-                    allow_internet=self._subscription_allow_internet,
-                ),
-                cwd=MANAGED_WORKSPACE,
-            )
-            if (
-                result.return_code != 0
-                or (result.stdout or "").strip() != CODEX_SUBSCRIPTION_CANARY_OK
-            ):
-                raise RuntimeError("Codex subscription credential isolation could not be proven")
             self._subscription_credential_isolation = codex_subscription_readiness_receipt()
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
@@ -304,7 +308,7 @@ class CodexHarness(BaseHarness):
                     "-c 'model_providers.harness_proxy.wire_api=\"responses\"'",
                 ]
             )
-        model = _cli_model_name(self.model_name)
+        model = _validated_cli_model_name(self.model_name)
         flags.append(f"--model {shlex.quote(model)}")
 
         for key, cli in [
@@ -382,12 +386,10 @@ class CodexHarness(BaseHarness):
         )
 
 
-def _cli_model_name(model_name: str | None) -> str:
+def _validated_cli_model_name(model_name: str | None) -> str:
     model = model_name or MANAGED_CODEX_DEFAULT_MODEL
-    for prefix in ("openai/", "anthropic/", "google/", "gcp/google/"):
-        if model.startswith(prefix):
-            return model[len(prefix) :]
-    return model
+    validated = validate_codex_model_ref(model)
+    return codex_cli_model_name(validated)
 
 
 def _nonempty_env_path(value: str | None) -> str | None:

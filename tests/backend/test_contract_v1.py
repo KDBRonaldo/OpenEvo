@@ -343,7 +343,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("006fbe0ad33497329912280d9836bd1dce44f49f26fb018a9d9ba6bdf33b62ed")
+    assert openapi_sha256() == ("2c68afc2b6490bf83a20b294b88398ac53fad4a7c449a66b687a13d71a87ef50")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -489,6 +489,122 @@ def test_project_spec_uses_the_core_owned_evolution_target_map() -> None:
                 "evolution_targets": [],
             },
         )
+
+
+def test_project_spec_scopes_codex_reasoning_effort_to_subscription() -> None:
+    subscription = _json_model(
+        ProjectSpecV1,
+        {
+            "execution_mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "harness_id": "codex",
+            "agent_model_ref": "gpt-5.3-codex-spark",
+            "reasoning_effort": "xhigh",
+            "evolution": {"targets": {}},
+        },
+    )
+    assert subscription.reasoning_effort == "xhigh"
+    assert subscription.model_dump(mode="json")["reasoning_effort"] == "xhigh"
+
+    legacy_compatible = _json_model(
+        ProjectSpecV1,
+        {
+            "execution_mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "harness_id": "codex",
+            "agent_model_ref": "gpt-5.3-codex-spark",
+            "evolution": {"targets": {}},
+        },
+    )
+    assert legacy_compatible.reasoning_effort is None
+    assert "reasoning_effort" not in legacy_compatible.model_dump(mode="json")
+
+    with pytest.raises(ValidationError, match="reasoning_effort"):
+        _json_model(
+            ProjectSpecV1,
+            {
+                "execution_mode": "self-deployed",
+                "capture_mode": "transcript",
+                "harness_id": "codex",
+                "agent_model_ref": "openai/gpt-oss-20b",
+                "reasoning_effort": "high",
+                "evolution": {"targets": {}},
+            },
+        )
+
+    for agent_model_ref in (
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ):
+        with pytest.raises(ValidationError, match="bare gpt-5 is unsupported"):
+            _json_model(
+                ProjectSpecV1,
+                {
+                    "execution_mode": "codex_subscription_transcript",
+                    "capture_mode": "transcript",
+                    "harness_id": "codex",
+                    "agent_model_ref": agent_model_ref,
+                    "evolution": {"targets": {}},
+                },
+            )
+
+    for historical_model_ref in (
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ):
+        historical = ProjectSpecV1.model_validate_json(
+            json.dumps(
+                {
+                    "execution_mode": "codex_subscription_transcript",
+                    "capture_mode": "transcript",
+                    "harness_id": "codex",
+                    "agent_model_ref": historical_model_ref,
+                    "evolution": {"targets": {}},
+                }
+            ),
+            strict=True,
+            context={"_openevo_historical_codex_model_recovery": True},
+        )
+        assert historical.agent_model_ref == historical_model_ref
+
+    for agent_model_ref in (
+        "openai/",
+        "a" * 129,
+        "gpt-5.5 alpha",
+        "gpt-5.5-\u4e2d\u6587",
+    ):
+        with pytest.raises(ValidationError, match="invalid final Codex CLI model value"):
+            _json_model(
+                ProjectSpecV1,
+                {
+                    "execution_mode": "codex_subscription_transcript",
+                    "capture_mode": "transcript",
+                    "harness_id": "codex",
+                    "agent_model_ref": agent_model_ref,
+                    "evolution": {"targets": {}},
+                },
+            )
+
+        with pytest.raises(ValidationError, match="invalid final Codex CLI model value"):
+            ProjectSpecV1.model_validate_json(
+                json.dumps(
+                    {
+                        "execution_mode": "codex_subscription_transcript",
+                        "capture_mode": "transcript",
+                        "harness_id": "codex",
+                        "agent_model_ref": agent_model_ref,
+                        "evolution": {"targets": {}},
+                    }
+                ),
+                strict=True,
+                context={"_openevo_historical_codex_model_recovery": True},
+            )
 
 
 def test_self_deployed_model_ref_is_not_a_managed_model_id() -> None:

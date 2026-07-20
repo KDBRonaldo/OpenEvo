@@ -30,7 +30,7 @@ def test_managed_subscription_prepare_creates_private_agent_log_tree(
 ) -> None:
     session_root = tmp_path / "session root"
     command = managed.MANAGED_SUBSCRIPTION_PREPARE_COMMAND
-    assert command.count("/openevo/session") == 7
+    assert command.count("/openevo/session") == 9
     rebased = command.replace("/openevo/session", shlex.quote(str(session_root)))
 
     subprocess.run(
@@ -39,7 +39,11 @@ def test_managed_subscription_prepare_creates_private_agent_log_tree(
         env={"PATH": "/usr/bin:/bin"},
     )
 
-    for directory in (session_root / "logs", session_root / "logs" / "agent"):
+    for directory in (
+        session_root / "logs",
+        session_root / "logs" / "agent",
+        session_root / "home" / ".openevo-codex-readiness",
+    ):
         assert directory.is_dir()
         assert directory.stat().st_mode & 0o777 == 0o700
 

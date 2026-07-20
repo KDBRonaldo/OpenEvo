@@ -69,7 +69,11 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Remote projects could not be synchronized");
     expect(screenText()).toContain("酶动力学模型复核");
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
-    expect(document.querySelector<HTMLSelectElement>("#project-switcher")?.disabled).toBe(true);
+    const fallbackSwitcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    expect(fallbackSwitcher?.disabled).toBe(false);
+    expect(Array.from(fallbackSwitcher?.options ?? []).filter((option) =>
+      option.textContent?.includes("[只读]")
+    )).toHaveLength(2);
     expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
     expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
     expect(document.querySelector(".initial-sync-sample")).not.toBeNull();
@@ -83,6 +87,17 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("SKILL.md");
     expect(screenText()).not.toContain("Add workspace");
     expect(screenText()).not.toContain("internal refresh details");
+    const proteinOption = Array.from(fallbackSwitcher?.options ?? []).find((option) =>
+      option.textContent?.includes("蛋白质稳定性证据整合")
+    );
+    if (!fallbackSwitcher || !proteinOption) throw new Error("Second fallback sample was not found.");
+    await act(async () => {
+      fallbackSwitcher.value = proteinOption.value;
+      fallbackSwitcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(screenText()).toContain("从轨迹到 Evolution Revision ER-PS-3");
+    await clickButton("版本差异");
+    expect(screenText()).toContain("ER-PS-2 → ER-PS-3");
 
     await clickButton("Try again");
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).toBeNull();
@@ -124,6 +139,51 @@ describe("DesktopProductApp", () => {
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).toBeNull();
     expect(screenText()).toContain("Protein Design");
     expect(switcher.value).toBe(realOption.value);
+  });
+
+  it("switches between two renderer-owned synthetic demonstrations without provider mutation", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const connectProfile = vi.spyOn(provider, "connectProfile");
+    const startRun = vi.spyOn(provider, "startRun");
+    const updateProject = vi.spyOn(provider, "updateProject");
+    root = await renderProduct(provider);
+
+    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
+    if (!switcher) throw new Error("Project switcher was not found.");
+    const enzymeOption = Array.from(switcher.options).find(
+      (option) => option.textContent?.includes("[只读] 酶动力学模型复核"),
+    );
+    const proteinOption = Array.from(switcher.options).find(
+      (option) => option.textContent?.includes("[只读] 蛋白质稳定性证据整合"),
+    );
+    if (!enzymeOption || !proteinOption) {
+      throw new Error("Both synthetic demonstration projects must be discoverable.");
+    }
+
+    await act(async () => {
+      switcher.value = proteinOption.value;
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(screenText()).toContain("蛋白质稳定性证据整合");
+    expect(screenText()).toContain("内置 synthetic 数据");
+    expect(screenText()).toContain("Project Head 2 → 3");
+    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
+    await clickButton("Task 1");
+    expect(screenText()).toContain("混杂与尺度差异足以推翻原排序");
+    await clickButton("Evolution");
+    await clickButton("版本差异");
+    expect(screenText()).toContain("ER-PS-2 → ER-PS-3");
+    expect(screenText()).toContain("SEC 单体保留率为 92%");
+
+    await act(async () => {
+      switcher.value = enzymeOption.value;
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(screenText()).toContain("酶动力学模型复核");
+    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
+    expect(connectProfile).not.toHaveBeenCalled();
+    expect(startRun).not.toHaveBeenCalled();
+    expect(updateProject).not.toHaveBeenCalled();
   });
 
   it("reports readiness once after the initial product snapshot commits", async () => {
@@ -476,6 +536,7 @@ describe("DesktopProductApp", () => {
     setInput("Task title", "Compare catalyst candidates");
     setInput("Objective", "Rank candidates using reproducible evidence.");
     expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
+    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("high");
     expect(screenText()).not.toContain("Hugging Face model");
     await clickButton("Prepare evolution");
     await clickButton("Save and activate");
@@ -487,6 +548,7 @@ describe("DesktopProductApp", () => {
     expect(snapshot.snapshot.projects[0]?.execution).toMatchObject({
       mode: "codex_subscription_transcript",
       codex_model: "gpt-5.5",
+      reasoning_effort: "high",
     });
 
     await clickButton("Evolution");
@@ -543,6 +605,90 @@ describe("DesktopProductApp", () => {
     expect(button("Start session").title).toContain("Activate this project");
   });
 
+  it("preserves an older project's unpinned Codex reasoning effort on unrelated edits", async () => {
+    provider = createFixtureDesktopProductProvider({
+      startOnline: true,
+      projectExecutionMode: "codex_subscription_transcript",
+      projectReasoningEffort: null,
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("default");
+    setInput("Project name", "Preserve Codex default project");
+    setInput("Objective", "Keep the existing Codex default while changing this objective.");
+    const firstEvolutionToggle = document.querySelector<HTMLInputElement>(".target-toggle input[role='switch']");
+    if (!firstEvolutionToggle) throw new Error("Evolution target switch was not found.");
+    await act(async () => firstEvolutionToggle.click());
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.projects[0]?.execution).toMatchObject({
+      mode: "codex_subscription_transcript",
+      codex_model: "gpt-5.5",
+      reasoning_effort: null,
+    });
+  });
+
+  it.each([
+    ["low", null, "low"],
+    ["medium", null, "medium"],
+    ["high", null, "high"],
+    ["extra high", null, "xhigh"],
+    ["Codex default", "high", "default"],
+  ] as const)("saves the selected Codex reasoning effort: %s", async (_label, initialEffort, selection) => {
+    provider = createFixtureDesktopProductProvider({
+      startOnline: true,
+      projectExecutionMode: "codex_subscription_transcript",
+      projectReasoningEffort: initialEffort,
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    setSelect("Reasoning effort", selection);
+    setInput("Objective", `Save Codex reasoning effort ${selection}.`);
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.projects[0]?.execution.reasoning_effort).toBe(
+      selection === "default" ? null : selection,
+    );
+  });
+
+  it("resets Codex reasoning effort to the saved value and preserves it across mode switching", async () => {
+    provider = createFixtureDesktopProductProvider({
+      startOnline: true,
+      projectExecutionMode: "codex_subscription_transcript",
+      projectReasoningEffort: null,
+    });
+    root = await renderProduct(provider);
+
+    await clickAria("Project settings");
+    await clickButton("Self-deployed");
+    await clickButton("Subscription");
+    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("default");
+
+    setSelect("Reasoning effort", "low");
+    await clickButton("Undo");
+    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("default");
+
+    setSelect("Reasoning effort", "medium");
+    await clickButton("Self-deployed");
+    await clickButton("Subscription");
+    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("medium");
+    setInput("Objective", "Keep the selected Codex effort after switching modes.");
+    await clickButton("Save");
+
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    expect(refreshed.snapshot.projects[0]?.execution).toMatchObject({
+      mode: "codex_subscription_transcript",
+      reasoning_effort: "medium",
+    });
+  });
+
   it("keeps new-project setup open until remote evolution defaults are saved and activated", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const before = await provider.refresh();
@@ -595,7 +741,11 @@ describe("DesktopProductApp", () => {
     const activated = await provider.refresh();
     if (activated.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const created = activated.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
-    expect(created?.execution).toMatchObject({ mode: "codex_subscription_transcript", codex_model: "gpt-5.5" });
+    expect(created?.execution).toMatchObject({
+      mode: "codex_subscription_transcript",
+      codex_model: "gpt-5.5",
+      reasoning_effort: "high",
+    });
     expect(created?.evolution_configuration_state).toBe("configured");
     expect(created?.evolution.targets).toMatchObject({
       text_memory: { enabled: false },
@@ -869,6 +1019,42 @@ describe("DesktopProductApp", () => {
     await clickButton("Changes");
     await flush();
     expect(screenText()).toContain("Added for Revision 2");
+  });
+
+  it("retries a newly published artifact before showing a terminal error", async () => {
+    vi.useFakeTimers();
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const original = provider.getArtifactContent.bind(provider);
+    let calls = 0;
+    const getArtifactContent = vi.fn(async (artifactId: string) => {
+      calls += 1;
+      if (calls === 1) {
+        throw new DesktopApiError(apiErrorV1Schema.parse({
+          schema_version: "1",
+          request_id: "request-artifact-publication-1",
+          http_status: 422,
+          code: "artifact_content_invalid",
+          message: "The artifact payload is still being published.",
+          severity: "warning",
+          category: "artifact",
+          retryable: false,
+          repair_action: "openevo_can_retry",
+          next_action: "Retry the artifact preview.",
+          details: {},
+        }));
+      }
+      return original(artifactId);
+    });
+    Object.assign(provider, { getArtifactContent });
+    root = await renderProduct(provider);
+
+    await clickButton("Evolution");
+    await advance(250);
+    await flush();
+
+    expect(getArtifactContent).toHaveBeenCalledTimes(2);
+    expect(screenText()).toContain("Agent guidance");
+    expect(screenText()).not.toContain("Artifact unavailable");
   });
 
   it("shows rename and empty-file document changes without line hunks", async () => {

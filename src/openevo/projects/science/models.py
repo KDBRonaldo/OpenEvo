@@ -14,6 +14,7 @@ from pydantic import (
     model_validator,
 )
 
+from openevo.codex_models import validate_codex_model_ref
 from openevo.evolution.framework import ProjectEvolutionTargetMap
 from openevo.projects.evolution_defaults import default_project_evolution_targets
 from openevo.runtime.managed import reject_managed_subscription_env
@@ -139,6 +140,7 @@ class ExecutionConfig(_StrictModel):
         "codex_subscription_transcript"
     )
     codex_model: str | None = None
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None = None
     hf_model: str | None = None
 
     @model_validator(mode="before")
@@ -165,6 +167,8 @@ class ExecutionConfig(_StrictModel):
         data = serializer(self)
         if self.codex_model is None:
             data.pop("codex_model", None)
+        if self.reasoning_effort is None:
+            data.pop("reasoning_effort", None)
         return data
 
     @field_validator("codex_model")
@@ -172,7 +176,10 @@ class ExecutionConfig(_StrictModel):
     def _strip_codex_model(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return _strip_non_empty(value, "execution.codex_model")
+        return validate_codex_model_ref(
+            value,
+            field_name="execution.codex_model",
+        )
 
     @field_validator("hf_model")
     @classmethod
@@ -199,6 +206,10 @@ class ExecutionConfig(_StrictModel):
                 )
             if self.hf_model is None:
                 raise ValueError("execution.hf_model is required for self-deployed mode")
+            if self.reasoning_effort is not None:
+                raise ValueError(
+                    "execution.reasoning_effort is only valid for subscription transcript mode"
+                )
         return self
 
 

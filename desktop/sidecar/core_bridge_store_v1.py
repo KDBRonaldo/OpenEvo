@@ -288,7 +288,11 @@ def _model(model_type: type[_ModelT], value: object, *, label: str) -> _ModelT:
     if type(value) is not dict:
         raise CoreBridgeStoreDataCorruptionError(f"stored {label} is not an object")
     try:
-        parsed = model_type.model_validate_json(_canonical_json_bytes(value), strict=True)
+        parsed = model_type.model_validate_json(
+            _canonical_json_bytes(value),
+            strict=True,
+            context={"_openevo_historical_codex_model_recovery": True},
+        )
     except (ValidationError, ValueError, TypeError) as exc:
         raise CoreBridgeStoreDataCorruptionError(
             f"stored {label} violates its Core model"

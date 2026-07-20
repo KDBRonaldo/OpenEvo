@@ -220,6 +220,7 @@ function productionHarness(options: { readonly includeSecondProject?: boolean } 
       capture_mode: "transcript",
       token_level_metrics_available: false,
       codex_model: "gpt-5.5",
+      reasoning_effort: "high",
       hf_model: null,
     },
     state: "draft",

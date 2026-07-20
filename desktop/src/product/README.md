@@ -1,26 +1,37 @@
 # Desktop Product Renderer Boundary
 
-## Built-in scientific project sample
+## Synthetic scientific project demonstrations
 
-The first-launch project switcher includes one Desktop-owned, static scientific
-project tour. When no remote profiles or real projects exist, the renderer
-opens this sample by default.
+The Desktop demonstration surface contains two scientifically distinct,
+explicitly synthetic project stories. Neither story represents a remote run or
+authoritative project state.
 
-- The sample is always labelled `内置示例 · 只读`.
-- Its synthetic enzyme-kinetics data, session summaries, timelines, safe Codex
-  trace summaries, evolution history, and readable artifacts live in
-  `scientificProjectSampleData.ts`.
+- The renderer owns an enzyme-kinetics tour and a protein-stability evidence
+  tour. Both are always listed as `[只读][Synthetic]` in the real release
+  project selector, including before any remote workspace exists and while the
+  Desktop sidecar startup fallback is visible.
+- Each project contains three sessions with a rejected baseline, later
+  corrective work, safe transcript/reasoning/tool summaries, and a validated
+  condition-scoped result. The protein project uses plate-aware DSF plus
+  orthogonal SEC evidence rather than copying the enzyme workflow.
+- Both projects advance Project Head generations 0 through 3 and separately
+  identify their Evolution Revisions. Every session pins one predecessor and
+  makes its successor available to the next session.
+- Every project contains `text_memory`, `skill_bundle`, and `agent_system`
+  histories with three evolution steps, readable Markdown, and an explicit
+  previous-versus-current diff.
+- All sample data and rendering live in `scientificProjectSampleData.ts` and
+  `ScientificProjectSample.tsx`; samples are not inserted into
+  `DesktopProductProvider`, Local API state, Core state, or run admission.
 - Project Head generations and Evolution Revision identities are displayed
-  separately; the sample does not collapse the full project composition into
-  its evolution artifact set.
-- It is rendered directly by `ScientificProjectSample.tsx`; it is not inserted
-  into `DesktopProductProvider`, Local API state, Core state, or run admission.
-- Sample interactions issue no mutations and initiate no SSH, Daemon, Core,
+  separately; the demonstrations do not collapse the full project composition
+  into its evolution artifact set.
+- Demonstration interactions issue no mutations and initiate no SSH, Daemon, Core,
   artifact, or external-network work. Normal read-only Desktop-local state
   synchronization remains active so real projects stay discoverable.
 - Safe trace summaries exclude raw chain-of-thought, commands, credentials,
   host paths, secret references, and Core/service URLs.
-- The fixture remains available beside real projects, but never replaces an
+- The samples remain available beside real projects, but never replace an
   authoritative project selection or revision.
 - `npm run test:product-browser` verifies the first-run Research and Evolution
   views at the closed 1440, 1024, and 760 pixel viewports with Chromium,
@@ -272,7 +283,7 @@ leave an unowned sidecar or publish/reuse their session token. A bounded native
 cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
-`60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777`.
+`3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57`.
 The checked-in TypeScript mirror and contract fixtures use that frozen digest.
 The product UI and simulator consume the final Local/Core v1 DTOs directly and
 construct simulator resources through the same strict Zod schemas as release

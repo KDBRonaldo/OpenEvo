@@ -7,7 +7,7 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 
 const DESKTOP_ENDPOINT = "http://127.0.0.1:43117";
 const DESKTOP_SESSION_TOKEN = "release-readonly-session-token-000000000001";
-const OPENAPI_SHA256 = "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777";
+const OPENAPI_SHA256 = "3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57";
 const FEATURE_FLAGS = [
   "remote_profiles",
   "project_validation",
@@ -67,6 +67,13 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await expect(page.getByText("内置示例 · 只读", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("内置合成数据 · 12 个观测点", { exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("contract_simulator");
+  const projectSelector = page.getByLabel("Project", { exact: true });
+  await expect(projectSelector.locator("option")).toHaveCount(2);
+  await projectSelector.selectOption({ label: "[只读] 蛋白质稳定性证据整合" });
+  await expect(page.getByRole("heading", { name: "蛋白质稳定性证据整合" })).toBeVisible();
+  await expect(page.getByText("48 条 DSF 曲线 + 12 条 SEC 汇总", { exact: false })).toBeVisible();
+  await projectSelector.selectOption({ label: "[只读] 酶动力学模型复核" });
+  await expect(page.getByRole("heading", { name: "酶动力学模型复核" })).toBeVisible();
   await assertViewportSafety(page, testInfo.project.name);
   await expect(page).toHaveScreenshot("release-packaged-research.png");
 
@@ -154,6 +161,13 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await expect(page.getByText("暂时无法连接 OpenEvo Desktop", { exact: true })).toBeVisible();
   await expect(page.getByText("内置示例 · 只读", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("不会连接本机服务或远端服务器", { exact: false })).toBeVisible();
+  const offlineProjectSelector = page.getByLabel("Project", { exact: true });
+  await expect(offlineProjectSelector.locator("option")).toHaveCount(2);
+  await offlineProjectSelector.selectOption({
+    label: "[只读] 蛋白质稳定性证据整合",
+  });
+  await expect(page.getByRole("heading", { name: "蛋白质稳定性证据整合" })).toBeVisible();
+  await offlineProjectSelector.selectOption({ label: "[只读] 酶动力学模型复核" });
   await expect(page.locator("body")).not.toContainText("Renderer sample");
   await expect(page.locator("body")).not.toContainText("provider");
   await expect(page.locator(".product-shell")).not.toHaveAttribute(

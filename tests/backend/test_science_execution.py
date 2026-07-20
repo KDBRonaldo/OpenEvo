@@ -34,6 +34,7 @@ def _project(
                     "capture_mode": "transcript",
                     "harness_id": "codex",
                     "agent_model_ref": "gpt-5.1-codex-mini",
+                    "reasoning_effort": "xhigh",
                     "evolution": {"targets": {}},
                 },
                 "task": {
@@ -60,6 +61,8 @@ def _project(
         "execution_mode": execution_mode,
         "capture_mode": capture_mode,
     }
+    if execution_mode is m.ExecutionMode.SELF_DEPLOYED:
+        payload["spec"].pop("reasoning_effort", None)
     return m.ProjectV1.model_validate(payload)
 
 
@@ -107,6 +110,7 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     assert execution.config.agent.auth == "subscription"
     assert execution.config.agent.env == {}
     assert execution.config.agent.settings["capture_mode"] == "transcript"
+    assert execution.config.agent.settings["reasoning_effort"] == "xhigh"
     assert execution.config.runtime.profile == "managed_science"
     assert execution.config.runtime.image == (
         MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest

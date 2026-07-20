@@ -68,7 +68,12 @@ import {
 import { MethodConfigEditor, methodConfigErrors } from "./MethodConfigEditor";
 import { retryRunProvesSingleAppend } from "./runRetryRecovery";
 import { SampleScientificProjectView } from "./ScientificProjectSample";
-import { SAMPLE_SCIENTIFIC_PROJECT } from "./scientificProjectSampleData";
+import {
+  SAMPLE_SCIENTIFIC_PROJECT,
+  SAMPLE_SCIENTIFIC_PROJECTS,
+  sampleScientificProject,
+  type SampleScientificProjectId,
+} from "./scientificProjectSampleData";
 import {
   sameSessionOutputIdentity,
   sessionOutputIdentity,
@@ -78,21 +83,25 @@ import {
 type ProductEvolutionTargets = ProjectV1["evolution"]["targets"];
 type EvolutionCapabilitiesV1 = ProjectCapabilitiesV1["capabilities"];
 type RevisionRefV1 = NonNullable<NonNullable<ProjectV1["remote"]>["active_revision"]>;
+type CodexReasoningEffort = NonNullable<ProjectV1["execution"]["reasoning_effort"]>;
+type CodexReasoningEffortSelection = CodexReasoningEffort | "default";
 
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "high";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
 const SYSTEM_OPERATION_REFRESH_INTERVAL_MS = 750;
 const SYSTEM_OPERATION_REFRESH_LIMIT = 480;
 const PENDING_RETRY_REFRESH_LIMIT = 60;
+const ARTIFACT_PUBLICATION_RETRY_DELAYS_MS = [250, 750, 1_500] as const;
 const REQUIRED_EVOLUTION_TARGETS = ["text_memory", "skill_bundle", "agent_system"] as const;
-const SAMPLE_PROJECT_OPTION_KEY = "sample";
+const SAMPLE_PROJECT_OPTION_PREFIX = "sample:";
 const PROJECT_OPTION_PREFIX = "project:";
 const WORKSPACE_OPTION_PREFIX = "workspace:";
 
 type Workspace = "research" | "evolution" | "system";
 type ProjectSelection =
-  | { readonly kind: "sample" }
+  | { readonly kind: "sample"; readonly sampleProjectId: SampleScientificProjectId }
   | { readonly kind: "project"; readonly projectId: string }
   | { readonly kind: "workspace"; readonly profileId: string };
 type RemoteWorkspaceDrawerMode =
@@ -344,7 +353,9 @@ export function DesktopProductApp({
       const projectId = next.state.active_project?.project_id ?? next.projects[0]?.project_id;
       if (projectId) return { kind: "project", projectId };
       const profileId = next.profiles[0]?.profile_id;
-      return profileId ? { kind: "workspace", profileId } : { kind: "sample" };
+      return profileId
+        ? { kind: "workspace", profileId }
+        : { kind: "sample", sampleProjectId: SAMPLE_SCIENTIFIC_PROJECT.id };
     });
   }, [abandonPendingRetry, clearPendingRetry, provider, reportInitialSnapshotFailure]);
 
@@ -387,6 +398,11 @@ export function DesktopProductApp({
   }, [provider, refresh]);
 
   const viewingSample = projectSelection?.kind === "sample";
+  const selectedSampleProject = sampleScientificProject(
+    projectSelection?.kind === "sample"
+      ? projectSelection.sampleProjectId
+      : SAMPLE_SCIENTIFIC_PROJECT.id,
+  );
   const selectedProjectId =
     projectSelection?.kind === "project" ? projectSelection.projectId : null;
   const selectedWorkspaceProfileId =
@@ -526,20 +542,13 @@ export function DesktopProductApp({
   }, [onReady, snapshot]);
 
   if (!snapshot) {
-    if (loadError) {
-      return (
-        <InitialSnapshotFailure
-          workspace={workspace}
-          error={loadError}
-          onWorkspaceChange={setWorkspace}
-          onRetry={() => void refresh("manual")}
-        />
-      );
-    }
     return (
-      <div className="product-boot" data-testid="product-loading">
-        <div className="product-loading-row"><LoaderCircle className="spin" size={18} /> Loading workspace...</div>
-      </div>
+      <InitialSnapshotSample
+        workspace={workspace}
+        state={loadError ? { kind: "failed", error: loadError } : { kind: "pending" }}
+        onWorkspaceChange={setWorkspace}
+        onRetry={() => void refresh("manual")}
+      />
     );
   }
 
@@ -702,7 +711,7 @@ export function DesktopProductApp({
           <div className="sidebar-foot-label">Current Project Head</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>{viewingSample ? `Project Head ${SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}` : revisionLabel(project, projectRuns)}</span>
+            <span>{viewingSample ? `Project Head ${selectedSampleProject.activeProjectHeadGeneration}` : revisionLabel(project, projectRuns)}</span>
           </div>
         </div>
       </aside>
@@ -715,7 +724,7 @@ export function DesktopProductApp({
               <select
                 id="project-switcher"
                 value={viewingSample
-                  ? SAMPLE_PROJECT_OPTION_KEY
+                  ? sampleOptionKey(selectedSampleProject.id)
                   : project
                     ? projectOptionKey(project.project_id)
                     : profile
@@ -725,8 +734,11 @@ export function DesktopProductApp({
                   const key = event.target.value;
                   setActionError(null);
                   setActionRecovery(null);
-                  if (key === SAMPLE_PROJECT_OPTION_KEY) {
-                    setProjectSelection({ kind: "sample" });
+                  const selectedSample = SAMPLE_SCIENTIFIC_PROJECTS.find(
+                    (item) => sampleOptionKey(item.id) === key,
+                  );
+                  if (selectedSample) {
+                    setProjectSelection({ kind: "sample", sampleProjectId: selectedSample.id });
                     return;
                   }
                   const selected = snapshot.projects.find(
@@ -746,7 +758,11 @@ export function DesktopProductApp({
                 disabled={lifecycleMutationBusy}
               >
                 <optgroup label="内置示例">
-                  <option value={SAMPLE_PROJECT_OPTION_KEY}>[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
+                  {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
+                    <option key={sample.id} value={sampleOptionKey(sample.id)}>
+                      [只读] {sample.name}
+                    </option>
+                  ))}
                 </optgroup>
                 {snapshot.projects.length > 0 ? (
                   <optgroup label="我的项目">
@@ -802,6 +818,7 @@ export function DesktopProductApp({
           {viewingSample ? (
             <SampleScientificProjectView
               workspace={workspace}
+              project={selectedSampleProject}
               onConnectRemote={() => setConnectionSettingsMode({ kind: "create" })}
             />
           ) : null}
@@ -1120,19 +1137,27 @@ export function DesktopProductApp({
   );
 }
 
-function InitialSnapshotFailure({
+function InitialSnapshotSample({
   workspace,
-  error,
+  state,
   onWorkspaceChange,
   onRetry,
 }: {
   workspace: Workspace;
-  error: string;
+  state: { readonly kind: "pending" } | { readonly kind: "failed"; readonly error: string };
   onWorkspaceChange: (workspace: Workspace) => void;
   onRetry: () => void;
 }) {
+  const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
+    SAMPLE_SCIENTIFIC_PROJECT.id,
+  );
+  const selectedSample = sampleScientificProject(selectedSampleId);
+  const pending = state.kind === "pending";
   return (
-    <div className="product-shell initial-sync-shell" data-testid="initial-sync-failure">
+    <div
+      className="product-shell initial-sync-shell"
+      data-testid={pending ? "initial-sync-pending" : "initial-sync-failure"}
+    >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
           <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
@@ -1147,7 +1172,7 @@ function InitialSnapshotFailure({
           <div className="sidebar-foot-label">Current Project Head</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>Project Head {SAMPLE_SCIENTIFIC_PROJECT.activeProjectHeadGeneration}</span>
+            <span>Project Head {selectedSample.activeProjectHeadGeneration}</span>
           </div>
         </div>
       </aside>
@@ -1156,33 +1181,60 @@ function InitialSnapshotFailure({
           <div className="project-switcher-wrap">
             <label htmlFor="project-switcher">Project</label>
             <div className="project-switcher-control">
-              <select id="project-switcher" value={SAMPLE_PROJECT_OPTION_KEY} disabled>
-                <option value={SAMPLE_PROJECT_OPTION_KEY}>[只读] {SAMPLE_SCIENTIFIC_PROJECT.name}</option>
+              <select
+                id="project-switcher"
+                value={sampleOptionKey(selectedSample.id)}
+                onChange={(event) => {
+                  const selected = SAMPLE_SCIENTIFIC_PROJECTS.find(
+                    (sample) => sampleOptionKey(sample.id) === event.target.value,
+                  );
+                  if (selected) setSelectedSampleId(selected.id);
+                }}
+              >
+                {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
+                  <option key={sample.id} value={sampleOptionKey(sample.id)}>
+                    [只读] {sample.name}
+                  </option>
+                ))}
               </select>
               <ChevronDown size={15} aria-hidden="true" />
             </div>
             <IconButton label="Create project" onClick={() => undefined} disabled><Plus size={17} /></IconButton>
           </div>
           <div className="topbar-actions">
-            <span className="sample-topbar-badge"><AlertCircle size={14} /> Sync unavailable</span>
+            <span className="sample-topbar-badge">
+              {pending ? <LoaderCircle className="spin" size={14} /> : <AlertCircle size={14} />}
+              {pending ? "Synchronizing" : "Sync unavailable"}
+            </span>
             <IconButton label="Remote workspace settings" onClick={() => undefined} disabled><PanelLeft size={17} /></IconButton>
             <IconButton label="Project settings" onClick={() => undefined} disabled><Settings size={17} /></IconButton>
           </div>
         </header>
         <main className="product-main">
-          <div className="initial-sync-notice" role="alert">
-            <AlertCircle size={18} />
+          <div
+            className="initial-sync-notice"
+            role={pending ? "status" : "alert"}
+            aria-live={pending ? "polite" : undefined}
+          >
+            {pending ? <LoaderCircle className="spin" size={18} /> : <AlertCircle size={18} />}
             <div>
-              <strong>Remote projects could not be synchronized</strong>
-              <span>{error} The built-in project remains available in read-only mode.</span>
+              <strong>{pending ? "Synchronizing your projects" : "Remote projects could not be synchronized"}</strong>
+              <span>
+                {pending
+                  ? "Your workspace is loading. The built-in synthetic projects remain available in read-only mode."
+                  : `${state.error} The built-in synthetic projects remain available in read-only mode.`}
+              </span>
             </div>
-            <button type="button" className="secondary-button" onClick={onRetry}>
-              <RefreshCw size={15} /> Try again
-            </button>
+            {pending ? null : (
+              <button type="button" className="secondary-button" onClick={onRetry}>
+                <RefreshCw size={15} /> Try again
+              </button>
+            )}
           </div>
           <div className="initial-sync-sample">
             <SampleScientificProjectView
               workspace={workspace}
+              project={selectedSample}
             />
           </div>
         </main>
@@ -1954,6 +2006,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
   const [diff, setDiff] = useState<ArtifactDiffV1 | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [artifactLoadAttempt, setArtifactLoadAttempt] = useState(0);
 
   useEffect(() => {
     if (!selectedArtifactId || orderedArtifacts.some((artifact) => artifact.id === selectedArtifactId)) return;
@@ -1973,7 +2026,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
     setDiff(null);
     const load = async () => {
       if (view === "content") {
-        const result = await provider.getArtifactContent(selectedArtifact.id);
+        const result = await loadArtifactContentAfterPublication(provider, selectedArtifact.id);
         const identityError = artifactContentIdentityError(selectedArtifact, result);
         if (identityError) throw new DesktopProductUserError(identityError);
         if (active) setContent(result);
@@ -1986,7 +2039,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
     };
     void load().catch((reason) => active && setError(userMessage(reason))).finally(() => active && setLoading(false));
     return () => { active = false; };
-  }, [artifacts, provider, selectedArtifactId, view]);
+  }, [artifactLoadAttempt, artifacts, provider, selectedArtifactId, view]);
 
   if (!project) return <EmptyState icon={Sparkles} title="No evolution history" detail="Choose a project to inspect revisions and artifacts." />;
   const selected = orderedArtifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
@@ -2033,7 +2086,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
                 </div>
                 <div id="artifact-view-panel" aria-labelledby={view === "content" ? "artifact-content-tab" : "artifact-diff-tab"} className="artifact-body" role="tabpanel">
                   {loading ? <div className="artifact-loading"><LoaderCircle className="spin" size={17} /> Loading artifact...</div> : null}
-                  {error ? <InlineNotice tone="error" title="Artifact unavailable" detail={error} /> : null}
+                  {error ? <div className="artifact-load-error"><InlineNotice tone="error" title="Artifact unavailable" detail={error} /><button className="text-button" type="button" onClick={() => setArtifactLoadAttempt((attempt) => attempt + 1)}><RefreshCw size={14} /> Retry</button></div> : null}
                   {!loading && !error && view === "content" && content ? <ArtifactContent content={content} /> : null}
                   {!loading && !error && view === "diff" && diff ? <ArtifactDiff diff={diff} /> : null}
                 </div>
@@ -2044,6 +2097,23 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
       )}
     </div>
   );
+}
+
+async function loadArtifactContentAfterPublication(
+  provider: DesktopProductProvider,
+  artifactId: string,
+): Promise<ArtifactContentV1> {
+  for (let attempt = 0; attempt <= ARTIFACT_PUBLICATION_RETRY_DELAYS_MS.length; attempt += 1) {
+    try {
+      return await provider.getArtifactContent(artifactId);
+    } catch (error) {
+      if (!(error instanceof DesktopApiError)
+        || error.apiError.code !== "artifact_content_invalid"
+        || attempt === ARTIFACT_PUBLICATION_RETRY_DELAYS_MS.length) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, ARTIFACT_PUBLICATION_RETRY_DELAYS_MS[attempt]));
+    }
+  }
+  throw new Error("Artifact publication retry loop did not return.");
 }
 
 function ArtifactContent({ content }: { content: ArtifactContentV1 }) {
@@ -3025,6 +3095,9 @@ function SettingsDrawer({
   const [mode, setMode] = useState<ProjectV1["execution"]["mode"]>(defaultMode);
   const [hfModel, setHfModel] = useState(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
   const [codexModel, setCodexModel] = useState(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
+  const [codexReasoningEffort, setCodexReasoningEffort] = useState<CodexReasoningEffortSelection>(() => (
+    codexReasoningEffortSelection(project)
+  ));
   const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? {});
   const [dirty, setDirty] = useState(false);
   const [retryingCapabilities, setRetryingCapabilities] = useState(false);
@@ -3100,6 +3173,7 @@ function SettingsDrawer({
     setMode(project?.execution.mode ?? firstSupportedExecutionMode(executionModeCapabilities)?.mode ?? executionModeCapabilities.modes[0].mode);
     setHfModel(project?.execution.hf_model ?? DEFAULT_HF_MODEL);
     setCodexModel(project?.execution.codex_model ?? DEFAULT_CODEX_MODEL);
+    setCodexReasoningEffort(codexReasoningEffortSelection(project));
     setEvolution(project?.evolution.targets ?? {});
     setDirty(false);
     setSourceError(null);
@@ -3223,7 +3297,7 @@ function SettingsDrawer({
             {sourceError ? <p className="form-error" role="alert">{sourceError}</p> : null}
           </section>
           <section className="form-section">
-            <h3>Model mode</h3>
+            <h3>{mode === "codex_subscription_transcript" ? "Codex runtime" : "Inference runtime"}</h3>
             <div className="segmented-control wide" role="radiogroup" aria-label="Model mode" onKeyDown={handleTablistKeyDown}>{visibleModeCapabilities.map((capability) => (
               <button
                 type="button"
@@ -3238,9 +3312,30 @@ function SettingsDrawer({
                 onClick={() => { setMode(capability.mode); markDirty(); }}
               >{capability.display_name}</button>
             ))}</div>
-            {mode === "self-deployed" ? <label>Hugging Face model<input required value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label> : <label>Codex model<input required value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>}
+            {mode === "self-deployed" ? (
+              <label>Hugging Face model<input required value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label>
+            ) : (
+              <>
+                <label>Codex model<input required value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>
+                <label>Reasoning effort
+                  <select
+                    value={codexReasoningEffort}
+                    onChange={(event) => {
+                      setCodexReasoningEffort(event.currentTarget.value as CodexReasoningEffortSelection);
+                      markDirty();
+                    }}
+                  >
+                    <option value="default">Codex default</option>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">Extra high</option>
+                  </select>
+                </label>
+              </>
+            )}
             {activeModeCapability.support_state !== "supported" ? <p className="mode-support-message" id="execution-mode-support-message" role="status">{activeModeCapability.message}</p> : null}
-            <p className="form-help">Sessions use transcript capture. Token-level metrics are unavailable in this mode.</p>
+            <p className="form-help">{mode === "codex_subscription_transcript" ? "Tasks run through the signed-in Codex subscription on the remote host." : "The remote host serves the selected model."} Sessions use transcript capture.</p>
           </section>
           <section className="form-section">
             <h3>Evolution targets</h3>
@@ -3286,7 +3381,9 @@ function SettingsDrawer({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim() },
           source,
-          execution: mode === "self-deployed" ? selfDeployedExecution(activeModel.trim()) : subscriptionExecution(activeModel.trim()),
+          execution: mode === "self-deployed"
+            ? selfDeployedExecution(activeModel.trim())
+            : subscriptionExecution(activeModel.trim(), codexReasoningEffort),
           evolution: { targets: evolution },
         }, saveActionId.current, pendingActionId).then((result) => {
           if (result.replaceActionId) saveActionId.current = newActionId();
@@ -3487,16 +3584,29 @@ function selfDeployedExecution(hfModel: string): ProjectV1["execution"] {
     capture_mode: "transcript",
     token_level_metrics_available: false,
     codex_model: null,
+    reasoning_effort: null,
     hf_model: hfModel,
   };
 }
 
-function subscriptionExecution(codexModel: string): ProjectV1["execution"] {
+function codexReasoningEffortSelection(
+  project: ProjectV1 | null,
+): CodexReasoningEffortSelection {
+  return project === null
+    ? DEFAULT_CODEX_REASONING_EFFORT
+    : project.execution.reasoning_effort ?? "default";
+}
+
+function subscriptionExecution(
+  codexModel: string,
+  reasoningEffort: CodexReasoningEffortSelection = DEFAULT_CODEX_REASONING_EFFORT,
+): ProjectV1["execution"] {
   return {
     mode: "codex_subscription_transcript",
     capture_mode: "transcript",
     token_level_metrics_available: false,
     codex_model: codexModel,
+    reasoning_effort: reasoningEffort === "default" ? null : reasoningEffort,
     hf_model: null,
   };
 }
@@ -3505,13 +3615,17 @@ function projectOptionKey(projectId: string): string {
   return `${PROJECT_OPTION_PREFIX}${projectId}`;
 }
 
+function sampleOptionKey(projectId: SampleScientificProjectId): string {
+  return `${SAMPLE_PROJECT_OPTION_PREFIX}${projectId}`;
+}
+
 function workspaceOptionKey(profileId: string): string {
   return `${WORKSPACE_OPTION_PREFIX}${profileId}`;
 }
 
 function projectSelectionIdentity(selection: ProjectSelection | null): string {
   if (!selection) return "none";
-  if (selection.kind === "sample") return SAMPLE_PROJECT_OPTION_KEY;
+  if (selection.kind === "sample") return sampleOptionKey(selection.sampleProjectId);
   return selection.kind === "project"
     ? projectOptionKey(selection.projectId)
     : workspaceOptionKey(selection.profileId);

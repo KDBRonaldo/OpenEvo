@@ -37,7 +37,7 @@ _SCRIPT_PATH = "/openevo/session/workspace/.openevo-test-canary-probe.sh"
 
 def test_codex_subscription_policy_identity_is_stable() -> None:
     assert CODEX_SUBSCRIPTION_POLICY_SHA256 == (
-        "1ce18989eddfabebde7965bc03d094e2f8c6c228e794a0c86b1b7010bcaf828d"
+        "59ea503b553aa414ddcc35ede66210ee901621eebcbd1cfbeb06023410e35d38"
     )
     assert codex_subscription_contract() == {
         "schema_version": 1,

@@ -1117,7 +1117,8 @@ def test_subscription_mapping_preserves_model_and_forces_transcript_capture() ->
         update={
             "execution": local_v1.ExecutionSettingsV1(
                 mode="codex_subscription_transcript",
-                codex_model="gpt-5-codex",
+                codex_model="gpt-5.3-codex-spark",
+                reasoning_effort="xhigh",
             )
         }
     )
@@ -1127,7 +1128,8 @@ def test_subscription_mapping_preserves_model_and_forces_transcript_capture() ->
     assert mapped.spec.execution_mode is core_v1.ExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
     assert mapped.spec.capture_mode is core_v1.CaptureMode.TRANSCRIPT
     assert mapped.spec.harness_id == "codex"
-    assert mapped.spec.agent_model_ref == "gpt-5-codex"
+    assert mapped.spec.agent_model_ref == "gpt-5.3-codex-spark"
+    assert mapped.spec.reasoning_effort == "xhigh"
 
 
 def test_activate_then_create_run_uses_real_strict_clients_and_core_authority() -> None:

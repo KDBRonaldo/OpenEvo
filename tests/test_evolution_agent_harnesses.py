@@ -19,6 +19,7 @@ from openevo.harness.presets.codex import (
 from openevo.harness.presets.openhands_sdk import OpenHandsSdkHarness
 from openevo.runtime.base import LOCAL_COMMAND_CAPTURE_MAX_BYTES, BaseRuntime
 from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_CANARY_CWD,
     CODEX_SUBSCRIPTION_CANARY_OK,
     CODEX_SUBSCRIPTION_CONTRACT_KEY,
     codex_subscription_contract,
@@ -378,6 +379,40 @@ def test_codex_run_steps_defaults_to_proxy_auth_mode():
     assert not steps[1].command.startswith("env -u")
 
 
+@pytest.mark.parametrize(
+    "model_name",
+    [
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ],
+)
+def test_codex_run_steps_rejects_unsupported_final_cli_model(model_name: str) -> None:
+    harness = CodexHarness(AgentSpec(harness="codex", model_name=model_name))
+
+    with pytest.raises(ValueError, match="bare gpt-5 is unsupported"):
+        harness.run_steps("Do work.")
+
+
+@pytest.mark.parametrize(
+    ("model_name", "expected"),
+    [
+        ("gpt-5.5", "--model gpt-5.5"),
+        ("openai/gpt-5.5", "--model gpt-5.5"),
+        ("gcp/google/gpt-5.3-codex-spark", "--model gpt-5.3-codex-spark"),
+    ],
+)
+def test_codex_run_steps_normalizes_supported_provider_model(
+    model_name: str,
+    expected: str,
+) -> None:
+    harness = CodexHarness(AgentSpec(harness="codex", model_name=model_name))
+
+    assert expected in harness.run_steps("Do work.")[1].command
+
+
 def test_codex_run_steps_subscription_auth_mode_uses_existing_login_state():
     harness = CodexHarness(
         AgentSpec(
@@ -704,7 +739,7 @@ async def test_codex_subscription_setup_requires_real_exec_canary(
             del env, timeout_sec
             self.commands.append(command)
             if "-probe.sh" in command and "command_execution" in command:
-                assert cwd == "/openevo/session/workspace"
+                assert cwd == CODEX_SUBSCRIPTION_CANARY_CWD
                 return ExecResult(
                     stdout=f"{CODEX_SUBSCRIPTION_CANARY_OK}\n",
                     return_code=0,
@@ -722,6 +757,7 @@ async def test_codex_subscription_setup_requires_real_exec_canary(
             },
         )
     )
+    harness.env["OPENEVO_SKILLS_DIR"] = "/openevo/session/evolution/skills"
     runtime = ReadyRuntime(tmp_path)
     runtime.spec = runtime.spec.model_copy(update={"allow_internet": allow_internet})
 
@@ -742,7 +778,14 @@ async def test_codex_subscription_setup_requires_real_exec_canary(
     assert "-events.jsonl" in joined
     assert "-workspace" in joined
     assert "-write" in joined
+    assert "test ! -e /openevo/session/home/.openevo-codex-readiness/AGENTS.md" in joined
+    assert "test ! -e /openevo/session/home/.agents/skills" in joined
     assert harness.subscription_credential_isolation_receipt is not None
+    canary_index = next(
+        index for index, command in enumerate(runtime.commands) if "-probe.sh" in command
+    )
+    assert not any("cp -R --" in command for command in runtime.commands[:canary_index])
+    assert any("cp -R --" in command for command in runtime.commands[canary_index + 1 :])
     normal_command = harness.run_steps("Do work.")[0].command
     assert f"network.enabled={str(allow_internet).lower()}" in normal_command
 
@@ -758,11 +801,54 @@ async def test_codex_subscription_setup_fails_closed_without_exact_canary(
         )
     )
     runtime = RecordingRuntime(tmp_path)
+    harness.env["OPENEVO_SKILLS_DIR"] = "/openevo/session/evolution/skills"
 
     with pytest.raises(RuntimeError, match="credential isolation could not be proven"):
         await harness.setup(runtime)
 
     assert harness.subscription_credential_isolation_receipt is None
+    assert not any("cp -R --" in command for command in runtime.commands)
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_publishes_readiness_only_after_skill_install(
+    tmp_path: Path,
+) -> None:
+    class SkillFailureRuntime(RecordingRuntime):
+        async def exec(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> ExecResult:
+            del env, timeout_sec
+            self.commands.append(command)
+            if "-probe.sh" in command and "command_execution" in command:
+                assert cwd == CODEX_SUBSCRIPTION_CANARY_CWD
+                return ExecResult(
+                    stdout=f"{CODEX_SUBSCRIPTION_CANARY_OK}\n",
+                    return_code=0,
+                )
+            if "cp -R --" in command:
+                return ExecResult(return_code=1)
+            return ExecResult(return_code=0)
+
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        )
+    )
+    harness.env["OPENEVO_SKILLS_DIR"] = "/openevo/session/evolution/skills"
+    runtime = SkillFailureRuntime(tmp_path)
+
+    with pytest.raises(RuntimeError, match="skill installation failed"):
+        await harness.setup(runtime)
+
+    assert harness.subscription_credential_isolation_receipt is None
+    assert any("cp -R --" in command for command in runtime.commands)
 
 
 @pytest.mark.parametrize(

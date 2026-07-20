@@ -7946,7 +7946,10 @@ def _json_value(value: object) -> object:
 
 def _validate_bytes(model: type[_ModelT], value: bytes) -> _ModelT:
     try:
-        return model.model_validate_json(bytes(value))
+        return model.model_validate_json(
+            bytes(value),
+            context={"_openevo_historical_codex_model_recovery": True},
+        )
     except ValidationError as exc:
         raise StoreCorruptionError(f"persisted {model.__name__} is invalid") from exc
 
@@ -8205,7 +8208,10 @@ def _validate_idempotency_request_envelope(
         request = None
     else:
         try:
-            request = request_model.model_validate(request_value)
+            request = request_model.model_validate(
+                request_value,
+                context={"_openevo_historical_codex_model_recovery": True},
+            )
         except ValidationError as exc:
             raise StoreCorruptionError("idempotency request envelope is invalid") from exc
         if _canonical_bytes(request.model_dump(mode="json", exclude_unset=True)) != request_json:

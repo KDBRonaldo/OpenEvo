@@ -169,14 +169,14 @@ describe("Desktop Local API v1 schemas", () => {
     expect(projectCreateV1Schema.parse({ ...base, task: { ...base.task, title: "t".repeat(256) } }).task.title).toHaveLength(256);
     expect(projectCreateV1Schema.parse({ ...base, source: { ...base.source, display_name: "s".repeat(256) } }).source.display_name).toHaveLength(256);
     expect(projectCreateV1Schema.parse({ ...base, execution: { mode: "self-deployed", hf_model: "m".repeat(256) } }).execution.hf_model).toHaveLength(256);
-    expect(projectCreateV1Schema.parse({ ...base, execution: { mode: "codex_subscription_transcript", codex_model: "c".repeat(256) } }).execution.codex_model).toHaveLength(256);
+    expect(projectCreateV1Schema.parse({ ...base, execution: { mode: "codex_subscription_transcript", codex_model: "c".repeat(128) } }).execution.codex_model).toHaveLength(128);
 
     for (const invalid of [
       { ...base, name: "n".repeat(129) },
       { ...base, task: { ...base.task, title: "t".repeat(257) } },
       { ...base, source: { ...base.source, display_name: "s".repeat(257) } },
       { ...base, execution: { mode: "self-deployed", hf_model: "m".repeat(257) } },
-      { ...base, execution: { mode: "codex_subscription_transcript", codex_model: "c".repeat(257) } },
+      { ...base, execution: { mode: "codex_subscription_transcript", codex_model: "c".repeat(129) } },
       { ...base, evolution: { targets: { "1invalid": { enabled: true, method: "Method.v1", config: {} } } } },
       { ...base, evolution: { targets: { valid: { enabled: true, method: "method/invalid", config: {} } } } },
       { ...base, evolution: { targets: { ["t".repeat(129)]: { enabled: true, method: "Method.v1", config: {} } } } },
@@ -344,8 +344,37 @@ describe("Desktop Local API v1 schemas", () => {
       capture_mode: "transcript",
       token_level_metrics_available: false,
       codex_model: null,
+      reasoning_effort: null,
       hf_model: "open-models/model-1",
     });
+    expect(executionSettingsV1Schema.parse({
+      mode: "codex_subscription_transcript",
+      codex_model: "gpt-5.3-codex-spark",
+      reasoning_effort: "xhigh",
+    }).reasoning_effort).toBe("xhigh");
+    expect(() => executionSettingsV1Schema.parse({
+      mode: "self-deployed",
+      hf_model: "open-models/model-1",
+      reasoning_effort: "high",
+    })).toThrow(/reasoning effort/i);
+    for (const codexModel of [
+      "gpt-5",
+      "openai/gpt-5",
+      "anthropic/gpt-5",
+      "google/gpt-5",
+      "gcp/google/gpt-5",
+    ]) {
+      expect(() => executionSettingsV1Schema.parse({
+        mode: "codex_subscription_transcript",
+        codex_model: codexModel,
+      })).toThrow(/not executable/i);
+    }
+    for (const codexModel of ["openai/", "a".repeat(129), "gpt-5.5 alpha", "gpt-5.5-中文"]) {
+      expect(() => executionSettingsV1Schema.parse({
+        mode: "codex_subscription_transcript",
+        codex_model: codexModel,
+      })).toThrow(/not executable/i);
+    }
     expect(profilePatchV1Schema.parse({ name: "Renamed" })).toEqual({ name: "Renamed" });
     expect(() => profilePatchV1Schema.parse({ host: null })).toThrow();
     expect(() => projectPatchV1Schema.parse({ execution: null })).toThrow();

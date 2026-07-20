@@ -29,6 +29,8 @@ from openevo.evolution.framework.builtins import (
     build_builtin_registry,
 )
 from openevo.projects.science import compile_science_project, load_science_project_config
+from openevo.harness.models import AgentSpec
+from openevo.harness.presets.codex import CodexHarness
 from desktop.server.app import create_desktop_app
 from openevo.deployment import RemoteCommandResult
 from desktop.sidecar.api import create_sidecar_app
@@ -320,6 +322,20 @@ def _smoke_config_backed_lifecycle(
             harness_id="codex",
         ),
     )
+    compiled_task = compiled.tasks[0]
+    if compiled_task.agent["settings"].get("reasoning_effort") != draft[
+        "reasoning_effort"
+    ]:
+        raise SmokeFailure("Desktop saved reasoning effort did not reach Core compilation.")
+    codex_command = CodexHarness(
+        AgentSpec.model_validate(compiled_task.agent)
+    ).run_steps("Validate release configuration.")[0].command
+    expected_effort = f"-c model_reasoning_effort={draft['reasoning_effort']}"
+    if (
+        f"--model {draft['codex_model']}" not in codex_command
+        or expected_effort not in codex_command
+    ):
+        raise SmokeFailure("Compiled Codex command did not preserve model and reasoning effort.")
     compiled_methods = {
         spec.method
         for spec in compiled.evolution_methods_for_round(
@@ -366,6 +382,7 @@ def _smoke_config_backed_lifecycle(
             "execution_mode": "codex_subscription_transcript",
             "expected_registry_digest": capabilities["registry_digest"],
             "agent_model": draft["codex_model"],
+            "reasoning_effort": draft["reasoning_effort"],
             "targets": draft["evolution"]["targets"],
         }
     ]:
@@ -493,7 +510,8 @@ def _desktop_config_draft_payload() -> dict[str, Any]:
         "auth_method": "ssh_agent",
         "https_proxy": "http://127.0.0.1:7890",
         "huggingface_endpoint": "https://hf-mirror.com",
-        "codex_model": "gpt-5.1-codex-mini",
+        "codex_model": "gpt-5.5",
+        "reasoning_effort": "high",
         "evolution": {
             "targets": {
                 "text_memory": {

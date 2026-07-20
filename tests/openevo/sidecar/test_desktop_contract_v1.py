@@ -584,9 +584,14 @@ def test_execution_modes_are_exact_and_cannot_claim_token_metrics() -> None:
     assert deployed.token_level_metrics_available is False
 
     subscription = ExecutionSettingsV1.model_validate(
-        {"mode": "codex_subscription_transcript", "codex_model": "gpt-5"}
+        {
+            "mode": "codex_subscription_transcript",
+            "codex_model": "gpt-5.3-codex-spark",
+            "reasoning_effort": "xhigh",
+        }
     )
     assert subscription.hf_model is None
+    assert subscription.reasoning_effort == "xhigh"
     with pytest.raises(ValidationError):
         ExecutionSettingsV1.model_validate(
             {"mode": "self_deployed", "hf_model": "open-models/model-1"}
@@ -595,6 +600,28 @@ def test_execution_modes_are_exact_and_cannot_claim_token_metrics() -> None:
         ExecutionSettingsV1.model_validate(
             {"mode": "self-deployed", "managed_model_id": "legacy-model"}
         )
+    with pytest.raises(ValidationError, match="reasoning_effort"):
+        ExecutionSettingsV1.model_validate(
+            {
+                "mode": "self-deployed",
+                "hf_model": "open-models/model-1",
+                "reasoning_effort": "high",
+            }
+        )
+    for codex_model in (
+        "gpt-5",
+        "openai/gpt-5",
+        "anthropic/gpt-5",
+        "google/gpt-5",
+        "gcp/google/gpt-5",
+    ):
+        with pytest.raises(ValidationError, match="bare gpt-5 is unsupported"):
+            ExecutionSettingsV1.model_validate(
+                {
+                    "mode": "codex_subscription_transcript",
+                    "codex_model": codex_model,
+                }
+            )
 
 
 def test_connection_health_and_release_provider_are_fail_closed() -> None:
@@ -760,7 +787,7 @@ def test_snapshots_are_canonical_and_digests_are_stable() -> None:
     openapi_digest, events_digest = verify_contract_snapshots()
     assert openapi_digest == DESKTOP_OPENAPI_SHA256
     assert events_digest == DESKTOP_EVENTS_SCHEMA_SHA256
-    assert openapi_digest == "60cd51f9ab1e7b1140747b9cc5d3760fad32204e4e5c399b608bb5d406172777"
+    assert openapi_digest == "3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57"
     assert events_digest == "39e485b6c61688832ec0445502d2f1f9e8bd9548e9b81a0a4740bc5997d90936"
     snapshot_root = Path(__file__).parents[3] / "desktop/sidecar/contracts/v1"
     assert (snapshot_root / "openapi.json").read_bytes() == canonical_json_bytes(

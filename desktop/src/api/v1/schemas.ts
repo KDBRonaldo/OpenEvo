@@ -20,6 +20,20 @@ const UTC_RFC3339 = /^\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])T(?:[01]\d|
 const CORE_UTC_RFC3339 = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const STABLE_ID = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/;
+const CODEX_PROVIDER_PREFIXES = ["gcp/google/", "openai/", "anthropic/", "google/"] as const;
+
+function codexCliModelName(model: string): string {
+  const prefix = CODEX_PROVIDER_PREFIXES.find((candidate) => model.startsWith(candidate));
+  return prefix ? model.slice(prefix.length) : model;
+}
+
+function isValidCodexCliModel(model: string): boolean {
+  const cliModel = codexCliModelName(model);
+  return cliModel.length > 0
+    && cliModel.length <= 128
+    && /^[\x21-\x7e]+$/.test(cliModel)
+    && cliModel !== "gpt-5";
+}
 
 export const schemaVersionV1Schema = z.literal("1").default("1");
 export const opaqueIdSchema = z
@@ -35,6 +49,7 @@ export const utcTimestampSchema = z.string().regex(UTC_RFC3339, "must be a UTC R
 export const sha256DigestSchema = z.string().regex(SHA256, "must be lowercase SHA-256 hex");
 export const etagSchema = z.string().regex(/^"[0-9a-f]{64}"$/);
 export const executionModeV1Schema = z.enum(["codex_subscription_transcript", "self-deployed"]);
+export const codexReasoningEffortV1Schema = z.enum(["low", "medium", "high", "xhigh"]);
 const executionModeReasonCodeV1Schema = z.enum([
   "self_deployed_release_unavailable",
   "execution_mode_release_unsupported",
@@ -320,12 +335,17 @@ export const executionSettingsV1Schema = z
     capture_mode: z.literal("transcript").default("transcript"),
     token_level_metrics_available: z.literal(false).default(false),
     codex_model: localCoreShortTextSchema.nullable().default(null),
+    reasoning_effort: codexReasoningEffortV1Schema.nullable().default(null),
     hf_model: huggingFaceModelSchema.nullable().default(null),
   })
   .strict()
   .superRefine((value, context) => {
     const subscription = value.mode === "codex_subscription_transcript";
     if (subscription !== (value.codex_model !== null) || subscription === (value.hf_model !== null)) issue(context, [], "execution mode and model fields do not agree");
+    if (subscription && value.codex_model !== null && !isValidCodexCliModel(value.codex_model)) {
+      issue(context, ["codex_model"], "Codex model is not executable after provider normalization");
+    }
+    if (!subscription && value.reasoning_effort !== null) issue(context, ["reasoning_effort"], "reasoning effort is only valid for Codex subscription mode");
   });
 export const projectTaskV1Schema = z.object({ title: localCoreShortTextSchema, objective: longTextSchema }).strict();
 export const workspaceImportRefV1Schema = z
