@@ -1185,9 +1185,29 @@ def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
 
-def _reject_symlink_path(path: Path) -> None:
+def _is_darwin_system_path_alias(path: Path) -> bool:
+    if sys.platform != "darwin" or path not in {
+        Path("/etc"),
+        Path("/tmp"),
+        Path("/var"),
+    }:
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    return resolved in {
+        Path("/private/etc"),
+        Path("/private/tmp"),
+        Path("/private/var"),
+    }
+
+
+def _reject_symlink_path(path: Path, *, allow_darwin_system_aliases: bool = False) -> None:
     for candidate in (path, *path.parents):
-        if candidate.is_symlink():
+        if candidate.is_symlink() and not (
+            allow_darwin_system_aliases and _is_darwin_system_path_alias(candidate)
+        ):
             raise RuntimeError(
                 f"Core wheel output path must not contain a symbolic link: {candidate}"
             )
@@ -1346,7 +1366,7 @@ def _snapshot_core_release_input(
 ) -> _CoreReleaseInput:
     _verify_core_release_input(source)
     destination_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _reject_symlink_path(destination_dir)
+    _reject_symlink_path(destination_dir, allow_darwin_system_aliases=True)
     directory_fd = os.open(
         destination_dir,
         os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,

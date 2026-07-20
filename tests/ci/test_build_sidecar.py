@@ -1289,6 +1289,60 @@ def test_build_sidecar_rejects_symlink_wheel_output_directory(
     assert list(real_output.iterdir()) == []
 
 
+def test_internal_snapshot_allows_only_explicit_darwin_system_path_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    path = Path("/var/folders/openevo")
+    original_is_symlink = Path.is_symlink
+
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda candidate: candidate == Path("/var") or original_is_symlink(candidate),
+    )
+    monkeypatch.setattr(
+        builder,
+        "_is_darwin_system_path_alias",
+        lambda candidate: candidate == Path("/var"),
+    )
+
+    builder._reject_symlink_path(path, allow_darwin_system_aliases=True)
+    with pytest.raises(RuntimeError, match="symbolic link"):
+        builder._reject_symlink_path(path)
+
+
+def test_darwin_system_path_alias_requires_exact_private_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    monkeypatch.setattr(builder.sys, "platform", "darwin")
+    original_resolve = Path.resolve
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda candidate, strict=False: (
+            Path("/private/var")
+            if candidate == Path("/var")
+            else original_resolve(candidate, strict=strict)
+        ),
+    )
+
+    assert builder._is_darwin_system_path_alias(Path("/var")) is True
+    assert builder._is_darwin_system_path_alias(Path("/usr")) is False
+
+    monkeypatch.setattr(
+        Path,
+        "resolve",
+        lambda candidate, strict=False: (
+            Path("/attacker/var")
+            if candidate == Path("/var")
+            else original_resolve(candidate, strict=strict)
+        ),
+    )
+    assert builder._is_darwin_system_path_alias(Path("/var")) is False
+
+
 def test_temporary_directory_cleanup_failure_keeps_complete_published_pair(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
