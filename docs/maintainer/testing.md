@@ -10,12 +10,11 @@ evidence.
 Use focused tests for ordinary changes and broaden the suite when touching
 shared contracts.
 
-Version `0.1.2` is published as an unsigned, non-gating Preview. Its real DMG,
+Version `0.1.3` is published as an unsigned, non-gating Preview. Its real DMG,
 packaged sidecar and renderer, self-contained Daemon Bundle, managed runtime,
 packaging smoke, and immutable asset roundtrip are current Preview evidence.
 No checked-in, candidate-bound science E2E exists for it, and it is not G2, G3,
-or G12 evidence. Version `0.1.1` is historical evidence and predates the
-current immutable Preview publication policy.
+or G12 evidence. Earlier Preview releases remain historical evidence.
 
 ## Focused Tests
 

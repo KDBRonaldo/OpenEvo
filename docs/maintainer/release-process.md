@@ -13,12 +13,18 @@ It predates and does not satisfy the immutable Preview publication policy
 defined below; its GitHub title/body changed when the draft was made public.
 Do not withdraw or replace it merely because it is not a gating candidate.
 
-Version `0.1.2` is the current public unsigned exhibition Preview, published on
-July 19, 2026 from the immutable candidate produced by run `29702250883`.
+Version `0.1.2` is a public unsigned historical exhibition Preview, published
+on July 19, 2026 from the immutable candidate produced by run `29702250883`.
 Preserve its exact source commit, tag, release assets, checksums, and complete
-publication evidence. It is a packaging Preview, not a G1-G12 candidate:
-there is still no candidate-bound real Codex science E2E, clean-host matrix,
-protected-performance verdict, or External Beta qualification.
+publication evidence.
+
+Version `0.1.3` is the current public unsigned exhibition Preview, published on
+July 20, 2026 from source `5e7a203f08dc2fe434979ae8e546c174378d1af5`
+and the immutable candidate produced by run `29756612736`. Preserve its exact
+source commit, tag, release assets, checksums, and complete publication evidence.
+It is a packaging Preview, not a G1-G12 candidate: there is still no
+candidate-bound real Codex science E2E, clean-host matrix, protected-performance
+verdict, or External Beta qualification.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
@@ -32,7 +38,7 @@ directory, and validates the exact closed manifest before leaving the draft for
 review.
 
 No checked-in, validator-bound two-session science E2E evidence exists for the
-published `0.1.2` Preview. Its packaging and managed-runtime smoke do not
+published `0.1.3` Preview. Its packaging and managed-runtime smoke do not
 satisfy G2, G3, G4, G7, G12, or the ordinary-user science workflow.
 
 Final External Beta publication remains disabled while productization work

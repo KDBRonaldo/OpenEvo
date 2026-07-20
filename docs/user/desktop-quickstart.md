@@ -1,6 +1,6 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the published `0.1.2` exhibition Preview. The Preview
+This guide describes the published `0.1.3` exhibition Preview. The Preview
 publication workflow verifies the exact packaged applications and assets, but
 it does not establish the canonical two-session science gate or general host
 support.
@@ -25,13 +25,13 @@ a runtime image manually.
 ## Install The Unsigned DMG
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.2 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.2-exhibition.29702250883.1),
-   confirm the title **OpenEvo Desktop 0.1.2 Preview**, then download
-   `OpenEvo-Desktop-0.1.2-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.3 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.3-exhibition.29756612736.1),
+   confirm the title **OpenEvo Desktop 0.1.3 Preview**, then download
+   `OpenEvo-Desktop-0.1.3-aarch64.dmg` and `SHA256SUMS`.
 2. Verify the exact DMG checksum recorded by that release:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.2-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.3-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -53,17 +53,18 @@ Do not clear quarantine from a parent directory or from an unverified download.
 
 ## Explore The Built-In Project
 
-Before a server is configured, Desktop opens the read-only **酶动力学模型复核**
-example. Use **Research** to inspect three synthetic task sessions, their
-de-identified reasoning and tool summaries, and the progression from baseline
-failure to a validated result. Use **Evolution** to inspect textual-memory,
-trajectory-to-skill, and agent-system histories plus their readable
-`memory.md`, `SKILL.md`, and `AGENTS.md` outputs.
+Before a server is configured, Desktop exposes two read-only examples in the
+project selector: **酶动力学模型复核** and **蛋白质稳定性证据整合**. Each
+contains three synthetic task sessions, de-identified reasoning and tool
+summaries, and a progression from an unsupported result to a bounded,
+validated conclusion. Use **Research** to inspect task execution and
+**Evolution** to inspect textual-memory, trajectory-to-skill, and agent-system
+histories plus their readable `memory.md`, `SKILL.md`, and `AGENTS.md` outputs.
 
-The example is always labelled **内置示例 · 只读**. It is synthetic Desktop
-content, does not represent a completed remote run, and performs no SSH,
-Daemon, Core, or network action. It remains available in the project selector
-after real projects are created.
+Both examples are labelled as built-in, synthetic, and read-only. They do not
+represent completed remote runs and perform no SSH, Daemon, Core, or network
+action. They remain available in the project selector after real projects are
+created.
 
 ## Connect The Server
 
@@ -122,7 +123,7 @@ to operate OpenEvo.
 4. Start a second session in the same project.
 
 The canonical product requires evolution to affect only later sessions and
-requires Desktop to block stale or partial successor state. The `0.1.2` v1
+requires Desktop to block stale or partial successor state. The `0.1.3` v1
 Preview does not yet prove that complete authority contract. Do not use it for
 work that depends on atomic cross-session guarantees.
 

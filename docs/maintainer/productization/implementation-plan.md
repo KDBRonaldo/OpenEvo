@@ -38,13 +38,14 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-Version `0.1.2` is the current public, installable unsigned exhibition Preview.
+Version `0.1.3` is the current public, installable unsigned exhibition Preview.
 It proves the real mounted and copied DMG, packaged sidecar and renderer, a
 self-contained Daemon Bundle, managed-runtime packaging smoke, and immutable
 release asset roundtrip. It has no checked-in candidate-bound science E2E or
 clean-host matrix evidence, and it is intentionally non-gating. It does not
 prove G2, G3, G12, or any full science workflow, and it is not the candidate
-that will satisfy G1-G12. Version `0.1.1` is retained as historical evidence.
+that will satisfy G1-G12. Earlier Preview releases are retained as historical
+evidence.
 System, Files, and History remain incomplete; the v2 authority cutover, G4, and
 G7-G12 remain open.
 
@@ -121,7 +122,7 @@ artifacts, revisions, recovery, and both execution modes.
 
 **Current state:** a real versioned control API, durable project/run stores,
 remote bootstrap, tunnel routing, Subscription prerequisite checks, and child
-service supervision exist. The published `0.1.2` Preview ships a self-contained
+service supervision exist. The published `0.1.3` Preview ships a self-contained
 Daemon Bundle and has packaging plus managed-runtime smoke evidence. It has no
 checked-in candidate-bound Docker plus Codex science rehearsal or clean-host
 matrix evidence. Clean-host preparation and lifecycle evidence, mediated
@@ -150,21 +151,21 @@ the packaged macOS application.
 
 **Current state:** release-mode server/project setup, host-key review, remote
 capabilities, task execution, retry/cancel, timeline/transcript, and evolution
-inspection are implemented. First launch opens a read-only synthetic enzyme
-kinetics project that demonstrates three cross-session tasks and textual-memory,
-trajectory-to-skill, and agent-system evolution without creating authoritative
-or remote state. The public `0.1.2` Preview launches from the real DMG with its
-packaged renderer and sidecar. G2 clean-user lifecycle evidence, Files, History,
-System maintenance, mediated credential choices, and several recovery flows
-remain incomplete.
+inspection are implemented. First launch exposes two read-only synthetic
+science projects, each demonstrating three cross-session tasks and
+textual-memory, trajectory-to-skill, and agent-system evolution without
+creating authoritative or remote state. The public `0.1.3` Preview launches
+from the real DMG with its packaged renderer and sidecar. G2 clean-user
+lifecycle evidence, Files, History, System maintenance, mediated credential
+choices, and several recovery flows remain incomplete.
 
 **Owning issues:** #158, #163, and #203.
 
 **Next work:** complete the narrow System recovery slice, then consume the
 migrated authority contract before deepening Task, Files, or History state.
-First validate the current read-only example and fail-closed System surface in
-the packaged Preview. Finish the missing ordinary-user views and full clean-user
-lifecycle required by G2 and G10.
+First validate the current read-only examples and fail-closed System surface in
+the packaged Preview. Finish the missing ordinary-user views and full
+clean-user lifecycle required by G2 and G10.
 
 ## D. Repository, Documentation, And Release Engineering
 
@@ -176,8 +177,8 @@ GitHub releases present one coherent Desktop-plus-Daemon product.
 documentation, issue state, package inventory, release metadata, dependency
 evidence, and cleanup work still reflect intermediate implementation states.
 The exact source, tag, assets, checksums, and publication evidence for the
-public `0.1.2` Preview must remain available as non-gating release records;
-the `0.1.1` Preview remains historical evidence.
+public `0.1.3` Preview must remain available as non-gating release records;
+earlier Preview releases remain historical evidence.
 
 **Owning issues:** #131 and #193.
 
@@ -192,7 +193,7 @@ G1 and G12. PyPI remains outside this release.
 **Outcome:** one immutable candidate satisfies every G1-G12 gate.
 
 **Current state:** component and subsystem tests exist, and the published
-`0.1.2` Preview has complete packaging and downloaded-release verification, but
+`0.1.3` Preview has complete packaging and downloaded-release verification, but
 there is no candidate with complete clean-host Desktop/Daemon evidence, both
 execution modes, all evolution gates, protected performance, recovery/security
 matrices, and full G1-G12 evidence. The published Preview cannot be reused as

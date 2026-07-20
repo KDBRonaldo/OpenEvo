@@ -1,13 +1,13 @@
 # OpenEvo Architecture Docs
 
 This directory describes the current architecture and External Beta target.
-OpenEvo `0.1.2` is the current installable unsigned exhibition Preview with a
+OpenEvo `0.1.3` is the current installable unsigned exhibition Preview with a
 real Desktop DMG, packaged sidecar and renderer, self-contained Daemon Bundle,
 managed-runtime packaging smoke, and immutable release asset verification. It
 has no checked-in candidate-bound science E2E or clean-host evidence. Target
 documents must not be read as proof that the Preview satisfies the full
-External Beta contract or G1-G12. Version `0.1.1` is historical evidence. The
-product surfaces are:
+External Beta contract or G1-G12. Earlier Preview releases are historical
+evidence. The product surfaces are:
 
 - **OpenEvo Desktop**: the ordinary-user macOS app and local sidecar facade.
 - **OpenEvo Daemon**: the remote Linux backend that owns execution, deployment,
