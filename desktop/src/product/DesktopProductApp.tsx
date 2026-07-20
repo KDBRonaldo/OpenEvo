@@ -87,6 +87,7 @@ type CodexReasoningEffort = NonNullable<ProjectV1["execution"]["reasoning_effort
 type CodexReasoningEffortSelection = CodexReasoningEffort | "default";
 
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
+const CODEX_MODEL_SUGGESTIONS = ["gpt-5.5", "gpt-5.3-codex-spark"] as const;
 const DEFAULT_CODEX_REASONING_EFFORT: CodexReasoningEffort = "high";
 const DEFAULT_HF_MODEL = "Qwen/Qwen3-8B";
 const ACTIVE_RUN_REFRESH_INTERVAL_MS = 1_000;
@@ -94,7 +95,6 @@ const SYSTEM_OPERATION_REFRESH_INTERVAL_MS = 750;
 const SYSTEM_OPERATION_REFRESH_LIMIT = 480;
 const PENDING_RETRY_REFRESH_LIMIT = 60;
 const ARTIFACT_PUBLICATION_RETRY_DELAYS_MS = [250, 750, 1_500] as const;
-const REQUIRED_EVOLUTION_TARGETS = ["text_memory", "skill_bundle", "agent_system"] as const;
 const SAMPLE_PROJECT_OPTION_PREFIX = "sample:";
 const PROJECT_OPTION_PREFIX = "project:";
 const WORKSPACE_OPTION_PREFIX = "workspace:";
@@ -194,6 +194,7 @@ export function DesktopProductApp({
   const [snapshot, setSnapshot] = useState<DesktopProductSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState<Workspace>("research");
+  const [requestedProjectHead, setRequestedProjectHead] = useState<RevisionRefV1 | null>(null);
   const [projectSelection, setProjectSelection] = useState<ProjectSelection | null>(null);
   const selectionIdentity = projectSelectionIdentity(projectSelection);
   const selectionIdentityRef = useRef(selectionIdentity);
@@ -436,7 +437,9 @@ export function DesktopProductApp({
     }
   }, [connectionSettingsMode, snapshot]);
   const coreProjectId = project?.remote?.core_project_id ?? null;
+  useEffect(() => setRequestedProjectHead(null), [coreProjectId]);
   const projectRuns = stableRunOrder(snapshot?.runs.filter((run) => run.project_id === coreProjectId) ?? []);
+  const projectArtifacts = snapshot?.artifacts.filter((artifact) => artifact.project_id === coreProjectId) ?? [];
   const activeRun = projectRuns.find((run) => !isTerminal(run.status)) ?? null;
   const projectSessionReady = snapshot ? hasReadySelectedProjectSession(snapshot, project) : false;
   const runPollingIdentity = useMemo(
@@ -600,6 +603,10 @@ export function DesktopProductApp({
     ? "Wait for System maintenance to finish."
     : getStartReason(snapshot, project, profile, projectServices, activeRun, actionState);
   const canStart = startReason === null;
+  const openEvolution = (projectHead: RevisionRefV1 | null = null): void => {
+    setRequestedProjectHead(projectHead);
+    setWorkspace("evolution");
+  };
 
   const cancelActiveOperation = async () => {
     const operation = selectedOperation;
@@ -704,7 +711,7 @@ export function DesktopProductApp({
         </div>
         <nav className="product-nav">
           <NavButton icon={BookOpen} label="Research" active={workspace === "research"} onClick={() => setWorkspace("research")} />
-          <NavButton icon={Sparkles} label="Evolution" active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} />
+          <NavButton icon={Sparkles} label="Evolution" active={workspace === "evolution"} onClick={() => openEvolution()} />
           <NavButton icon={Activity} label="System" active={workspace === "system"} onClick={() => setWorkspace("system")} />
         </nav>
         <div className="sidebar-foot">
@@ -882,6 +889,8 @@ export function DesktopProductApp({
               canCreateProject={canCreateProject}
               executionModeLabel={project ? executionModeCapability(snapshot.executionModeCapabilities, project.execution.mode).display_name : null}
               runs={projectRuns}
+              artifacts={projectArtifacts}
+              artifactCollection={snapshot.artifactCollection}
               activeRun={activeRun}
               timelines={snapshot.timelines}
               provider={provider}
@@ -899,7 +908,7 @@ export function DesktopProductApp({
                   ? { kind: "edit", profileId: profile.profile_id }
                   : { kind: "create" },
               )}
-              onOpenEvolution={() => setWorkspace("evolution")}
+              onOpenEvolution={openEvolution}
               onOpenSystem={() => setWorkspace("system")}
               onRefresh={() => void refresh("manual")}
             />
@@ -908,8 +917,9 @@ export function DesktopProductApp({
             <EvolutionWorkspace
               project={project}
               runs={projectRuns}
-              artifacts={snapshot.artifacts.filter((artifact) => artifact.project_id === coreProjectId)}
+              artifacts={projectArtifacts}
               artifactCollection={snapshot.artifactCollection}
+              requestedProjectHead={requestedProjectHead}
               provider={provider}
               onRefresh={() => void refresh("manual")}
               onOpenSettings={() => { setCreatingProject(false); setSettingsOpen(true); }}
@@ -1637,6 +1647,8 @@ function ResearchWorkspace({
   canCreateProject,
   executionModeLabel,
   runs,
+  artifacts,
+  artifactCollection,
   activeRun,
   timelines,
   provider,
@@ -1659,6 +1671,8 @@ function ResearchWorkspace({
   canCreateProject: boolean;
   executionModeLabel: string | null;
   runs: readonly RunV1[];
+  artifacts: readonly ArtifactV1[];
+  artifactCollection: ProductArtifactCollectionState;
   activeRun: RunV1 | null;
   timelines: DesktopProductSnapshot["timelines"];
   provider: DesktopProductProvider;
@@ -1672,17 +1686,34 @@ function ResearchWorkspace({
   onCancel: () => void;
   onOpenSettings: () => void;
   onOpenConnection: () => void;
-  onOpenEvolution: () => void;
+  onOpenEvolution: (projectHead: RevisionRefV1) => void;
   onOpenSystem: () => void;
   onRefresh: () => void;
 }) {
+  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  useEffect(() => {
+    setSelectedRunId(null);
+  }, [project?.project_id]);
+  useEffect(() => {
+    if (activeRun) setSelectedRunId(activeRun.id);
+  }, [activeRun?.id]);
   if (!project) {
     if (!hasProfile) return <EmptyState icon={PanelLeft} title="Add a remote workspace" detail="Enter the server that will run research sessions." action="Add workspace" actionIcon={Plus} onAction={onOpenConnection} />;
     if (!canCreateProject) return <EmptyState icon={PanelLeft} title="Connect the remote workspace" detail="Confirm the server connection before creating a research project." />;
     return <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />;
   }
-  const latestTerminal = runs.find((run) => isTerminal(run.status));
-  const outputRun = activeRun ?? latestTerminal ?? null;
+  const latestTerminal = [...runs]
+    .filter((run) => isTerminal(run.status))
+    .sort((left, right) => compareTimestampAndId(left.created_at, left.id, right.created_at, right.id))
+    .at(-1) ?? null;
+  const selectedRun = selectedRunId === null
+    ? null
+    : runs.find((run) => run.id === selectedRunId) ?? null;
+  const observedRun = selectedRun ?? activeRun ?? latestTerminal ?? null;
+  const evolutionOutputsLoading = artifactCollection.status !== "complete";
+  const observedOutputProjectHead = observedRun && !evolutionOutputsLoading
+    ? evolutionOutputRevisionForRun(artifacts, observedRun)
+    : null;
   const recover = (run: RunV1) => {
     const action = run.current_error?.repair_action;
     const disabled = busy || activeRun !== null;
@@ -1723,10 +1754,10 @@ function ResearchWorkspace({
 
         <section className="product-panel active-run-panel">
           <div className="panel-heading">
-            <div><span className="panel-kicker">Active session</span><h2>{activeRun ? sessionTitle(activeRun, runs) : "No session running"}</h2></div>
-            {activeRun ? <StatePill state={activeRun.status} /> : <span className="muted-pill">Ready</span>}
+            <div><span className="panel-kicker">{observedRun === activeRun && activeRun ? "Active session" : "Selected session"}</span><h2>{observedRun ? sessionTitle(observedRun, runs) : "No session selected"}</h2></div>
+            {observedRun ? <StatePill state={observedRun.status} /> : <span className="muted-pill">Ready</span>}
           </div>
-          {activeRun ? (
+          {observedRun === activeRun && activeRun ? (
             <>
               <RevisionPin run={activeRun} />
               <RunStatusDetail run={activeRun} modelService={modelService} onRefresh={onRefresh} />
@@ -1735,44 +1766,54 @@ function ResearchWorkspace({
                 <Square size={14} fill="currentColor" /> Cancel session
               </button>
             </>
-          ) : latestTerminal ? (
-            <RunOutcomeSummary run={latestTerminal} onOpenEvolution={onOpenEvolution} recovery={recover(latestTerminal)} />
+          ) : observedRun && isTerminal(observedRun.status) ? (
+            <>
+              <RunOutcomeSummary run={observedRun} isLatest={observedRun.id === latestTerminal?.id} outputProjectHead={observedOutputProjectHead} evolutionOutputsLoading={evolutionOutputsLoading} onOpenEvolution={onOpenEvolution} recovery={recover(observedRun)} />
+              <Timeline entries={timelines[observedRun.id] ?? []} />
+            </>
           ) : (
             <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>
           )}
         </section>
       </div>
 
-      {outputRun ? (
-        <SessionOutput run={outputRun} provider={provider} streamEpoch={streamEpoch} />
+      {observedRun ? (
+        <SessionOutput run={observedRun} provider={provider} streamEpoch={streamEpoch} />
+      ) : null}
+
+      {evolutionOutputsLoading ? (
+        <div className="disabled-reason" role="status">
+          <RefreshCw size={14} />
+          <span>Artifact collection is incomplete. Refetch all artifact pages before identifying session evolution outputs.</span>
+          <button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={14} /> Refetch artifacts</button>
+        </div>
       ) : null}
 
       <section className="history-section">
         <div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{runs.length} total</span></div>
-        {runs.length ? <SessionTable runs={runs} activeRun={activeRun} modelService={modelService} onRefresh={onRefresh} onRecover={recover} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}
+        {runs.length ? <SessionTable runs={runs} artifacts={artifacts} artifactCollection={artifactCollection} selectedRunId={observedRun?.id ?? null} modelService={modelService} onSelectRun={setSelectedRunId} onRefresh={onRefresh} onRecover={recover} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}
       </section>
     </div>
   );
 }
 
 function RevisionPin({ run }: { run: RunV1 }) {
-  const successor = run.revision_transition?.successor_revision ?? null;
   return (
     <div className="revision-pin">
-      <div><span>Pinned context</span><strong>{run.pinned_revision ? `Revision ${run.pinned_revision.generation}` : "Admission pending"}</strong></div>
+      <div><span>Pinned context</span><strong>{run.pinned_revision ? `Project Head ${run.pinned_revision.generation}` : "Admission pending"}</strong></div>
       <ArrowRight size={16} />
-      <div><span>Successor revision</span><strong>{successor ? `Revision ${successor.generation}` : "Not reported"}</strong></div>
+      <div><span>Admission source</span><strong>{run.required_revision.relation === "active" ? "Active project head" : "Next-head transition"}</strong></div>
       {run.revision_transition ? <StatePill state={run.revision_transition.state} /> : null}
     </div>
   );
 }
 
 function Timeline({ entries }: { entries: readonly DesktopProductSnapshot["timelines"][string][number][] }) {
-  const visible = [...entries].sort((left, right) => compareTimestampAndId(left.occurred_at, left.id, right.occurred_at, right.id)).slice(-4);
+  const visible = [...entries].sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id));
   return (
     <ol className="run-timeline">
       {visible.map((entry) => (
-        <li key={entry.id} className={entry.status}>
+        <li key={entry.id} className={entry.status} data-sequence={entry.sequence} data-phase={entry.phase}>
           <span className="timeline-marker">{entry.status === "succeeded" ? <Check size={11} /> : entry.status === "running" ? <LoaderCircle className="spin" size={11} /> : null}</span>
           <div><strong>{entry.title}</strong><span>{entry.message}</span></div>
         </li>
@@ -1916,33 +1957,47 @@ function sessionStreamLabel(stream: LogEntryV1["stream"]): string {
 
 function SessionTable({
   runs,
-  activeRun,
+  artifacts,
+  artifactCollection,
+  selectedRunId,
   modelService,
+  onSelectRun,
   onRefresh,
   onRecover,
 }: {
   runs: readonly RunV1[];
-  activeRun: RunV1 | null;
+  artifacts: readonly ArtifactV1[];
+  artifactCollection: ProductArtifactCollectionState;
+  selectedRunId: string | null;
   modelService: ServiceV1 | null;
+  onSelectRun: (runId: string) => void;
   onRefresh: () => void;
   onRecover: (run: RunV1) => { label: string; onClick: () => void; disabled: boolean };
 }) {
   return (
     <div className="session-table" role="table" aria-label="Session history">
-      <div className="session-table-head" role="row"><span role="columnheader">Session</span><span role="columnheader">State</span><span role="columnheader">Details</span><span role="columnheader">Pinned</span><span role="columnheader">Successor</span><span role="columnheader">Updated</span></div>
+      <div className="session-table-head" role="row"><span role="columnheader">Session</span><span role="columnheader">State</span><span role="columnheader">Details</span><span role="columnheader">Pinned</span><span role="columnheader">Evolution output</span><span role="columnheader">Updated</span></div>
       {runs.map((run) => {
         const recovery = onRecover(run);
+        const evolutionOutputsLoading = artifactCollection.status !== "complete";
+        const evolutionRevision = evolutionOutputsLoading
+          ? null
+          : evolutionOutputRevisionForRun(artifacts, run);
         return (
-        <div className="session-table-row" role="row" key={run.id}>
-          <strong role="cell">{sessionTitle(run, runs)}</strong>
+        <div className={`session-table-row ${run.id === selectedRunId ? "selected" : ""}`} role="row" key={run.id}>
+          <span role="cell"><button type="button" className="session-history-button" aria-pressed={run.id === selectedRunId} onClick={() => onSelectRun(run.id)}>{sessionTitle(run, runs)}</button></span>
           <span role="cell"><StatePill state={run.status} /></span>
           <span role="cell" className="session-detail">
-            <RunStatusText run={run} modelService={modelService} />
+            <RunStatusText run={run} modelService={modelService} outputProjectHead={evolutionRevision} evolutionOutputsLoading={evolutionOutputsLoading} />
             {run.status === "queued" ? <button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={13} /> Refresh status</button> : null}
             {run.status === "failed" ? <button type="button" className="text-button" onClick={recovery.onClick} disabled={recovery.disabled}>{recovery.label === "Retry session" ? <RotateCcw size={13} /> : <Wrench size={13} />} {recovery.label}</button> : null}
           </span>
-          <span role="cell">{run.pinned_revision ? `Revision ${run.pinned_revision.generation}` : "Pending"}</span>
-          <span role="cell">{run.revision_transition ? `Revision ${run.revision_transition.successor_revision.generation}` : "Unknown"}</span>
+          <span role="cell">{run.pinned_revision ? `Project Head ${run.pinned_revision.generation}` : "Pending"}</span>
+          <span role="cell">{evolutionRevision
+            ? `Project Head ${evolutionRevision.generation}`
+            : run.status === "succeeded"
+              ? evolutionOutputsLoading ? "Artifacts incomplete" : "No evolution output"
+              : "Pending"}</span>
           <span role="cell">{formatTime(run.updated_at)}</span>
         </div>
         );
@@ -1964,15 +2019,18 @@ function RunStatusDetail({ run, modelService, onRefresh }: { run: RunV1; modelSe
   );
 }
 
-function RunStatusText({ run, modelService }: { run: RunV1; modelService: ServiceV1 | null }) {
+function RunStatusText({ run, modelService, outputProjectHead = null, evolutionOutputsLoading = false }: { run: RunV1; modelService: ServiceV1 | null; outputProjectHead?: RevisionRefV1 | null; evolutionOutputsLoading?: boolean }) {
   if (run.status === "queued" && run.queued_reason) {
     const retry = run.queued_reason.retry_after_seconds === null ? "" : ` Check again in about ${run.queued_reason.retry_after_seconds} seconds.`;
     const model = run.queued_reason.code === "service_starting" && modelService?.status === "starting" ? ` ${modelService.status_message ?? ""}` : "";
     return <span>{run.queued_reason.summary}{model}{retry}</span>;
   }
   if (run.status === "failed" && run.current_error) return <span>{run.current_error.message}{run.current_error.next_action ? ` ${run.current_error.next_action}` : ""}</span>;
-  if (run.status === "cancelled") return <span>Cancelled without reporting a successful successor.</span>;
-  if (run.status === "succeeded") return <span>{run.revision_transition?.state === "active" ? `Revision ${run.revision_transition.successor_revision.generation} is active.` : "The session succeeded; successor readiness is not yet known."}</span>;
+  if (run.status === "cancelled") return <span>The session was cancelled before completion.</span>;
+  if (run.status === "succeeded") {
+    if (evolutionOutputsLoading) return <span>Evolution output status is unavailable until all artifact pages are loaded.</span>;
+    return <span>{outputProjectHead ? `Project Head ${outputProjectHead.generation} contains this session's selected evolution outputs.` : "The session completed without evolution output artifacts."}</span>;
+  }
   return <span>{stateLabel(run.status)}</span>;
 }
 
@@ -1983,22 +2041,33 @@ function queuedReasonLabel(code: NonNullable<RunV1["queued_reason"]>["code"], mo
   return modelService?.status === "starting" ? "Model preparation" : "Service preparation";
 }
 
-function RunOutcomeSummary({ run, onOpenEvolution, recovery }: { run: RunV1; onOpenEvolution: () => void; recovery: { label: string; onClick: () => void; disabled?: boolean } }) {
+function RunOutcomeSummary({ run, isLatest, outputProjectHead, evolutionOutputsLoading, onOpenEvolution, recovery }: { run: RunV1; isLatest: boolean; outputProjectHead: RevisionRefV1 | null; evolutionOutputsLoading: boolean; onOpenEvolution: (projectHead: RevisionRefV1) => void; recovery: { label: string; onClick: () => void; disabled?: boolean } }) {
   const succeeded = run.status === "succeeded";
+  const subject = isLatest ? "Latest session" : "Session";
   return (
     <div className={`completed-summary ${run.status}`}>
       {succeeded ? <CheckCircle2 size={25} /> : run.status === "failed" ? <XCircle size={25} /> : <Square size={22} />}
-      <div><strong>{succeeded ? "Latest session complete" : run.status === "failed" ? "Latest session failed" : "Latest session cancelled"}</strong><RunStatusText run={run} modelService={null} /></div>
-      {succeeded && run.revision_transition?.state === "active" ? <button className="text-button" type="button" onClick={onOpenEvolution}>View changes <ArrowRight size={14} /></button> : null}
+      <div><strong>{`${subject} ${succeeded ? "complete" : run.status === "failed" ? "failed" : "cancelled"}`}</strong><RunStatusText run={run} modelService={null} outputProjectHead={outputProjectHead} evolutionOutputsLoading={evolutionOutputsLoading} /></div>
+      {succeeded && outputProjectHead ? <button className="text-button" type="button" onClick={() => onOpenEvolution(outputProjectHead)}>View changes <ArrowRight size={14} /></button> : null}
       {run.status === "failed" ? <button className="text-button" type="button" onClick={recovery.onClick} disabled={recovery.disabled}>{recovery.label === "Retry session" ? <RotateCcw size={14} /> : <Wrench size={14} />} {recovery.label}</button> : null}
     </div>
   );
 }
 
-function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, provider, onRefresh, onOpenSettings }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; provider: DesktopProductProvider; onRefresh: () => void; onOpenSettings: () => void }) {
+function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, requestedProjectHead, provider, onRefresh, onOpenSettings }: { project: ProjectV1 | null; runs: readonly RunV1[]; artifacts: readonly ArtifactV1[]; artifactCollection: ProductArtifactCollectionState; requestedProjectHead: RevisionRefV1 | null; provider: DesktopProductProvider; onRefresh: () => void; onOpenSettings: () => void }) {
   const activeRevision = project ? authoritativeActiveRevision(project, runs) : null;
-  const orderedArtifacts = activeRevision && artifactCollection.status === "complete"
-    ? selectedArtifactsForRevision(artifacts, activeRevision)
+  const historicalOutputHeads = artifactCollection.status === "complete"
+    ? runs.map((run) => evolutionOutputRevisionForRun(artifacts, run)).filter((revision): revision is RevisionRefV1 => revision !== null)
+    : [];
+  const selectedProjectHead = requestedProjectHead
+    && historicalOutputHeads.some((revision) => sameRevisionRef(revision, requestedProjectHead))
+    ? requestedProjectHead
+    : activeRevision;
+  const selectedProjectHeadIsActive = selectedProjectHead !== null
+    && activeRevision !== null
+    && sameRevisionRef(selectedProjectHead, activeRevision);
+  const orderedArtifacts = selectedProjectHead && artifactCollection.status === "complete"
+    ? selectedArtifactsForRevision(artifacts, selectedProjectHead)
     : [];
   const [selectedArtifactId, setSelectedArtifactId] = useState<string | null>(orderedArtifacts[0]?.id ?? null);
   const [view, setView] = useState<"content" | "diff">("content");
@@ -2043,18 +2112,18 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
 
   if (!project) return <EmptyState icon={Sparkles} title="No evolution history" detail="Choose a project to inspect revisions and artifacts." />;
   const selected = orderedArtifacts.find((artifact) => artifact.id === selectedArtifactId) ?? null;
-  const activeGeneration = activeRevision?.generation ?? null;
+  const selectedGeneration = selectedProjectHead?.generation ?? null;
   const evolutionEnabled = Object.values(project.evolution.targets).some((target) => target.enabled);
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
       <div className="workspace-heading">
-        <div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Review what changed and which revision the next session will use.</p></div>
+        <div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Review what changed and which Project Head a session used or produced.</p></div>
       </div>
       <section className="revision-strip">
-        {activeRevision ? <div className="revision-node active"><span>Active</span><strong>Revision {activeRevision.generation}</strong><small>Used by the next session</small></div> : <div className="revision-node"><span>Active revision</span><strong>Revision unknown</strong><small>Waiting for an authoritative revision reference</small><button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={13} /> Refetch revision</button></div>}
+        {selectedProjectHead ? <div className={`revision-node ${selectedProjectHeadIsActive ? "active" : ""}`}><span>{selectedProjectHeadIsActive ? "Active Project Head" : "Historical Project Head"}</span><strong>Project Head {selectedProjectHead.generation}</strong><small>{selectedProjectHeadIsActive ? "Used by the next session" : "Produced by the selected session"}</small></div> : <div className="revision-node"><span>Active Project Head</span><strong>Project Head unknown</strong><small>Waiting for an authoritative Project Head reference</small><button type="button" className="text-button" onClick={onRefresh}><RefreshCw size={13} /> Refetch Project Head</button></div>}
       </section>
-      {!activeRevision ? (
-        <EmptyState icon={RefreshCw} title="Revision relation is unknown" detail="Refetch before inspecting selected artifacts for the next session." action="Refetch revision" actionIcon={RefreshCw} onAction={onRefresh} />
+      {!selectedProjectHead ? (
+        <EmptyState icon={RefreshCw} title="Project Head relation is unknown" detail="Refetch before inspecting selected artifacts for a session." action="Refetch Project Head" actionIcon={RefreshCw} onAction={onRefresh} />
       ) : artifactCollection.status !== "complete" ? (
         <EmptyState icon={RefreshCw} title="Artifact collection is incomplete" detail="Refetch all artifact pages before inspecting revision membership." action="Refetch artifacts" actionIcon={RefreshCw} onAction={onRefresh} />
       ) : orderedArtifacts.length === 0 ? (
@@ -2064,7 +2133,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
       ) : (
         <div className="artifact-layout">
           <aside className="artifact-list" aria-label="Evolution artifacts">
-            <div className="artifact-list-heading"><span>{activeGeneration === null ? "Revision unknown" : `Revision ${activeGeneration}`}</span><strong>{orderedArtifacts.length} selected</strong></div>
+            <div className="artifact-list-heading"><span>{selectedGeneration === null ? "Project Head unknown" : `Project Head ${selectedGeneration}`}</span><strong>{orderedArtifacts.length} selected</strong></div>
             {orderedArtifacts.map((artifact) => (
               <button key={artifact.id} type="button" className={`artifact-list-item ${artifact.id === selected?.id ? "active" : ""}`} onClick={() => setSelectedArtifactId(artifact.id)}>
                 <span className={`artifact-icon ${artifact.artifact_type}`}>{artifactIcon(artifact.artifact_type)}</span>
@@ -2078,7 +2147,7 @@ function EvolutionWorkspace({ project, runs, artifacts, artifactCollection, prov
               <>
                 <div className="artifact-viewer-head">
                   <div><span className="panel-kicker">{artifactTypeLabel(selected.artifact_type)}</span><h2>{selected.display_name}</h2><p>{selected.summary}</p></div>
-                  <div className="artifact-meta"><span>{activeGeneration === null ? "Revision unknown" : `Revision ${activeGeneration}`}</span>{selected.scores[0] ? <span>Quality {Math.round(selected.scores[0].value * 100)}%</span> : null}</div>
+                  <div className="artifact-meta"><span>{selectedGeneration === null ? "Project Head unknown" : `Project Head ${selectedGeneration}`}</span>{selected.scores[0] ? <span>Quality {Math.round(selected.scores[0].value * 100)}%</span> : null}</div>
                 </div>
                 <div className="segmented-control" role="tablist" aria-label="Artifact view" onKeyDown={handleTablistKeyDown}>
                   <button id="artifact-content-tab" aria-controls="artifact-view-panel" type="button" role="tab" aria-selected={view === "content"} tabIndex={view === "content" ? 0 : -1} className={view === "content" ? "active" : ""} onClick={() => setView("content")}><FileText size={14} /> Content</button>
@@ -3101,7 +3170,6 @@ function SettingsDrawer({
   const [evolution, setEvolution] = useState<ProductEvolutionTargets>(project?.evolution.targets ?? {});
   const [dirty, setDirty] = useState(false);
   const [retryingCapabilities, setRetryingCapabilities] = useState(false);
-  const setupDefaultsApplied = useRef(false);
   const sourceSelectionGeneration = useRef(0);
   const sourceSelectionInFlight = useRef(false);
   const sourceSelectionMounted = useRef(true);
@@ -3233,15 +3301,6 @@ function SettingsDrawer({
     };
   }, [takePendingSourceAction]);
   const rows = evolutionTargetRows(modeCapabilities, evolution);
-  useEffect(() => {
-    if (!incompleteSetup || !modeCapabilities || setupDefaultsApplied.current) return;
-    const requiredRows = REQUIRED_EVOLUTION_TARGETS.map((targetId) => rows.find((row) => row.targetId === targetId));
-    if (requiredRows.some((row) => !row?.canEnable)) return;
-    setupDefaultsApplied.current = true;
-    setEvolution(Object.fromEntries(requiredRows.map((row) => [row!.targetId, enableTarget(row!)])));
-    saveActionId.current = newActionId();
-    setDirty(true);
-  }, [incompleteSetup, modeCapabilities, rows]);
   const setupReady = !incompleteSetup || (modeCapabilities !== null && rows.every((row) => !row.selection.enabled || row.valid));
   const requiredFieldMessage = name.trim() === ""
     ? "Enter a project name."
@@ -3316,7 +3375,10 @@ function SettingsDrawer({
               <label>Hugging Face model<input required value={hfModel} onChange={change(setHfModel)} placeholder="organization/model" /></label>
             ) : (
               <>
-                <label>Codex model<input required value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>
+                <label>Codex model<input required list="codex-model-suggestions" value={codexModel} onChange={change(setCodexModel)} placeholder="Model name" /></label>
+                <datalist id="codex-model-suggestions">
+                  {CODEX_MODEL_SUGGESTIONS.map((model) => <option key={model} value={model} />)}
+                </datalist>
                 <label>Reasoning effort
                   <select
                     value={codexReasoningEffort}
@@ -3339,7 +3401,7 @@ function SettingsDrawer({
           </section>
           <section className="form-section">
             <h3>Evolution targets</h3>
-            {incompleteSetup && modeCapabilities ? <div className="capability-ready" role="status"><CheckCircle2 size={15} /><p className="form-help">Remote evolution methods are ready. Review the defaults, then save and activate.</p></div> : null}
+            {incompleteSetup && modeCapabilities ? <div className="capability-ready" role="status"><CheckCircle2 size={15} /><p className="form-help">Remote evolution methods are ready.</p></div> : null}
             {!modeCapabilities ? <div className="capability-unavailable" role="status"><p className="form-help">{project === null ? "Remote methods will be loaded after the project session is prepared." : capabilityMatchesDraft && capability?.status === "loading" ? "Capabilities are loading for this project and mode." : "Capabilities are unavailable for this project and mode."}</p>{capabilityRetryable ? <button type="button" className="secondary-button" onClick={() => void retryCapabilities()} disabled={retryingCapabilities || busy}><RefreshCw className={retryingCapabilities ? "spin" : undefined} size={14} /> Retry capabilities</button> : null}</div> : null}
             <div className="target-list">{rows.map((row) => (
               <div className={`target-toggle ${row.valid ? "" : "invalid"}`} data-target-id={row.targetId} key={row.targetId}>
@@ -3377,7 +3439,7 @@ function SettingsDrawer({
           </section>
         </div>
         {guardedClose.confirming ? <DiscardChangesPrompt onKeep={guardedClose.keepEditing} onDiscard={guardedClose.discard} /> : null}
-        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" aria-describedby={requiredFieldMessage ? "project-required-fields" : undefined} disabled={!valid || busy || selectingSource || (project !== null && !dirty)} title={!profileId ? "Add a remote workspace first" : activeModeCapability.support_state !== "supported" ? activeModeCapability.message : !valid ? "Complete all required fields and valid method settings" : project && !dirty ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
+        <div className="drawer-footer" inert={guardedClose.confirming ? true : undefined} aria-hidden={guardedClose.confirming || undefined}><button className="secondary-button" type="button" onClick={() => void reset()} disabled={!dirty || busy || selectingSource} title={!dirty ? "No unsaved changes" : "Undo changes"}><RotateCcw size={15} /> Undo</button><button className="primary-button" type="button" aria-describedby={requiredFieldMessage ? "project-required-fields" : undefined} disabled={!valid || busy || selectingSource || (project !== null && !dirty && !incompleteSetup)} title={!profileId ? "Add a remote workspace first" : activeModeCapability.support_state !== "supported" ? activeModeCapability.message : !valid ? "Complete all required fields and valid method settings" : project && !dirty && !incompleteSetup ? "No unsaved changes" : "Save project settings"} onClick={() => { invalidateSourceSelection(); const pendingActionId = pendingSourceActionId.current; void onSave({
           name: name.trim(),
           task: { title: title.trim(), objective: objective.trim() },
           source,
@@ -3744,6 +3806,26 @@ function selectedArtifactsForRevision(artifacts: readonly ArtifactV1[], revision
     });
 }
 
+function evolutionOutputRevisionForRun(
+  artifacts: readonly ArtifactV1[],
+  run: RunV1,
+): RevisionRefV1 | null {
+  if (run.status !== "succeeded" || !run.pinned_revision) return null;
+  const outputs = artifacts.filter((artifact) => artifact.run_id === run.id
+    && artifact.selected
+    && artifact.release_enabled
+    && artifact.membership_revisions.some((member) => sameRevisionRef(member, artifact.produced_revision))
+    && !artifactRevisionRefs(artifact).some((member) => member.id === artifact.produced_revision.id && !sameRevisionRef(member, artifact.produced_revision)));
+  if (outputs.length === 0) return null;
+  const candidate = outputs[0]!.produced_revision;
+  if (outputs.some((artifact) => !sameRevisionRef(artifact.produced_revision, candidate))) return null;
+  const predecessor = run.pinned_revision;
+  return candidate.project_id === predecessor.project_id
+    && candidate.generation === predecessor.generation + 1
+    ? candidate
+    : null;
+}
+
 function currentGeneration(project: ProjectV1, runs: readonly RunV1[]): number | null {
   return authoritativeActiveRevision(project, runs)?.generation ?? null;
 }
@@ -3806,7 +3888,7 @@ function artifactDiffIdentityError(artifact: ArtifactV1, diff: ArtifactDiffV1, a
 function revisionLabel(project: ProjectV1 | null, runs: readonly RunV1[]): string {
   if (!project) return "Not available";
   const generation = currentGeneration(project, runs);
-  return generation === null ? "Revision unknown" : `Revision ${generation}`;
+  return generation === null ? "Project Head unknown" : `Project Head ${generation}`;
 }
 
 function getProjectActivationReason(

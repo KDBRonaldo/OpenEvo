@@ -832,8 +832,10 @@ pre.json {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  max-height: 300px;
   margin: 15px 0 0;
   padding: 0;
+  overflow-y: auto;
   list-style: none;
 }
 
@@ -1161,8 +1163,27 @@ pre.json {
   font-size: 12px;
 }
 
-.session-table-row strong {
+.session-table-row.selected {
+  background: var(--surface-soft);
+}
+
+.session-history-button {
+  width: fit-content;
+  max-width: 100%;
+  border: 0;
+  padding: 4px 0;
   color: var(--ink);
+  background: transparent;
+  font: inherit;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-history-button:hover,
+.session-history-button:focus-visible,
+.session-history-button[aria-pressed="true"] {
+  color: var(--accent);
 }
 
 .session-detail {

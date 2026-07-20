@@ -94,10 +94,11 @@ describe("product preview scenarios", () => {
         reachable_from_revision_id: run?.pinned_revision?.id,
         relation: "active",
       });
-      expect(run?.revision_transition?.state).toBe("active");
-      expect(run?.revision_transition?.predecessor_revision).toEqual(run?.pinned_revision);
-      expect(run?.revision_transition?.successor_revision.generation).toBe(2);
-      expect(activeRevision).toEqual(run?.revision_transition?.successor_revision);
+      expect(run?.revision_transition).toBeNull();
+      const runOutputs = refreshed.snapshot.artifacts.filter((artifact) => artifact.run_id === run?.id);
+      expect(runOutputs).toHaveLength(3);
+      expect(runOutputs.every((artifact) => artifact.produced_revision.generation === 2)).toBe(true);
+      expect(activeRevision).toEqual(runOutputs[0]?.produced_revision);
 
       const activeArtifacts = refreshed.snapshot.artifacts.filter((artifact) =>
         activeRevision && artifact.membership_revisions.some((revision) => revision.id === activeRevision.id),

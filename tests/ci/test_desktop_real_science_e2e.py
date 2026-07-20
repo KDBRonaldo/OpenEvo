@@ -130,6 +130,205 @@ def test_smoke_does_not_add_the_evolution_context_canary() -> None:
     assert module.CONTEXT_CANARY_INSTRUCTION not in smoke._task_objective
 
 
+def test_renderer_expectations_bind_successful_sessions_and_latest_artifacts() -> None:
+    module = _load_runner()
+    workflow = _workflow(module)
+    workflow.project_id = "desktop-project"
+    workflow._method_ids = {
+        target_id: f"method_{target_id}" for target_id in module.REQUIRED_TARGET_IDS
+    }
+    workflow._allowed_concrete_method_ids = {
+        target_id: frozenset({f"method_{target_id}"})
+        for target_id in module.REQUIRED_TARGET_IDS
+    }
+    first_revision = _revision("revision-1", 1)
+    successor = _revision("revision-3", 3)
+
+    def observation(ordinal: int, artifact_suffix: str, transition: object):
+        return module.SessionObservation(
+            evidence={
+                "timeline": {
+                    "phase_values": [
+                        "admission",
+                        "preparation",
+                        "execution",
+                        "evolution",
+                        "revision",
+                        "terminal",
+                    ]
+                },
+                "logs": {"count": ordinal + 1},
+            },
+            run={
+                "id": f"run-{ordinal}",
+                "status": "succeeded",
+                "pinned_revision": first_revision,
+                "revision_transition": transition,
+            },
+            context={},
+            artifacts=tuple(
+                {
+                    "id": f"artifact-{target_id}-{artifact_suffix}",
+                    "artifact_type": target_id,
+                    "target_id": target_id,
+                    "content_sha256": ("a" if ordinal == 1 else "b") * 64,
+                    "produced_revision": transition["successor_revision"],
+                }
+                for target_id in module.REQUIRED_TARGET_IDS
+            ),
+            document_sha256_by_target={
+                target_id: ("c" if ordinal == 1 else "d") * 64
+                for target_id in module.REQUIRED_TARGET_IDS
+            },
+            runtime_context_receipt_sha256=None,
+        )
+
+    workflow._session_observations = (
+        observation(1, "old", {"successor_revision": _revision("revision-2", 2)}),
+        observation(2, "latest", {"successor_revision": successor}),
+    )
+
+    expectations = workflow.renderer_expectations()
+
+    assert expectations["project_id"] == "desktop-project"
+    assert expectations["project_name"] == module.RELEASE_PROJECT_DISPLAY_NAME
+    assert expectations["codex_model"] == module.RELEASE_CODEX_MODEL
+    assert expectations["reasoning_effort"] == module.RELEASE_REASONING_EFFORT
+    assert expectations["method_ids"] == workflow._method_ids
+    assert expectations["project_head_generation"] == 3
+    assert [item["run_id"] for item in expectations["sessions"]] == ["run-1", "run-2"]
+    assert {
+        item["artifact_id"] for item in expectations["artifacts"]
+    } == {
+        f"artifact-{target_id}-latest" for target_id in module.REQUIRED_TARGET_IDS
+    }
+    assert {
+        item["target_id"] for item in expectations["artifacts"]
+    } == set(module.REQUIRED_TARGET_IDS)
+    assert {item["artifact_content_sha256"] for item in expectations["artifacts"]} == {
+        "b" * 64
+    }
+    assert {item["runtime_document_sha256"] for item in expectations["artifacts"]} == {
+        "d" * 64
+    }
+
+
+def test_renderer_result_validation_binds_live_observations() -> None:
+    module = _load_runner()
+    digest = "a" * 64
+    expectations = {
+        "project_id": "desktop-project",
+        "sessions": [
+            {
+                "ordinal": 1,
+                "run_id": "run-1",
+                "timeline_phase_values": [
+                    "admission",
+                    "preparation",
+                    "execution",
+                    "evolution",
+                    "revision",
+                    "terminal",
+                ],
+                "minimum_log_count": 2,
+            },
+            {
+                "ordinal": 2,
+                "run_id": "run-2",
+                "timeline_phase_values": [
+                    "admission",
+                    "preparation",
+                    "execution",
+                    "evolution",
+                    "revision",
+                    "terminal",
+                ],
+                "minimum_log_count": 3,
+            },
+        ],
+        "project_head_generation": 3,
+        "artifacts": [
+            {
+                "artifact_id": f"artifact-{target_id}",
+                "artifact_type": target_id,
+                "target_id": target_id,
+                "artifact_content_sha256": digest,
+                "runtime_document_sha256": "c" * 64,
+            }
+            for target_id in module.REQUIRED_TARGET_IDS
+        ],
+    }
+    payload = {
+        "schema_version": "1",
+        "kind": "openevo_desktop_live_renderer_observability",
+        "outcome": "passed",
+        "provider_kind": "desktop_sidecar",
+        "source_commit": "f" * 40,
+        "packaged_web_build_digest": digest,
+        "renderer_ready": True,
+        "builtin_sample_count": 2,
+        "project_id_sha256": module._digest_text("desktop-project"),
+        "session_count": 2,
+        "timeline": {
+            "count": 6,
+            "phase_values": [
+                "admission",
+                "evolution",
+                "execution",
+                "preparation",
+                "revision",
+                "terminal",
+            ],
+        },
+        "logs": {"count": 3},
+        "project_head_generation": 3,
+        "independent_target_controls_verified": True,
+        "remote_method_selection_verified": True,
+        "artifacts": [
+            {
+                "artifact_id_sha256": module._digest_text(f"artifact-{target_id}"),
+                "artifact_type": target_id,
+                "target_id": target_id,
+                "document_count": 1,
+                "total_utf8_bytes": 100,
+                "content_sha256": digest,
+                "runtime_document_sha256": "c" * 64,
+            }
+            for target_id in module.REQUIRED_TARGET_IDS
+        ],
+        "screenshot_sha256": "b" * 64,
+    }
+
+    assert module._validate_renderer_result(
+        payload,
+        expectations=expectations,
+        source_commit="f" * 40,
+        packaged_web_build_digest=digest,
+        screenshot_sha256="b" * 64,
+    ) == payload
+
+    payload["renderer_ready"] = False
+    with pytest.raises(module.E2EFailure, match="renderer_result_identity_mismatch"):
+        module._validate_renderer_result(
+            payload,
+            expectations=expectations,
+            source_commit="f" * 40,
+            packaged_web_build_digest=digest,
+            screenshot_sha256="b" * 64,
+        )
+
+    payload["renderer_ready"] = True
+    payload["artifacts"][0]["runtime_document_sha256"] = "d" * 64
+    with pytest.raises(module.E2EFailure, match="renderer_artifact_observation_invalid"):
+        module._validate_renderer_result(
+            payload,
+            expectations=expectations,
+            source_commit="f" * 40,
+            packaged_web_build_digest=digest,
+            screenshot_sha256="b" * 64,
+        )
+
+
 def test_native_frame_uses_the_closed_credential_protocol() -> None:
     module = _load_runner()
     credentials = module.NativeCredentials.create()
@@ -322,6 +521,183 @@ def test_arguments_require_managed_runtime_archive_for_real_e2e() -> None:
         module._validate_runtime_arguments(args)
 
 
+def test_renderer_requires_exact_candidate_binding_inputs() -> None:
+    module = _load_runner()
+    args = module._parser().parse_args(
+        [
+            "--host",
+            "compute.example.org",
+            "--user",
+            "researcher",
+            "--expected-host-key-fingerprint",
+            "SHA256:" + "A" * 43 + "=",
+            "--core-wheel",
+            "openevo.whl",
+            "--framework-lock",
+            "framework-lock.json",
+            "--daemon-bundle",
+            "openevo-daemon-linux-x86_64",
+            "--daemon-manifest",
+            "openevo-daemon-bundle.json",
+            "--managed-runtime-archive",
+            "runtime.tar",
+            "--verify-renderer",
+        ]
+    )
+
+    with pytest.raises(module.E2EFailure, match="renderer_candidate_binding_required"):
+        module._validate_runtime_arguments(args)
+
+
+def test_renderer_candidate_binding_pins_release_and_packaged_web_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    monkeypatch.setattr(module, "_validate_candidate_source_checkout", lambda _source: None)
+
+    def write_bytes(name: str, payload: bytes) -> Path:
+        path = tmp_path / name
+        path.write_bytes(payload)
+        return path
+
+    def file_record(role: str, path: Path) -> dict[str, object]:
+        payload = path.read_bytes()
+        return {
+            "byte_size": len(payload),
+            "filename": path.name,
+            "role": role,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    sidecar = write_bytes("sidecar", b"sidecar")
+    wheel = write_bytes("openevo-0.1.4-py3-none-any.whl", b"wheel")
+    framework_lock = write_bytes("framework-lock.json", b"lock")
+    runtime = write_bytes("runtime.tar", b"runtime")
+    daemon = write_bytes("openevo-daemon-linux-x86_64", b"daemon")
+    daemon_manifest = write_bytes("openevo-daemon-bundle.json", b"daemon-manifest")
+    packaged_root = tmp_path / "packaged-web"
+    packaged_root.mkdir()
+    build_digest = "a" * 64
+    packaged_manifest_payload = json.dumps(
+        {"schema_version": "1", "build_digest": build_digest, "files": []},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    root_manifest = packaged_root / ".openevo-product-web.json"
+    root_manifest.write_bytes(packaged_manifest_payload)
+    packaged_manifest = write_bytes(
+        "packaged-web-manifest.json", packaged_manifest_payload
+    )
+    packaged_manifest_sha256 = hashlib.sha256(packaged_manifest_payload).hexdigest()
+    source_commit = "b" * 40
+    playwright_payload = json.dumps(
+        {
+            "schema_version": 2,
+            "composition": "packaged_web",
+            "provider_kind": "desktop_sidecar",
+            "source_commit": source_commit,
+            "status": "passed",
+            "packaged_web": {
+                "build_digest": build_digest,
+                "manifest": {
+                    "filename": packaged_manifest.name,
+                    "sha256": packaged_manifest_sha256,
+                },
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    playwright_evidence = write_bytes(
+        "playwright-candidate-evidence.json", playwright_payload
+    )
+    dmg = write_bytes("OpenEvo-Desktop-0.1.4-aarch64.dmg", b"dmg")
+    app_smoke_payload = json.dumps(
+        {
+            "schema_version": 3,
+            "launch_origin": "mounted_dmg",
+            "source_dmg": {
+                "filename": dmg.name,
+                "sha256": hashlib.sha256(dmg.read_bytes()).hexdigest(),
+            },
+            "bundled_external_bin": "openevo-desktop-sidecar",
+            "sidecar_ready": True,
+            "bundled_external_bin_resolved": True,
+            "native_listener_fd_handoff": True,
+            "native_executable_fd_handoff": True,
+            "process_group_cleanup": True,
+            "binary_sha256": {
+                "native_executable": hashlib.sha256(b"native").hexdigest(),
+                "bundled_external_bin": hashlib.sha256(b"candidate-sidecar").hexdigest(),
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    app_smoke = write_bytes("app-bundle-smoke.json", app_smoke_payload)
+    candidate_payload = {
+        "schema_version": 6,
+        "source_commit": source_commit,
+        "version": "0.1.4",
+        "files": [
+            file_record("core_wheel", wheel),
+            file_record("framework_lock", framework_lock),
+            file_record("daemon_bundle", daemon),
+            file_record("daemon_manifest", daemon_manifest),
+            file_record("packaged_web_manifest", packaged_manifest),
+            file_record("playwright_evidence", playwright_evidence),
+            file_record("desktop_dmg", dmg),
+            file_record("app_bundle_smoke", app_smoke),
+        ],
+        "managed_runtime": {"archive": file_record("runtime", runtime)},
+    }
+    release_candidate = write_bytes(
+        "release-candidate.json",
+        json.dumps(candidate_payload, sort_keys=True, separators=(",", ":")).encode(),
+    )
+    authorities = tuple(
+        module.HeldReleaseAsset.open(path)
+        for path in (sidecar, wheel, framework_lock, runtime, daemon, daemon_manifest)
+    )
+    assets = module.ReleaseAssets(
+        sidecar=sidecar,
+        wheel=wheel,
+        framework_lock=framework_lock,
+        managed_runtime_archive=runtime,
+        daemon_bundle=daemon,
+        daemon_manifest=daemon_manifest,
+        evidence={},
+        authorities=authorities,
+    )
+
+    binding = module._validate_renderer_candidate_binding(
+        assets=assets,
+        release_candidate_manifest=release_candidate,
+        app_bundle_smoke=app_smoke,
+        packaged_web_manifest=packaged_manifest,
+        playwright_candidate_evidence=playwright_evidence,
+        packaged_web_root=packaged_root,
+    )
+    try:
+        assert binding.source_commit == source_commit
+        assert binding.version == "0.1.4"
+        assert binding.build_digest == build_digest
+        assert binding.evidence["desktop_dmg_sha256"] == hashlib.sha256(b"dmg").hexdigest()
+        assert binding.evidence["candidate_packaged_sidecar_sha256"] == hashlib.sha256(
+            b"candidate-sidecar"
+        ).hexdigest()
+        assert binding.evidence["science_sidecar_sha256"] == hashlib.sha256(
+            b"sidecar"
+        ).hexdigest()
+        module._audit_evidence(
+            {"renderer_candidate_binding": binding.evidence}, private_values=()
+        )
+    finally:
+        binding.close()
+        assets.close()
+
+
 def test_local_build_is_release_build_with_managed_runtime_archive(
     tmp_path: Path,
     monkeypatch,
@@ -356,7 +732,10 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
         archive: Path,
         bundle: Path,
         manifest: Path,
+        *,
+        validation_root: Path,
     ):
+        captured["validation_root"] = validation_root
         captured["inspected"] = (sidecar, wheel, lock, archive, bundle, manifest)
         return module.ReleaseAssets(
             sidecar,
@@ -394,6 +773,7 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     assert command[command.index("--daemon-manifest") + 1] == str(daemon_manifest.resolve())
     assert command.count("--release-build") == 1
     assert assets.managed_runtime_archive == runtime_archive.resolve()
+    assert captured["validation_root"] == tmp_path / "build" / "validated-assets"
     assert captured["inspected"][-3:] == (  # type: ignore[index]
         runtime_archive.resolve(),
         daemon_bundle,
@@ -502,11 +882,19 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
         runtime_archive,
         daemon_bundle,
         daemon_manifest,
+        validation_root=tmp_path / "validated-assets",
     )
 
-    assert ("runtime", runtime_archive) in calls
-    assert ("embedded_runtime", sidecar, runtime_archive) in calls
+    validated_root = tmp_path / "validated-assets"
+    validated_sidecar = validated_root / sidecar.name
+    validated_runtime = validated_root / runtime_archive.name
+    assert ("runtime", validated_runtime) in calls
+    assert ("embedded_runtime", validated_sidecar, validated_runtime) in calls
     assert any(call[0] == "embedded_daemon" for call in calls)
+    assert assets.sidecar == validated_sidecar
+    assert assets.wheel == validated_root / wheel.name
+    assert stat.S_IMODE(validated_root.stat().st_mode) == 0o700
+    assert all(authority.path.parent == validated_root for authority in assets.authorities)
     assert assets.evidence["managed_runtime_archive"] == {
         "sha256": runtime_digest,
         "byte_size": runtime_archive.stat().st_size,
@@ -561,7 +949,7 @@ def test_successor_reuse_requires_the_second_real_session_pin() -> None:
         runtime_context_receipt_sha256=None,
     )
     second = module.SessionObservation(
-        evidence={},
+        evidence={"runtime_context_receipt_core_provenance_verified": True},
         run={
             "pinned_revision": successor,
             "required_revision": {"relation": "active", "revision": successor},
@@ -726,6 +1114,10 @@ def test_successful_session_requires_real_harness_execution_phase() -> None:
 def test_successful_session_requires_typed_transcript_dataset_artifacts() -> None:
     module = _load_runner()
     workflow = _workflow(module)
+    workflow._allowed_concrete_method_ids = {
+        target_id: frozenset({f"method-{target_id}"})
+        for target_id in module.REQUIRED_TARGET_IDS
+    }
     predecessor = _revision("revision-0", 0)
     successor = _revision("revision-1", 1)
 
@@ -782,7 +1174,7 @@ def test_successful_session_requires_typed_transcript_dataset_artifacts() -> Non
         source_dataset_ids=["dataset-transcript"],
     )
     workflow._assert_successful_session(valid, ordinal=1)
-    assert valid.evidence["transcript_dataset_lineage_verified"] is True
+    assert valid.evidence["transcript_dataset_lineage_observed"] is True
 
     with pytest.raises(
         module.E2EFailure,
@@ -803,6 +1195,84 @@ def test_successful_session_requires_typed_transcript_dataset_artifacts() -> Non
             observation(artifact_type="text_memory", source_dataset_ids=[]),
             ordinal=1,
         )
+
+    workflow._allowed_concrete_method_ids["agent_system"] = frozenset(
+        {"different-agent-system-method"}
+    )
+    with pytest.raises(
+        module.E2EFailure,
+        match="typed_transcript_artifact_contract_mismatch",
+    ):
+        workflow._assert_successful_session(valid, ordinal=1)
+
+
+def test_runtime_context_receipt_requires_core_log_provenance() -> None:
+    module = _load_runner()
+    digest = "f" * 64
+    run_id = "run-real-e2e"
+    attempt_id = "attempt-real-e2e"
+    revision = _revision("revision-1", 1)
+    run = {
+        "id": run_id,
+        "status": "succeeded",
+        "current_attempt_id": attempt_id,
+        "required_revision": {"relation": "active", "revision": revision},
+        "pinned_revision": revision,
+    }
+
+    class Api:
+        logs = [
+            {
+                "stream": "stdout",
+                "service_id": "codex",
+                "level": "info",
+                "run_id": run_id,
+                "attempt_id": attempt_id,
+                "message": module.RUNTIME_CONTEXT_RECEIPT_PREFIX + digest,
+            }
+        ]
+
+        def page(self, route: str, **_kwargs: object) -> list[dict[str, object]]:
+            if route.endswith("/timeline"):
+                return []
+            if route.endswith("/logs"):
+                return list(self.logs)
+            if route.endswith("/artifacts"):
+                return []
+            raise AssertionError(route)
+
+        def request(self, _method: str, route: str, **_kwargs: object):
+            if route.endswith("/context"):
+                return {
+                    "status": "ready",
+                    "capture_mode": "transcript",
+                    "token_level_metrics_available": False,
+                    "artifacts": [],
+                    "adapters": [],
+                }
+            raise AssertionError(route)
+
+    workflow = _workflow(module)
+    api = Api()
+    workflow._api = api
+
+    spoofed = workflow._observe_session(run, ordinal=2)
+    assert spoofed.runtime_context_receipt_sha256 is None
+    assert spoofed.evidence["runtime_context_receipt_core_provenance_verified"] is False
+
+    api.logs.append(
+        {
+            "stream": "core",
+            "service_id": "core-control",
+            "level": "info",
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "message": module.RUNTIME_CONTEXT_RECEIPT_PREFIX + digest,
+        }
+    )
+    authoritative = workflow._observe_session(run, ordinal=2)
+    assert authoritative.runtime_context_receipt_sha256 == digest
+    assert authoritative.evidence["runtime_context_receipt_core_provenance_verified"] is True
 
 
 def test_followup_accepts_the_durable_predecessor_projection() -> None:
@@ -959,7 +1429,7 @@ def test_evidence_audit_rejects_sensitive_values(
         module._audit_evidence(payload, private_values=private_values)
 
 
-def test_bounded_evidence_contains_only_redacted_identity(tmp_path: Path) -> None:
+def test_bounded_evidence_contains_no_enumerable_remote_identity(tmp_path: Path) -> None:
     module = _load_runner()
     output = tmp_path / "evidence.json"
     payload = {
@@ -967,8 +1437,8 @@ def test_bounded_evidence_contains_only_redacted_identity(tmp_path: Path) -> Non
         "kind": "openevo_desktop_real_science_e2e",
         "outcome": "failed",
         "remote": {
-            "host_sha256": "1" * 64,
-            "user_sha256": "2" * 64,
+            "ssh_connection_verified": True,
+            "host_key_verified": True,
         },
         "failure": {"stage": "project_activate", "code": "project_activation_failed"},
     }
@@ -978,6 +1448,8 @@ def test_bounded_evidence_contains_only_redacted_identity(tmp_path: Path) -> Non
     assert output.stat().st_size <= module.MAX_EVIDENCE_BYTES
     assert json.loads(output.read_text(encoding="utf-8")) == payload
     assert "compute.example.org" not in output.read_text(encoding="utf-8")
+    assert "host_sha256" not in output.read_text(encoding="utf-8")
+    assert "user_sha256" not in output.read_text(encoding="utf-8")
 
 
 def test_closed_evidence_schema_accepts_runtime_receipt_shape() -> None:
@@ -1041,7 +1513,10 @@ def test_closed_evidence_schema_accepts_single_session_smoke_shape() -> None:
         ],
         "session_count": 1,
         "evolution_targets_enabled": False,
-        "evolution_e2e_verified": False,
+        "artifact_publication_verified": False,
+        "cross_session_reuse_verified": False,
+        "release_evolution_path_verified": False,
+        "canonical_project_head_orchestration_verified": False,
         "codex_subscription_transcript_verified": True,
         "project": {
             "target_ids": [],
@@ -1408,7 +1883,15 @@ def test_smoke_workflow_runs_exactly_one_session_and_labels_scope() -> None:
     workflow = _workflow(module, smoke=True)
     workflow.project_id = "project-real-e2e"
     revision = _revision("revision-0", 0)
-    project = {"etag": '"' + "1" * 64 + '"'}
+    project = {
+        "etag": '"' + "1" * 64 + '"',
+        "evolution": {
+            "targets": {
+                target_id: {"enabled": False, "method": None, "config": {}}
+                for target_id in module.REQUIRED_TARGET_IDS
+            }
+        },
+    }
     capabilities = {"registry_digest": "a" * 64, "targets": []}
     observation = module.SessionObservation(
         evidence={"ordinal": 1},
@@ -1452,11 +1935,83 @@ def test_smoke_workflow_runs_exactly_one_session_and_labels_scope() -> None:
     assert evidence["run_mode"] == "single_session_smoke"
     assert evidence["session_count"] == 1
     assert evidence["evolution_targets_enabled"] is False
-    assert evidence["evolution_e2e_verified"] is False
+    assert evidence["artifact_publication_verified"] is False
+    assert evidence["cross_session_reuse_verified"] is False
+    assert evidence["release_evolution_path_verified"] is False
+    assert evidence["canonical_project_head_orchestration_verified"] is False
     assert evidence["codex_subscription_transcript_verified"] is True
     assert evidence["sessions"] == [{"ordinal": 1}]
     assert evidence["project"]["target_ids"] == []  # type: ignore[index]
     assert evidence["project"]["method_ids"] == {}  # type: ignore[index]
+
+
+def test_single_session_evolution_runs_once_and_keeps_release_targets_enabled() -> None:
+    module = _load_runner()
+    workflow = _workflow(module)
+    workflow._single_session_evolution = True
+    workflow.project_id = "project-real-e2e"
+    workflow._method_ids = {
+        target_id: f"method-{target_id}" for target_id in module.REQUIRED_TARGET_IDS
+    }
+    revision = _revision("revision-0", 0)
+    project = {
+        "etag": '"' + "1" * 64 + '"',
+        "evolution": {
+            "targets": {
+                target_id: {"enabled": False, "method": None, "config": {}}
+                for target_id in module.REQUIRED_TARGET_IDS
+            }
+        },
+    }
+    capabilities = {"registry_digest": "a" * 64, "targets": []}
+    observation = module.SessionObservation(
+        evidence={"ordinal": 1},
+        run={"status": "succeeded", "pinned_revision": revision},
+        context={
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "artifacts": [],
+            "adapters": [],
+        },
+        artifacts=(),
+        document_sha256_by_target={},
+        runtime_context_receipt_sha256=None,
+    )
+    created_ordinals: list[int] = []
+
+    workflow._create_and_confirm_profile = lambda: {"profile_id": "profile"}
+    workflow._create_and_activate_project = lambda _profile: project
+    workflow._select_and_activate_targets = lambda _project: capabilities
+    workflow._get_project = lambda: project
+    workflow._validate_project = lambda _project: {
+        "registry_digest": "a" * 64,
+        "checks": ["remote"],
+    }
+
+    def create_run(_project: dict[str, object], *, ordinal: int):
+        created_ordinals.append(ordinal)
+        return observation.run
+
+    workflow._create_run = create_run
+    workflow._wait_run = lambda run, *, ordinal: run
+    workflow._observe_session = lambda _run, *, ordinal: observation
+    workflow._assert_successful_session = lambda observed, *, ordinal: None
+
+    evidence = workflow.run()
+
+    assert created_ordinals == [1]
+    assert evidence["run_mode"] == "single_session_evolution_release"
+    assert evidence["session_count"] == 1
+    assert evidence["evolution_targets_enabled"] is True
+    assert evidence["artifact_publication_verified"] is True
+    assert evidence["cross_session_reuse_verified"] is False
+    assert evidence["release_evolution_path_verified"] is False
+    assert evidence["canonical_project_head_orchestration_verified"] is False
+    assert evidence["codex_subscription_transcript_verified"] is True
+    assert evidence["sessions"] == [{"ordinal": 1}]
+    assert evidence["project"]["target_ids"] == list(  # type: ignore[index]
+        module.REQUIRED_TARGET_IDS
+    )
 
 
 def test_capability_selection_rejects_unsupported_agent_system_auto() -> None:

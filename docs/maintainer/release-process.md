@@ -211,8 +211,9 @@ bounds online. `cargo-audit` is pinned to `0.22.2` so the current RustSec CVSS
 4.0 data is parseable. `pip-audit==2.9.0` and its tool closure are installed
 from the frozen repository `uv.lock`, not resolved by `uvx` during the release
 run. Malformed or incomplete audit JSON still fails in the collector and no
-advisory is ignored. The final draft job alone receives `contents: write`;
-build and Linux verification retain read-only permissions.
+advisory is ignored. The final draft job alone receives `contents: write` and
+runs behind the protected `openevo-preview-publication` environment; build and
+Linux verification retain read-only permissions.
 
 The Linux producer runs the nine contract-simulator preview tests as a separate
 non-release gate. They do not emit a candidate blob and are never merged into
@@ -243,13 +244,35 @@ skipped, flaky, retried, or cross-candidate evidence fails closed.
 This Playwright result proves only the source-bound packaged Desktop interaction
 and viewport contract represented by those browser tests. It is not evidence
 of a real Codex Subscription science run. Release notes must describe Codex
-Subscription support as packaged and declared, with real-host verification
-still pending, until exact-candidate evidence binds the packaged Desktop, a
+Subscription support as packaged and declared while the release remains a
+draft. A public Preview additionally requires candidate-bound evidence for a
+packaged Desktop, a
 supported remote OpenEvo Daemon, subscription-authenticated Codex, transcript
-capture, two completed science sessions, all required promoted artifacts, and
+capture, two completed science sessions, all required selected artifacts, and
 their reuse by the successor session. Without that evidence, neither a Preview
 nor a packaging candidate may say that a real Codex Subscription run was
 validated.
+
+The exact-candidate run is performed after the draft exists. It consumes the
+draft's exact manifest, Daemon, Core, runtime, and packaged-web evidence and
+binds the exact DMG digest. Linux cannot execute the macOS sidecar from that
+DMG, so release acceptance composes this source-equivalent science run with the
+candidate workflow's separate mounted-DMG and copied-app native macOS smokes;
+it does not describe them as one exact-DMG science process. A passing canonical
+record and its OpenSSH signature are committed at
+`release-evidence/<candidate-tag>/desktop-real-science-e2e.json{,.sig}`.
+The candidate manifest's `app_bundle_smoke` role binds the exact macOS sidecar
+digest observed in the mounted DMG; the science-run record separately binds the
+source-equivalent Linux sidecar and does not claim cross-platform binary
+identity. Publication is fail-closed until the reviewed publication workflow
+validates the record, both caller-supplied SHA256 values, and the signature
+against the public key frozen in the candidate source. That key must also match
+the SHA-256 trust anchor configured as
+`OPENEVO_REAL_SCIENCE_E2E_PUBLIC_KEY_SHA256` in the protected
+`openevo-preview-publication` environment. The publication-policy
+commit must descend from the candidate commit and its complete Git delta may add
+only those two candidate-tag files, so evidence cannot be accompanied by a
+post-candidate policy relaxation.
 
 The current rehearsal's dependency and security summaries and Core descriptor
 use schema version 2 for those closed contracts. The release candidate manifest
@@ -401,7 +424,9 @@ published only under the Preview policy above.
 Dispatch `Publish validated OpenEvo Desktop Preview` only from `stable` and
 through the protected `openevo-preview-publication` environment. Supply the
 exact candidate tag, numeric release ID, source SHA, `release-candidate.json`
-SHA256, candidate workflow run ID and attempt, plus the explicit confirmation.
+SHA256, committed two-session real-science evidence SHA256, its OpenSSH
+signature SHA256, candidate workflow run ID and attempt, plus the explicit
+confirmation.
 The publisher first runs a read-only verification job. That job checks out the
 workflow's own `github.workflow_sha`, never the candidate source, and requires
 the Actions API to identify that exact run as a successful, completed
@@ -409,7 +434,22 @@ the Actions API to identify that exact run as a successful, completed
 `.github/workflows/openevo-desktop-candidate.yml` on `stable` at the expected
 source SHA. It then downloads that run's canonical snapshot, re-resolves the
 tag in the authenticated paginated release inventory, and re-reads metadata by
-the expected numeric ID.
+the expected numeric ID. It also validates the fixed candidate-tag evidence path
+with `validate_desktop_real_science_e2e.py`, requiring the exact source and
+candidate-manifest identities, the exact candidate native-sidecar smoke,
+candidate-source public key and protected trust anchor, trusted evidence
+signature, two successful subscription sessions, cross-session artifact reuse,
+concrete method lineage, Core-provenance runtime receipt, renderer observability,
+and complete ownership cleanup.
+It also requires the publication-policy commit to descend from the candidate
+source and permits exactly two added paths in that delta: the candidate-tag
+evidence and its signature.
+
+The fixed publication receipt records the candidate workflow identity,
+candidate-manifest digest, publication-policy commit, durable evidence and
+signature paths and digests, signer-key digest, release identity, and immutable
+publication result. The receipt is retained for 90 days; the canonical evidence
+and signature remain durable in the recorded policy commit.
 
 Before publication it downloads every draft asset by immutable asset ID into a
 fresh owner-only directory and verifies the manifest, `SHA256SUMS`, title,
@@ -420,8 +460,9 @@ repository administration that immutable releases remain enabled; the normal
 workflow token intentionally has no repository-administration permission. Any
 failure through this point leaves the draft unpublished.
 
-The protected write job does not check out or execute repository or candidate
-code. It downloads the candidate snapshot as data, repeats the closed identity,
+The protected write job never checks out or executes candidate code. It
+downloads the read-only job's validated evidence as data, re-hashes those bytes,
+downloads the candidate snapshot as data, repeats the closed identity,
 metadata, API digest, asset-byte and tag-absence checks with fixed standard
 library code embedded in the reviewed workflow, and only then performs the
 single mutation: a REST PATCH to

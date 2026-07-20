@@ -234,6 +234,10 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Session output");
     expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
     expect(screenText()).toContain("Memory and skills were prepared for the next session.");
+    expect(document.querySelector(".run-timeline")).not.toBeNull();
+    expect(document.querySelectorAll(".run-timeline li").length).toBeGreaterThan(0);
+    const renderedSequences = [...document.querySelectorAll<HTMLElement>(".run-timeline li")].map((entry) => Number(entry.dataset.sequence));
+    expect(renderedSequences).toEqual([...renderedSequences].sort((left, right) => left - right));
 
     await clickButton("Evolution logs");
     expect(screenText()).not.toContain("Evidence synthesis completed with three supported findings.");
@@ -242,6 +246,35 @@ describe("DesktopProductApp", () => {
     await clickButton("Agent logs");
     expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
     expect(screenText()).not.toContain("Memory and skills were prepared for the next session.");
+  });
+
+  it("keeps the Daemon project head authoritative while the project projection refreshes", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const current = await provider.refresh();
+    if (current.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
+    const project = current.snapshot.projects[0];
+    const predecessor = current.snapshot.runs[0]?.pinned_revision;
+    if (!project?.remote || !predecessor) throw new Error("Expected revision fixtures.");
+    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
+      status: "fresh",
+      snapshot: {
+        ...current.snapshot,
+        projects: [{
+          ...project,
+          remote: { ...project.remote, active_revision: predecessor },
+        }],
+      },
+    });
+
+    root = await renderProduct(provider);
+    await clickButton("Evolution");
+
+    expect(document.querySelector(".revision-node.active")?.textContent).toContain("Project Head 1");
+    expect(screenText()).not.toContain("Project Head 2");
+    expect(document.querySelectorAll(".revision-node")).toHaveLength(1);
+    expect(document.querySelector(".artifact-list-heading")?.textContent).toContain("3 selected");
+    expect(screenText()).toContain("Quality 83%");
+    expect(screenText()).not.toContain("Quality 84%");
   });
 
   it("refreshes live session output after authoritative stream updates", async () => {
@@ -689,7 +722,7 @@ describe("DesktopProductApp", () => {
     });
   });
 
-  it("keeps new-project setup open until remote evolution defaults are saved and activated", async () => {
+  it("keeps new-project setup open and activates only the evolution targets selected by the user", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const before = await provider.refresh();
     if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
@@ -705,9 +738,16 @@ describe("DesktopProductApp", () => {
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
     expect(screenText()).toContain("Remote evolution methods are ready");
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
+    expect([...document.querySelectorAll<HTMLOptionElement>("#codex-model-suggestions option")].map((option) => option.value)).toEqual([
+      "gpt-5.5",
+      "gpt-5.3-codex-spark",
+    ]);
     expect(button("Save and activate").disabled).toBe(false);
 
-    const firstToggle = document.querySelector<HTMLInputElement>(".target-toggle input[role='switch']");
+    const toggles = [...document.querySelectorAll<HTMLInputElement>(".target-toggle input[role='switch']")];
+    expect(toggles).toHaveLength(3);
+    expect(toggles.every((toggle) => !toggle.checked)).toBe(true);
+    const firstToggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
     if (!firstToggle) throw new Error("Evolution target switch was not found.");
     expect(firstToggle.type).toBe("checkbox");
     expect(firstToggle.disabled).toBe(false);
@@ -719,21 +759,15 @@ describe("DesktopProductApp", () => {
     if (!(firstTrack instanceof HTMLElement) || !firstTrack.classList.contains("switch-track")) {
       throw new Error("Evolution target switch track was not adjacent to its checkbox.");
     }
-    const initiallyChecked = firstToggle.checked;
     await act(async () => firstTrack.click());
-    expect(firstToggle.checked).toBe(!initiallyChecked);
-    await act(async () => firstTrack.click());
-    expect(firstToggle.checked).toBe(initiallyChecked);
+    expect(firstToggle.checked).toBe(true);
+    expect(document.querySelector<HTMLSelectElement>('select[aria-label="Text memory method"]')?.value).toBe("reference_text_memory");
 
     const prepared = await provider.refresh();
     if (prepared.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
     const draft = prepared.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
     expect(draft?.evolution.targets).toEqual({});
     expect(draft?.evolution_configuration_state).toBe("pending");
-
-    for (const toggle of document.querySelectorAll<HTMLInputElement>(".target-toggle input[role='switch']")) {
-      await act(async () => toggle.click());
-    }
 
     await clickButton("Save and activate");
     expect(document.querySelector('[role="dialog"]')).toBeNull();
@@ -747,10 +781,8 @@ describe("DesktopProductApp", () => {
       reasoning_effort: "high",
     });
     expect(created?.evolution_configuration_state).toBe("configured");
-    expect(created?.evolution.targets).toMatchObject({
-      text_memory: { enabled: false },
-      skill_bundle: { enabled: false },
-      agent_system: { enabled: false },
+    expect(created?.evolution.targets).toEqual({
+      text_memory: { enabled: true, method: "reference_text_memory", config: {} },
     });
   });
 
@@ -936,28 +968,51 @@ describe("DesktopProductApp", () => {
 
     await clickButton("Start session");
     expect(screenText()).toContain("Queued");
-    expect(screenText()).toContain("Revision 2");
+    expect(screenText()).toContain("Project Head 2");
     await advance(45);
     expect(screenText()).toContain("Running");
     await advance(60);
     expect(screenText()).toContain("Preparing next revision");
-    expect(screenText()).toContain("Revision 2");
+    expect(screenText()).toContain("Project Head 2");
     await advance(25);
-    expect(screenText()).toContain("Revision 3");
+    expect(screenText()).toContain("Project Head 3");
     expect(screenText()).toContain("Latest session complete");
+    expect(screenText()).toContain("Project Head 3 contains this session's selected evolution outputs.");
+    expect(Array.from(document.querySelectorAll('[role="columnheader"]'), (header) => header.textContent)).toContain("Evolution output");
+    expect(screenText()).not.toContain("Successor");
 
     const completed = await provider.refresh();
     if (completed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
     const evolvedRun = completed.snapshot.runs.find((run) => run.status === "succeeded" && run.id !== "run-fixture-1");
     expect(evolvedRun?.pinned_revision?.generation).toBe(2);
     expect(evolvedRun?.required_revision.revision.generation).toBe(2);
-    expect(evolvedRun?.revision_transition?.predecessor_revision.generation).toBe(2);
-    expect(evolvedRun?.revision_transition?.successor_revision.generation).toBe(3);
-    expect(evolvedRun?.revision_transition?.state).toBe("active");
+    expect(evolvedRun?.revision_transition).toBeNull();
+    const evolvedArtifacts = completed.snapshot.artifacts.filter((artifact) => artifact.run_id === evolvedRun?.id);
+    expect(evolvedArtifacts).toHaveLength(3);
+    expect(evolvedArtifacts.every((artifact) => artifact.produced_revision.generation === 3)).toBe(true);
+
+    await clickButton("Session 1");
+    expect(button("Session 1").getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector(".active-run-panel .panel-kicker")?.textContent).toBe("Selected session");
+    expect(document.querySelector(".active-run-panel h2")?.textContent).toBe("Session 1");
+    expect(document.querySelector(".completed-summary strong")?.textContent).toBe("Session complete");
+    expect(optionalButton("View changes")).not.toBeNull();
+    await clickButton("View changes");
+    expect(screenText()).toContain("Historical Project Head");
+    expect(document.querySelector(".revision-node")?.textContent).toContain("Project Head 2");
+    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(3);
+
+    await clickButton("Research");
+
+    await clickButton("Session 2");
+    expect(button("Session 2").getAttribute("aria-pressed")).toBe("true");
+    expect(document.querySelector(".active-run-panel h2")?.textContent).toBe("Session 2");
+    expect(document.querySelector(".completed-summary strong")?.textContent).toBe("Latest session complete");
+    expect(optionalButton("View changes")).not.toBeNull();
 
     await clickButton("Start session");
     expect(screenText()).toContain("Pinned context");
-    expect(screenText()).toContain("Revision 3");
+    expect(screenText()).toContain("Project Head 3");
   });
 
   it("keeps Desktop project identity distinct from Core run and artifact identity", async () => {
@@ -1157,7 +1212,7 @@ describe("DesktopProductApp", () => {
     expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
     expect(screenText()).toContain("Text memory");
     await clickAria("Close settings");
-    await clickButton("Discard changes");
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
 
     provider.useUnsupportedSavedMethod();
     await flush();
@@ -1399,8 +1454,8 @@ describe("DesktopProductApp", () => {
     root = await renderProduct(provider);
 
     expect(screenText()).toContain("Latest session failed");
-    expect(screenText()).toContain("Revision 1");
-    expect(screenText()).not.toContain("Revision unknown");
+    expect(screenText()).toContain("Project Head 1");
+    expect(screenText()).not.toContain("Project Head unknown");
     expect(screenText()).not.toContain("Remote capabilities are unavailable for this project and mode.");
     expect(screenText()).toContain("The research session failed before evolution outputs were committed.");
     expect(screenText()).not.toContain("Latest session complete");
@@ -1927,7 +1982,7 @@ describe("DesktopProductApp", () => {
     await clickButton("Evolution");
     await flush();
 
-    expect(screenText()).toContain("Revision 4");
+    expect(screenText()).toContain("Project Head 4");
     expect(screenText()).not.toContain("Unselected newer artifact");
     const artifactNames = Array.from(document.querySelectorAll(".artifact-list-item strong"), (item) => item.textContent);
     expect(artifactNames).toEqual(["Parametric memory", "Skills", "Text memory", "Text memory", "Agent guidance"]);
@@ -1942,8 +1997,8 @@ describe("DesktopProductApp", () => {
 
     provider.makeRevisionEvidenceUnknown();
     await flush();
-    expect(screenText()).toContain("Revision unknown");
-    expect(button("Refetch revision").disabled).toBe(false);
+    expect(screenText()).toContain("Project Head unknown");
+    expect(button("Refetch Project Head").disabled).toBe(false);
   });
 
   it("fails closed on conflicting required and transition predecessor revision identities", async () => {
@@ -1951,12 +2006,12 @@ describe("DesktopProductApp", () => {
     provider.useRequiredRevisionIdentityConflict();
     root = await renderProduct(provider);
     await clickButton("Evolution");
-    expect(screenText()).toContain("Revision relation is unknown");
+    expect(screenText()).toContain("Project Head relation is unknown");
 
     provider.useTransitionPredecessorIdentityConflict();
     provider.emitAuthoritativeRefresh();
     await flush();
-    expect(screenText()).toContain("Revision relation is unknown");
+    expect(screenText()).toContain("Project Head relation is unknown");
     expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
   });
 
@@ -1980,6 +2035,21 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Artifact collection is incomplete");
     expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
     expect(button("Refetch artifacts").disabled).toBe(false);
+  });
+
+  it("does not infer session evolution outputs from an incomplete artifact collection", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    provider.markArtifactCollectionIncomplete();
+    root = await renderProduct(provider);
+
+    expect(screenText()).toContain("Artifact collection is incomplete");
+    expect(screenText()).toContain("Evolution output status is unavailable until all artifact pages are loaded.");
+    expect(screenText()).toContain("Artifacts incomplete");
+    expect(screenText()).toContain("Evolution output");
+    expect(screenText()).not.toContain("No evolution output");
+    expect(screenText()).not.toContain("contains this session's evolution outputs");
+    expect(button("Refetch artifacts").disabled).toBe(false);
+    expect(optionalButton("View changes")).toBeNull();
   });
 
   it("reloads typed 409/410/412 failures without replaying stale mutations", async () => {

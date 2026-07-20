@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.1.4 Preview - 2026-07-20
+
+- Keeps evolution target activation under explicit user control and resolves
+  each enabled target's method from the connected Daemon capabilities.
+- Shows the completed session timeline in authoritative remote sequence order
+  and treats the Daemon-reported Project Head as the sole active revision
+  authority while local projections refresh.
+- Adds candidate-bound packaged-renderer observation against the live Desktop
+  Local API, including bounded task, log, and evolution-artifact verification.
+- Lets users inspect every completed session's authoritative timeline and
+  transcript from the project history.
+- Requires signed, candidate-bound two-session Codex Subscription evidence,
+  including cross-session artifact reuse, before Preview publication.
+- Preserves the existing evolution algorithm implementations; this release
+  changes product configuration, observability, validation, and packaging only.
+
 ## 0.1.3 Preview - 2026-07-20
 
 ### Added

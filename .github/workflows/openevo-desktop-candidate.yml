@@ -45,6 +45,7 @@ jobs:
           npm ci
           npx playwright install --with-deps chromium
           CI=1 npm run test:product-browser:preview
+          CI=1 npm run test:product-browser:release-live -- --list
 
       - name: Produce packaged release-composition Playwright report
         working-directory: desktop
@@ -226,6 +227,7 @@ jobs:
             tests/ci/test_check_openevo_release.py \
             tests/ci/test_openevo_release_candidate.py \
             tests/ci/test_openevo_release_evidence.py \
+            tests/ci/test_validate_desktop_real_science_e2e.py \
             tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_darwin_sqlite_connection_uses_managed_path_and_persists_writes \
@@ -872,6 +874,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     needs: [macos-candidate, linux-core-candidate]
+    environment: openevo-preview-publication
     permissions:
       contents: write
     steps:

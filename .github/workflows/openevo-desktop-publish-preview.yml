@@ -15,6 +15,12 @@ on:
       expected_release_candidate_manifest_sha256:
         description: Exact SHA-256 of release-candidate.json
         required: true
+      expected_real_science_e2e_sha256:
+        description: Exact SHA-256 of the committed candidate-bound two-session E2E evidence
+        required: true
+      expected_real_science_e2e_signature_sha256:
+        description: Exact SHA-256 of the trusted release-host signature over the E2E evidence
+        required: true
       candidate_workflow_run_id:
         description: Candidate workflow run ID that produced the draft
         required: true
@@ -36,6 +42,7 @@ jobs:
     name: Revalidate Preview with read-only authority
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    environment: openevo-preview-publication
     permissions:
       actions: read
       contents: read
@@ -58,7 +65,10 @@ jobs:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           CONFIRMATION: ${{ inputs.confirmation }}
           EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SHA256: ${{ inputs.expected_real_science_e2e_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256: ${{ inputs.expected_real_science_e2e_signature_sha256 }}
           EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          EXPECTED_SIGNER_PUBLIC_KEY_SHA256: ${{ vars.OPENEVO_REAL_SCIENCE_E2E_PUBLIC_KEY_SHA256 }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           POLICY_SHA: ${{ github.workflow_sha }}
         run: |
@@ -67,11 +77,51 @@ jobs:
           [[ "$POLICY_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           [[ "$EXPECTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_REAL_SCIENCE_E2E_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SIGNER_PUBLIC_KEY_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$EXPECTED_RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$CANDIDATE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$CANDIDATE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
           test "$CONFIRMATION" = "publish-preview"
+          [[ "$CANDIDATE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{1,199}$ ]]
           git check-ref-format "refs/tags/$CANDIDATE_TAG"
+          git -C publication-policy merge-base --is-ancestor "$EXPECTED_SOURCE_SHA" "$POLICY_SHA"
+          test "$EXPECTED_SOURCE_SHA" != "$POLICY_SHA"
+          python - <<'PY'
+          from pathlib import Path
+          import os
+          import subprocess
+
+          repository = Path("publication-policy")
+          source = os.environ["EXPECTED_SOURCE_SHA"]
+          policy = os.environ["POLICY_SHA"]
+          tag = os.environ["CANDIDATE_TAG"]
+          expected = {
+              f"release-evidence/{tag}/desktop-real-science-e2e.json",
+              f"release-evidence/{tag}/desktop-real-science-e2e.json.sig",
+          }
+          result = subprocess.run(
+              ["git", "-C", str(repository), "diff", "--name-status", "--no-renames", source, policy],
+              check=True,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
+          )
+          observed = {}
+          for line in result.stdout.splitlines():
+              fields = line.split("\t")
+              if len(fields) != 2:
+                  raise SystemExit("Publication policy delta is not a simple file addition")
+              status, path = fields
+              if path in observed:
+                  raise SystemExit("Publication policy delta repeats a path")
+              observed[path] = status
+          if set(observed) != expected or any(status != "A" for status in observed.values()):
+              raise SystemExit(
+                  "After candidate creation, stable may add only its exact evidence and signature"
+              )
+          PY
 
       - name: Verify the exact successful candidate workflow run
         env:
@@ -134,6 +184,124 @@ jobs:
             exit 1
           fi
 
+      - name: Download the exact candidate manifest by validated asset ID
+        env:
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset_id="$(python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          snapshot = json.loads(
+              (Path(os.environ["RUNNER_TEMP"]) / "candidate-verification/preview-release-snapshot.json")
+              .read_text(encoding="utf-8")
+          )
+          matches = [
+              asset
+              for asset in snapshot.get("assets", [])
+              if asset.get("name") == "release-candidate.json"
+              and asset.get("sha256") == os.environ["EXPECTED_MANIFEST_SHA256"]
+          ]
+          if len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] < 1:
+              raise SystemExit("Validated snapshot does not identify release-candidate.json")
+          print(matches[0]["id"])
+          PY
+          )"
+          target="$RUNNER_TEMP/candidate-verification/release-candidate.json"
+          gh api \
+            -H "Accept: application/octet-stream" \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+            > "$target"
+          test "$(sha256sum "$target" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
+
+      - name: Download the exact candidate native-sidecar smoke by validated asset ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY' > "$RUNNER_TEMP/candidate-app-smoke-identity.txt"
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["RUNNER_TEMP"]) / "candidate-verification"
+          candidate = json.loads((root / "release-candidate.json").read_text(encoding="utf-8"))
+          snapshot = json.loads((root / "preview-release-snapshot.json").read_text(encoding="utf-8"))
+          roles = [item for item in candidate.get("files", []) if item.get("role") == "app_bundle_smoke"]
+          if len(roles) != 1:
+              raise SystemExit("Candidate does not identify one app-bundle smoke asset")
+          role = roles[0]
+          if role.get("filename") != "app-bundle-smoke.json":
+              raise SystemExit("Candidate app-bundle smoke filename is invalid")
+          matches = [
+              asset
+              for asset in snapshot.get("assets", [])
+              if asset.get("name") == role.get("filename")
+              and asset.get("sha256") == role.get("sha256")
+              and asset.get("size") == role.get("byte_size")
+          ]
+          if len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] < 1:
+              raise SystemExit("Validated snapshot does not identify app-bundle-smoke.json")
+          print(matches[0]["id"], role["sha256"], role["byte_size"])
+          PY
+          read -r asset_id expected_sha256 expected_size \
+            < "$RUNNER_TEMP/candidate-app-smoke-identity.txt"
+          [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+          [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
+          target="$RUNNER_TEMP/candidate-verification/app-bundle-smoke.json"
+          gh api \
+            -H "Accept: application/octet-stream" \
+            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+            > "$target"
+          test "$(sha256sum "$target" | awk '{print $1}')" = "$expected_sha256"
+          test "$(stat -c '%s' "$target")" = "$expected_size"
+
+      - name: Require exact-candidate two-session science evidence
+        env:
+          CANDIDATE_TAG: ${{ inputs.candidate_tag }}
+          EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SHA256: ${{ inputs.expected_real_science_e2e_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256: ${{ inputs.expected_real_science_e2e_signature_sha256 }}
+          EXPECTED_SIGNER_PUBLIC_KEY_SHA256: ${{ vars.OPENEVO_REAL_SCIENCE_E2E_PUBLIC_KEY_SHA256 }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+        run: |
+          evidence="publication-policy/release-evidence/$CANDIDATE_TAG/desktop-real-science-e2e.json"
+          signature="$evidence.sig"
+          test -f "$evidence"
+          test -f "$signature"
+          python publication-policy/scripts/ci/validate_desktop_real_science_e2e.py \
+            "$evidence" \
+            --candidate-manifest "$RUNNER_TEMP/candidate-verification/release-candidate.json" \
+            --candidate-app-bundle-smoke "$RUNNER_TEMP/candidate-verification/app-bundle-smoke.json" \
+            --expected-sha256 "$EXPECTED_REAL_SCIENCE_E2E_SHA256" \
+            --expected-source-commit "$EXPECTED_SOURCE_SHA" \
+            --expected-candidate-manifest-sha256 "$EXPECTED_MANIFEST_SHA256"
+          public_key="$RUNNER_TEMP/candidate-real-science-e2e.pub"
+          git -C publication-policy show \
+            "$EXPECTED_SOURCE_SHA:release-trust/desktop-real-science-e2e-v1.pub" \
+            > "$public_key"
+          chmod 0600 "$public_key"
+          test "$(sha256sum "$public_key" | awk '{print $1}')" = "$EXPECTED_SIGNER_PUBLIC_KEY_SHA256"
+          python publication-policy/scripts/ci/desktop_real_science_e2e_attestation.py verify \
+            "$evidence" \
+            --signature "$signature" \
+            --public-key "$public_key" \
+            --expected-signature-sha256 "$EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256"
+          target="$RUNNER_TEMP/verified-real-science-e2e"
+          mkdir -m 700 "$target"
+          install -m 0600 "$evidence" "$target/desktop-real-science-e2e.json"
+          install -m 0600 "$signature" "$target/desktop-real-science-e2e.json.sig"
+
+      - name: Retain the verified real-science evidence for the write job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-desktop-real-science-e2e-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-real-science-e2e/
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Retain read-only candidate verification
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -156,6 +324,24 @@ jobs:
         with:
           python-version: "3.11.15"
 
+      - name: Download the read-only job's verified real-science evidence
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: openevo-desktop-real-science-e2e-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/verified-real-science-e2e
+
+      - name: Rebind the reviewed two-session evidence bytes
+        env:
+          EXPECTED_REAL_SCIENCE_E2E_SHA256: ${{ inputs.expected_real_science_e2e_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256: ${{ inputs.expected_real_science_e2e_signature_sha256 }}
+        run: |
+          evidence="$RUNNER_TEMP/verified-real-science-e2e/desktop-real-science-e2e.json"
+          signature="$evidence.sig"
+          test -f "$evidence"
+          test -f "$signature"
+          test "$(sha256sum "$evidence" | awk '{print $1}')" = "$EXPECTED_REAL_SCIENCE_E2E_SHA256"
+          test "$(sha256sum "$signature" | awk '{print $1}')" = "$EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256"
+
       - name: Download the candidate-owned verification snapshot as data only
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
@@ -171,9 +357,13 @@ jobs:
           CANDIDATE_TAG: ${{ inputs.candidate_tag }}
           CONFIRMATION: ${{ inputs.confirmation }}
           EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SHA256: ${{ inputs.expected_real_science_e2e_sha256 }}
+          EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256: ${{ inputs.expected_real_science_e2e_signature_sha256 }}
           EXPECTED_RELEASE_ID: ${{ inputs.expected_release_id }}
+          EXPECTED_SIGNER_PUBLIC_KEY_SHA256: ${{ vars.OPENEVO_REAL_SCIENCE_E2E_PUBLIC_KEY_SHA256 }}
           EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
           GH_TOKEN: ${{ github.token }}
+          POLICY_SHA: ${{ github.workflow_sha }}
           SNAPSHOT_PATH: ${{ runner.temp }}/candidate-verification/preview-release-snapshot.json
         run: |
           python - <<'PY'
@@ -194,6 +384,12 @@ jobs:
           tag = os.environ["CANDIDATE_TAG"]
           source = os.environ["EXPECTED_SOURCE_SHA"]
           manifest_sha256 = os.environ["EXPECTED_MANIFEST_SHA256"]
+          evidence_sha256 = os.environ["EXPECTED_REAL_SCIENCE_E2E_SHA256"]
+          evidence_signature_sha256 = os.environ[
+              "EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256"
+          ]
+          signer_public_key_sha256 = os.environ["EXPECTED_SIGNER_PUBLIC_KEY_SHA256"]
+          policy_sha = os.environ["POLICY_SHA"]
           run_id_text = os.environ["CANDIDATE_RUN_ID"]
           run_attempt_text = os.environ["CANDIDATE_RUN_ATTEMPT"]
           if os.environ["CONFIRMATION"] != "publish-preview":
@@ -208,6 +404,14 @@ jobs:
               raise SystemExit("Candidate source SHA is invalid")
           if not re.fullmatch(r"[0-9a-f]{64}", manifest_sha256):
               raise SystemExit("Candidate manifest SHA-256 is invalid")
+          if not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256):
+              raise SystemExit("Real-science evidence SHA-256 is invalid")
+          if not re.fullmatch(r"[0-9a-f]{64}", evidence_signature_sha256):
+              raise SystemExit("Real-science evidence signature SHA-256 is invalid")
+          if not re.fullmatch(r"[0-9a-f]{64}", signer_public_key_sha256):
+              raise SystemExit("Real-science signer public-key SHA-256 is invalid")
+          if not re.fullmatch(r"[0-9a-f]{40}", policy_sha):
+              raise SystemExit("Publication policy SHA is invalid")
           if not tag or len(tag) > 200 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]+", tag):
               raise SystemExit("Candidate tag is invalid")
 
@@ -394,14 +598,10 @@ jobs:
           release = api_json(f"/releases/{release_id}")
           if type(release) is not dict:
               raise SystemExit("Release metadata is invalid")
-          if release.get("draft") is False:
-              assert_release(release, draft=False, immutable=True)
-              assert_tag_target(must_exist=True)
-              publication_mode = "already_public"
-          else:
-              assert_release(release, draft=True, immutable=False)
-              assert_tag_target(must_exist=False)
-              publication_mode = "published_now"
+          if release.get("draft") is not True:
+              raise SystemExit("Candidate was published outside the validated mutation")
+          assert_release(release, draft=True, immutable=False)
+          assert_tag_target(must_exist=False)
 
           for asset in expected_assets:
               digest = hashlib.sha256()
@@ -413,18 +613,34 @@ jobs:
               if size != asset["size"] or digest.hexdigest() != asset["sha256"]:
                   raise SystemExit(f"Release asset bytes changed: {asset['name']}")
 
-          if publication_mode == "published_now":
-              published = api_json(
-                  f"/releases/{release_id}",
-                  method="PATCH",
-                  body=b'{"draft":false}',
-              )
-              assert_release(published, draft=False, immutable=True)
-              assert_tag_target(must_exist=True)
+          published = api_json(
+              f"/releases/{release_id}",
+              method="PATCH",
+              body=b'{"draft":false}',
+          )
+          assert_release(published, draft=False, immutable=True)
+          assert_tag_target(must_exist=True)
           receipt = {
+              "candidate_manifest_sha256": manifest_sha256,
+              "candidate_workflow": {
+                  "run_attempt": run_attempt,
+                  "run_id": run_id,
+              },
+              "evidence_storage": {
+                  "commit": policy_sha,
+                  "path": f"release-evidence/{tag}/desktop-real-science-e2e.json",
+                  "sha256": evidence_sha256,
+                  "signature_path": (
+                      f"release-evidence/{tag}/desktop-real-science-e2e.json.sig"
+                  ),
+                  "signature_sha256": evidence_signature_sha256,
+              },
               "immutable": True,
-              "publication_mode": publication_mode,
+              "policy_commit": policy_sha,
+              "publication_mode": "published_now",
               "release_id": release_id,
+              "schema_version": 2,
+              "signer_public_key_sha256": signer_public_key_sha256,
               "source_commit": source,
               "tag": tag,
           }
@@ -441,7 +657,7 @@ jobs:
           name: openevo-desktop-preview-mutation-${{ inputs.expected_source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/publish-visibility-receipt.json
           if-no-files-found: warn
-          retention-days: 30
+          retention-days: 90
 
   verify-public-preview:
     name: Verify the immutable public Preview

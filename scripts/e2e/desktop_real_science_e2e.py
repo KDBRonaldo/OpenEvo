@@ -47,8 +47,16 @@ GUARD_FD_MINIMUM = 64
 MAX_NATIVE_FRAME_BYTES = 512
 MAX_HTTP_RESPONSE_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_BYTES = 128 * 1024
+MAX_RENDERER_HANDOFF_BYTES = 64 * 1024
+MAX_RENDERER_RESULT_BYTES = 64 * 1024
+MAX_RENDERER_SCREENSHOT_BYTES = 16 * 1024 * 1024
+MAX_RENDERER_PROCESS_LOG_BYTES = 8 * 1024 * 1024
+MAX_BUILD_PROCESS_LOG_BYTES = 8 * 1024 * 1024
+MAX_SIDECAR_PROCESS_LOG_BYTES = 16 * 1024 * 1024
+MAX_RENDERER_CANDIDATE_JSON_BYTES = 2 * 1024 * 1024
 MAX_EVIDENCE_ITEMS = 64
 REQUIRED_TARGET_IDS = ("agent_system", "skill_bundle", "text_memory")
+RELEASE_PROJECT_DISPLAY_NAME = "OpenEvo real science E2E"
 RELEASE_CODEX_MODEL = "gpt-5.3-codex-spark"
 RELEASE_REASONING_EFFORT = "high"
 MAX_POLL_SECONDS = 30.0
@@ -57,6 +65,8 @@ ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS = (0.25, 0.75, 1.5, 3.0)
 MAX_ACTIVATION_TIMEOUT_SECONDS = 1800.0
 MAX_RUN_TIMEOUT_SECONDS = 10800.0
 MAX_BUILD_TIMEOUT_SECONDS = 2400.0
+MAX_RENDERER_TIMEOUT_SECONDS = 600.0
+MAX_INTER_SESSION_DELAY_SECONDS = 300.0
 MAX_OVERALL_TIMEOUT_SECONDS = 21600.0
 RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v3: "
 CONTEXT_CANARY_INSTRUCTION = (
@@ -131,10 +141,8 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "authenticated_session_probe",
         "unauthenticated_session_rejected",
         "remote",
-        "host_sha256",
-        "port",
-        "user_sha256",
-        "host_key_fingerprint_sha256",
+        "ssh_connection_verified",
+        "host_key_verified",
         "project",
         "project_id_sha256",
         "execution_mode",
@@ -144,13 +152,41 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "reasoning_effort",
         "target_ids",
         "method_ids",
+        "allowed_concrete_method_ids",
+        "initial_zero_target_activation_verified",
         "registry_digest",
         "validation_check_count",
         "verification_scope",
         "session_count",
         "evolution_targets_enabled",
-        "evolution_e2e_verified",
+        "artifact_publication_verified",
+        "cross_session_reuse_verified",
+        "release_evolution_path_verified",
+        "canonical_project_head_orchestration_verified",
         "codex_subscription_transcript_verified",
+        "renderer",
+        "renderer_observability_verified",
+        "renderer_boundary",
+        "native_tauri_live_verified",
+        "renderer_candidate_binding",
+        "source_checkout_verified",
+        "candidate_version",
+        "release_candidate_manifest_sha256",
+        "desktop_dmg_sha256",
+        "packaged_web_manifest_sha256",
+        "playwright_candidate_evidence_sha256",
+        "app_bundle_smoke_sha256",
+        "candidate_packaged_sidecar_sha256",
+        "science_sidecar_sha256",
+        "candidate_native_sidecar_smoke_verified",
+        "cross_platform_source_equivalent_verified",
+        "renderer_ready",
+        "packaged_web_build_digest",
+        "builtin_sample_count",
+        "project_head_generation",
+        "independent_target_controls_verified",
+        "remote_method_selection_verified",
+        "screenshot_sha256",
         "disabled_target_ids",
         "sessions",
         "ordinal",
@@ -175,11 +211,13 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "artifact_id_sha256",
         "artifact_type",
         "target_id",
+        "method_id",
         "selected",
         "promoted",
         "produced_revision",
         "release_enabled",
         "source_artifact_count",
+        "source_artifact_ids_sha256",
         "source_dataset_count",
         "artifact_count",
         "artifact_evidence_truncated",
@@ -190,6 +228,7 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "truncated",
         "runtime_document_sha256",
         "runtime_context_receipt_sha256",
+        "runtime_context_receipt_core_provenance_verified",
         "context",
         "adapter_count",
         "reuse",
@@ -200,9 +239,9 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "session_1_artifacts_reused",
         "session_2_runtime_injection_verified",
         "session_2_lineage_verified",
-        "transcript_dataset_lineage_verified",
+        "transcript_dataset_lineage_observed",
         "reused_artifact_count",
-        "successor_revision",
+        "successor_project_head",
         "cleanup",
         "active_run_cleanup_required",
         "active_run_cancel_requested",
@@ -352,7 +391,14 @@ class HeldReleaseAsset:
         self.verify_unchanged()
         return {"sha256": self.sha256, "byte_size": self.byte_size}
 
-    def copy_to(self, destination: Path, *, executable: bool) -> None:
+    def copy_to(
+        self,
+        destination: Path,
+        *,
+        executable: bool,
+        failure_stage: str = "native_launch",
+        failure_code: str = "sidecar_snapshot_failed",
+    ) -> None:
         self.verify_unchanged()
         target_fd = -1
         try:
@@ -396,7 +442,7 @@ class HeldReleaseAsset:
                 destination.unlink()
             except OSError:
                 pass
-            raise E2EFailure("native_launch", "sidecar_snapshot_failed") from exc
+            raise E2EFailure(failure_stage, failure_code) from exc
         finally:
             if target_fd >= 0:
                 os.close(target_fd)
@@ -425,6 +471,24 @@ class ReleaseAssets:
         if len(matches) != 1:
             raise E2EFailure("release_assets", "release_asset_authority_missing")
         return matches[0]
+
+    def close(self) -> None:
+        for authority in self.authorities:
+            authority.close()
+
+
+@dataclass(frozen=True)
+class RendererCandidateBinding:
+    packaged_web_root: Path
+    source_commit: str
+    version: str
+    build_digest: str
+    evidence: dict[str, object]
+    authorities: tuple[HeldReleaseAsset, ...] = field(repr=False, compare=False)
+
+    def verify_unchanged(self) -> None:
+        for authority in self.authorities:
+            authority.verify_unchanged()
 
     def close(self) -> None:
         for authority in self.authorities:
@@ -476,6 +540,15 @@ class NativeSidecar:
     credentials: NativeCredentials = field(repr=False)
     process_log: BinaryIO = field(repr=False)
 
+    def assert_log_budget(self) -> None:
+        try:
+            self.process_log.flush()
+            size = os.fstat(self.process_log.fileno()).st_size
+        except OSError as exc:
+            raise E2EFailure("native_launch", "sidecar_process_log_unavailable") from exc
+        if size > MAX_SIDECAR_PROCESS_LOG_BYTES:
+            raise E2EFailure("native_launch", "sidecar_process_log_budget_exceeded")
+
     def terminate(self) -> bool:
         try:
             return _terminate_process_group(
@@ -504,11 +577,13 @@ class LocalApi:
         session_token: str,
         *,
         progress: ProgressReporter | None = None,
+        health_check: Callable[[], None] | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._session_token = session_token
         self._opener: OpenerDirector = build_opener(ProxyHandler({}))
         self._progress = progress
+        self._health_check = health_check
 
     def request(
         self,
@@ -522,6 +597,8 @@ class LocalApi:
         authenticated: bool = True,
         expected_empty_body: bool = False,
     ) -> dict[str, Any] | None:
+        if self._health_check is not None:
+            self._health_check()
         if self._progress is not None:
             self._progress.remaining(stage)
             self._progress.heartbeat(stage, "requesting")
@@ -552,6 +629,8 @@ class LocalApi:
             payload = _read_bounded(exc)
         except (OSError, URLError) as exc:
             raise E2EFailure(stage, "desktop_local_api_unreachable") from exc
+        if self._health_check is not None:
+            self._health_check()
         if self._progress is not None:
             self._progress.remaining(stage)
         if status not in statuses:
@@ -622,6 +701,8 @@ class DesktopScienceWorkflow:
         run_timeout_seconds: float,
         smoke: bool = False,
         progress: ProgressReporter | None = None,
+        inter_session_delay_seconds: float = 0.0,
+        single_session_evolution: bool = False,
     ) -> None:
         self._api = api
         self._host = host
@@ -640,18 +721,26 @@ class DesktopScienceWorkflow:
         self._activation_timeout = activation_timeout_seconds
         self._run_timeout = run_timeout_seconds
         self._progress = progress
+        self._inter_session_delay_seconds = inter_session_delay_seconds
+        self._single_session_evolution = single_session_evolution
         self._nonce = secrets.token_hex(12)
         self.profile_id: str | None = None
         self.project_id: str | None = None
         self._method_ids: dict[str, str] = {}
+        self._allowed_concrete_method_ids: dict[str, frozenset[str]] = {}
+        self._initial_zero_target_activation_verified = False
         self._disabled_target_ids: frozenset[str] = frozenset()
         self._expected_followup_successor: dict[str, Any] | None = None
         self._active_run: dict[str, Any] | None = None
+        self._session_observations: tuple[SessionObservation, ...] = ()
 
     def run(self) -> dict[str, object]:
         self._emit_progress("workflow", "started", force=True)
         profile = self._create_and_confirm_profile()
         project = self._create_and_activate_project(profile)
+        self._initial_zero_target_activation_verified = self._targets_are_disabled(project)
+        if not self._initial_zero_target_activation_verified:
+            raise E2EFailure("project_bootstrap_activate", "initial_targets_not_disabled")
         if self._smoke:
             capabilities, disabled_target_ids = self._disable_and_activate_targets(project)
             project = self._get_project()
@@ -663,6 +752,7 @@ class DesktopScienceWorkflow:
             run = self._wait_run(run, ordinal=1)
             observation = self._observe_session(run, ordinal=1)
             self._assert_smoke_session(observation)
+            self._session_observations = (observation,)
             self._emit_progress("workflow", "succeeded", force=True)
             return {
                 "run_mode": "single_session_smoke",
@@ -674,7 +764,10 @@ class DesktopScienceWorkflow:
                 ],
                 "session_count": 1,
                 "evolution_targets_enabled": False,
-                "evolution_e2e_verified": False,
+                "artifact_publication_verified": False,
+                "cross_session_reuse_verified": False,
+                "release_evolution_path_verified": False,
+                "canonical_project_head_orchestration_verified": False,
                 "codex_subscription_transcript_verified": True,
                 "remote": self._remote_evidence(),
                 "project": self._project_evidence(
@@ -697,13 +790,43 @@ class DesktopScienceWorkflow:
         first = self._observe_session(first_run, ordinal=1)
         self._assert_successful_session(first, ordinal=1)
 
+        if self._single_session_evolution:
+            self._session_observations = (first,)
+            self._emit_progress("workflow", "succeeded", force=True)
+            return {
+                "run_mode": "single_session_evolution_release",
+                "verification_scope": [
+                    "desktop_sidecar",
+                    "ssh_bootstrap",
+                    "daemon_core",
+                    "codex_subscription_transcript",
+                    "evolution_artifact_publication",
+                ],
+                "session_count": 1,
+                "evolution_targets_enabled": True,
+                "artifact_publication_verified": True,
+                "cross_session_reuse_verified": False,
+                "release_evolution_path_verified": False,
+                "canonical_project_head_orchestration_verified": False,
+                "codex_subscription_transcript_verified": True,
+                "remote": self._remote_evidence(),
+                "project": self._project_evidence(
+                    capabilities=capabilities,
+                    validation=validation,
+                    target_ids=list(REQUIRED_TARGET_IDS),
+                ),
+                "sessions": [first.evidence],
+            }
+
         current_project = self._get_project()
         self._prepare_followup_successor(first, current_project)
+        self._wait_between_sessions()
         second_run = self._create_run(current_project, ordinal=2)
         second_run = self._wait_run(second_run, ordinal=2)
         second = self._observe_session(second_run, ordinal=2)
         self._assert_successful_session(second, ordinal=2)
         reuse = self._assert_successor_reuse(first, second)
+        self._session_observations = (first, second)
         self._emit_progress("workflow", "succeeded", force=True)
 
         return {
@@ -713,11 +836,14 @@ class DesktopScienceWorkflow:
                 "ssh_bootstrap",
                 "daemon_core",
                 "codex_subscription_transcript",
-                "cross_session_evolution",
+                "cross_session_artifact_reuse",
             ],
             "session_count": 2,
             "evolution_targets_enabled": True,
-            "evolution_e2e_verified": True,
+            "artifact_publication_verified": True,
+            "cross_session_reuse_verified": True,
+            "release_evolution_path_verified": True,
+            "canonical_project_head_orchestration_verified": False,
             "codex_subscription_transcript_verified": True,
             "remote": self._remote_evidence(),
             "project": self._project_evidence(
@@ -729,16 +855,98 @@ class DesktopScienceWorkflow:
             "reuse": reuse,
         }
 
+    def renderer_expectations(self) -> dict[str, object]:
+        """Return private live-renderer expectations after a successful workflow."""
+
+        if self.project_id is None or not self._session_observations:
+            raise E2EFailure("renderer", "renderer_workflow_state_unavailable")
+        if set(self._method_ids) != set(REQUIRED_TARGET_IDS) or any(
+            not isinstance(method_id, str) or not method_id
+            for method_id in self._method_ids.values()
+        ):
+            raise E2EFailure("renderer", "renderer_method_expectation_missing")
+        if set(self._allowed_concrete_method_ids) != set(REQUIRED_TARGET_IDS) or any(
+            not method_ids for method_ids in self._allowed_concrete_method_ids.values()
+        ):
+            raise E2EFailure("renderer", "renderer_method_expectation_missing")
+        sessions: list[dict[str, object]] = []
+        artifact_by_target: dict[str, dict[str, object]] = {}
+        for ordinal, observation in enumerate(self._session_observations, start=1):
+            run_id = _text(observation.run, "id", "renderer")
+            timeline = observation.evidence.get("timeline")
+            logs = observation.evidence.get("logs")
+            if not isinstance(timeline, dict) or not isinstance(logs, dict):
+                raise E2EFailure("renderer", "renderer_observation_invalid")
+            sessions.append(
+                {
+                    "ordinal": ordinal,
+                    "run_id": run_id,
+                    "timeline_phase_values": list(timeline.get("phase_values", [])),
+                    "minimum_log_count": logs.get("count", 0),
+                }
+            )
+            for artifact in observation.artifacts:
+                target_id = _text(artifact, "target_id", "renderer")
+                if target_id not in REQUIRED_TARGET_IDS:
+                    continue
+                artifact_content_sha256 = artifact.get("content_sha256")
+                runtime_document_sha256 = observation.document_sha256_by_target.get(
+                    target_id
+                )
+                if not _is_sha256(artifact_content_sha256) or not _is_sha256(
+                    runtime_document_sha256
+                ):
+                    raise E2EFailure(
+                        "renderer", "renderer_artifact_expectation_invalid"
+                    )
+                artifact_by_target[target_id] = {
+                    "artifact_id": _text(artifact, "id", "renderer"),
+                    "artifact_type": _text(artifact, "artifact_type", "renderer"),
+                    "target_id": target_id,
+                    "artifact_content_sha256": artifact_content_sha256,
+                    "runtime_document_sha256": runtime_document_sha256,
+                }
+        if set(artifact_by_target) != set(REQUIRED_TARGET_IDS):
+            raise E2EFailure("renderer", "renderer_artifact_expectation_missing")
+        successor_revisions = {
+            _canonical_object_sha256(artifact.get("produced_revision")): artifact.get(
+                "produced_revision"
+            )
+            for artifact in self._session_observations[-1].artifacts
+            if artifact.get("target_id") in REQUIRED_TARGET_IDS
+        }
+        if len(successor_revisions) != 1:
+            raise E2EFailure("renderer", "renderer_successor_expectation_missing")
+        successor = next(iter(successor_revisions.values()))
+        if not isinstance(successor, dict) or not isinstance(successor.get("generation"), int):
+            raise E2EFailure("renderer", "renderer_successor_expectation_missing")
+        return {
+            "project_id": self.project_id,
+            "project_name": RELEASE_PROJECT_DISPLAY_NAME,
+            "codex_model": self._codex_model,
+            "reasoning_effort": self._reasoning_effort,
+            "method_ids": dict(sorted(self._method_ids.items())),
+            "sessions": sessions,
+            "project_head_generation": successor.get("generation"),
+            "artifacts": [artifact_by_target[target_id] for target_id in REQUIRED_TARGET_IDS],
+        }
+
     def _emit_progress(self, stage: str, state: object, *, force: bool = False) -> None:
         if self._progress is not None:
             self._progress.emit(stage, state, force=force)
 
+    def _wait_between_sessions(self) -> None:
+        deadline = time.monotonic() + self._inter_session_delay_seconds
+        while time.monotonic() < deadline:
+            if self._progress is not None:
+                self._progress.remaining("inter_session_cooldown")
+                self._progress.emit("inter_session_cooldown", "waiting")
+            time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
+
     def _remote_evidence(self) -> dict[str, object]:
         return {
-            "host_sha256": _digest_text(self._host),
-            "port": self._port,
-            "user_sha256": _digest_text(self._user),
-            "host_key_fingerprint_sha256": _digest_text(self._expected_host_key_fingerprint),
+            "ssh_connection_verified": True,
+            "host_key_verified": True,
         }
 
     def _project_evidence(
@@ -758,6 +966,13 @@ class DesktopScienceWorkflow:
             "reasoning_effort": self._reasoning_effort,
             "target_ids": target_ids,
             "method_ids": dict(sorted(self._method_ids.items())),
+            "allowed_concrete_method_ids": {
+                target_id: sorted(method_ids)
+                for target_id, method_ids in sorted(self._allowed_concrete_method_ids.items())
+            },
+            "initial_zero_target_activation_verified": (
+                self._initial_zero_target_activation_verified
+            ),
             "registry_digest": capabilities["registry_digest"],
             "validation_check_count": len(validation.get("checks", [])),
         }
@@ -876,7 +1091,7 @@ class DesktopScienceWorkflow:
             stage="profile_create",
             headers={"Idempotency-Key": self._idempotency("profile-create")},
             body={
-                "name": "OpenEvo real science E2E",
+                "name": RELEASE_PROJECT_DISPLAY_NAME,
                 "host": self._host,
                 "port": self._port,
                 "user": self._user,
@@ -1023,6 +1238,18 @@ class DesktopScienceWorkflow:
             raise E2EFailure(stage, "remote_project_not_ready")
         return project
 
+    @staticmethod
+    def _targets_are_disabled(project: Mapping[str, object]) -> bool:
+        targets = _nested(project, "evolution", "targets")
+        return (
+            isinstance(targets, dict)
+            and set(targets) == set(REQUIRED_TARGET_IDS)
+            and all(
+                isinstance(selection, dict) and selection.get("enabled") is False
+                for selection in targets.values()
+            )
+        )
+
     def _select_and_activate_targets(self, project: dict[str, Any]) -> dict[str, Any]:
         body = self._get_capabilities(project)
         targets = body["targets"]
@@ -1078,6 +1305,9 @@ class DesktopScienceWorkflow:
                 ):
                     raise E2EFailure("project_capabilities", "agent_system_auto_not_supported")
                 self._method_ids[target_id] = "auto"
+                self._allowed_concrete_method_ids[target_id] = frozenset(
+                    str(method["method_id"]) for method in resolved_methods
+                )
                 selections[target_id] = {
                     "enabled": True,
                     "method": "auto",
@@ -1118,6 +1348,7 @@ class DesktopScienceWorkflow:
                 raise E2EFailure("project_capabilities", "invalid_method_default_config")
             method_id = str(selected["method_id"])
             self._method_ids[target_id] = method_id
+            self._allowed_concrete_method_ids[target_id] = frozenset({method_id})
             selections[target_id] = {
                 "enabled": True,
                 "method": method_id,
@@ -1327,6 +1558,11 @@ class DesktopScienceWorkflow:
             message.removeprefix(RUNTIME_CONTEXT_RECEIPT_PREFIX)
             for item in logs
             if isinstance((message := item.get("message")), str)
+            and item.get("stream") == "core"
+            and item.get("service_id") == "core-control"
+            and item.get("level") == "info"
+            and item.get("run_id") == run_id
+            and item.get("attempt_id") == run.get("current_attempt_id")
             and message.startswith(RUNTIME_CONTEXT_RECEIPT_PREFIX)
             and _is_sha256(message.removeprefix(RUNTIME_CONTEXT_RECEIPT_PREFIX))
         ]
@@ -1357,6 +1593,9 @@ class DesktopScienceWorkflow:
             "artifact_evidence_truncated": len(artifacts) > MAX_EVIDENCE_ITEMS,
             "artifact_inspections": inspections,
             "runtime_context_receipt_sha256": runtime_context_receipt_sha256,
+            "runtime_context_receipt_core_provenance_verified": (
+                runtime_context_receipt_sha256 is not None
+            ),
             "context": {
                 "status": context.get("status"),
                 "capture_mode": context.get("capture_mode"),
@@ -1434,6 +1673,8 @@ class DesktopScienceWorkflow:
             produced_revision = artifact.get("produced_revision")
             membership_revisions = artifact.get("membership_revisions")
             lineage = artifact.get("lineage")
+            method_id = lineage.get("method_id") if isinstance(lineage, dict) else None
+            allowed_method_ids = self._allowed_concrete_method_ids.get(target_id, frozenset())
             source_dataset_ids = (
                 lineage.get("source_dataset_ids") if isinstance(lineage, dict) else None
             )
@@ -1447,8 +1688,8 @@ class DesktopScienceWorkflow:
                 or not isinstance(membership_revisions, list)
                 or produced_revision not in membership_revisions
                 or not isinstance(lineage, dict)
-                or not isinstance(lineage.get("method_id"), str)
-                or not lineage["method_id"]
+                or not isinstance(method_id, str)
+                or method_id not in allowed_method_ids
                 or not isinstance(lineage.get("job_id"), str)
                 or not lineage["job_id"]
                 or not isinstance(source_dataset_ids, list)
@@ -1469,7 +1710,7 @@ class DesktopScienceWorkflow:
         }
         if len(revisions) != 1:
             raise E2EFailure(f"session_{ordinal}_artifacts", "output_revision_inconsistent")
-        observation.evidence["transcript_dataset_lineage_verified"] = True
+        observation.evidence["transcript_dataset_lineage_observed"] = True
 
     def _assert_smoke_session(self, observation: SessionObservation) -> None:
         run = observation.run
@@ -1612,7 +1853,10 @@ class DesktopScienceWorkflow:
             ):
                 raise E2EFailure("successor_reuse", "successor_lineage_missing")
         receipt_sha256 = second.runtime_context_receipt_sha256
-        if not _is_sha256(receipt_sha256):
+        if (
+            not _is_sha256(receipt_sha256)
+            or second.evidence.get("runtime_context_receipt_core_provenance_verified") is not True
+        ):
             raise E2EFailure("successor_reuse", "runtime_context_receipt_mismatch")
         return {
             "successor_generation_delta": 1,
@@ -1624,7 +1868,7 @@ class DesktopScienceWorkflow:
             "session_2_lineage_verified": True,
             "runtime_context_receipt_sha256": receipt_sha256,
             "reused_artifact_count": len(reused),
-            "successor_revision": _revision_evidence(successor, "successor_reuse"),
+            "successor_project_head": _revision_evidence(successor, "successor_reuse"),
         }
 
     def _prepare_followup_successor(
@@ -1795,9 +2039,12 @@ def _build_assets(
             process_group_id=process_group_id,
             timeout_seconds=timeout_seconds,
             progress=progress,
+            process_log=build_log,
         )
         if returncode != 0:
             raise E2EFailure("release_assets", "sidecar_build_failed")
+        if os.fstat(build_log.fileno()).st_size > MAX_BUILD_PROCESS_LOG_BYTES:
+            raise E2EFailure("release_assets", "build_process_log_budget_exceeded")
         build_log.seek(0)
         lines = build_log.read().decode("utf-8", errors="replace").splitlines()
     if not lines:
@@ -1810,6 +2057,7 @@ def _build_assets(
         managed_runtime_archive,
         daemon_bundle,
         daemon_manifest,
+        validation_root=root / "validated-assets",
     )
 
 
@@ -1820,23 +2068,73 @@ def _inspect_release_assets(
     managed_runtime_archive: Path,
     daemon_bundle: Path,
     daemon_manifest: Path,
+    *,
+    validation_root: Path,
 ) -> ReleaseAssets:
     inputs = (
-        (sidecar, "packaged_sidecar_invalid"),
-        (wheel, "core_wheel_invalid"),
-        (lock, "framework_lock_invalid"),
-        (managed_runtime_archive, "managed_runtime_archive_invalid"),
-        (daemon_bundle, "daemon_bundle_invalid"),
-        (daemon_manifest, "daemon_manifest_invalid"),
+        (sidecar, "packaged_sidecar_invalid", True),
+        (wheel, "core_wheel_invalid", False),
+        (lock, "framework_lock_invalid", False),
+        (managed_runtime_archive, "managed_runtime_archive_invalid", False),
+        (daemon_bundle, "daemon_bundle_invalid", True),
+        (daemon_manifest, "daemon_manifest_invalid", False),
     )
-    for item, code in inputs:
+    for item, code, _executable in inputs:
         if item.is_symlink() or not item.is_file() or not stat.S_ISREG(item.stat().st_mode):
             raise E2EFailure("release_assets", code)
     if not os.access(sidecar, os.X_OK):
         raise E2EFailure("release_assets", "packaged_sidecar_not_executable")
+    if len({item.name for item, _code, _executable in inputs}) != len(inputs):
+        raise E2EFailure("release_assets", "release_asset_snapshot_name_collision")
+
+    source_authorities: list[HeldReleaseAsset] = []
+    try:
+        source_authorities.extend(
+            HeldReleaseAsset.open(path) for path, _code, _executable in inputs
+        )
+        validation_root.mkdir(mode=0o700)
+        root_metadata = validation_root.stat()
+        if (
+            not stat.S_ISDIR(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid()
+            or stat.S_IMODE(root_metadata.st_mode) != 0o700
+        ):
+            raise E2EFailure("release_assets", "release_asset_snapshot_root_invalid")
+        source_by_path = {
+            authority.path: authority for authority in source_authorities
+        }
+        for path, _code, executable in inputs:
+            source_by_path[path].copy_to(
+                validation_root / path.name,
+                executable=executable,
+                failure_stage="release_assets",
+                failure_code="release_asset_snapshot_failed",
+            )
+        for authority in source_authorities:
+            authority.verify_unchanged()
+    except FileExistsError as exc:
+        raise E2EFailure("release_assets", "release_asset_snapshot_root_exists") from exc
+    finally:
+        for authority in source_authorities:
+            authority.close()
+
+    sidecar = validation_root / sidecar.name
+    wheel = validation_root / wheel.name
+    lock = validation_root / lock.name
+    managed_runtime_archive = validation_root / managed_runtime_archive.name
+    daemon_bundle = validation_root / daemon_bundle.name
+    daemon_manifest = validation_root / daemon_manifest.name
+    validated_inputs = (
+        sidecar,
+        wheel,
+        lock,
+        managed_runtime_archive,
+        daemon_bundle,
+        daemon_manifest,
+    )
     authorities: list[HeldReleaseAsset] = []
     try:
-        authorities.extend(HeldReleaseAsset.open(path) for path, _code in inputs)
+        authorities.extend(HeldReleaseAsset.open(path) for path in validated_inputs)
         authority_by_path = {authority.path: authority for authority in authorities}
         name, version, wheel_digest = _validate_wheel_lock(wheel, lock)
         if wheel_digest != authority_by_path[wheel].sha256:
@@ -2090,6 +2388,7 @@ def _wait_sidecar_ready(
         native.base_url,
         native.credentials.session_token,
         progress=progress,
+        health_check=native.assert_log_budget,
     )
     deadline = (
         time.monotonic() + 60
@@ -2274,6 +2573,499 @@ def _write_evidence(
                 pass
 
 
+def _write_private_json(path: Path, payload: Mapping[str, object]) -> None:
+    encoded = _canonical_json(dict(payload))
+    if len(encoded) > MAX_RENDERER_HANDOFF_BYTES:
+        raise E2EFailure("renderer", "renderer_handoff_capacity_exceeded")
+    descriptor = -1
+    try:
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise E2EFailure("renderer", "renderer_handoff_write_failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_private_file(path: Path, *, maximum_bytes: int, code: str) -> bytes:
+    descriptor = -1
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_size <= 0
+            or metadata.st_size > maximum_bytes
+        ):
+            raise OSError("private file authority is invalid")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise OSError("private file ended during read")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        if os.read(descriptor, 1):
+            raise OSError("private file length changed")
+        return payload
+    except OSError as exc:
+        raise E2EFailure("renderer", code) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _copy_private_file(source: Path, destination: Path, *, maximum_bytes: int) -> None:
+    payload = _read_private_file(
+        source,
+        maximum_bytes=maximum_bytes,
+        code="renderer_screenshot_invalid",
+    )
+    descriptor = -1
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise E2EFailure("renderer", "renderer_screenshot_copy_failed") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _write_private_bytes(path: Path, payload: bytes, *, code: str) -> None:
+    descriptor = -1
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise E2EFailure("renderer", code) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _packaged_web_build_digest(packaged_web_root: Path) -> str:
+    manifest_path = packaged_web_root / ".openevo-product-web.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise E2EFailure("renderer", "packaged_web_manifest_invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema_version", "build_digest", "files"}
+        or payload.get("schema_version") != "1"
+        or not _is_sha256(payload.get("build_digest"))
+        or not isinstance(payload.get("files"), list)
+    ):
+        raise E2EFailure("renderer", "packaged_web_manifest_invalid")
+    return str(payload["build_digest"])
+
+
+def _held_json(authority: HeldReleaseAsset, *, code: str) -> tuple[bytes, dict[str, object]]:
+    authority.verify_unchanged()
+    if authority.byte_size > MAX_RENDERER_CANDIDATE_JSON_BYTES:
+        raise E2EFailure("renderer", code)
+    try:
+        payload = os.pread(authority.descriptor, authority.byte_size, 0)
+        if len(payload) != authority.byte_size or os.pread(
+            authority.descriptor, 1, authority.byte_size
+        ):
+            raise OSError("candidate input length changed")
+        parsed = json.loads(payload.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise E2EFailure("renderer", code) from exc
+    authority.verify_unchanged()
+    if not isinstance(parsed, dict):
+        raise E2EFailure("renderer", code)
+    return payload, parsed
+
+
+def _candidate_file(candidate: Mapping[str, object], role: str) -> dict[str, object]:
+    files = candidate.get("files")
+    matches = [
+        item
+        for item in files
+        if isinstance(files, list)
+        and isinstance(item, dict)
+        and item.get("role") == role
+    ] if isinstance(files, list) else []
+    if len(matches) != 1:
+        raise E2EFailure("renderer", "renderer_candidate_manifest_invalid")
+    item = matches[0]
+    if (
+        set(item) != {"byte_size", "filename", "role", "sha256"}
+        or not isinstance(item.get("filename"), str)
+        or not isinstance(item.get("byte_size"), int)
+        or item["byte_size"] <= 0
+        or not _is_sha256(item.get("sha256"))
+    ):
+        raise E2EFailure("renderer", "renderer_candidate_manifest_invalid")
+    return item
+
+
+def _validate_candidate_source_checkout(source_commit: str) -> None:
+    command = [
+        "git",
+        "-C",
+        str(REPOSITORY_ROOT),
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+    ]
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(REPOSITORY_ROOT), "rev-parse", "HEAD"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+            env=_build_environment(),
+        )
+        status = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=10,
+            env=_build_environment(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise E2EFailure("renderer", "renderer_source_checkout_unverifiable") from exc
+    if (
+        head.returncode != 0
+        or head.stdout.decode("ascii", errors="ignore").strip() != source_commit
+        or status.returncode != 0
+        or status.stdout
+    ):
+        raise E2EFailure("renderer", "renderer_source_checkout_mismatch")
+
+
+def _validate_renderer_candidate_binding(
+    *,
+    assets: ReleaseAssets,
+    release_candidate_manifest: Path,
+    app_bundle_smoke: Path,
+    packaged_web_manifest: Path,
+    playwright_candidate_evidence: Path,
+    packaged_web_root: Path,
+) -> RendererCandidateBinding:
+    opened: list[HeldReleaseAsset] = []
+    try:
+        candidate_authority = HeldReleaseAsset.open(release_candidate_manifest)
+        opened.append(candidate_authority)
+        app_smoke_authority = HeldReleaseAsset.open(app_bundle_smoke)
+        opened.append(app_smoke_authority)
+        packaged_manifest_authority = HeldReleaseAsset.open(packaged_web_manifest)
+        opened.append(packaged_manifest_authority)
+        playwright_authority = HeldReleaseAsset.open(playwright_candidate_evidence)
+        opened.append(playwright_authority)
+        root_manifest_authority = HeldReleaseAsset.open(
+            packaged_web_root / ".openevo-product-web.json"
+        )
+        opened.append(root_manifest_authority)
+        _, candidate = _held_json(
+            candidate_authority, code="renderer_candidate_manifest_invalid"
+        )
+        _, app_smoke = _held_json(
+            app_smoke_authority, code="renderer_candidate_app_smoke_invalid"
+        )
+        packaged_manifest_bytes, packaged_manifest_payload = _held_json(
+            packaged_manifest_authority,
+            code="renderer_candidate_packaged_web_manifest_invalid",
+        )
+        root_manifest_bytes, _ = _held_json(
+            root_manifest_authority,
+            code="renderer_candidate_packaged_web_manifest_invalid",
+        )
+        _, playwright_evidence = _held_json(
+            playwright_authority,
+            code="renderer_candidate_playwright_evidence_invalid",
+        )
+        source_commit = candidate.get("source_commit")
+        if (
+            not isinstance(candidate.get("schema_version"), int)
+            or not isinstance(source_commit, str)
+            or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+            or not isinstance(candidate.get("version"), str)
+        ):
+            raise E2EFailure("renderer", "renderer_candidate_manifest_invalid")
+        _validate_candidate_source_checkout(source_commit)
+
+        candidate_assets = {
+            "core_wheel": assets.authority(assets.wheel),
+            "framework_lock": assets.authority(assets.framework_lock),
+            "daemon_bundle": assets.authority(assets.daemon_bundle),
+            "daemon_manifest": assets.authority(assets.daemon_manifest),
+        }
+        for role, authority in candidate_assets.items():
+            item = _candidate_file(candidate, role)
+            if (
+                item["filename"] != authority.path.name
+                or item["sha256"] != authority.sha256
+                or item["byte_size"] != authority.byte_size
+            ):
+                raise E2EFailure("renderer", "renderer_candidate_asset_mismatch")
+        managed_runtime = candidate.get("managed_runtime")
+        archive = managed_runtime.get("archive") if isinstance(managed_runtime, dict) else None
+        runtime_authority = assets.authority(assets.managed_runtime_archive)
+        if (
+            not isinstance(archive, dict)
+            or archive.get("filename") != runtime_authority.path.name
+            or archive.get("sha256") != runtime_authority.sha256
+            or archive.get("byte_size") != runtime_authority.byte_size
+        ):
+            raise E2EFailure("renderer", "renderer_candidate_asset_mismatch")
+
+        packaged_role = _candidate_file(candidate, "packaged_web_manifest")
+        playwright_role = _candidate_file(candidate, "playwright_evidence")
+        desktop_dmg_role = _candidate_file(candidate, "desktop_dmg")
+        app_smoke_role = _candidate_file(candidate, "app_bundle_smoke")
+        if (
+            packaged_role["filename"] != packaged_web_manifest.name
+            or packaged_role["sha256"] != packaged_manifest_authority.sha256
+            or packaged_role["byte_size"] != packaged_manifest_authority.byte_size
+            or playwright_role["filename"] != playwright_candidate_evidence.name
+            or playwright_role["sha256"] != playwright_authority.sha256
+            or playwright_role["byte_size"] != playwright_authority.byte_size
+            or app_smoke_role["filename"] != app_bundle_smoke.name
+            or app_smoke_role["sha256"] != app_smoke_authority.sha256
+            or app_smoke_role["byte_size"] != app_smoke_authority.byte_size
+            or packaged_manifest_bytes != root_manifest_bytes
+        ):
+            raise E2EFailure("renderer", "renderer_candidate_asset_mismatch")
+        app_binary_sha256 = app_smoke.get("binary_sha256")
+        app_source_dmg = app_smoke.get("source_dmg")
+        candidate_sidecar_sha256 = (
+            app_binary_sha256.get("bundled_external_bin")
+            if isinstance(app_binary_sha256, dict)
+            else None
+        )
+        if (
+            app_smoke.get("schema_version") != 3
+            or app_smoke.get("launch_origin") != "mounted_dmg"
+            or app_smoke.get("bundled_external_bin") != "openevo-desktop-sidecar"
+            or not isinstance(app_source_dmg, dict)
+            or app_source_dmg
+            != {
+                "filename": desktop_dmg_role["filename"],
+                "sha256": desktop_dmg_role["sha256"],
+            }
+            or not isinstance(app_binary_sha256, dict)
+            or set(app_binary_sha256) != {"native_executable", "bundled_external_bin"}
+            or not _is_sha256(app_binary_sha256.get("native_executable"))
+            or not _is_sha256(candidate_sidecar_sha256)
+            or app_smoke.get("sidecar_ready") is not True
+            or app_smoke.get("bundled_external_bin_resolved") is not True
+            or app_smoke.get("native_listener_fd_handoff") is not True
+            or app_smoke.get("native_executable_fd_handoff") is not True
+            or app_smoke.get("process_group_cleanup") is not True
+        ):
+            raise E2EFailure("renderer", "renderer_candidate_app_smoke_invalid")
+        build_digest = packaged_manifest_payload.get("build_digest")
+        packaged_evidence = playwright_evidence.get("packaged_web")
+        evidence_manifest = (
+            packaged_evidence.get("manifest")
+            if isinstance(packaged_evidence, dict)
+            else None
+        )
+        if (
+            not _is_sha256(build_digest)
+            or playwright_evidence.get("schema_version") != 2
+            or playwright_evidence.get("composition") != "packaged_web"
+            or playwright_evidence.get("provider_kind") != "desktop_sidecar"
+            or playwright_evidence.get("source_commit") != source_commit
+            or playwright_evidence.get("status") != "passed"
+            or not isinstance(packaged_evidence, dict)
+            or packaged_evidence.get("build_digest") != build_digest
+            or not isinstance(evidence_manifest, dict)
+            or evidence_manifest.get("sha256") != packaged_manifest_authority.sha256
+            or evidence_manifest.get("filename") != packaged_web_manifest.name
+        ):
+            raise E2EFailure("renderer", "renderer_candidate_playwright_evidence_invalid")
+        return RendererCandidateBinding(
+            packaged_web_root=packaged_web_root,
+            source_commit=source_commit,
+            version=str(candidate["version"]),
+            build_digest=str(build_digest),
+            evidence={
+                "source_commit": source_commit,
+                "candidate_version": str(candidate["version"]),
+                "release_candidate_manifest_sha256": candidate_authority.sha256,
+                "desktop_dmg_sha256": desktop_dmg_role["sha256"],
+                "app_bundle_smoke_sha256": app_smoke_authority.sha256,
+                "candidate_packaged_sidecar_sha256": candidate_sidecar_sha256,
+                "science_sidecar_sha256": assets.authority(assets.sidecar).sha256,
+                "candidate_native_sidecar_smoke_verified": True,
+                "cross_platform_source_equivalent_verified": True,
+                "packaged_web_manifest_sha256": packaged_manifest_authority.sha256,
+                "playwright_candidate_evidence_sha256": playwright_authority.sha256,
+                "packaged_web_build_digest": build_digest,
+                "source_checkout_verified": True,
+            },
+            authorities=tuple(opened),
+        )
+    except BaseException:
+        for authority in opened:
+            authority.close()
+        raise
+
+
+def _validate_renderer_result(
+    payload: object,
+    *,
+    expectations: Mapping[str, object],
+    source_commit: str,
+    packaged_web_build_digest: str,
+    screenshot_sha256: str,
+) -> dict[str, object]:
+    if not isinstance(payload, dict) or set(payload) != {
+        "schema_version",
+        "kind",
+        "outcome",
+        "provider_kind",
+        "source_commit",
+        "packaged_web_build_digest",
+        "renderer_ready",
+        "builtin_sample_count",
+        "project_id_sha256",
+        "session_count",
+        "timeline",
+        "logs",
+        "project_head_generation",
+        "independent_target_controls_verified",
+        "remote_method_selection_verified",
+        "artifacts",
+        "screenshot_sha256",
+    }:
+        raise E2EFailure("renderer", "renderer_result_schema_invalid")
+    required_scalars = {
+        "schema_version": "1",
+        "kind": "openevo_desktop_live_renderer_observability",
+        "outcome": "passed",
+        "provider_kind": "desktop_sidecar",
+        "source_commit": source_commit,
+        "packaged_web_build_digest": packaged_web_build_digest,
+        "renderer_ready": True,
+        "builtin_sample_count": 2,
+        "independent_target_controls_verified": True,
+        "remote_method_selection_verified": True,
+        "project_id_sha256": _digest_text(str(expectations["project_id"])),
+        "session_count": len(expectations["sessions"]),
+        "project_head_generation": expectations["project_head_generation"],
+        "screenshot_sha256": screenshot_sha256,
+    }
+    if any(payload.get(key) != value for key, value in required_scalars.items()):
+        raise E2EFailure("renderer", "renderer_result_identity_mismatch")
+
+    timeline = payload.get("timeline")
+    expected_sessions = expectations["sessions"]
+    assert isinstance(expected_sessions, list)
+    expected_phases = {
+        phase
+        for session in expected_sessions
+        if isinstance(session, dict)
+        for phase in session.get("timeline_phase_values", [])
+        if isinstance(phase, str)
+    }
+    if (
+        not isinstance(timeline, dict)
+        or set(timeline) != {"count", "phase_values"}
+        or not isinstance(timeline.get("count"), int)
+        or timeline["count"] < len(expected_phases)
+        or not isinstance(timeline.get("phase_values"), list)
+        or set(timeline["phase_values"]) != expected_phases
+    ):
+        raise E2EFailure("renderer", "renderer_timeline_observation_invalid")
+    logs = payload.get("logs")
+    minimum_latest_logs = expected_sessions[-1].get("minimum_log_count", 0)
+    if (
+        not isinstance(logs, dict)
+        or set(logs) != {"count"}
+        or not isinstance(logs.get("count"), int)
+        or not isinstance(minimum_latest_logs, int)
+        or logs["count"] < minimum_latest_logs
+    ):
+        raise E2EFailure("renderer", "renderer_log_observation_invalid")
+
+    expected_artifacts = expectations["artifacts"]
+    observed_artifacts = payload.get("artifacts")
+    if not isinstance(expected_artifacts, list) or not isinstance(observed_artifacts, list):
+        raise E2EFailure("renderer", "renderer_artifact_observation_invalid")
+    expected_by_target = {
+        str(item["target_id"]): item for item in expected_artifacts if isinstance(item, dict)
+    }
+    if len(observed_artifacts) != len(expected_by_target):
+        raise E2EFailure("renderer", "renderer_artifact_observation_invalid")
+    observed_targets: set[str] = set()
+    for item in observed_artifacts:
+        if not isinstance(item, dict) or set(item) != {
+            "artifact_id_sha256",
+            "artifact_type",
+            "target_id",
+            "document_count",
+            "total_utf8_bytes",
+            "content_sha256",
+            "runtime_document_sha256",
+        }:
+            raise E2EFailure("renderer", "renderer_artifact_observation_invalid")
+        target_id = item.get("target_id")
+        expected = expected_by_target.get(str(target_id))
+        if (
+            expected is None
+            or target_id in observed_targets
+            or item.get("artifact_type") != expected.get("artifact_type")
+            or item.get("artifact_id_sha256") != _digest_text(str(expected["artifact_id"]))
+            or item.get("content_sha256") != expected.get("artifact_content_sha256")
+            or item.get("runtime_document_sha256")
+            != expected.get("runtime_document_sha256")
+            or not isinstance(item.get("document_count"), int)
+            or item["document_count"] < 1
+            or not isinstance(item.get("total_utf8_bytes"), int)
+            or item["total_utf8_bytes"] < 1
+            or not _is_sha256(item.get("content_sha256"))
+            or not _is_sha256(item.get("runtime_document_sha256"))
+        ):
+            raise E2EFailure("renderer", "renderer_artifact_observation_invalid")
+        observed_targets.add(str(target_id))
+    if observed_targets != set(expected_by_target):
+        raise E2EFailure("renderer", "renderer_artifact_observation_invalid")
+    return dict(payload)
+
+
 def _audit_evidence(value: object, *, private_values: Sequence[str]) -> None:
     secrets_to_reject = tuple(item for item in private_values if item)
 
@@ -2400,6 +3192,7 @@ def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, 
         "artifact_id_sha256": _digest_text(_text(artifact, "id", stage)),
         "artifact_type": artifact.get("artifact_type"),
         "target_id": artifact.get("target_id"),
+        "method_id": lineage.get("method_id") if isinstance(lineage, dict) else None,
         "content_sha256": artifact.get("content_sha256"),
         "byte_size": artifact.get("byte_size"),
         "selected": artifact.get("selected"),
@@ -2408,6 +3201,13 @@ def _artifact_evidence(artifact: Mapping[str, object], stage: str) -> dict[str, 
         "source_artifact_count": len(source_artifact_ids)
         if isinstance(source_artifact_ids, list)
         else -1,
+        "source_artifact_ids_sha256": [
+            _digest_text(source_artifact_id)
+            for source_artifact_id in source_artifact_ids[:MAX_EVIDENCE_ITEMS]
+            if isinstance(source_artifact_id, str) and source_artifact_id
+        ]
+        if isinstance(source_artifact_ids, list)
+        else [],
         "source_dataset_count": len(source_dataset_ids)
         if isinstance(source_dataset_ids, list)
         else -1,
@@ -2435,9 +3235,27 @@ def _required_target_document_sha256(
         if isinstance(document, dict)
         and document.get("truncated") is False
         and _is_sha256(document.get("content_sha256"))
+        and isinstance(document.get("content"), str)
+        and isinstance(document.get("byte_size"), int)
+        and not isinstance(document.get("byte_size"), bool)
+        and document["byte_size"] >= 0
     ]
     if len(complete) != len(documents):
         raise E2EFailure(stage, "artifact_document_not_complete")
+    total_bytes = 0
+    for document in complete:
+        content_bytes = str(document["content"]).encode("utf-8")
+        if (
+            len(content_bytes) != document["byte_size"]
+            or hashlib.sha256(content_bytes).hexdigest() != document["content_sha256"]
+        ):
+            raise E2EFailure(stage, "artifact_document_digest_mismatch")
+        total_bytes += len(content_bytes)
+    if (
+        content.get("total_utf8_bytes") != total_bytes
+        or content.get("returned_utf8_bytes") != total_bytes
+    ):
+        raise E2EFailure(stage, "artifact_content_byte_count_mismatch")
     if target_id == "skill_bundle":
         selected = [
             document for document in complete if document.get("relative_path") == "SKILL.md"
@@ -2660,6 +3478,7 @@ def _wait_for_build_process_group(
     process_group_id: int,
     timeout_seconds: float,
     progress: ProgressReporter | None = None,
+    process_log: BinaryIO | None = None,
 ) -> int:
     deadline = (
         time.monotonic() + timeout_seconds
@@ -2668,6 +3487,10 @@ def _wait_for_build_process_group(
     )
     try:
         while not _process_exited_without_reap(process):
+            if process_log is not None:
+                process_log.flush()
+                if os.fstat(process_log.fileno()).st_size > MAX_BUILD_PROCESS_LOG_BYTES:
+                    raise E2EFailure("release_assets", "build_process_log_budget_exceeded")
             if progress is not None:
                 progress.emit("release_assets", "building")
             remaining = deadline - time.monotonic()
@@ -2692,6 +3515,175 @@ def _wait_for_build_process_group(
     if process.returncode is None:
         raise E2EFailure("release_assets", "build_process_status_missing")
     return process.returncode
+
+
+def _run_renderer_verification(
+    *,
+    native: NativeSidecar,
+    workflow: DesktopScienceWorkflow,
+    desktop_identity: Mapping[str, object],
+    candidate_binding: RendererCandidateBinding,
+    root: Path,
+    timeout_seconds: float,
+    screenshot_output: Path | None,
+    progress: ProgressReporter | None,
+) -> dict[str, object]:
+    try:
+        root.mkdir(mode=0o700)
+    except OSError as exc:
+        raise E2EFailure("renderer", "renderer_workspace_create_failed") from exc
+    packaged_web_root = candidate_binding.packaged_web_root
+    playwright = REPOSITORY_ROOT / "desktop" / "node_modules" / ".bin" / "playwright"
+    config = REPOSITORY_ROOT / "desktop" / "playwright.release-live.config.ts"
+    if not playwright.is_file() or not os.access(playwright, os.X_OK) or not config.is_file():
+        raise E2EFailure("renderer", "renderer_harness_unavailable")
+    build_digest = _packaged_web_build_digest(packaged_web_root)
+    source_commit = desktop_identity.get("source_commit")
+    build_version = desktop_identity.get("build_version")
+    openapi_sha256 = desktop_identity.get("openapi_sha256")
+    feature_flags = desktop_identity.get("feature_flags")
+    if (
+        not isinstance(source_commit, str)
+        or source_commit != candidate_binding.source_commit
+        or build_version != candidate_binding.version
+        or build_digest != candidate_binding.build_digest
+        or not _is_sha256(openapi_sha256)
+        or not isinstance(feature_flags, list)
+        or not all(isinstance(item, str) for item in feature_flags)
+    ):
+        raise E2EFailure("renderer", "renderer_bootstrap_identity_invalid")
+    expectations = {
+        "source_commit": source_commit,
+        **workflow.renderer_expectations(),
+    }
+
+    handoff_path = root / "renderer-handoff.json"
+    result_path = root / "renderer-result.json"
+    screenshot_path = root / "renderer-observability.png"
+    handoff = {
+        "schema_version": "1",
+        "kind": "openevo_desktop_live_renderer_handoff",
+        "bootstrap": {
+            "schema_version": "1",
+            "endpoint": native.base_url,
+            "session_token": native.credentials.session_token,
+            "negotiated_contract": {
+                "major": 1,
+                "openapi_sha256": openapi_sha256,
+                "provider_kind": "desktop_sidecar",
+                "feature_flags": feature_flags,
+            },
+        },
+        "expected": expectations,
+        "packaged_web_root": str(packaged_web_root),
+        "result_path": str(result_path),
+        "screenshot_path": str(screenshot_path),
+    }
+    _write_private_json(handoff_path, handoff)
+    environment = _renderer_environment()
+    environment["OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF"] = str(handoff_path)
+    environment["OPENEVO_DESKTOP_LIVE_RENDERER_TIMEOUT_MS"] = str(
+        min(600_000, max(30_000, math.ceil(timeout_seconds * 1_000)))
+    )
+    process_log = TemporaryFile(mode="w+b")
+    process: subprocess.Popen[bytes] | None = None
+    if progress is not None:
+        progress.emit("renderer", "started", force=True)
+    try:
+        process = subprocess.Popen(
+            [str(playwright), "test", "--config", str(config)],
+            cwd=REPOSITORY_ROOT / "desktop",
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=process_log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        process_group_id = os.getpgid(process.pid)
+        if process_group_id != process.pid:
+            raise E2EFailure("renderer", "renderer_process_group_invalid")
+        deadline = (
+            time.monotonic() + timeout_seconds
+            if progress is None
+            else progress.phase_deadline("renderer", timeout_seconds)
+        )
+        while not _process_exited_without_reap(process):
+            native.assert_log_budget()
+            process_log.flush()
+            if os.fstat(process_log.fileno()).st_size > MAX_RENDERER_PROCESS_LOG_BYTES:
+                raise E2EFailure("renderer", "renderer_process_log_budget_exceeded")
+            if progress is not None:
+                progress.emit("renderer", "running")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise E2EFailure("renderer", "renderer_timeout")
+            time.sleep(min(0.25, remaining))
+        native.assert_log_budget()
+        process_log.flush()
+        if os.fstat(process_log.fileno()).st_size > MAX_RENDERER_PROCESS_LOG_BYTES:
+            raise E2EFailure("renderer", "renderer_process_log_budget_exceeded")
+        if not _terminate_process_group(
+            process,
+            process_group_id=process_group_id,
+            graceful_timeout_seconds=0,
+        ):
+            raise E2EFailure("renderer", "renderer_process_cleanup_failed")
+        if process.returncode != 0:
+            raise E2EFailure("renderer", "renderer_verification_failed")
+
+        screenshot = _read_private_file(
+            screenshot_path,
+            maximum_bytes=MAX_RENDERER_SCREENSHOT_BYTES,
+            code="renderer_screenshot_invalid",
+        )
+        screenshot_sha256 = hashlib.sha256(screenshot).hexdigest()
+        result_bytes = _read_private_file(
+            result_path,
+            maximum_bytes=MAX_RENDERER_RESULT_BYTES,
+            code="renderer_result_invalid",
+        )
+        try:
+            result_payload = json.loads(result_bytes.decode("utf-8", errors="strict"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise E2EFailure("renderer", "renderer_result_invalid") from exc
+        result = _validate_renderer_result(
+            result_payload,
+            expectations=expectations,
+            source_commit=source_commit,
+            packaged_web_build_digest=build_digest,
+            screenshot_sha256=screenshot_sha256,
+        )
+        if screenshot_output is not None:
+            _copy_private_file(
+                screenshot_path,
+                screenshot_output,
+                maximum_bytes=MAX_RENDERER_SCREENSHOT_BYTES,
+            )
+        if progress is not None:
+            progress.emit("renderer", "succeeded", force=True)
+        candidate_binding.verify_unchanged()
+        return result
+    except BaseException:
+        if process is not None and process.returncode is None:
+            try:
+                process_group_id = os.getpgid(process.pid)
+            except ProcessLookupError:
+                process_group_id = process.pid
+            _terminate_process_group(
+                process,
+                process_group_id=process_group_id,
+                graceful_timeout_seconds=5,
+            )
+        if progress is not None:
+            progress.emit("renderer", "failed", force=True)
+        raise
+    finally:
+        process_log.close()
+        for private_path in (handoff_path, result_path, screenshot_path):
+            try:
+                private_path.unlink()
+            except OSError:
+                pass
 
 
 def _terminate_process_group(
@@ -2762,9 +3754,42 @@ def _build_environment() -> dict[str, str]:
     return {name: value for name, value in os.environ.items() if name in allowed}
 
 
+def _renderer_environment() -> dict[str, str]:
+    allowed = {
+        "CI",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LOGNAME",
+        "PATH",
+        "PLAYWRIGHT_BROWSERS_PATH",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "USER",
+    }
+    return {name: value for name, value in os.environ.items() if name in allowed}
+
+
 def _validate_runtime_arguments(args: argparse.Namespace) -> None:
     if args.structural_check:
         return
+    if getattr(args, "smoke", False) and getattr(args, "verify_renderer", False):
+        raise E2EFailure("arguments", "renderer_requires_full_evolution_e2e")
+    verify_renderer = getattr(args, "verify_renderer", False)
+    renderer_candidate_inputs = (
+        getattr(args, "release_candidate_manifest", None),
+        getattr(args, "app_bundle_smoke", None),
+        getattr(args, "packaged_web_manifest", None),
+        getattr(args, "playwright_candidate_evidence", None),
+        getattr(args, "packaged_web_root", None),
+    )
+    if verify_renderer and any(item is None for item in renderer_candidate_inputs):
+        raise E2EFailure("arguments", "renderer_candidate_binding_required")
+    if verify_renderer and getattr(args, "sidecar", None) is not None:
+        raise E2EFailure("arguments", "renderer_requires_source_built_sidecar")
+    if not verify_renderer and any(item is not None for item in renderer_candidate_inputs):
+        raise E2EFailure("arguments", "renderer_candidate_binding_without_renderer")
     if (args.core_wheel is None) != (args.framework_lock is None):
         raise E2EFailure("arguments", "core_release_pair_required")
     if args.core_wheel is None or args.framework_lock is None:
@@ -2798,6 +3823,21 @@ def _positive_finite_seconds(value: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a finite positive number")
     return parsed
+
+
+def _nonnegative_seconds_at_most(maximum: float) -> Callable[[str], float]:
+    def parse(value: str) -> float:
+        try:
+            parsed = float(value)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
+        if not math.isfinite(parsed) or parsed < 0 or parsed > maximum:
+            raise argparse.ArgumentTypeError(
+                f"must be a finite number between 0 and {maximum:g}"
+            )
+        return parsed
+
+    return parse
 
 
 def _seconds_at_most(maximum: float) -> Callable[[str], float]:
@@ -2866,6 +3906,12 @@ def _parser() -> argparse.ArgumentParser:
         default=30.0,
     )
     parser.add_argument(
+        "--inter-session-delay-seconds",
+        type=_nonnegative_seconds_at_most(MAX_INTER_SESSION_DELAY_SECONDS),
+        default=0.0,
+        help="Optional maintainer E2E cooldown between the two subscription sessions.",
+    )
+    parser.add_argument(
         "--activation-timeout-seconds",
         type=_seconds_at_most(MAX_ACTIVATION_TIMEOUT_SECONDS),
         default=1200.0,
@@ -2885,6 +3931,49 @@ def _parser() -> argparse.ArgumentParser:
         type=_seconds_at_most(MAX_OVERALL_TIMEOUT_SECONDS),
         default=MAX_OVERALL_TIMEOUT_SECONDS,
     )
+    parser.add_argument(
+        "--verify-renderer",
+        action="store_true",
+        help=(
+            "Before cleanup, drive the packaged Desktop renderer against the live "
+            "Local API and verify task/evolution observability."
+        ),
+    )
+    parser.add_argument(
+        "--renderer-timeout-seconds",
+        type=_seconds_at_most(MAX_RENDERER_TIMEOUT_SECONDS),
+        default=300.0,
+    )
+    parser.add_argument(
+        "--renderer-screenshot-output",
+        type=Path,
+        help="Optional destination for the validated renderer screenshot.",
+    )
+    parser.add_argument(
+        "--release-candidate-manifest",
+        type=Path,
+        help="Exact candidate release-candidate.json required by renderer verification.",
+    )
+    parser.add_argument(
+        "--app-bundle-smoke",
+        type=Path,
+        help="Exact candidate app-bundle-smoke.json required by renderer verification.",
+    )
+    parser.add_argument(
+        "--packaged-web-manifest",
+        type=Path,
+        help="Exact candidate packaged-web-manifest.json required by renderer verification.",
+    )
+    parser.add_argument(
+        "--playwright-candidate-evidence",
+        type=Path,
+        help="Exact candidate Playwright evidence required by renderer verification.",
+    )
+    parser.add_argument(
+        "--packaged-web-root",
+        type=Path,
+        help="Exact source checkout packaged web root matching the candidate manifest.",
+    )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
         "--smoke",
@@ -2892,6 +3981,14 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "Run exactly one real Codex subscription transcript session with every "
             "remote evolution target disabled. This is not evolution E2E evidence."
+        ),
+    )
+    mode.add_argument(
+        "--single-session-evolution",
+        action="store_true",
+        help=(
+            "Run one real subscription session with release evolution targets enabled. "
+            "This verifies artifact publication but not cross-session reuse."
         ),
     )
     mode.add_argument(
@@ -2950,12 +4047,16 @@ def main(argv: list[str] | None = None) -> int:
                 ],
                 "session_count": 1,
                 "evolution_targets_enabled": False,
-                "evolution_e2e_verified": False,
+                "artifact_publication_verified": False,
+                "cross_session_reuse_verified": False,
+                "release_evolution_path_verified": False,
+                "canonical_project_head_orchestration_verified": False,
             }
         )
     private_values = [os.environ.get("SSH_AUTH_SOCK", "")]
     native: NativeSidecar | None = None
     assets: ReleaseAssets | None = None
+    renderer_binding: RendererCandidateBinding | None = None
     workflow: DesktopScienceWorkflow | None = None
     cleanup = {
         "active_run_cleanup_required": False,
@@ -2991,17 +4092,35 @@ def main(argv: list[str] | None = None) -> int:
                     args.managed_runtime_archive,
                     args.daemon_bundle,
                     args.daemon_manifest,
+                    validation_root=root / "validated-assets",
                 )
                 progress.emit("release_assets", "verified", force=True)
             evidence["release_assets"] = assets.evidence
+            if args.verify_renderer:
+                assert args.release_candidate_manifest is not None
+                assert args.app_bundle_smoke is not None
+                assert args.packaged_web_manifest is not None
+                assert args.playwright_candidate_evidence is not None
+                assert args.packaged_web_root is not None
+                renderer_binding = _validate_renderer_candidate_binding(
+                    assets=assets,
+                    release_candidate_manifest=args.release_candidate_manifest,
+                    app_bundle_smoke=args.app_bundle_smoke,
+                    packaged_web_manifest=args.packaged_web_manifest,
+                    playwright_candidate_evidence=args.playwright_candidate_evidence,
+                    packaged_web_root=args.packaged_web_root,
+                )
+                evidence["renderer_candidate_binding"] = renderer_binding.evidence
             native = _launch_sidecar(assets, root / "native", progress=progress)
             private_values.extend(native.credentials.private_values())
             api = LocalApi(
                 native.base_url,
                 native.credentials.session_token,
                 progress=progress,
+                health_check=native.assert_log_budget,
             )
-            evidence["desktop"] = _release_identity(api)
+            desktop_identity = _release_identity(api)
+            evidence["desktop"] = desktop_identity
             workflow = DesktopScienceWorkflow(
                 api,
                 host=args.host,
@@ -3018,8 +4137,32 @@ def main(argv: list[str] | None = None) -> int:
                 run_timeout_seconds=args.run_timeout_seconds,
                 smoke=args.smoke,
                 progress=progress,
+                inter_session_delay_seconds=args.inter_session_delay_seconds,
+                single_session_evolution=args.single_session_evolution,
             )
             evidence.update(workflow.run())
+            if args.verify_renderer:
+                assert renderer_binding is not None
+                evidence["renderer"] = _run_renderer_verification(
+                    native=native,
+                    workflow=workflow,
+                    desktop_identity=desktop_identity,
+                    candidate_binding=renderer_binding,
+                    root=root / "renderer",
+                    timeout_seconds=args.renderer_timeout_seconds,
+                    screenshot_output=args.renderer_screenshot_output,
+                    progress=progress,
+                )
+                evidence["renderer_observability_verified"] = True
+                evidence["renderer_boundary"] = "packaged_web_to_live_local_api"
+                evidence["native_tauri_live_verified"] = False
+                verification_scope = evidence.get("verification_scope")
+                if isinstance(verification_scope, list):
+                    verification_scope.append("packaged_renderer_local_api_observability")
+            for authority in assets.authorities:
+                authority.verify_unchanged()
+            if renderer_binding is not None:
+                renderer_binding.verify_unchanged()
             evidence["outcome"] = "passed"
             exit_code = 0
         except E2EFailure as exc:
@@ -3042,6 +4185,8 @@ def main(argv: list[str] | None = None) -> int:
             if native is not None:
                 cleanup["core_ownership_release_requested"] = True
                 cleanup["sidecar_shutdown_succeeded"] = native.terminate()
+            if renderer_binding is not None:
+                renderer_binding.close()
             if assets is not None:
                 assets.close()
             evidence["cleanup"] = cleanup
@@ -3077,8 +4222,25 @@ def main(argv: list[str] | None = None) -> int:
                 "Desktop/SSH/Daemon/Core/Codex subscription transcript verified, "
                 "evolution E2E was not run; bounded evidence written."
             )
+        elif args.single_session_evolution:
+            suffix = (
+                " packaged renderer to live Local API observability verified;"
+                if args.verify_renderer
+                else ""
+            )
+            print(
+                "Desktop real-science single-session evolution check passed; "
+                "artifact publication verified, cross-session reuse was not run;"
+                f"{suffix} bounded evidence written."
+            )
         else:
-            print("Desktop real-science E2E passed; bounded evidence written.")
+            if args.verify_renderer:
+                print(
+                    "Desktop real-science E2E passed; packaged renderer to live Local API "
+                    "task/evolution observability verified; bounded evidence written."
+                )
+            else:
+                print("Desktop real-science E2E passed; bounded evidence written.")
     else:
         failure = evidence.get("failure")
         code = failure.get("code") if isinstance(failure, dict) else "unknown_failure"

@@ -2526,8 +2526,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "unsigned and not notarized",
         "## Supported Workflows",
         "Codex subscription transcript mode: packaged and declared in this Preview.",
-        "Candidate-bound real Codex Subscription science E2E: not yet verified",
-        "No real Codex Subscription run claim is made",
+            "Candidate-bound real Codex Subscription science E2E: required before",
+            "A public Preview carrying these notes has passed the separate signed publication gate",
         "Self-Deployed Reference mode: unavailable in this Preview.",
         "## Known Limitations",
         "Parameter evolution is not included in this Preview.",
@@ -2611,6 +2611,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         '" stop \\'
     )
     assert "needs: [macos-candidate, linux-core-candidate]" in text
+    draft_job = text.split("  draft-prerelease-roundtrip:\n", maxsplit=1)[1]
+    assert "environment: openevo-preview-publication" in draft_job
     assert text.index("gh release create") < text.index("gh release upload")
     assert text.index("gh release upload") < text.index("gh release download")
     cleanup = text.split(
@@ -2831,6 +2833,8 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
         "expected_release_id:",
         "expected_source_sha:",
         "expected_release_candidate_manifest_sha256:",
+        "expected_real_science_e2e_sha256:",
+        "expected_real_science_e2e_signature_sha256:",
         "candidate_workflow_run_id:",
         "candidate_workflow_run_attempt:",
         "confirmation:",
@@ -2839,7 +2843,8 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
         assert marker in workflow
 
     assert "workflow_dispatch:" in workflow
-    assert "environment: openevo-preview-publication" in workflow
+    assert workflow.count("environment: openevo-preview-publication") == 2
+    assert workflow.count("OPENEVO_REAL_SCIENCE_E2E_PUBLIC_KEY_SHA256") == 3
     assert "actions: read" in workflow
     assert workflow.count("contents: write") == 1
     assert workflow.count("ref: ${{ github.workflow_sha }}") == 2
@@ -2853,12 +2858,14 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert workflow.count("write-preview-asset-plan") == 1
     assert workflow.count("snapshot-preview") == 1
     assert "postpublication-release-rest.json" in workflow
-    assert workflow.count("releases/assets/${asset_id}") == 1
+    assert workflow.count("releases/assets/${asset_id}") == 3
     assert workflow.count('test ! -e "$public_dir"') == 1
     assert workflow.count('method="PATCH"') == 1
     assert workflow.count("b'{\"draft\":false}'") == 1
-    assert 'publication_mode = "already_public"' in workflow
-    assert 'publication_mode = "published_now"' in workflow
+    assert 'publication_mode = "already_public"' not in workflow
+    assert '"publication_mode": "published_now"' in workflow
+    assert 'if release.get("draft") is not True:' in workflow
+    assert "Candidate was published outside the validated mutation" in workflow
     assert "assert_tag_target(must_exist=True)" in workflow
     assert "assert_tag_target(must_exist=False)" in workflow
     assert 'json.load(open(sys.argv[1]))["immutable"]' in workflow
@@ -2885,13 +2892,33 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert "contents: read" in read_only_job
     assert "contents: write" not in read_only_job
     assert "validate-preview-snapshot" in read_only_job
+    assert "validate_desktop_real_science_e2e.py" in read_only_job
+    assert "expected_real_science_e2e_sha256" in read_only_job
+    assert "expected_real_science_e2e_signature_sha256" in read_only_job
+    assert "desktop_real_science_e2e_attestation.py verify" in read_only_job
+    assert "release-trust/desktop-real-science-e2e-v1.pub" in read_only_job
+    assert 'sha256sum "$public_key"' in read_only_job
+    assert '"$EXPECTED_SIGNER_PUBLIC_KEY_SHA256"' in read_only_job
+    assert "merge-base --is-ancestor" in read_only_job
+    assert "After candidate creation, stable may add only" in read_only_job
     assert "/releases?" not in read_only_job
     assert "/releases/${EXPECTED_RELEASE_ID}" not in read_only_job
-    assert "releases/assets/" not in read_only_job
+    assert read_only_job.count("releases/assets/${asset_id}") == 2
+    assert '--candidate-manifest "$RUNNER_TEMP/candidate-verification/release-candidate.json"' in read_only_job
+    assert '--candidate-app-bundle-smoke "$RUNNER_TEMP/candidate-verification/app-bundle-smoke.json"' in read_only_job
     assert "contents: write" in write_job
     assert "actions/checkout@" not in write_job
     assert "scripts/ci/" not in write_job
     assert "data only" in write_job
+    assert "verified-real-science-e2e" in write_job
+    assert "sha256sum" in write_job
+    assert "EXPECTED_REAL_SCIENCE_E2E_SIGNATURE_SHA256" in write_job
+    assert '"schema_version": 2' in write_job
+    assert '"policy_commit": policy_sha' in write_job
+    assert '"candidate_manifest_sha256": manifest_sha256' in write_job
+    assert '"signer_public_key_sha256": signer_public_key_sha256' in write_job
+    assert '"signature_sha256": evidence_signature_sha256' in write_job
+    assert "retention-days: 90" in write_job
     assert 'request_headers["Content-Type"] = "application/json"' in write_job
     assert "class RejectRedirects(HTTPRedirectHandler)" in write_job
     assert '"Authorization"' not in write_job.split(
@@ -2927,7 +2954,7 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     )
     write_asset_hash = write_job.index("with open_asset(asset[\"id\"]) as response:")
     write_patch = write_job.index('body=b\'{"draft":false}\'')
-    public_retry = write_job.index('publication_mode = "already_public"')
+    draft_gate = write_job.index('if release.get("draft") is not True:')
     postdownload = workflow.index(
         "Re-read and redownload the immutable public release"
     )
@@ -2938,7 +2965,7 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert (
         write_tag_validator
         < write_release_read
-        < public_retry
+        < draft_gate
         < write_asset_hash
         < write_patch
     )
@@ -3098,8 +3125,8 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
     assert by_mode["codex_subscription_transcript"].support_state == "supported"
     assert by_mode["self-deployed"].support_state == "unavailable"
     assert "Codex subscription transcript mode: packaged and declared in this Preview." in notes
-    assert "Candidate-bound real Codex Subscription science E2E: not yet verified" in notes
-    assert "No real Codex Subscription run claim is made" in notes
+    assert "Candidate-bound real Codex Subscription science E2E: required before" in notes
+    assert "A public Preview carrying these notes has passed the separate signed publication gate" in notes
     assert "Remote Core" not in notes
     assert "Self-Deployed Reference mode: unavailable in this Preview." in notes
     assert "canonical External Beta requires both modes" in normalized_readme

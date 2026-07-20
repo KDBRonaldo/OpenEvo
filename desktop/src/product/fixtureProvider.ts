@@ -19,7 +19,6 @@ import {
   projectValidationV1Schema,
   projectV1Schema,
   remoteProfileV1Schema,
-  revisionTransitionV1Schema,
   runV1Schema,
   serviceV1Schema,
   timelineEntryV1Schema,
@@ -1045,33 +1044,20 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
     const successor = this.revision(2, coreProjectId);
     const base = structuredClone(CONTRACT_FIXTURE_V1.run);
     const attempt = { ...base.attempts[0], status: "succeeded" as const, finished_at: NOW };
-    const transition = revisionTransitionV1Schema.parse({
-      state: "active",
-      predecessor_revision: predecessor,
-      successor_revision: successor,
-      progress_completed: 4,
-      progress_total: 4,
-      message: "The successor revision is active.",
-      error: null,
-      updated_at: NOW,
+    const run = runV1Schema.parse({
+      ...base,
+      project_id: coreProjectId,
+      execution_mode: project.execution.mode,
+      status: "succeeded",
+      queued_reason: null,
+      current_attempt: attempt,
+      current_error: null,
+      pinned_revision: predecessor,
+      required_revision: { revision: predecessor, reachable_from_revision_id: predecessor.id, relation: "active" },
+      revision_transition: null,
+      attempts: [attempt],
+      finished_at: NOW,
     });
-    const run = {
-      ...runV1Schema.parse({
-        ...base,
-        project_id: coreProjectId,
-        execution_mode: project.execution.mode,
-        status: "succeeded",
-        queued_reason: null,
-        current_attempt: attempt,
-        current_error: null,
-        pinned_revision: predecessor,
-        required_revision: { revision: predecessor, reachable_from_revision_id: predecessor.id, relation: "active" },
-        revision_transition: null,
-        attempts: [attempt],
-        finished_at: NOW,
-      }),
-      revision_transition: transition,
-    } satisfies RunV1;
     this.runs = [run];
     this.timelines[run.id] = [
       this.timeline(1, "revision", "succeeded", "Revision 2 active", "The next session will use the new revision.", run.id),
@@ -1142,16 +1128,6 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       throw new Error("The successor must directly follow the run's pinned revision.");
     }
     const successor = this.revision(successorGeneration, run.project_id);
-    const transition = revisionTransitionV1Schema.parse({
-      state: "active",
-      predecessor_revision: predecessor,
-      successor_revision: successor,
-      progress_completed: 4,
-      progress_total: 4,
-      message: "The successor revision is active.",
-      error: null,
-      updated_at: NOW,
-    });
     const attempt = {
       ...run.current_attempt!,
       status: "succeeded" as const,
@@ -1159,19 +1135,16 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       updated_at: NOW,
       finished_at: NOW,
     };
-    const succeeded = {
-      ...runV1Schema.parse({
-        ...run,
-        status: "succeeded",
-        queued_reason: null,
-        current_attempt: attempt,
-        revision_transition: null,
-        attempts: [...run.attempts.slice(0, -1), attempt],
-        updated_at: NOW,
-        finished_at: NOW,
-      }),
-      revision_transition: transition,
-    } satisfies RunV1;
+    const succeeded = runV1Schema.parse({
+      ...run,
+      status: "succeeded",
+      queued_reason: null,
+      current_attempt: attempt,
+      revision_transition: run.revision_transition,
+      attempts: [...run.attempts.slice(0, -1), attempt],
+      updated_at: NOW,
+      finished_at: NOW,
+    });
     this.replaceRun(succeeded);
     this.projects = this.projects.map((project) =>
       project.remote?.core_project_id === run.project_id

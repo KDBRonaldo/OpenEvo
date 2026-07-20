@@ -1142,6 +1142,12 @@ Project configuration uses one generic
 `evolution.targets.<target_id> = {enabled, method, config}` map. It does not add
 target-specific top-level project fields.
 
+Desktop renders the remote target set as independent user-controlled switches.
+The user MAY enable any subset, including none; enabling one target does not
+enable another, and release verification that enables every built-in target is
+not a product default. For each enabled target, Desktop separately renders the
+methods and configuration schema projected by that target's remote capability.
+
 Each enabled target stores either one concrete method or a Core-owned selection
 resolver exposed for that target. A resolver, such as the supported
 agent-system `auto` value, MUST resolve to one concrete method before the

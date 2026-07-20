@@ -1,7 +1,7 @@
 {
   "name": "openevo-desktop",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -17,6 +17,7 @@
     "test:product-browser": "npm run test:product-browser:preview && npm run test:product-browser:release-readonly",
     "test:product-browser:preview": "playwright test",
     "test:product-browser:release-readonly": "playwright test --config playwright.release-readonly.config.ts",
+    "test:product-browser:release-live": "playwright test --config playwright.release-live.config.ts",
     "test:product-browser:update": "playwright test --update-snapshots",
     "typecheck": "tsc --noEmit"
   },
