@@ -61,8 +61,11 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
     assert notes.startswith("# OpenEvo Desktop 0.1.0 Preview\n")
     assert "draft" not in notes.casefold()
     assert "Codex subscription transcript mode: packaged and declared in this Preview." in notes
-    assert "Candidate-bound real Codex Subscription science E2E: not yet verified" in notes
-    assert "No real Codex Subscription run claim is made" in notes
+    assert (
+        "Candidate-bound real Codex Subscription science E2E: required before public "
+        "Preview publication."
+    ) in notes
+    assert "A candidate that has not passed that gate is not public." in notes
     assert "real remote OpenEvo Daemon" in notes
     assert "Remote Core" not in notes
     assert "Codex subscription transcript mode: available in this candidate." not in notes
@@ -703,8 +706,8 @@ def test_managed_runtime_source_binds_prerelease_asset_and_download(
     [
         "## Supported Workflows",
         "Codex subscription transcript mode: packaged and declared in this Preview.",
-        "Candidate-bound real Codex Subscription science E2E: not yet verified",
-        "No real Codex Subscription run claim is made",
+        "Candidate-bound real Codex Subscription science E2E: required before public Preview publication.",
+        "A candidate that has not passed that gate is not public.",
         "Self-Deployed Reference mode: unavailable in this Preview.",
         "## Known Limitations",
         "Parameter evolution is not included in this Preview.",
