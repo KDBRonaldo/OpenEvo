@@ -160,6 +160,9 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await assertAccessibility(page);
   await expectPackagedReleaseAssets(page);
 
+  // Tear down the connected renderer before establishing the failure-case
+  // request boundary so an in-flight event poll cannot cross scenarios.
+  await page.goto("about:blank");
   sidecarObservation.httpCalls.length = 0;
   sidecarObservation.unexpectedCalls.length = 0;
   await page.goto("/?native=readiness-failure");
