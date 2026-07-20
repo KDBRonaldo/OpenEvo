@@ -566,6 +566,9 @@ def test_release_app_composes_full_remote_feature_surface(tmp_path: Path) -> Non
         "operation_events",
         "run_observability",
         "artifact_inspection",
+        "service_control",
+        "diagnostics",
+        "maintenance",
     ]
 
 

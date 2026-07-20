@@ -127,10 +127,12 @@ checked-in candidate-bound Docker plus Codex science rehearsal or clean-host
 matrix evidence. Clean-host preparation and lifecycle evidence, mediated
 Subscription authentication, the direct/proxy matrix, Self-Deployed,
 upgrade/rollback, and release-grade maintenance operations remain incomplete.
-An opt-in maintenance owner exists for focused contract development, but
-release construction intentionally leaves it disabled and fail closed while
-its durable receipt, replay, concurrency, shutdown, and authority-audit
-semantics remain under review.
+The maintenance owner is now part of the release composition. Generic
+development/test construction leaves it disabled by default, while the release
+launcher enables it only alongside the verified registry, service supervisor,
+and run owner. The matching Desktop release negotiates the complete
+`service_control`, `diagnostics`, and `maintenance` feature set and fails closed
+against older or incomplete Daemon compositions.
 
 **Owning issues:** #159, #160, #167, and #168.
 
@@ -215,7 +217,9 @@ independently review product/spec compliance and release risk/evidence.
    and the supported direct/proxy matrix. This is non-gating integration
    evidence, not G3 proof.
 3. Complete and independently review the System recovery owner around
-   authoritative status, diagnostics, reconnect, and bounded repair.
+   authoritative status, diagnostics, reconnect, and bounded repair. The
+   production owner is wired; this item now means release evidence and clean
+   host validation rather than the initial owner implementation.
 4. Implement and adopt the critical v2 authority migration before extending
    deep Task, Files, or History state on the frozen v1 model.
 5. Complete the Desktop System, Files, History, diagnostics, and recovery views,

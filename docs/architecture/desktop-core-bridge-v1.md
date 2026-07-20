@@ -413,10 +413,11 @@ saved Local `ProjectV1` and verifies it against the active generation before
 transport, but bridge availability alone does not make a release feature. The
 current bridge implements strict forwarding methods for Core-owned diagnostics,
 project doctor/repair, managed service restart, referenced logs, and
-completed-diagnostic cleanup in addition to service observations. The Preview
-Core release composition does not publish those maintenance owners, so the real
-renderer provider marks maintenance unavailable and hides their mutation
-controls; direct calls return typed `provider_capability_unavailable`.
+completed-diagnostic cleanup in addition to service observations. The matching
+production Daemon release composition publishes those maintenance owners, so
+the matching renderer provider exposes their controls. Development or
+incomplete compositions keep maintenance unavailable and direct calls return
+typed `provider_capability_unavailable`.
 Unsupported cache scopes and unavailable owners never fall back to SSH or local
 simulation. The provider holds its project-session transition lock from
 that Local lookup through result delivery, so an active-project edit cannot
@@ -437,11 +438,11 @@ Packaged startup composes `DesktopCoreSshBridgeAdapterV1`,
 `release_runtime.py`. The exact embedded wheel/framework-lock pair is verified
 before construction, and the dedicated bridge state is rooted under the private
 Desktop provider state. When both the owned bridge and broker are present, the
-Preview sidecar advertises exactly `remote_profiles`, `project_validation`,
-`operation_events`, `run_observability`, and `artifact_inspection`.
-`service_control`, `diagnostics`, and `maintenance` remain reserved Local API
-enum values and are not advertised while the connected Core has no production
-maintenance owner. A missing or invalid asset pair, bridge, broker, or active
+release sidecar advertises the complete feature set:
+`remote_profiles`, `project_validation`, `operation_events`, `run_observability`,
+`artifact_inspection`, `service_control`, `diagnostics`, and `maintenance`.
+Development or incomplete compositions may omit the last three flags. A missing
+or invalid asset pair, bridge, broker, or active
 project fails closed; there is no reduced release composition or direct-backend
 fallback.
 

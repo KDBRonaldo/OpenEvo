@@ -223,7 +223,12 @@ function ReleaseStartupSample({ onRetry }: { onRetry: () => void }) {
   };
 
   return (
-    <div className="product-shell initial-sync-shell" data-testid="release-startup-sample">
+    <div
+      className="product-shell initial-sync-shell"
+      data-testid="release-startup-sample"
+      data-provider-kind="desktop_sidecar"
+      data-system-maintenance-available="false"
+    >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
           <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>

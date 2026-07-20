@@ -14,6 +14,9 @@ const FEATURE_FLAGS = [
   "operation_events",
   "run_observability",
   "artifact_inspection",
+  "service_control",
+  "diagnostics",
+  "maintenance",
 ] as const;
 const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const EXPECTED_PROJECTS = new Set([
@@ -59,7 +62,7 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   );
   await expect(page.locator(".product-shell")).toHaveAttribute(
     "data-system-maintenance-available",
-    "false",
+    "true",
   );
   await expect(page.getByText("内置示例 · 只读", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("内置合成数据 · 12 个观测点", { exact: true })).toBeVisible();

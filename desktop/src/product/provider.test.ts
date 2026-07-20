@@ -102,7 +102,7 @@ describe("Desktop product provider boundary", () => {
       expect(Object.isFrozen(featureFlags)).toBe(true);
       const source = await bridge.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0001", streamEpoch: 7 });
       expect(source).toMatchObject({ kind: "native_folder_snapshot", import_ref: { import_id: "source-opaque-1" } });
-      return unavailableDesktopProductProvider;
+      return releaseAdapter();
     });
 
     const provider = await createReleaseDesktopProductProvider({
@@ -138,17 +138,12 @@ describe("Desktop product provider boundary", () => {
       },
     });
     expect(provider.providerKind).toBe("desktop_sidecar");
-    expect(provider.systemMaintenanceAvailable).toBe(false);
+    expect(provider.systemMaintenanceAvailable).toBe(true);
   });
 
-  it("enables System only when the negotiated Local API publishes its complete owner", async () => {
+  it("enables System when the release-required Local API publishes its complete owner", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
-    const flags = [
-      ...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags,
-      "service_control",
-      "diagnostics",
-      "maintenance",
-    ];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
     const provider = await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
       retryRecoveryStore: memoryRetryRecoveryStore(),
@@ -164,23 +159,9 @@ describe("Desktop product provider boundary", () => {
     expect(provider.systemMaintenanceAvailable).toBe(true);
   });
 
-  it.each([
-    {
-      name: "adapter enables maintenance without the complete feature set",
-      extraFlags: [] as string[],
-      systemMaintenanceAvailable: true,
-    },
-    {
-      name: "adapter disables maintenance with the complete feature set",
-      extraFlags: ["service_control", "diagnostics", "maintenance"],
-      systemMaintenanceAvailable: false,
-    },
-  ])("rejects when $name", async ({ extraFlags, systemMaintenanceAvailable }) => {
+  it("rejects when an adapter disables maintenance for the release-required feature set", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
-    const flags = [
-      ...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags,
-      ...extraFlags,
-    ];
+    const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
 
     await expect(createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
@@ -193,10 +174,7 @@ describe("Desktop product provider boundary", () => {
       },
       adapterFactory: ({ featureFlags }) => {
         expect(featureFlags).toEqual(flags);
-        return {
-          ...unavailableDesktopProductProvider,
-          systemMaintenanceAvailable,
-        };
+        return releaseAdapter({ systemMaintenanceAvailable: false });
       },
     })).rejects.toThrow(/maintenance capability.*negotiated feature set/i);
   });
@@ -251,7 +229,7 @@ describe("Desktop product provider boundary", () => {
         ...baseNative,
         bootstrap: vi.fn().mockResolvedValue({ invalid: true }),
       },
-      adapterFactory: () => unavailableDesktopProductProvider,
+      adapterFactory: () => releaseAdapter(),
       reportStage: bootstrapStages,
     })).rejects.toThrow();
     expect(bootstrapStages.mock.calls.map(([stage]) => stage)).toEqual([
@@ -262,7 +240,7 @@ describe("Desktop product provider boundary", () => {
     await expect(createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockRejectedValue(new TypeError("blocked transport")),
       native: baseNative,
-      adapterFactory: () => unavailableDesktopProductProvider,
+      adapterFactory: () => releaseAdapter(),
       reportStage: versionStages,
     })).rejects.toThrow("blocked transport");
     expect(versionStages.mock.calls.map(([stage]) => stage)).toEqual([
@@ -425,7 +403,7 @@ describe("Desktop product provider boundary", () => {
           actionId: "source-action-new",
           streamEpoch: 7,
         });
-        return unavailableDesktopProductProvider;
+        return releaseAdapter();
       },
     });
 
@@ -454,7 +432,7 @@ describe("Desktop product provider boundary", () => {
   it("rejects simulator bootstrap and missing release features without constructing an adapter", async () => {
     const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
     const flags = [...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags];
-    const adapterFactory = vi.fn(() => unavailableDesktopProductProvider);
+    const adapterFactory = vi.fn(() => releaseAdapter());
     const simulatorStages = vi.fn();
     await expect(createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>(),
@@ -508,7 +486,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
       },
-      adapterFactory: () => ({ ...unavailableDesktopProductProvider, retryRun: undefined }),
+      adapterFactory: () => ({ ...releaseAdapter(), retryRun: undefined }),
     })).rejects.toThrow(/run retry contract/i);
 
     await expect(createReleaseDesktopProductProvider({
@@ -520,7 +498,7 @@ describe("Desktop product provider boundary", () => {
         cancelProjectSource: vi.fn(),
         settleProjectSource: vi.fn(),
       },
-      adapterFactory: () => ({ ...unavailableDesktopProductProvider, getRunRetryRecovery: undefined }),
+      adapterFactory: () => ({ ...releaseAdapter(), getRunRetryRecovery: undefined }),
     })).rejects.toThrow(/durable run retry recovery/i);
   });
 
@@ -537,7 +515,7 @@ describe("Desktop product provider boundary", () => {
         settleProjectSource: vi.fn(),
       },
       adapterFactory: () => ({
-        ...unavailableDesktopProductProvider,
+        ...releaseAdapter(),
         createDiagnostic: undefined,
       } as unknown as typeof unavailableDesktopProductProvider),
     })).rejects.toThrow(/System recovery capabilities/i);
@@ -566,7 +544,7 @@ describe("Desktop product provider boundary", () => {
         settleProjectSource: vi.fn(),
       },
       adapterFactory: () => ({
-        ...unavailableDesktopProductProvider,
+        ...releaseAdapter(),
         getCoreOperation,
       }),
     });
@@ -620,7 +598,7 @@ describe("Desktop product provider boundary", () => {
       },
       adapterFactory: async ({ native }) => {
         await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0002", streamEpoch: 1 });
-        return unavailableDesktopProductProvider;
+        return releaseAdapter();
       },
     })).rejects.toThrow();
 
@@ -639,7 +617,7 @@ describe("Desktop product provider boundary", () => {
       },
       adapterFactory: async ({ native }) => {
         await native.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0003", streamEpoch: 1 });
-        return unavailableDesktopProductProvider;
+        return releaseAdapter();
       },
     })).rejects.toThrow(/requested kind/i);
   });
@@ -658,7 +636,7 @@ describe("Desktop product provider boundary", () => {
       },
       adapterFactory: async ({ native }) => {
         expect("configureCredential" in native).toBe(false);
-        return unavailableDesktopProductProvider;
+        return releaseAdapter();
       },
     });
   });
@@ -673,7 +651,7 @@ describe("Desktop product provider boundary", () => {
 
     await createReleaseDesktopProductProvider({
       fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
-      adapterFactory: async () => unavailableDesktopProductProvider,
+      adapterFactory: async () => releaseAdapter(),
     });
     expect(invokeMock.mock.calls.some(([command]) => command === "configure_credential")).toBe(false);
   });
@@ -700,6 +678,16 @@ function releaseVersion(openapiSha256: string, featureFlags: string[]) {
     build_channel: "release",
     provider_kind: "desktop_sidecar",
     feature_flags: featureFlags,
+  };
+}
+
+function releaseAdapter(
+  overrides: Partial<typeof unavailableDesktopProductProvider> = {},
+): typeof unavailableDesktopProductProvider {
+  return {
+    ...unavailableDesktopProductProvider,
+    systemMaintenanceAvailable: true,
+    ...overrides,
   };
 }
 

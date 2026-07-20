@@ -110,6 +110,7 @@ def _serve_core_control(args: argparse.Namespace) -> int:
             bearer_token=bearer_token,
             source_commit=args.source_commit,
             build_channel="release",
+            enable_maintenance_owner=True,
             evolution_registry=registry,
             service_supervisor=service_supervisor,
             run_control_factory=lambda store: CoreScienceRunOwner(

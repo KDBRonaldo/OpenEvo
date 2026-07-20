@@ -412,6 +412,9 @@ class DesktopReleaseProvider:
                 "operation_events",
                 "run_observability",
                 "artifact_inspection",
+                "service_control",
+                "diagnostics",
+                "maintenance",
             )
         self._version = VersionV1(
             openapi_sha256=DESKTOP_OPENAPI_SHA256,

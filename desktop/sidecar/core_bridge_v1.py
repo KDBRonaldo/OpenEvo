@@ -46,6 +46,7 @@ REQUIRED_RELEASE_CORE_FEATURES = frozenset(
         core_v1.FeatureFlag.TRANSCRIPT_CAPTURE,
         core_v1.FeatureFlag.NON_PARAMETRIC_EVOLUTION,
         core_v1.FeatureFlag.SSE_REPLAY,
+        core_v1.FeatureFlag.DIAGNOSTICS,
     }
 )
 MAX_REVISION_HISTORY_PROOF_GENERATIONS = 256

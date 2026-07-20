@@ -390,6 +390,7 @@ def test_supervised_launcher_builds_release_core_control_app(
     create = calls["create"]
     assert create["state_root"] == service_root / "state"
     assert create["build_channel"] == "release"
+    assert create["enable_maintenance_owner"] is True
     assert create["source_commit"] == release.source_commit
     assert create["evolution_registry"] is registry
     assert create["service_supervisor"] is service_supervisor

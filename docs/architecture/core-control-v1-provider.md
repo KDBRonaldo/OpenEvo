@@ -45,20 +45,20 @@ before releasing the threads.
 | `/v1/projects/{id}/validate` | Validates exact current project/workspace snapshots and registry digest, then delegates evolution selection validation to the existing framework compiler validator. |
 | `/v1/services`, `/v1/services/{id}` | Reports `core-control` plus read-only summaries from the release-injected `CoreServiceSupervisor`. No service is inferred from files, Desktop commands, or legacy scaffold state. |
 | `/v1/events` | Durable ordered SSE with signed opaque record IDs, at-least-once replay, a 10,000-record maximum window, 15-second durable heartbeats, and typed 400/410 cursor errors. |
-| Environment doctor/repair | Typed 503 until a real environment owner and recoverable operation implementation are wired. |
+| Environment doctor/repair | Owned by the production maintenance composition; typed 503 when that owner or its required authorities are absent. |
 | Run, timeline, run log, run context, and run artifact-list routes | The release launcher injects `CoreScienceRunOwner`, which durably executes and observes the complete frozen `/v1/runs*` family. Tests may omit the owner and receive typed 503. |
 | Standalone artifact routes | Typed 503 until run ownership exposes authoritative v1 artifact projections. |
-| Service restart/log routes | Typed 503 until durable operation ownership is implemented. The provider never invokes Desktop SSH lifecycle or infers services it cannot observe. |
-| Operation, referenced-log, diagnostic, and cache-cleanup routes | Typed 503 until their durable business owners are implemented. |
+| Service restart/log routes | Owned by the production maintenance composition; typed 503 when the supervisor or run owner is unavailable. The provider never invokes Desktop SSH lifecycle or infers services it cannot observe. |
+| Operation, referenced-log, diagnostic, and cache-cleanup routes | Owned by the production maintenance composition; typed 503 when the owner is not installed. |
 
 All unavailable operations use `provider_capability_unavailable`; they never
 return fixture resources or synthetic successful operations.
 
-The repository contains an opt-in maintenance-owner prototype for focused
-contract tests. Production and release construction do not instantiate it,
-do not advertise `DIAGNOSTICS`, and keep every owner-backed route fail closed
-until durable side-effect receipts, lifecycle/replay semantics, run fencing,
-shutdown draining, and complete authority audits are implemented and reviewed.
+The maintenance owner is a formally composable production dependency. Generic
+development/test construction leaves it disabled by default, while the release
+launcher enables it and advertises `DIAGNOSTICS` only after all required
+authorities are present. Missing supervisor, run owner, registry, or durable
+maintenance storage keeps the owner-backed routes fail closed.
 
 ## Durable State
 
@@ -372,8 +372,9 @@ Provider coverage is in
 schema bytes and digests. The release owner implements generation-bound run
 admission, managed service preparation, durable execution, artifact-list
 projection, and direct cross-session successor activation. Standalone artifact
-content/diff, environment repair, service mutation, and diagnostics remain fail
-closed.
+content/diff remains subject to its artifact authority requirements.
+Environment repair, service mutation, and diagnostics are available through
+the release maintenance owner and remain fail closed when that owner is absent.
 
 The provider accepts either an internal `CoreRunControl` dependency or a
 mutually exclusive factory that receives the provider's exact durable store. When it

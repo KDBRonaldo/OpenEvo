@@ -58,6 +58,11 @@ from openevo.backend.service_supervisor import (
     SupervisorLogEntry,
     SupervisorServiceSummary,
 )
+from openevo.backend.service_control import (
+    CoreServiceControlError,
+    ServiceRestartAttempt,
+    ServiceRestartAttemptState,
+)
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
 import openevo.backend.contracts.v1.workspace as workspace_module
@@ -203,7 +208,7 @@ def _app(
     artifact_loader=None,
     event_replay_limit: int = 10_000,
     build_channel: str = "test",
-    enable_maintenance_owner_for_tests: bool = False,
+    enable_maintenance_owner: bool = False,
 ):
     return create_core_control_app(
         state_root=state_root,
@@ -218,7 +223,7 @@ def _app(
         evolution_artifact_root=evolution_artifact_root,
         artifact_loader=artifact_loader,
         event_replay_limit=event_replay_limit,
-        _enable_maintenance_owner_for_tests=enable_maintenance_owner_for_tests,
+        enable_maintenance_owner=enable_maintenance_owner,
     )
 
 
@@ -5269,22 +5274,82 @@ def test_default_provider_keeps_release_store_schema_rollback_compatible(
     )
 
 
-def test_maintenance_owner_test_seam_rejects_non_test_builds(tmp_path: Path) -> None:
-    with pytest.raises(
-        ValueError,
-        match="maintenance owner test seam is allowed only in test builds",
-    ):
+def test_release_composition_can_enable_maintenance_owner(tmp_path: Path) -> None:
+    with TestClient(
         _app(
             tmp_path,
             build_channel="release",
-            enable_maintenance_owner_for_tests=True,
+            enable_maintenance_owner=True,
         )
+    ) as client:
+        assert "diagnostics" not in client.get("/version").json()["features"]
+        assert client.get("/v1/services", headers=AUTH).status_code == 200
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert store_module._schema_fingerprint(
+            connection
+        ) == store_module._expected_schema_fingerprint(
+            store_module._SCHEMA_WITH_MAINTENANCE
+        )
+
+
+def test_release_maintenance_schema_upgrades_existing_state_and_rejects_downgrade(
+    tmp_path: Path,
+) -> None:
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        project, _etag = _create_project(
+            client,
+            _project_create(),
+            idempotency_key="maintenance-upgrade-project",
+        )
+        before = client.get("/v1/projects", headers=AUTH).json()
+        before_event_ids = [
+            frame["id"]
+            for frame in app.state.core_control_provider.store.replay_events(None)
+        ]
+
+    upgraded = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        listed = upgraded.list_projects(
+            limit=100,
+            after=None,
+            sort="created_at",
+            direction="asc",
+        )
+        assert [item.id for item in listed.items] == [project["id"]]
+        assert [frame["id"] for frame in upgraded.replay_events(None)] == before_event_ids
+        assert before["items"][0]["id"] == project["id"]
+    finally:
+        upgraded.close()
+
+    database = tmp_path / "core-control-v1" / "provider.sqlite3"
+    with sqlite3.connect(database) as connection:
+        assert store_module._schema_fingerprint(
+            connection
+        ) == store_module._expected_schema_fingerprint(
+            store_module._SCHEMA_WITH_MAINTENANCE
+        )
+        tables = {
+            row[0]
+            for row in connection.execute("SELECT name FROM sqlite_schema WHERE type = 'table'")
+        }
+    assert {
+        "maintenance_operations",
+        "maintenance_diagnostics",
+        "maintenance_logs",
+        "maintenance_idempotency_records",
+    }.issubset(tables)
+
+    with pytest.raises(StoreCorruptionError, match="schema fingerprint is incompatible"):
+        CoreControlStoreV1(tmp_path)
 
 
 def test_opted_in_system_owner_without_supervisor_is_truthful_and_fails_closed(
     tmp_path: Path,
 ) -> None:
-    with TestClient(_app(tmp_path, enable_maintenance_owner_for_tests=True)) as client:
+    with TestClient(_app(tmp_path, enable_maintenance_owner=True)) as client:
         assert "diagnostics" not in client.get("/version").json()["features"]
         services = client.get("/v1/services", headers=AUTH)
         assert services.status_code == 200
@@ -5339,9 +5404,17 @@ def test_opted_in_system_owner_without_supervisor_is_truthful_and_fails_closed(
 
 
 class _RecordingServiceSupervisor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        restart_attempts: tuple[ServiceRestartAttempt, ...] = (),
+    ) -> None:
         self.close_calls = 0
         self.restart_calls: list[tuple[str, str]] = []
+        self.restart_attempts: dict[str, ServiceRestartAttempt] = {
+            attempt.operation_id: attempt for attempt in restart_attempts
+        }
+        self.acknowledge_calls: list[tuple[str, str, str]] = []
         self._services = (
             SupervisorServiceSummary(
                 id="evolution-backend",
@@ -5396,6 +5469,49 @@ class _RecordingServiceSupervisor:
         )
         self._services = (restarted,)
         return restarted
+
+    def restart_once(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        expected_service_etag: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary:
+        del total_timeout
+        prior = self.restart_attempts.get(operation_id)
+        if prior is not None:
+            assert prior.service is not None
+            return prior.service
+        restarted = self.restart(
+            service_id,
+            operation_id=operation_id,
+        )
+        self.restart_attempts[operation_id] = ServiceRestartAttempt(
+            operation_id=operation_id,
+            service_id=service_id,
+            expected_service_etag=expected_service_etag,
+            state=ServiceRestartAttemptState.COMPLETED,
+            service=restarted,
+        )
+        return restarted
+
+    def list_restart_attempts(self) -> tuple[ServiceRestartAttempt, ...]:
+        return tuple(self.restart_attempts.values())
+
+    def acknowledge_restart_attempt(
+        self,
+        operation_id: str,
+        *,
+        service_id: str,
+        expected_service_etag: str,
+    ) -> None:
+        self.acknowledge_calls.append(
+            (operation_id, service_id, expected_service_etag)
+        )
+        attempt = self.restart_attempts.pop(operation_id)
+        assert attempt.service_id == service_id
+        assert attempt.expected_service_etag == expected_service_etag
 
     def logs(
         self,
@@ -5484,6 +5600,92 @@ class _ActivationServiceSupervisor(_RecordingServiceSupervisor):
         )
 
 
+def _restart_result(service_id: str = "evolution-backend") -> SupervisorServiceSummary:
+    return SupervisorServiceSummary(
+        id=service_id,
+        display_name="Evolution backend",
+        component=ServiceComponent.EVOLUTION_BACKEND,
+        status=ServiceStatus.RUNNING,
+        restartable=True,
+        status_message="Restarted and ready.",
+        error_code=None,
+        updated_at="2026-07-14T00:00:02Z",
+        observed_at="2026-07-14T00:00:03Z",
+        identity_digest="c" * 64,
+        pid=2345,
+        port=8200,
+        etag='"' + "d" * 64 + '"',
+    )
+
+
+def _persist_running_service_restart(
+    state_root: Path,
+    *,
+    idempotency_key: str,
+) -> tuple[m.OperationV1, str]:
+    store = CoreControlStoreV1(
+        state_root,
+        enable_maintenance_storage=True,
+    )
+    expected_etag = '"' + ("b" * 64) + '"'
+    request = m.ServiceRestartOperationRequestV1(
+        kind=m.OperationKind.SERVICE_RESTART,
+        service_id="evolution-backend",
+        request=m.ServiceRestartRequestV1(reason="Exercise durable restart recovery."),
+    )
+    try:
+        created = store.create_maintenance_operation(
+            "restartCoreServiceV1",
+            request,
+            resource_scope=request.service_id,
+            idempotency_key=idempotency_key,
+            semantic_headers={"if-match": expected_etag},
+        )
+        operation = created.model
+        assert isinstance(operation, m.OperationV1)
+        running = store.mark_maintenance_operation_running(operation.id)
+        return running, expected_etag
+    finally:
+        store.close()
+
+
+def _restart_attempt(
+    operation_id: str,
+    expected_etag: str,
+    *,
+    state: ServiceRestartAttemptState,
+    service_id: str = "evolution-backend",
+    service: SupervisorServiceSummary | None = None,
+) -> ServiceRestartAttempt:
+    return ServiceRestartAttempt(
+        operation_id=operation_id,
+        service_id=service_id,
+        expected_service_etag=expected_etag,
+        state=state,
+        service=service,
+    )
+
+
+def _matching_event_count(
+    store: CoreControlStoreV1,
+    *,
+    event: str,
+    resource_id: str,
+    status: str | None = None,
+) -> int:
+    matches = 0
+    for frame in store.replay_events(None):
+        if frame["event"] != event:
+            continue
+        payload = frame["data"]["payload"]
+        if payload.get("id") != resource_id:
+            continue
+        if status is not None and payload.get("status") != status:
+            continue
+        matches += 1
+    return matches
+
+
 def test_default_provider_projects_managed_services_as_read_only(
     tmp_path: Path,
 ) -> None:
@@ -5516,7 +5718,7 @@ def test_complete_system_owner_negotiates_and_returns_terminal_repair(
             registry=registry,
             service_supervisor=supervisor,
             run_control=_QuiescentRunControl(),
-            enable_maintenance_owner_for_tests=True,
+            enable_maintenance_owner=True,
         )
     ) as client:
         assert "diagnostics" in client.get("/version").json()["features"]
@@ -5600,7 +5802,7 @@ def test_service_restart_is_etag_bound_idempotent_and_uses_supervisor(
             registry=registry,
             service_supervisor=supervisor,
             run_control=_QuiescentRunControl(),
-            enable_maintenance_owner_for_tests=True,
+            enable_maintenance_owner=True,
         )
     ) as client:
         assert "diagnostics" in client.get("/version").json()["features"]
@@ -5645,6 +5847,48 @@ def test_service_restart_is_etag_bound_idempotent_and_uses_supervisor(
         assert service_logs.json()["items"][0]["service_id"] == "evolution-backend"
 
 
+def test_release_full_maintenance_owner_negotiates_production_capability(
+    tmp_path: Path,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    with TestClient(
+        _app(
+            tmp_path / "state",
+            build_channel="release",
+            registry=registry,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    ) as client:
+        assert "diagnostics" in client.get("/version").json()["features"]
+        doctor = client.post(
+            "/v1/environment/doctor",
+            headers={**AUTH, "Idempotency-Key": "release-system-doctor"},
+            json={
+                "schema_version": "1",
+                "execution_mode": "codex_subscription_transcript",
+                "checks": [],
+            },
+        )
+        assert doctor.status_code == 200
+        assert doctor.json()["checks"]
+        service = client.get("/v1/services/evolution-backend", headers=AUTH).json()
+        restart = client.post(
+            "/v1/services/evolution-backend/restart",
+            headers={
+                **AUTH,
+                "Idempotency-Key": "release-service-restart",
+                "If-Match": service["etag"],
+            },
+            json={"schema_version": "1", "reason": "Release owner integration."},
+        )
+        assert restart.status_code == 202
+        assert restart.json()["status"] == "succeeded"
+        assert len(supervisor.restart_calls) == 1
+
+
 def test_missing_run_owner_disables_suite_and_blocks_maintenance(
     tmp_path: Path,
 ) -> None:
@@ -5655,7 +5899,7 @@ def test_missing_run_owner_disables_suite_and_blocks_maintenance(
             tmp_path / "state",
             registry=registry,
             service_supervisor=supervisor,
-            enable_maintenance_owner_for_tests=True,
+            enable_maintenance_owner=True,
         )
     ) as client:
         assert "diagnostics" not in client.get("/version").json()["features"]
@@ -5686,7 +5930,7 @@ def test_diagnostic_crud_and_unsupported_cache_scope_are_truthful(
             registry=registry,
             service_supervisor=supervisor,
             run_control=_QuiescentRunControl(),
-            enable_maintenance_owner_for_tests=True,
+            enable_maintenance_owner=True,
         )
     ) as client:
         created = client.post(
@@ -5752,7 +5996,7 @@ def test_interrupted_maintenance_operation_recovers_as_failed(
 ) -> None:
     store = CoreControlStoreV1(
         tmp_path,
-        _enable_maintenance_storage_for_tests=True,
+        enable_maintenance_storage=True,
     )
     request = m.EnvironmentRepairOperationRequestV1(
         kind=m.OperationKind.ENVIRONMENT_REPAIR,
@@ -5774,7 +6018,7 @@ def test_interrupted_maintenance_operation_recovers_as_failed(
 
     recovered = CoreControlStoreV1(
         tmp_path,
-        _enable_maintenance_storage_for_tests=True,
+        enable_maintenance_storage=True,
     )
     try:
         terminal = recovered.get_maintenance_operation(operation.id)
@@ -5789,6 +6033,277 @@ def test_interrupted_maintenance_operation_recovers_as_failed(
         )
     finally:
         recovered.close()
+
+
+def test_service_restart_without_receipt_recovers_before_side_effect(
+    tmp_path: Path,
+) -> None:
+    operation, expected_etag = _persist_running_service_restart(
+        tmp_path,
+        idempotency_key="restart-recovery-no-receipt",
+    )
+    supervisor = _RecordingServiceSupervisor()
+
+    with TestClient(
+        _app(
+            tmp_path,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    ):
+        assert supervisor.restart_calls == []
+        assert supervisor.acknowledge_calls == []
+
+    store = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        recovered = store.get_maintenance_operation(operation.id)
+        assert recovered.status is m.OperationStatus.FAILED
+        assert recovered.error is not None
+        assert recovered.error.code == "service_restart_interrupted_before_side_effect"
+        assert recovered.error.retryable is True
+        assert _matching_event_count(
+            store,
+            event="service.updated.v1",
+            resource_id="evolution-backend",
+        ) == 0
+        assert _matching_event_count(
+            store,
+            event="operation.updated.v1",
+            resource_id=operation.id,
+            status="failed",
+        ) == 1
+    finally:
+        store.close()
+    assert expected_etag == '"' + ("b" * 64) + '"'
+
+
+def test_service_restart_started_receipt_recovers_unknown_without_retry(
+    tmp_path: Path,
+) -> None:
+    operation, expected_etag = _persist_running_service_restart(
+        tmp_path,
+        idempotency_key="restart-recovery-started",
+    )
+    supervisor = _RecordingServiceSupervisor(
+        restart_attempts=(
+            _restart_attempt(
+                operation.id,
+                expected_etag,
+                state=ServiceRestartAttemptState.STARTED,
+            ),
+        )
+    )
+
+    with TestClient(
+        _app(
+            tmp_path,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    ):
+        assert supervisor.restart_calls == []
+        assert supervisor.acknowledge_calls == [
+            (operation.id, "evolution-backend", expected_etag)
+        ]
+        assert supervisor.restart_attempts == {}
+
+    store = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        recovered = store.get_maintenance_operation(operation.id)
+        assert recovered.status is m.OperationStatus.FAILED
+        assert recovered.error is not None
+        assert recovered.error.code == "service_restart_outcome_unknown"
+        assert recovered.error.retryable is False
+    finally:
+        store.close()
+
+
+def test_service_restart_completed_receipt_completes_atomically_and_acks(
+    tmp_path: Path,
+) -> None:
+    operation, expected_etag = _persist_running_service_restart(
+        tmp_path,
+        idempotency_key="restart-recovery-completed",
+    )
+    restarted = _restart_result()
+    supervisor = _RecordingServiceSupervisor(
+        restart_attempts=(
+            _restart_attempt(
+                operation.id,
+                expected_etag,
+                state=ServiceRestartAttemptState.COMPLETED,
+                service=restarted,
+            ),
+        )
+    )
+
+    with TestClient(
+        _app(
+            tmp_path,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    ):
+        assert supervisor.restart_calls == []
+        assert supervisor.acknowledge_calls == [
+            (operation.id, "evolution-backend", expected_etag)
+        ]
+        assert supervisor.restart_attempts == {}
+
+    store = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        recovered = store.get_maintenance_operation(operation.id)
+        assert recovered.status is m.OperationStatus.SUCCEEDED
+        assert recovered.result is not None
+        assert isinstance(recovered.result, m.ServiceRestartOperationResultV1)
+        assert recovered.result.service.id == "evolution-backend"
+        assert _matching_event_count(
+            store,
+            event="service.updated.v1",
+            resource_id="evolution-backend",
+        ) == 1
+        assert _matching_event_count(
+            store,
+            event="operation.updated.v1",
+            resource_id=operation.id,
+            status="succeeded",
+        ) == 1
+    finally:
+        store.close()
+
+
+def test_service_restart_terminal_operation_only_acks_completed_receipt(
+    tmp_path: Path,
+) -> None:
+    operation, expected_etag = _persist_running_service_restart(
+        tmp_path,
+        idempotency_key="restart-recovery-terminal-receipt",
+    )
+    restarted = _restart_result()
+    store = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        terminal = store.complete_service_restart_operation(
+            operation.id,
+            restarted.to_contract(),
+        )
+        assert terminal.status is m.OperationStatus.SUCCEEDED
+        before = store.replay_events(None)
+        before_service_events = _matching_event_count(
+            store,
+            event="service.updated.v1",
+            resource_id="evolution-backend",
+        )
+        before_operation_events = _matching_event_count(
+            store,
+            event="operation.updated.v1",
+            resource_id=operation.id,
+            status="succeeded",
+        )
+    finally:
+        store.close()
+
+    supervisor = _RecordingServiceSupervisor(
+        restart_attempts=(
+            _restart_attempt(
+                operation.id,
+                expected_etag,
+                state=ServiceRestartAttemptState.COMPLETED,
+                service=restarted,
+            ),
+        )
+    )
+    with TestClient(
+        _app(
+            tmp_path,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    ):
+        assert supervisor.restart_calls == []
+        assert supervisor.acknowledge_calls == [
+            (operation.id, "evolution-backend", expected_etag)
+        ]
+        assert supervisor.restart_attempts == {}
+
+    store = CoreControlStoreV1(tmp_path, enable_maintenance_storage=True)
+    try:
+        assert store.replay_events(None) == before
+        assert _matching_event_count(
+            store,
+            event="service.updated.v1",
+            resource_id="evolution-backend",
+        ) == before_service_events
+        assert _matching_event_count(
+            store,
+            event="operation.updated.v1",
+            resource_id=operation.id,
+            status="succeeded",
+        ) == before_operation_events
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize(
+    ("receipt_operation_id", "receipt_service_id", "receipt_etag", "match"),
+    [
+        (
+            "operation-id",
+            "different-service",
+            '"' + ("b" * 64) + '"',
+            "service restart receipt does not match",
+        ),
+        (
+            "operation-id",
+            "evolution-backend",
+            '"' + ("e" * 64) + '"',
+            "service restart receipt does not match",
+        ),
+        (
+            "unknown-operation",
+            "evolution-backend",
+            '"' + ("b" * 64) + '"',
+            "maintenance operation",
+        ),
+    ],
+)
+def test_service_restart_receipt_authority_conflict_fails_provider_closed(
+    tmp_path: Path,
+    receipt_operation_id: str,
+    receipt_service_id: str,
+    receipt_etag: str,
+    match: str,
+) -> None:
+    operation, expected_etag = _persist_running_service_restart(
+        tmp_path,
+        idempotency_key=f"restart-recovery-conflict-{receipt_operation_id}-{receipt_service_id}",
+    )
+    attempt_id = operation.id if receipt_operation_id == "operation-id" else receipt_operation_id
+    supervisor = _RecordingServiceSupervisor(
+        restart_attempts=(
+            _restart_attempt(
+                attempt_id,
+                receipt_etag,
+                state=ServiceRestartAttemptState.COMPLETED,
+                service=_restart_result(),
+                service_id=receipt_service_id,
+            ),
+        )
+    )
+
+    with pytest.raises((CoreServiceControlError, StoreCorruptionError), match=match):
+        _app(
+            tmp_path,
+            service_supervisor=supervisor,
+            run_control=_QuiescentRunControl(),
+            enable_maintenance_owner=True,
+        )
+    assert supervisor.restart_calls == []
+    assert supervisor.acknowledge_calls == []
+    assert expected_etag == '"' + ("b" * 64) + '"'
 
 
 class _RecordingRunControl:
@@ -5853,7 +6368,7 @@ def test_maintenance_is_terminally_blocked_by_active_or_queued_runs(
             tmp_path,
             service_supervisor=supervisor,
             run_control=run_control,
-            enable_maintenance_owner_for_tests=True,
+            enable_maintenance_owner=True,
         )
     ) as client:
         repair = client.post(
@@ -5888,7 +6403,7 @@ def test_maintenance_is_terminally_blocked_by_active_or_queued_runs(
 def test_maintenance_document_tampering_fails_closed_on_restart(
     tmp_path: Path,
 ) -> None:
-    with TestClient(_app(tmp_path, enable_maintenance_owner_for_tests=True)) as client:
+    with TestClient(_app(tmp_path, enable_maintenance_owner=True)) as client:
         repair = client.post(
             "/v1/environment/repair",
             headers={**AUTH, "Idempotency-Key": "repair-for-corruption"},
@@ -5927,8 +6442,118 @@ def test_maintenance_document_tampering_fails_closed_on_restart(
     with pytest.raises(StoreCorruptionError, match="maintenance operation row"):
         CoreControlStoreV1(
             tmp_path,
-            _enable_maintenance_storage_for_tests=True,
+            enable_maintenance_storage=True,
         )
+
+
+def test_provider_shutdown_drains_maintenance_and_rejects_new_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor = _RecordingServiceSupervisor()
+    app = _app(
+        tmp_path,
+        registry=verified_builtin_registry(tmp_path / "registry"),
+        service_supervisor=supervisor,
+        run_control=_QuiescentRunControl(),
+        enable_maintenance_owner=True,
+    )
+    provider = app.state.core_control_provider
+    entered = threading.Event()
+    release = threading.Event()
+    original_restart = supervisor.restart
+
+    def blocked_restart(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_restart(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "restart", blocked_restart)
+    service = provider.invoke(
+        "getCoreServiceV1",
+        {"service_id": "evolution-backend"},
+    )
+    arguments = {
+        "service_id": "evolution-backend",
+        "request": m.ServiceRestartRequestV1(reason="Shutdown drain test."),
+        "if_match": service.headers["etag"],
+        "idempotency_key": "shutdown-maintenance-restart",
+    }
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        mutation = executor.submit(provider.invoke, "restartCoreServiceV1", arguments)
+        assert entered.wait(timeout=5)
+        closing = executor.submit(provider.close)
+        deadline = time.monotonic() + 5
+        while True:
+            with provider._admission_condition:
+                if provider._admission_closed:
+                    break
+            if time.monotonic() >= deadline:
+                raise AssertionError("provider shutdown did not stop admission")
+            time.sleep(0.005)
+        with pytest.raises(provider_module.CoreControlHTTPError) as rejected:
+            provider.invoke("discoverCoreContractVersionV1", {})
+        assert rejected.value.error.code == "core_control_closing"
+        assert not closing.done()
+        assert supervisor.close_calls == 0
+        release.set()
+        response = mutation.result(timeout=10)
+        assert response.status_code == 202
+        closing.result(timeout=10)
+
+    assert supervisor.close_calls == 1
+
+
+def test_provider_shutdown_timeout_keeps_admission_closed_until_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(provider_module, "_INVOCATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS", 0.05)
+    supervisor = _RecordingServiceSupervisor()
+    app = _app(
+        tmp_path,
+        registry=verified_builtin_registry(tmp_path / "registry"),
+        service_supervisor=supervisor,
+        run_control=_QuiescentRunControl(),
+        enable_maintenance_owner=True,
+    )
+    provider = app.state.core_control_provider
+    entered = threading.Event()
+    release = threading.Event()
+    original_restart = supervisor.restart
+
+    def blocked_restart(*args, **kwargs):
+        entered.set()
+        assert release.wait(timeout=5)
+        return original_restart(*args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "restart", blocked_restart)
+    service = provider.invoke(
+        "getCoreServiceV1",
+        {"service_id": "evolution-backend"},
+    )
+    arguments = {
+        "service_id": "evolution-backend",
+        "request": m.ServiceRestartRequestV1(reason="Shutdown timeout test."),
+        "if_match": service.headers["etag"],
+        "idempotency_key": "shutdown-maintenance-timeout",
+    }
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        mutation = executor.submit(provider.invoke, "restartCoreServiceV1", arguments)
+        assert entered.wait(timeout=5)
+        with pytest.raises(RuntimeError, match="invocations did not drain"):
+            provider.close()
+        assert supervisor.close_calls == 0
+        with pytest.raises(provider_module.CoreControlHTTPError) as rejected:
+            provider.invoke("discoverCoreContractVersionV1", {})
+        assert rejected.value.error.code == "core_control_closing"
+        release.set()
+        assert mutation.result(timeout=10).status_code == 202
+
+    provider.close()
+    assert supervisor.close_calls == 1
 
 
 def _artifact_payload(

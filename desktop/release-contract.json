@@ -10,7 +10,10 @@
     "project_validation",
     "operation_events",
     "run_observability",
-    "artifact_inspection"
+    "artifact_inspection",
+    "service_control",
+    "diagnostics",
+    "maintenance"
   ],
   "schema_version": "1"
 }

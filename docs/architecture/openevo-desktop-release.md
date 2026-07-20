@@ -442,10 +442,10 @@ expected digest has one build-time source of truth,
 `DESKTOP_LOCAL_API_OPENAPI_SHA256`; it contains the final frozen Local API v1
 OpenAPI digest. Exact bootstrap and version tests consume that same native
 constant.
-The release contract requires only `remote_profiles`, `project_validation`,
-`operation_events`, `run_observability`, and `artifact_inspection`.
-`service_control` and `diagnostics` remain valid future enum values but are not
-advertised by this release because their Core owners are unavailable.
+The release contract requires `remote_profiles`, `project_validation`,
+`operation_events`, `run_observability`, `artifact_inspection`,
+`service_control`, `diagnostics`, and `maintenance`. The renderer enables
+System mutations only when the complete maintenance feature set is negotiated.
 Native readiness also requires `GET /openevo-api/desktop/shell` to return 404,
 so the old shell token route cannot remain in a release sidecar inventory.
 It then calls the hidden no-side-effect native session probe with

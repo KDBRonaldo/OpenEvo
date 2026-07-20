@@ -245,15 +245,13 @@ drawers lock background scrolling and restore the opener on close. When the
 native folder picker temporarily disables its radio control, keyboard focus is
 restored to that control after the picker settles.
 
-The Preview System view exposes connection and authoritative service state.
-The frozen provider boundary contains environment doctor/repair, service
-restart, redacted diagnostics, and cleanup routes, but the production Core does
-not publish their owner yet. The real release provider therefore sets
+The System view exposes connection, authoritative service state, environment
+doctor/repair, service restart, redacted diagnostics, and bounded cleanup when
+the negotiated release composition publishes `service_control`, `diagnostics`,
+and `maintenance`. Missing or partial publication keeps
 `systemMaintenanceAvailable=false`, hides every mutation control, and leaves
-direct route calls fail closed. The contract simulator may opt in to those
-controls for focused development tests; that does not make them a release
-feature. No path exposes workspace sync, arbitrary maintenance scopes, or a
-remote shell.
+direct route calls fail closed. No path exposes workspace sync, arbitrary
+maintenance scopes, or a remote shell.
 Nonterminal local connect/bootstrap/activation operations expose the frozen
 Local API cancel action, interrupt their exact transport/process/tunnel
 authority, and return to the authoritative disconnected or draft state before

@@ -13,6 +13,7 @@ import time
 import pytest
 
 from openevo.backend import service_supervisor as supervisor_module
+from openevo.backend.service_control import ServiceRestartAttempt, ServiceRestartAttemptState
 from openevo.gateway import session_files as session_files_module
 from openevo.backend.contracts.v1.models import LogEntryV1, ServiceSummaryV1
 from openevo.backend.service_supervisor import (
@@ -3007,6 +3008,256 @@ def test_restart_operation_capacity_preserves_replay_and_rejects_conflicts(
         assert len(backend.spawned) == spawn_count
     finally:
         supervisor.close()
+
+
+def test_restart_once_completed_receipt_replays_across_restart_until_acknowledged(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    expected = None
+    completed = None
+    try:
+        _ensure_subscription(supervisor)
+        expected = supervisor.get("gateway")
+        completed = supervisor.restart_once(
+            "gateway",
+            operation_id="durable-completed",
+            expected_service_etag=expected.etag,
+        )
+        attempts = supervisor.list_restart_attempts()
+        assert attempts == (
+            ServiceRestartAttempt(
+                operation_id="durable-completed",
+                service_id="gateway",
+                expected_service_etag=expected.etag,
+                state=ServiceRestartAttemptState.COMPLETED,
+                service=completed,
+            ),
+        )
+    finally:
+        supervisor.close()
+
+    replay, replay_backend, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        assert expected is not None
+        assert completed is not None
+        assert replay.restart_once(
+            "gateway",
+            operation_id="durable-completed",
+            expected_service_etag=expected.etag,
+        ) == completed
+        assert replay_backend.spawned == []
+        with pytest.raises(SupervisorStateError, match="different request"):
+            replay.restart_once(
+                "rollout",
+                operation_id="durable-completed",
+                expected_service_etag=expected.etag,
+            )
+        with pytest.raises(SupervisorStateError, match="different request"):
+            replay.acknowledge_restart_attempt(
+                "durable-completed",
+                service_id="gateway",
+                expected_service_etag='"' + ("0" * 64) + '"',
+            )
+        replay.acknowledge_restart_attempt(
+            "durable-completed",
+            service_id="gateway",
+            expected_service_etag=expected.etag,
+        )
+        assert replay.list_restart_attempts() == ()
+        with pytest.raises(SupervisorStateError, match="does not exist"):
+            replay.acknowledge_restart_attempt(
+                "durable-completed",
+                service_id="gateway",
+                expected_service_etag=expected.etag,
+            )
+    finally:
+        replay.close()
+
+    final, _, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        assert final.list_restart_attempts() == ()
+    finally:
+        final.close()
+
+
+def test_restart_once_started_receipt_replay_never_executes_again(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, backend, _, _ = _supervisor(tmp_path, framework_lock)
+    expected = None
+    try:
+        _ensure_subscription(supervisor)
+        expected = supervisor.get("gateway")
+        spawn_count = len(backend.spawned)
+
+        def fail_before_restart(*_args, **_kwargs):
+            raise RuntimeError("controlled interruption after durable start")
+
+        monkeypatch.setattr(supervisor, "_ensure_locked", fail_before_restart)
+        with pytest.raises(RuntimeError, match="controlled interruption"):
+            supervisor.restart_once(
+                "gateway",
+                operation_id="durable-started",
+                expected_service_etag=expected.etag,
+            )
+        assert len(backend.spawned) == spawn_count
+        attempt = supervisor.list_restart_attempts()[0]
+        assert attempt.state is ServiceRestartAttemptState.STARTED
+        assert attempt.service is None
+    finally:
+        supervisor.close()
+
+    replay, replay_backend, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        assert expected is not None
+        with pytest.raises(SupervisorStateError, match="already started"):
+            replay.restart_once(
+                "gateway",
+                operation_id="durable-started",
+                expected_service_etag=expected.etag,
+            )
+        assert replay_backend.spawned == []
+        replay.acknowledge_restart_attempt(
+            "durable-started",
+            service_id="gateway",
+            expected_service_etag=expected.etag,
+        )
+        assert replay.list_restart_attempts() == ()
+    finally:
+        replay.close()
+
+
+def test_restart_once_receipt_capacity_is_released_only_by_ack(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        max_restart_operations=1,
+    )
+    try:
+        _ensure_subscription(supervisor)
+        first_expected = supervisor.get("gateway")
+        supervisor.restart_once(
+            "gateway",
+            operation_id="durable-capacity-1",
+            expected_service_etag=first_expected.etag,
+        )
+        second_expected = supervisor.get("gateway")
+        with pytest.raises(SupervisorBusyError, match="capacity"):
+            supervisor.restart_once(
+                "gateway",
+                operation_id="durable-capacity-2",
+                expected_service_etag=second_expected.etag,
+            )
+        supervisor.acknowledge_restart_attempt(
+            "durable-capacity-1",
+            service_id="gateway",
+            expected_service_etag=first_expected.etag,
+        )
+        supervisor.restart_once(
+            "gateway",
+            operation_id="durable-capacity-2",
+            expected_service_etag=second_expected.etag,
+        )
+    finally:
+        supervisor.close()
+
+
+def test_service_ledger_v1_migrates_atomically_to_v2(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+    supervisor.close()
+    ledger_path = tmp_path / "core-services" / "ledger.json"
+    legacy = json.loads(ledger_path.read_text(encoding="utf-8"))
+    legacy["schema_version"] = 1
+    legacy.pop("restart_attempts")
+    ledger_path.write_text(
+        json.dumps(legacy, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    ledger_path.chmod(0o600)
+
+    migrated, _, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        persisted = json.loads(ledger_path.read_text(encoding="utf-8"))
+        assert persisted["schema_version"] == 2
+        assert persisted["restart_attempts"] == []
+        assert migrated.list_restart_attempts() == ()
+    finally:
+        migrated.close()
+
+
+def test_restart_receipt_corruption_and_duplicates_fail_closed_on_startup(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+    expected = None
+    try:
+        _ensure_subscription(supervisor)
+        expected = supervisor.get("gateway")
+        supervisor.restart_once(
+            "gateway",
+            operation_id="durable-corrupt",
+            expected_service_etag=expected.etag,
+        )
+    finally:
+        supervisor.close()
+
+    ledger_path = tmp_path / "core-services" / "ledger.json"
+    duplicated = json.loads(ledger_path.read_text(encoding="utf-8"))
+    duplicated["restart_attempts"].append(copy.deepcopy(duplicated["restart_attempts"][0]))
+    ledger_path.write_text(
+        json.dumps(duplicated, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    ledger_path.chmod(0o600)
+    with pytest.raises(SupervisorStateError, match="duplicate"):
+        _supervisor(tmp_path, framework_lock)
+
+    duplicated["restart_attempts"] = [duplicated["restart_attempts"][0]]
+    duplicated["restart_attempts"][0]["state"] = "started"
+    assert duplicated["restart_attempts"][0]["service"] is not None
+    ledger_path.write_text(
+        json.dumps(duplicated, ensure_ascii=True, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    ledger_path.chmod(0o600)
+    with pytest.raises(SupervisorStateError, match="started restart attempt"):
+        _supervisor(tmp_path, framework_lock)
+
+
+def test_release_rebind_rejects_unacknowledged_restart_receipt(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        _ensure_subscription(supervisor)
+        expected = supervisor.get("gateway")
+        supervisor.restart_once(
+            "gateway",
+            operation_id="durable-rebind",
+            expected_service_etag=expected.etag,
+        )
+    finally:
+        supervisor.close()
+
+    with pytest.raises(SupervisorStateError, match="pending restart receipts"):
+        CoreServiceSupervisor(
+            launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
+            service_root=tmp_path / "core-services",
+            framework_lock=framework_lock,
+            release_identity=ServiceReleaseIdentity("c" * 64, "d" * 64),
+        )
 
 
 def test_real_process_group_reaps_child_and_grandchild() -> None:

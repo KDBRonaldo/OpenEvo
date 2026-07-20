@@ -38,7 +38,11 @@ from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
-from openevo.backend.service_control import CoreServiceControlError
+from openevo.backend.service_control import (
+    CoreServiceControlError,
+    ServiceRestartAttempt,
+    ServiceRestartAttemptState,
+)
 from openevo.backend.contracts.v1.models import (
     ApiErrorV1,
     ErrorCategory,
@@ -88,6 +92,7 @@ from openevo.internal_auth import (
 
 
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+_STRONG_ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
 _SECRET_KEY_PATTERN = (
     r"(?:authorization|proxy[-_]?authorization|cookie|set[-_]?cookie|credential|"
     r"api[-_]?key|access[-_]?token|refresh[-_]?token|token|password|passwd|secret|"
@@ -1313,7 +1318,70 @@ class _LedgerService(_StrictStateModel):
         return ServiceStatus(value) if isinstance(value, str) else value
 
 
-class _Ledger(_StrictStateModel):
+class _LedgerRestartModelPreparation(_StrictStateModel):
+    model_ref: str = Field(min_length=1, max_length=256)
+    status: str = Field(min_length=1, max_length=64)
+    updated_at: str = Field(min_length=20, max_length=40)
+    next_interface: str = Field(min_length=1, max_length=64)
+
+
+class _LedgerRestartService(_StrictStateModel):
+    id: str = Field(min_length=1, max_length=128)
+    display_name: str = Field(min_length=1, max_length=128)
+    component: ServiceComponent
+    status: ServiceStatus
+    restartable: bool
+    status_message: str | None = Field(default=None, max_length=256)
+    error_code: str | None = Field(default=None, max_length=128)
+    updated_at: str = Field(min_length=20, max_length=40)
+    observed_at: str = Field(min_length=20, max_length=40)
+    identity_digest: str
+    pid: int | None = Field(default=None, gt=0)
+    port: int | None = Field(default=None, ge=1, le=65535)
+    etag: str = Field(min_length=66, max_length=66)
+    model_preparation: _LedgerRestartModelPreparation | None = None
+
+    _identity = field_validator("identity_digest")(_state_digest)
+
+    @field_validator("component", mode="before")
+    @classmethod
+    def _component_from_canonical_text(cls, value: object) -> object:
+        return ServiceComponent(value) if isinstance(value, str) else value
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def _status_from_canonical_text(cls, value: object) -> object:
+        return ServiceStatus(value) if isinstance(value, str) else value
+
+    @field_validator("etag")
+    @classmethod
+    def _strong_etag(cls, value: str) -> str:
+        if _STRONG_ETAG_RE.fullmatch(value) is None:
+            raise ValueError("restart service etag is invalid")
+        return value
+
+
+class _LedgerRestartAttempt(_StrictStateModel):
+    operation_id: str = Field(min_length=1, max_length=128)
+    service_id: str = Field(min_length=1, max_length=128)
+    expected_service_etag: str = Field(min_length=66, max_length=66)
+    state: ServiceRestartAttemptState
+    service: _LedgerRestartService | None = None
+
+    @field_validator("expected_service_etag")
+    @classmethod
+    def _strong_expected_etag(cls, value: str) -> str:
+        if _STRONG_ETAG_RE.fullmatch(value) is None:
+            raise ValueError("restart expected service etag is invalid")
+        return value
+
+    @field_validator("state", mode="before")
+    @classmethod
+    def _state_from_canonical_text(cls, value: object) -> object:
+        return ServiceRestartAttemptState(value) if isinstance(value, str) else value
+
+
+class _LedgerBase(_StrictStateModel):
     schema_version: int
     release: _LedgerRelease
     execution_mode: ServiceExecutionMode | None = None
@@ -1322,13 +1390,6 @@ class _Ledger(_StrictStateModel):
     runtime_readiness_code: ServiceRunReadinessCode | None = None
     group_status_message: str | None = Field(default=None, max_length=256)
     services: list[_LedgerService] = Field(default_factory=list, max_length=16)
-
-    @field_validator("schema_version")
-    @classmethod
-    def _schema_is_one(cls, value: int) -> int:
-        if value != 1:
-            raise ValueError("unsupported service ledger schema")
-        return value
 
     @field_validator("generation_digest")
     @classmethod
@@ -1349,6 +1410,26 @@ class _Ledger(_StrictStateModel):
     @classmethod
     def _readiness_from_canonical_text(cls, value: object) -> object:
         return ServiceRunReadinessCode(value) if isinstance(value, str) else value
+
+
+class _LedgerV1(_LedgerBase):
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_is_one(cls, value: int) -> int:
+        if value != 1:
+            raise ValueError("unsupported service ledger schema")
+        return value
+
+
+class _Ledger(_LedgerBase):
+    restart_attempts: list[_LedgerRestartAttempt] = Field(default_factory=list, max_length=4096)
+
+    @field_validator("schema_version")
+    @classmethod
+    def _schema_is_two(cls, value: int) -> int:
+        if value != 2:
+            raise ValueError("unsupported service ledger schema")
+        return value
 
 
 @dataclass(slots=True)
@@ -2636,6 +2717,107 @@ class CoreServiceSupervisor:
             self._restart_results[operation_id] = (service_id, result)
             return result
 
+    def restart_once(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        expected_service_etag: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary:
+        _validate_restart_identity(operation_id, expected_service_etag)
+        with self._mutex:
+            self._require_open()
+            self._verify_release_installation()
+            if total_timeout is not None and total_timeout <= 0:
+                raise ValueError("total_timeout must be positive")
+            prior = self._restart_attempt_or_none(operation_id)
+            if prior is not None:
+                self._require_matching_restart_attempt(
+                    prior,
+                    service_id=service_id,
+                    expected_service_etag=expected_service_etag,
+                )
+                if prior.state is ServiceRestartAttemptState.STARTED:
+                    raise SupervisorStateError(
+                        "restart attempt was already started and cannot be executed again"
+                    )
+                if prior.service is None:
+                    raise SupervisorStateError("completed restart attempt lacks its service result")
+                return self._restart_service_summary(prior.service)
+
+            record = self._record(service_id)
+            current = self._summary(record)
+            if current.etag != expected_service_etag:
+                raise SupervisorStateError("restart expected service etag does not match")
+            if not record.restartable:
+                raise SupervisorStateError("service is not restartable in its current state")
+            if len(self._ledger.restart_attempts) >= self._max_restart_operations:
+                raise SupervisorBusyError("restart attempt receipt capacity is exhausted")
+            runtime_request = self._active_runtime_request
+            if runtime_request is None:
+                raise SupervisorStateError("subscription runtime request is unavailable")
+
+            attempt = _LedgerRestartAttempt(
+                operation_id=operation_id,
+                service_id=service_id,
+                expected_service_etag=expected_service_etag,
+                state=ServiceRestartAttemptState.STARTED,
+            )
+            self._ledger.restart_attempts.append(attempt)
+            self._persist()
+
+            snapshot = self._ensure_locked(
+                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                codex_model=runtime_request.codex_model,
+                runtime_image=runtime_request.runtime_image,
+                total_timeout=total_timeout,
+                force_restart=True,
+            )
+            result = snapshot.service(service_id)
+            frozen = self._ledger_restart_service(result)
+            attempt.state = ServiceRestartAttemptState.COMPLETED
+            attempt.service = frozen
+            try:
+                self._persist()
+            except BaseException:
+                attempt.state = ServiceRestartAttemptState.STARTED
+                attempt.service = None
+                raise
+            return result
+
+    def list_restart_attempts(self) -> tuple[ServiceRestartAttempt, ...]:
+        with self._mutex:
+            self._require_open()
+            return tuple(self._restart_attempt(item) for item in self._ledger.restart_attempts)
+
+    def acknowledge_restart_attempt(
+        self,
+        operation_id: str,
+        *,
+        service_id: str,
+        expected_service_etag: str,
+    ) -> None:
+        _validate_restart_identity(operation_id, expected_service_etag)
+        with self._mutex:
+            self._require_open()
+            self._verify_release_installation()
+            attempt = self._restart_attempt_or_none(operation_id)
+            if attempt is None:
+                raise SupervisorStateError("restart attempt receipt does not exist")
+            self._require_matching_restart_attempt(
+                attempt,
+                service_id=service_id,
+                expected_service_etag=expected_service_etag,
+            )
+            index = self._ledger.restart_attempts.index(attempt)
+            del self._ledger.restart_attempts[index]
+            try:
+                self._persist()
+            except BaseException:
+                self._ledger.restart_attempts.insert(index, attempt)
+                raise
+
     def logs(
         self,
         service_id: str,
@@ -3435,17 +3617,6 @@ class CoreServiceSupervisor:
                 updated_at=record.model_updated_at or record.updated_at,
                 next_interface=record.model_next_interface or "model_preparer_v1",
             )
-        etag_payload = {
-            "component": record.component.value,
-            "error_code": record.error_code,
-            "identity_digest": record.identity_digest,
-            "model_status": record.model_status,
-            "pid": record.pid,
-            "service_id": record.service_id,
-            "status": record.status.value,
-            "status_message": record.status_message,
-            "updated_at": record.updated_at,
-        }
         return SupervisorServiceSummary(
             id=record.service_id,
             display_name=record.display_name,
@@ -3459,7 +3630,17 @@ class CoreServiceSupervisor:
             identity_digest=record.identity_digest,
             pid=record.pid,
             port=record.port,
-            etag=f'"{_digest_json(etag_payload)}"',
+            etag=_service_summary_etag(
+                component=record.component,
+                error_code=record.error_code,
+                identity_digest=record.identity_digest,
+                model_status=record.model_status,
+                pid=record.pid,
+                service_id=record.service_id,
+                status=record.status,
+                status_message=record.status_message,
+                updated_at=record.updated_at,
+            ),
             model_preparation=preparation,
         )
 
@@ -3471,29 +3652,50 @@ class CoreServiceSupervisor:
         )
         payload = self._root.read("ledger.json", max_bytes=_MAX_LEDGER_BYTES)
         if payload is None:
-            ledger = _Ledger(schema_version=1, release=expected_release)
+            ledger = _Ledger(schema_version=2, release=expected_release)
             self._ledger = ledger
             self._persist()
             return ledger
+        migrated = False
         try:
             decoded = payload.decode("utf-8")
             raw = json.loads(decoded)
             if _canonical_bytes(raw) != payload:
                 raise ValueError("ledger is not canonical JSON")
-            ledger = _Ledger.model_validate(raw)
+            schema_version = raw.get("schema_version")
+            if schema_version == 1:
+                legacy = _LedgerV1.model_validate(raw)
+                self._validate_loaded_ledger(legacy)
+                ledger = _Ledger.model_validate(
+                    {
+                        **legacy.model_dump(mode="json"),
+                        "schema_version": 2,
+                        "restart_attempts": [],
+                    }
+                )
+                migrated = True
+            else:
+                ledger = _Ledger.model_validate(raw)
         except (UnicodeDecodeError, json.JSONDecodeError, ValidationError, ValueError) as exc:
             raise SupervisorStateError("service ledger is invalid") from exc
         self._validate_loaded_ledger(ledger)
         if ledger.release != expected_release:
+            if ledger.restart_attempts:
+                raise SupervisorStateError(
+                    "service ledger release identity does not match Core with pending restart receipts"
+                )
             if not self._ledger_is_quiescent(ledger):
                 raise SupervisorStateError("service ledger release identity does not match Core")
-            ledger = _Ledger(schema_version=1, release=expected_release)
+            ledger = _Ledger(schema_version=2, release=expected_release)
             self._ledger = ledger
             self._persist()
             return ledger
+        if migrated:
+            self._ledger = ledger
+            self._persist()
         return ledger
 
-    def _validate_loaded_ledger(self, ledger: _Ledger) -> None:
+    def _validate_loaded_ledger(self, ledger: _LedgerBase) -> None:
         if ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
             if ledger.runtime_identity_digest is not None or ledger.runtime_readiness_code not in {
                 None,
@@ -3575,6 +3777,51 @@ class CoreServiceSupervisor:
             > self._max_log_bytes
         ):
             raise SupervisorStateError("service ledger aggregate log budget is exceeded")
+        restart_attempts = (
+            ledger.restart_attempts if isinstance(ledger, _Ledger) else ()
+        )
+        if len(restart_attempts) > self._max_restart_operations:
+            raise SupervisorStateError("restart attempt receipt capacity is exceeded")
+        operation_ids: set[str] = set()
+        for attempt in restart_attempts:
+            if attempt.operation_id in operation_ids:
+                raise SupervisorStateError("restart attempt ledger contains duplicate operation IDs")
+            operation_ids.add(attempt.operation_id)
+            if attempt.state is ServiceRestartAttemptState.STARTED:
+                if attempt.service is not None:
+                    raise SupervisorStateError("started restart attempt contains a service result")
+            elif attempt.service is None:
+                raise SupervisorStateError("completed restart attempt lacks a service result")
+            if attempt.service is not None:
+                if attempt.service.id != attempt.service_id:
+                    raise SupervisorStateError(
+                        "restart attempt service result has a different service identity"
+                    )
+                service = attempt.service
+                if service.etag != _service_summary_etag(
+                    component=service.component,
+                    error_code=service.error_code,
+                    identity_digest=service.identity_digest,
+                    model_status=(
+                        None
+                        if service.model_preparation is None
+                        else service.model_preparation.status
+                    ),
+                    pid=service.pid,
+                    service_id=service.id,
+                    status=service.status,
+                    status_message=service.status_message,
+                    updated_at=service.updated_at,
+                ):
+                    raise SupervisorStateError(
+                        "restart attempt service result etag is inconsistent"
+                    )
+                if (service.status is ServiceStatus.FAILED) != (
+                    service.error_code is not None
+                ):
+                    raise SupervisorStateError(
+                        "restart attempt service result failure state is inconsistent"
+                    )
 
     @staticmethod
     def _ledger_is_quiescent(ledger: _Ledger) -> bool:
@@ -3628,6 +3875,106 @@ class CoreServiceSupervisor:
         if len(payload) > _MAX_LEDGER_BYTES:
             raise SupervisorStateError("service ledger exceeds its byte limit")
         self._root.atomic_write("ledger.json", payload)
+
+    @staticmethod
+    def _ledger_restart_service(
+        service: SupervisorServiceSummary,
+    ) -> _LedgerRestartService:
+        return _LedgerRestartService.model_validate(
+            service.__dict__ if hasattr(service, "__dict__") else {
+                "id": service.id,
+                "display_name": service.display_name,
+                "component": service.component.value,
+                "status": service.status.value,
+                "restartable": service.restartable,
+                "status_message": service.status_message,
+                "error_code": service.error_code,
+                "updated_at": service.updated_at,
+                "observed_at": service.observed_at,
+                "identity_digest": service.identity_digest,
+                "pid": service.pid,
+                "port": service.port,
+                "etag": service.etag,
+                "model_preparation": (
+                    None
+                    if service.model_preparation is None
+                    else {
+                        "model_ref": service.model_preparation.model_ref,
+                        "status": service.model_preparation.status,
+                        "updated_at": service.model_preparation.updated_at,
+                        "next_interface": service.model_preparation.next_interface,
+                    }
+                ),
+            }
+        )
+
+    @staticmethod
+    def _restart_service_summary(
+        service: _LedgerRestartService,
+    ) -> SupervisorServiceSummary:
+        preparation = service.model_preparation
+        return SupervisorServiceSummary(
+            id=service.id,
+            display_name=service.display_name,
+            component=service.component,
+            status=service.status,
+            restartable=service.restartable,
+            status_message=service.status_message,
+            error_code=service.error_code,
+            updated_at=service.updated_at,
+            observed_at=service.observed_at,
+            identity_digest=service.identity_digest,
+            pid=service.pid,
+            port=service.port,
+            etag=service.etag,
+            model_preparation=(
+                None
+                if preparation is None
+                else SupervisorModelPreparation(
+                    model_ref=preparation.model_ref,
+                    status=preparation.status,
+                    updated_at=preparation.updated_at,
+                    next_interface=preparation.next_interface,
+                )
+            ),
+        )
+
+    @staticmethod
+    def _restart_attempt(attempt: _LedgerRestartAttempt) -> ServiceRestartAttempt:
+        return ServiceRestartAttempt(
+            operation_id=attempt.operation_id,
+            service_id=attempt.service_id,
+            expected_service_etag=attempt.expected_service_etag,
+            state=attempt.state,
+            service=(
+                None
+                if attempt.service is None
+                else CoreServiceSupervisor._restart_service_summary(attempt.service)
+            ),
+        )
+
+    def _restart_attempt_or_none(self, operation_id: str) -> _LedgerRestartAttempt | None:
+        return next(
+            (
+                attempt
+                for attempt in self._ledger.restart_attempts
+                if attempt.operation_id == operation_id
+            ),
+            None,
+        )
+
+    @staticmethod
+    def _require_matching_restart_attempt(
+        attempt: _LedgerRestartAttempt,
+        *,
+        service_id: str,
+        expected_service_etag: str,
+    ) -> None:
+        if (
+            attempt.service_id != service_id
+            or attempt.expected_service_etag != expected_service_etag
+        ):
+            raise SupervisorStateError("restart operation identity was reused for a different request")
 
     def _record(self, service_id: str) -> _LedgerService:
         record = self._record_or_none(service_id)
@@ -4198,6 +4545,47 @@ def _canonical_bytes(value: object) -> bytes:
 
 def _digest_json(value: object) -> str:
     return hashlib.sha256(_canonical_bytes(value)).hexdigest()
+
+
+def _service_summary_etag(
+    *,
+    component: ServiceComponent,
+    error_code: str | None,
+    identity_digest: str,
+    model_status: str | None,
+    pid: int | None,
+    service_id: str,
+    status: ServiceStatus,
+    status_message: str | None,
+    updated_at: str,
+) -> str:
+    payload = {
+        "component": component.value,
+        "error_code": error_code,
+        "identity_digest": identity_digest,
+        "model_status": model_status,
+        "pid": pid,
+        "service_id": service_id,
+        "status": status.value,
+        "status_message": status_message,
+        "updated_at": updated_at,
+    }
+    return f'"{_digest_json(payload)}"'
+
+
+def _validate_restart_identity(operation_id: str, expected_service_etag: str) -> None:
+    if (
+        not isinstance(operation_id, str)
+        or not operation_id
+        or len(operation_id) > 128
+        or any(ord(char) < 0x20 for char in operation_id)
+    ):
+        raise ValueError("restart operation_id is invalid")
+    if (
+        not isinstance(expected_service_etag, str)
+        or _STRONG_ETAG_RE.fullmatch(expected_service_etag) is None
+    ):
+        raise ValueError("restart expected_service_etag is invalid")
 
 
 def _binding_matches_snapshot(

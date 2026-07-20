@@ -509,14 +509,12 @@ GET    /desktop/v1/events
 Routes in this frozen boundary are not automatically release features. The
 current release composition provides sidecar-owned connection, host-key,
 bootstrap, activation and operation cancellation; Core-owned runs and artifact
-inspection; and service observation. Strict forwarding routes for restart,
-doctor/repair, diagnostics, referenced logs, and cleanup remain in the frozen
-boundary, but a release renderer enables those controls only when the negotiated
-Local API version publishes the complete `service_control`, `diagnostics`, and
-`maintenance` feature set. The current Preview Core does not publish that
-complete set, so the renderer remains read-only and direct calls return typed
-`provider_capability_unavailable`. Partial feature publication remains
-fail-closed. Workspace sync and Local operation-log handlers remain unavailable.
+inspection; service observation; and the complete maintenance owner. Strict
+forwarding routes for restart, doctor/repair, diagnostics, referenced logs, and
+cleanup are enabled only when the negotiated Local API version publishes the
+complete `service_control`, `diagnostics`, and `maintenance` feature set.
+Partial feature publication remains fail-closed. Workspace sync and Local
+operation-log handlers remain unavailable.
 The provider never synthesizes progress or successful diagnostic/service
 operations.
 
@@ -1108,10 +1106,10 @@ cross-wire its document identity.
 
 Timeline and log records preserve remote sequence, attempt, and service
 identity. Service summaries remain authoritative observations from Core. The
-Preview release does not own bounded diagnostics, project doctor/repair,
-managed service restart, referenced maintenance logs, or
-completed-diagnostic cleanup. Desktop hides those controls; the route models
-remain reserved for a later reviewed owner.
+matching release owns bounded diagnostics, project doctor/repair, managed
+service restart, referenced maintenance logs, and completed-diagnostic cleanup.
+Development and incomplete compositions may keep these controls unavailable;
+Desktop derives that state from negotiated feature flags.
 
 Inference services carry `model_preparation` if and only if
 `kind=inference`; environment checks carry it if and only if
@@ -1121,13 +1119,14 @@ project ID, and run scope requires both project and run IDs. Providers still
 verify that the run belongs to the project.
 
 The frozen `OperationV1` shapes for environment repair, service restart, cache
-cleanup, and recoverable diagnostic resources define the intended boundary.
-The repository has a test-only opt-in owner under active hardening, but release
-construction excludes it until strong ETags, durable side-effect receipts,
-idempotent replay, bounded recovery, lifecycle revocation, run fencing, and
-shutdown semantics are complete. Every maintenance scope currently fails
-closed instead of implying ownership over project inputs, runs, outputs, or
-evolution artifacts.
+cleanup, and recoverable diagnostic resources define the release boundary.
+The production owner is enabled only by the matching Daemon release
+composition and remains fail-closed when required supervisor, run-owner, or
+registry authorities are absent. It uses strong ETags, durable operation
+receipts, idempotent replay, bounded recovery, lifecycle revocation, run
+fencing, and shutdown semantics; every maintenance scope remains bounded and
+does not imply ownership over research inputs, runs, outputs, or evolution
+artifacts.
 
 Core SSE adds artifact, log, operation, successor-transition, and
 revision-activated events. Every non-heartbeat event carries a replay-stable

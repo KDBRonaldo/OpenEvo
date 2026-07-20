@@ -503,7 +503,7 @@ the production SSH adapter, bridge store, bridge, event broker, and Core event
 relay from the exact embedded Core wheel/framework-lock pair. It advertises the
 complete frozen release feature set: `remote_profiles`, `project_validation`,
 `operation_events`, `run_observability`, `artifact_inspection`,
-`service_control`, and `diagnostics`. A composition failure aborts startup; it
+`service_control`, `diagnostics`, and `maintenance`. A composition failure aborts startup; it
 never falls back to a local method table, direct backend URL, fixture data, or a
 synthetic ready/success state.
 

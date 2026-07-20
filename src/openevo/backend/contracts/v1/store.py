@@ -628,7 +628,7 @@ _ARTIFACT_INSPECTION_V1_SCHEMA_WITH_MAINTENANCE = (
     *_ARTIFACT_INSPECTION_V1_SCHEMA,
     *_MAINTENANCE_TABLE_SCHEMA,
 )
-_TEST_SCHEMA_WITH_MAINTENANCE = (
+_SCHEMA_WITH_MAINTENANCE = (
     *_PRE_MAINTENANCE_SCHEMA,
     *_MAINTENANCE_TABLE_SCHEMA,
 )
@@ -644,7 +644,7 @@ class CoreControlStoreV1:
         *,
         event_replay_limit: int = 10_000,
         clock: Callable[[], datetime] | None = None,
-        _enable_maintenance_storage_for_tests: bool = False,
+        enable_maintenance_storage: bool = False,
     ) -> None:
         if not 1 <= event_replay_limit <= 10_000:
             raise ValueError("event replay limit must be between 1 and 10000")
@@ -654,7 +654,7 @@ class CoreControlStoreV1:
         self.workspace_root = self.root / "workspace-snapshots"
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._event_replay_limit = event_replay_limit
-        self._maintenance_storage_enabled = _enable_maintenance_storage_for_tests
+        self._maintenance_storage_enabled = enable_maintenance_storage
         self._mutex = threading.RLock()
         self._closed = False
         self._database_fds: dict[str, int] = {}
@@ -2246,6 +2246,80 @@ class CoreControlStoreV1:
                 raise ResourceNotFoundError("operation", operation_id)
             return self._validate_maintenance_operation_row(row)
 
+    def service_restart_operation_authority(
+        self,
+        operation_id: str,
+    ) -> tuple[m.OperationV1, str]:
+        """Return the durable request/If-Match authority for a restart operation."""
+
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            try:
+                operation = self.get_maintenance_operation(operation_id)
+            except ResourceNotFoundError as exc:
+                raise StoreCorruptionError(
+                    "service restart receipt references an unknown maintenance operation"
+                ) from exc
+            if not isinstance(operation.request, m.ServiceRestartOperationRequestV1):
+                raise ResourceConflictError(
+                    "operation_kind_mismatch",
+                    "The maintenance operation is not a service restart.",
+                )
+            matches: list[str] = []
+            for row in self._connection.execute(
+                "SELECT * FROM maintenance_idempotency_records "
+                "WHERE route_operation_id = ? AND resource_scope = ?",
+                ("restartCoreServiceV1", operation.request.service_id),
+            ).fetchall():
+                result = self._validate_maintenance_idempotency_row(row)
+                if not isinstance(result.model, m.OperationV1):
+                    raise StoreCorruptionError(
+                        "service restart idempotency response is not an operation"
+                    )
+                if result.model.id != operation_id:
+                    continue
+                try:
+                    semantic_headers = json.loads(bytes(row["semantic_headers_json"]))
+                except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise StoreCorruptionError(
+                        "service restart semantic headers are invalid"
+                    ) from exc
+                matches.append(cast(str, semantic_headers["if-match"]))
+            if len(matches) != 1:
+                raise StoreCorruptionError(
+                    "service restart operation lacks unique idempotency authority"
+                )
+            return operation, matches[0]
+
+    def interrupted_service_restart_operations(
+        self,
+    ) -> tuple[tuple[m.OperationV1, str], ...]:
+        """List restart operations deliberately deferred to the service owner."""
+
+        with self._mutex:
+            self._verify_lifecycle_storage()
+            rows = self._connection.execute(
+                "SELECT operation_id FROM maintenance_operations ORDER BY operation_id"
+            ).fetchall()
+            interrupted: list[tuple[m.OperationV1, str]] = []
+            for row in rows:
+                operation = self.get_maintenance_operation(row["operation_id"])
+                if (
+                    operation.status
+                    in {
+                        m.OperationStatus.QUEUED,
+                        m.OperationStatus.RUNNING,
+                    }
+                    and isinstance(
+                        operation.request,
+                        m.ServiceRestartOperationRequestV1,
+                    )
+                ):
+                    interrupted.append(
+                        self.service_restart_operation_authority(operation.id)
+                    )
+            return tuple(interrupted)
+
     def mark_maintenance_operation_running(self, operation_id: str) -> m.OperationV1:
         return self._transition_maintenance_operation(
             operation_id,
@@ -2266,6 +2340,49 @@ class CoreControlStoreV1:
             result=result,
             log_message="The Core maintenance operation completed.",
         )
+
+    def complete_service_restart_operation(
+        self,
+        operation_id: str,
+        service: m.ServiceSummaryV1,
+    ) -> m.OperationV1:
+        with self._mutex, self._transaction():
+            row = self._maintenance_operation_row(operation_id)
+            current = self._validate_maintenance_operation_row(row)
+            if (
+                current.status is not m.OperationStatus.RUNNING
+                or not isinstance(current.request, m.ServiceRestartOperationRequestV1)
+                or current.request.service_id != service.id
+            ):
+                raise ResourceConflictError(
+                    "operation_state_changed",
+                    "The service restart operation changed before completion.",
+                )
+            now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
+            version = int(row["resource_version"]) + 1
+            data = current.model_dump(mode="python", exclude={"etag"})
+            data.update(
+                status=m.OperationStatus.SUCCEEDED,
+                result=m.ServiceRestartOperationResultV1(
+                    kind=m.OperationKind.SERVICE_RESTART,
+                    service=service,
+                ),
+                error=None,
+                updated_at=now,
+                observed_at=now,
+                finished_at=now,
+            )
+            updated = _model_with_etag(m.OperationV1, data, version=version)
+            self._append_service_update_locked(service, now=now)
+            self._update_maintenance_operation(updated, version=version)
+            self._append_operation_log(
+                updated,
+                level=m.LogLevel.INFO,
+                message="The Core maintenance operation completed.",
+                now=now,
+            )
+            self._append_operation_event(updated, now=now)
+            return updated
 
     def fail_maintenance_operation(
         self,
@@ -2673,40 +2790,47 @@ class CoreControlStoreV1:
 
     def append_service_update(self, service: m.ServiceSummaryV1) -> None:
         with self._mutex, self._transaction():
-            now = self._timestamp()
-            sequence = self._reserve_event_sequence()
-            event_id = self.event_cursor(sequence)
-            frame = m.SseFrameV1.model_validate_json(
-                _canonical_bytes(
-                    {
+            self._append_service_update_locked(service, now=self._timestamp())
+
+    def _append_service_update_locked(
+        self,
+        service: m.ServiceSummaryV1,
+        *,
+        now: str,
+    ) -> None:
+        sequence = self._reserve_event_sequence()
+        event_id = self.event_cursor(sequence)
+        frame = m.SseFrameV1.model_validate_json(
+            _canonical_bytes(
+                {
+                    "id": event_id,
+                    "event": "service.updated.v1",
+                    "data": {
+                        "schema_version": "1",
                         "id": event_id,
+                        "sequence": sequence,
+                        "occurred_at": now,
                         "event": "service.updated.v1",
-                        "data": {
-                            "schema_version": "1",
-                            "id": event_id,
-                            "sequence": sequence,
-                            "occurred_at": now,
-                            "event": "service.updated.v1",
-                            "change": {
-                                "change_id": _core_owned_id(
-                                    self._signing_key,
-                                    "change",
-                                    {
-                                        "resource_type": "service",
-                                        "resource_id": service.id,
-                                        "resource_etag": service.etag,
-                                    },
-                                ),
-                                "resource_type": "service",
-                                "resource_id": service.id,
-                                "resource_etag": service.etag,
-                            },
-                            "payload": service.model_dump(mode="json"),
+                        "change": {
+                            "change_id": _core_owned_id(
+                                self._signing_key,
+                                "change",
+                                {
+                                    "resource_type": "service",
+                                    "resource_id": service.id,
+                                    "resource_etag": service.etag,
+                                },
+                            ),
+                            "resource_type": "service",
+                            "resource_id": service.id,
+                            "resource_etag": service.etag,
                         },
-                    }
-                )
+                        "payload": service.model_dump(mode="json"),
+                    },
+                }
             )
-            self._finish_event(sequence, frame)
+        )
+        self._finish_event(sequence, frame)
 
     def _maintenance_operation_row(self, operation_id: str) -> sqlite3.Row:
         row = self._connection.execute(
@@ -3417,6 +3541,10 @@ class CoreControlStoreV1:
         diagnostics: list[tuple[m.DiagnosticV1, int]],
     ) -> None:
         for current, current_version in operations:
+            if isinstance(current.request, m.ServiceRestartOperationRequestV1):
+                # The service supervisor owns a durable side-effect receipt.  The
+                # maintenance owner reconciles it before the provider admits calls.
+                continue
             now = _strictly_later_timestamp(self._timestamp(), current.updated_at)
             version = current_version + 1
             data = current.model_dump(mode="python", exclude={"etag"})
@@ -6195,7 +6323,7 @@ class CoreControlStoreV1:
             _ARTIFACT_INSPECTION_V1_SCHEMA_WITH_MAINTENANCE
         )
         pre_maintenance_fingerprint = _expected_schema_fingerprint(_PRE_MAINTENANCE_SCHEMA)
-        test_current_fingerprint = _expected_schema_fingerprint(_TEST_SCHEMA_WITH_MAINTENANCE)
+        maintenance_fingerprint = _expected_schema_fingerprint(_SCHEMA_WITH_MAINTENANCE)
         if fingerprint == empty_fingerprint:
             if hasattr(self, "_marker_fd"):
                 raise StoreCorruptionError(
@@ -6265,7 +6393,7 @@ class CoreControlStoreV1:
                     for statement in _MAINTENANCE_TABLE_SCHEMA:
                         self._connection.execute(statement)
                     self._verify_schema_fingerprint()
-        elif not (self._maintenance_storage_enabled and fingerprint == test_current_fingerprint):
+        elif not (self._maintenance_storage_enabled and fingerprint == maintenance_fingerprint):
             raise StoreCorruptionError(
                 "Core Control schema fingerprint is incompatible with an allowed migration"
             )
@@ -6622,7 +6750,7 @@ class CoreControlStoreV1:
         store_id = secrets.token_hex(_STORE_ID_BYTES)
         with self._transaction():
             active_schema = (
-                _TEST_SCHEMA_WITH_MAINTENANCE if self._maintenance_storage_enabled else _SCHEMA
+                _SCHEMA_WITH_MAINTENANCE if self._maintenance_storage_enabled else _SCHEMA
             )
             statements = (
                 active_schema
@@ -6983,7 +7111,7 @@ class CoreControlStoreV1:
 
     def _verify_schema_fingerprint(self) -> None:
         expected_schema = (
-            _TEST_SCHEMA_WITH_MAINTENANCE if self._maintenance_storage_enabled else _SCHEMA
+            _SCHEMA_WITH_MAINTENANCE if self._maintenance_storage_enabled else _SCHEMA
         )
         if _schema_fingerprint(self._connection) != _expected_schema_fingerprint(expected_schema):
             raise StoreCorruptionError(
@@ -7121,7 +7249,7 @@ class CoreControlStoreV1:
                             _expected_schema_fingerprint(
                                 _ARTIFACT_INSPECTION_V1_SCHEMA_WITH_MAINTENANCE
                             ),
-                            _expected_schema_fingerprint(_TEST_SCHEMA_WITH_MAINTENANCE),
+                            _expected_schema_fingerprint(_SCHEMA_WITH_MAINTENANCE),
                         }
                     )
                 if (

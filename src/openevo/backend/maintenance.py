@@ -18,7 +18,12 @@ from openevo.backend.contracts.v1.store import (
     StoredResult,
 )
 from openevo.backend.run_control import CoreRunControl, CoreRunControlError
-from openevo.backend.service_control import CoreServiceControl, CoreServiceControlError
+from openevo.backend.service_control import (
+    CoreServiceControl,
+    CoreServiceControlError,
+    ServiceRestartAttempt,
+    ServiceRestartAttemptState,
+)
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 
 
@@ -43,11 +48,14 @@ class CoreMaintenanceOwnerV1:
         self._service_control_complete = service_control is not None and all(
             callable(getattr(service_control, name, None))
             for name in (
+                "acknowledge_restart_attempt",
                 "cancel",
                 "get",
                 "list",
+                "list_restart_attempts",
                 "logs",
                 "restart",
+                "restart_once",
                 "run_binding",
             )
         )
@@ -63,6 +71,8 @@ class CoreMaintenanceOwnerV1:
         self._diagnostic_lock = threading.Lock()
         self._cancellation_lock = threading.Lock()
         self._cancellations: dict[str, threading.Event] = {}
+        if self._service_control_complete:
+            self._reconcile_service_restart_operations()
 
     @property
     def diagnostics_available(self) -> bool:
@@ -214,24 +224,38 @@ class CoreMaintenanceOwnerV1:
                 current_service = service_control.get(service_id).to_contract()
                 if not hmac.compare_digest(current_service.etag, if_match):
                     raise ETagPreconditionError("service")
-                restarted = service_control.restart(
+                restarted = service_control.restart_once(
                     service_id,
                     operation_id=operation.id,
+                    expected_service_etag=if_match,
                 ).to_contract()
                 if restarted.id != service_id:
                     raise CoreServiceControlError(
                         "service restart returned a different service identity"
                     )
-                self._store.append_service_update(restarted)
-                terminal = self._store.complete_maintenance_operation(
+                terminal = self._store.complete_service_restart_operation(
                     operation.id,
-                    m.ServiceRestartOperationResultV1(
-                        kind=m.OperationKind.SERVICE_RESTART,
-                        service=restarted,
-                    ),
+                    restarted,
                 )
+                try:
+                    service_control.acknowledge_restart_attempt(
+                        operation.id,
+                        service_id=service_id,
+                        expected_service_etag=if_match,
+                    )
+                except CoreServiceControlError:
+                    # The operation result is already committed.  Retain the
+                    # receipt so startup reconciliation can acknowledge it.
+                    pass
                 return StoredResult(202, terminal, terminal.etag)
             except Exception as exc:
+                recovered = self._recover_restart_after_exception(
+                    operation.id,
+                    service_id=service_id,
+                    expected_service_etag=if_match,
+                )
+                if recovered is not None:
+                    return StoredResult(202, recovered, recovered.etag)
                 terminal = self._fail_operation(
                     operation.id,
                     code="service_restart_failed",
@@ -240,6 +264,183 @@ class CoreMaintenanceOwnerV1:
                     retryable=isinstance(exc, CoreServiceControlError),
                 )
                 return StoredResult(202, terminal, terminal.etag)
+
+    def _recover_restart_after_exception(
+        self,
+        operation_id: str,
+        *,
+        service_id: str,
+        expected_service_etag: str,
+    ) -> m.OperationV1 | None:
+        service_control = self._require_service_control()
+        attempts = {
+            attempt.operation_id: attempt
+            for attempt in service_control.list_restart_attempts()
+        }
+        attempt = attempts.get(operation_id)
+        if attempt is None:
+            return None
+        self._require_matching_restart_attempt(
+            attempt,
+            service_id=service_id,
+            expected_service_etag=expected_service_etag,
+        )
+        current = self._store.get_maintenance_operation(operation_id)
+        if current.status is m.OperationStatus.SUCCEEDED:
+            terminal = current
+        elif attempt.state is ServiceRestartAttemptState.COMPLETED:
+            if attempt.service is None:
+                raise CoreServiceControlError(
+                    "completed service restart receipt lacks its result"
+                )
+            terminal = self._store.complete_service_restart_operation(
+                operation_id,
+                attempt.service.to_contract(),
+            )
+        else:
+            terminal = self._store.fail_maintenance_operation(
+                operation_id,
+                _service_restart_recovery_error(
+                    operation_id,
+                    code="service_restart_outcome_unknown",
+                    message=(
+                        "Core cannot prove the outcome of the interrupted managed "
+                        "service restart and will not repeat it."
+                    ),
+                    retryable=False,
+                ),
+            )
+        try:
+            service_control.acknowledge_restart_attempt(
+                operation_id,
+                service_id=service_id,
+                expected_service_etag=expected_service_etag,
+            )
+        except CoreServiceControlError:
+            pass
+        return terminal
+
+    def _reconcile_service_restart_operations(self) -> None:
+        service_control = self._require_service_control()
+        attempts = service_control.list_restart_attempts()
+        by_operation: dict[str, ServiceRestartAttempt] = {}
+        for attempt in attempts:
+            if attempt.operation_id in by_operation:
+                raise CoreServiceControlError(
+                    "service restart receipt identity is duplicated"
+                )
+            by_operation[attempt.operation_id] = attempt
+
+        interrupted = {
+            operation.id: (operation, expected_etag)
+            for operation, expected_etag in (
+                self._store.interrupted_service_restart_operations()
+            )
+        }
+        for operation_id, (operation, expected_etag) in interrupted.items():
+            request = cast(m.ServiceRestartOperationRequestV1, operation.request)
+            attempt = by_operation.pop(operation_id, None)
+            if attempt is None:
+                self._store.fail_maintenance_operation(
+                    operation_id,
+                    _service_restart_recovery_error(
+                        operation_id,
+                        code="service_restart_interrupted_before_side_effect",
+                        message=(
+                            "Core restarted before the managed service restart "
+                            "side effect was durably admitted."
+                        ),
+                        retryable=True,
+                    ),
+                )
+                continue
+            self._require_matching_restart_attempt(
+                attempt,
+                service_id=request.service_id,
+                expected_service_etag=expected_etag,
+            )
+            if attempt.state is ServiceRestartAttemptState.STARTED:
+                self._store.fail_maintenance_operation(
+                    operation_id,
+                    _service_restart_recovery_error(
+                        operation_id,
+                        code="service_restart_outcome_unknown",
+                        message=(
+                            "Core cannot prove the outcome of the interrupted "
+                            "managed service restart and will not repeat it."
+                        ),
+                        retryable=False,
+                    ),
+                )
+            else:
+                if attempt.service is None:
+                    raise CoreServiceControlError(
+                        "completed service restart receipt lacks its result"
+                    )
+                restarted = attempt.service.to_contract()
+                if restarted.id != request.service_id:
+                    raise CoreServiceControlError(
+                        "service restart receipt returned a different service identity"
+                    )
+                self._store.complete_service_restart_operation(
+                    operation_id,
+                    restarted,
+                )
+            service_control.acknowledge_restart_attempt(
+                operation_id,
+                service_id=request.service_id,
+                expected_service_etag=expected_etag,
+            )
+
+        for operation_id, attempt in by_operation.items():
+            operation, expected_etag = self._store.service_restart_operation_authority(
+                operation_id
+            )
+            request = cast(m.ServiceRestartOperationRequestV1, operation.request)
+            self._require_matching_restart_attempt(
+                attempt,
+                service_id=request.service_id,
+                expected_service_etag=expected_etag,
+            )
+            if operation.status is not m.OperationStatus.SUCCEEDED:
+                raise CoreServiceControlError(
+                    "service restart receipt has no matching successful operation"
+                )
+            if (
+                attempt.state is not ServiceRestartAttemptState.COMPLETED
+                or attempt.service is None
+                or not isinstance(
+                    operation.result,
+                    m.ServiceRestartOperationResultV1,
+                )
+                or operation.result.service != attempt.service.to_contract()
+            ):
+                raise CoreServiceControlError(
+                    "service restart receipt conflicts with its terminal operation"
+                )
+            service_control.acknowledge_restart_attempt(
+                operation_id,
+                service_id=request.service_id,
+                expected_service_etag=expected_etag,
+            )
+
+    @staticmethod
+    def _require_matching_restart_attempt(
+        attempt: ServiceRestartAttempt,
+        *,
+        service_id: str,
+        expected_service_etag: str,
+    ) -> None:
+        if (
+            attempt.service_id != service_id
+            or not hmac.compare_digest(
+                attempt.expected_service_etag,
+                expected_service_etag,
+            )
+        ):
+            raise CoreServiceControlError(
+                "service restart receipt does not match its durable operation authority"
+            )
 
     def service_logs(
         self,
@@ -1034,6 +1235,22 @@ def _operation_error(
             if retryable
             else "Inspect the diagnostic result and complete the required user action."
         ),
+    )
+
+
+def _service_restart_recovery_error(
+    operation_id: str,
+    *,
+    code: str,
+    message: str,
+    retryable: bool,
+) -> m.ApiErrorV1:
+    return _operation_error(
+        operation_id,
+        code=code,
+        message=message,
+        category=m.ErrorCategory.SERVICE,
+        retryable=retryable,
     )
 
 

@@ -577,6 +577,7 @@ class FakeCore:
             "transcript_capture",
             "non_parametric_evolution",
             "sse_replay",
+            "diagnostics",
         ]
         self.create_created_at: str | None = None
         self.finalize_created_at: str | None = None

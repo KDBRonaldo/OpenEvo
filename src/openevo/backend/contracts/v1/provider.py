@@ -11,6 +11,7 @@ import hashlib
 import hmac
 from pathlib import Path, PurePosixPath
 import threading
+import time
 from typing import TYPE_CHECKING, Any, NoReturn, cast
 
 from fastapi import FastAPI
@@ -134,6 +135,7 @@ _MAINTENANCE_OWNER_OPERATION_IDS = frozenset(
 )
 _RUN_MUTATION_SINGLEFLIGHT_CAPACITY = 256
 _RUN_MUTATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 30.0
+_INVOCATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS = 30.0
 _ARTIFACT_PAGE_LIMIT = 100
 _MAX_ARTIFACT_PAGES_PER_RUN = 11
 _MAX_ARTIFACT_SOURCE_REVISIONS = 128
@@ -517,7 +519,7 @@ class CoreControlProviderV1:
         evolution_artifact_root: str | Path | None = None,
         artifact_loader: Callable[[str], Mapping[str, object]] | None = None,
         clock: Callable[[], datetime] | None = None,
-        _enable_maintenance_owner_for_tests: bool = False,
+        enable_maintenance_owner: bool = False,
     ) -> None:
         try:
             token_bytes = bearer_token.encode("ascii")
@@ -530,16 +532,14 @@ class CoreControlProviderV1:
         resolved_build_channel = (
             m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
         )
-        if (
-            _enable_maintenance_owner_for_tests
-            and resolved_build_channel is not m.BuildChannel.TEST
-        ):
-            raise ValueError("the maintenance owner test seam is allowed only in test builds")
         self.store = store
         self._executor = ThreadPoolExecutor(
             max_workers=4, thread_name_prefix="openevo-core-control"
         )
         self._close_lock = threading.Lock()
+        self._admission_condition = threading.Condition(threading.RLock())
+        self._admission_closed = False
+        self._active_invocations = 0
         self._closed = False
         self._run_mutations = _RunMutationSingleFlight(_RUN_MUTATION_SINGLEFLIGHT_CAPACITY)
         self._run_maintenance_gate = threading.RLock()
@@ -566,7 +566,7 @@ class CoreControlProviderV1:
                 run_control=run_control,
                 clock=clock,
             )
-            if _enable_maintenance_owner_for_tests
+            if enable_maintenance_owner
             else None
         )
         self._evolution_artifact_root = (
@@ -647,6 +647,8 @@ class CoreControlProviderV1:
         with self._close_lock:
             if self._closed:
                 return
+            with self._admission_condition:
+                self._admission_closed = True
             if self._run_mutation_drain is None:
                 self._run_mutation_drain = self._run_mutations.close()
             _, pending_run_mutations = wait(
@@ -655,19 +657,24 @@ class CoreControlProviderV1:
             )
             if pending_run_mutations:
                 raise RuntimeError("admitted run mutations did not drain before shutdown timeout")
+            deadline = time.monotonic() + _INVOCATION_SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+            with self._admission_condition:
+                while self._active_invocations:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            "Core Control invocations did not drain before shutdown timeout"
+                        )
+                    self._admission_condition.wait(timeout=remaining)
+            self._executor.shutdown(wait=True, cancel_futures=False)
             if self._run_control is not None:
                 self._run_control.close()
                 self._run_control = None
             if self._service_supervisor is not None:
                 self._service_supervisor.close()
                 self._service_supervisor = None
-            if self._run_control is not None:
-                self._run_control.close()
-                self._run_control = None
-            future = self._executor.submit(self.store.close)
-            future.result()
+            self.store.close()
             self._closed = True
-            self._executor.shutdown(wait=True, cancel_futures=True)
 
     async def aclose(self) -> None:
         loop = asyncio.get_running_loop()
@@ -685,6 +692,15 @@ class CoreControlProviderV1:
         )
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self._begin_invocation()
+        try:
+            return self._invoke_admitted(operation_id, arguments)
+        finally:
+            self._end_invocation()
+
+    def _invoke_admitted(
+        self, operation_id: str, arguments: Mapping[str, object]
+    ) -> object:
         if operation_id in _RUN_MUTATION_OPERATION_IDS:
             identity = _failed_idempotency_identity(operation_id, arguments)
             if identity is not None:
@@ -723,8 +739,36 @@ class CoreControlProviderV1:
             raise
 
     async def invoke_async(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        self._begin_invocation()
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self.invoke, operation_id, arguments)
+        try:
+            return await loop.run_in_executor(
+                self._executor, self._invoke_admitted, operation_id, arguments
+            )
+        finally:
+            self._end_invocation()
+
+    def _begin_invocation(self) -> None:
+        with self._admission_condition:
+            if self._admission_closed or self._closed:
+                raise _error(
+                    503,
+                    code="core_control_closing",
+                    message="Core Control is closing and cannot accept another request.",
+                    category=m.ErrorCategory.SERVICE,
+                    retryable=True,
+                    repair_action=m.RepairAction.OPENEVO_CAN_RETRY,
+                    next_action="Wait for the Daemon to finish restarting, then retry.",
+                )
+            self._active_invocations += 1
+
+    def _end_invocation(self) -> None:
+        with self._admission_condition:
+            self._active_invocations -= 1
+            if self._active_invocations < 0:
+                self._active_invocations = 0
+                raise RuntimeError("Core Control invocation accounting underflow")
+            self._admission_condition.notify_all()
 
     def _invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         if operation_id in RUN_OPERATION_IDS and self._run_control is not None:
@@ -2099,7 +2143,7 @@ def create_core_control_app(
     evolution_artifact_root: str | Path | None = None,
     artifact_loader: Callable[[str], Mapping[str, object]] | None = None,
     event_replay_limit: int = 10_000,
-    _enable_maintenance_owner_for_tests: bool = False,
+    enable_maintenance_owner: bool = False,
 ) -> FastAPI:
     """Create a provider-backed app without adding a second route table."""
 
@@ -2108,12 +2152,10 @@ def create_core_control_app(
     resolved_build_channel = (
         m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
     )
-    if _enable_maintenance_owner_for_tests and resolved_build_channel is not m.BuildChannel.TEST:
-        raise ValueError("the maintenance owner test seam is allowed only in test builds")
     store = CoreControlStoreV1(
         state_root,
         event_replay_limit=event_replay_limit,
-        _enable_maintenance_storage_for_tests=_enable_maintenance_owner_for_tests,
+        enable_maintenance_storage=enable_maintenance_owner,
     )
     provider: CoreControlProviderV1 | None = None
     resolved_run_control = run_control
@@ -2139,7 +2181,7 @@ def create_core_control_app(
             run_control=resolved_run_control,
             evolution_artifact_root=resolved_artifact_root,
             artifact_loader=artifact_loader,
-            _enable_maintenance_owner_for_tests=_enable_maintenance_owner_for_tests,
+            enable_maintenance_owner=enable_maintenance_owner,
         )
         app = create_core_control_contract_app(provider)
         contract_operation_ids = frozenset(

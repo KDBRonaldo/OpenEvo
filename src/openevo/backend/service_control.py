@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
+from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -17,6 +19,22 @@ if TYPE_CHECKING:
 
 class CoreServiceControlError(RuntimeError):
     """A managed service operation failed closed."""
+
+
+class ServiceRestartAttemptState(StrEnum):
+    STARTED = "started"
+    COMPLETED = "completed"
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceRestartAttempt:
+    """Durable operation-owned receipt for one automatic service restart."""
+
+    operation_id: str
+    service_id: str
+    expected_service_etag: str
+    state: ServiceRestartAttemptState
+    service: SupervisorServiceSummary | None
 
 
 class CoreServiceControl(Protocol):
@@ -44,6 +62,25 @@ class CoreServiceControl(Protocol):
         total_timeout: float | None = None,
     ) -> SupervisorServiceSummary: ...
 
+    def restart_once(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        expected_service_etag: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary: ...
+
+    def list_restart_attempts(self) -> tuple[ServiceRestartAttempt, ...]: ...
+
+    def acknowledge_restart_attempt(
+        self,
+        operation_id: str,
+        *,
+        service_id: str,
+        expected_service_etag: str,
+    ) -> None: ...
+
     def logs(
         self,
         service_id: str,
@@ -61,4 +98,9 @@ class CoreServiceControl(Protocol):
     def close(self) -> None: ...
 
 
-__all__ = ["CoreServiceControl", "CoreServiceControlError"]
+__all__ = [
+    "CoreServiceControl",
+    "CoreServiceControlError",
+    "ServiceRestartAttempt",
+    "ServiceRestartAttemptState",
+]
