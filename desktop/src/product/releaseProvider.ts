@@ -11,7 +11,10 @@ import {
   type ProjectSourceV1,
   type VersionInfoV1,
 } from "../api/v1/schemas";
-import { createLocalApiDesktopProductProvider } from "./localApiProvider";
+import {
+  createLocalApiDesktopProductProvider,
+  systemMaintenanceAvailableForFeatures,
+} from "./localApiProvider";
 import type { ProductRunRetryRecoveryStore } from "./runRetryRecovery";
 import {
   type DesktopProductProvider,
@@ -33,6 +36,7 @@ export interface ReleaseNativeBridge {
 
 export interface ReleaseProviderAdapterContext {
   readonly client: DesktopApiClientV1;
+  readonly featureFlags: readonly VersionInfoV1["feature_flags"][number][];
   readonly native: {
     selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<ProjectSourceV1>;
     cancelProjectSource(actionId: string): Promise<void>;
@@ -143,8 +147,10 @@ export async function createReleaseDesktopProductProvider(
     reportStageBestEffort(reportStage, "local_api_version_failed");
     throw error;
   }
+  const featureFlags = Object.freeze([...version.feature_flags]);
   const context: ReleaseProviderAdapterContext = {
     client,
+    featureFlags,
     native: {
       selectProjectSource: async (intent) => {
         const source = projectSourceV1Schema.parse(await native.selectProjectSource(intent));
@@ -184,11 +190,15 @@ export async function createReleaseDesktopProductProvider(
       provider = createLocalApiDesktopProductProvider({
         client,
         native: context.native,
+        featureFlags,
         fetch: dependencies.fetch,
         retryRecoveryStore,
       });
     }
-    assertReleaseProvider(provider);
+    assertReleaseProvider(
+      provider,
+      systemMaintenanceAvailableForFeatures(featureFlags),
+    );
     const authoritativeProvider = withOperationContinuationAuthority(provider);
     reportStageBestEffort(reportStage, "provider_adapter_ready");
     return authoritativeProvider;
@@ -271,6 +281,7 @@ function parseNativeRunRetryRecovery(value: unknown): string | null {
 
 function assertReleaseProvider(
   provider: DesktopProductProvider,
+  systemMaintenanceAvailable: boolean,
 ): asserts provider is ReleaseDesktopProductProvider {
   if (provider.providerKind !== "desktop_sidecar") {
     throw new DesktopContractError("Release provider adapter reported a forbidden provider kind");
@@ -280,6 +291,11 @@ function assertReleaseProvider(
   }
   if (typeof provider.getRunRetryRecovery !== "function") {
     throw new DesktopContractError("Release provider adapter is missing durable run retry recovery");
+  }
+  if (provider.systemMaintenanceAvailable !== systemMaintenanceAvailable) {
+    throw new DesktopContractError(
+      "Release provider adapter maintenance capability does not match the negotiated feature set",
+    );
   }
   const requiredSystemActions: ReadonlyArray<keyof DesktopProductProvider> = [
     "getLocalOperation",

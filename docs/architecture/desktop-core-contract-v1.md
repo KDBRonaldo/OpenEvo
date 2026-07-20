@@ -511,11 +511,14 @@ current release composition provides sidecar-owned connection, host-key,
 bootstrap, activation and operation cancellation; Core-owned runs and artifact
 inspection; and service observation. Strict forwarding routes for restart,
 doctor/repair, diagnostics, referenced logs, and cleanup remain in the frozen
-boundary, but the Preview Core does not publish their production owner. The
-real renderer marks maintenance unavailable and hides those mutation controls;
-direct calls return typed `provider_capability_unavailable`. Workspace sync and
-Local operation-log handlers remain unavailable. The provider never synthesizes
-progress or successful diagnostic/service operations.
+boundary, but a release renderer enables those controls only when the negotiated
+Local API version publishes the complete `service_control`, `diagnostics`, and
+`maintenance` feature set. The current Preview Core does not publish that
+complete set, so the renderer remains read-only and direct calls return typed
+`provider_capability_unavailable`. Partial feature publication remains
+fail-closed. Workspace sync and Local operation-log handlers remain unavailable.
+The provider never synthesizes progress or successful diagnostic/service
+operations.
 
 Activation completion is published under the project-session transition lock.
 The bridge commit and authoritative online project binding happen before the

@@ -23,6 +23,7 @@ import {
   type RemoteProfileV1,
   type RunV1,
   type TimelineEntryV1,
+  type VersionInfoV1,
 } from "../api/v1/schemas";
 import { parseEventStreamFailure, parseSseFrame } from "../api/v1/sse";
 import {
@@ -63,6 +64,18 @@ const MAX_SSE_BUFFER_BYTES = 1_048_576 + 4;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
 const RETRY_RECOVERY_BUSY_MESSAGE = "OpenEvo is updating local retry recovery state. Wait for it to finish.";
 const RETRY_RECOVERY_RESTART_MESSAGE = "OpenEvo could not save local retry recovery state. Restart Desktop and try again.";
+const SYSTEM_MAINTENANCE_FEATURES: readonly VersionInfoV1["feature_flags"][number][] = [
+  "service_control",
+  "diagnostics",
+  "maintenance",
+];
+
+export function systemMaintenanceAvailableForFeatures(
+  featureFlags: readonly VersionInfoV1["feature_flags"][number][],
+): boolean {
+  const available = new Set(featureFlags);
+  return SYSTEM_MAINTENANCE_FEATURES.every((feature) => available.has(feature));
+}
 
 export interface LocalApiNativeBridge {
   selectProjectSource(intent: ProjectSourceSelectionIntent): Promise<unknown>;
@@ -73,6 +86,7 @@ export interface LocalApiNativeBridge {
 export interface LocalApiDesktopProductProviderOptions {
   readonly client: DesktopApiClientV1;
   readonly native: LocalApiNativeBridge;
+  readonly featureFlags?: readonly VersionInfoV1["feature_flags"][number][];
   readonly fetch?: FetchLike;
   readonly reconnectDelaysMs?: readonly number[];
   readonly retryRecoveryStore?: ProductRunRetryRecoveryStore | null;
@@ -103,7 +117,7 @@ class RefreshBudget {
 
 export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProvider {
   readonly providerKind = "desktop_sidecar" as const;
-  readonly systemMaintenanceAvailable = false;
+  readonly systemMaintenanceAvailable: boolean;
 
   private readonly client: DesktopApiClientV1;
   private readonly native: LocalApiNativeBridge;
@@ -128,6 +142,9 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
   constructor(options: LocalApiDesktopProductProviderOptions) {
     this.client = options.client;
     this.native = options.native;
+    this.systemMaintenanceAvailable = systemMaintenanceAvailableForFeatures(
+      options.featureFlags ?? [],
+    );
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
     const retryRecoveryStore = options.retryRecoveryStore;

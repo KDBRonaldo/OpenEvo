@@ -97,7 +97,9 @@ describe("Desktop product provider boundary", () => {
     };
     const fetchMock = vi.fn<FetchLike>().mockResolvedValue(jsonResponse(version));
     const reportStage = vi.fn();
-    const adapterFactory = vi.fn(async ({ native: bridge }) => {
+    const adapterFactory = vi.fn(async ({ featureFlags, native: bridge }) => {
+      expect(featureFlags).toEqual(contract.requiredFeatureFlags);
+      expect(Object.isFrozen(featureFlags)).toBe(true);
       const source = await bridge.selectProjectSource({ kind: "native_folder_snapshot", actionId: "source-action-0001", streamEpoch: 7 });
       expect(source).toMatchObject({ kind: "native_folder_snapshot", import_ref: { import_id: "source-opaque-1" } });
       return unavailableDesktopProductProvider;
@@ -137,6 +139,66 @@ describe("Desktop product provider boundary", () => {
     });
     expect(provider.providerKind).toBe("desktop_sidecar");
     expect(provider.systemMaintenanceAvailable).toBe(false);
+  });
+
+  it("enables System only when the negotiated Local API publishes its complete owner", async () => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [
+      ...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags,
+      "service_control",
+      "diagnostics",
+      "maintenance",
+    ];
+    const provider = await createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      retryRecoveryStore: memoryRetryRecoveryStore(),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
+        selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
+        settleProjectSource: vi.fn(),
+      },
+    });
+
+    expect(provider.systemMaintenanceAvailable).toBe(true);
+  });
+
+  it.each([
+    {
+      name: "adapter enables maintenance without the complete feature set",
+      extraFlags: [] as string[],
+      systemMaintenanceAvailable: true,
+    },
+    {
+      name: "adapter disables maintenance with the complete feature set",
+      extraFlags: ["service_control", "diagnostics", "maintenance"],
+      systemMaintenanceAvailable: false,
+    },
+  ])("rejects when $name", async ({ extraFlags, systemMaintenanceAvailable }) => {
+    const digest = DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0];
+    const flags = [
+      ...DESKTOP_PRODUCT_RELEASE_CONTRACT.requiredFeatureFlags,
+      ...extraFlags,
+    ];
+
+    await expect(createReleaseDesktopProductProvider({
+      fetch: vi.fn<FetchLike>().mockResolvedValue(jsonResponse(releaseVersion(digest, flags))),
+      native: {
+        bootstrap: vi.fn().mockResolvedValue(releaseBootstrap(digest, flags)),
+        stop: vi.fn().mockResolvedValue(undefined),
+        selectProjectSource: vi.fn(),
+        cancelProjectSource: vi.fn(),
+        settleProjectSource: vi.fn(),
+      },
+      adapterFactory: ({ featureFlags }) => {
+        expect(featureFlags).toEqual(flags);
+        return {
+          ...unavailableDesktopProductProvider,
+          systemMaintenanceAvailable,
+        };
+      },
+    })).rejects.toThrow(/maintenance capability.*negotiated feature set/i);
   });
 
   it("requires and restores the native retry journal for the release provider", async () => {

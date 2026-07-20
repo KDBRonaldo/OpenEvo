@@ -48,6 +48,29 @@ const LATER = "2026-07-14T12:00:01Z";
 const LATEST = "2026-07-14T12:00:02Z";
 
 describe("LocalApiDesktopProductProvider", () => {
+  it("enables System maintenance only for the complete negotiated feature set", () => {
+    const client = mockClient();
+
+    expect(createProvider(client).systemMaintenanceAvailable).toBe(false);
+    for (const features of [
+      ["diagnostics", "maintenance"],
+      ["service_control", "maintenance"],
+      ["service_control", "diagnostics"],
+    ] as const) {
+      expect(createProvider(
+        client,
+        undefined,
+        memoryRetryRecoveryStore(),
+        features,
+      ).systemMaintenanceAvailable).toBe(false);
+    }
+    expect(createProvider(client, undefined, memoryRetryRecoveryStore(), [
+      "service_control",
+      "diagnostics",
+      "maintenance",
+    ]).systemMaintenanceAvailable).toBe(true);
+  });
+
   it("fails closed without persistent retry recovery and preserves an invalid saved record", () => {
     const client = mockClient();
     const native = {
@@ -1649,6 +1672,16 @@ function createProvider(
   client: DesktopApiClientV1,
   fetch: FetchLike = vi.fn<FetchLike>(),
   retryRecoveryStore: ProductRunRetryRecoveryStore | null = memoryRetryRecoveryStore(),
+  featureFlags: readonly (
+    | "remote_profiles"
+    | "project_validation"
+    | "operation_events"
+    | "run_observability"
+    | "artifact_inspection"
+    | "service_control"
+    | "diagnostics"
+    | "maintenance"
+  )[] = [],
 ) {
   return new LocalApiDesktopProductProvider({
     client,
@@ -1657,6 +1690,7 @@ function createProvider(
       cancelProjectSource: vi.fn(),
       settleProjectSource: vi.fn(),
     },
+    featureFlags,
     fetch,
     reconnectDelaysMs: [],
     retryRecoveryStore,
