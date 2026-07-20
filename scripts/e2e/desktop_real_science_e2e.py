@@ -1328,6 +1328,8 @@ class DesktopScienceWorkflow:
 
 def _build_assets(
     root: Path,
+    core_wheel: Path,
+    framework_lock: Path,
     managed_runtime_archive: Path,
     daemon_bundle: Path,
     daemon_manifest: Path,
@@ -1335,13 +1337,14 @@ def _build_assets(
     timeout_seconds: float,
 ) -> ReleaseAssets:
     root.mkdir(parents=True, exist_ok=True)
-    output = root / "core-release-assets"
     managed_runtime_archive = Path(os.path.abspath(managed_runtime_archive))
     command = [
         sys.executable,
         str(REPOSITORY_ROOT / "desktop/packaging/build_sidecar.py"),
-        "--core-wheel-output-dir",
-        str(output),
+        "--core-wheel",
+        str(Path(os.path.abspath(core_wheel))),
+        "--framework-lock",
+        str(Path(os.path.abspath(framework_lock))),
         "--managed-runtime-archive",
         str(managed_runtime_archive),
         "--daemon-bundle",
@@ -1380,14 +1383,10 @@ def _build_assets(
     if not lines:
         raise E2EFailure("release_assets", "sidecar_build_output_missing")
     sidecar = Path(lines[-1].strip())
-    wheels = sorted(output.glob("*.whl"))
-    lock = output / "framework-lock.json"
-    if len(wheels) != 1:
-        raise E2EFailure("release_assets", "built_wheel_inventory_invalid")
     return _inspect_release_assets(
         sidecar,
-        wheels[0],
-        lock,
+        core_wheel,
+        framework_lock,
         managed_runtime_archive,
         daemon_bundle,
         daemon_manifest,
@@ -2303,13 +2302,16 @@ def _build_environment() -> dict[str, str]:
 
 
 def _validate_runtime_arguments(args: argparse.Namespace) -> None:
-    external_sidecar = (args.sidecar, args.core_wheel, args.framework_lock)
-    if any(item is not None for item in external_sidecar) and not all(
-        item is not None for item in external_sidecar
-    ):
-        raise E2EFailure("arguments", "release_asset_triplet_required")
     if args.structural_check:
         return
+    if (args.core_wheel is None) != (args.framework_lock is None):
+        raise E2EFailure("arguments", "core_release_pair_required")
+    if args.core_wheel is None or args.framework_lock is None:
+        raise E2EFailure("arguments", "core_release_pair_required")
+    if args.sidecar is not None and (
+        args.core_wheel is None or args.framework_lock is None
+    ):
+        raise E2EFailure("arguments", "release_asset_triplet_required")
     if args.daemon_bundle is None or args.daemon_manifest is None:
         raise E2EFailure("arguments", "daemon_release_pair_required")
     if args.managed_runtime_archive is None:
@@ -2445,6 +2447,8 @@ def main(argv: list[str] | None = None) -> int:
             if args.sidecar is None:
                 assets = _build_assets(
                     root / "build",
+                    args.core_wheel,
+                    args.framework_lock,
                     args.managed_runtime_archive,
                     args.daemon_bundle,
                     args.daemon_manifest,

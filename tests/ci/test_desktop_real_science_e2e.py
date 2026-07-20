@@ -248,7 +248,7 @@ def test_held_release_asset_copy_is_digest_bound_and_executable(tmp_path: Path) 
     authority.close()
 
 
-def test_arguments_require_the_complete_exact_asset_triplet() -> None:
+def test_arguments_require_the_complete_exact_asset_set() -> None:
     module = _load_runner()
     args = argparse.Namespace(
         sidecar=Path("sidecar"),
@@ -263,7 +263,7 @@ def test_arguments_require_the_complete_exact_asset_triplet() -> None:
         expected_host_key_fingerprint="SHA256:" + "A" * 43 + "=",
     )
 
-    with pytest.raises(module.E2EFailure, match="release_asset_triplet_required"):
+    with pytest.raises(module.E2EFailure, match="core_release_pair_required"):
         module._validate_runtime_arguments(args)
 
 
@@ -296,6 +296,8 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     runtime_archive.write_bytes(b"runtime")
     daemon_bundle = tmp_path / "openevo-daemon-linux-x86_64"
     daemon_manifest = tmp_path / "openevo-daemon-bundle.json"
+    core_wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    framework_lock = tmp_path / "framework-lock.json"
     daemon_bundle.write_bytes(b"daemon")
     daemon_manifest.write_bytes(b"manifest")
     built_sidecar = tmp_path / "built-sidecar"
@@ -307,11 +309,6 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
 
     def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
         captured["command"] = command
-        output = Path(command[command.index("--core-wheel-output-dir") + 1])
-        output.mkdir(parents=True)
-        wheel = output / "openevo-0.1.0-py3-none-any.whl"
-        wheel.write_bytes(b"wheel")
-        (output / "framework-lock.json").write_bytes(b"lock")
         build_log = kwargs["stdout"]
         build_log.write(f"{built_sidecar}\n".encode())  # type: ignore[union-attr]
         build_log.flush()  # type: ignore[union-attr]
@@ -343,6 +340,8 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
 
     assets = module._build_assets(
         tmp_path / "build",
+        core_wheel,
+        framework_lock,
         runtime_archive,
         daemon_bundle,
         daemon_manifest,
@@ -353,6 +352,10 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     assert isinstance(command, list)
     assert command[command.index("--managed-runtime-archive") + 1] == str(
         runtime_archive.resolve()
+    )
+    assert command[command.index("--core-wheel") + 1] == str(core_wheel.resolve())
+    assert command[command.index("--framework-lock") + 1] == str(
+        framework_lock.resolve()
     )
     assert command[command.index("--daemon-bundle") + 1] == str(daemon_bundle.resolve())
     assert command[command.index("--daemon-manifest") + 1] == str(daemon_manifest.resolve())

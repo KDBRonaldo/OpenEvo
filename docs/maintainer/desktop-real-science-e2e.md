@@ -17,7 +17,7 @@ Run on a supported macOS release-builder host with:
 - the exact managed subscription Science runtime archive for the release;
 - the exact Linux Daemon bundle and canonical Daemon manifest for the release;
 - either an exact packaged sidecar/Core wheel/framework lock triplet or the
-  complete local sidecar build toolchain.
+  exact Core pair plus the complete local sidecar build toolchain.
 
 Do not pass an unreviewed fingerprint copied from the runner. The runner
 requires an exact expected fingerprint and accepts only the candidate returned
@@ -48,8 +48,9 @@ packaged sidecar embeds that exact wheel, lock, runtime archive, Daemon bundle,
 and Daemon manifest. Held file descriptors bind validation, evidence, and the
 executed sidecar snapshot to the same source inodes.
 
-Omit the sidecar/Core wheel/framework lock triplet to build a fresh packaged sidecar and export the
-exact embedded wheel/lock pair. That mode uses
+When no packaged sidecar is supplied, the runner builds one from the exact
+Core wheel/framework-lock pair produced with the Daemon composition so both
+applications embed one byte-identical Core release identity. The build uses
 `desktop/packaging/build_sidecar.py`; it is not a substitute for candidate
 signing, DMG copy smoke, or clean-machine rehearsal.
 
@@ -59,6 +60,8 @@ uv run python scripts/e2e/desktop_real_science_e2e.py \
   --port 22 \
   --user <remote-user> \
   --expected-host-key-fingerprint 'SHA256:<reviewed-fingerprint>' \
+  --core-wheel <exact-core-wheel> \
+  --framework-lock <exact-framework-lock> \
   --managed-runtime-archive <exact-managed-runtime-archive> \
   --daemon-bundle <exact-openevo-daemon-linux-x86_64> \
   --daemon-manifest <exact-openevo-daemon-bundle.json> \

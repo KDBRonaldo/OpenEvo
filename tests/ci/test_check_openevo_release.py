@@ -2305,7 +2305,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "npm test -- --run",
         "npm run typecheck",
         "packaging/build_sidecar.py",
-        "--core-wheel-output-dir",
+        "--core-wheel",
         "framework-lock.json",
         "--framework-lock",
         "openevo-core-service",

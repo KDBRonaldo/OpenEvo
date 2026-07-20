@@ -358,16 +358,17 @@ jobs:
             --pip-requirements candidate-artifacts/python-requirements.txt \
             --cargo-audit "$RUNNER_TEMP/cargo-audit.json"
 
-      - name: Build packaged sidecar and final exact Core wheel
+      - name: Build packaged sidecar from the exact Core release
         working-directory: desktop
         run: |
           python packaging/build_sidecar.py \
-            --core-wheel-output-dir "$RUNNER_TEMP/openevo-candidate-core" \
+            --core-wheel "$OPENEVO_DAEMON_INPUTS"/core/openevo-*.whl \
+            --framework-lock "$OPENEVO_DAEMON_INPUTS/core/framework-lock.json" \
             --managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" \
             --daemon-bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
             --daemon-manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
             --release-build
-          echo "OPENEVO_CANDIDATE_CORE=$RUNNER_TEMP/openevo-candidate-core" >> "$GITHUB_ENV"
+          echo "OPENEVO_CANDIDATE_CORE=$OPENEVO_DAEMON_INPUTS/core" >> "$GITHUB_ENV"
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-${OPENEVO_RUST_TARGET}"
           test -x "$sidecar"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"

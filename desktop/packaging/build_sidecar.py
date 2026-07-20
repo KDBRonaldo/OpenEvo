@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import nullcontext
+from contextlib import ExitStack
 import ctypes
 from email.parser import Parser
 import hashlib
@@ -732,9 +732,20 @@ def _project_identity(repo: Path) -> tuple[str, str]:
     return name, version
 
 
-def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
+def _validate_core_wheel(
+    wheel: Path | _CoreReleaseInput,
+    *,
+    name: str,
+    version: str,
+) -> None:
+    wheel_name = wheel.name
     try:
-        with ZipFile(wheel) as archive:
+        payload = (
+            _read_core_release_input(wheel)
+            if isinstance(wheel, _CoreReleaseInput)
+            else wheel.read_bytes()
+        )
+        with ZipFile(BytesIO(payload)) as archive:
             names = set(archive.namelist())
             _validate_core_inventory(names, container="Core wheel")
             nested_wheels = [member for member in names if member.endswith(".whl")]
@@ -746,8 +757,8 @@ def _validate_core_wheel(wheel: Path, *, name: str, version: str) -> None:
                     f"Core wheel must contain one METADATA file, found {len(metadata_names)}"
                 )
             metadata = Parser().parsestr(archive.read(metadata_names[0]).decode("utf-8"))
-    except OSError as exc:
-        raise RuntimeError(f"failed to read built Core wheel: {wheel}") from exc
+    except (BadZipFile, OSError) as exc:
+        raise RuntimeError(f"failed to read built Core wheel: {wheel_name}") from exc
 
     actual_name = metadata.get("Name")
     actual_version = metadata.get("Version")
@@ -767,11 +778,24 @@ def _core_framework_lock_bytes(wheel: Path, *, version: str) -> bytes:
         wheel_payload = wheel.read_bytes()
     except (OSError, RuntimeError) as exc:
         raise RuntimeError("Core wheel is unavailable for framework lock generation") from exc
+    return _core_framework_lock_bytes_for_identity(
+        wheel_filename=wheel.name,
+        wheel_digest=_sha256_bytes(wheel_payload),
+        version=version,
+    )
+
+
+def _core_framework_lock_bytes_for_identity(
+    *,
+    wheel_filename: str,
+    wheel_digest: str,
+    version: str,
+) -> bytes:
     try:
         lock = FrameworkDistributionLock(
             distribution_version=version,
-            distribution_digest=_sha256_bytes(wheel_payload),
-            wheel_filename=wheel.name,
+            distribution_digest=wheel_digest,
+            wheel_filename=wheel_filename,
         )
     except ValueError as exc:
         raise RuntimeError("Core wheel cannot produce a valid framework lock identity") from exc
@@ -1243,18 +1267,184 @@ def _verify_core_release_input(source: _CoreReleaseInput) -> None:
         raise RuntimeError(f"Core release input content changed: {source.name}")
 
 
+def _read_core_release_input(source: _CoreReleaseInput) -> bytes:
+    _verify_core_release_input(source)
+    payload = bytearray()
+    offset = 0
+    while offset < source.byte_size:
+        chunk = os.pread(
+            source.file_fd,
+            min(1024 * 1024, source.byte_size - offset),
+            offset,
+        )
+        if not chunk:
+            raise RuntimeError(f"Core release input ended while reading: {source.name}")
+        payload.extend(chunk)
+        offset += len(chunk)
+    if os.pread(source.file_fd, 1, source.byte_size):
+        raise RuntimeError(f"Core release input grew while reading: {source.name}")
+    if _sha256_bytes(payload) != source.sha256:
+        raise RuntimeError(f"Core release input content changed: {source.name}")
+    _verify_core_release_input(source)
+    return bytes(payload)
+
+
+def _core_release_identity(
+    source: Path | _CoreReleaseInput,
+) -> tuple[str, int, str]:
+    if isinstance(source, _CoreReleaseInput):
+        _verify_core_release_input(source)
+        return source.name, source.byte_size, source.sha256
+    payload = source.read_bytes()
+    return source.name, len(payload), _sha256_bytes(payload)
+
+
+def _core_release_payload(source: Path | _CoreReleaseInput) -> bytes:
+    if isinstance(source, _CoreReleaseInput):
+        return _read_core_release_input(source)
+    return source.read_bytes()
+
+
 def _validate_core_release_input_pair(
     wheel: _CoreReleaseInput,
     framework_lock: _CoreReleaseInput,
 ) -> None:
-    os.lseek(framework_lock.file_fd, 0, os.SEEK_SET)
-    payload = os.read(framework_lock.file_fd, framework_lock.byte_size + 1)
-    os.lseek(framework_lock.file_fd, 0, os.SEEK_SET)
-    if len(payload) != framework_lock.byte_size:
-        raise RuntimeError("Core framework lock changed while reading")
-    lock = _validated_framework_lock(payload)
+    lock = _validated_framework_lock(_read_core_release_input(framework_lock))
     if lock.distribution_digest != wheel.sha256 or lock.wheel_filename != wheel.name:
         raise RuntimeError("Core framework lock does not bind the exported wheel")
+
+
+def _open_core_release_input_pair(
+    wheel: Path,
+    framework_lock: Path,
+) -> tuple[_CoreReleaseInput, _CoreReleaseInput]:
+    wheel = Path(os.path.abspath(wheel))
+    framework_lock = Path(os.path.abspath(framework_lock))
+    if framework_lock.name != CORE_FRAMEWORK_LOCK_BASENAME:
+        raise RuntimeError("Core framework lock input must use the canonical filename")
+    wheel_source = _open_core_release_input(wheel, name=wheel.name)
+    try:
+        lock_source = _open_core_release_input(
+            framework_lock,
+            name=CORE_FRAMEWORK_LOCK_BASENAME,
+        )
+    except BaseException:
+        wheel_source.close()
+        raise
+    try:
+        _validate_core_release_input_pair(wheel_source, lock_source)
+    except BaseException:
+        lock_source.close()
+        wheel_source.close()
+        raise
+    return wheel_source, lock_source
+
+
+def _snapshot_core_release_input(
+    source: _CoreReleaseInput,
+    destination_dir: Path,
+) -> _CoreReleaseInput:
+    _verify_core_release_input(source)
+    destination_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    _reject_symlink_path(destination_dir)
+    directory_fd = os.open(
+        destination_dir,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    try:
+        destination_fd = os.open(
+            source.name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            _copy_core_release_input(source, destination_fd)
+            os.fsync(destination_fd)
+        finally:
+            os.close(destination_fd)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+    snapshot = _open_core_release_input(destination_dir / source.name, name=source.name)
+    try:
+        _verify_core_release_input(source)
+        if snapshot.byte_size != source.byte_size or snapshot.sha256 != source.sha256:
+            raise RuntimeError(f"Core release snapshot differs from source: {source.name}")
+    except BaseException:
+        snapshot.close()
+        raise
+    return snapshot
+
+
+def _snapshot_core_release_input_pair(
+    wheel: _CoreReleaseInput,
+    framework_lock: _CoreReleaseInput,
+    destination_dir: Path,
+    *,
+    project_name: str,
+    project_version: str,
+) -> tuple[_CoreReleaseInput, _CoreReleaseInput]:
+    wheel_snapshot = _snapshot_core_release_input(wheel, destination_dir)
+    try:
+        lock_snapshot = _snapshot_core_release_input(framework_lock, destination_dir)
+    except BaseException:
+        wheel_snapshot.close()
+        raise
+    try:
+        _verify_core_release_input(wheel)
+        _verify_core_release_input(framework_lock)
+        _validate_core_release_input_pair(wheel_snapshot, lock_snapshot)
+        _validate_core_wheel(wheel_snapshot, name=project_name, version=project_version)
+        lock = _validated_framework_lock(_read_core_release_input(lock_snapshot))
+        if (
+            lock.distribution != "openevo"
+            or lock.distribution_version != project_version
+            or lock.distribution_digest != wheel_snapshot.sha256
+            or lock.wheel_filename != wheel_snapshot.name
+        ):
+            raise RuntimeError("Core framework lock does not bind the exact built wheel")
+        _verify_core_release_input(wheel_snapshot)
+        _verify_core_release_input(lock_snapshot)
+    except BaseException:
+        lock_snapshot.close()
+        wheel_snapshot.close()
+        raise
+    return wheel_snapshot, lock_snapshot
+
+
+def _snapshot_daemon_release_input_pair(
+    bundle: _CoreReleaseInput,
+    manifest: _CoreReleaseInput,
+    destination_dir: Path,
+    *,
+    repo: Path,
+) -> tuple[_CoreReleaseInput, _CoreReleaseInput, dict[str, object]]:
+    bundle_snapshot = _snapshot_core_release_input(bundle, destination_dir)
+    try:
+        manifest_snapshot = _snapshot_core_release_input(manifest, destination_dir)
+    except BaseException:
+        bundle_snapshot.close()
+        raise
+    try:
+        _verify_core_release_input(bundle)
+        _verify_core_release_input(manifest)
+        value = _load_daemon_release_manifest(
+            bundle_snapshot,
+            manifest_snapshot,
+            repo=repo,
+        )
+        _verify_core_release_input(bundle_snapshot)
+        _verify_core_release_input(manifest_snapshot)
+    except BaseException:
+        manifest_snapshot.close()
+        bundle_snapshot.close()
+        raise
+    return bundle_snapshot, manifest_snapshot, value
 
 
 def _copy_core_release_input(source: _CoreReleaseInput, destination_fd: int) -> None:
@@ -1787,7 +1977,10 @@ def _validate_fd_bound_bootloader(executable: Path) -> None:
         raise RuntimeError("packaged sidecar is missing the native execution bootloader")
 
 
-def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
+def _validate_embedded_core_wheel(
+    executable: Path,
+    wheel: Path | _CoreReleaseInput,
+) -> str:
     archive_members = _archive_member_names(executable)
     benchmark_members = sorted(
         name
@@ -1810,7 +2003,8 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
             "Desktop sidecar must not contain removed Terminal Bench Core modules: "
             f"{legacy_modules}"
         )
-    expected = (CORE_WHEEL_ARCHIVE_ROOT / wheel.name).as_posix()
+    wheel_name, _wheel_size, source_digest = _core_release_identity(wheel)
+    expected = (CORE_WHEEL_ARCHIVE_ROOT / wheel_name).as_posix()
     embedded_wheels = sorted(
         name
         for name in archive_members
@@ -1821,7 +2015,6 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
             "sidecar archive does not contain the exact staged Core wheel: "
             f"expected {[expected]}, found {embedded_wheels}"
         )
-    source_digest = _sha256_bytes(wheel.read_bytes())
     embedded_payload = _archive_member_bytes(executable, expected)
     try:
         with ZipFile(BytesIO(embedded_payload)) as embedded_wheel:
@@ -1842,12 +2035,16 @@ def _validate_embedded_core_wheel(executable: Path, wheel: Path) -> str:
 
 def _validate_embedded_core_framework_lock(
     executable: Path,
-    wheel: Path,
-    framework_lock: Path,
+    wheel: Path | _CoreReleaseInput,
+    framework_lock: Path | _CoreReleaseInput,
     *,
     version: str,
 ) -> str:
-    expected_wheel = (CORE_WHEEL_ARCHIVE_ROOT / wheel.name).as_posix()
+    wheel_name, _wheel_size, wheel_digest = _core_release_identity(wheel)
+    lock_name, _lock_size, lock_digest = _core_release_identity(framework_lock)
+    if lock_name != CORE_FRAMEWORK_LOCK_BASENAME:
+        raise RuntimeError("Core framework lock input must use the canonical filename")
+    expected_wheel = (CORE_WHEEL_ARCHIVE_ROOT / wheel_name).as_posix()
     expected_lock = (CORE_WHEEL_ARCHIVE_ROOT / CORE_FRAMEWORK_LOCK_BASENAME).as_posix()
     archive_members = _archive_member_names(executable)
     embedded_release_inputs = sorted(
@@ -1862,28 +2059,36 @@ def _validate_embedded_core_framework_lock(
             f"expected {expected_release_inputs}, found {embedded_release_inputs}"
         )
 
-    expected_payload = _core_framework_lock_bytes(wheel, version=version)
+    expected_payload = _core_framework_lock_bytes_for_identity(
+        wheel_filename=wheel_name,
+        wheel_digest=wheel_digest,
+        version=version,
+    )
     try:
-        source_payload = framework_lock.read_bytes()
+        source_payload = _core_release_payload(framework_lock)
     except OSError as exc:
         raise RuntimeError("Core framework lock is unavailable") from exc
     if source_payload != expected_payload:
         raise RuntimeError("staged Core framework lock differs from the exact built wheel")
-    _load_exact_framework_lock(framework_lock, wheel, version=version)
+    source_lock = _validated_framework_lock(source_payload)
+    if (
+        source_lock.distribution != "openevo"
+        or source_lock.distribution_version != version
+        or source_lock.distribution_digest != wheel_digest
+        or source_lock.wheel_filename != wheel_name
+        or _sha256_bytes(source_payload) != lock_digest
+    ):
+        raise RuntimeError("staged Core framework lock identity is invalid")
+    embedded_wheel_payload = _archive_member_bytes(executable, expected_wheel)
+    if _sha256_bytes(embedded_wheel_payload) != wheel_digest:
+        raise RuntimeError("sidecar embedded Core wheel differs from the staged wheel")
     embedded_payload = _archive_member_bytes(executable, expected_lock)
     if embedded_payload != source_payload:
         raise RuntimeError("sidecar embedded Core framework lock differs from the staged lock")
-    with TemporaryDirectory(prefix="openevo-embedded-core-lock-") as temporary_dir:
-        embedded_root = Path(temporary_dir)
-        embedded_wheel = embedded_root / wheel.name
-        embedded_lock = embedded_root / CORE_FRAMEWORK_LOCK_BASENAME
-        embedded_wheel.write_bytes(_archive_member_bytes(executable, expected_wheel))
-        embedded_lock.write_bytes(embedded_payload)
-        try:
-            _load_exact_framework_lock(embedded_lock, embedded_wheel, version=version)
-        except RuntimeError as exc:
-            raise RuntimeError("sidecar embedded Core framework lock identity is invalid") from exc
-    return _sha256_bytes(source_payload)
+    embedded_lock = _validated_framework_lock(embedded_payload)
+    if embedded_lock != source_lock:
+        raise RuntimeError("sidecar embedded Core framework lock identity is invalid")
+    return lock_digest
 
 
 def _validate_embedded_product_web(
@@ -2062,19 +2267,21 @@ def _load_daemon_release_manifest(
 def _validate_daemon_manifest_core(
     manifest: dict[str, object],
     *,
-    wheel: Path,
-    framework_lock: Path,
+    wheel: Path | _CoreReleaseInput,
+    framework_lock: Path | _CoreReleaseInput,
     version: str,
 ) -> None:
+    wheel_name, wheel_size, wheel_digest = _core_release_identity(wheel)
+    lock_name, _lock_size, lock_digest = _core_release_identity(framework_lock)
     core = manifest["core"]
     assert isinstance(core, dict)
     if core.get("framework_lock") != {
-        "filename": CORE_FRAMEWORK_LOCK_BASENAME,
-        "sha256": _sha256_bytes(framework_lock.read_bytes()),
+        "filename": lock_name,
+        "sha256": lock_digest,
     } or core.get("wheel") != {
-        "filename": wheel.name,
-        "sha256": _sha256_bytes(wheel.read_bytes()),
-        "size": wheel.stat().st_size,
+        "filename": wheel_name,
+        "sha256": wheel_digest,
+        "size": wheel_size,
         "version": version,
     }:
         raise RuntimeError("Daemon release manifest does not bind the embedded Core wheel and lock")
@@ -2145,6 +2352,8 @@ def build_sidecar(
     *,
     clean: bool,
     core_wheel_output_dir: Path | None = None,
+    core_wheel: Path | None = None,
+    core_framework_lock: Path | None = None,
     managed_runtime_archive: Path | None = None,
     daemon_bundle: Path | None = None,
     daemon_manifest: Path | None = None,
@@ -2170,6 +2379,21 @@ def build_sidecar(
         )
     if (daemon_bundle is None) != (daemon_manifest is None):
         raise RuntimeError("Daemon bundle and manifest must be provided together")
+    if (core_wheel is None) != (core_framework_lock is None):
+        raise RuntimeError("Core wheel and framework lock inputs must be provided together")
+    if (
+        release_build
+        and daemon_bundle is not None
+        and core_wheel is None
+    ):
+        raise RuntimeError(
+            "release sidecar build with Daemon inputs requires the exact Core wheel "
+            "and framework lock inputs"
+        )
+    if core_wheel is not None and core_wheel_output_dir is not None:
+        raise RuntimeError(
+            "Core wheel input pair cannot be combined with a Core wheel output directory"
+        )
     if managed_runtime_archive is not None:
         managed_runtime_archive = Path(os.path.abspath(managed_runtime_archive))
         _validate_managed_runtime_archive(managed_runtime_archive)
@@ -2184,45 +2408,86 @@ def build_sidecar(
             raise RuntimeError("Core wheel output directory overlaps generated paths")
         requested_output = _require_core_release_output_absent(output_candidate)
         core_wheel_output_dir = requested_output
-    daemon_manifest_value: dict[str, object] | None = None
-    if daemon_bundle is not None and daemon_manifest is not None:
-        daemon_bundle = Path(os.path.abspath(daemon_bundle))
-        daemon_manifest = Path(os.path.abspath(daemon_manifest))
-        (
-            daemon_bundle_context,
-            daemon_manifest_context,
-            daemon_manifest_value,
-        ) = _open_daemon_release_input_pair(
-            daemon_bundle,
-            daemon_manifest,
-            repo=repo,
+    project_name, core_version = _project_identity(repo)
+    with ExitStack() as resources:
+        temporary_dir = resources.enter_context(
+            TemporaryDirectory(prefix="openevo-sidecar-build-")
         )
-    else:
-        daemon_bundle_context = nullcontext(None)
-        daemon_manifest_context = nullcontext(None)
+        temporary_root = Path(temporary_dir)
+        provided_core_wheel: _CoreReleaseInput | None = None
+        provided_core_lock: _CoreReleaseInput | None = None
+        if core_wheel is not None and core_framework_lock is not None:
+            raw_core_wheel, raw_core_lock = _open_core_release_input_pair(
+                core_wheel,
+                core_framework_lock,
+            )
+            resources.callback(raw_core_lock.close)
+            resources.callback(raw_core_wheel.close)
+            provided_core_wheel, provided_core_lock = _snapshot_core_release_input_pair(
+                raw_core_wheel,
+                raw_core_lock,
+                temporary_root / "core-inputs",
+                project_name=project_name,
+                project_version=core_version,
+            )
+            resources.callback(provided_core_lock.close)
+            resources.callback(provided_core_wheel.close)
 
-    with (
-        daemon_bundle_context as daemon_bundle_source,
-        daemon_manifest_context as daemon_manifest_source,
-        TemporaryDirectory(prefix="openevo-sidecar-build-") as temporary_dir,
-    ):
+        daemon_bundle_source: _CoreReleaseInput | None = None
+        daemon_manifest_source: _CoreReleaseInput | None = None
+        daemon_manifest_value: dict[str, object] | None = None
+        if daemon_bundle is not None and daemon_manifest is not None:
+            daemon_bundle = Path(os.path.abspath(daemon_bundle))
+            daemon_manifest = Path(os.path.abspath(daemon_manifest))
+            (
+                raw_daemon_bundle,
+                raw_daemon_manifest,
+                _raw_daemon_manifest_value,
+            ) = _open_daemon_release_input_pair(
+                daemon_bundle,
+                daemon_manifest,
+                repo=repo,
+            )
+            resources.callback(raw_daemon_manifest.close)
+            resources.callback(raw_daemon_bundle.close)
+            (
+                daemon_bundle_source,
+                daemon_manifest_source,
+                daemon_manifest_value,
+            ) = _snapshot_daemon_release_input_pair(
+                raw_daemon_bundle,
+                raw_daemon_manifest,
+                temporary_root / "daemon-inputs",
+                repo=repo,
+            )
+            resources.callback(daemon_manifest_source.close)
+            resources.callback(daemon_bundle_source.close)
         if clean:
             shutil.rmtree(dist_dir, ignore_errors=True)
             shutil.rmtree(build_dir, ignore_errors=True)
         binary_dir.mkdir(parents=True, exist_ok=True)
         target = binary_dir / f"{SIDECAR_NAME}-{_target_triple()}{_platform_extension()}"
-        temporary_root = Path(temporary_dir)
-        core_wheel = _build_core_wheel(repo, temporary_root / "core")
-        _, core_version = _project_identity(repo)
-        core_framework_lock = _write_core_framework_lock(
-            core_wheel,
-            version=core_version,
-        )
+        if provided_core_wheel is None or provided_core_lock is None:
+            core_wheel = _build_core_wheel(repo, temporary_root / "core")
+            core_framework_lock = _write_core_framework_lock(
+                core_wheel,
+                version=core_version,
+            )
+        else:
+            _verify_core_release_input(provided_core_wheel)
+            _verify_core_release_input(provided_core_lock)
+            core_wheel = provided_core_wheel.path
+            core_framework_lock = provided_core_lock.path
+        core_release_wheel: Path | _CoreReleaseInput = core_wheel
+        core_release_lock: Path | _CoreReleaseInput = core_framework_lock
+        if provided_core_wheel is not None and provided_core_lock is not None:
+            core_release_wheel = provided_core_wheel
+            core_release_lock = provided_core_lock
         if daemon_manifest_value is not None:
             _validate_daemon_manifest_core(
                 daemon_manifest_value,
-                wheel=core_wheel,
-                framework_lock=core_framework_lock,
+                wheel=core_release_wheel,
+                framework_lock=core_release_lock,
                 version=core_version,
             )
         product_web_digest = _build_product_web(desktop_root)
@@ -2322,11 +2587,11 @@ def build_sidecar(
         if not built.is_file():
             raise RuntimeError(f"PyInstaller did not produce expected sidecar: {built}")
         _validate_fd_bound_bootloader(built)
-        _validate_embedded_core_wheel(built, core_wheel)
+        _validate_embedded_core_wheel(built, core_release_wheel)
         _validate_embedded_core_framework_lock(
             built,
-            core_wheel,
-            core_framework_lock,
+            core_release_wheel,
+            core_release_lock,
             version=core_version,
         )
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
@@ -2338,6 +2603,9 @@ def build_sidecar(
                 daemon_bundle_source,
                 daemon_manifest_source,
             )
+        if provided_core_wheel is not None and provided_core_lock is not None:
+            _verify_core_release_input(provided_core_wheel)
+            _verify_core_release_input(provided_core_lock)
 
         if core_wheel_output_dir is not None:
             _publish_core_release_inputs_once(
@@ -2361,6 +2629,17 @@ def main(argv: list[str] | None = None) -> int:
         "--core-wheel-output-dir",
         type=Path,
         help="Preserve the exact embedded Core wheel and framework lock in this output directory.",
+    )
+    parser.add_argument(
+        "--core-wheel",
+        type=Path,
+        help="Use this already verified Core wheel instead of rebuilding it.",
+    )
+    parser.add_argument(
+        "--framework-lock",
+        dest="core_framework_lock",
+        type=Path,
+        help="Framework lock paired with --core-wheel.",
     )
     parser.add_argument(
         "--managed-runtime-archive",
@@ -2395,6 +2674,8 @@ def main(argv: list[str] | None = None) -> int:
     target = build_sidecar(
         clean=not args.no_clean,
         core_wheel_output_dir=args.core_wheel_output_dir,
+        core_wheel=args.core_wheel,
+        core_framework_lock=args.core_framework_lock,
         managed_runtime_archive=args.managed_runtime_archive,
         daemon_bundle=args.daemon_bundle,
         daemon_manifest=args.daemon_manifest,
