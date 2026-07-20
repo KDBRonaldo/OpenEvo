@@ -68,6 +68,18 @@ MAX_BUILD_TIMEOUT_SECONDS = 2400.0
 MAX_RENDERER_TIMEOUT_SECONDS = 600.0
 MAX_INTER_SESSION_DELAY_SECONDS = 300.0
 MAX_OVERALL_TIMEOUT_SECONDS = 21600.0
+BUILD_PROXY_ENVIRONMENT_NAMES = frozenset(
+    {
+        "ALL_PROXY",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "all_proxy",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
 RUNTIME_CONTEXT_RECEIPT_PREFIX = "Runtime context receipt v3: "
 CONTEXT_CANARY_INSTRUCTION = (
     "\n\nOpenEvo E2E context canary v1: when OPENEVO_MEMORY_FILE, "
@@ -2023,7 +2035,7 @@ def _build_assets(
             stdin=subprocess.DEVNULL,
             stdout=build_log,
             stderr=subprocess.STDOUT,
-            env=_build_environment(),
+            env=_release_asset_build_environment(),
             start_new_session=True,
         )
         process_group_id = os.getpgid(process.pid)
@@ -3751,6 +3763,11 @@ def _build_environment() -> dict[str, str]:
         "UV_CACHE_DIR",
         "VIRTUAL_ENV",
     }
+    return {name: value for name, value in os.environ.items() if name in allowed}
+
+
+def _release_asset_build_environment() -> dict[str, str]:
+    allowed = set(_build_environment()) | BUILD_PROXY_ENVIRONMENT_NAMES
     return {name: value for name, value in os.environ.items() if name in allowed}
 
 

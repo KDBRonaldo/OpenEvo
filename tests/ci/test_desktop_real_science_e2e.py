@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import hashlib
 import importlib.util
+from io import BytesIO
 import json
 import os
 from pathlib import Path
@@ -10,7 +12,7 @@ import stat
 import subprocess
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
@@ -54,6 +56,19 @@ def _revision(identifier: str, generation: int) -> dict[str, object]:
         "project_id": "project-real-e2e",
         "generation": generation,
         "manifest_sha256": f"{generation + 1:064x}",
+    }
+
+
+def _proxy_environment_canaries() -> dict[str, str]:
+    return {
+        "ALL_PROXY": "socks5://proxy.example:1080",
+        "HTTP_PROXY": "http://proxy.example:8080",
+        "HTTPS_PROXY": "http://proxy.example:8443",
+        "NO_PROXY": "localhost,127.0.0.1",
+        "all_proxy": "socks5://lower-proxy.example:1080",
+        "http_proxy": "http://lower-proxy.example:8080",
+        "https_proxy": "http://lower-proxy.example:8443",
+        "no_proxy": "localhost,.example.test",
     }
 
 
@@ -714,12 +729,16 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     built_sidecar = tmp_path / "built-sidecar"
     built_sidecar.write_bytes(b"sidecar")
     captured: dict[str, object] = {}
+    proxy_values = _proxy_environment_canaries()
+    for name, value in proxy_values.items():
+        monkeypatch.setenv(name, value)
 
     class FakeProcess:
         pid = 1234
 
     def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
         captured["command"] = command
+        captured["environment"] = kwargs["env"]
         build_log = kwargs["stdout"]
         build_log.write(f"{built_sidecar}\n".encode())  # type: ignore[union-attr]
         build_log.flush()  # type: ignore[union-attr]
@@ -772,6 +791,9 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
     assert command[command.index("--daemon-bundle") + 1] == str(daemon_bundle.resolve())
     assert command[command.index("--daemon-manifest") + 1] == str(daemon_manifest.resolve())
     assert command.count("--release-build") == 1
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert {name: environment[name] for name in proxy_values} == proxy_values
     assert assets.managed_runtime_archive == runtime_archive.resolve()
     assert captured["validation_root"] == tmp_path / "build" / "validated-assets"
     assert captured["inspected"][-3:] == (  # type: ignore[index]
@@ -779,6 +801,161 @@ def test_local_build_is_release_build_with_managed_runtime_archive(
         daemon_bundle,
         daemon_manifest,
     )
+
+
+def test_build_environment_inherits_proxy_only_for_release_asset_build(
+    monkeypatch,
+) -> None:
+    module = _load_runner()
+    proxy_values = _proxy_environment_canaries()
+    for name, value in proxy_values.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OPENEVO_PROXY_CANARY", "must-not-be-inherited")
+
+    release_environment = module._release_asset_build_environment()
+
+    assert {name: release_environment[name] for name in proxy_values} == proxy_values
+    assert "OPENEVO_PROXY_CANARY" not in release_environment
+    assert all(name not in module._build_environment() for name in proxy_values)
+    assert all(name not in module._sidecar_environment() for name in proxy_values)
+    assert all(name not in module._renderer_environment() for name in proxy_values)
+
+
+def test_candidate_source_checkout_does_not_inherit_release_proxy(
+    monkeypatch,
+) -> None:
+    module = _load_runner()
+    source_commit = "a" * 40
+    proxy_values = _proxy_environment_canaries()
+    calls: list[dict[str, str]] = []
+    for name, value in proxy_values.items():
+        monkeypatch.setenv(name, value)
+
+    def fake_run(command: list[str], **kwargs: object):
+        environment = kwargs["env"]
+        assert isinstance(environment, dict)
+        calls.append(environment)
+        stdout = f"{source_commit}\n".encode() if command[-1] == "HEAD" else b""
+        return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr=b"")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    module._validate_candidate_source_checkout(source_commit)
+
+    assert len(calls) == 2
+    assert all(name not in environment for environment in calls for name in proxy_values)
+
+
+def test_sidecar_launch_does_not_inherit_release_proxy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_runner()
+    proxy_values = _proxy_environment_canaries()
+    for name, value in proxy_values.items():
+        monkeypatch.setenv(name, value)
+    captured: dict[str, object] = {}
+
+    class FakeAuthority:
+        @staticmethod
+        def copy_to(target: Path, *, executable: bool) -> None:
+            target.write_bytes(b"sidecar")
+            target.chmod(0o700 if executable else 0o600)
+
+    class FakeAssets:
+        sidecar = tmp_path / "source-sidecar"
+
+        @staticmethod
+        def authority(_path: Path) -> FakeAuthority:
+            return FakeAuthority()
+
+    class FakeProcess:
+        pid = 4321
+        returncode = None
+
+        def __init__(self) -> None:
+            self.stdin = BytesIO()
+
+    def fake_popen(_command: list[str], **kwargs: object) -> FakeProcess:
+        captured["environment"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(module, "_fixed_descriptors", lambda *_args: nullcontext())
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(module.os, "getpgid", lambda _pid: FakeProcess.pid)
+    monkeypatch.setattr(module, "_wait_sidecar_ready", lambda *_args, **_kwargs: None)
+
+    native = module._launch_sidecar(FakeAssets(), tmp_path / "launch")
+    try:
+        environment = captured["environment"]
+        assert isinstance(environment, dict)
+        assert all(name not in environment for name in proxy_values)
+    finally:
+        native.process_log.close()
+
+
+def test_renderer_launch_does_not_inherit_release_proxy(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    module = _load_runner()
+    proxy_values = _proxy_environment_canaries()
+    for name, value in proxy_values.items():
+        monkeypatch.setenv(name, value)
+    repository_root = tmp_path / "repo"
+    playwright = repository_root / "desktop/node_modules/.bin/playwright"
+    playwright.parent.mkdir(parents=True)
+    playwright.write_text("#!/bin/sh\n", encoding="utf-8")
+    playwright.chmod(0o700)
+    config = repository_root / "desktop/playwright.release-live.config.ts"
+    config.write_text("export default {};\n", encoding="utf-8")
+    packaged_web_root = tmp_path / "packaged-web"
+    packaged_web_root.mkdir()
+    build_digest = "b" * 64
+    (packaged_web_root / ".openevo-product-web.json").write_text(
+        json.dumps(
+            {"schema_version": "1", "build_digest": build_digest, "files": []}
+        ),
+        encoding="utf-8",
+    )
+    source_commit = "a" * 40
+    captured: dict[str, object] = {}
+
+    def fake_popen(_command: list[str], **kwargs: object):
+        captured["environment"] = kwargs["env"]
+        raise OSError("stop after capturing renderer environment")
+
+    monkeypatch.setattr(module, "REPOSITORY_ROOT", repository_root)
+    monkeypatch.setattr(module.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(OSError, match="stop after capturing"):
+        module._run_renderer_verification(
+            native=SimpleNamespace(
+                base_url="http://127.0.0.1:1234",
+                credentials=SimpleNamespace(session_token="session-token"),
+            ),
+            workflow=SimpleNamespace(renderer_expectations=lambda: {}),
+            desktop_identity={
+                "source_commit": source_commit,
+                "build_version": "0.1.4",
+                "openapi_sha256": "c" * 64,
+                "feature_flags": [],
+            },
+            candidate_binding=SimpleNamespace(
+                packaged_web_root=packaged_web_root,
+                source_commit=source_commit,
+                version="0.1.4",
+                build_digest=build_digest,
+            ),
+            root=tmp_path / "renderer",
+            timeout_seconds=30,
+            screenshot_output=None,
+            progress=None,
+        )
+
+    environment = captured["environment"]
+    assert isinstance(environment, dict)
+    assert all(name not in environment for name in proxy_values)
 
 
 def test_external_assets_bind_exact_embedded_managed_runtime(
