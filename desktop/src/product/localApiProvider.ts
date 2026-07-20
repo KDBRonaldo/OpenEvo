@@ -47,7 +47,7 @@ import {
   createRunRetryRecovery,
   overlayAcceptedRetryRun,
   parseRunRetryRecovery,
-  retryRunProvesSingleAppend,
+  retryRunProvesApplied,
   sameRunRetryIntent,
   serializeRunRetryRecovery,
   withAcceptedRetryRun,
@@ -152,7 +152,7 @@ export class LocalApiDesktopProductProvider implements ReleaseDesktopProductProv
         if (!this.retryRecoveryWriteInFlight
           && this.retryRequestInFlight !== recovery
           && run
-          && retryRunProvesSingleAppend(run, recovery)) {
+          && retryRunProvesApplied(run, recovery)) {
           await this.setRunRetryRecovery(null);
         } else if (recovery.acceptedRun && snapshot.projects.some(
           (project) => project.remote?.core_project_id === recovery.projectId,

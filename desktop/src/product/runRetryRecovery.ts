@@ -13,12 +13,16 @@ export function createRunRetryRecovery(
   run: RunV1,
   intent: ProductResourceMutationIntent,
 ): ProductRunRetryRecovery {
+  const originalRun = runV1Schema.parse(run);
+  if (!originalRunProvesRetryAuthority(originalRun)) {
+    throw new DesktopContractError("Run retry requires a terminal attempt under immutable admission");
+  }
   return {
     schemaVersion: 1,
-    runId: run.id,
-    projectId: run.project_id,
+    runId: originalRun.id,
+    projectId: originalRun.project_id,
     intent: { ...intent },
-    originalRun: runV1Schema.parse(run),
+    originalRun,
     acceptedRun: null,
   };
 }
@@ -28,7 +32,7 @@ export function withAcceptedRetryRun(
   run: RunV1,
 ): ProductRunRetryRecovery {
   if (!retryRunProvesSingleAppend(run, recovery)
-    || !retryResponseProvesAdmissionReset(run, recovery.originalRun)
+    || !retryResponsePreservesAdmission(run, recovery.originalRun)
     || (recovery.acceptedRun !== null
       && canonicalJsonSnapshot(run) !== canonicalJsonSnapshot(recovery.acceptedRun))) {
     throw new DesktopContractError("Run retry response does not prove one canonical appended attempt");
@@ -77,6 +81,19 @@ export function retryRunProvesSingleAppend(
     && acceptedAttempt.created_at === observedAttempt.created_at;
 }
 
+export function retryRunProvesApplied(
+  run: RunV1,
+  recovery: ProductRunRetryRecovery,
+): boolean {
+  if (!retryRunProvesSingleAppend(run, recovery)) return false;
+  if (!retryRunPreservesAdmission(run, recovery.originalRun)) return false;
+  if (run.status !== "queued") return true;
+  return run.queued_reason?.code === "capacity"
+    && run.current_attempt?.queued_reason?.code === "capacity"
+    && canonicalJsonSnapshot(run.queued_reason)
+      === canonicalJsonSnapshot(run.current_attempt.queued_reason);
+}
+
 export function overlayAcceptedRetryRun(
   runs: readonly RunV1[],
   recovery: ProductRunRetryRecovery,
@@ -85,7 +102,7 @@ export function overlayAcceptedRetryRun(
   if (!accepted) return [...runs];
   const index = runs.findIndex((run) => run.id === recovery.runId);
   if (index < 0) return [accepted, ...runs];
-  if (retryRunProvesSingleAppend(runs[index]!, recovery)) return [...runs];
+  if (retryRunProvesApplied(runs[index]!, recovery)) return [...runs];
   const next = [...runs];
   next[index] = accepted;
   return next;
@@ -153,10 +170,10 @@ export function parseRunRetryRecovery(value: string): ProductRunRetryRecovery {
   if (originalRun.id !== recoveryWithoutAccepted.runId
     || originalRun.project_id !== recoveryWithoutAccepted.projectId
     || originalRun.etag !== recoveryWithoutAccepted.intent.etag
-    || originalRun.current_attempt_id === null
+    || !originalRunProvesRetryAuthority(originalRun)
     || (acceptedRun !== null
       && (!retryRunProvesSingleAppend(acceptedRun, recoveryWithoutAccepted)
-        || !retryResponseProvesAdmissionReset(acceptedRun, originalRun)))) {
+        || !retryResponsePreservesAdmission(acceptedRun, originalRun)))) {
     throw new DesktopContractError("Run retry recovery state does not match its run authority");
   }
   return { ...recoveryWithoutAccepted, acceptedRun };
@@ -183,9 +200,7 @@ function immutableRunIdentity(run: RunV1): unknown {
     current_attempt: _currentAttempt,
     attempt_count: _attemptCount,
     current_error: _currentError,
-    pinned_revision: _pinnedRevision,
     updated_at: _updatedAt,
-    admitted_at: _admittedAt,
     started_at: _startedAt,
     finished_at: _finishedAt,
     etag: _etag,
@@ -195,24 +210,39 @@ function immutableRunIdentity(run: RunV1): unknown {
   return identity;
 }
 
-function retryResponseProvesAdmissionReset(run: RunV1, original: RunV1): boolean {
+function retryResponsePreservesAdmission(run: RunV1, original: RunV1): boolean {
   const appended = run.attempts[original.attempt_count];
   return appended !== undefined
+    && retryRunPreservesAdmission(run, original)
     && run.status === "queued"
-    && run.queued_reason?.code === "admission_pending"
+    && run.queued_reason?.code === "capacity"
     && run.current_error === null
-    && run.pinned_revision === null
-    && run.admitted_at === null
     && run.started_at === null
     && run.finished_at === null
     && appended.run_id === run.id
     && appended.number === original.attempt_count + 1
     && appended.status === "queued"
-    && appended.queued_reason?.code === "admission_pending"
+    && appended.queued_reason?.code === "capacity"
     && appended.error === null
     && appended.started_at === null
     && appended.finished_at === null
     && canonicalJsonSnapshot(run.queued_reason) === canonicalJsonSnapshot(appended.queued_reason);
+}
+
+function retryRunPreservesAdmission(run: RunV1, original: RunV1): boolean {
+  return original.pinned_revision !== null
+    && original.admitted_at !== null
+    && canonicalJsonSnapshot(run.pinned_revision) === canonicalJsonSnapshot(original.pinned_revision)
+    && run.admitted_at === original.admitted_at;
+}
+
+function originalRunProvesRetryAuthority(run: RunV1): boolean {
+  return (run.status === "failed" || run.status === "cancelled")
+    && run.current_attempt_id !== null
+    && run.current_attempt?.id === run.current_attempt_id
+    && run.current_attempt.status === run.status
+    && run.pinned_revision !== null
+    && run.admitted_at !== null;
 }
 
 function sortCanonicalJsonValue(value: unknown): unknown {
