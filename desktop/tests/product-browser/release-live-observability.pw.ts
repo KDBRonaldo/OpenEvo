@@ -8,9 +8,20 @@ import {
 } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import { expect, test, type Page, type Response, type Route } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Page,
+  type Request,
+  type Response,
+  type Route,
+} from "@playwright/test";
 import { z } from "zod";
 import { desktopBootstrapContextV1Schema } from "../../src/api/v1/schemas";
+import {
+  drainPendingSnapshot,
+  InFlightCaptureWindow,
+} from "./release-live-capture";
 
 const HANDOFF_ENV = "OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF";
 const HANDOFF_PATH = process.env[HANDOFF_ENV];
@@ -245,7 +256,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
     handoff.expected.project_id,
     capture,
   );
-  observeResponses(page, liveOrigin, capture);
+  const stopObservingResponses = observeResponses(page, liveOrigin, capture);
 
   await page.goto(`${STATIC_ORIGIN}/`);
   const startupTerminalStages = new Set([
@@ -483,6 +494,8 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   });
 
   const native = await readNativeObservation(page);
+  await stopObservingResponses();
+  await drainCapture(capture);
   assertClosed(native.rendererReady, "renderer readiness was not acknowledged");
   assertClosed(native.commands.includes("start_sidecar"), "native bootstrap was not invoked");
   assertClosed(native.stages.includes("product_committed"), "product commit was not reported");
@@ -991,14 +1004,27 @@ function observeNetwork(
   });
 }
 
-function observeResponses(page: Page, liveOrigin: string, capture: CaptureState): void {
-  page.on("response", (response) => {
+function observeResponses(
+  page: Page,
+  liveOrigin: string,
+  capture: CaptureState,
+): () => Promise<void> {
+  const window = new InFlightCaptureWindow<Request>();
+  const observes = (request: Request): boolean => {
+    const url = new URL(request.url());
+    return url.origin === liveOrigin
+      && url.pathname !== "/desktop/v1/events"
+      && request.method() !== "OPTIONS";
+  };
+  const requestListener = (request: Request) => {
+    if (observes(request)) window.begin(request);
+  };
+  const requestSettledListener = (request: Request) => {
+    if (observes(request)) window.finish(request);
+  };
+  const listener = (response: Response) => {
     const url = new URL(response.url());
-    if (
-      url.origin !== liveOrigin
-      || url.pathname === "/desktop/v1/events"
-      || response.request().method() === "OPTIONS"
-    ) return;
+    if (!window.accepts(response.request())) return;
     if (capture.responses.length >= MAX_CAPTURE_RESPONSES) {
       capture.errors.push("live Local API response inventory exceeded the capture budget");
       return;
@@ -1011,7 +1037,18 @@ function observeResponses(page: Page, liveOrigin: string, capture: CaptureState)
       })
       .finally(() => capture.pending.delete(promise));
     capture.pending.add(promise);
-  });
+  };
+  page.on("request", requestListener);
+  page.on("requestfinished", requestSettledListener);
+  page.on("requestfailed", requestSettledListener);
+  page.on("response", listener);
+  return async () => {
+    await window.close();
+    page.off("request", requestListener);
+    page.off("requestfinished", requestSettledListener);
+    page.off("requestfailed", requestSettledListener);
+    page.off("response", listener);
+  };
 }
 
 async function captureResponse(response: Response, capture: CaptureState): Promise<void> {
@@ -1117,7 +1154,7 @@ function captureArtifact(value: unknown, capture: CaptureState): void {
 }
 
 async function drainCapture(capture: CaptureState): Promise<void> {
-  while (capture.pending.size > 0) await Promise.all([...capture.pending]);
+  await drainPendingSnapshot(capture.pending);
   assertClosed(capture.errors.length === 0, "live Local API response capture failed");
 }
 

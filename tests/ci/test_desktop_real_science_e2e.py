@@ -958,6 +958,26 @@ def test_renderer_launch_does_not_inherit_release_proxy(
     assert all(name not in environment for name in proxy_values)
 
 
+@pytest.mark.parametrize(
+    ("requested_seconds", "test_seconds", "process_seconds"),
+    (
+        (1.0, 30.0, 45.0),
+        (30.0, 30.0, 45.0),
+        (300.0, 300.0, 315.0),
+        (600.0, 600.0, 615.0),
+    ),
+)
+def test_renderer_timeout_reserves_process_exit_grace(
+    requested_seconds: float,
+    test_seconds: float,
+    process_seconds: float,
+) -> None:
+    module = _load_runner()
+
+    assert module._renderer_test_timeout_seconds(requested_seconds) == test_seconds
+    assert module._renderer_process_timeout_seconds(requested_seconds) == process_seconds
+
+
 def test_external_assets_bind_exact_embedded_managed_runtime(
     tmp_path: Path,
     monkeypatch,

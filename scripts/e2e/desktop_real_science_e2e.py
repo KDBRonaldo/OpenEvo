@@ -65,7 +65,9 @@ ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS = (0.25, 0.75, 1.5, 3.0)
 MAX_ACTIVATION_TIMEOUT_SECONDS = 1800.0
 MAX_RUN_TIMEOUT_SECONDS = 10800.0
 MAX_BUILD_TIMEOUT_SECONDS = 2400.0
+MIN_RENDERER_TIMEOUT_SECONDS = 30.0
 MAX_RENDERER_TIMEOUT_SECONDS = 600.0
+RENDERER_PROCESS_EXIT_GRACE_SECONDS = 15.0
 MAX_INTER_SESSION_DELAY_SECONDS = 300.0
 MAX_OVERALL_TIMEOUT_SECONDS = 21600.0
 BUILD_PROXY_ENVIRONMENT_NAMES = frozenset(
@@ -3592,10 +3594,11 @@ def _run_renderer_verification(
         "screenshot_path": str(screenshot_path),
     }
     _write_private_json(handoff_path, handoff)
+    renderer_test_timeout_seconds = _renderer_test_timeout_seconds(timeout_seconds)
     environment = _renderer_environment()
     environment["OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF"] = str(handoff_path)
     environment["OPENEVO_DESKTOP_LIVE_RENDERER_TIMEOUT_MS"] = str(
-        min(600_000, max(30_000, math.ceil(timeout_seconds * 1_000)))
+        math.ceil(renderer_test_timeout_seconds * 1_000)
     )
     process_log = TemporaryFile(mode="w+b")
     process: subprocess.Popen[bytes] | None = None
@@ -3615,9 +3618,12 @@ def _run_renderer_verification(
         if process_group_id != process.pid:
             raise E2EFailure("renderer", "renderer_process_group_invalid")
         deadline = (
-            time.monotonic() + timeout_seconds
+            time.monotonic() + _renderer_process_timeout_seconds(timeout_seconds)
             if progress is None
-            else progress.phase_deadline("renderer", timeout_seconds)
+            else progress.phase_deadline(
+                "renderer",
+                _renderer_process_timeout_seconds(timeout_seconds),
+            )
         )
         while not _process_exited_without_reap(process):
             native.assert_log_budget()
@@ -3696,6 +3702,20 @@ def _run_renderer_verification(
                 private_path.unlink()
             except OSError:
                 pass
+
+
+def _renderer_test_timeout_seconds(requested_seconds: float) -> float:
+    return min(
+        MAX_RENDERER_TIMEOUT_SECONDS,
+        max(MIN_RENDERER_TIMEOUT_SECONDS, requested_seconds),
+    )
+
+
+def _renderer_process_timeout_seconds(requested_seconds: float) -> float:
+    return (
+        _renderer_test_timeout_seconds(requested_seconds)
+        + RENDERER_PROCESS_EXIT_GRACE_SECONDS
+    )
 
 
 def _terminate_process_group(
