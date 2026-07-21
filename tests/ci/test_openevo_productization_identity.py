@@ -95,6 +95,7 @@ FORBIDDEN_TEXT_PATTERNS = tuple(
         r"\bPOLAR[A-Z0-9_]*\b",
     )
 )
+CJK_TEXT_PATTERN = re.compile(r"[\u3400-\u9fff]")
 
 
 def _tracked_files() -> list[Path]:
@@ -189,3 +190,17 @@ def test_desktop_is_top_level_product_surface() -> None:
     assert (REPO_ROOT / "desktop" / "src").is_dir()
     assert (REPO_ROOT / "desktop" / "sidecar").is_dir()
     assert not (REPO_ROOT / "src" / "openevo" / "desktop").exists()
+
+
+def test_desktop_release_ui_copy_is_english() -> None:
+    offenders: list[str] = []
+    for path in (REPO_ROOT / "desktop" / "src").rglob("*"):
+        if not path.is_file() or path.suffix not in {".ts", ".tsx"}:
+            continue
+        if ".test." in path.name:
+            continue
+        text = path.read_text(encoding="utf-8")
+        if CJK_TEXT_PATTERN.search(text):
+            offenders.append(path.relative_to(REPO_ROOT).as_posix())
+
+    assert offenders == []

@@ -442,6 +442,32 @@ def test_bundle_smoke_requires_the_closed_macos_loopback_ats_policy(
             smoke._validate_macos_loopback_transport(app)
 
 
+def test_bundle_smoke_requires_the_generated_macos_app_icon(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    app = tmp_path / "OpenEvo Desktop.app"
+    info_plist = app / "Contents" / "Info.plist"
+    packaged_icon = app / "Contents" / "Resources" / "icon.icns"
+    expected_icon = tmp_path / "generated-icon.icns"
+    packaged_icon.parent.mkdir(parents=True)
+    expected_icon.write_bytes(b"generated OpenEvo icon")
+    packaged_icon.write_bytes(expected_icon.read_bytes())
+
+    with info_plist.open("wb") as stream:
+        plistlib.dump({"CFBundleIconFile": "icon.icns"}, stream)
+    smoke._validate_macos_app_icon(app, expected_icon)
+
+    with info_plist.open("wb") as stream:
+        plistlib.dump({"CFBundleIconFile": "old-icon.icns"}, stream)
+    with pytest.raises(smoke.SmokeFailure, match="does not select"):
+        smoke._validate_macos_app_icon(app, expected_icon)
+
+    with info_plist.open("wb") as stream:
+        plistlib.dump({"CFBundleIconFile": "icon"}, stream)
+    packaged_icon.write_bytes(b"stale icon")
+    with pytest.raises(smoke.SmokeFailure, match="does not match"):
+        smoke._validate_macos_app_icon(app, expected_icon)
+
+
 def test_bundle_smoke_rejects_symbolic_app_bundle(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     external_app = tmp_path / "external" / "OpenEvo Desktop.app"

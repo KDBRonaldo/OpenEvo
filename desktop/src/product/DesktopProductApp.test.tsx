@@ -66,43 +66,45 @@ describe("DesktopProductApp", () => {
 
     expect(onInitialSnapshotFailed).toHaveBeenCalledTimes(1);
     expect(onReady).not.toHaveBeenCalled();
-    expect(screenText()).toContain("Remote projects could not be synchronized");
-    expect(screenText()).toContain("酶动力学模型复核");
+    expect(screenText()).toContain("Your workspace could not be loaded");
+    expect(screenText()).toContain("Enzyme Kinetics Model Review");
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
     const fallbackSwitcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     expect(fallbackSwitcher?.disabled).toBe(false);
     expect(Array.from(fallbackSwitcher?.options ?? []).filter((option) =>
-      option.textContent?.includes("[只读]")
+      option.textContent?.includes("[Demo]")
     )).toHaveLength(2);
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')).toBeNull();
+    expect(optionalButton("Add remote workspace")).not.toBeNull();
     expect(document.querySelector(".initial-sync-sample")).not.toBeNull();
     expect(document.querySelector(".initial-sync-sample[inert]")).toBeNull();
     await clickButton("Task 1");
-    expect(screenText()).toContain("线性化拟合对高浓度点产生系统性偏差");
+    expect(screenText()).toContain("The linearized fit systematically misses high-concentration observations");
     await clickButton("Evolution");
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
-    await clickButton("轨迹到技能");
-    await clickButton("可读产物");
+    await clickButton("Trajectory to Skill");
+    await clickButton("Output");
     expect(screenText()).toContain("SKILL.md");
     expect(screenText()).not.toContain("Add workspace");
     expect(screenText()).not.toContain("internal refresh details");
     const proteinOption = Array.from(fallbackSwitcher?.options ?? []).find((option) =>
-      option.textContent?.includes("蛋白质稳定性证据整合")
+      option.textContent?.includes("Protein Stability Evidence Review")
     );
     if (!fallbackSwitcher || !proteinOption) throw new Error("Second fallback sample was not found.");
     await act(async () => {
       fallbackSwitcher.value = proteinOption.value;
       fallbackSwitcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(screenText()).toContain("从轨迹到 Evolution Revision ER-PS-3");
-    await clickButton("版本差异");
+    expect(screenText()).toContain("How OpenEvo improved this project");
+    await clickButton("Changes");
     expect(screenText()).toContain("ER-PS-2 → ER-PS-3");
 
-    await clickButton("Try again");
+    await clickButton("Add remote workspace");
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).toBeNull();
     expect(screenText()).toContain("Protein Design");
     expect(screenText()).toContain("Cross-session changes");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(screenText()).toContain("Server connection");
     expect(onReady).toHaveBeenCalledTimes(1);
   });
 
@@ -113,7 +115,7 @@ describe("DesktopProductApp", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
     const sampleOption = Array.from(switcher.options).find(
-      (option) => option.textContent?.includes("[只读] 酶动力学模型复核"),
+      (option) => option.textContent?.includes("[Demo] Enzyme Kinetics Model Review"),
     );
     const realOption = Array.from(switcher.options).find(
       (option) => option.dataset.projectId === "project-fixture-1",
@@ -141,7 +143,7 @@ describe("DesktopProductApp", () => {
     expect(switcher.value).toBe(realOption.value);
   });
 
-  it("switches between two renderer-owned synthetic demonstrations without provider mutation", async () => {
+  it("switches between two renderer-owned demos without provider mutation", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const connectProfile = vi.spyOn(provider, "connectProfile");
     const startRun = vi.spyOn(provider, "startRun");
@@ -151,35 +153,35 @@ describe("DesktopProductApp", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
     const enzymeOption = Array.from(switcher.options).find(
-      (option) => option.textContent?.includes("[只读] 酶动力学模型复核"),
+      (option) => option.textContent?.includes("[Demo] Enzyme Kinetics Model Review"),
     );
     const proteinOption = Array.from(switcher.options).find(
-      (option) => option.textContent?.includes("[只读] 蛋白质稳定性证据整合"),
+      (option) => option.textContent?.includes("[Demo] Protein Stability Evidence Review"),
     );
     if (!enzymeOption || !proteinOption) {
-      throw new Error("Both synthetic demonstration projects must be discoverable.");
+      throw new Error("Both demo projects must be discoverable.");
     }
 
     await act(async () => {
       switcher.value = proteinOption.value;
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(screenText()).toContain("蛋白质稳定性证据整合");
-    expect(screenText()).toContain("内置 synthetic 数据");
-    expect(screenText()).toContain("Project Head 2 → 3");
+    expect(screenText()).toContain("Protein Stability Evidence Review");
+    expect(screenText()).toContain("Demo data");
+    expect(screenText()).toContain("Generation 2 → 3");
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
     await clickButton("Task 1");
-    expect(screenText()).toContain("混杂与尺度差异足以推翻原排序");
+    expect(screenText()).toContain("Confounding and scale differences invalidate the original ranking");
     await clickButton("Evolution");
-    await clickButton("版本差异");
+    await clickButton("Changes");
     expect(screenText()).toContain("ER-PS-2 → ER-PS-3");
-    expect(screenText()).toContain("SEC 单体保留率为 92%");
+    expect(screenText()).toContain("92% SEC monomer retention");
 
     await act(async () => {
       switcher.value = enzymeOption.value;
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(screenText()).toContain("酶动力学模型复核");
+    expect(screenText()).toContain("Enzyme Kinetics Model Review");
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
     expect(connectProfile).not.toHaveBeenCalled();
     expect(startRun).not.toHaveBeenCalled();
@@ -554,11 +556,10 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ stepDelayMs: 20 });
     root = await renderProduct(provider);
 
-    expect(screenText()).toContain("Add a remote workspace");
+    expect(screenText()).toContain("Add remote workspace");
     expect(optionalButton("Create project")).toBeNull();
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
     expect(screenText()).not.toContain("Start session");
-    await clickButton("Add workspace");
+    await clickButton("Add remote workspace");
     setInput("Workspace name", "Lab server");
     setInput("Server address", "lab.example.test");
     setInput("User name", "researcher");
@@ -610,7 +611,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
     root = await renderProduct(provider);
 
-    await clickButton("Add workspace");
+    await clickButton("Add remote workspace");
     const host = labelledControl<HTMLInputElement>("Server address", "input");
     expect(host.required).toBe(true);
     expect(screenText()).toContain("Enter the remote server address.");
@@ -970,7 +971,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider();
     root = await renderProduct(provider);
 
-    await clickAria("Remote workspace settings");
+    await clickButton("Add remote workspace");
     expect(screenText()).toContain("Authentication");
     expect(screenText()).toContain("SSH agent");
     expect(screenText()).not.toContain("Server password");
@@ -2210,7 +2211,7 @@ describe("DesktopProductApp", () => {
     const settleSource = vi.spyOn(provider, "settleProjectSource");
     root = await renderProduct(provider);
 
-    await clickButton("Add workspace");
+    await clickButton("Add remote workspace");
     setInput("Server address", "lab.example.test");
     setInput("User name", "researcher");
     provider.failNextProfileCreateWithUnknownError();
@@ -2272,7 +2273,7 @@ describe("DesktopProductApp", () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
     root = await renderProduct(provider);
 
-    await clickButton("Add workspace");
+    await clickButton("Add remote workspace");
     setInput("Server address", "lab.example.test");
     setInput("User name", "researcher");
     provider.advanceEpochOnNextRefresh();

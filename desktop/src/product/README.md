@@ -1,17 +1,21 @@
 # Desktop Product Renderer Boundary
 
-## Synthetic scientific project demonstrations
+## Built-in scientific project demos
 
 The Desktop demonstration surface contains two scientifically distinct,
-explicitly synthetic project stories. Neither story represents a remote run or
-authoritative project state.
+curated project stories. Neither story represents a remote run or authoritative
+project state.
 
 - The renderer owns an enzyme-kinetics tour and a protein-stability evidence
-  tour. Both are always listed as `[只读][Synthetic]` in the real release
+  tour. Both are always listed as `[Demo]` in the real release
   project selector, including before any remote workspace exists and while the
   Desktop sidecar startup fallback is visible.
+- `Add remote workspace` remains visible in the top bar throughout startup and
+  snapshot recovery. A request made before authority is available is retained,
+  recovery is retried, and the real connection drawer opens only after the
+  provider has published an authoritative snapshot.
 - Each project contains three sessions with a rejected baseline, later
-  corrective work, safe transcript/reasoning/tool summaries, and a validated
+  corrective work, concise transcript activity, and a validated
   condition-scoped result. The protein project uses plate-aware DSF plus
   orthogonal SEC evidence rather than copying the enzyme workflow.
 - Both projects advance Project Head generations 0 through 3 and separately
@@ -23,14 +27,12 @@ authoritative project state.
 - All sample data and rendering live in `scientificProjectSampleData.ts` and
   `ScientificProjectSample.tsx`; samples are not inserted into
   `DesktopProductProvider`, Local API state, Core state, or run admission.
-- Project Head generations and Evolution Revision identities are displayed
-  separately; the demonstrations do not collapse the full project composition
-  into its evolution artifact set.
+- The deeper session timeline keeps project generations and evolution update
+  identities separate; the demonstrations do not collapse the full project
+  composition into its evolution artifact set.
 - Demonstration interactions issue no mutations and initiate no SSH, Daemon, Core,
   artifact, or external-network work. Normal read-only Desktop-local state
   synchronization remains active so real projects stay discoverable.
-- Safe trace summaries exclude raw chain-of-thought, commands, credentials,
-  host paths, secret references, and Core/service URLs.
 - The samples remain available beside real projects, but never replace an
   authoritative project selection or revision.
 - `npm run test:product-browser` verifies the first-run Research and Evolution
@@ -106,7 +108,7 @@ observations. Contract simulator scenarios may supply validated alternate states
 only in test and Vite preview builds.
 
 The first-run renderer exposes one next action at a time. Until a remote profile
-exists, the Research workspace owns the `Add workspace` action and project
+exists, the Research workspace owns the `Add remote workspace` action and project
 creation is disabled. Once a profile is present, project creation becomes
 available. New-project setup is one recoverable two-stage drawer flow: Desktop
 first saves and activates a minimal draft to establish the project tunnel, then

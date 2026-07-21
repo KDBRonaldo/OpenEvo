@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { DesktopApiError } from "../api/v1/client";
+import { OpenEvoMark } from "../components/OpenEvoMark";
 import type { OpenEvoJsonObject } from "../api/evolutionConfigSchema";
 import type {
   ApiErrorV1,
@@ -184,12 +185,16 @@ export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
   onInitialSnapshotFailed?: () => void;
   onReady?: () => void;
+  openConnectionSettings?: boolean;
+  onConnectionSettingsOpened?: () => void;
 }
 
 export function DesktopProductApp({
   provider = unavailableDesktopProductProvider,
   onInitialSnapshotFailed,
   onReady,
+  openConnectionSettings = false,
+  onConnectionSettingsOpened,
 }: DesktopProductAppProps) {
   const [snapshot, setSnapshot] = useState<DesktopProductSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -202,6 +207,7 @@ export function DesktopProductApp({
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [connectionSettingsMode, setConnectionSettingsMode] =
     useState<RemoteWorkspaceDrawerMode | null>(null);
+  const [openConnectionAfterRefresh, setOpenConnectionAfterRefresh] = useState(false);
   const [creatingProject, setCreatingProject] = useState(false);
   const [actionState, setActionState] = useState<AsyncState>("idle");
   const [actionError, setActionError] = useState<ActionErrorState | null>(null);
@@ -544,6 +550,13 @@ export function DesktopProductApp({
     onReady?.();
   }, [onReady, snapshot]);
 
+  useEffect(() => {
+    if (!snapshot || (!openConnectionSettings && !openConnectionAfterRefresh)) return;
+    setConnectionSettingsMode((current) => current ?? { kind: "create" });
+    setOpenConnectionAfterRefresh(false);
+    if (openConnectionSettings) onConnectionSettingsOpened?.();
+  }, [onConnectionSettingsOpened, openConnectionAfterRefresh, openConnectionSettings, snapshot]);
+
   if (!snapshot) {
     return (
       <InitialSnapshotSample
@@ -551,6 +564,10 @@ export function DesktopProductApp({
         state={loadError ? { kind: "failed", error: loadError } : { kind: "pending" }}
         onWorkspaceChange={setWorkspace}
         onRetry={() => void refresh("manual")}
+        onAddRemoteWorkspace={() => {
+          setOpenConnectionAfterRefresh(true);
+          void refresh("manual");
+        }}
       />
     );
   }
@@ -706,7 +723,7 @@ export function DesktopProductApp({
     >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
-          <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
+          <span className="product-mark"><OpenEvoMark /></span>
           <span>OpenEvo</span>
         </div>
         <nav className="product-nav">
@@ -715,10 +732,10 @@ export function DesktopProductApp({
           <NavButton icon={Activity} label="System" active={workspace === "system"} onClick={() => setWorkspace("system")} />
         </nav>
         <div className="sidebar-foot">
-          <div className="sidebar-foot-label">Current Project Head</div>
+          <div className="sidebar-foot-label">{viewingSample ? "Demo progress" : "Current Project Head"}</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>{viewingSample ? `Project Head ${selectedSampleProject.activeProjectHeadGeneration}` : revisionLabel(project, projectRuns)}</span>
+            <span>{viewingSample ? `Generation ${selectedSampleProject.activeProjectHeadGeneration}` : revisionLabel(project, projectRuns)}</span>
           </div>
         </div>
       </aside>
@@ -764,15 +781,15 @@ export function DesktopProductApp({
                 }}
                 disabled={lifecycleMutationBusy}
               >
-                <optgroup label="内置示例">
+                <optgroup label="Demos">
                   {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
                     <option key={sample.id} value={sampleOptionKey(sample.id)}>
-                      [只读] {sample.name}
+                      [Demo] {sample.name}
                     </option>
                   ))}
                 </optgroup>
                 {snapshot.projects.length > 0 ? (
-                  <optgroup label="我的项目">
+                  <optgroup label="Projects">
                     {snapshot.projects.map((item) => (
                       <option
                         key={item.project_id}
@@ -785,14 +802,14 @@ export function DesktopProductApp({
                   </optgroup>
                 ) : null}
                 {profilesWithoutProjects.length > 0 ? (
-                  <optgroup label="待创建项目的工作区">
+                  <optgroup label="Remote workspaces">
                     {profilesWithoutProjects.map((item) => (
                       <option
                         key={item.profile_id}
                         value={workspaceOptionKey(item.profile_id)}
                         data-profile-id={item.profile_id}
                       >
-                        {item.name} · 尚无项目
+                        {item.name} · No project
                       </option>
                     ))}
                   </optgroup>
@@ -800,24 +817,36 @@ export function DesktopProductApp({
               </select>
               <ChevronDown size={15} aria-hidden="true" />
             </div>
-            <IconButton label="Create project" onClick={() => { setCreatingProject(true); setSettingsOpen(true); }} disabled={!canCreateProject}><Plus size={17} /></IconButton>
+            {!viewingSample && profile ? (
+              <IconButton label="Create project" onClick={() => { setCreatingProject(true); setSettingsOpen(true); }} disabled={!canCreateProject}><Plus size={17} /></IconButton>
+            ) : null}
           </div>
           <div className="topbar-actions">
-            {viewingSample
-              ? <span className="sample-topbar-badge"><ShieldCheck size={14} /> 示例 · 未连接</span>
-              : <ConnectionBadge state={displayedConnectionState} profileName={profile?.name ?? "Remote workspace"} />}
-            <IconButton
-              label="Remote workspace settings"
-              onClick={() => setConnectionSettingsMode(
-                viewingSample || !profile
-                  ? { kind: "create" }
-                  : { kind: "edit", profileId: profile.profile_id },
-              )}
-              disabled={maintenanceBusy}
-            >
-              <PanelLeft size={17} />
-            </IconButton>
-            <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={viewingSample || !project || maintenanceBusy}><Settings size={17} /></IconButton>
+            {viewingSample || !profile ? (
+              <button
+                type="button"
+                className="primary-button topbar-primary-action"
+                aria-label="Add remote workspace"
+                onClick={() => setConnectionSettingsMode({ kind: "create" })}
+                disabled={maintenanceBusy}
+              >
+                <Plus size={16} /> Add remote workspace
+              </button>
+            ) : (
+              <>
+                <ConnectionBadge state={displayedConnectionState} profileName={profile.name} />
+                <IconButton
+                  label="Remote workspace settings"
+                  onClick={() => setConnectionSettingsMode({ kind: "edit", profileId: profile.profile_id })}
+                  disabled={maintenanceBusy}
+                >
+                  <PanelLeft size={17} />
+                </IconButton>
+              </>
+            )}
+            {!viewingSample && project ? (
+              <IconButton label="Project settings" onClick={() => { setCreatingProject(false); setSettingsOpen(true); }} disabled={maintenanceBusy}><Settings size={17} /></IconButton>
+            ) : null}
           </div>
         </header>
 
@@ -1152,11 +1181,13 @@ function InitialSnapshotSample({
   state,
   onWorkspaceChange,
   onRetry,
+  onAddRemoteWorkspace,
 }: {
   workspace: Workspace;
   state: { readonly kind: "pending" } | { readonly kind: "failed"; readonly error: string };
   onWorkspaceChange: (workspace: Workspace) => void;
   onRetry: () => void;
+  onAddRemoteWorkspace: () => void;
 }) {
   const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
     SAMPLE_SCIENTIFIC_PROJECT.id,
@@ -1170,7 +1201,7 @@ function InitialSnapshotSample({
     >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
-          <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
+          <span className="product-mark"><OpenEvoMark /></span>
           <span>OpenEvo</span>
         </div>
         <nav className="product-nav">
@@ -1179,10 +1210,10 @@ function InitialSnapshotSample({
           <NavButton icon={Activity} label="System" active={workspace === "system"} onClick={() => onWorkspaceChange("system")} />
         </nav>
         <div className="sidebar-foot">
-          <div className="sidebar-foot-label">Current Project Head</div>
+          <div className="sidebar-foot-label">Demo progress</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>Project Head {selectedSample.activeProjectHeadGeneration}</span>
+            <span>Generation {selectedSample.activeProjectHeadGeneration}</span>
           </div>
         </div>
       </aside>
@@ -1203,21 +1234,21 @@ function InitialSnapshotSample({
               >
                 {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
                   <option key={sample.id} value={sampleOptionKey(sample.id)}>
-                    [只读] {sample.name}
+                    [Demo] {sample.name}
                   </option>
                 ))}
               </select>
               <ChevronDown size={15} aria-hidden="true" />
             </div>
-            <IconButton label="Create project" onClick={() => undefined} disabled><Plus size={17} /></IconButton>
           </div>
           <div className="topbar-actions">
-            <span className="sample-topbar-badge">
-              {pending ? <LoaderCircle className="spin" size={14} /> : <AlertCircle size={14} />}
-              {pending ? "Synchronizing" : "Sync unavailable"}
-            </span>
-            <IconButton label="Remote workspace settings" onClick={() => undefined} disabled><PanelLeft size={17} /></IconButton>
-            <IconButton label="Project settings" onClick={() => undefined} disabled><Settings size={17} /></IconButton>
+            <button
+              type="button"
+              className="primary-button topbar-primary-action"
+              onClick={onAddRemoteWorkspace}
+            >
+              <Plus size={16} /> Add remote workspace
+            </button>
           </div>
         </header>
         <main className="product-main">
@@ -1228,12 +1259,8 @@ function InitialSnapshotSample({
           >
             {pending ? <LoaderCircle className="spin" size={18} /> : <AlertCircle size={18} />}
             <div>
-              <strong>{pending ? "Synchronizing your projects" : "Remote projects could not be synchronized"}</strong>
-              <span>
-                {pending
-                  ? "Your workspace is loading. The built-in synthetic projects remain available in read-only mode."
-                  : `${state.error} The built-in synthetic projects remain available in read-only mode.`}
-              </span>
+              <strong>{pending ? "Loading your workspace" : "Your workspace could not be loaded"}</strong>
+              {pending ? null : <span>{state.error}</span>}
             </div>
             {pending ? null : (
               <button type="button" className="secondary-button" onClick={onRetry}>
@@ -1245,6 +1272,7 @@ function InitialSnapshotSample({
             <SampleScientificProjectView
               workspace={workspace}
               project={selectedSample}
+              onConnectRemote={onAddRemoteWorkspace}
             />
           </div>
         </main>
@@ -1698,7 +1726,7 @@ function ResearchWorkspace({
     if (activeRun) setSelectedRunId(activeRun.id);
   }, [activeRun?.id]);
   if (!project) {
-    if (!hasProfile) return <EmptyState icon={PanelLeft} title="Add a remote workspace" detail="Enter the server that will run research sessions." action="Add workspace" actionIcon={Plus} onAction={onOpenConnection} />;
+    if (!hasProfile) return <EmptyState icon={PanelLeft} title="Add a remote workspace" detail="Enter the server that will run research sessions." action="Add remote workspace" actionIcon={Plus} onAction={onOpenConnection} />;
     if (!canCreateProject) return <EmptyState icon={PanelLeft} title="Connect the remote workspace" detail="Confirm the server connection before creating a research project." />;
     return <EmptyState icon={FolderOpen} title="Create a research project" detail="Define a task and source to begin a session." action="Create project" onAction={onOpenSettings} />;
   }
@@ -2663,7 +2691,7 @@ function SystemWorkspace({
             <div><dt>Project access</dt><dd>{projectSessionReady ? "Ready" : "Unavailable"}</dd></div>
           </dl>
           <div className="system-button-row">
-            <button className="secondary-button" type="button" onClick={onConfigure} disabled={busy || maintenanceBusy}><Settings size={15} /> {profile ? "Edit" : "Add workspace"}</button>
+            <button className="secondary-button" type="button" onClick={onConfigure} disabled={busy || maintenanceBusy}><Settings size={15} /> {profile ? "Edit" : "Add remote workspace"}</button>
             {profile && (displayedCoreState !== "online" || servicesNeedAttention) ? <button className="secondary-button" type="button" onClick={onConnect} disabled={busy || (profileOwnsCore && isConnectionBusy(core.state)) || missingCredentialReason(profile) !== null} title={busy ? "A connection action is already running" : missingCredentialReason(profile) ?? "Reconnect remote workspace"}><RefreshCw size={15} /> Reconnect</button> : null}
             {project && maintenanceAvailable ? (
               <button

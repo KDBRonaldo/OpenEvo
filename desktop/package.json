@@ -1,13 +1,15 @@
 {
   "name": "openevo-desktop",
   "private": true,
-  "version": "0.1.4",
+  "version": "0.1.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "dev:openevo": "vite --mode openevo-desktop",
     "build": "vite build",
     "build:openevo": "vite build --mode openevo-desktop && node scripts/package-openevo-product.mjs",
+    "generate:icons": "bash src-tauri/icons/generate-icons.sh",
+    "check:icons": "bash src-tauri/icons/generate-icons.sh --check",
     "tauri:dev": "tauri dev",
     "tauri:build": "tauri build",
     "build:sidecar": "python packaging/build_sidecar.py",

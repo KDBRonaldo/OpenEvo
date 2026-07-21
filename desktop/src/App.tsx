@@ -4,8 +4,8 @@ import {
   BookOpen,
   CircleDot,
   LoaderCircle,
+  Plus,
   RefreshCw,
-  ShieldCheck,
   Sparkles,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -18,6 +18,7 @@ import { SessionDetail } from "./routes/SessionDetail";
 import { Compare } from "./routes/Compare";
 import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
+import { OpenEvoMark } from "./components/OpenEvoMark";
 import { DesktopProductApp } from "./product/DesktopProductApp";
 import { SampleScientificProjectView } from "./product/ScientificProjectSample";
 import {
@@ -155,10 +156,14 @@ export function OpenEvoDesktopOnlyShell({
   provider,
   onInitialSnapshotFailed,
   onReady,
+  openConnectionSettings = false,
+  onConnectionSettingsOpened,
 }: {
   provider?: DesktopProductProvider;
   onInitialSnapshotFailed?: () => void;
   onReady?: () => void;
+  openConnectionSettings?: boolean;
+  onConnectionSettingsOpened?: () => void;
 }) {
   return (
     <Routes>
@@ -169,6 +174,8 @@ export function OpenEvoDesktopOnlyShell({
             provider={provider}
             onInitialSnapshotFailed={onInitialSnapshotFailed}
             onReady={onReady}
+            openConnectionSettings={openConnectionSettings}
+            onConnectionSettingsOpened={onConnectionSettingsOpened}
           />
         )}
       />
@@ -192,7 +199,15 @@ type ReleaseDesktopStartupState =
 
 type ReadonlySampleWorkspace = "research" | "evolution" | "system";
 
-function ReleaseStartupSample({ onRetry, startupPending = false }: { onRetry: () => void; startupPending?: boolean }) {
+function ReleaseStartupSample({
+  onRetry,
+  onAddRemoteWorkspace,
+  startupPending = false,
+}: {
+  onRetry: () => void;
+  onAddRemoteWorkspace: () => void;
+  startupPending?: boolean;
+}) {
   const [workspace, setWorkspace] = useState<ReadonlySampleWorkspace>("research");
   const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
     SAMPLE_SCIENTIFIC_PROJECT.id,
@@ -240,13 +255,13 @@ function ReleaseStartupSample({ onRetry, startupPending = false }: { onRetry: ()
     >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
-          <span className="product-mark"><Sparkles size={17} strokeWidth={2.2} /></span>
+          <span className="product-mark"><OpenEvoMark /></span>
           <span>OpenEvo</span>
         </div>
         <nav
           className="product-nav"
           role="tablist"
-          aria-label="内置示例视图"
+          aria-label="Demo views"
           aria-orientation="vertical"
           onKeyDown={handleWorkspaceKeyDown}
         >
@@ -265,10 +280,10 @@ function ReleaseStartupSample({ onRetry, startupPending = false }: { onRetry: ()
           ))}
         </nav>
         <div className="sidebar-foot">
-          <div className="sidebar-foot-label">Current Project Head</div>
+          <div className="sidebar-foot-label">Demo progress</div>
           <div className="sidebar-revision">
             <CircleDot size={15} />
-            <span>Project Head {selectedSample.activeProjectHeadGeneration}</span>
+            <span>Generation {selectedSample.activeProjectHeadGeneration}</span>
           </div>
         </div>
       </aside>
@@ -289,37 +304,42 @@ function ReleaseStartupSample({ onRetry, startupPending = false }: { onRetry: ()
               >
                 {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
                   <option key={sample.id} value={sample.id}>
-                    [只读] {sample.name}
+                    [Demo] {sample.name}
                   </option>
                 ))}
               </select>
             </div>
           </div>
-          <span className="sample-topbar-badge">
-            <ShieldCheck size={14} /> 内置示例 · 只读
-          </span>
+          <button
+            type="button"
+            className="primary-button topbar-primary-action"
+            onClick={onAddRemoteWorkspace}
+          >
+            <Plus size={16} /> Add remote workspace
+          </button>
         </header>
         <main className="product-main">
           <div className="initial-sync-notice" role="alert">
             <AlertCircle size={18} />
             <div>
-              <strong>{startupPending ? "正在启动 OpenEvo Desktop" : "暂时无法连接 OpenEvo Desktop"}</strong>
-              <span>
-                本机服务尚未就绪。下方两个内置 synthetic 示例保持只读，不会连接本机服务或远端服务器。
-              </span>
+              <strong>{startupPending ? "Starting OpenEvo Desktop" : "OpenEvo Desktop could not start"}</strong>
             </div>
             {startupPending ? (
               <span className="product-loading-row" role="status" aria-live="polite">
-                <LoaderCircle className="spin" size={16} /> 正在连接本机服务
+                <LoaderCircle className="spin" size={16} /> Starting
               </span>
             ) : (
               <button type="button" className="secondary-button" onClick={onRetry}>
-                <RefreshCw size={15} /> 重试启动
+                <RefreshCw size={15} /> Retry
               </button>
             )}
           </div>
           <div className="initial-sync-sample">
-            <SampleScientificProjectView workspace={workspace} project={selectedSample} />
+            <SampleScientificProjectView
+              workspace={workspace}
+              project={selectedSample}
+              onConnectRemote={onAddRemoteWorkspace}
+            />
           </div>
         </main>
       </div>
@@ -342,6 +362,7 @@ export function ReleaseDesktopProductShell({
   const readinessGeneration = useRef<number | null>(null);
   const lifecycle = useRef<Promise<void>>(Promise.resolve());
   const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading" });
+  const [connectionRequested, setConnectionRequested] = useState(false);
 
   const reportStageBestEffort = useCallback((stage: ReleaseDesktopBootstrapStage): void => {
     try {
@@ -430,6 +451,15 @@ export function ReleaseDesktopProductShell({
     });
   }, [enqueueLifecycle, reportReady, reportStageBestEffort, stopProvider]);
 
+  const requestRemoteWorkspace = useCallback(() => {
+    setConnectionRequested(true);
+    if (startup.status === "failed") start();
+  }, [start, startup.status]);
+
+  const connectionSettingsOpened = useCallback(() => {
+    setConnectionRequested(false);
+  }, []);
+
   useEffect(() => {
     start();
     return () => {
@@ -444,16 +474,35 @@ export function ReleaseDesktopProductShell({
         provider={startup.provider}
         onInitialSnapshotFailed={() => reportStageBestEffort("initial_snapshot_failed")}
         onReady={() => reportCommittedProduct(startup.generation, startup.provider)}
+        openConnectionSettings={connectionRequested}
+        onConnectionSettingsOpened={connectionSettingsOpened}
       />
     );
   }
   if (startup.status === "ready") {
-    return <OpenEvoDesktopOnlyShell provider={startup.provider} />;
+    return (
+      <OpenEvoDesktopOnlyShell
+        provider={startup.provider}
+        openConnectionSettings={connectionRequested}
+        onConnectionSettingsOpened={connectionSettingsOpened}
+      />
+    );
   }
   if (startup.status === "failed") {
-    return <ReleaseStartupSample onRetry={start} />;
+    return (
+      <ReleaseStartupSample
+        onRetry={start}
+        onAddRemoteWorkspace={requestRemoteWorkspace}
+      />
+    );
   }
-  return <ReleaseStartupSample onRetry={start} startupPending />;
+  return (
+    <ReleaseStartupSample
+      onRetry={start}
+      onAddRemoteWorkspace={requestRemoteWorkspace}
+      startupPending
+    />
+  );
 }
 
 // Keep this build-time branch at the entrypoint so Vite can drop shared

@@ -36,7 +36,7 @@ describe("built-in scientific project sample", () => {
     document.body.innerHTML = "";
   });
 
-  it("ships two complete renderer-owned synthetic projects with three artifact carriers", () => {
+  it("ships two complete renderer-owned demo projects with three artifact carriers", () => {
     expect(SAMPLE_SCIENTIFIC_PROJECTS).toHaveLength(2);
     expect(new Set(SAMPLE_SCIENTIFIC_PROJECTS.map((project) => project.id)).size).toBe(2);
     for (const project of SAMPLE_SCIENTIFIC_PROJECTS) {
@@ -71,7 +71,7 @@ describe("built-in scientific project sample", () => {
     expect(PROTEIN_STABILITY_SAMPLE_PROJECT.sessions[2]?.successorEvolutionRevision).toBe("ER-PS-3");
   });
 
-  it("opens the read-only sample on first launch and browses its scientific progression", async () => {
+  it("opens the demo on first launch and browses its scientific progression", async () => {
     provider = createFixtureDesktopProductProvider({ newUser: true });
     const connectProfile = vi.spyOn(provider, "connectProfile");
     const createProject = vi.spyOn(provider, "createProject");
@@ -79,44 +79,44 @@ describe("built-in scientific project sample", () => {
     root = await renderProduct(provider);
 
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    expect(switcher?.value).toBe(optionValueContaining(switcher, "[只读]"));
-    expect(screenText()).toContain("内置示例 · 只读");
-    expect(screenText()).toContain("酶动力学模型复核");
-    expect(screenText()).toContain("结论未通过");
-    expect(screenText()).toContain("验证通过");
+    expect(switcher?.value).toBe(optionValueContaining(switcher, "[Demo]"));
+    expect(screenText()).toContain("Demo");
+    expect(screenText()).toContain("Enzyme Kinetics Model Review");
+    expect(screenText()).toContain("Conclusion not accepted");
+    expect(screenText()).toContain("Validated");
     expect(screenText()).not.toContain("Start session");
 
     const selectedSessionTab = document.querySelector<HTMLButtonElement>('.sample-session-card[aria-selected="true"]');
     if (!selectedSessionTab) throw new Error("Selected sample session tab was not found.");
     selectedSessionTab.focus();
     await act(async () => selectedSessionTab.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
-    expect(screenText()).toContain("Vmax 与 Km 在重复拟合中稳定");
+    expect(screenText()).toContain("Vmax and Km are stable across repeated fits");
 
-    await clickButtonContaining("建立 Michaelis-Menten 基线");
-    expect(screenText()).toContain("线性化拟合对高浓度点产生系统性偏差");
-    expect(screenText()).toContain("推理与工具调用安全摘要");
-    expect(screenText()).toContain("不包含原始思维链、命令、主机位置、凭据或服务地址");
+    await clickButtonContaining("Establish a Michaelis-Menten Baseline");
+    expect(screenText()).toContain("The linearized fit systematically misses high-concentration observations");
+    expect(screenText()).toContain("Reasoning and tool activity");
+    expect(screenText()).toContain("Check dimensions first, then compare residuals");
 
     await clickButton("Evolution");
-    expect(screenText()).toContain("会话封存");
-    expect(screenText()).toContain("下一 Evolution Revision");
-    expect(screenText()).toContain("文本记忆");
-    expect(screenText()).toContain("轨迹到技能");
-    expect(screenText()).toContain("Agent 系统");
+    expect(screenText()).toContain("Run research");
+    expect(screenText()).toContain("Use next session");
+    expect(screenText()).toContain("Text Memory");
+    expect(screenText()).toContain("Trajectory to Skill");
+    expect(screenText()).toContain("Agent System");
 
-    await clickButton("可读产物");
+    await clickButton("Output");
     expect(screenText()).toContain("memory.md");
-    expect(screenText()).toContain("底物浓度统一使用 mM");
+    expect(screenText()).toContain("Use mM for substrate concentration");
 
-    await clickButtonContaining("轨迹到技能");
-    await clickButton("可读产物");
+    await clickButtonContaining("Trajectory to Skill");
+    await clickButton("Output");
     expect(screenText()).toContain("SKILL.md");
-    expect(screenText()).toContain("至少使用三个可复现起点");
+    expect(screenText()).toContain("at least three reproducible starting points");
 
-    await clickButtonContaining("Agent 系统");
-    await clickButton("可读产物");
+    await clickButtonContaining("Agent System");
+    await clickButton("Output");
     expect(screenText()).toContain("AGENTS.md");
-    expect(screenText()).toContain("模型比较必须使用预先固定的留出观测");
+    expect(screenText()).toContain("Compare models using observations fixed in advance for holdout");
 
     expect(connectProfile).not.toHaveBeenCalled();
     expect(createProject).not.toHaveBeenCalled();
@@ -132,7 +132,7 @@ describe("built-in scientific project sample", () => {
     expect(switcher.value).toContain("project-fixture-1");
     expect(screenText()).toContain("Research brief");
     const realProjectValue = switcher.value;
-    const sampleValue = optionValueContaining(switcher, "[只读]");
+    const sampleValue = optionValueContaining(switcher, "[Demo]");
 
     await selectProject(switcher, sampleValue);
     expect(screenText()).toContain("Scientific project tour");
@@ -153,7 +153,7 @@ describe("built-in scientific project sample", () => {
     if (!switcher) throw new Error("Project switcher was not found.");
 
     const realProjectValue = switcher.value;
-    const sampleValue = optionValueContaining(switcher, "[只读]");
+    const sampleValue = optionValueContaining(switcher, "[Demo]");
     expect(realProjectValue).not.toBe(sampleValue);
     expect(screenText()).toContain("Research brief");
 
@@ -173,8 +173,8 @@ describe("built-in scientific project sample", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
 
-    await selectProject(switcher, optionValueContaining(switcher, "[只读]"));
-    await clickButton("Add workspace");
+    await selectProject(switcher, optionValueContaining(switcher, "[Demo]"));
+    await clickButton("Add remote workspace");
 
     const host = inputForLabel("Server address");
     const user = inputForLabel("User name");
@@ -199,8 +199,8 @@ describe("built-in scientific project sample", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
 
-    await selectProject(switcher, optionValueContaining(switcher, "[只读]"));
-    await clickButton("Add workspace");
+    await selectProject(switcher, optionValueContaining(switcher, "[Demo]"));
+    await clickButton("Add remote workspace");
     await enterText(inputForLabel("Workspace name"), "Research GPU");
     await enterText(inputForLabel("Server address"), "gpu.example.test");
     await enterText(inputForLabel("User name"), "researcher");
@@ -213,7 +213,7 @@ describe("built-in scientific project sample", () => {
     await vi.waitFor(() => expect(createProfile).toHaveBeenCalledTimes(1));
     expect(updateProfile).not.toHaveBeenCalled();
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(switcher.value).toBe(optionValueContaining(switcher, "[只读]"));
+    expect(switcher.value).toBe(optionValueContaining(switcher, "[Demo]"));
     expect(screenText()).toContain("Action could not be completed");
     expect(screenText()).toContain("The request could not be completed.");
 
@@ -236,15 +236,15 @@ describe("built-in scientific project sample", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
 
-    await selectProject(switcher, optionValueContaining(switcher, "[只读]"));
-    await clickButton("Add workspace");
+    await selectProject(switcher, optionValueContaining(switcher, "[Demo]"));
+    await clickButton("Add remote workspace");
     await enterText(inputForLabel("Server address"), "new-research.example.org");
     await enterText(inputForLabel("User name"), "scientist");
     provider.failNextRefresh();
     await clickButton("Save workspace");
 
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(switcher.value).toBe(optionValueContaining(switcher, "[只读]"));
+    expect(switcher.value).toBe(optionValueContaining(switcher, "[Demo]"));
     expect(provider.profileCreateActionIds()).toHaveLength(1);
 
     await act(async () => publishSnapshot?.());
@@ -259,7 +259,7 @@ describe("built-in scientific project sample", () => {
     root = await renderProduct(provider);
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
-    await selectProject(switcher, optionValueContaining(switcher, "[只读]"));
+    await selectProject(switcher, optionValueContaining(switcher, "[Demo]"));
 
     const before = await provider.refresh();
     if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
@@ -276,7 +276,7 @@ describe("built-in scientific project sample", () => {
       streamEpoch: before.snapshot.stream.epoch,
     });
 
-    await clickButton("Add workspace");
+    await clickButton("Add remote workspace");
     await enterText(inputForLabel("Workspace name"), concurrentInput.name);
     await enterText(inputForLabel("Server address"), concurrentInput.host);
     await enterText(inputForLabel("User name"), concurrentInput.user);
@@ -284,7 +284,7 @@ describe("built-in scientific project sample", () => {
     await clickButton("Save workspace");
 
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(switcher.value).toBe(optionValueContaining(switcher, "[只读]"));
+    expect(switcher.value).toBe(optionValueContaining(switcher, "[Demo]"));
   });
 
   it("does not apply another profile's host-key review to a newly created workspace", async () => {
@@ -294,8 +294,8 @@ describe("built-in scientific project sample", () => {
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Project switcher was not found.");
 
-    await selectProject(switcher, optionValueContaining(switcher, "[只读]"));
-    await clickButton("Add workspace");
+    await selectProject(switcher, optionValueContaining(switcher, "[Demo]"));
+    await clickButton("Add remote workspace");
     await enterText(inputForLabel("Server address"), "new-research.example.org");
     await enterText(inputForLabel("User name"), "scientist");
     await clickButton("Save workspace");

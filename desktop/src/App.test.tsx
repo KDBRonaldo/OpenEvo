@@ -34,9 +34,9 @@ describe("AppShell", () => {
   it("renders OpenEvo Desktop without shared dashboard navigation in desktop-only mode", () => {
     const html = renderShell("/openevo", true);
 
-    expect(html).toContain("Synchronizing your projects");
-    expect(html).toContain("酶动力学模型复核");
-    expect(html).toContain("蛋白质稳定性证据整合");
+    expect(html).toContain("Loading your workspace");
+    expect(html).toContain("Enzyme Kinetics Model Review");
+    expect(html).toContain("Protein Stability Evidence Review");
     expect(html).not.toContain("OpenEvo Observability");
     expect(html).not.toContain('href="/tasks"');
     expect(html).not.toContain(">Dashboard<");
@@ -45,7 +45,7 @@ describe("AppShell", () => {
   it("renders OpenEvo Desktop at the root path in desktop-only mode", () => {
     const html = renderShell("/", true);
 
-    expect(html).toContain("Synchronizing your projects");
+    expect(html).toContain("Loading your workspace");
     expect(html).not.toContain("Not found");
   });
 });
@@ -74,23 +74,24 @@ describe("ReleaseDesktopProductShell", () => {
     root = await renderReleaseShell(() => pending.promise, vi.fn(async () => {}), vi.fn(async () => {}));
 
     expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("正在启动 OpenEvo Desktop");
+    expect(document.body.textContent).toContain("Starting OpenEvo Desktop");
     const switcher = document.querySelector<HTMLSelectElement>("#startup-sample-project");
     if (!switcher) throw new Error("Pending startup sample switcher was not found.");
     expect(switcher.disabled).toBe(false);
     expect(Array.from(switcher.options)).toHaveLength(2);
     const proteinOption = Array.from(switcher.options).find((option) =>
-      option.textContent?.includes("蛋白质稳定性证据整合")
+      option.textContent?.includes("Protein Stability Evidence Review")
     );
     if (!proteinOption) throw new Error("Pending startup protein sample was not found.");
     await act(async () => {
       switcher.value = proteinOption.value;
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(document.body.textContent).toContain("内置 synthetic 数据");
+    expect(document.body.textContent).toContain("Demo data");
     expect([...document.querySelectorAll("button")].some((item) =>
-      item.textContent?.includes("重试启动")
+      item.textContent?.includes("Retry")
     )).toBe(false);
+    expect(button("Add remote workspace").disabled).toBe(false);
 
     await act(async () => {
       pending.resolve(provider!);
@@ -114,30 +115,30 @@ describe("ReleaseDesktopProductShell", () => {
     expect(refresh).toHaveBeenCalledTimes(1);
     expect(reportReady).not.toHaveBeenCalled();
     expect(document.querySelector('[data-testid="initial-sync-pending"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("Synchronizing your projects");
-    expect(document.body.textContent).toContain("酶动力学模型复核");
+    expect(document.body.textContent).toContain("Loading your workspace");
+    expect(document.body.textContent).toContain("Enzyme Kinetics Model Review");
     const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
     if (!switcher) throw new Error("Pending snapshot sample switcher was not found.");
     expect(switcher.disabled).toBe(false);
     expect(Array.from(switcher.options).filter((option) =>
-      option.textContent?.includes("[只读]")
+      option.textContent?.includes("[Demo]")
     )).toHaveLength(2);
     const proteinOption = Array.from(switcher.options).find((option) =>
-      option.textContent?.includes("蛋白质稳定性证据整合")
+      option.textContent?.includes("Protein Stability Evidence Review")
     );
     if (!proteinOption) throw new Error("Pending snapshot protein sample was not found.");
     await act(async () => {
       switcher.value = proteinOption.value;
       switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(document.body.textContent).toContain("蛋白质稳定性证据整合");
-    expect(document.body.textContent).toContain("内置 synthetic 数据");
+    expect(document.body.textContent).toContain("Protein Stability Evidence Review");
+    expect(document.body.textContent).toContain("Demo data");
 
     await act(async () => {
       button("Evolution").click();
     });
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("从轨迹到 Evolution Revision ER-PS-3");
+    expect(document.body.textContent).toContain("How OpenEvo improved this project");
 
     await act(async () => {
       pendingRefresh.resolve(initial);
@@ -172,15 +173,16 @@ describe("ReleaseDesktopProductShell", () => {
       reportReady,
       reportStage,
     );
-    expect(document.body.textContent).toContain("暂时无法连接 OpenEvo Desktop");
+    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
     expect(document.body.textContent).not.toContain("secret bootstrap detail");
     expect(factory).toHaveBeenCalledTimes(1);
     expect(reportReady).not.toHaveBeenCalled();
 
-    const retry = button("重试启动");
+    const addRemoteWorkspace = button("Add remote workspace");
     await act(async () => {
-      retry.click();
+      addRemoteWorkspace.click();
+      await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
     });
@@ -189,12 +191,14 @@ describe("ReleaseDesktopProductShell", () => {
     expect(reportStage).toHaveBeenCalledWith("provider_create_failed");
     expect(reportStage).toHaveBeenCalledWith("product_committed");
     expect(document.body.textContent).toContain("Research brief");
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("Server connection");
     const firstStart = lifecycle.indexOf("start-1");
     const secondStart = lifecycle.indexOf("start-2");
     expect(lifecycle.slice(firstStart + 1, secondStart)).toContain("stop");
   });
 
-  it("keeps the startup fallback renderer-owned and read-only", async () => {
+  it("keeps the startup fallback renderer-owned and mutation-closed", async () => {
     const factory = vi.fn(async () => {
       throw new Error("native sidecar unavailable");
     });
@@ -205,45 +209,45 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
-    expect(button("重试启动").disabled).toBe(false);
+    expect(button("Retry").disabled).toBe(false);
     expect(reportReady).not.toHaveBeenCalled();
-    expect(document.body.textContent).toContain("内置示例 · 只读");
-    expect(document.body.textContent).toContain("不会连接本机服务或远端服务器");
+    expect(document.body.textContent).toContain("Demo");
     expect(document.body.textContent).not.toContain("Renderer sample");
     expect(document.body.textContent).not.toContain("provider");
+    expect(button("Add remote workspace").disabled).toBe(false);
     expect(
       [...document.querySelectorAll("button")].some((candidate) =>
-        /Add workspace|Create project/i.test(candidate.textContent ?? "")
+        /Create project/i.test(candidate.textContent ?? "")
       ),
     ).toBe(false);
 
     const sampleSwitcher = document.querySelector<HTMLSelectElement>("#startup-sample-project");
     if (!sampleSwitcher) throw new Error("Startup sample switcher was not found.");
     expect(Array.from(sampleSwitcher.options).filter((option) =>
-      option.textContent?.includes("[只读]")
+      option.textContent?.includes("[Demo]")
     )).toHaveLength(2);
     const proteinOption = Array.from(sampleSwitcher.options).find((option) =>
-      option.textContent?.includes("蛋白质稳定性证据整合")
+      option.textContent?.includes("Protein Stability Evidence Review")
     );
     if (!proteinOption) throw new Error("Protein stability startup sample was not found.");
     await act(async () => {
       sampleSwitcher.value = proteinOption.value;
       sampleSwitcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    expect(document.body.textContent).toContain("内置 synthetic 数据");
+    expect(document.body.textContent).toContain("Demo data");
     expect(document.body.textContent).toContain("ER-PS-3");
 
     await act(async () => {
       button("Evolution").click();
     });
     expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
-    await act(async () => button("版本差异").click());
+    await act(async () => button("Changes").click());
     expect(document.body.textContent).toContain("ER-PS-2 → ER-PS-3");
     await act(async () => {
       button("System").click();
     });
     expect(document.querySelector('[data-testid="sample-about-workspace"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("静态、只读、不会运行");
+    expect(document.body.textContent).toContain("No remote workspace");
     await act(async () => {
       button("Research").click();
     });
@@ -341,7 +345,7 @@ describe("ReleaseDesktopProductShell", () => {
       await Promise.resolve();
     });
     expect(stop.mock.calls.length).toBeGreaterThan(stopsBeforeSupersession);
-    expect(document.body.textContent).toContain("正在启动 OpenEvo Desktop");
+    expect(document.body.textContent).toContain("Starting OpenEvo Desktop");
 
     await act(async () => {
       first.resolve(staleProvider);
@@ -357,7 +361,7 @@ describe("ReleaseDesktopProductShell", () => {
     staleProvider.dispose();
   });
 
-  it("keeps the renderer-owned read-only sample when native renderer readiness fails", async () => {
+  it("keeps the renderer-owned demo when native renderer readiness fails", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const factory = vi.fn(async () => provider!);
     const stop = vi.fn(async () => {});
@@ -369,11 +373,10 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(reportReady).toHaveBeenCalledTimes(1);
     expect(stop).toHaveBeenCalledTimes(2);
-    expect(document.body.textContent).toContain("暂时无法连接 OpenEvo Desktop");
+    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
     expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("内置示例 · 只读");
-    expect(document.body.textContent).toContain("不会连接本机服务或远端服务器");
+    expect(document.body.textContent).toContain("Demo");
     expect(document.body.textContent).not.toContain("native renderer contract mismatch");
   });
 
@@ -412,7 +415,7 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(factory).not.toHaveBeenCalled();
     expect(reportStage).not.toHaveBeenCalledWith("provider_create_failed");
-    expect(document.body.textContent).toContain("暂时无法连接 OpenEvo Desktop");
+    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
     expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
     expect(document.body.textContent).not.toContain("native stop unavailable");
   });

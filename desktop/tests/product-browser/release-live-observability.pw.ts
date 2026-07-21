@@ -67,7 +67,7 @@ const PHASE_ORDER = [
   "terminal",
 ] as const;
 const TARGETS = ["agent_system", "skill_bundle", "text_memory"] as const;
-const SAMPLE_NAMES = ["酶动力学模型复核", "蛋白质稳定性证据整合"] as const;
+const SAMPLE_NAMES = ["Enzyme Kinetics Model Review", "Protein Stability Evidence Review"] as const;
 
 const sha256Schema = z.string().regex(/^[0-9a-f]{64}$/);
 const phaseSchema = z.enum(PHASE_ORDER);
@@ -285,7 +285,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   const projectSelector = page.getByLabel("Project", { exact: true });
   await expect(projectSelector).toBeVisible();
   for (const sampleName of SAMPLE_NAMES) {
-    await projectSelector.selectOption({ label: `[只读] ${sampleName}` });
+    await projectSelector.selectOption({ label: `[Demo] ${sampleName}` });
     await expect(page.getByRole("heading", { name: sampleName })).toBeVisible();
   }
   const selectedRealProject = await page.evaluate(({ projectId, projectName }) => {

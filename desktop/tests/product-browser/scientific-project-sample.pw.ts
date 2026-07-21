@@ -10,10 +10,10 @@ test("first-run sample is accessible, keyboard-operable, and viewport-safe", asy
   page,
 }) => {
   await expect(page.locator("html")).toHaveAttribute("lang", "en");
-  await expect(page.getByTestId("sample-research-workspace")).toHaveAttribute("lang", "zh-CN");
-  await expect(page.getByRole("heading", { name: "酶动力学模型复核" })).toBeVisible();
-  await expect(page.getByText("Project Head", { exact: true })).toBeVisible();
-  await expect(page.getByText("Evolution Revision", { exact: true })).toBeVisible();
+  await expect(page.getByTestId("sample-research-workspace")).toHaveAttribute("lang", "en");
+  await expect(page.getByRole("heading", { name: "Enzyme Kinetics Model Review" })).toBeVisible();
+  await expect(page.getByText("Research engine", { exact: true })).toBeVisible();
+  await expect(page.getByText("3 components improved", { exact: true })).toBeVisible();
   await assertViewportSafety(page);
   await assertAccessibility(page);
   await expect(page).toHaveScreenshot("scientific-project-research.png", {
@@ -28,12 +28,13 @@ test("first-run sample is accessible, keyboard-operable, and viewport-safe", asy
   await page.getByRole("button", { name: "Evolution" }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("sample-evolution-workspace")).toBeVisible();
-  await expect(page.getByText("Evolution Revision ER-3", { exact: false }).first()).toBeVisible();
+  await expect(page.getByRole("heading", { name: "How OpenEvo improved this project" })).toBeVisible();
+  await expect(page.getByText("Update ER-3", { exact: true })).toBeVisible();
 
-  const processTab = page.getByRole("tab", { name: /演化过程/ });
+  const processTab = page.getByRole("tab", { name: "Evolution", exact: true });
   await processTab.focus();
   await processTab.press("ArrowRight");
-  await expect(page.getByRole("tab", { name: /可读产物/ })).toHaveAttribute("aria-selected", "true");
+  await expect(page.getByRole("tab", { name: "Output", exact: true })).toHaveAttribute("aria-selected", "true");
   await expect(page.getByText("memory.md", { exact: true })).toBeVisible();
 
   await assertViewportSafety(page);

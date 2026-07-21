@@ -20,6 +20,7 @@ import time
 from typing import NamedTuple
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parents[1]
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
@@ -31,6 +32,7 @@ from smoke_openevo_desktop_sidecar import (  # noqa: E402
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
 APP_BUNDLE_NAME = "OpenEvo Desktop.app"
+EXPECTED_MACOS_ICON = REPO_ROOT / "desktop" / "src-tauri" / "icons" / "icon.icns"
 EVIDENCE_SCHEMA_VERSION = 3
 LAUNCH_ORIGINS = {"mounted_dmg", "detached_copy"}
 REQUIRED_BOOLEAN_EVIDENCE = (
@@ -234,6 +236,31 @@ def _validate_macos_loopback_transport(app: Path) -> None:
         != {"NSExceptionAllowsInsecureHTTPLoads": True}
     ):
         raise SmokeFailure("App Info.plist loopback ATS policy is invalid")
+
+
+def _validate_macos_app_icon(app: Path, expected_icon: Path = EXPECTED_MACOS_ICON) -> None:
+    payload = _read_app_info_plist(app)
+    icon_name = payload.get("CFBundleIconFile")
+    if icon_name not in {"icon", "icon.icns"}:
+        raise SmokeFailure("App Info.plist does not select the expected macOS icon")
+    packaged_icon = app / "Contents" / "Resources" / "icon.icns"
+    packaged_metadata = _bundle_path_metadata(
+        app,
+        packaged_icon,
+        subject="App macOS icon",
+        required=True,
+    )
+    assert packaged_metadata is not None
+    if not stat.S_ISREG(packaged_metadata.st_mode):
+        raise SmokeFailure("App macOS icon is not a regular file")
+    try:
+        expected_metadata = expected_icon.lstat()
+    except OSError as exc:
+        raise SmokeFailure("Expected generated macOS icon is unavailable") from exc
+    if not stat.S_ISREG(expected_metadata.st_mode):
+        raise SmokeFailure("Expected generated macOS icon is not a regular file")
+    if _sha256(packaged_icon) != _sha256(expected_icon):
+        raise SmokeFailure("App macOS icon does not match the generated release icon")
 
 
 def find_app_executable(bundle_root: Path) -> Path:
@@ -981,6 +1008,7 @@ def smoke_bundle(
     app = _app_bundle(bundle_root)
     if sys.platform == "darwin":
         _validate_macos_loopback_transport(app)
+        _validate_macos_app_icon(app)
     nonce = os.urandom(32).hex()
     with tempfile.TemporaryDirectory(prefix="openevo-desktop-app-smoke-") as temporary:
         smoke_root = Path(temporary)

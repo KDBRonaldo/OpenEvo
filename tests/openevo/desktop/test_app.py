@@ -462,7 +462,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
             "preferred_major": 1,
             "supported_majors": [1],
                 "openapi_sha256": "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb",
-                "build_version": "0.1.4",
+                "build_version": "0.1.5",
             "source_commit": "89baeb26",
             "build_channel": "test",
             "provider_kind": "desktop_sidecar",

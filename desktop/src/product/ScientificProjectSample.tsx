@@ -4,15 +4,13 @@ import {
   BrainCircuit,
   Check,
   CheckCircle2,
-  CircleDot,
   FileDiff,
   FileText,
-  FlaskConical,
   FolderOpen,
-  Info,
   MemoryStick,
   Microscope,
   PanelLeft,
+  Plus,
   ShieldCheck,
   Sparkles,
   TerminalSquare,
@@ -43,18 +41,17 @@ export function SampleScientificProjectView({
 }) {
   if (workspace === "evolution") return <SampleEvolutionWorkspace project={project} />;
   if (workspace === "system") return <SampleAboutWorkspace project={project} onConnectRemote={onConnectRemote} />;
-  return <SampleResearchWorkspace project={project} onConnectRemote={onConnectRemote} />;
+  return <SampleResearchWorkspace project={project} />;
 }
 
-function SampleResearchWorkspace({ project, onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
+function SampleResearchWorkspace({ project }: { project: SampleScientificProject }) {
   const [selectedSessionId, setSelectedSessionId] = useState(project.sessions.at(-1)?.id ?? "");
   useEffect(() => setSelectedSessionId(project.sessions.at(-1)?.id ?? ""), [project.id]);
   const selected =
     project.sessions.find((session) => session.id === selectedSessionId) ?? project.sessions[0];
 
   return (
-    <div className="workspace-stack sample-workspace" data-testid="sample-research-workspace" lang="zh-CN">
-      <SampleBanner project={project} onConnectRemote={onConnectRemote} />
+    <div className="workspace-stack sample-workspace" data-testid="sample-research-workspace" lang="en">
       <div className="workspace-heading sample-heading">
         <div>
           <p className="eyebrow">Scientific project tour</p>
@@ -64,20 +61,19 @@ function SampleResearchWorkspace({ project, onConnectRemote }: { project: Sample
         <span className="sample-readonly-label"><ShieldCheck size={15} /> {project.badge}</span>
       </div>
 
-      <section className="sample-project-facts" aria-label="示例项目概况">
-        <div><FolderOpen size={16} /><span>输入</span><strong>{project.sourceLabel}</strong></div>
-        <div><TerminalSquare size={16} /><span>执行</span><strong>{project.executionLabel}</strong></div>
-        <div><BookOpenCheck size={16} /><span>捕获</span><strong>{project.captureLabel}</strong></div>
-        <div><CircleDot size={16} /><span>Project Head</span><strong>Generation {project.activeProjectHeadGeneration}</strong></div>
-        <div><Sparkles size={16} /><span>Evolution Revision</span><strong>{project.activeEvolutionRevision}</strong></div>
+      <section className="sample-project-facts" aria-label="Demo project overview">
+        <div><FolderOpen size={16} /><span>Data</span><strong>{project.sourceLabel}</strong></div>
+        <div><TerminalSquare size={16} /><span>Research engine</span><strong>{project.executionLabel}</strong></div>
+        <div><BookOpenCheck size={16} /><span>Sessions</span><strong>{project.sessions.length} completed</strong></div>
+        <div><Sparkles size={16} /><span>Evolution</span><strong>{project.evolutionTargets.length} components improved</strong></div>
       </section>
 
       <section className="sample-progression" aria-labelledby="sample-progression-title">
         <div className="section-heading">
-          <div><Microscope size={17} /><h2 id="sample-progression-title">三次连续任务</h2></div>
-          <span>基线失败 → 机制验证</span>
+          <div><Microscope size={17} /><h2 id="sample-progression-title">Three consecutive sessions</h2></div>
+          <span>Baseline failure → validated result</span>
         </div>
-        <div className="sample-session-cards" role="tablist" aria-label="示例任务与会话" onKeyDown={handleSampleTabKeyDown}>
+        <div className="sample-session-cards" role="tablist" aria-label="Demo sessions" onKeyDown={handleSampleTabKeyDown}>
           {project.sessions.map((session) => (
             <button
               key={session.id}
@@ -96,8 +92,8 @@ function SampleResearchWorkspace({ project, onConnectRemote }: { project: Sample
                 {outcomeIcon(session.outcome)}
                 {session.outcomeLabel}
               </span>
-              <small>Project Head {session.pinnedProjectHeadGeneration} → {session.successorProjectHeadGeneration}</small>
-              <small>Evolution {session.pinnedEvolutionRevision} → {session.successorEvolutionRevision}</small>
+              <small>Generation {session.pinnedProjectHeadGeneration} → {session.successorProjectHeadGeneration}</small>
+              <small>Memory, skill, and agent system updated</small>
             </button>
           ))}
         </div>
@@ -124,21 +120,21 @@ function SampleSessionDetail({ session }: { session: SampleSession }) {
         <p className="sample-objective">{session.objective}</p>
         <div className="sample-finding">
           {session.outcome === "needs_revision" ? <TriangleAlert size={18} /> : <CheckCircle2 size={18} />}
-          <div><span>科研结论</span><strong>{session.finding}</strong></div>
+          <div><span>Scientific finding</span><strong>{session.finding}</strong></div>
         </div>
         <div className="brief-footer">
-          <div><span>时间</span><strong>{session.occurredAt}</strong></div>
-          <div><span>用时</span><strong>{session.duration}</strong></div>
-          <div><span>上下文</span><strong>{session.contextUsed.length ? `${session.contextUsed.length} 类 evolution` : "Genesis"}</strong></div>
+          <div><span>Time</span><strong>{session.occurredAt}</strong></div>
+          <div><span>Duration</span><strong>{session.duration}</strong></div>
+          <div><span>Prior improvements</span><strong>{session.contextUsed.length ? `${session.contextUsed.length} evolved components` : "None"}</strong></div>
         </div>
       </section>
 
       <section className="product-panel sample-timeline-panel">
         <div className="panel-heading">
-          <div><span className="panel-kicker">Task / session timeline</span><h2>会话时间线</h2></div>
+          <div><span className="panel-kicker">Task / session timeline</span><h2>Session timeline</h2></div>
           <span className="sample-revision-flow">
-            <span>Head {session.pinnedProjectHeadGeneration}<ArrowRight size={13} />{session.successorProjectHeadGeneration}</span>
-            <span>{session.pinnedEvolutionRevision}<ArrowRight size={13} />{session.successorEvolutionRevision}</span>
+            <span>Generation {session.pinnedProjectHeadGeneration}<ArrowRight size={13} />{session.successorProjectHeadGeneration}</span>
+            <span>Update {session.pinnedEvolutionRevision}<ArrowRight size={13} />{session.successorEvolutionRevision}</span>
           </span>
         </div>
         <ol className="sample-timeline">
@@ -153,12 +149,8 @@ function SampleSessionDetail({ session }: { session: SampleSession }) {
 
       <section className="product-panel sample-trace-panel">
         <div className="panel-heading">
-          <div><span className="panel-kicker">Codex transcript</span><h2>推理与工具调用安全摘要</h2></div>
-          <span className="sample-safe-label"><ShieldCheck size={14} /> 已脱敏</span>
+          <div><span className="panel-kicker">Codex transcript</span><h2>Reasoning and tool activity</h2></div>
         </div>
-        <p className="sample-trace-note">
-          仅展示决策摘要和工具类别，不包含原始思维链、命令、主机位置、凭据或服务地址。
-        </p>
         <div className="sample-trace-list">
           {session.trace.map((entry) => (
             <article key={entry.id} className={`sample-trace-entry ${entry.kind}`}>
@@ -185,19 +177,18 @@ function SampleEvolutionWorkspace({ project }: { project: SampleScientificProjec
     project.evolutionTargets[0];
 
   return (
-    <div className="workspace-stack sample-workspace" data-testid="sample-evolution-workspace" lang="zh-CN">
-      <SampleBanner project={project} />
+    <div className="workspace-stack sample-workspace" data-testid="sample-evolution-workspace" lang="en">
       <div className="workspace-heading sample-heading">
         <div>
-          <p className="eyebrow">Cross-session evolution</p>
-          <h1>从轨迹到 Evolution Revision {project.activeEvolutionRevision}</h1>
-          <p>每次会话结束后封存输入，产物只在后续会话生效。</p>
+          <p className="eyebrow">How OpenEvo learns</p>
+          <h1>How OpenEvo improved this project</h1>
+          <p>Each completed session updates selected components for the next task.</p>
         </div>
-        <span className="sample-readonly-label"><ShieldCheck size={15} /> 内置示例 · 只读</span>
+        <span className="sample-readonly-label"><ShieldCheck size={15} /> Demo</span>
       </div>
 
-      <section className="sample-evolution-pipeline" aria-label="跨会话演化流程">
-        {["会话封存", "轨迹整理", "三类演化", "产物验证", "下一 Evolution Revision"].map((label, index) => (
+      <section className="sample-evolution-pipeline" aria-label="Cross-session improvement process">
+        {["Run research", "Review result", "Update components", "Validate updates", "Use next session"].map((label, index) => (
           <div key={label}>
             <span>{index + 1}</span>
             <strong>{label}</strong>
@@ -207,7 +198,7 @@ function SampleEvolutionWorkspace({ project }: { project: SampleScientificProjec
       </section>
 
       <div className="sample-evolution-layout">
-        <aside className="sample-target-list" aria-label="Evolution targets">
+        <aside className="sample-target-list" aria-label="Evolved components">
           {project.evolutionTargets.map((target) => (
             <button
               key={target.id}
@@ -240,12 +231,12 @@ function SampleEvolutionTargetDetail({ target, activeEvolutionRevision }: { targ
           <h2>{target.label}</h2>
           <p>{target.description}</p>
         </div>
-        <div className="artifact-meta"><span>Evolution Revision {activeEvolutionRevision}</span><span><CheckCircle2 size={13} /> Active</span></div>
+        <div className="artifact-meta"><span>Update {activeEvolutionRevision}</span><span><CheckCircle2 size={13} /> Active</span></div>
       </div>
-      <div className="segmented-control" role="tablist" aria-label={`${target.label}视图`} onKeyDown={handleSampleTabKeyDown}>
-        <button id="sample-evolution-process-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "process"} tabIndex={view === "process" ? 0 : -1} className={view === "process" ? "active" : ""} onClick={() => setView("process")}><Sparkles size={14} /> 演化过程</button>
-        <button id="sample-evolution-artifact-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "artifact"} tabIndex={view === "artifact" ? 0 : -1} className={view === "artifact" ? "active" : ""} onClick={() => setView("artifact")}><FileText size={14} /> 可读产物</button>
-        <button id="sample-evolution-diff-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "diff"} tabIndex={view === "diff" ? 0 : -1} className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}><FileDiff size={14} /> 版本差异</button>
+      <div className="segmented-control" role="tablist" aria-label={`${target.label} views`} onKeyDown={handleSampleTabKeyDown}>
+        <button id="sample-evolution-process-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "process"} tabIndex={view === "process" ? 0 : -1} className={view === "process" ? "active" : ""} onClick={() => setView("process")}><Sparkles size={14} /> Evolution</button>
+        <button id="sample-evolution-artifact-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "artifact"} tabIndex={view === "artifact" ? 0 : -1} className={view === "artifact" ? "active" : ""} onClick={() => setView("artifact")}><FileText size={14} /> Output</button>
+        <button id="sample-evolution-diff-tab" aria-controls="sample-evolution-view-panel" type="button" role="tab" aria-selected={view === "diff"} tabIndex={view === "diff" ? 0 : -1} className={view === "diff" ? "active" : ""} onClick={() => setView("diff")}><FileDiff size={14} /> Changes</button>
       </div>
       <div
         id="sample-evolution-view-panel"
@@ -258,7 +249,7 @@ function SampleEvolutionTargetDetail({ target, activeEvolutionRevision }: { targ
               <li key={step.sessionId}>
                 <span className="sample-step-index">{index + 1}</span>
                 <div className="sample-step-copy">
-                  <div><strong>Session {index + 1} → Evolution Revision {step.evolutionRevision}</strong><span><CheckCircle2 size={13} /> 已激活</span></div>
+                  <div><strong>After session {index + 1} · {step.evolutionRevision}</strong><span><CheckCircle2 size={13} /> Active</span></div>
                   <small>{step.input}</small>
                   <p>{step.change}</p>
                 </div>
@@ -267,11 +258,11 @@ function SampleEvolutionTargetDetail({ target, activeEvolutionRevision }: { targ
           </ol>
         ) : view === "artifact" ? (
           <div className="sample-artifact-document">
-            <div><FileText size={15} /><strong>{target.artifact.title}</strong><span>只读预览</span></div>
+            <div><FileText size={15} /><strong>{target.artifact.title}</strong><span>Preview</span></div>
             <pre>{target.artifact.content}</pre>
           </div>
         ) : (
-          <div className="diff-view sample-artifact-diff" aria-label={`${target.artifact.title} 版本差异`}>
+          <div className="diff-view sample-artifact-diff" aria-label={`${target.artifact.title} changes`}>
             <div className="diff-document-heading">
               <span>modified</span>
               <h3>{target.artifact.title} · {target.artifact.previousRevision} → {target.artifact.currentRevision}</h3>
@@ -289,38 +280,23 @@ function SampleEvolutionTargetDetail({ target, activeEvolutionRevision }: { targ
   );
 }
 
-function SampleAboutWorkspace({ project, onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
+function SampleAboutWorkspace({ onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
   return (
-    <div className="workspace-stack sample-workspace" data-testid="sample-about-workspace" lang="zh-CN">
-      <SampleBanner project={project} />
+    <div className="workspace-stack sample-workspace" data-testid="sample-about-workspace" lang="en">
       <div className="workspace-heading sample-heading">
         <div>
-          <p className="eyebrow">About this sample</p>
-          <h1>静态、只读、不会运行</h1>
-          <p>这个项目用于首启浏览产品结构，不代表本机或远端已有运行结果。</p>
+          <p className="eyebrow">System</p>
+          <h1>No remote workspace</h1>
+          <p>Add the Linux server that will run your research sessions.</p>
         </div>
       </div>
-      <section className="sample-about-grid">
-        <article><ShieldCheck size={21} /><h2>明确隔离</h2><p>数据随 Desktop 发布，不请求 SSH、远端 OpenEvo 服务或外部网络。</p></article>
-        <article><Info size={21} /><h2>安全摘要</h2><p>只包含策展后的科研过程，不包含原始思维链、命令、凭据或主机信息。</p></article>
-        <article><FlaskConical size={21} /><h2>合成数据</h2><p>任务与数值为演示用途，不应作为真实科学结论引用。</p></article>
-      </section>
       <section className="sample-next-step">
-        <div><PanelLeft size={20} /><div><strong>开始真实项目</strong><p>添加远端工作区后，真实项目将使用独立的受鉴权连接与权威数据。</p></div></div>
+        <div><PanelLeft size={20} /><div><strong>Connect a research server</strong><p>OpenEvo Desktop will install and manage the remote Daemon.</p></div></div>
         {onConnectRemote ? (
-          <button type="button" className="primary-button" onClick={onConnectRemote}><PanelLeft size={16} /> 添加远端工作区</button>
+          <button type="button" className="primary-button" onClick={onConnectRemote}><Plus size={16} /> Add remote workspace</button>
         ) : null}
       </section>
     </div>
-  );
-}
-
-function SampleBanner({ project, onConnectRemote }: { project: SampleScientificProject; onConnectRemote?: () => void }) {
-  return (
-    <section className="sample-banner" aria-label="内置示例说明">
-      <div><Info size={17} /><p><strong>{project.badge}</strong><span>合成内容，仅用于浏览产品；Add a remote workspace 后才会连接或执行真实任务。</span></p></div>
-      {onConnectRemote ? <button type="button" className="text-button" onClick={onConnectRemote}>Add workspace <ArrowRight size={14} /></button> : null}
-    </section>
   );
 }
 

@@ -31,7 +31,7 @@ type HarnessObservation = {
   unexpectedCalls: string[];
 };
 
-test("first launch uses the release sidecar composition and keeps its sample read-only", async ({
+test("first launch uses the release sidecar composition and keeps demo navigation non-mutating", async ({
   page,
 }, testInfo) => {
   const sidecarObservation: Pick<HarnessObservation, "httpCalls" | "unexpectedCalls"> = {
@@ -55,7 +55,7 @@ test("first launch uses the release sidecar composition and keeps its sample rea
 
   await page.goto("/");
   await expect(page.getByTestId("sample-research-workspace")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "酶动力学模型复核" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Enzyme Kinetics Model Review" })).toBeVisible();
   await expect(page.locator(".product-shell")).toHaveAttribute(
     "data-provider-kind",
     "desktop_sidecar",
@@ -64,16 +64,26 @@ test("first launch uses the release sidecar composition and keeps its sample rea
     "data-system-maintenance-available",
     "true",
   );
-  await expect(page.getByText("内置示例 · 只读", { exact: true }).first()).toBeVisible();
-  await expect(page.getByText("内置合成数据 · 12 个观测点", { exact: true })).toBeVisible();
+  await expect(page.getByText("Demo", { exact: true }).first()).toBeVisible();
+  await expect(page.getByText("Demo data · 12 observations", { exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("contract_simulator");
+  const addRemoteWorkspace = page.getByRole("button", {
+    name: "Add remote workspace",
+    exact: true,
+  });
+  await expect(addRemoteWorkspace).toBeVisible();
+  await expect(addRemoteWorkspace).toHaveClass(/primary-button/);
+  await addRemoteWorkspace.click();
+  await expect(page.getByRole("dialog", { name: "Server connection" })).toBeVisible();
+  await page.getByRole("button", { name: "Close connection settings", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Server connection" })).toBeHidden();
   const projectSelector = page.getByLabel("Project", { exact: true });
   await expect(projectSelector.locator("option")).toHaveCount(2);
-  await projectSelector.selectOption({ label: "[只读] 蛋白质稳定性证据整合" });
-  await expect(page.getByRole("heading", { name: "蛋白质稳定性证据整合" })).toBeVisible();
-  await expect(page.getByText("48 条 DSF 曲线 + 12 条 SEC 汇总", { exact: false })).toBeVisible();
-  await projectSelector.selectOption({ label: "[只读] 酶动力学模型复核" });
-  await expect(page.getByRole("heading", { name: "酶动力学模型复核" })).toBeVisible();
+  await projectSelector.selectOption({ label: "[Demo] Protein Stability Evidence Review" });
+  await expect(page.getByRole("heading", { name: "Protein Stability Evidence Review" })).toBeVisible();
+  await expect(page.getByText("48 DSF curves + 12 SEC summaries", { exact: false })).toBeVisible();
+  await projectSelector.selectOption({ label: "[Demo] Enzyme Kinetics Model Review" });
+  await expect(page.getByRole("heading", { name: "Enzyme Kinetics Model Review" })).toBeVisible();
   await assertViewportSafety(page, testInfo.project.name);
   await expect(page).toHaveScreenshot("release-packaged-research.png");
 
@@ -89,31 +99,34 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await evolution.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("sample-evolution-workspace")).toBeVisible();
-  const processTab = page.getByRole("tab", { name: /演化过程/ });
+  await expect(page.getByRole("heading", { name: "How OpenEvo improved this project" })).toBeVisible();
+  await expect(page.getByText("Update components", { exact: true })).toBeVisible();
+  const processTab = page.getByRole("tab", { name: "Evolution", exact: true });
   await processTab.focus();
   await processTab.press("ArrowRight");
-  await expect(page.getByRole("tab", { name: /可读产物/ })).toHaveAttribute(
+  await expect(page.getByRole("tab", { name: "Output", exact: true })).toHaveAttribute(
     "aria-selected",
     "true",
   );
   await expect(page.getByText("memory.md", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: /轨迹到技能/ }).click();
+  await page.getByRole("button", { name: /Trajectory to Skill/ }).click();
   await expect(page.getByText("Failed fit trajectory", { exact: true })).toBeVisible();
-  await page.getByRole("tab", { name: /可读产物/ }).click();
+  await page.getByRole("tab", { name: "Output", exact: true }).click();
   await expect(page.getByText("SKILL.md", { exact: true })).toBeVisible();
 
-  await page.getByRole("button", { name: /Agent 系统/ }).click();
+  await page.getByRole("button", { name: /Agent System/ }).click();
   await expect(page.getByText("Rejected conclusion", { exact: true })).toBeVisible();
-  await page.getByRole("tab", { name: /可读产物/ }).click();
+  await page.getByRole("tab", { name: "Output", exact: true }).click();
   await expect(page.getByText("AGENTS.md", { exact: true })).toBeVisible();
   const agentSystemArtifact = page.getByText("AGENTS.md", { exact: true });
   await agentSystemArtifact.scrollIntoViewIfNeeded();
   await assertViewportSafety(page, testInfo.project.name);
   if (testInfo.project.name === "release-packaged-760") {
-    // Narrow Linux viewports use geometry and occlusion checks because font
-    // packages can change the full-page scroll offset across runner images.
     await expect(agentSystemArtifact).toBeInViewport();
+    await page.evaluate(() => window.scrollTo(0, 0));
+    await expect(page.getByRole("heading", { name: "How OpenEvo improved this project" })).toBeInViewport();
+    await expect(page).toHaveScreenshot("release-packaged-evolution.png");
   } else {
     await expect(page).toHaveScreenshot("release-packaged-evolution.png");
   }
@@ -122,7 +135,13 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await system.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("sample-about-workspace")).toBeVisible();
-  await expect(page.getByRole("heading", { name: "静态、只读、不会运行" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "No remote workspace" })).toBeVisible();
+  await expect(
+    page.getByTestId("sample-about-workspace").getByRole("button", {
+      name: "Add remote workspace",
+      exact: true,
+    }),
+  ).toBeVisible();
 
   for (const name of [
     "Check",
@@ -168,16 +187,16 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await page.goto("/?native=readiness-failure");
   await expect(page.getByTestId("release-startup-sample")).toBeVisible();
   await expect(page.getByTestId("sample-research-workspace")).toBeVisible();
-  await expect(page.getByText("暂时无法连接 OpenEvo Desktop", { exact: true })).toBeVisible();
-  await expect(page.getByText("内置示例 · 只读", { exact: true }).first()).toBeVisible();
-  await expect(page.getByText("不会连接本机服务或远端服务器", { exact: false })).toBeVisible();
+  await expect(page.getByText("OpenEvo Desktop could not start", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Retry", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Add remote workspace", exact: true })).toBeVisible();
   const offlineProjectSelector = page.getByLabel("Project", { exact: true });
   await expect(offlineProjectSelector.locator("option")).toHaveCount(2);
   await offlineProjectSelector.selectOption({
-    label: "[只读] 蛋白质稳定性证据整合",
+    label: "[Demo] Protein Stability Evidence Review",
   });
-  await expect(page.getByRole("heading", { name: "蛋白质稳定性证据整合" })).toBeVisible();
-  await offlineProjectSelector.selectOption({ label: "[只读] 酶动力学模型复核" });
+  await expect(page.getByRole("heading", { name: "Protein Stability Evidence Review" })).toBeVisible();
+  await offlineProjectSelector.selectOption({ label: "[Demo] Enzyme Kinetics Model Review" });
   await expect(page.locator("body")).not.toContainText("Renderer sample");
   await expect(page.locator("body")).not.toContainText("provider");
   await expect(page.locator(".product-shell")).not.toHaveAttribute(
@@ -187,18 +206,21 @@ test("first launch uses the release sidecar composition and keeps its sample rea
   await assertViewportSafety(page, testInfo.project.name);
 
   await page.keyboard.press("Tab");
-  const researchTab = page.getByRole("tab", { name: "Research", exact: true });
+  const demoNavigation = page.getByLabel("Demo views");
+  const researchTab = demoNavigation.getByRole("tab", { name: "Research", exact: true });
   await expect(researchTab).toBeFocused();
   await researchTab.press("ArrowDown");
-  const evolutionTab = page.getByRole("tab", { name: "Evolution", exact: true });
+  const evolutionTab = demoNavigation.getByRole("tab", { name: "Evolution", exact: true });
   await expect(evolutionTab).toBeFocused();
   await expect(evolutionTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByTestId("sample-evolution-workspace")).toBeVisible();
 
-  const offlineProcessTab = page.getByRole("tab", { name: /演化过程/ });
+  const offlineProcessTab = page
+    .getByTestId("sample-evolution-workspace")
+    .getByRole("tab", { name: "Evolution", exact: true });
   await offlineProcessTab.focus();
   await offlineProcessTab.press("ArrowRight");
-  await expect(page.getByRole("tab", { name: /可读产物/ })).toHaveAttribute(
+  await expect(page.getByRole("tab", { name: "Output", exact: true })).toHaveAttribute(
     "aria-selected",
     "true",
   );
@@ -206,7 +228,7 @@ test("first launch uses the release sidecar composition and keeps its sample rea
 
   await evolutionTab.focus();
   await evolutionTab.press("ArrowDown");
-  const systemTab = page.getByRole("tab", { name: "System", exact: true });
+  const systemTab = demoNavigation.getByRole("tab", { name: "System", exact: true });
   await expect(systemTab).toBeFocused();
   await expect(systemTab).toHaveAttribute("aria-selected", "true");
   await expect(page.getByTestId("sample-about-workspace")).toBeVisible();
@@ -218,7 +240,6 @@ test("first launch uses the release sidecar composition and keeps its sample rea
 
   for (const name of [
     "Add workspace",
-    "Add remote workspace",
     "Create project",
     "Check",
     "Diagnostics",
