@@ -30,6 +30,8 @@ EvolutionMethod = Callable[[WorkerClaimedJob, Path], list[ArtifactRegisterReques
 
 _REFLECTOR_PROVIDER_OPENAI_CHAT = "openai_chat"
 _REFLECTOR_PROVIDER_CODEX_CLI = "codex_cli"
+_DEFAULT_REFLECTOR_TIMEOUT_SECONDS = 30.0
+_DEFAULT_CODEX_CLI_REFLECTOR_TIMEOUT_SECONDS = 300.0
 _REFLECTOR_PROXY_ENV_VARS = (
     "OPENAI_BASE_URL",
     "OPENAI_API_KEY",
@@ -5176,9 +5178,14 @@ def _reflector_llm_config(job: WorkerClaimedJob) -> dict[str, Any]:
         raw_config.get("temperature", job.config.get("reflector_temperature")),
         0.2,
     )
+    default_timeout_seconds = (
+        _DEFAULT_CODEX_CLI_REFLECTOR_TIMEOUT_SECONDS
+        if provider == _REFLECTOR_PROVIDER_CODEX_CLI
+        else _DEFAULT_REFLECTOR_TIMEOUT_SECONDS
+    )
     timeout_seconds = _float_config(
         raw_config.get("timeout_seconds", job.config.get("reflector_timeout_seconds")),
-        30.0,
+        default_timeout_seconds,
     )
     max_tokens = raw_config.get("max_tokens", job.config.get("reflector_max_tokens"))
     codex_home = _config_string(raw_config, "codex_home") or _config_string(

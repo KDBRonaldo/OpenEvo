@@ -1498,6 +1498,32 @@ def test_agent_system_reflector_can_use_codex_cli_subscription_provider(tmp_path
     assert artifact.manifest["reflector_model"] == "gpt-5.4"
 
 
+def test_reflector_llm_uses_provider_specific_default_timeout(tmp_path: Path):
+    codex_job = _job(
+        "agent_system_reflector",
+        tmp_path,
+        config={
+            "reflector_llm": {
+                "provider": "codex_cli",
+                "model": "gpt-5.4",
+            }
+        },
+    )
+    openai_job = _job(
+        "agent_system_reflector",
+        tmp_path,
+        config={
+            "reflector_llm": {
+                "provider": "openai_chat",
+                "model": "gpt-5.4",
+            }
+        },
+    )
+
+    assert methods_module._reflector_llm_config(codex_job)["timeout_seconds"] == 300.0
+    assert methods_module._reflector_llm_config(openai_job)["timeout_seconds"] == 30.0
+
+
 def test_agent_system_reflector_preserves_existing_agent_system_as_base(tmp_path, monkeypatch):
     _patch_reflector_llm(
         monkeypatch,
