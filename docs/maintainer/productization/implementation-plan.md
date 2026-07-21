@@ -38,13 +38,15 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-Version `0.1.5` is the current public, installable unsigned exhibition Preview.
-It proves the real mounted and copied DMG, packaged sidecar and renderer, a
-self-contained Daemon Bundle, managed-runtime packaging smoke, and immutable
-release asset roundtrip. It was published through the emergency manual path
-documented in `docs/maintainer/release-process.md`; it has no detached signed
-candidate-bound science publication record or clean-host matrix evidence, and
-it is intentionally non-gating. It does not prove G2, G3, G12, or a complete
+Version `0.1.6` is the current public, installable unsigned exhibition Preview.
+It proves the real mounted and copied DMG, bounded Desktop startup, packaged
+sidecar and renderer, a self-contained Daemon Bundle, managed upgrade from
+`0.1.5`, managed-runtime packaging, and immutable release asset roundtrip.
+Signed candidate-bound evidence additionally proves two real remote Codex
+Subscription sessions, all three text-evolution targets, and next-session
+artifact reuse through the packaged renderer and live Desktop Local API. It has
+no final macOS Tauri-to-remote-host E2E or clean-host matrix evidence, and it is
+intentionally non-gating. It does not prove G2, G3, G12, or a complete
 ordinary-user qualification matrix, and it is not the candidate that will
 satisfy G1-G12. Earlier Preview releases are retained as historical evidence.
 System, Files, and History remain incomplete; the v2 authority cutover, G4, and
@@ -52,16 +54,13 @@ G7-G12 remain open.
 
 Current priority is:
 
-1. execute and record the candidate-bound real Codex Subscription Desktop/Daemon
-   science E2E for the published product path, without treating the published
-   packaging Preview as G1-G12 evidence;
-2. assign the clean-host workstream owner and complete a G3-shaped rehearsal,
+1. assign the clean-host workstream owner and complete a G3-shaped rehearsal,
    including mediated Subscription authentication and the direct/proxy matrix;
-3. complete and independently review the durable System recovery owner;
-4. cut product authority over to the next negotiated API contract major before
+2. complete and independently review the durable System recovery owner;
+3. cut product authority over to the next negotiated API contract major before
    extending deep Task, Files, or History state;
-5. complete the Desktop System, Files, History, diagnostics, and recovery views;
-6. close Self-Deployed, atomic cross-session evolution, benchmark, security,
+4. complete the Desktop System, Files, History, diagnostics, and recovery views;
+5. close Self-Deployed, atomic cross-session evolution, benchmark, security,
    lifecycle, and release-evidence gates.
 
 This order changes implementation scheduling only. It does not reduce any
@@ -123,10 +122,10 @@ artifacts, revisions, recovery, and both execution modes.
 
 **Current state:** a real versioned control API, durable project/run stores,
 remote bootstrap, tunnel routing, Subscription prerequisite checks, and child
-service supervision exist. The published `0.1.3` Preview ships a self-contained
-Daemon Bundle and has packaging plus managed-runtime smoke evidence. It has no
-checked-in candidate-bound Docker plus Codex science rehearsal or clean-host
-matrix evidence. Clean-host preparation and lifecycle evidence, mediated
+service supervision exist. The published `0.1.6` Preview ships a self-contained
+Daemon Bundle and has packaging, managed-runtime, managed-upgrade, and signed
+candidate-bound Docker plus Codex science evidence. It has no clean-host matrix
+evidence. Clean-host preparation and lifecycle evidence, mediated
 Subscription authentication, the direct/proxy matrix, Self-Deployed,
 upgrade/rollback, and release-grade maintenance operations remain incomplete.
 The maintenance owner is now part of the release composition. Generic
@@ -155,10 +154,10 @@ capabilities, task execution, retry/cancel, timeline/transcript, and evolution
 inspection are implemented. First launch exposes two read-only synthetic
 science projects, each demonstrating three cross-session tasks and
 textual-memory, trajectory-to-skill, and agent-system evolution without
-creating authoritative or remote state. The public `0.1.5` Preview launches
-from the real DMG with its packaged renderer and sidecar. G2 clean-user
-lifecycle evidence, Files, History, System maintenance, mediated credential
-choices, and several recovery flows remain incomplete.
+creating authoritative or remote state. The public `0.1.6` Preview launches
+from the real DMG with its packaged renderer and startup-bounded sidecar. G2
+clean-user lifecycle evidence, Files, History, System maintenance, mediated
+credential choices, and several recovery flows remain incomplete.
 
 **Owning issues:** #158, #163, and #203.
 
@@ -178,7 +177,7 @@ GitHub releases present one coherent Desktop-plus-Daemon product.
 documentation, issue state, package inventory, release metadata, dependency
 evidence, and cleanup work still reflect intermediate implementation states.
 The exact source, tag, assets, checksums, and publication evidence for the
-public `0.1.3` Preview must remain available as non-gating release records;
+public `0.1.6` Preview must remain available as non-gating release records;
 earlier Preview releases remain historical evidence.
 
 **Owning issues:** #131 and #193.
@@ -194,8 +193,9 @@ G1 and G12. PyPI remains outside this release.
 **Outcome:** one immutable candidate satisfies every G1-G12 gate.
 
 **Current state:** component and subsystem tests exist, and the published
-`0.1.3` Preview has complete packaging and downloaded-release verification, but
-there is no candidate with complete clean-host Desktop/Daemon evidence, both
+`0.1.6` Preview has complete packaging, downloaded-release verification, and
+signed candidate-bound two-session science evidence, but there is no candidate
+with complete clean-host Desktop/Daemon evidence, both
 execution modes, all evolution gates, protected performance, recovery/security
 matrices, and full G1-G12 evidence. The published Preview cannot be reused as
 that candidate.

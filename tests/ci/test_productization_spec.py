@@ -227,7 +227,7 @@ def test_plan_has_five_executable_workstreams_without_old_governance_model() -> 
     assert "## Immediate Execution Order" in plan
 
     for marker in (
-        "gpt-5.6-sol",
+        "gpt-5.6-terra",
         "ivowang <ziyiwang@ieee.org>",
         "git diff --check",
         "Critical Contract Migration",

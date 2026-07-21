@@ -25,7 +25,7 @@ def test_plan_uses_focused_branch_and_pr_workflow() -> None:
     assert "Base branch: `stable`" in text
     assert "focused branches" in text
     assert "ivowang <ziyiwang@ieee.org>" in text
-    assert "gpt-5.6-sol" in text
+    assert "gpt-5.6-terra" in text
 
 
 def test_plan_covers_productization_workstreams_and_release_gates() -> None:
