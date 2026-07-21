@@ -14,7 +14,7 @@ OpenEvo has two user-facing applications:
 - **OpenEvo Daemon** is the Linux service that Desktop installs and controls on
   the selected remote server.
 
-[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1)
+[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.6-v016.29850844088.1)
 | [Read the user guide](docs/user/README.md)
 | [Report a problem](https://github.com/CompLifeLab-ZJU/OpenEvo/issues)
 
@@ -56,7 +56,7 @@ state.
 
 ## Current Preview
 
-The current public release is **OpenEvo Desktop 0.1.5 Preview**. It supports the
+The current public release is **OpenEvo Desktop 0.1.6 Preview**. It supports the
 following exhibition profile:
 
 | Component | Current support |
@@ -76,12 +76,12 @@ documented host profile and do not depend on it for production-critical work.
 ## Install On macOS
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.5 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1).
-2. Download `OpenEvo-Desktop-0.1.5-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.6 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.6-v016.29850844088.1).
+2. Download `OpenEvo-Desktop-0.1.6-aarch64.dmg` and `SHA256SUMS`.
 3. Verify the DMG before opening it:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.5-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.6-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 

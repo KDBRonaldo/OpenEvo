@@ -1,6 +1,6 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the published `0.1.5` exhibition Preview and its supported
+This guide describes the published `0.1.6` exhibition Preview and its supported
 Apple Silicon Mac plus Linux Docker-host profile.
 
 ## Before You Start
@@ -23,13 +23,13 @@ a runtime image manually.
 ## Install The Unsigned DMG
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.5 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1),
-   confirm the title **OpenEvo Desktop 0.1.5 Preview**, then download
-   `OpenEvo-Desktop-0.1.5-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.6 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.6-v016.29850844088.1),
+   confirm the title **OpenEvo Desktop 0.1.6 Preview**, then download
+   `OpenEvo-Desktop-0.1.6-aarch64.dmg` and `SHA256SUMS`.
 2. Verify the exact DMG checksum recorded by that release:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.5-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.6-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 

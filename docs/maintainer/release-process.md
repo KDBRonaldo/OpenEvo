@@ -35,7 +35,7 @@ the final macOS Tauri process against the remote host, and clean-host matrix,
 protected-performance, signing, notarization, and External Beta gates remain
 open.
 
-Version `0.1.5` is the current public immutable unsigned exhibition Preview,
+Version `0.1.5` is a public immutable unsigned historical exhibition Preview,
 published on July 21, 2026 from source
 `cf7d027b3967db2842af3879882af2b2a8cd693c` and candidate run
 `29827786454` under tag
@@ -49,11 +49,28 @@ independent two-session remote Codex runs exercised transcript capture, all
 three text-evolution targets, next-session artifact reuse, and successor
 Project Heads, but those runs are not detached signed publication evidence for
 this immutable release. Therefore `0.1.5` must not be cited as proof that the
-signed publication controller or the G1-G12 release gates completed. Version
-`0.1.4` remains the latest Preview with checked-in signed, candidate-bound
-science evidence. The immutable `0.1.5` release notes overstate that gate; this
-repository audit records the authoritative deviation because published notes
-and assets cannot be replaced.
+signed publication controller or the G1-G12 release gates completed. At the
+time, `0.1.4` remained the newest Preview with checked-in signed,
+candidate-bound science evidence. The immutable `0.1.5` release notes overstate
+that gate; this repository audit records the authoritative deviation because
+published notes and assets cannot be replaced.
+
+Version `0.1.6` is the current public immutable unsigned exhibition Preview,
+published on July 21, 2026 from source
+`221380f724fcf6dc3b9780bb2b2044a8ababd25a`, candidate run `29850844088`, and
+publication run `29853426425` under tag
+`openevo-desktop-v0.1.6-v016.29850844088.1`. It replaces the oversized packaged
+sidecar with a startup-bounded Desktop runtime, makes Tauri launch and recovery
+asynchronous, restores working **Retry** and **Add remote workspace** actions,
+and supports a generation-checked automatic upgrade from the `0.1.5` Daemon.
+The exact candidate passed mounted-DMG and detached-copy launch checks. Signed,
+checked-in candidate-bound evidence also verifies two real remote Codex
+subscription sessions, transcript capture, all three text-evolution targets,
+next-session artifact reuse, and packaged-renderer observability through the
+live Desktop Local API. It remains a Preview rather than a G1-G12 candidate:
+the remote-host E2E does not execute the final macOS Tauri process, and the
+clean-host matrix, protected-performance gates, signing, notarization, and
+External Beta gates remain open.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
@@ -66,10 +83,10 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-The checked-in evidence for `0.1.4` is bound to its exact candidate manifest and
-signed by the release host. It proves the stated Preview path, but it does not
-by itself satisfy G2, G3, G4, G7, G12, or the full ordinary-user qualification
-matrix.
+The checked-in evidence for `0.1.4` and `0.1.6` is bound to each exact candidate
+manifest and signed by the release host. It proves the stated Preview paths,
+but it does not by itself satisfy G2, G3, G4, G7, G12, or the full
+ordinary-user qualification matrix.
 
 Final External Beta publication remains disabled while productization work
 tracked by #131/#163 is in progress. PyPI is not part of either the Preview or
