@@ -18,7 +18,7 @@ OpenEvo has two user-facing applications:
 | [Read the user guide](docs/user/README.md)
 | [Report a problem](https://github.com/CompLifeLab-ZJU/OpenEvo/issues)
 
-![OpenEvo Desktop showing a built-in scientific project](docs/user/assets/openevo-desktop-research.png)
+![OpenEvo Desktop showing a built-in scientific project](assets/openevo-desktop-research.png)
 
 ## What OpenEvo Does
 
