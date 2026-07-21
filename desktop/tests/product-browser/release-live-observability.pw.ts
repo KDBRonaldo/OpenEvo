@@ -321,11 +321,14 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
     assertClosed(optionValues.includes(handoff.expected.method_ids[target]), "selected remote method is absent from the rendered capability options");
   }
   const memoryRow = page.locator('.target-toggle[data-target-id="text_memory"]');
-  await memoryRow.getByRole("switch").click();
+  const memoryToggleLabel = memoryRow.locator(":scope > label");
+  await memoryToggleLabel.scrollIntoViewIfNeeded();
+  await memoryToggleLabel.click();
   await expect(memoryRow.getByRole("switch")).not.toBeChecked();
   await expect(page.locator('.target-toggle[data-target-id="skill_bundle"]').getByRole("switch")).toBeChecked();
   await expect(page.locator('.target-toggle[data-target-id="agent_system"]').getByRole("switch")).toBeChecked();
-  await memoryRow.getByRole("switch").click();
+  await memoryToggleLabel.scrollIntoViewIfNeeded();
+  await memoryToggleLabel.click();
   await expect(memoryRow.getByRole("switch")).toBeChecked();
   await expect(memoryRow.getByRole("combobox")).toHaveValue(handoff.expected.method_ids.text_memory);
   await page.getByRole("button", { name: "Undo", exact: true }).click();
