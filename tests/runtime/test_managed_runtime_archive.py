@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import dataclasses
 import importlib.util
+import os
 import shlex
 import subprocess
 
@@ -205,6 +206,60 @@ def test_structured_archive_verifier_accepts_exact_manifest_config_label_and_no_
     assert authority.oci_index_id == release.oci_index_id
     assert authority.platform == "linux-amd64"
     assert authority.managed_label is True
+
+
+def test_structured_archive_verifier_requires_explicit_read_only_media_policy(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / RUNTIME_FILENAME
+    release = write_test_managed_runtime_archive(archive)
+    archive.chmod(0o644)
+
+    with pytest.raises(ManagedRuntimeArchiveVerificationError):
+        verify_managed_runtime_archive(archive, release=release)
+
+    authority = verify_managed_runtime_archive(
+        archive,
+        release=release,
+        allowed_owner_ids=frozenset({os.getuid()}),
+        require_private=False,
+    )
+    assert authority.oci_index_id == release.oci_index_id
+
+    archive.chmod(0o664)
+    with pytest.raises(ManagedRuntimeArchiveVerificationError):
+        verify_managed_runtime_archive(
+            archive,
+            release=release,
+            allowed_owner_ids=frozenset({os.getuid()}),
+            require_private=False,
+        )
+
+
+def test_read_only_media_policy_rejects_late_permission_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = tmp_path / RUNTIME_FILENAME
+    release = write_test_managed_runtime_archive(archive)
+    archive.chmod(0o644)
+
+    def make_group_writable(_descriptor: int) -> None:
+        archive.chmod(0o664)
+
+    monkeypatch.setattr(
+        managed,
+        "_after_managed_runtime_archive_structure",
+        make_group_writable,
+    )
+
+    with pytest.raises(ManagedRuntimeArchiveVerificationError):
+        verify_managed_runtime_archive(
+            archive,
+            release=release,
+            allowed_owner_ids=frozenset({os.getuid()}),
+            require_private=False,
+        )
 
 
 def test_structured_archive_verifier_rejects_load_time_alias_publication(

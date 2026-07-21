@@ -958,7 +958,12 @@ def _load_managed_runtime_archive(
                 "managed runtime release archive identity is invalid"
             )
         try:
-            verify_managed_runtime_archive(sealed.local_path, release=release)
+            verify_managed_runtime_archive(
+                sealed.local_path,
+                release=release,
+                allowed_owner_ids=allowed_owner_ids,
+                require_private=require_private,
+            )
         except ManagedRuntimeArchiveVerificationError as exc:
             raise ReleaseRuntimeConfigurationError(
                 "managed runtime release archive contents are invalid"

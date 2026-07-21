@@ -158,7 +158,9 @@ def _packaged_release_assets(
     _daemon_assets(root / "daemon", wheel_root)
     runtime_root = root / "runtime"
     runtime_root.mkdir(mode=0o700)
-    expected = write_test_managed_runtime_archive(runtime_root / RUNTIME_FILENAME)
+    runtime_archive = runtime_root / RUNTIME_FILENAME
+    expected = write_test_managed_runtime_archive(runtime_archive)
+    runtime_archive.chmod(0o644)
     monkeypatch.setattr(release_runtime, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
     monkeypatch.setattr(core_bridge_adapters_v1, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
     _write_release_assets_manifest(root)
@@ -334,6 +336,25 @@ def test_packaged_release_manifest_binds_all_lazy_bootstrap_assets(
     assert config.daemon_bundle is not None
     assert config.managed_runtime_archive is not None
     assert config.managed_runtime_archive.sha256 == expected_runtime.sha256
+
+
+def test_packaged_release_assets_accept_root_owned_read_only_media(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_root = tmp_path / "openevo-release-assets"
+    wheel_root, _expected_runtime = _packaged_release_assets(release_root, monkeypatch)
+    owner_id = release_root.stat().st_uid
+    monkeypatch.setattr(release_runtime.os, "getuid", lambda: owner_id + 1)
+
+    config = load_core_bootstrap_config(
+        wheel_root,
+        release_assets_root=release_root,
+        source_commit=SOURCE_COMMIT,
+        packaged_resource_assets=True,
+    )
+
+    assert config.managed_runtime_archive is not None
 
 
 @pytest.mark.parametrize("linked_entry", ("root", "core"))

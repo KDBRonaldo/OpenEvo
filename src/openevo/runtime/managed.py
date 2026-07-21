@@ -187,12 +187,23 @@ def verify_managed_runtime_archive(
     archive: Path | str,
     *,
     release: ManagedRuntimeArchiveRelease | None = None,
+    allowed_owner_ids: frozenset[int] | None = None,
+    require_private: bool = True,
 ) -> ManagedRuntimeArchiveAuthority:
-    """Verify the sealed outer archive and its Docker/OCI config authority."""
+    """Verify archive authority; relaxed mode still rejects group/other writes."""
 
     expected = MANAGED_RUNTIME_ARCHIVE_RELEASE if release is None else release
     try:
+        if allowed_owner_ids is None:
+            allowed_owner_ids = frozenset({os.getuid()})
         if not isinstance(expected, ManagedRuntimeArchiveRelease):
+            raise ValueError
+        if (
+            not isinstance(allowed_owner_ids, frozenset)
+            or not allowed_owner_ids
+            or any(type(owner_id) is not int or owner_id < 0 for owner_id in allowed_owner_ids)
+            or type(require_private) is not bool
+        ):
             raise ValueError
         expected.__post_init__()
         requested = Path(os.path.abspath(archive))
@@ -209,9 +220,9 @@ def verify_managed_runtime_archive(
                 metadata = os.fstat(descriptor)
                 if (
                     not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_uid != os.getuid()
+                    or metadata.st_uid not in allowed_owner_ids
                     or metadata.st_nlink != 1
-                    or stat.S_IMODE(metadata.st_mode) & 0o077
+                    or stat.S_IMODE(metadata.st_mode) & (0o077 if require_private else 0o022)
                     or metadata.st_size != expected.byte_size
                 ):
                     raise ValueError
@@ -230,9 +241,9 @@ def verify_managed_runtime_archive(
                 )
                 if (
                     not stat.S_ISREG(current.st_mode)
-                    or current.st_uid != os.getuid()
+                    or current.st_uid not in allowed_owner_ids
                     or current.st_nlink != 1
-                    or stat.S_IMODE(current.st_mode) & 0o077
+                    or stat.S_IMODE(current.st_mode) & (0o077 if require_private else 0o022)
                     or current.st_size != expected.byte_size
                     or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
                     or current.st_mtime_ns != metadata.st_mtime_ns
@@ -539,9 +550,7 @@ def _safe_archive_member_name(value: str) -> str:
 
 MANAGED_HOME: Final[str] = "/openevo/session/home"
 MANAGED_WORKSPACE: Final[str] = "/openevo/session/workspace"
-MANAGED_CODEX_READINESS_WORKSPACE: Final[str] = (
-    f"{MANAGED_HOME}/.openevo-codex-readiness"
-)
+MANAGED_CODEX_READINESS_WORKSPACE: Final[str] = f"{MANAGED_HOME}/.openevo-codex-readiness"
 MANAGED_CODEX_HOME: Final[str] = "/openevo/credentials/codex"
 MANAGED_CODEX_PACKAGE_ROOT: Final[str] = "/opt/codex"
 MANAGED_CODEX_BINARY: Final[str] = f"{MANAGED_CODEX_PACKAGE_ROOT}/bin/codex"
