@@ -4,8 +4,11 @@ import dataclasses
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
 from types import ModuleType
 from zipfile import ZipFile
 
@@ -256,6 +259,78 @@ def test_verify_app_resource_binds_all_release_assets_for_both_origins(
             launch_origin="mounted_dmg",
             evidence_out=tmp_path / "tampered.json",
         )
+
+
+def test_packaged_runtime_loader_adds_repo_root_for_direct_script_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_module()
+    repo_root = str(module.REPO_ROOT)
+    original_import = module.importlib.import_module
+    import_path_observations: list[bool] = []
+
+    def recording_import(name: str, package: str | None = None):
+        if name == "desktop.sidecar.release_runtime":
+            import_path_observations.append(repo_root in sys.path)
+        return original_import(name, package)
+
+    monkeypatch.setattr(sys, "path", [entry for entry in sys.path if entry != repo_root])
+    monkeypatch.setattr(module.importlib, "import_module", recording_import)
+
+    loader = module._load_packaged_runtime_loader()
+
+    assert loader.__name__ == "load_core_bootstrap_config"
+    assert import_path_observations
+    assert all(import_path_observations)
+    assert repo_root not in sys.path
+
+
+def test_packaged_runtime_loader_works_in_fresh_direct_script_process(tmp_path: Path) -> None:
+    code = f"""
+import runpy
+import sys
+from pathlib import Path
+
+repo = Path({str(REPO_ROOT)!r})
+sys.path = [entry for entry in sys.path if Path(entry or '.').resolve() != repo]
+for name in tuple(sys.modules):
+    if name == 'desktop' or name.startswith('desktop.'):
+        del sys.modules[name]
+namespace = runpy.run_path(str(repo / 'scripts/ci/openevo_desktop_daemon_resource.py'))
+loader = namespace['_load_packaged_runtime_loader']()
+assert loader.__module__ == 'desktop.sidecar.release_runtime'
+assert str(repo) not in sys.path
+"""
+    environment = os.environ.copy()
+    environment.pop("PYTHONPATH", None)
+
+    subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env=environment,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+
+
+def test_packaged_runtime_loader_rejects_foreign_or_incomplete_module(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    foreign = ModuleType("desktop.sidecar.release_runtime")
+    foreign.__file__ = str(tmp_path / "release_runtime.py")
+    monkeypatch.setattr(module.importlib, "import_module", lambda _name: foreign)
+    with pytest.raises(module.ResourceCompositionError, match="candidate source checkout"):
+        module._load_packaged_runtime_loader()
+
+    incomplete = ModuleType("desktop.sidecar.release_runtime")
+    incomplete.__file__ = str(REPO_ROOT / "desktop/sidecar/release_runtime.py")
+    monkeypatch.setattr(module.importlib, "import_module", lambda _name: incomplete)
+    with pytest.raises(module.ResourceCompositionError, match="loader is unavailable"):
+        module._load_packaged_runtime_loader()
 
 
 def test_release_workflow_stages_one_release_asset_tree_without_sidecar_embedding() -> None:

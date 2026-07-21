@@ -473,9 +473,37 @@ def build_daemon_release_inputs(*, output_dir: Path, source_commit: str) -> None
     )
 
 
+def _load_packaged_runtime_loader():
+    repo_root = os.fspath(REPO_ROOT)
+    inserted_repo_root = repo_root not in sys.path
+    if inserted_repo_root:
+        sys.path.insert(0, repo_root)
+    try:
+        runtime_module = importlib.import_module("desktop.sidecar.release_runtime")
+    finally:
+        if inserted_repo_root:
+            sys.path.remove(repo_root)
+    expected_module = (REPO_ROOT / "desktop/sidecar/release_runtime.py").resolve(strict=True)
+    module_path = getattr(runtime_module, "__file__", None)
+    try:
+        observed_module = (
+            Path(module_path).resolve(strict=True) if isinstance(module_path, str) else None
+        )
+    except OSError:
+        observed_module = None
+    if observed_module != expected_module:
+        raise ResourceCompositionError(
+            "Desktop runtime loader did not come from the candidate source checkout"
+        )
+    load_core_bootstrap_config = getattr(runtime_module, "load_core_bootstrap_config", None)
+    if not callable(load_core_bootstrap_config):
+        raise ResourceCompositionError("Desktop runtime loader is unavailable")
+    return load_core_bootstrap_config
+
+
 def _validate_packaged_runtime_loader(resource_root: Path, *, source_commit: str) -> None:
     try:
-        from desktop.sidecar.release_runtime import load_core_bootstrap_config
+        load_core_bootstrap_config = _load_packaged_runtime_loader()
 
         config = load_core_bootstrap_config(
             resource_root / CORE_DIRECTORY,
