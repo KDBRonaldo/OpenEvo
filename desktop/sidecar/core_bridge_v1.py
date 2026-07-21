@@ -1420,6 +1420,14 @@ class DesktopCoreBridgeV1:
 
         return self._invoke_project(project, call)
 
+    def refresh_project_authority(
+        self,
+        project: local_v1.ProjectV1,
+    ) -> tuple[core_v1.ProjectV1, core_v1.CapabilitiesResponseV1]:
+        """Return the latest fully verified Core project authority."""
+
+        return self._invoke_project(project, self._refresh_authority)
+
     def validate_project(
         self, project: local_v1.ProjectV1, *, idempotency_key: str
     ) -> core_v1.ProjectValidationResponseV1:

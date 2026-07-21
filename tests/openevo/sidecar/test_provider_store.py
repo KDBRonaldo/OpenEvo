@@ -45,6 +45,7 @@ from desktop.sidecar.provider_store import (
     ProviderDataCorruptionError,
     ProviderMutation,
     ProviderSchemaError,
+    ProviderStoreError,
     ProviderStateRootError,
     ResourceInUseError,
     ResourceNotFoundError,
@@ -3792,6 +3793,61 @@ def test_project_activation_requires_a_matching_ready_remote_projection(
 
     assert store.get_project(project.project_id) == project
     assert store.get_local_operation(reservation.operation.operation_id).state == "running"
+
+
+def test_active_project_remote_authority_sync_preserves_local_intent_etag(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStore(tmp_path / "state")
+    profile = _create_profile(store)
+    draft = store.create_project(
+        _project(profile.profile_id),
+        idempotency_key="remote-authority-sync-create",
+    )
+    _activate_project(store, draft, key="remote-authority-sync-activate")
+    active = store.get_project(draft.project_id)
+    assert active.remote is not None
+    assert active.remote.active_revision is not None
+    successor = active.remote.model_copy(
+        update={
+            "active_revision": active.remote.active_revision.model_copy(
+                update={
+                    "id": "core-revision-0003",
+                    "generation": 3,
+                    "manifest_sha256": "d" * 64,
+                }
+            ),
+            "observed_at": "2026-07-14T12:01:00Z",
+            "etag": '"' + "e" * 64 + '"',
+        }
+    )
+
+    refreshed = store.synchronize_active_project_remote_state(
+        active.project_id,
+        if_match=active.etag,
+        remote_state=successor,
+    )
+
+    assert refreshed.remote == successor
+    assert refreshed.etag == active.etag
+    assert refreshed.updated_at == active.updated_at
+    assert refreshed.state == "active"
+    replay = store.synchronize_active_project_remote_state(
+        active.project_id,
+        if_match=active.etag,
+        remote_state=successor.model_copy(
+            update={"observed_at": "2026-07-14T12:02:00Z"}
+        ),
+    )
+    assert replay == refreshed
+
+    with pytest.raises(ProviderStoreError, match="moved backwards"):
+        store.synchronize_active_project_remote_state(
+            active.project_id,
+            if_match=active.etag,
+            remote_state=active.remote,
+        )
+    assert store.get_project(active.project_id) == refreshed
 
 
 def test_project_activation_rejects_remote_projection_over_its_persistence_bound(

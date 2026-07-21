@@ -270,6 +270,53 @@ def test_activation_returns_queued_and_commits_remote_projection(tmp_path: Path)
         provider.close()
 
 
+def test_core_event_refreshes_the_active_project_remote_projection(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    activation = _activation(project)
+    bridge.activate_project.return_value = activation
+    try:
+        response = provider.invoke("activateProject", _activate_arguments(project))
+        operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+        _wait_for_operation(store, operation.operation_id, "succeeded")
+        active = store.get_project(project.project_id)
+        assert active.remote is not None
+        assert active.remote.active_revision is not None
+        successor_revision = active.remote.active_revision.model_copy(
+            update={
+                "id": "revision-3",
+                "generation": 3,
+                "manifest_sha256": "7" * 64,
+            }
+        )
+        successor_project = activation.core_project.model_copy(
+            update={
+                "active_revision": successor_revision,
+                "updated_at": "2026-07-14T12:01:00Z",
+                "etag": '"' + "d" * 64 + '"',
+            }
+        )
+        bridge.refresh_project_authority.return_value = (
+            successor_project,
+            activation.capabilities,
+        )
+
+        provider._refresh_project_authority_and_publish()
+
+        refreshed = store.get_project(project.project_id)
+        assert refreshed.remote is not None
+        assert refreshed.remote.active_revision == successor_revision
+        assert refreshed.remote.etag == successor_project.etag
+        assert refreshed.etag == active.etag
+        assert refreshed.updated_at == active.updated_at
+        binding = provider._active_project_for_runtime()
+        assert binding is not None
+        assert binding.project == refreshed
+        bridge.refresh_project_authority.assert_called_once_with(active)
+    finally:
+        provider.close()
+
+
 def test_activation_success_is_not_visible_before_local_binding_commit(tmp_path: Path) -> None:
     bridge = Mock(spec=DesktopCoreBridgeV1)
     provider, store, project = _provider(tmp_path, bridge)

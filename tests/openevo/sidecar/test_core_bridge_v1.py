@@ -2458,6 +2458,12 @@ def test_authority_only_revision_successor_keeps_local_project_binding_valid() -
         updated_at="2026-07-14T12:02:00Z",
     )
 
+    refreshed_project, refreshed_capabilities = bridge.refresh_project_authority(
+        local_project
+    )
+    assert refreshed_project.active_revision == successor
+    assert refreshed_capabilities.registry_digest == fake_core.registry_digest
+
     run = bridge.create_run(
         local_project,
         idempotency_key="create-run-authority-successor-0001",

@@ -475,7 +475,7 @@ class DesktopReleaseProvider:
         if self._core_runtime is not None:
             self._core_runtime.start(
                 active_project=self._active_project_for_runtime,
-                publish=self._publish_core_event_invalidation,
+                publish=self._refresh_project_authority_and_publish,
                 session_lost=self._handle_core_session_loss,
             )
 
@@ -1919,8 +1919,16 @@ class DesktopReleaseProvider:
         ):
             raise ProviderStoreError("Core activation authority does not match the local project")
 
-    def _remote_project_state(self, activation: CoreActivationV1) -> local_v1.RemoteProjectStateV1:
-        project = activation.core_project
+    def _remote_project_state(
+        self,
+        activation: CoreActivationV1,
+    ) -> local_v1.RemoteProjectStateV1:
+        return self._remote_project_state_from_core(activation.core_project)
+
+    def _remote_project_state_from_core(
+        self,
+        project: core_v1.ProjectV1,
+    ) -> local_v1.RemoteProjectStateV1:
         return local_v1.RemoteProjectStateV1(
             core_project_id=project.id,
             status=project.status.value,
@@ -2349,6 +2357,35 @@ class DesktopReleaseProvider:
     def _publish_core_event_invalidation(self) -> None:
         if self._event_broker is not None:
             self._event_broker.publish(StateEventV1(state=self._get_state({})))
+
+    def _refresh_project_authority_and_publish(self) -> None:
+        with self._project_session_lock:
+            binding = self._active_project_for_runtime()
+            if binding is None:
+                raise ProviderStoreError(
+                    "Desktop has no active project for Core authority refresh"
+                )
+            bridge = self._require_bridge("refreshProjectAuthority")
+            core_project, capabilities = bridge.refresh_project_authority(binding.project)
+            if core_project.registry_digest != capabilities.registry_digest:
+                raise ProviderStoreError(
+                    "Core project authority does not match verified capabilities"
+                )
+            refreshed = self._store.synchronize_active_project_remote_state(
+                binding.project.project_id,
+                if_match=binding.project.etag,
+                remote_state=self._remote_project_state_from_core(core_project),
+            )
+            with self._connection_state_lock:
+                if self._core_session_binding != binding:
+                    raise ProviderStoreError(
+                        "Core project authority refresh lost its active session"
+                    )
+                self._core_session_binding = CoreRuntimeSessionBinding(
+                    project=refreshed,
+                    generation=binding.generation,
+                )
+        self._publish_core_event_invalidation()
 
     def _active_project_for_runtime(self) -> CoreRuntimeSessionBinding | None:
         with self._project_session_lock:

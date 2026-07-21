@@ -3934,6 +3934,70 @@ class DesktopProviderStore:
         with self._transaction(write=False) as connection:
             return self._project_from_row(self._require_project_row(connection, project_id))
 
+    def synchronize_active_project_remote_state(
+        self,
+        project_id: str,
+        *,
+        if_match: str,
+        remote_state: RemoteProjectStateV1,
+    ) -> ProjectV1:
+        """Persist bridge-verified Core authority without changing Local intent."""
+
+        self._validate_resource_id(project_id)
+        self._validate_if_match(if_match)
+        validated_remote = _validate_model(RemoteProjectStateV1, remote_state)
+        self._validate_activation_remote_state(validated_remote)
+        with self._transaction(write=True) as connection:
+            row = self._require_project_row(connection, project_id)
+            self._require_etag("project", project_id, row, if_match)
+            current = self._project_from_row(row)
+            current_remote = current.remote
+            if current.state != "active" or current_remote is None:
+                raise ProviderStoreError(
+                    "only an active project can synchronize remote Core authority"
+                )
+            if current_remote.core_project_id != validated_remote.core_project_id:
+                raise ProviderStoreError(
+                    "remote Core authority belongs to another project"
+                )
+            current_revision = current_remote.active_revision
+            next_revision = validated_remote.active_revision
+            if current_revision is None or next_revision is None:
+                raise ProviderStoreError("active remote Core authority is incomplete")
+            if next_revision.generation < current_revision.generation or (
+                next_revision.generation == current_revision.generation
+                and next_revision != current_revision
+            ):
+                raise ProviderStoreError("remote Core revision authority moved backwards")
+
+            comparable_remote = validated_remote.model_copy(
+                update={"observed_at": current_remote.observed_at}
+            )
+            if comparable_remote == current_remote:
+                return current
+
+            remote_state_bytes = self._encode_remote_project_state(validated_remote)
+            remote_state_token = self._remote_payload_content_token(
+                project_id=project_id,
+                payload=remote_state_bytes,
+            )
+            connection.execute(
+                """
+                UPDATE projects
+                SET current_revision_id = ?, remote_state_json = ?,
+                    remote_state_token_0 = ?, remote_state_token_1 = ?,
+                    remote_state_token_2 = ?, remote_state_token_3 = ?
+                WHERE project_id = ?
+                """,
+                (
+                    next_revision.id,
+                    remote_state_bytes,
+                    *remote_state_token,
+                    project_id,
+                ),
+            )
+            return self._project_from_row(self._require_project_row(connection, project_id))
+
     def native_workspace_sources(self) -> tuple[tuple[str, ProjectSourceV1], ...]:
         """Return the bounded persisted source set used for private-store recovery."""
 
