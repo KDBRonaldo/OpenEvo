@@ -18,13 +18,22 @@ on July 19, 2026 from the immutable candidate produced by run `29702250883`.
 Preserve its exact source commit, tag, release assets, checksums, and complete
 publication evidence.
 
-Version `0.1.3` is the current public unsigned exhibition Preview, published on
+Version `0.1.3` is a public unsigned historical exhibition Preview, published on
 July 20, 2026 from source `5e7a203f08dc2fe434979ae8e546c174378d1af5`
 and the immutable candidate produced by run `29756612736`. Preserve its exact
 source commit, tag, release assets, checksums, and complete publication evidence.
-It is a packaging Preview, not a G1-G12 candidate: there is still no
-candidate-bound real Codex science E2E, clean-host matrix, protected-performance
-verdict, or External Beta qualification.
+It is a packaging Preview without candidate-bound real Codex science E2E.
+
+Version `0.1.4` is the current public unsigned exhibition Preview, published on
+July 21, 2026 from source `963407c11e8bac3873eb7de73c3fb55fd5547fb7`,
+candidate run `29813754427`, and publication run `29816113282`. Its
+candidate-bound release-host evidence verifies two remote Codex subscription
+sessions, transcript capture, all three text-evolution targets, next-session
+context reuse, two built-in samples, and packaged-renderer observability. It is
+still a Preview rather than a G1-G12 candidate: the evidence does not execute
+the final macOS Tauri process against the remote host, and clean-host matrix,
+protected-performance, signing, notarization, and External Beta gates remain
+open.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
@@ -37,9 +46,10 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-No checked-in, validator-bound two-session science E2E evidence exists for the
-published `0.1.3` Preview. Its packaging and managed-runtime smoke do not
-satisfy G2, G3, G4, G7, G12, or the ordinary-user science workflow.
+The checked-in evidence for `0.1.4` is bound to the exact candidate manifest and
+signed by the release host. It proves the stated Preview path, but it does not
+by itself satisfy G2, G3, G4, G7, G12, or the full ordinary-user qualification
+matrix.
 
 Final External Beta publication remains disabled while productization work
 tracked by #131/#163 is in progress. PyPI is not part of either the Preview or
