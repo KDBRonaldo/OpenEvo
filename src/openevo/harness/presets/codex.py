@@ -407,7 +407,7 @@ def _codex_subscription_json_pipeline(codex_command: str, log_path: str) -> str:
     )
     return (
         "set +e; "
-        f"{codex_command} 2>&1 </dev/null | tee {quoted_log}; "
+        f"{codex_command} </dev/null | tee {quoted_log}; "
         'pipeline_status=("${PIPESTATUS[@]}"); '
         'codex_rc="${pipeline_status[0]:-1}"; '
         'tee_rc="${pipeline_status[1]:-1}"; '

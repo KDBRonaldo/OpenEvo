@@ -602,6 +602,39 @@ def test_codex_subscription_json_pipeline_uses_structured_terminal_event(
     ] == events
 
 
+def test_codex_subscription_json_pipeline_keeps_diagnostics_out_of_json(
+    tmp_path: Path,
+) -> None:
+    events = [
+        {"type": "thread.started", "thread_id": "thread-1"},
+        {"type": "turn.started"},
+        {"type": "turn.completed", "usage": dict(CODEX_USAGE)},
+    ]
+    diagnostic = "Codex ignored one malformed optional skill"
+    producer = (
+        "import json,sys\n"
+        f"print({diagnostic!r}, file=sys.stderr)\n"
+        f"events = {events!r}\n"
+        "for event in events:\n"
+        "    print(json.dumps(event, separators=(',', ':')))\n"
+        "raise SystemExit(1)\n"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(producer)}"
+    log_path = tmp_path / "codex.jsonl"
+    pipeline = _codex_subscription_json_pipeline(command, os.fspath(log_path))
+
+    completed = subprocess.run(
+        ["/bin/bash", "-o", "pipefail", "-c", pipeline],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0
+    assert diagnostic in completed.stderr
+    assert diagnostic not in log_path.read_text(encoding="utf-8")
+
+
 def test_codex_subscription_json_pipeline_fails_when_tee_cannot_publish(
     tmp_path: Path,
 ) -> None:
