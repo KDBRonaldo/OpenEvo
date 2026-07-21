@@ -7,9 +7,9 @@ OpenEvo Preview has two applications:
   on a remote Linux server. Ordinary users manage it through Desktop and do not
   operate it directly.
 
-Version `0.1.4` is the current immutable Preview described by these guides. Its
+Version `0.1.5` is the current immutable Preview described by these guides. Its
 exact DMG and `SHA256SUMS` are available in the
-[OpenEvo Desktop 0.1.4 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.4-exhibition.29813754427.1).
+[OpenEvo Desktop 0.1.5 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1).
 The Preview DMG is unsigned and not notarized. Open it only after checking the
 exact checksum in the quickstart. Use the current release unless a maintainer
 has asked you to reproduce an older version.
@@ -26,7 +26,7 @@ has asked you to reproduce an older version.
 This Preview packages:
 
 - one Apple Silicon macOS 12+ asset and matching Linux x86-64 Daemon Bundle;
-- two built-in, read-only synthetic science project tours, each showing three
+- two built-in, read-only science project tours, each showing three
   task sessions and the three textual evolution targets without contacting a
   server;
 - SSH agent authentication;

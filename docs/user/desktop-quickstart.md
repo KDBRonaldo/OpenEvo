@@ -1,6 +1,6 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the published `0.1.4` exhibition Preview and its supported
+This guide describes the published `0.1.5` exhibition Preview and its supported
 Apple Silicon Mac plus Linux Docker-host profile.
 
 ## Before You Start
@@ -23,13 +23,13 @@ a runtime image manually.
 ## Install The Unsigned DMG
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.4 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.4-exhibition.29813754427.1),
-   confirm the title **OpenEvo Desktop 0.1.4 Preview**, then download
-   `OpenEvo-Desktop-0.1.4-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.5 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1),
+   confirm the title **OpenEvo Desktop 0.1.5 Preview**, then download
+   `OpenEvo-Desktop-0.1.5-aarch64.dmg` and `SHA256SUMS`.
 2. Verify the exact DMG checksum recorded by that release:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.4-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.5-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -49,25 +49,26 @@ a runtime image manually.
 The wording and location of **Open Anyway** can vary by macOS version.
 Do not clear quarantine from a parent directory or from an unverified download.
 
-## Explore The Built-In Project
+## Explore The Built-In Projects
 
 Before a server is configured, Desktop exposes two read-only examples in the
-project selector: **酶动力学模型复核** and **蛋白质稳定性证据整合**. Each
-contains three synthetic task sessions, de-identified reasoning and tool
-summaries, and a progression from an unsupported result to a bounded,
-validated conclusion. Use **Research** to inspect task execution and
-**Evolution** to inspect textual-memory, trajectory-to-skill, and agent-system
-histories plus their readable `memory.md`, `SKILL.md`, and `AGENTS.md` outputs.
+project selector: **Enzyme Kinetics Model Review** and **Protein Stability
+Evidence Review**. Each contains three demonstration task sessions,
+de-identified reasoning and tool summaries, and a progression from an
+unsupported result to a bounded, validated conclusion. Use **Research** to
+inspect task execution and **Evolution** to inspect textual-memory,
+trajectory-to-skill, and agent-system histories plus their readable
+`memory.md`, `SKILL.md`, and `AGENTS.md` outputs.
 
-Both examples are labelled as built-in, synthetic, and read-only. They do not
+Both examples are built in and read-only. They do not
 represent completed remote runs and perform no SSH, Daemon, Core, or network
 action. They remain available in the project selector after real projects are
 created.
 
 ## Connect The Server
 
-1. Choose **Add workspace** and enter a display name, server address, SSH port,
-   and remote user name.
+1. Choose **Add remote workspace** and enter a display name, server address,
+   SSH port, and remote user name.
 2. Add HTTP, HTTPS, or bypass-proxy settings if the remote server needs them.
 3. Choose **Save workspace**, then **Connect**.
 4. When **Confirm server identity** appears, compare the displayed SHA-256

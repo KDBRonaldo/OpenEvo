@@ -357,7 +357,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   await expect(page.locator(".session-output-message").first()).not.toHaveText("");
   await drainCapture(capture);
 
-  await page.getByRole("button", { name: "Evolution", exact: true }).click();
+  await page.getByRole("button", { name: "View changes", exact: true }).click();
   await expect(page.getByTestId("evolution-workspace")).toBeVisible();
   await expect(page.locator(".revision-node").filter({
     hasText: `Project Head ${handoff.expected.project_head_generation}`,
@@ -381,6 +381,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   }
 
   const prefetchedDiffArtifactIds = new Set<string>();
+  const renderedDiffs = new Map<string, Awaited<ReturnType<typeof readRenderedDiff>>>();
   const diffArtifacts = handoff.expected.artifacts.filter((candidate) => {
     const artifact = capture.artifacts.get(candidate.artifact_id);
     return artifact?.lineage.source_artifact_ids.some((id) => capture.artifacts.has(id));
@@ -400,6 +401,14 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
       return capture.diffs.has(diffArtifact.artifact_id);
     }, { message: "live artifact diff was not observed by the renderer" }).toBe(true);
     assertArtifactDiffCapture(capture, diffArtifact.artifact_id);
+    const stableDiff = capture.diffs.get(diffArtifact.artifact_id);
+    assertClosed(stableDiff !== undefined, "stable artifact diff is missing");
+    const renderedDiff = await readRenderedDiff(page);
+    renderedDiffs.set(diffArtifact.artifact_id, renderedDiff);
+    assertClosed(
+      JSON.stringify(renderedDiff) === JSON.stringify(expectedRenderedDiff(stableDiff)),
+      `renderer ${diffArtifact.target_id} diff differs from the stable response cutoff`,
+    );
     prefetchedDiffArtifactIds.add(diffArtifact.artifact_id);
   }
 
@@ -414,7 +423,6 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   const renderedTimelines = new Map<string, Awaited<ReturnType<typeof readRenderedTimeline>>>();
   const renderedLogsByRun = new Map<string, Awaited<ReturnType<typeof readRenderedLogs>>>();
   const renderedContents = new Map<string, { captureJson: string; documents: readonly string[] }>();
-  const renderedDiffs = new Map<string, Awaited<ReturnType<typeof readRenderedDiff>>>();
 
   await page.getByRole("button", { name: "Research", exact: true }).click();
   await expect(page.getByTestId("research-workspace")).toBeVisible();
@@ -460,7 +468,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
     );
   }
 
-  await page.getByRole("button", { name: "Evolution", exact: true }).click();
+  await page.getByRole("button", { name: "View changes", exact: true }).click();
   await expect(page.getByTestId("evolution-workspace")).toBeVisible();
   await expect(page.locator(".revision-node").filter({
     hasText: `Project Head ${handoff.expected.project_head_generation}`,
@@ -512,22 +520,6 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
       documents: renderedDocuments,
     });
   }
-  for (const stableDiffArtifact of diffArtifacts) {
-    await page.locator(".artifact-list").getByRole("button", {
-      name: new RegExp(`^${escapeRegex(artifactLabel(stableDiffArtifact.target_id))}`),
-    }).click();
-    await page.getByRole("tab", { name: "Changes", exact: true }).click();
-    const stableDiff = capture.diffs.get(stableDiffArtifact.artifact_id);
-    assertClosed(stableDiff !== undefined, "stable artifact diff is missing");
-    await expect(page.locator(".diff-view")).toBeVisible();
-    const renderedDiff = await readRenderedDiff(page);
-    renderedDiffs.set(stableDiffArtifact.artifact_id, renderedDiff);
-    assertClosed(
-      JSON.stringify(renderedDiff) === JSON.stringify(expectedRenderedDiff(stableDiff)),
-      `renderer ${stableDiffArtifact.target_id} diff differs from the stable response cutoff`,
-    );
-  }
-
   await page.getByRole("button", { name: "Research", exact: true }).click();
   await expect(page.getByTestId("research-workspace")).toBeVisible();
   await page.evaluate(() => window.scrollTo(0, 0));

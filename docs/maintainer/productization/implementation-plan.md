@@ -28,7 +28,7 @@ architecture document, module README, test, or pull request.
   repository boundaries.
 - Write focused regressions before behavior-changing fixes.
 - Update the owning documentation with each behavior or contract change.
-- At each workstream boundary, use fresh independent `gpt-5.6-sol` reviewers
+- At each workstream boundary, use fresh independent `gpt-5.6-terra` reviewers
   with high reasoning and resolve findings before merge.
 - Run focused tests, broader affected regressions, `git diff --check`, and a
   complete diff review before commit.
@@ -38,14 +38,15 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-Version `0.1.3` is the current public, installable unsigned exhibition Preview.
+Version `0.1.5` is the current public, installable unsigned exhibition Preview.
 It proves the real mounted and copied DMG, packaged sidecar and renderer, a
 self-contained Daemon Bundle, managed-runtime packaging smoke, and immutable
-release asset roundtrip. It has no checked-in candidate-bound science E2E or
-clean-host matrix evidence, and it is intentionally non-gating. It does not
-prove G2, G3, G12, or any full science workflow, and it is not the candidate
-that will satisfy G1-G12. Earlier Preview releases are retained as historical
-evidence.
+release asset roundtrip. It was published through the emergency manual path
+documented in `docs/maintainer/release-process.md`; it has no detached signed
+candidate-bound science publication record or clean-host matrix evidence, and
+it is intentionally non-gating. It does not prove G2, G3, G12, or a complete
+ordinary-user qualification matrix, and it is not the candidate that will
+satisfy G1-G12. Earlier Preview releases are retained as historical evidence.
 System, Files, and History remain incomplete; the v2 authority cutover, G4, and
 G7-G12 remain open.
 
@@ -154,7 +155,7 @@ capabilities, task execution, retry/cancel, timeline/transcript, and evolution
 inspection are implemented. First launch exposes two read-only synthetic
 science projects, each demonstrating three cross-session tasks and
 textual-memory, trajectory-to-skill, and agent-system evolution without
-creating authoritative or remote state. The public `0.1.3` Preview launches
+creating authoritative or remote state. The public `0.1.5` Preview launches
 from the real DMG with its packaged renderer and sidecar. G2 clean-user
 lifecycle evidence, Files, History, System maintenance, mediated credential
 choices, and several recovery flows remain incomplete.
@@ -205,7 +206,7 @@ that candidate.
 manifest-bound candidate. Infrastructure reruns follow the policy in the spec;
 product or benchmark failures require a corrected candidate.
 
-Before publication, two fresh-context `gpt-5.6-sol` high-effort reviewers
+Before publication, two fresh-context `gpt-5.6-terra` high-effort reviewers
 independently review product/spec compliance and release risk/evidence.
 
 ## Immediate Execution Order

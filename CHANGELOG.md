@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.1.5 Preview - 2026-07-21
+
+### Added
+
+- Make **Add remote workspace** the prominent first-run action for connecting
+  Desktop to a supported Linux host.
+- Add Codex model and reasoning-effort controls for Subscription projects.
+- Let users independently enable textual memory, skill bundle, and agent-system
+  targets and select each target's Daemon-reported evolution method.
+- Include two built-in, read-only scientific project demonstrations with task
+  timelines and evolution artifacts that require no server configuration.
+
+### Changed
+
+- Present the Desktop interface and built-in demonstrations entirely in
+  English and use the current OpenEvo application icon throughout macOS and the
+  app interface.
+- Allow Desktop to upgrade a managed OpenEvo Daemon from Preview `0.1.4` to the
+  release-matched `0.1.5` bundle.
+
+### Known Limitations
+
+- This is an unsigned, non-notarized Apple Silicon exhibition Preview. Follow
+  the checksum and quarantine instructions in the Desktop quickstart.
+- The supported path uses a remote Linux x86-64 host with Docker user-container
+  access and a Codex CLI that is already signed in to a subscription.
+- Self-deployed inference, parameter evolution, other harnesses, Intel Mac
+  builds, and a general clean-host matrix remain outside this Preview.
+
 ## 0.1.4 Preview - 2026-07-20
 
 - Keeps evolution target activation under explicit user control and resolves

@@ -14,7 +14,7 @@ OpenEvo has two user-facing applications:
 - **OpenEvo Daemon** is the Linux service that Desktop installs and controls on
   the selected remote server.
 
-[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.4-exhibition.29813754427.1)
+[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1)
 | [Read the user guide](docs/user/README.md)
 | [Report a problem](https://github.com/CompLifeLab-ZJU/OpenEvo/issues)
 
@@ -42,11 +42,11 @@ lifecycle management.
 
 ## Try It Before Connecting A Server
 
-The first launch includes two read-only synthetic projects:
+The first launch includes two read-only demonstration projects:
 
-- **Enzyme kinetics model review** follows a failed baseline through corrected
+- **Enzyme Kinetics Model Review** follows a failed baseline through corrected
   fitting and held-out validation.
-- **Protein stability evidence integration** combines plate-aware DSF analysis
+- **Protein Stability Evidence Review** combines plate-aware DSF analysis
   with orthogonal SEC evidence.
 
 Each project contains three task sessions and complete textual-memory,
@@ -56,7 +56,7 @@ state.
 
 ## Current Preview
 
-The current public release is **OpenEvo Desktop 0.1.4 Preview**. It supports the
+The current public release is **OpenEvo Desktop 0.1.5 Preview**. It supports the
 following exhibition profile:
 
 | Component | Current support |
@@ -76,12 +76,12 @@ documented host profile and do not depend on it for production-critical work.
 ## Install On macOS
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.4 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.4-exhibition.29813754427.1).
-2. Download `OpenEvo-Desktop-0.1.4-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.5 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.5-exhibition.29827786454.1).
+2. Download `OpenEvo-Desktop-0.1.5-aarch64.dmg` and `SHA256SUMS`.
 3. Verify the DMG before opening it:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.4-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.5-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -123,8 +123,8 @@ See [Remote server setup](docs/user/remote-server-setup.md) and
 
 ## Run Your First Project
 
-1. In Desktop, choose **Add workspace** and enter the server address, SSH port,
-   and remote user.
+1. In Desktop, choose **Add remote workspace** and enter the server address,
+   SSH port, and remote user.
 2. Connect and confirm the server fingerprint.
 3. Create a project with a task objective and either an empty managed workspace
    or a snapshot of a local folder.
@@ -158,7 +158,7 @@ missed events.
   accepted host identity and fails closed on an unexplained key change.
 - Desktop and Daemon communicate through an authenticated private SSH tunnel;
   the Daemon API is not exposed as a normal user surface.
-- The two built-in demonstrations are synthetic, local, and read-only.
+- The two built-in demonstrations are local and read-only.
 
 Review the [security policy](SECURITY.md) before using private research data.
 

@@ -24,7 +24,7 @@ and the immutable candidate produced by run `29756612736`. Preserve its exact
 source commit, tag, release assets, checksums, and complete publication evidence.
 It is a packaging Preview without candidate-bound real Codex science E2E.
 
-Version `0.1.4` is the current public unsigned exhibition Preview, published on
+Version `0.1.4` is a public unsigned historical exhibition Preview, published on
 July 21, 2026 from source `963407c11e8bac3873eb7de73c3fb55fd5547fb7`,
 candidate run `29813754427`, and publication run `29816113282`. Its
 candidate-bound release-host evidence verifies two remote Codex subscription
@@ -34,6 +34,26 @@ still a Preview rather than a G1-G12 candidate: the evidence does not execute
 the final macOS Tauri process against the remote host, and clean-host matrix,
 protected-performance, signing, notarization, and External Beta gates remain
 open.
+
+Version `0.1.5` is the current public immutable unsigned exhibition Preview,
+published on July 21, 2026 from source
+`cf7d027b3967db2842af3879882af2b2a8cd693c` and candidate run
+`29827786454` under tag
+`openevo-desktop-v0.1.5-exhibition.29827786454.1`. The exact candidate passed
+Daemon Bundle construction, managed `0.1.4` to `0.1.5` Daemon upgrade,
+mounted-DMG launch, detached-copy relaunch, packaged-renderer checks, checksum
+validation, and clean-directory asset roundtrip. At the product owner's
+direction it was made public through an emergency manual publication before a
+detached, signed real-science publication record was completed. Several
+independent two-session remote Codex runs exercised transcript capture, all
+three text-evolution targets, next-session artifact reuse, and successor
+Project Heads, but those runs are not detached signed publication evidence for
+this immutable release. Therefore `0.1.5` must not be cited as proof that the
+signed publication controller or the G1-G12 release gates completed. Version
+`0.1.4` remains the latest Preview with checked-in signed, candidate-bound
+science evidence. The immutable `0.1.5` release notes overstate that gate; this
+repository audit records the authoritative deviation because published notes
+and assets cannot be replaced.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
@@ -46,7 +66,7 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-The checked-in evidence for `0.1.4` is bound to the exact candidate manifest and
+The checked-in evidence for `0.1.4` is bound to its exact candidate manifest and
 signed by the release host. It proves the stated Preview path, but it does not
 by itself satisfy G2, G3, G4, G7, G12, or the full ordinary-user qualification
 matrix.
@@ -494,7 +514,7 @@ non-immutable response after publication and the run enters that incident path;
 no broader token is stored in Actions to eliminate this administrator-level
 race.
 
-Two fresh-context `gpt-5.6-sol` high-effort reviews must approve product/spec
+Two fresh-context `gpt-5.6-terra` high-effort reviews must approve product/spec
 compliance and release risk before a candidate reaches `stable`.
 
 ## Publication

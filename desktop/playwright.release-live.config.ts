@@ -18,6 +18,7 @@ export default defineConfig({
   workers: 1,
   reporter: "line",
   timeout,
+  expect: { timeout: 30_000 },
   use: {
     baseURL: "http://tauri.localhost",
     colorScheme: "light",
