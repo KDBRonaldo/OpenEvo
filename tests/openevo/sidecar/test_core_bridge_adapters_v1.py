@@ -41,6 +41,7 @@ from openevo.deployment.daemon_bundle_transport import (
     DaemonBundleIdentity,
     DaemonBundleServicePredecessor,
     DaemonBundleServiceStatus,
+    DaemonBundleStopReceipt,
     StagedDaemonBundle,
 )
 from openevo.deployment.preflight import RemoteCommandResult
@@ -76,7 +77,11 @@ ARCHIVE = bytes(1024)
 IMPORT_ID = "workspace-import-" + "7" * 48
 
 
-def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
+def _bootstrap_config(
+    tmp_path: Path,
+    *,
+    replace_mismatched: bool = False,
+) -> CoreBootstrapConfigV1:
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
     wheel.write_bytes(b"sealed-wheel")
     wheel_digest = WHEEL_DIGEST
@@ -127,6 +132,7 @@ def _bootstrap_config(tmp_path: Path) -> CoreBootstrapConfigV1:
             config_id=release.config_id,
             oci_index_id=release.oci_index_id,
         ),
+        replace_mismatched=replace_mismatched,
     )
 
 
@@ -191,18 +197,23 @@ class FakeCoreTransport:
         self.stage_calls: list[dict[str, object]] = []
         self.identity_error: Exception | None = None
         self.observation_error: Exception | None = None
+        self.observation_results: list[DaemonBundleServicePredecessor] = []
         self.ensure_error: Exception | None = None
+        self.stop_error: Exception | None = None
         self.service_bundle_sha256: str | None = None
         self.service_manifest_sha256: str | None = None
         self.after_stage: Callable[[], None] | None = None
         self.after_identity: Callable[[], None] | None = None
+        self.after_stop: Callable[[], None] | None = None
         self.after_ensure: Callable[[], None] | None = None
         self.managed_runtime_calls: list[dict[str, object]] = []
+        self.managed_runtime_error: Exception | None = None
         self.managed_runtime_block = False
         self.managed_runtime_entered = threading.Event()
         self.managed_runtime_cancelled = threading.Event()
         self.operation_order: list[str] = []
         self.ensure_predecessors: list[DaemonBundleServicePredecessor] = []
+        self.stop_predecessors: list[DaemonBundleServicePredecessor] = []
 
     def stage_daemon_bundle(
         self,
@@ -294,6 +305,8 @@ class FakeCoreTransport:
         del bundle
         self.operation_order.append("managed_runtime")
         self.managed_runtime_calls.append(kwargs)
+        if self.managed_runtime_error is not None:
+            raise self.managed_runtime_error
         if self.managed_runtime_block:
             cancel_event = kwargs.get("cancel_event")
             assert isinstance(cancel_event, threading.Event)
@@ -312,7 +325,34 @@ class FakeCoreTransport:
         self.operation_order.append("daemon_observe")
         if self.observation_error is not None:
             raise self.observation_error
+        if self.observation_results:
+            return self.observation_results.pop(0)
         return DaemonBundleServicePredecessor(state="absent")
+
+    def stop_daemon_bundle(
+        self,
+        bundle: StagedDaemonBundle,
+        *,
+        expected_predecessor: DaemonBundleServicePredecessor,
+        timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
+    ) -> DaemonBundleStopReceipt:
+        del bundle, timeout_seconds
+        if cancel_event is not None and cancel_event.is_set():
+            raise SshTransportError(SshTransportErrorCode.CANCELLED)
+        self.operation_order.append("daemon_stop")
+        self.stop_predecessors.append(expected_predecessor)
+        if self.stop_error is not None:
+            raise self.stop_error
+        if self.after_stop is not None:
+            self.after_stop()
+        assert expected_predecessor.generation is not None
+        assert expected_predecessor.release_identity is not None
+        return DaemonBundleStopReceipt(
+            stopped=True,
+            generation=expected_predecessor.generation,
+            release_identity=expected_predecessor.release_identity,
+        )
 
     def ensure_daemon_bundle(
         self,
@@ -386,11 +426,16 @@ class FakeLifecycle(DesktopRemoteLifecycle):
 def _adapter(
     tmp_path: Path,
     transport: FakeCoreTransport | None = None,
+    *,
+    replace_mismatched: bool = False,
 ) -> tuple[DesktopCoreSshBridgeAdapterV1, FakeLifecycle, FakeCoreTransport]:
     active = transport or FakeCoreTransport()
     lifecycle = FakeLifecycle(PROFILE_ID, active)
     return (
-        DesktopCoreSshBridgeAdapterV1(lifecycle, _bootstrap_config(tmp_path)),
+        DesktopCoreSshBridgeAdapterV1(
+            lifecycle,
+            _bootstrap_config(tmp_path, replace_mismatched=replace_mismatched),
+        ),
         lifecycle,
         active,
     )
@@ -736,6 +781,229 @@ def test_core_host_preserves_nonretryable_daemon_update_required(
     assert update.value.error.code == "daemon_update_required"
     assert update.value.error.http_status == 409
     assert update.value.error.retryable is False
+
+
+def test_core_host_atomically_replaces_observed_mismatched_daemon(
+    tmp_path: Path,
+) -> None:
+    old = DaemonBundleServicePredecessor(
+        state="running",
+        generation="8" * 32,
+        release_identity="9" * 64,
+        bundle_sha256="a" * 64,
+        canonical_manifest_sha256="b" * 64,
+        lifecycle_compatibility=6,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [
+        old,
+        DaemonBundleServicePredecessor(state="absent"),
+    ]
+    adapter, _lifecycle, _transport = _adapter(
+        tmp_path,
+        transport,
+        replace_mismatched=True,
+    )
+
+    attachment = adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert attachment.remote_port == 43117
+    assert transport.stop_predecessors == [old]
+    assert transport.ensure_predecessors == [DaemonBundleServicePredecessor(state="absent")]
+    assert transport.operation_order == [
+        "daemon_stage",
+        "daemon_identity",
+        "daemon_observe",
+        "managed_runtime",
+        "daemon_stop",
+        "daemon_observe",
+        "daemon_start",
+    ]
+
+
+def test_core_host_keeps_old_daemon_when_runtime_prepare_fails(tmp_path: Path) -> None:
+    old = DaemonBundleServicePredecessor(
+        state="legacy",
+        generation="8" * 32,
+        release_identity="9" * 64,
+        lifecycle_compatibility=1,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [old]
+    transport.managed_runtime_error = SshTransportError(
+        SshTransportErrorCode.MANAGED_RUNTIME_FAILED
+    )
+    adapter, _lifecycle, _transport = _adapter(
+        tmp_path,
+        transport,
+        replace_mismatched=True,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as failed:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert failed.value.error.code == "managed_runtime_prepare_failed"
+    assert transport.stop_predecessors == []
+    assert transport.ensure_predecessors == []
+
+
+def test_core_host_does_not_replace_exact_candidate_daemon(tmp_path: Path) -> None:
+    candidate = _bootstrap_config(tmp_path).daemon_bundle
+    assert candidate is not None
+    predecessor = DaemonBundleServicePredecessor(
+        state="running",
+        generation="8" * 32,
+        release_identity=candidate.release_identity,
+        bundle_sha256=candidate.sha256,
+        canonical_manifest_sha256=candidate.manifest_sha256,
+        lifecycle_compatibility=6,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [predecessor]
+    adapter, _lifecycle, _transport = _adapter(
+        tmp_path,
+        transport,
+        replace_mismatched=True,
+    )
+
+    adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert transport.stop_predecessors == []
+    assert transport.ensure_predecessors == [predecessor]
+
+
+def test_core_host_preserves_mismatched_daemon_when_replacement_is_disabled(
+    tmp_path: Path,
+) -> None:
+    predecessor = DaemonBundleServicePredecessor(
+        state="legacy",
+        generation="8" * 32,
+        release_identity="9" * 64,
+        lifecycle_compatibility=1,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [predecessor]
+    transport.ensure_error = SshTransportError(SshTransportErrorCode.DAEMON_UPDATE_REQUIRED)
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as update:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert update.value.error.code == "daemon_update_required"
+    assert transport.stop_predecessors == []
+    assert transport.ensure_predecessors == [predecessor]
+
+
+def test_core_host_fails_closed_when_daemon_changes_during_replacement(
+    tmp_path: Path,
+) -> None:
+    old = DaemonBundleServicePredecessor(
+        state="running",
+        generation="8" * 32,
+        release_identity="9" * 64,
+        bundle_sha256="a" * 64,
+        canonical_manifest_sha256="b" * 64,
+        lifecycle_compatibility=6,
+    )
+    replacement = DaemonBundleServicePredecessor(
+        state="running",
+        generation="7" * 32,
+        release_identity="6" * 64,
+        bundle_sha256="c" * 64,
+        canonical_manifest_sha256="d" * 64,
+        lifecycle_compatibility=6,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [old, replacement]
+    adapter, _lifecycle, _transport = _adapter(
+        tmp_path,
+        transport,
+        replace_mismatched=True,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as conflict:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert conflict.value.error.code == "daemon_service_predecessor_mismatch"
+    assert conflict.value.error.retryable is True
+    assert transport.stop_predecessors == [old]
+    assert transport.ensure_predecessors == []
+
+
+def test_core_host_maps_conditional_daemon_stop_conflict(tmp_path: Path) -> None:
+    old = DaemonBundleServicePredecessor(
+        state="legacy",
+        generation="8" * 32,
+        release_identity="9" * 64,
+        lifecycle_compatibility=1,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [old]
+    transport.stop_error = SshTransportError(
+        SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH
+    )
+    adapter, _lifecycle, _transport = _adapter(
+        tmp_path,
+        transport,
+        replace_mismatched=True,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as conflict:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert conflict.value.error.code == "daemon_service_predecessor_mismatch"
+    assert conflict.value.error.retryable is True
+    assert transport.ensure_predecessors == []
+
+
+def test_core_host_cancellation_after_stop_never_starts_daemon(tmp_path: Path) -> None:
+    old = DaemonBundleServicePredecessor(
+        state="legacy",
+        generation="8" * 32,
+        release_identity="9" * 64,
+        lifecycle_compatibility=1,
+    )
+    transport = FakeCoreTransport()
+    transport.observation_results = [old]
+    cancel_event = threading.Event()
+    transport.after_stop = cancel_event.set
+    adapter, _lifecycle, _transport = _adapter(
+        tmp_path,
+        transport,
+        replace_mismatched=True,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as cancelled:
+        adapter.ensure_core(
+            PROFILE_ID,
+            deadline=time.monotonic() + 5,
+            cancel_event=cancel_event,
+        )
+
+    assert cancelled.value.error.code == "active_project_session_superseded"
+    assert transport.stop_predecessors == [old]
+    assert transport.ensure_predecessors == []
+    assert transport.operation_order == [
+        "daemon_stage",
+        "daemon_identity",
+        "daemon_observe",
+        "managed_runtime",
+        "daemon_stop",
+    ]
+
+
+def test_core_host_requires_conditional_daemon_stop_transport(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    transport.stop_daemon_bundle = None  # type: ignore[assignment]
+    adapter, _lifecycle, _transport = _adapter(tmp_path, transport)
+
+    with pytest.raises(DesktopCoreBridgeErrorV1) as incompatible:
+        adapter.ensure_core(PROFILE_ID, deadline=time.monotonic() + 5)
+
+    assert incompatible.value.error.code == "core_ssh_transport_incompatible"
+    assert transport.stage_calls == []
 
 
 def test_tunnel_uses_same_transport_exact_attachment_and_idempotent_close(

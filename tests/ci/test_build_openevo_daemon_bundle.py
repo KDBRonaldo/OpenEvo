@@ -392,36 +392,45 @@ def test_internal_managed_service_dispatch_is_closed_and_rebinds_framework_lock(
         lambda: captured.setdefault("gateway", list(sys.argv)) and None,
     )
 
-    assert daemon_bundle._internal_module_dispatch(
-        [
-            "-I",
-            "-m",
-            "openevo.evolution.cli",
-            "serve",
-            "--framework-lock",
-            "/parent-extraction/framework-lock.json",
-        ]
-    ) == 0
-    assert daemon_bundle._internal_module_dispatch(
-        [
-            "-I",
-            "-m",
-            "openevo.rollout.server",
-            "--config",
-            "/managed/topology.json",
-        ]
-    ) == 0
-    assert daemon_bundle._internal_module_dispatch(
-        [
-            "-I",
-            "-m",
-            "openevo.gateway.server",
-            "--config",
-            "/managed/topology.json",
-            "--node-id",
-            "core-gateway",
-        ]
-    ) == 0
+    assert (
+        daemon_bundle._internal_module_dispatch(
+            [
+                "-I",
+                "-m",
+                "openevo.evolution.cli",
+                "serve",
+                "--framework-lock",
+                "/parent-extraction/framework-lock.json",
+            ]
+        )
+        == 0
+    )
+    assert (
+        daemon_bundle._internal_module_dispatch(
+            [
+                "-I",
+                "-m",
+                "openevo.rollout.server",
+                "--config",
+                "/managed/topology.json",
+            ]
+        )
+        == 0
+    )
+    assert (
+        daemon_bundle._internal_module_dispatch(
+            [
+                "-I",
+                "-m",
+                "openevo.gateway.server",
+                "--config",
+                "/managed/topology.json",
+                "--node-id",
+                "core-gateway",
+            ]
+        )
+        == 0
+    )
 
     assert captured == {
         "evolution": [
@@ -447,9 +456,7 @@ def test_internal_managed_service_dispatch_is_closed_and_rebinds_framework_lock(
     with pytest.raises(daemon_bundle.DaemonBundleError, match="not allowlisted"):
         daemon_bundle._internal_module_dispatch(["-I", "-m", "os", "getcwd"])
     with pytest.raises(daemon_bundle.DaemonBundleError, match="not allowlisted"):
-        daemon_bundle._internal_module_dispatch(
-            ["-I", "-m", "openevo.evolution.cli", "promote"]
-        )
+        daemon_bundle._internal_module_dispatch(["-I", "-m", "openevo.evolution.cli", "promote"])
 
 
 def test_internal_script_dispatch_only_allows_managed_runtime_contract(
@@ -738,3 +745,56 @@ def test_service_inspect_excludes_bearer_and_status_proof(
     }
     assert "bearer_token" not in result
     assert "status_proof" not in result
+
+
+def test_service_stop_is_bound_to_observed_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def stop(**kwargs: object) -> bool:
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(daemon_bundle, "stop_core_service_if_generation", stop)
+
+    result = daemon_bundle._run_service_command(
+        SimpleNamespace(
+            service_command="stop",
+            deadline_seconds=30.0,
+            expect_service_generation="5" * 32,
+            expect_service_release_identity="2" * 64,
+        )
+    )
+
+    assert result == {
+        "generation": "5" * 32,
+        "release_identity": "2" * 64,
+        "schema_version": 2,
+        "stopped": True,
+    }
+    assert captured["expected_generation"] == "5" * 32
+    assert captured["expected_release_identity"] == "2" * 64
+
+
+def test_service_stop_rejects_changed_generation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        daemon_bundle,
+        "stop_core_service_if_generation",
+        lambda **_kwargs: False,
+    )
+
+    with pytest.raises(daemon_bundle.CoreServiceError) as conflict:
+        daemon_bundle._run_service_command(
+            SimpleNamespace(
+                service_command="stop",
+                deadline_seconds=30.0,
+                expect_service_generation="5" * 32,
+                expect_service_release_identity="2" * 64,
+            )
+        )
+
+    assert conflict.value.code is daemon_bundle.CoreServiceErrorCode.PREDECESSOR_MISMATCH
+    assert conflict.value.retryable is True

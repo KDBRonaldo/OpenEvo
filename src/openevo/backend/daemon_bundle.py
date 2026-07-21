@@ -28,7 +28,6 @@ from openevo.backend.service import (
     ensure_core_service,
     inspect_core_service,
     observe_core_service_predecessor,
-    stop_core_service,
     stop_core_service_if_generation,
 )
 from openevo.evolution.framework import (
@@ -746,6 +745,8 @@ def build_parser() -> argparse.ArgumentParser:
     service_subparsers.add_parser("inspect")
     stop = service_subparsers.add_parser("stop")
     stop.add_argument("--deadline-seconds", type=float, default=15.0)
+    stop.add_argument("--expect-service-generation", required=True)
+    stop.add_argument("--expect-service-release-identity", required=True)
     managed_runtime = subparsers.add_parser("managed-runtime")
     managed_runtime.add_argument(
         "runtime_action",
@@ -825,12 +826,24 @@ def _run_service_command(args: argparse.Namespace) -> dict[str, object]:
     if args.service_command == "inspect":
         return _service_metadata(inspect_core_service(service_root=service_root))
     if args.service_command == "stop":
-        stop_core_service(
+        stopped = stop_core_service_if_generation(
             service_root=service_root,
+            expected_generation=args.expect_service_generation,
+            expected_release_identity=args.expect_service_release_identity,
             deadline_seconds=args.deadline_seconds,
-            preserve_compatibility_floor=True,
         )
-        return {"schema_version": 1, "stopped": True}
+        if not stopped:
+            raise CoreServiceError(
+                CoreServiceErrorCode.PREDECESSOR_MISMATCH,
+                "The active Core service no longer matches the requested predecessor.",
+                retryable=True,
+            )
+        return {
+            "generation": args.expect_service_generation,
+            "release_identity": args.expect_service_release_identity,
+            "schema_version": 2,
+            "stopped": True,
+        }
     raise DaemonBundleError("The Daemon service command is invalid.")
 
 

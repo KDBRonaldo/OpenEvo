@@ -25,9 +25,11 @@ from openevo.deployment.daemon_bundle_transport import (
     _STAGE_SCRIPT,
     build_daemon_bundle_ensure_command,
     build_daemon_bundle_observe_command,
+    build_daemon_bundle_stop_command,
     parse_daemon_bundle_error_code,
     parse_daemon_bundle_identity,
     parse_daemon_bundle_service_predecessor,
+    parse_daemon_bundle_stop_receipt,
     parse_staged_daemon_bundle,
 )
 from openevo.deployment.host_keys import ProviderKnownHostStore, TrustedKnownHostsBinding
@@ -471,6 +473,48 @@ def test_observe_command_and_predecessor_parser_are_closed() -> None:
         )
 
 
+def test_stop_command_and_receipt_bind_exact_predecessor() -> None:
+    bundle = _staged(digest="a" * 64, size=12)
+    predecessor = DaemonBundleServicePredecessor(
+        state="legacy",
+        generation="b" * 32,
+        release_identity="5" * 64,
+        lifecycle_compatibility=1,
+    )
+
+    command = build_daemon_bundle_stop_command(
+        bundle,
+        deadline_seconds=12,
+        expected_predecessor=predecessor,
+    )
+    receipt = parse_daemon_bundle_stop_receipt(
+        SecretStr(
+            _canonical(
+                {
+                    "generation": predecessor.generation,
+                    "release_identity": predecessor.release_identity,
+                    "schema_version": 2,
+                    "stopped": True,
+                }
+            )
+        )
+    )
+
+    assert f"--expect-service-generation {'b' * 32}" in command
+    assert f"--expect-service-release-identity {'5' * 64}" in command
+    assert receipt.generation == predecessor.generation
+    with pytest.raises(DaemonBundleTransportContractError):
+        build_daemon_bundle_stop_command(
+            bundle,
+            deadline_seconds=12,
+            expected_predecessor=DaemonBundleServicePredecessor(state="absent"),
+        )
+    with pytest.raises(DaemonBundleTransportContractError):
+        parse_daemon_bundle_stop_receipt(
+            SecretStr(_canonical({"schema_version": 1, "stopped": True}))
+        )
+
+
 def test_daemon_error_parser_returns_only_closed_error_code() -> None:
     payload = SecretStr(
         _canonical(
@@ -782,6 +826,58 @@ def test_ssh_ensure_preserves_predecessor_conflict_without_remote_message(
     assert private not in str(raised.value)
 
 
+def test_ssh_stop_preserves_predecessor_conflict_without_remote_message(
+    tmp_path: Path,
+) -> None:
+    bundle = _staged(digest="a" * 64, size=12)
+    predecessor = DaemonBundleServicePredecessor(
+        state="legacy",
+        generation="b" * 32,
+        release_identity="5" * 64,
+        lifecycle_compatibility=1,
+    )
+    private = "private-remote-stop-detail"
+
+    def runner(
+        argv: list[str],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds
+        command = argv[-1]
+        error = _canonical(
+            {
+                "error": {
+                    "code": "core_service_predecessor_mismatch",
+                    "message": private,
+                    "retryable": True,
+                },
+                "schema_version": 1,
+            }
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            1,
+            stdout="",
+            stderr=error + _completion_stderr(command, return_code=1),
+        )
+
+    profile = _profile()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=_trusted_binding(tmp_path, profile),
+        runner=runner,
+    )
+
+    with pytest.raises(SshTransportError) as raised:
+        transport.stop_daemon_bundle(
+            bundle,
+            expected_predecessor=predecessor,
+        )
+
+    assert raised.value.code is SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH
+    assert private not in str(raised.value)
+
+
 def test_ssh_ensure_preserves_nonretryable_update_required_error(
     tmp_path: Path,
 ) -> None:
@@ -851,7 +947,23 @@ def test_ssh_inspect_and_stop_use_closed_bundle_responses(tmp_path: Path) -> Non
             "source_commit": "6" * 40,
         }
     )
-    stop = _canonical({"schema_version": 1, "stopped": True})
+    predecessor = DaemonBundleServicePredecessor(
+        state="running",
+        generation="b" * 32,
+        release_identity="5" * 64,
+        bundle_sha256="a" * 64,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+        lifecycle_compatibility=2,
+    )
+    stop = _canonical(
+        {
+            "generation": predecessor.generation,
+            "release_identity": predecessor.release_identity,
+            "schema_version": 2,
+            "stopped": True,
+        }
+    )
+    commands: list[str] = []
 
     def runner(
         argv: list[str],
@@ -859,6 +971,7 @@ def test_ssh_inspect_and_stop_use_closed_bundle_responses(tmp_path: Path) -> Non
     ) -> subprocess.CompletedProcess[str]:
         del timeout_seconds
         command = argv[-1]
+        commands.append(command)
         stdout = status if " service inspect" in command else stop
         return subprocess.CompletedProcess(
             argv,
@@ -875,11 +988,18 @@ def test_ssh_inspect_and_stop_use_closed_bundle_responses(tmp_path: Path) -> Non
     )
 
     observed = transport.inspect_daemon_bundle(bundle)
-    stopped = transport.stop_daemon_bundle(bundle)
+    stopped = transport.stop_daemon_bundle(
+        bundle,
+        expected_predecessor=predecessor,
+    )
 
     assert observed.remote_port == 43123
     assert observed.generation == "b" * 32
     assert stopped.stopped is True
+    assert stopped.generation == predecessor.generation
+    assert stopped.release_identity == predecessor.release_identity
+    assert "--expect-service-generation " + "b" * 32 in commands[-1]
+    assert "--expect-service-release-identity " + "5" * 64 in commands[-1]
 
 
 def test_daemon_managed_runtime_streams_without_python_rsync_or_scp(

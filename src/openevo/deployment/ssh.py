@@ -1723,6 +1723,7 @@ class SshRemoteExecutorTransport:
         self,
         bundle: StagedDaemonBundle,
         *,
+        expected_predecessor: DaemonBundleServicePredecessor,
         timeout_seconds: float = 30.0,
         cancel_event: threading.Event | None = None,
     ) -> DaemonBundleStopReceipt:
@@ -1732,17 +1733,37 @@ class SshRemoteExecutorTransport:
             cancel_event=cancel_event,
         )
         try:
+            if (
+                not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
+                or expected_predecessor.state == "absent"
+            ):
+                raise DaemonBundleTransportContractError("Daemon bundle stop request is invalid.")
+            expected_predecessor.__post_init__()
             command = build_daemon_bundle_stop_command(
                 bundle,
                 deadline_seconds=float(timeout_seconds),
+                expected_predecessor=expected_predecessor,
             )
             payload = self._run_secret_with_remote_failure(
                 command,
                 timeout_seconds=float(timeout_seconds),
                 remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+                remote_error_codes={
+                    "core_service_predecessor_mismatch": (
+                        SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH
+                    )
+                },
                 cancel_event=cancel_event,
             )
-            return parse_daemon_bundle_stop_receipt(payload)
+            receipt = parse_daemon_bundle_stop_receipt(payload)
+            if (
+                receipt.generation != expected_predecessor.generation
+                or receipt.release_identity != expected_predecessor.release_identity
+            ):
+                raise DaemonBundleTransportContractError(
+                    "Daemon stop receipt does not match the requested predecessor."
+                )
+            return receipt
         except DaemonBundleTransportContractError:
             _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
             raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED) from None

@@ -179,6 +179,18 @@ class DaemonBundleServicePredecessor:
 @dataclass(frozen=True, slots=True)
 class DaemonBundleStopReceipt:
     stopped: Literal[True]
+    generation: str
+    release_identity: str
+
+    def __post_init__(self) -> None:
+        if (
+            self.stopped is not True
+            or type(self.generation) is not str
+            or _GENERATION_PATTERN.fullmatch(self.generation) is None
+            or type(self.release_identity) is not str
+            or _DIGEST_PATTERN.fullmatch(self.release_identity) is None
+        ):
+            raise DaemonBundleTransportContractError("Daemon stop receipt is invalid.")
 
 
 class OpenedDaemonBundle:
@@ -444,17 +456,32 @@ def build_daemon_bundle_stop_command(
     bundle: StagedDaemonBundle,
     *,
     deadline_seconds: float,
+    expected_predecessor: DaemonBundleServicePredecessor,
 ) -> str:
     bundle.__post_init__()
     if (
         isinstance(deadline_seconds, bool)
         or not isinstance(deadline_seconds, (int, float))
         or not 0 < deadline_seconds <= 300
+        or not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
     ):
         raise DaemonBundleTransportContractError("Daemon bundle stop request is invalid.")
+    try:
+        expected_predecessor.__post_init__()
+    except DaemonBundleTransportContractError:
+        raise DaemonBundleTransportContractError(
+            "Daemon bundle stop request is invalid."
+        ) from None
+    if expected_predecessor.state == "absent":
+        raise DaemonBundleTransportContractError("Daemon bundle stop request is invalid.")
+    assert expected_predecessor.generation is not None
+    assert expected_predecessor.release_identity is not None
     return (
         f"{shlex.quote(bundle._executable_path)} service stop"
         f" --deadline-seconds {deadline_seconds:.6f}"
+        f" --expect-service-generation {expected_predecessor.generation}"
+        " --expect-service-release-identity "
+        f"{expected_predecessor.release_identity}"
     )
 
 
@@ -687,11 +714,25 @@ def parse_daemon_bundle_stop_receipt(payload: SecretStr) -> DaemonBundleStopRece
     value = _load_secret_json(payload)
     if (
         type(value) is not dict
-        or set(value) != {"schema_version", "stopped"}
-        or value != {"schema_version": 1, "stopped": True}
+        or set(value)
+        != {
+            "generation",
+            "release_identity",
+            "schema_version",
+            "stopped",
+        }
+        or value.get("schema_version") != 2
+        or value.get("stopped") is not True
     ):
         raise DaemonBundleTransportContractError("Daemon stop receipt is invalid.")
-    return DaemonBundleStopReceipt(stopped=True)
+    try:
+        return DaemonBundleStopReceipt(
+            stopped=True,
+            generation=value["generation"],
+            release_identity=value["release_identity"],
+        )
+    except (DaemonBundleTransportContractError, TypeError):
+        raise DaemonBundleTransportContractError("Daemon stop receipt is invalid.") from None
 
 
 def _file_identity(metadata: os.stat_result) -> tuple[int, ...]:
