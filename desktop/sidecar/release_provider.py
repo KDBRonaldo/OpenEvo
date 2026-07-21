@@ -186,7 +186,8 @@ class DesktopCoreRuntimeOwnerV1(Protocol):
         self,
         *,
         active_project: Callable[[], CoreRuntimeSessionBinding | None],
-        publish: Callable[[], None],
+        refresh_authority: Callable[[CoreRuntimeSessionBinding], None],
+        publish: Callable[[CoreRuntimeSessionBinding], None],
         session_lost: Callable[[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None],
     ) -> None: ...
 
@@ -475,7 +476,8 @@ class DesktopReleaseProvider:
         if self._core_runtime is not None:
             self._core_runtime.start(
                 active_project=self._active_project_for_runtime,
-                publish=self._refresh_project_authority_and_publish,
+                refresh_authority=self._refresh_project_authority,
+                publish=self._publish_core_event_invalidation_for_session,
                 session_lost=self._handle_core_session_loss,
             )
 
@@ -2358,12 +2360,27 @@ class DesktopReleaseProvider:
         if self._event_broker is not None:
             self._event_broker.publish(StateEventV1(state=self._get_state({})))
 
-    def _refresh_project_authority_and_publish(self) -> None:
+    def _publish_core_event_invalidation_for_session(
+        self,
+        source_binding: CoreRuntimeSessionBinding,
+    ) -> None:
         with self._project_session_lock:
             binding = self._active_project_for_runtime()
-            if binding is None:
+            if binding is None or not self._same_core_session(binding, source_binding):
                 raise ProviderStoreError(
-                    "Desktop has no active project for Core authority refresh"
+                    "Core event no longer belongs to the active Desktop session"
+                )
+            self._publish_core_event_invalidation()
+
+    def _refresh_project_authority(
+        self,
+        source_binding: CoreRuntimeSessionBinding,
+    ) -> None:
+        with self._project_session_lock:
+            binding = self._active_project_for_runtime()
+            if binding is None or not self._same_core_session(binding, source_binding):
+                raise ProviderStoreError(
+                    "Core project update no longer belongs to the active Desktop session"
                 )
             bridge = self._require_bridge("refreshProjectAuthority")
             core_project, capabilities = bridge.refresh_project_authority(binding.project)
@@ -2385,7 +2402,18 @@ class DesktopReleaseProvider:
                     project=refreshed,
                     generation=binding.generation,
                 )
-        self._publish_core_event_invalidation()
+
+    @staticmethod
+    def _same_core_session(
+        left: CoreRuntimeSessionBinding,
+        right: CoreRuntimeSessionBinding,
+    ) -> bool:
+        return (
+            left.generation == right.generation
+            and left.project.project_id == right.project.project_id
+            and left.project.profile_id == right.project.profile_id
+            and left.project.etag == right.project.etag
+        )
 
     def _active_project_for_runtime(self) -> CoreRuntimeSessionBinding | None:
         with self._project_session_lock:

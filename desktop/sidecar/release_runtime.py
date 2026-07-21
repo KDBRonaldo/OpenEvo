@@ -142,7 +142,8 @@ class DesktopCoreEventRelayV1:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._active_project: Callable[[], CoreRuntimeSessionBinding | None] | None = None
-        self._publish: Callable[[], None] | None = None
+        self._refresh_authority: Callable[[CoreRuntimeSessionBinding], None] | None = None
+        self._publish: Callable[[CoreRuntimeSessionBinding], None] | None = None
         self._session_lost: (
             Callable[[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None] | None
         ) = None
@@ -151,15 +152,22 @@ class DesktopCoreEventRelayV1:
         self,
         *,
         active_project: Callable[[], CoreRuntimeSessionBinding | None],
-        publish: Callable[[], None],
+        refresh_authority: Callable[[CoreRuntimeSessionBinding], None],
+        publish: Callable[[CoreRuntimeSessionBinding], None],
         session_lost: Callable[[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None],
     ) -> None:
-        if not callable(active_project) or not callable(publish) or not callable(session_lost):
+        if (
+            not callable(active_project)
+            or not callable(refresh_authority)
+            or not callable(publish)
+            or not callable(session_lost)
+        ):
             raise TypeError("event relay callbacks must be callable")
         with self._lock:
             if self._thread is not None:
                 raise RuntimeError("Core event relay was already started")
             self._active_project = active_project
+            self._refresh_authority = refresh_authority
             self._publish = publish
             self._session_lost = session_lost
             self._thread = threading.Thread(
@@ -185,9 +193,15 @@ class DesktopCoreEventRelayV1:
         backoff = _RELAY_MIN_BACKOFF_SECONDS
         while not self._stop.is_set():
             active_project = self._active_project
+            refresh_authority = self._refresh_authority
             publish = self._publish
             session_lost = self._session_lost
-            if active_project is None or publish is None or session_lost is None:
+            if (
+                active_project is None
+                or refresh_authority is None
+                or publish is None
+                or session_lost is None
+            ):
                 return
             binding: CoreRuntimeSessionBinding | None = None
             try:
@@ -212,7 +226,9 @@ class DesktopCoreEventRelayV1:
                             return
                         event = frame.data.root
                         if not isinstance(event, core_v1.HeartbeatEventV1):
-                            publish()
+                            if isinstance(event, core_v1.ProjectUpdatedEventV1):
+                                refresh_authority(binding)
+                            publish(binding)
                         if (
                             last_event_sequence is None
                             or event.sequence == last_event_sequence + 1
@@ -269,7 +285,8 @@ class DesktopReleaseCoreRuntimeV1:
         self,
         *,
         active_project: Callable[[], CoreRuntimeSessionBinding | None],
-        publish: Callable[[], None],
+        refresh_authority: Callable[[CoreRuntimeSessionBinding], None],
+        publish: Callable[[CoreRuntimeSessionBinding], None],
         session_lost: Callable[[CoreRuntimeSessionBinding, DesktopCoreBridgeErrorV1], None],
     ) -> None:
         with self._close_lock:
@@ -277,6 +294,7 @@ class DesktopReleaseCoreRuntimeV1:
                 raise RuntimeError("release Core runtime is closed")
             self._relay.start(
                 active_project=active_project,
+                refresh_authority=refresh_authority,
                 publish=publish,
                 session_lost=session_lost,
             )

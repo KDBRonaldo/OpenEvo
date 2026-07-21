@@ -16,7 +16,7 @@ from desktop.sidecar.core_bridge_v1 import (
     DesktopCoreBridgeV1,
     map_project_create_v1,
 )
-from desktop.sidecar.provider_store import DesktopProviderStore
+from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
 from desktop.sidecar.release_provider import DesktopReleaseProvider, _BoundedProjectExecutor
 from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
@@ -301,7 +301,9 @@ def test_core_event_refreshes_the_active_project_remote_projection(tmp_path: Pat
             activation.capabilities,
         )
 
-        provider._refresh_project_authority_and_publish()
+        source_binding = provider._active_project_for_runtime()
+        assert source_binding is not None
+        provider._refresh_project_authority(source_binding)
 
         refreshed = store.get_project(project.project_id)
         assert refreshed.remote is not None
@@ -313,6 +315,36 @@ def test_core_event_refreshes_the_active_project_remote_projection(tmp_path: Pat
         assert binding is not None
         assert binding.project == refreshed
         bridge.refresh_project_authority.assert_called_once_with(active)
+    finally:
+        provider.close()
+
+
+def test_core_event_callbacks_reject_a_superseded_session_binding(tmp_path: Path) -> None:
+    bridge = Mock(spec=DesktopCoreBridgeV1)
+    provider, store, project = _provider(tmp_path, bridge)
+    bridge.activate_project.return_value = _activation(project)
+    try:
+        response = provider.invoke("activateProject", _activate_arguments(project))
+        operation = local_v1.LocalOperationV1.model_validate_json(response.body)
+        _wait_for_operation(store, operation.operation_id, "succeeded")
+        stale_binding = provider._active_project_for_runtime()
+        assert stale_binding is not None
+
+        with provider._project_session_lock:
+            with provider._connection_state_lock:
+                provider._session_generation += 1
+                provider._core_session_binding = CoreRuntimeSessionBinding(
+                    project=stale_binding.project,
+                    generation=provider._session_generation,
+                )
+
+        bridge.refresh_project_authority.reset_mock()
+        with pytest.raises(ProviderStoreError, match="no longer belongs"):
+            provider._refresh_project_authority(stale_binding)
+        with pytest.raises(ProviderStoreError, match="no longer belongs"):
+            provider._publish_core_event_invalidation_for_session(stale_binding)
+
+        bridge.refresh_project_authority.assert_not_called()
     finally:
         provider.close()
 

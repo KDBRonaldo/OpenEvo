@@ -18,7 +18,7 @@ from tests.managed_runtime_testkit import (
 )
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError
-from desktop.sidecar.provider_store import DesktopProviderStore
+from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.release_runtime import (
@@ -301,7 +301,8 @@ def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> 
     assert runtime.managed_runtime_available is False
     runtime.start(
         active_project=lambda: None,
-        publish=lambda: None,
+        refresh_authority=lambda _binding: None,
+        publish=lambda _binding: None,
         session_lost=lambda _binding, _error: None,
     )
     runtime.close()
@@ -580,9 +581,23 @@ def test_core_event_relay_skips_heartbeat_and_invalidates_on_change() -> None:
         event="heartbeat.v1",
         payload=core_v1.HeartbeatPayloadV1(active_run_count=0),
     )
+    project_change = core_v1.ProjectUpdatedEventV1.model_construct(
+        id="project-change-1",
+        sequence=3,
+        occurred_at="2026-07-14T12:00:02Z",
+        event="project.updated.v1",
+        change=None,
+        payload=None,
+    )
     frames = (
         SimpleNamespace(id="heartbeat-1", data=SimpleNamespace(root=heartbeat)),
-        SimpleNamespace(id="run-change-1", data=SimpleNamespace(root=object())),
+        SimpleNamespace(
+            id="run-change-1",
+            data=SimpleNamespace(
+                root=SimpleNamespace(sequence=2, event="run.updated.v1")
+            ),
+        ),
+        SimpleNamespace(id="project-change-1", data=SimpleNamespace(root=project_change)),
     )
 
     class EventContext:
@@ -603,29 +618,39 @@ def test_core_event_relay_skips_heartbeat_and_invalidates_on_change() -> None:
     bridge = Bridge()
     relay = DesktopCoreEventRelayV1(bridge)  # type: ignore[arg-type]
     project = SimpleNamespace(project_id="project-1", etag='"' + "a" * 64 + '"')
-    published = threading.Event()
+    complete = threading.Event()
     publish_count = 0
+    refresh_count = 0
 
     binding = CoreRuntimeSessionBinding(project=project, generation=1)  # type: ignore[arg-type]
 
     def active_project():
-        return None if published.is_set() else binding
+        return None if complete.is_set() else binding
 
-    def publish() -> None:
+    def refresh_authority(candidate: CoreRuntimeSessionBinding) -> None:
+        nonlocal refresh_count
+        assert candidate is binding
+        refresh_count += 1
+
+    def publish(candidate: CoreRuntimeSessionBinding) -> None:
         nonlocal publish_count
+        assert candidate is binding
         publish_count += 1
-        published.set()
+        if publish_count == 2:
+            complete.set()
 
     relay.start(
         active_project=active_project,
+        refresh_authority=refresh_authority,
         publish=publish,
         session_lost=lambda _binding, _error: None,
     )
-    assert published.wait(timeout=2)
+    assert complete.wait(timeout=2)
     relay.request_stop()
     relay.join()
 
-    assert publish_count == 1
+    assert publish_count == 2
+    assert refresh_count == 1
     assert bridge.calls == [(project, None)]
 
 
@@ -667,7 +692,8 @@ def test_core_event_relay_reports_typed_session_loss_with_captured_authority() -
 
     relay.start(
         active_project=active_project,
-        publish=lambda: None,
+        refresh_authority=lambda _binding: None,
+        publish=lambda _binding: None,
         session_lost=session_lost,
     )
     assert lost.wait(timeout=2)
@@ -728,8 +754,9 @@ def test_core_event_relay_commits_cursor_only_after_publication_and_replays_afte
     def active_project():
         return None if complete.is_set() else binding
 
-    def publish() -> None:
+    def publish(candidate: CoreRuntimeSessionBinding) -> None:
         nonlocal publication_attempt
+        assert candidate is binding
         publication_attempt += 1
         if publication_attempt == 1:
             raise DesktopEventBrokerError("injected publication failure")
@@ -739,6 +766,7 @@ def test_core_event_relay_commits_cursor_only_after_publication_and_replays_afte
 
     relay.start(
         active_project=active_project,
+        refresh_authority=lambda _binding: None,
         publish=publish,
         session_lost=lambda _binding, _error: None,
     )
@@ -754,3 +782,73 @@ def test_core_event_relay_commits_cursor_only_after_publication_and_replays_afte
         "publication-6",
     ]
     assert bridge.calls[:4] == [None, None, "event-1", "event-2"]
+
+
+def test_core_event_relay_replays_project_update_after_callback_failures() -> None:
+    project_change = core_v1.ProjectUpdatedEventV1.model_construct(
+        id="project-change-1",
+        sequence=1,
+        occurred_at="2026-07-14T12:00:00Z",
+        event="project.updated.v1",
+        change=None,
+        payload=None,
+    )
+    frame = SimpleNamespace(
+        id="project-change-1",
+        data=SimpleNamespace(root=project_change),
+    )
+
+    class EventContext:
+        def __enter__(self):
+            return iter((frame,))
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.calls: list[str | None] = []
+
+        def events(self, _project: object, *, last_event_id: str | None = None):
+            self.calls.append(last_event_id)
+            return EventContext()
+
+    bridge = Bridge()
+    relay = DesktopCoreEventRelayV1(bridge)  # type: ignore[arg-type]
+    project = SimpleNamespace(project_id="project-1", etag='"' + "a" * 64 + '"')
+    binding = CoreRuntimeSessionBinding(project=project, generation=1)  # type: ignore[arg-type]
+    complete = threading.Event()
+    refresh_attempts = 0
+    publish_attempts = 0
+
+    def active_project():
+        return None if complete.is_set() else binding
+
+    def refresh_authority(candidate: CoreRuntimeSessionBinding) -> None:
+        nonlocal refresh_attempts
+        assert candidate is binding
+        refresh_attempts += 1
+        if refresh_attempts == 1:
+            raise ProviderStoreError("injected authority persistence failure")
+
+    def publish(candidate: CoreRuntimeSessionBinding) -> None:
+        nonlocal publish_attempts
+        assert candidate is binding
+        publish_attempts += 1
+        if publish_attempts == 1:
+            raise DesktopEventBrokerError("injected invalidation publication failure")
+        complete.set()
+
+    relay.start(
+        active_project=active_project,
+        refresh_authority=refresh_authority,
+        publish=publish,
+        session_lost=lambda _binding, _error: None,
+    )
+    assert complete.wait(timeout=2)
+    relay.request_stop()
+    relay.join()
+
+    assert refresh_attempts == 3
+    assert publish_attempts == 2
+    assert bridge.calls[:3] == [None, None, None]
