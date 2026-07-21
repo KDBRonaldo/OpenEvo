@@ -48,7 +48,7 @@ MAX_CORE_CLOSE_QUEUE_SIZE = 256
 CORE_CLOSE_WORKER_COUNT = 4
 CORE_BLOCKING_IO_WORKER_COUNT = 8
 MAX_CORE_REQUEST_DEADLINE_SECONDS = 300.0
-CORE_OPENAPI_SHA256 = "2c68afc2b6490bf83a20b294b88398ac53fad4a7c449a66b687a13d71a87ef50"
+CORE_OPENAPI_SHA256 = "0553a38f229c4fe091b29c609c7557e12d0d30354170d19ba8377da04469ee48"
 
 _BEARER = re.compile(r"[A-Za-z0-9._~+/\-]{43,510}={0,2}\Z", re.ASCII)
 _ETAG = re.compile(r'"[0-9a-f]{64}"\Z', re.ASCII)
@@ -1459,7 +1459,11 @@ class CoreControlClientV1:
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         with self._membership_lock:
             artifact = self._artifacts.get(artifact_id)
-        if artifact is None or result.artifact_type is not artifact.artifact_type:
+        if (
+            artifact is None
+            or result.artifact_type is not artifact.artifact_type
+            or result.artifact_content_sha256 != artifact.content_sha256
+        ):
             _raise_local(CoreClientLocalErrorCodeV1.INVALID_RESPONSE, 502)
         return result
 

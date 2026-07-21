@@ -7167,6 +7167,7 @@ def test_artifact_list_get_and_verified_text_content(
         "schema_version": "1",
         "artifact_id": artifact_id,
         "artifact_type": artifact_type.value,
+        "artifact_content_sha256": fetched.json()["content_sha256"],
         "documents": [
             {
                 "document_id": provider_module._artifact_document_id(artifact_id, relative_path),

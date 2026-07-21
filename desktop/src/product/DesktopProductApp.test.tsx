@@ -236,8 +236,26 @@ describe("DesktopProductApp", () => {
     expect(screenText()).toContain("Memory and skills were prepared for the next session.");
     expect(document.querySelector(".run-timeline")).not.toBeNull();
     expect(document.querySelectorAll(".run-timeline li").length).toBeGreaterThan(0);
-    const renderedSequences = [...document.querySelectorAll<HTMLElement>(".run-timeline li")].map((entry) => Number(entry.dataset.sequence));
+    const renderedTimeline = [...document.querySelectorAll<HTMLElement>(".run-timeline li")];
+    const renderedSequences = renderedTimeline.map((entry) => Number(entry.dataset.sequence));
     expect(renderedSequences).toEqual([...renderedSequences].sort((left, right) => left - right));
+    expect(renderedTimeline.every((entry) => (
+      Boolean(entry.dataset.timelineId)
+      && Boolean(entry.dataset.phase)
+      && Boolean(entry.dataset.status)
+      && /^[a-f0-9]{64}$/.test(entry.dataset.contentSha256 ?? "")
+    ))).toBe(true);
+    const renderedLogs = [...document.querySelectorAll<HTMLElement>(".session-output-entry")];
+    expect(renderedLogs.length).toBeGreaterThan(0);
+    expect(renderedLogs.every((entry) => (
+      Boolean(entry.dataset.logId)
+      && Number.isSafeInteger(Number(entry.dataset.sequence))
+      && Boolean(entry.dataset.stream)
+      && Boolean(entry.dataset.level)
+      && /^[a-f0-9]{64}$/.test(entry.dataset.contentSha256 ?? "")
+      && Boolean(entry.dataset.runId)
+      && Boolean(entry.dataset.occurredAt)
+    ))).toBe(true);
 
     await clickButton("Evolution logs");
     expect(screenText()).not.toContain("Evidence synthesis completed with three supported findings.");
@@ -1071,9 +1089,40 @@ describe("DesktopProductApp", () => {
     await flush();
     expect(screenText()).toContain("Analysis workflow");
     expect(screenText()).toContain("Result verification");
+    const contentRoot = document.querySelector<HTMLElement>(".artifact-content-view");
+    expect(contentRoot?.dataset.artifactId).toBeTruthy();
+    expect(contentRoot?.dataset.artifactType).toBe("skill_bundle");
+    expect(contentRoot?.dataset.artifactContentSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(Number(contentRoot?.dataset.totalDocuments)).toBeGreaterThan(1);
+    expect(Number(contentRoot?.dataset.totalUtf8Bytes)).toBeGreaterThan(0);
+    expect(Number(contentRoot?.dataset.returnedUtf8Bytes)).toBeGreaterThan(0);
+    expect(contentRoot?.dataset.truncated).toBe("true");
+    const documentTabs = [...document.querySelectorAll<HTMLElement>(".document-tabs [role=tab]")];
+    expect(documentTabs.length).toBeGreaterThan(1);
+    expect(documentTabs.every((tab) => (
+      Boolean(tab.dataset.documentId)
+      && Boolean(tab.dataset.displayName)
+      && Boolean(tab.dataset.relativePath)
+      && Boolean(tab.dataset.mimeType)
+      && /^[a-f0-9]{64}$/.test(tab.dataset.contentSha256 ?? "")
+      && Number.isSafeInteger(Number(tab.dataset.byteSize))
+      && ["true", "false"].includes(tab.dataset.truncated ?? "")
+    ))).toBe(true);
+    const documentPanel = document.querySelector<HTMLElement>(".artifact-document");
+    expect(documentPanel?.dataset.documentId).toBeTruthy();
+    expect(documentPanel?.dataset.contentSha256).toMatch(/^[a-f0-9]{64}$/);
     await clickButton("Changes");
     await flush();
     expect(screenText()).toContain("Added for Revision 2");
+    const diff = document.querySelector<HTMLElement>(".diff-view");
+    expect(diff?.dataset.artifactId).toBeTruthy();
+    expect(diff?.dataset.previousArtifactId).toBeTruthy();
+    expect(diff?.dataset.artifactContentSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(diff?.dataset.previousArtifactContentSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(document.querySelector(".diff-hunk-block")).not.toBeNull();
+    const diffLine = document.querySelector<HTMLElement>(".diff-line");
+    expect(diffLine?.dataset.kind).toBeTruthy();
+    expect(diffLine?.querySelector("code")?.textContent).not.toBeNull();
   });
 
   it("retries a newly published artifact before showing a terminal error", async () => {
@@ -1141,6 +1190,23 @@ describe("DesktopProductApp", () => {
     await flush();
     expect(screenText()).toContain("Artifact change identity does not match the selected artifact.");
     expect(document.querySelector(".diff-hunk")).toBeNull();
+  });
+
+  it("refuses content whose parent artifact digest does not match the selection", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
+    const original = provider.getArtifactContent.bind(provider);
+    Object.assign(provider, {
+      getArtifactContent: async (artifactId: string) => ({
+        ...await original(artifactId),
+        artifact_content_sha256: "f".repeat(64),
+      }),
+    });
+    root = await renderProduct(provider);
+
+    await clickButton("Evolution");
+    await flush();
+    expect(screenText()).toContain("Artifact content identity does not match the selected artifact.");
+    expect(document.querySelector(".artifact-document")).toBeNull();
   });
 
   it("refuses a diff whose previous artifact identity is unrelated to the selection", async () => {

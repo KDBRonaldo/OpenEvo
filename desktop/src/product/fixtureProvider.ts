@@ -1258,6 +1258,7 @@ export class FixtureDesktopProductProvider implements DesktopProductProvider {
       schema_version: "1",
       artifact_id: artifact.id,
       artifact_type: artifact.artifact_type,
+      artifact_content_sha256: artifact.content_sha256,
       documents,
       total_documents: this.artifactTruncated ? documents.length + 2 : documents.length,
       total_utf8_bytes: this.artifactTruncated ? returnedBytes + 128 : returnedBytes,

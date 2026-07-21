@@ -1178,6 +1178,7 @@ class CoreControlProviderV1:
         return m.ArtifactContentV1(
             artifact_id=verified.summary.id,
             artifact_type=verified.summary.artifact_type,
+            artifact_content_sha256=verified.summary.content_sha256,
             documents=documents,
             total_documents=len(documents),
             total_utf8_bytes=total_bytes,

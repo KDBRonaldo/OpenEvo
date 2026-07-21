@@ -4,7 +4,7 @@ const C = "c".repeat(64);
 const ETAG_A = `"${A}"`;
 const ETAG_B = `"${B}"`;
 const NOW = "2026-07-14T12:00:00Z";
-const OPENAPI_DIGEST = "3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57";
+const OPENAPI_DIGEST = "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb";
 
 export const RELEASE_EXECUTION_MODE_CAPABILITIES_FIXTURE_V1 = {
   schema_version: "1",
@@ -433,6 +433,7 @@ export const CONTRACT_FIXTURE_V1 = {
     schema_version: "1",
     artifact_id: "artifact-memory-fixture-1",
     artifact_type: "text_memory",
+    artifact_content_sha256: A,
     documents: [
       {
         document_id: "memory",

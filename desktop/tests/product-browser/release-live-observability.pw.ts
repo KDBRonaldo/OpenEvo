@@ -11,16 +11,26 @@ import { fileURLToPath } from "node:url";
 import {
   expect,
   test,
+  type ConsoleMessage,
+  type Locator,
   type Page,
   type Request,
   type Response,
   type Route,
 } from "@playwright/test";
 import { z } from "zod";
-import { desktopBootstrapContextV1Schema } from "../../src/api/v1/schemas";
+import {
+  artifactContentV1Schema,
+  artifactDiffV1Schema,
+  artifactV1Schema,
+  desktopBootstrapContextV1Schema,
+  logEntryV1Schema,
+  timelineEntryV1Schema,
+} from "../../src/api/v1/schemas";
 import {
   drainPendingSnapshot,
-  InFlightCaptureWindow,
+  InFlightCaptureCutoff,
+  selectLatestArtifactPredecessor,
 } from "./release-live-capture";
 
 const HANDOFF_ENV = "OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF";
@@ -32,6 +42,9 @@ const MAX_CAPTURE_TOTAL_BYTES = 16 * 1024 * 1024;
 const MAX_CAPTURE_RESPONSES = 1_024;
 const MAX_CAPTURE_ENTRIES = 4_096;
 const MAX_RESULT_BYTES = 64 * 1024;
+const RESPONSE_BODY_TIMEOUT_MS = 15_000;
+const CAPTURE_CUTOFF_TIMEOUT_MS = 20_000;
+const NETWORK_CUTOFF_TIMEOUT_MS = 25_000;
 const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const REPOSITORY_PACKAGED_WEB_ROOT = resolve(DESKTOP_ROOT, "packaging/web");
 const REQUIRED_PHASES = [
@@ -144,37 +157,19 @@ const handoffSchema = z
 type LiveHandoff = z.infer<typeof handoffSchema>;
 type Target = typeof TARGETS[number];
 type Phase = typeof PHASE_ORDER[number];
-type CapturedArtifact = {
-  id: string;
-  artifact_type: Target;
-  target_id: Target;
-  content_sha256: string;
-  lineage: { source_artifact_ids: string[] };
-};
-type CapturedContent = {
-  artifact_id: string;
-  artifact_type: Target;
-  documents: Array<{
-    content: string;
-    content_sha256: string;
-    byte_size: number;
-    truncated: boolean;
-    relative_path: string;
-  }>;
-  total_documents: number;
-  total_utf8_bytes: number;
-  returned_utf8_bytes: number;
-  truncated: boolean;
-};
-type CapturedTimeline = { phase: Phase; sequence: number };
+type CapturedArtifact = z.infer<typeof artifactV1Schema>;
+type CapturedContent = z.infer<typeof artifactContentV1Schema>;
+type CapturedDiff = z.infer<typeof artifactDiffV1Schema>;
+type CapturedLog = z.infer<typeof logEntryV1Schema>;
+type CapturedTimeline = z.infer<typeof timelineEntryV1Schema>;
 
 type CaptureState = {
   sourceCommit: string | null;
   timelines: Map<string, Map<string, CapturedTimeline>>;
-  logs: Map<string, Map<string, unknown>>;
+  logs: Map<string, Map<string, CapturedLog>>;
   artifacts: Map<string, CapturedArtifact>;
   contents: Map<string, CapturedContent>;
-  diffs: Map<string, { previous_artifact_id: string; document_changes: unknown[] }>;
+  diffs: Map<string, CapturedDiff>;
   pending: Set<Promise<void>>;
   responses: string[];
   errors: string[];
@@ -240,6 +235,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   const liveOrigin = new URL(handoff.bootstrap.endpoint).origin;
 
   await installNativeBridge(page, handoff.bootstrap);
+  const networkFreeze = await installReleaseNetworkFreeze(page);
   await installPackagedWebRoute(page, packaged);
   await installWebSocketGate(page, capture);
   await installNetworkGate(
@@ -249,12 +245,13 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
     handoff.expected.project_id,
     capture,
   );
-  observeNetwork(
+  const networkObservation = observeNetwork(
     page,
     liveOrigin,
     handoff.bootstrap.session_token,
     handoff.expected.project_id,
     capture,
+    networkFreeze.isFrozen,
   );
   const stopObservingResponses = observeResponses(page, liveOrigin, capture);
 
@@ -346,21 +343,6 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
     await expect(page.locator(".active-run-panel h2")).toHaveText(`Session ${session.ordinal}`);
     await expect(page.locator(".run-timeline")).toBeVisible();
     await drainCapture(capture);
-    const expectedRenderedTimeline = [...(capture.timelines.get(session.run_id)?.entries() ?? [])]
-      .sort(([leftId, left], [rightId, right]) => left.sequence - right.sequence || leftId.localeCompare(rightId))
-      .map(([, entry]) => entry);
-    const renderedTimeline = await page.locator(".run-timeline li").evaluateAll((entries) => entries.map((entry) => ({
-      sequence: Number((entry as HTMLElement).dataset.sequence),
-      phase: (entry as HTMLElement).dataset.phase,
-    })));
-    assertClosed(
-      renderedTimeline.length === expectedRenderedTimeline.length
-      && renderedTimeline.every((entry, index) => (
-        entry.sequence === expectedRenderedTimeline[index]?.sequence
-        && entry.phase === expectedRenderedTimeline[index]?.phase
-      )),
-      `renderer timeline for session ${session.ordinal} does not follow the authoritative remote sequence`,
-    );
     await expect.poll(async () => {
       await drainCapture(capture);
       return capture.logs.get(session.run_id)?.size ?? 0;
@@ -371,12 +353,6 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   await expect(page.locator(".session-output-entry").first()).toBeVisible();
   await expect(page.locator(".session-output-message").first()).not.toHaveText("");
   await drainCapture(capture);
-  assertTimelineCapture(capture, handoff);
-  const latestLogs = capture.logs.get(latestSession.run_id);
-  assertClosed(
-    latestLogs !== undefined && latestLogs.size >= latestSession.minimum_log_count,
-    "live session output did not satisfy the expected lower bound",
-  );
 
   await page.getByRole("button", { name: "Evolution", exact: true }).click();
   await expect(page.getByTestId("evolution-workspace")).toBeVisible();
@@ -388,7 +364,6 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   await drainCapture(capture);
   assertExpectedArtifactCollection(capture, handoff);
 
-  const artifactEvidence: Array<z.infer<typeof resultArtifactSchema>> = [];
   for (const expectedArtifact of handoff.expected.artifacts) {
     const label = artifactLabel(expectedArtifact.target_id);
     await page.locator(".artifact-list")
@@ -400,62 +375,18 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
       await drainCapture(capture);
       return capture.contents.has(expectedArtifact.artifact_id);
     }, { message: "live artifact content was not observed by the renderer" }).toBe(true);
-
-    const content = capture.contents.get(expectedArtifact.artifact_id);
-    const artifact = capture.artifacts.get(expectedArtifact.artifact_id);
-    assertClosed(content !== undefined && artifact !== undefined, "artifact observation is incomplete");
-    assertClosed(
-      content.artifact_id === expectedArtifact.artifact_id
-      && content.artifact_type === expectedArtifact.artifact_type
-      && artifact.content_sha256 === expectedArtifact.artifact_content_sha256,
-      "artifact content identity mismatch",
-    );
-    assertClosed(
-      !content.truncated
-      && content.documents.length > 0
-      && content.documents.length === content.total_documents
-      && content.returned_utf8_bytes === content.total_utf8_bytes
-      && content.returned_utf8_bytes > 0,
-      "artifact content is empty or incomplete",
-    );
-    for (const document of content.documents) {
-      const bytes = Buffer.from(document.content, "utf8");
-      assertClosed(
-        !document.truncated
-        && bytes.byteLength === document.byte_size
-        && sha256(bytes) === document.content_sha256,
-        "artifact document content identity mismatch",
-      );
-    }
-    const runtimeDocuments = expectedArtifact.target_id === "skill_bundle"
-      ? content.documents.filter((document) => document.relative_path === "SKILL.md")
-      : content.documents;
-    assertClosed(
-      runtimeDocuments.length === 1
-      && runtimeDocuments[0]?.content_sha256 === expectedArtifact.runtime_document_sha256,
-      "artifact runtime document changed after workflow verification",
-    );
-    const rendered = await page.locator(".artifact-document").textContent();
-    assertClosed(
-      rendered === content.documents[0]!.content && rendered.trim().length > 0,
-      "artifact content was not rendered",
-    );
-    artifactEvidence.push({
-      artifact_id_sha256: sha256(Buffer.from(expectedArtifact.artifact_id, "utf8")),
-      artifact_type: expectedArtifact.artifact_type,
-      target_id: expectedArtifact.target_id,
-      document_count: content.documents.length,
-      total_utf8_bytes: content.total_utf8_bytes,
-      content_sha256: artifact.content_sha256,
-      runtime_document_sha256: runtimeDocuments[0]!.content_sha256,
-    });
   }
 
-  const diffArtifact = handoff.expected.artifacts.find((candidate) => {
+  const prefetchedDiffArtifactIds = new Set<string>();
+  const diffArtifacts = handoff.expected.artifacts.filter((candidate) => {
     const artifact = capture.artifacts.get(candidate.artifact_id);
     return artifact?.lineage.source_artifact_ids.some((id) => capture.artifacts.has(id));
   });
-  if (diffArtifact !== undefined) {
+  assertClosed(
+    diffArtifacts.length === handoff.expected.artifacts.length,
+    "not every evolved artifact has a reachable predecessor",
+  );
+  for (const diffArtifact of diffArtifacts) {
     await page.locator(".artifact-list").getByRole("button", {
       name: new RegExp(`^${escapeRegex(artifactLabel(diffArtifact.target_id))}`),
     }).click();
@@ -465,13 +396,132 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
       await drainCapture(capture);
       return capture.diffs.has(diffArtifact.artifact_id);
     }, { message: "live artifact diff was not observed by the renderer" }).toBe(true);
-    const diff = capture.diffs.get(diffArtifact.artifact_id);
-    const diffSourceIds = capture.artifacts.get(diffArtifact.artifact_id)?.lineage.source_artifact_ids ?? [];
+    assertArtifactDiffCapture(capture, diffArtifact.artifact_id);
+    prefetchedDiffArtifactIds.add(diffArtifact.artifact_id);
+  }
+
+  await drainCapture(capture);
+  assertTimelineCapture(capture, handoff);
+  assertExpectedArtifactCollection(capture, handoff);
+  const latestLogs = capture.logs.get(latestSession.run_id);
+  assertClosed(
+    latestLogs !== undefined && latestLogs.size >= latestSession.minimum_log_count,
+    "live session output did not satisfy the expected lower bound",
+  );
+  const renderedTimelines = new Map<string, Awaited<ReturnType<typeof readRenderedTimeline>>>();
+  const renderedLogsByRun = new Map<string, Awaited<ReturnType<typeof readRenderedLogs>>>();
+  const renderedContents = new Map<string, { captureJson: string; documents: readonly string[] }>();
+  const renderedDiffs = new Map<string, Awaited<ReturnType<typeof readRenderedDiff>>>();
+
+  await page.getByRole("button", { name: "Research", exact: true }).click();
+  await expect(page.getByTestId("research-workspace")).toBeVisible();
+  for (const session of handoff.expected.sessions) {
+    const sessionButton = page.getByRole("button", { name: `Session ${session.ordinal}`, exact: true });
+    await sessionButton.click();
+    await expect(sessionButton).toHaveAttribute("aria-pressed", "true");
+    await expect(page.locator(".active-run-panel h2")).toHaveText(`Session ${session.ordinal}`);
+    await expect(page.locator(".run-timeline")).toBeVisible();
+    const renderedTimeline = await readRenderedTimeline(page);
+    renderedTimelines.set(session.run_id, renderedTimeline);
+    assertRenderedTimelineCapture(capture, session, renderedTimeline);
+    const stableLogs = capture.logs.get(session.run_id);
     assertClosed(
-      diff !== undefined
-      && diffSourceIds.includes(diff.previous_artifact_id)
-      && diff.document_changes.length > 0,
-      "artifact changes do not prove predecessor lineage",
+      stableLogs !== undefined && stableLogs.size >= session.minimum_log_count,
+      `stable logs for session ${session.ordinal} are incomplete`,
+    );
+    await expect(page.locator(".session-output-state")).toContainText(`${stableLogs.size} records`);
+    const expectedRenderedLogs = [...stableLogs.values()]
+      .sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id))
+      .slice(-200)
+      .map((entry) => ({
+        id: entry.id,
+        sequence: entry.sequence,
+        stream: entry.stream,
+        level: entry.level,
+        contentSha256: entry.content_sha256,
+        runId: entry.run_id ?? "",
+        occurredAt: entry.occurred_at,
+        attemptId: entry.attempt_id ?? "",
+        serviceId: entry.service_id,
+        streamLabel: sessionStreamLabel(entry.stream),
+        dateTime: entry.occurred_at,
+        displayedTime: formatSessionTime(entry.occurred_at),
+        message: entry.message,
+      }));
+    await expect(page.locator(".session-output-entry")).toHaveCount(expectedRenderedLogs.length);
+    const renderedLogs = await readRenderedLogs(page);
+    renderedLogsByRun.set(session.run_id, renderedLogs);
+    assertClosed(
+      JSON.stringify(renderedLogs) === JSON.stringify(expectedRenderedLogs),
+      `renderer logs for session ${session.ordinal} differ from the stable response cutoff`,
+    );
+  }
+
+  await page.getByRole("button", { name: "Evolution", exact: true }).click();
+  await expect(page.getByTestId("evolution-workspace")).toBeVisible();
+  await expect(page.locator(".revision-node").filter({
+    hasText: `Project Head ${handoff.expected.project_head_generation}`,
+  })).toBeVisible();
+  await expect(page.locator(".artifact-list-heading")).toContainText("3 selected");
+  await expect(page.locator(".artifact-list-item")).toHaveCount(3);
+  for (const expectedArtifact of handoff.expected.artifacts) {
+    await page.locator(".artifact-list").getByRole("button", {
+      name: new RegExp(`^${escapeRegex(artifactLabel(expectedArtifact.target_id))}`),
+    }).click();
+    await page.getByRole("tab", { name: "Content", exact: true }).click();
+    const stableContent = capture.contents.get(expectedArtifact.artifact_id);
+    assertClosed(
+      stableContent !== undefined && stableContent.documents.length > 0,
+      "stable artifact content is missing",
+    );
+    const contentRoot = page.locator(".artifact-content-view");
+    await expect(contentRoot).toHaveAttribute("data-artifact-id", stableContent.artifact_id);
+    await expect(contentRoot).toHaveAttribute("data-artifact-type", stableContent.artifact_type);
+    await expect(contentRoot).toHaveAttribute("data-artifact-content-sha256", stableContent.artifact_content_sha256);
+    await expect(contentRoot).toHaveAttribute("data-total-documents", String(stableContent.total_documents));
+    await expect(contentRoot).toHaveAttribute("data-total-utf8-bytes", String(stableContent.total_utf8_bytes));
+    await expect(contentRoot).toHaveAttribute("data-returned-utf8-bytes", String(stableContent.returned_utf8_bytes));
+    await expect(contentRoot).toHaveAttribute("data-truncated", String(stableContent.truncated));
+    await expect(page.locator(".document-tabs [role=tab]")).toHaveCount(
+      stableContent.documents.length > 1 ? stableContent.documents.length : 0,
+    );
+    const renderedDocuments: string[] = [];
+    for (const [index, document] of stableContent.documents.entries()) {
+      if (stableContent.documents.length > 1) {
+        const tab = page.locator(`#artifact-document-tab-${index}`);
+        await expect(tab).toHaveText(document.display_name);
+        await expectArtifactDocumentIdentity(tab, document);
+        await tab.click();
+        await expect(tab).toHaveAttribute("aria-selected", "true");
+      }
+      await expect.poll(
+        () => page.locator(".artifact-document").textContent(),
+        { message: "renderer artifact content differs from the stable response cutoff" },
+      ).toBe(document.content);
+      const panel = page.locator(".artifact-document");
+      await expectArtifactDocumentIdentity(panel, document);
+      const rendered = await panel.textContent();
+      assertClosed(rendered !== null, "renderer artifact content disappeared after verification");
+      renderedDocuments.push(rendered);
+    }
+    renderedContents.set(expectedArtifact.artifact_id, {
+      captureJson: JSON.stringify(stableContent),
+      documents: renderedDocuments,
+    });
+  }
+  for (const stableDiffArtifact of diffArtifacts) {
+    await page.locator(".artifact-list").getByRole("button", {
+      name: new RegExp(`^${escapeRegex(artifactLabel(stableDiffArtifact.target_id))}`),
+    }).click();
+    await page.getByRole("tab", { name: "Changes", exact: true }).click();
+    const stableDiff = capture.diffs.get(stableDiffArtifact.artifact_id);
+    assertClosed(stableDiff !== undefined, "stable artifact diff is missing");
+    await expect(page.locator(".diff-view")).toBeVisible();
+    const renderedDiff = await readRenderedDiff(page);
+    renderedDiffs.set(stableDiffArtifact.artifact_id, renderedDiff);
+    assertClosed(
+      JSON.stringify(renderedDiff) === JSON.stringify(expectedRenderedDiff(stableDiff)),
+      `renderer ${stableDiffArtifact.target_id} diff differs from the stable response cutoff`,
     );
   }
 
@@ -493,19 +543,64 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
     maskColor: "#d7dce2",
   });
 
-  const native = await readNativeObservation(page);
+  await networkFreeze.freeze();
   await stopObservingResponses();
+  await networkObservation.settleFiniteRequests();
   await drainCapture(capture);
+  assertTimelineCapture(capture, handoff);
+  assertExpectedArtifactCollection(capture, handoff);
+  for (const session of handoff.expected.sessions) {
+    const renderedTimeline = renderedTimelines.get(session.run_id);
+    const renderedLogs = renderedLogsByRun.get(session.run_id);
+    assertClosed(renderedTimeline !== undefined && renderedLogs !== undefined, "renderer session evidence is incomplete");
+    assertRenderedTimelineCapture(capture, session, renderedTimeline);
+    assertRenderedLogCapture(capture, session, renderedLogs);
+  }
+  const finalLatestLogs = capture.logs.get(latestSession.run_id);
+  assertClosed(
+    finalLatestLogs !== undefined && finalLatestLogs.size >= latestSession.minimum_log_count,
+    "stable live session output did not satisfy the expected lower bound",
+  );
+  const stableDiffArtifacts = handoff.expected.artifacts.filter((candidate) => {
+    const artifact = capture.artifacts.get(candidate.artifact_id);
+    return artifact?.lineage.source_artifact_ids.some((id) => capture.artifacts.has(id));
+  });
+  assertClosed(
+    stableDiffArtifacts.length === handoff.expected.artifacts.length
+    && stableDiffArtifacts.every((artifact) => prefetchedDiffArtifactIds.has(artifact.artifact_id)),
+    "stable predecessor lineage was not observed before the response cutoff",
+  );
+  const artifactEvidence: Array<z.infer<typeof resultArtifactSchema>> = [];
+  for (const expectedArtifact of handoff.expected.artifacts) {
+    const rendered = renderedContents.get(expectedArtifact.artifact_id);
+    const stableContent = capture.contents.get(expectedArtifact.artifact_id);
+    assertClosed(rendered !== undefined && stableContent !== undefined, "stable artifact renderer evidence is incomplete");
+    assertClosed(
+      rendered.captureJson === JSON.stringify(stableContent),
+      "artifact content changed between renderer observation and the response cutoff",
+    );
+    artifactEvidence.push(artifactEvidenceFromCapture(
+      capture,
+      expectedArtifact,
+      rendered.documents,
+    ));
+  }
+  for (const stableDiffArtifact of stableDiffArtifacts) {
+    assertArtifactDiffCapture(capture, stableDiffArtifact.artifact_id);
+    const stableDiff = capture.diffs.get(stableDiffArtifact.artifact_id);
+    const renderedDiff = renderedDiffs.get(stableDiffArtifact.artifact_id);
+    assertClosed(stableDiff !== undefined && renderedDiff !== undefined, "stable artifact diff evidence is incomplete");
+    assertClosed(
+      JSON.stringify(renderedDiff) === JSON.stringify(expectedRenderedDiff(stableDiff)),
+      `renderer ${stableDiffArtifact.target_id} diff changed before the response cutoff`,
+    );
+  }
+
+  const native = await readNativeObservation(page);
   assertClosed(native.rendererReady, "renderer readiness was not acknowledged");
   assertClosed(native.commands.includes("start_sidecar"), "native bootstrap was not invoked");
   assertClosed(native.stages.includes("product_committed"), "product commit was not reported");
   assertClosed(native.unexpected.length === 0, "renderer invoked an unsupported native command");
-  assertClosed(capture.errors.length === 0, "a live response could not be captured");
-  assertClosed(
-    capture.networkErrors.length === 0,
-    `renderer crossed the allowed network boundary: ${capture.networkErrors.join(",")}`,
-  );
-
   const timelineEntries = handoff.expected.sessions.flatMap(
     (session) => [...(capture.timelines.get(session.run_id)?.values() ?? [])],
   );
@@ -525,7 +620,7 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
       count: timelineEntries.length,
       phase_values: timelinePhases,
     },
-    logs: { count: latestLogs!.size },
+    logs: { count: finalLatestLogs.size },
     project_head_generation: handoff.expected.project_head_generation,
     independent_target_controls_verified: true,
     remote_method_selection_verified: true,
@@ -534,6 +629,16 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   });
 
   await page.close();
+  networkObservation.stop();
+  assertClosed(capture.errors.length === 0, "a live response could not be captured");
+  assertClosed(
+    capture.browserErrors.length === 0,
+    `renderer reported browser security/resource errors: ${capture.browserErrors.join(",")}`,
+  );
+  assertClosed(
+    capture.networkErrors.length === 0,
+    `renderer crossed the allowed network boundary: ${capture.networkErrors.join(",")}`,
+  );
   await writeExclusive(handoff.screenshot_path, screenshot);
   const resultBytes = Buffer.from(`${JSON.stringify(result, null, 2)}\n`, "utf8");
   assertClosed(resultBytes.byteLength <= MAX_RESULT_BYTES, "renderer result exceeds its byte budget");
@@ -859,6 +964,84 @@ async function installWebSocketGate(page: Page, capture: CaptureState): Promise<
   });
 }
 
+async function installReleaseNetworkFreeze(page: Page): Promise<{
+  isFrozen: () => boolean;
+  freeze: () => Promise<void>;
+}> {
+  let frozen = false;
+  await page.addInitScript(() => {
+    type ReleaseNetworkWindow = Window & {
+      __openevoReleasePrepareNetworkFreeze?: () => void;
+      __openevoReleaseAbortEventStreams?: () => void;
+      __openevoReleaseNetworkState?: () => { frozen: boolean; activeEventStreams: number };
+    };
+    const releaseWindow = window as ReleaseNetworkWindow;
+    const originalFetch = globalThis.fetch.bind(globalThis);
+    const eventStreamControllers = new Set<AbortController>();
+    let networkFrozen = false;
+    globalThis.fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+      if (networkFrozen) return new Promise<Response>(() => undefined);
+      const requestUrl = new URL(input instanceof Request ? input.url : String(input), globalThis.location.href);
+      if (requestUrl.pathname !== "/desktop/v1/events") return originalFetch(input, init);
+      const controller = new AbortController();
+      const callerSignal = init?.signal ?? (input instanceof Request ? input.signal : null);
+      const forwardAbort = () => controller.abort(callerSignal?.reason);
+      eventStreamControllers.add(controller);
+      const releaseController = () => {
+        callerSignal?.removeEventListener("abort", forwardAbort);
+        eventStreamControllers.delete(controller);
+      };
+      controller.signal.addEventListener("abort", releaseController, { once: true });
+      if (callerSignal?.aborted) forwardAbort();
+      else callerSignal?.addEventListener("abort", forwardAbort, { once: true });
+      try {
+        return await originalFetch(input, { ...init, signal: controller.signal });
+      } catch (error) {
+        releaseController();
+        throw error;
+      }
+    };
+    releaseWindow.__openevoReleasePrepareNetworkFreeze = () => {
+      networkFrozen = true;
+    };
+    releaseWindow.__openevoReleaseAbortEventStreams = () => {
+      for (const controller of eventStreamControllers) controller.abort("release evidence frozen");
+    };
+    releaseWindow.__openevoReleaseNetworkState = () => ({
+      frozen: networkFrozen,
+      activeEventStreams: eventStreamControllers.size,
+    });
+  });
+  return {
+    isFrozen: () => frozen,
+    freeze: async () => {
+      if (frozen) return;
+      await page.evaluate(() => {
+        const releaseWindow = window as Window & { __openevoReleasePrepareNetworkFreeze?: () => void };
+        if (!releaseWindow.__openevoReleasePrepareNetworkFreeze) {
+          throw new Error("release network freeze controller is unavailable");
+        }
+        releaseWindow.__openevoReleasePrepareNetworkFreeze();
+      });
+      frozen = true;
+      await page.evaluate(() => {
+        const releaseWindow = window as Window & { __openevoReleaseAbortEventStreams?: () => void };
+        if (!releaseWindow.__openevoReleaseAbortEventStreams) {
+          throw new Error("release event-stream abort controller is unavailable");
+        }
+        releaseWindow.__openevoReleaseAbortEventStreams();
+      });
+      await expect.poll(async () => page.evaluate(() => {
+        const releaseWindow = window as Window & {
+          __openevoReleaseNetworkState?: () => { frozen: boolean; activeEventStreams: number };
+        };
+        return releaseWindow.__openevoReleaseNetworkState?.() ?? null;
+      }), { timeout: 5_000, message: "renderer event stream did not quiesce at the evidence cutoff" })
+        .toEqual({ frozen: true, activeEventStreams: 0 });
+    },
+  };
+}
+
 async function installNetworkGate(
   page: Page,
   liveOrigin: string,
@@ -932,8 +1115,16 @@ function observeNetwork(
   sessionToken: string,
   projectId: string,
   capture: CaptureState,
-): void {
-  page.on("request", (request) => {
+  isFrozen: () => boolean,
+): { settleFiniteRequests: () => Promise<void>; stop: () => void } {
+  const cutoff = new InFlightCaptureCutoff<Request>();
+  const isFiniteObservedRequest = (request: Request) => {
+    const url = new URL(request.url());
+    return [STATIC_ORIGIN, liveOrigin].includes(url.origin)
+      && !(url.origin === liveOrigin && url.pathname === "/desktop/v1/events");
+  };
+  const requestListener = (request: Request) => {
+    if (isFiniteObservedRequest(request)) cutoff.begin(request);
     const url = new URL(request.url());
     if (url.origin === STATIC_ORIGIN) return;
     if (url.origin !== liveOrigin) {
@@ -984,14 +1175,28 @@ function observeNetwork(
     if (!url.pathname.startsWith("/desktop/v1/") || !authenticated) {
       capture.networkErrors.push("invalid Local API request");
     }
-  });
-  page.on("requestfailed", (request) => {
+  };
+  const requestFailedListener = (request: Request) => {
     const url = new URL(request.url());
-    if (url.origin === liveOrigin) {
+    const expectedEventStreamAbort = isFrozen()
+      && url.origin === liveOrigin
+      && url.pathname === "/desktop/v1/events";
+    if ([STATIC_ORIGIN, liveOrigin].includes(url.origin) && !expectedEventStreamAbort) {
       capture.networkErrors.push(`${request.method()} ${url.pathname} ${request.failure()?.errorText ?? "failed"}`);
     }
-  });
-  page.on("console", (message) => {
+    cutoff.finish(request);
+  };
+  const responseListener = (response: Response) => {
+    const url = new URL(response.url());
+    if (
+      [STATIC_ORIGIN, liveOrigin].includes(url.origin)
+      && response.status() >= 400
+    ) {
+      capture.networkErrors.push(`${response.request().method()} ${url.pathname} ${response.status()}`);
+    }
+  };
+  const requestFinishedListener = (request: Request) => cutoff.finish(request);
+  const consoleListener = (message: ConsoleMessage) => {
     if (message.type() !== "error" && message.type() !== "warning") return;
     const value = message.text();
     if (value.includes("more-private address space") || value.includes("Private Network Access")) {
@@ -1000,8 +1205,57 @@ function observeNetwork(
       capture.browserErrors.push("CORS policy blocked request");
     } else if (value.includes("Failed to load resource")) {
       capture.browserErrors.push("resource load failed");
+    } else if (message.type() === "error") {
+      capture.browserErrors.push("console error");
     }
-  });
+  };
+  const pageErrorListener = () => capture.browserErrors.push("unhandled page error");
+  const crashListener = () => capture.browserErrors.push("renderer page crashed");
+  page.on("request", requestListener);
+  page.on("requestfailed", requestFailedListener);
+  page.on("requestfinished", requestFinishedListener);
+  page.on("response", responseListener);
+  page.on("console", consoleListener);
+  page.on("pageerror", pageErrorListener);
+  page.on("crash", crashListener);
+  return {
+    settleFiniteRequests: async () => {
+      const closing = cutoff.close(NETWORK_CUTOFF_TIMEOUT_MS);
+      page.off("request", requestListener);
+      const unresolved = await closing;
+      if (unresolved.length > 0) {
+        capture.networkErrors.push(`network cutoff timed out: ${unresolved.map(requestLabel).join(",")}`);
+      }
+    },
+    stop: () => {
+      page.off("request", requestListener);
+      page.off("requestfailed", requestFailedListener);
+      page.off("requestfinished", requestFinishedListener);
+      page.off("response", responseListener);
+      page.off("console", consoleListener);
+      page.off("pageerror", pageErrorListener);
+      page.off("crash", crashListener);
+    },
+  };
+}
+
+function requestLabel(request: Request): string {
+  const url = new URL(request.url());
+  return `${request.method()} ${url.pathname}`;
+}
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout !== undefined) clearTimeout(timeout);
+  }
 }
 
 function observeResponses(
@@ -1009,49 +1263,75 @@ function observeResponses(
   liveOrigin: string,
   capture: CaptureState,
 ): () => Promise<void> {
-  const window = new InFlightCaptureWindow<Request>();
-  const observes = (request: Request): boolean => {
+  const cutoff = new InFlightCaptureCutoff<Request>();
+  const responded = new Set<Request>();
+  const observes = (request: Request) => {
     const url = new URL(request.url());
     return url.origin === liveOrigin
       && url.pathname !== "/desktop/v1/events"
       && request.method() !== "OPTIONS";
   };
   const requestListener = (request: Request) => {
-    if (observes(request)) window.begin(request);
+    if (observes(request)) cutoff.begin(request);
   };
-  const requestSettledListener = (request: Request) => {
-    if (observes(request)) window.finish(request);
-  };
-  const listener = (response: Response) => {
+  const responseListener = (response: Response) => {
+    const request = response.request();
+    if (!cutoff.accepts(request)) return;
+    responded.add(request);
     const url = new URL(response.url());
-    if (!window.accepts(response.request())) return;
-    if (capture.responses.length >= MAX_CAPTURE_RESPONSES) {
-      capture.errors.push("live Local API response inventory exceeded the capture budget");
-      return;
-    }
-    capture.responses.push(`${response.request().method()} ${url.pathname} ${response.status()}`);
-    let promise: Promise<void>;
-    promise = captureResponse(response, capture)
+    let pending: Promise<void>;
+    pending = withDeadline(
+      (async () => {
+        if (capture.responses.length >= MAX_CAPTURE_RESPONSES) {
+          throw new Error("live Local API response inventory exceeded the capture budget");
+        }
+        capture.responses.push(`${request.method()} ${url.pathname} ${response.status()}`);
+        await captureResponse(response, capture, () => cutoff.accepts(request));
+      })(),
+      RESPONSE_BODY_TIMEOUT_MS,
+      `response body capture timed out for ${requestLabel(request)}`,
+    )
       .catch((error: unknown) => {
         capture.errors.push(`${url.pathname}:${error instanceof Error ? error.message : "response capture"}`);
       })
-      .finally(() => capture.pending.delete(promise));
-    capture.pending.add(promise);
+      .finally(() => {
+        capture.pending.delete(pending);
+        cutoff.finish(request);
+      });
+    capture.pending.add(pending);
+  };
+  const requestFinishedListener = (request: Request) => {
+    if (!cutoff.accepts(request) || responded.has(request)) return;
+    capture.errors.push(`captured request finished without a response: ${requestLabel(request)}`);
+    cutoff.finish(request);
+  };
+  const requestFailedListener = (request: Request) => {
+    if (!cutoff.accepts(request)) return;
+    capture.errors.push(`captured request failed: ${requestLabel(request)}`);
+    cutoff.finish(request);
   };
   page.on("request", requestListener);
-  page.on("requestfinished", requestSettledListener);
-  page.on("requestfailed", requestSettledListener);
-  page.on("response", listener);
+  page.on("response", responseListener);
+  page.on("requestfinished", requestFinishedListener);
+  page.on("requestfailed", requestFailedListener);
   return async () => {
-    await window.close();
+    const closing = cutoff.close(CAPTURE_CUTOFF_TIMEOUT_MS);
     page.off("request", requestListener);
-    page.off("requestfinished", requestSettledListener);
-    page.off("requestfailed", requestSettledListener);
-    page.off("response", listener);
+    const unresolved = await closing;
+    if (unresolved.length > 0) {
+      capture.errors.push(`response cutoff timed out: ${unresolved.map(requestLabel).join(",")}`);
+    }
+    page.off("response", responseListener);
+    page.off("requestfinished", requestFinishedListener);
+    page.off("requestfailed", requestFailedListener);
   };
 }
 
-async function captureResponse(response: Response, capture: CaptureState): Promise<void> {
+async function captureResponse(
+  response: Response,
+  capture: CaptureState,
+  isAccepted: () => boolean,
+): Promise<void> {
   assertClosed(response.ok(), "live Local API returned a non-success response");
   const contentLength = response.headers()["content-length"];
   assertClosed(contentLength !== undefined && /^\d+$/.test(contentLength), "live Local API omitted a bounded response length");
@@ -1062,6 +1342,7 @@ async function captureResponse(response: Response, capture: CaptureState): Promi
   capture.responseCount += 1;
   capture.capturedBytes += declaredBytes;
   const bytes = await response.body();
+  assertClosed(isAccepted(), "live Local API response completed after its capture deadline");
   assertClosed(bytes.byteLength === declaredBytes, "live Local API response length changed during capture");
   const payload = JSON.parse(bytes.toString("utf8")) as unknown;
   const url = new URL(response.url());
@@ -1074,10 +1355,9 @@ async function captureResponse(response: Response, capture: CaptureState): Promi
   if (timeline !== null) {
     const runEntries = capture.timelines.get(timeline) ?? new Map<string, CapturedTimeline>();
     for (const item of pageItems(payload)) {
-      runEntries.set(textField(item, "id"), {
-        phase: phaseSchema.parse(item.phase),
-        sequence: integerField(item, "sequence"),
-      });
+      const entry = timelineEntryV1Schema.parse(item);
+      assertClosed(entry.run_id === timeline, "timeline entry route identity mismatch");
+      runEntries.set(entry.id, entry);
     }
     assertClosed(runEntries.size <= MAX_CAPTURE_ENTRIES, "live timeline exceeded the capture budget");
     capture.timelines.set(timeline, runEntries);
@@ -1085,8 +1365,12 @@ async function captureResponse(response: Response, capture: CaptureState): Promi
   }
   const logs = resourceMatch(url.pathname, "logs");
   if (logs !== null) {
-    const runLogs = capture.logs.get(logs) ?? new Map<string, unknown>();
-    for (const item of pageItems(payload)) runLogs.set(textField(item, "id"), item);
+    const runLogs = capture.logs.get(logs) ?? new Map<string, CapturedLog>();
+    for (const item of pageItems(payload)) {
+      const entry = logEntryV1Schema.parse(item);
+      assertClosed(entry.run_id === logs, "log entry route identity mismatch");
+      runLogs.set(entry.id, entry);
+    }
     assertClosed(runLogs.size <= MAX_CAPTURE_ENTRIES, "live logs exceeded the capture budget");
     capture.logs.set(logs, runLogs);
     return;
@@ -1099,57 +1383,23 @@ async function captureResponse(response: Response, capture: CaptureState): Promi
   }
   const artifactContent = artifactResourceMatch(url.pathname, "content");
   if (artifactContent !== null) {
-    const object = record(payload);
-    const artifactId = textField(object, "artifact_id");
-    assertClosed(artifactId === artifactContent, "artifact content route identity mismatch");
-    capture.contents.set(artifactId, {
-      artifact_id: artifactId,
-      artifact_type: targetSchema.parse(object.artifact_type),
-      documents: arrayField(object, "documents").map((item) => {
-        const document = record(item);
-        return {
-          content: stringField(document, "content"),
-          content_sha256: sha256Schema.parse(document.content_sha256),
-          byte_size: integerField(document, "byte_size"),
-          truncated: booleanField(document, "truncated"),
-          relative_path: stringField(document, "relative_path"),
-        };
-      }),
-      total_documents: integerField(object, "total_documents"),
-      total_utf8_bytes: integerField(object, "total_utf8_bytes"),
-      returned_utf8_bytes: integerField(object, "returned_utf8_bytes"),
-      truncated: booleanField(object, "truncated"),
-    });
+    const content = artifactContentV1Schema.parse(payload);
+    assertClosed(content.artifact_id === artifactContent, "artifact content route identity mismatch");
+    capture.contents.set(content.artifact_id, content);
     assertClosed(capture.contents.size <= MAX_CAPTURE_ENTRIES, "live artifact content exceeded the capture budget");
     return;
   }
   const artifactDiff = artifactResourceMatch(url.pathname, "diff");
   if (artifactDiff !== null) {
-    const object = record(payload);
-    assertClosed(textField(object, "artifact_id") === artifactDiff, "artifact diff route identity mismatch");
-    capture.diffs.set(artifactDiff, {
-      previous_artifact_id: textField(object, "previous_artifact_id"),
-      document_changes: arrayField(object, "document_changes"),
-    });
+    const diff = artifactDiffV1Schema.parse(payload);
+    assertClosed(diff.artifact_id === artifactDiff, "artifact diff route identity mismatch");
+    capture.diffs.set(artifactDiff, diff);
     assertClosed(capture.diffs.size <= MAX_CAPTURE_ENTRIES, "live artifact diffs exceeded the capture budget");
   }
 }
 
 function captureArtifact(value: unknown, capture: CaptureState): void {
-  const artifact = record(value);
-  const lineage = record(artifact.lineage);
-  const captured: CapturedArtifact = {
-    id: textField(artifact, "id"),
-    artifact_type: targetSchema.parse(artifact.artifact_type),
-    target_id: targetSchema.parse(artifact.target_id),
-    content_sha256: sha256Schema.parse(artifact.content_sha256),
-    lineage: {
-      source_artifact_ids: arrayField(lineage, "source_artifact_ids").map((item) => {
-        assertClosed(typeof item === "string" && safeText(item), "artifact predecessor identity is invalid");
-        return item;
-      }),
-    },
-  };
+  const captured = artifactV1Schema.parse(value);
   capture.artifacts.set(captured.id, captured);
 }
 
@@ -1199,24 +1449,6 @@ function textField(value: Record<string, unknown>, key: string): string {
   return field;
 }
 
-function stringField(value: Record<string, unknown>, key: string): string {
-  const field = value[key];
-  assertClosed(typeof field === "string", "captured payload has an invalid string");
-  return field;
-}
-
-function integerField(value: Record<string, unknown>, key: string): number {
-  const field = value[key];
-  assertClosed(typeof field === "number" && Number.isSafeInteger(field) && field >= 0, "captured payload has an invalid count");
-  return field;
-}
-
-function booleanField(value: Record<string, unknown>, key: string): boolean {
-  const field = value[key];
-  assertClosed(typeof field === "boolean", "captured payload has an invalid flag");
-  return field;
-}
-
 function assertTimelineCapture(capture: CaptureState, handoff: LiveHandoff): void {
   for (const session of handoff.expected.sessions) {
     const phases = capture.timelines.get(session.run_id);
@@ -1232,6 +1464,112 @@ function assertTimelineCapture(capture: CaptureState, handoff: LiveHandoff): voi
       "live timeline is missing a required phase",
     );
   }
+}
+
+async function readRenderedTimeline(page: Page) {
+  return page.locator(".run-timeline li").evaluateAll((entries) => entries.map((entry) => ({
+    id: (entry as HTMLElement).dataset.timelineId,
+    sequence: Number((entry as HTMLElement).dataset.sequence),
+    phase: (entry as HTMLElement).dataset.phase,
+    status: (entry as HTMLElement).dataset.status,
+    contentSha256: (entry as HTMLElement).dataset.contentSha256,
+    attemptId: (entry as HTMLElement).dataset.attemptId,
+    serviceId: (entry as HTMLElement).dataset.serviceId,
+    occurredAt: (entry as HTMLElement).dataset.occurredAt,
+    artifactIds: (entry as HTMLElement).dataset.artifactIds,
+    error: (entry as HTMLElement).dataset.error,
+    title: entry.querySelector("strong")?.textContent ?? "",
+    message: entry.querySelector("div > span")?.textContent ?? "",
+  })));
+}
+
+async function readRenderedLogs(page: Page) {
+  return page.locator(".session-output-entry").evaluateAll((entries) => entries.map((entry) => ({
+    id: (entry as HTMLElement).dataset.logId,
+    sequence: Number((entry as HTMLElement).dataset.sequence),
+    stream: (entry as HTMLElement).dataset.stream,
+    level: (entry as HTMLElement).dataset.level,
+    contentSha256: (entry as HTMLElement).dataset.contentSha256,
+    runId: (entry as HTMLElement).dataset.runId,
+    occurredAt: (entry as HTMLElement).dataset.occurredAt,
+    attemptId: (entry as HTMLElement).dataset.attemptId,
+    serviceId: (entry as HTMLElement).dataset.serviceId,
+    streamLabel: entry.querySelector(".session-stream")?.textContent ?? "",
+    dateTime: entry.querySelector("time")?.getAttribute("datetime") ?? "",
+    displayedTime: entry.querySelector("time")?.textContent ?? "",
+    message: entry.querySelector(".session-output-message")?.textContent ?? "",
+  })));
+}
+
+function assertRenderedTimelineCapture(
+  capture: CaptureState,
+  session: LiveHandoff["expected"]["sessions"][number],
+  rendered: ReadonlyArray<{
+    id: string | undefined;
+    sequence: number;
+    phase: string | undefined;
+    status: string | undefined;
+    contentSha256: string | undefined;
+    attemptId: string | undefined;
+    serviceId: string | undefined;
+    occurredAt: string | undefined;
+    artifactIds: string | undefined;
+    error: string | undefined;
+    title: string;
+    message: string;
+  }>,
+): void {
+  const expected = [...(capture.timelines.get(session.run_id)?.entries() ?? [])]
+    .sort(([leftId, left], [rightId, right]) => (
+      left.sequence - right.sequence || leftId.localeCompare(rightId)
+    ))
+    .map(([, entry]) => ({
+      id: entry.id,
+      sequence: entry.sequence,
+      phase: entry.phase,
+      status: entry.status,
+      contentSha256: entry.content_sha256,
+      attemptId: entry.attempt_id ?? "",
+      serviceId: entry.service_id,
+      occurredAt: entry.occurred_at,
+      artifactIds: JSON.stringify(entry.artifact_ids),
+      error: JSON.stringify(entry.error),
+      title: entry.title,
+      message: entry.message,
+    }));
+  assertClosed(
+    JSON.stringify(rendered) === JSON.stringify(expected),
+    `renderer timeline for session ${session.ordinal} does not follow the authoritative remote sequence`,
+  );
+}
+
+function assertRenderedLogCapture(
+  capture: CaptureState,
+  session: LiveHandoff["expected"]["sessions"][number],
+  rendered: Awaited<ReturnType<typeof readRenderedLogs>>,
+): void {
+  const expected = [...(capture.logs.get(session.run_id)?.values() ?? [])]
+    .sort((left, right) => left.sequence - right.sequence || left.id.localeCompare(right.id))
+    .slice(-200)
+    .map((entry) => ({
+      id: entry.id,
+      sequence: entry.sequence,
+      stream: entry.stream,
+      level: entry.level,
+      contentSha256: entry.content_sha256,
+      runId: entry.run_id ?? "",
+      occurredAt: entry.occurred_at,
+      attemptId: entry.attempt_id ?? "",
+      serviceId: entry.service_id,
+      streamLabel: sessionStreamLabel(entry.stream),
+      dateTime: entry.occurred_at,
+      displayedTime: formatSessionTime(entry.occurred_at),
+      message: entry.message,
+    }));
+  assertClosed(
+    JSON.stringify(rendered) === JSON.stringify(expected),
+    `renderer logs for session ${session.ordinal} differ from the stable response cutoff`,
+  );
 }
 
 function phasesHas(phases: Map<string, CapturedTimeline>, phase: typeof REQUIRED_PHASES[number]): boolean {
@@ -1255,10 +1593,232 @@ function assertExpectedArtifactCollection(capture: CaptureState, handoff: LiveHa
   }
 }
 
+async function expectArtifactDocumentIdentity(
+  locator: Locator,
+  document: CapturedContent["documents"][number],
+): Promise<void> {
+  await expect(locator).toHaveAttribute("data-document-id", document.document_id);
+  await expect(locator).toHaveAttribute("data-display-name", document.display_name);
+  await expect(locator).toHaveAttribute("data-relative-path", document.relative_path ?? "");
+  await expect(locator).toHaveAttribute("data-mime-type", document.mime_type);
+  await expect(locator).toHaveAttribute("data-content-sha256", document.content_sha256);
+  await expect(locator).toHaveAttribute("data-byte-size", String(document.byte_size));
+  await expect(locator).toHaveAttribute("data-truncated", String(document.truncated));
+}
+
+function artifactEvidenceFromCapture(
+  capture: CaptureState,
+  expected: LiveHandoff["expected"]["artifacts"][number],
+  renderedDocuments: readonly string[],
+): z.infer<typeof resultArtifactSchema> {
+  const content = capture.contents.get(expected.artifact_id);
+  const artifact = capture.artifacts.get(expected.artifact_id);
+  assertClosed(content !== undefined && artifact !== undefined, "artifact observation is incomplete");
+  assertClosed(
+    content.artifact_id === expected.artifact_id
+    && content.artifact_type === expected.artifact_type
+    && content.artifact_content_sha256 === artifact.content_sha256
+    && artifact.content_sha256 === expected.artifact_content_sha256,
+    "artifact content identity mismatch",
+  );
+  assertClosed(
+    !content.truncated
+    && content.documents.length > 0
+    && content.documents.length === content.total_documents
+    && content.returned_utf8_bytes === content.total_utf8_bytes
+    && content.returned_utf8_bytes > 0,
+    "artifact content is empty or incomplete",
+  );
+  for (const document of content.documents) {
+    const bytes = Buffer.from(document.content, "utf8");
+    assertClosed(
+      !document.truncated
+      && bytes.byteLength === document.byte_size
+      && sha256(bytes) === document.content_sha256,
+      "artifact document content identity mismatch",
+    );
+  }
+  const runtimeDocuments = expected.target_id === "skill_bundle"
+    ? content.documents.filter((document) => document.relative_path === "SKILL.md")
+    : content.documents;
+  assertClosed(
+    runtimeDocuments.length === 1
+    && runtimeDocuments[0]?.content_sha256 === expected.runtime_document_sha256,
+    "artifact runtime document changed after workflow verification",
+  );
+  assertClosed(
+    renderedDocuments.length === content.documents.length
+    && renderedDocuments.every((rendered, index) => (
+      rendered === content.documents[index]?.content && rendered.trim().length > 0
+    )),
+    "artifact documents were not rendered from the stable response cutoff",
+  );
+  return {
+    artifact_id_sha256: sha256(Buffer.from(expected.artifact_id, "utf8")),
+    artifact_type: expected.artifact_type,
+    target_id: expected.target_id,
+    document_count: content.documents.length,
+    total_utf8_bytes: content.total_utf8_bytes,
+    content_sha256: artifact.content_sha256,
+    runtime_document_sha256: runtimeDocuments[0]!.content_sha256,
+  };
+}
+
+async function readRenderedDiff(page: Page) {
+  return page.locator(".diff-view").evaluate((root) => {
+    const attribute = (element: Element, name: string) => element.getAttribute(name) ?? "";
+    const integer = (element: Element, name: string) => {
+      const value = attribute(element, name);
+      if (!/^\d+$/.test(value)) throw new Error(`Rendered diff omitted ${name}`);
+      return Number(value);
+    };
+    const nullableInteger = (element: Element, name: string) => {
+      const value = attribute(element, name);
+      if (value === "") return null;
+      if (!/^\d+$/.test(value)) throw new Error(`Rendered diff contains invalid ${name}`);
+      return Number(value);
+    };
+    return {
+      artifactId: attribute(root, "data-artifact-id"),
+      artifactContentSha256: attribute(root, "data-artifact-content-sha256"),
+      previousArtifactId: attribute(root, "data-previous-artifact-id"),
+      previousArtifactContentSha256: attribute(root, "data-previous-artifact-content-sha256"),
+      truncated: attribute(root, "data-truncated") === "true",
+      changes: [...root.querySelectorAll(":scope > .diff-hunk")].map((change) => ({
+        kind: attribute(change, "data-kind"),
+        oldDocumentId: attribute(change, "data-old-document-id"),
+        oldPath: attribute(change, "data-old-path"),
+        oldContentSha256: attribute(change, "data-old-content-sha256"),
+        newDocumentId: attribute(change, "data-new-document-id"),
+        newPath: attribute(change, "data-new-path"),
+        newContentSha256: attribute(change, "data-new-content-sha256"),
+        heading: change.querySelector(".diff-document-heading h3")?.textContent ?? "",
+        emptyMessage: change.querySelector(".diff-document-empty")?.textContent ?? null,
+        hunks: [...change.querySelectorAll(":scope > .diff-hunk-block")].map((hunk) => ({
+          oldStart: integer(hunk, "data-old-start"),
+          oldCount: integer(hunk, "data-old-count"),
+          newStart: integer(hunk, "data-new-start"),
+          newCount: integer(hunk, "data-new-count"),
+          lines: [...hunk.querySelectorAll(":scope > .diff-line")].map((line) => ({
+            kind: attribute(line, "data-kind"),
+            oldLineNumber: nullableInteger(line, "data-old-line-number"),
+            newLineNumber: nullableInteger(line, "data-new-line-number"),
+            text: line.querySelector("code")?.textContent ?? "",
+          })),
+        })),
+      })),
+    };
+  });
+}
+
+function expectedRenderedDiff(diff: CapturedDiff) {
+  return {
+    artifactId: diff.artifact_id,
+    artifactContentSha256: diff.artifact_content_sha256,
+    previousArtifactId: diff.previous_artifact_id,
+    previousArtifactContentSha256: diff.previous_artifact_content_sha256,
+    truncated: diff.truncated,
+    changes: diff.document_changes.map((change) => {
+      const oldDocument = "old_document" in change ? change.old_document : null;
+      const newDocument = "new_document" in change ? change.new_document : null;
+      const oldPath = oldDocument?.relative_path ?? null;
+      const newPath = newDocument?.relative_path ?? null;
+      const heading = change.kind === "renamed" ? `${oldPath} to ${newPath}` : (newPath ?? oldPath ?? "");
+      const emptyMessage = change.hunks.length > 0
+        ? null
+        : change.kind === "renamed"
+          ? "Renamed without content changes."
+          : change.kind === "added"
+            ? "Empty document added."
+            : change.kind === "removed"
+              ? "Empty document removed."
+              : "Content identity changed without line changes.";
+      return {
+        kind: change.kind,
+        oldDocumentId: oldDocument?.document_id ?? "",
+        oldPath: oldDocument?.relative_path ?? "",
+        oldContentSha256: oldDocument?.content_sha256 ?? "",
+        newDocumentId: newDocument?.document_id ?? "",
+        newPath: newDocument?.relative_path ?? "",
+        newContentSha256: newDocument?.content_sha256 ?? "",
+        heading,
+        emptyMessage,
+        hunks: change.hunks.map((hunk) => ({
+          oldStart: hunk.old_start,
+          oldCount: hunk.old_count,
+          newStart: hunk.new_start,
+          newCount: hunk.new_count,
+          lines: hunk.lines.map((line) => ({
+            kind: line.kind,
+            oldLineNumber: line.old_line_number,
+            newLineNumber: line.new_line_number,
+            text: line.text,
+          })),
+        })),
+      };
+    }),
+  };
+}
+
+function assertArtifactDiffCapture(capture: CaptureState, artifactId: string): void {
+  const diff = capture.diffs.get(artifactId);
+  const artifact = capture.artifacts.get(artifactId);
+  assertClosed(diff !== undefined && artifact !== undefined, "artifact changes are incomplete");
+  const previous = expectedDiffPredecessor(capture, artifact);
+  const hunks = diff.document_changes.flatMap((change) => change.hunks);
+  const lines = hunks.flatMap((hunk) => hunk.lines);
+  assertClosed(
+    diff.artifact_id === artifact.id
+    && diff.artifact_content_sha256 === artifact.content_sha256
+    && diff.previous_artifact_id === previous.id
+    && diff.previous_artifact_content_sha256 === previous.content_sha256
+    && diff.document_changes.length > 0,
+    "artifact changes do not prove predecessor lineage",
+  );
+  assertClosed(
+    !diff.truncated
+    && diff.document_changes.length === diff.total_document_changes
+    && hunks.length === diff.total_hunks
+    && lines.length === diff.total_lines,
+    "artifact changes are truncated or incomplete",
+  );
+}
+
+function expectedDiffPredecessor(
+  capture: CaptureState,
+  artifact: CapturedArtifact,
+): CapturedArtifact {
+  const sources = artifact.lineage.source_artifact_ids.map((sourceId) => {
+    const source = capture.artifacts.get(sourceId);
+    assertClosed(source !== undefined, "artifact predecessor is absent from the stable capture");
+    return source;
+  });
+  const previous = selectLatestArtifactPredecessor(artifact, sources);
+  assertClosed(previous !== undefined, "artifact has no compatible stable predecessor");
+  return previous;
+}
+
 function artifactLabel(target: Target): string {
   if (target === "text_memory") return "Text memory";
   if (target === "skill_bundle") return "Skills";
   return "Agent guidance";
+}
+
+function sessionStreamLabel(stream: CapturedLog["stream"]): string {
+  if (stream === "agent") return "Agent";
+  if (stream === "evolution") return "Evolution";
+  if (stream === "service") return "Service";
+  return "Core";
+}
+
+function formatSessionTime(timestamp: string): string {
+  return new Intl.DateTimeFormat("en", {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: "UTC",
+  }).format(new Date(timestamp));
 }
 
 function escapeRegex(value: string): string {

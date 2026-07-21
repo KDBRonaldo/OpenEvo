@@ -2455,6 +2455,7 @@ def test_artifact_content_response_budget_covers_worst_case_json_escaping(
     payload = v1.ArtifactContentV1(
         artifact_id="artifact-current",
         artifact_type=v1.ArtifactType.SKILL_BUNDLE,
+        artifact_content_sha256="a" * 64,
         documents=documents,
         total_documents=v1.MAX_ARTIFACT_PREVIEW_DOCUMENTS,
         total_utf8_bytes=len(content_bytes),
@@ -4758,6 +4759,7 @@ def test_run_child_and_artifact_content_bind_requested_parent_ids() -> None:
             "schema_version": "1",
             "artifact_id": "artifact-other",
             "artifact_type": "skill_bundle",
+            "artifact_content_sha256": "a" * 64,
             "documents": [],
             "total_documents": 0,
             "total_utf8_bytes": 0,
@@ -4772,6 +4774,16 @@ def test_run_child_and_artifact_content_bind_requested_parent_ids() -> None:
     client.get_artifact("artifact-1", project_id=PROJECT_ID)
     with pytest.raises(CoreClientErrorV1) as content_error:
         client.artifact_content("artifact-1", project_id=PROJECT_ID)
+    wrong_content = responses[f"/v1/projects/{PROJECT_ID}/artifacts/artifact-1/content"]
+    assert isinstance(wrong_content, dict)
+    responses[f"/v1/projects/{PROJECT_ID}/artifacts/artifact-1/content"] = {
+        **wrong_content,
+        "artifact_id": "artifact-1",
+        "artifact_content_sha256": "b" * 64,
+    }
+    with pytest.raises(CoreClientErrorV1) as digest_error:
+        client.artifact_content("artifact-1", project_id=PROJECT_ID)
 
     assert timeline_error.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
     assert content_error.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE
+    assert digest_error.value.error.code is CoreClientLocalErrorCodeV1.INVALID_RESPONSE

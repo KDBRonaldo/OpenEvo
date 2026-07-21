@@ -31,7 +31,7 @@ const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57";
+    "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
 const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V1";
 const RENDERER_STAGE_VOCABULARY: [&str; 22] = [

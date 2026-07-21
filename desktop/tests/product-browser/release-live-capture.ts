@@ -3,7 +3,7 @@ type Deferred = {
   resolve: () => void;
 };
 
-export class InFlightCaptureWindow<Key> {
+export class InFlightCaptureCutoff<Key> {
   readonly #inFlight = new Map<Key, Deferred>();
   #accepting = true;
 
@@ -29,10 +29,67 @@ export class InFlightCaptureWindow<Key> {
     deferred.resolve();
   }
 
-  async close(): Promise<void> {
+  async close(timeoutMs: number): Promise<readonly Key[]> {
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("Capture cutoff timeout must be a positive safe integer");
+    }
     this.#accepting = false;
-    await Promise.all([...this.#inFlight.values()].map(({ promise }) => promise));
+    const snapshot = [...this.#inFlight.entries()];
+    if (snapshot.length === 0) return [];
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = await Promise.race([
+      Promise.all(snapshot.map(([, deferred]) => deferred.promise)).then(() => false),
+      new Promise<true>((resolve) => {
+        timeout = setTimeout(() => resolve(true), timeoutMs);
+      }),
+    ]);
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (!timedOut) return [];
+    const unresolved = snapshot
+      .filter(([key]) => this.#inFlight.has(key))
+      .map(([key]) => key);
+    for (const key of unresolved) this.finish(key);
+    return unresolved;
   }
+}
+
+type ArtifactPredecessorCandidate = {
+  id: string;
+  project_id: string;
+  target_id: string;
+  artifact_type: string;
+  created_at: string;
+  produced_revision: { generation: number };
+};
+
+export function selectLatestArtifactPredecessor<T extends ArtifactPredecessorCandidate>(
+  current: T,
+  sources: readonly T[],
+): T | undefined {
+  const candidates = sources.filter((source) => (
+    source.id !== current.id
+    && source.project_id === current.project_id
+    && source.target_id === current.target_id
+    && source.artifact_type === current.artifact_type
+    && source.produced_revision.generation < current.produced_revision.generation
+  ));
+  candidates.sort((left, right) => (
+    left.produced_revision.generation - right.produced_revision.generation
+    || pythonStringCompare(left.created_at, right.created_at)
+    || pythonStringCompare(left.id, right.id)
+  ));
+  return candidates.at(-1);
+}
+
+function pythonStringCompare(left: string, right: string): number {
+  const leftCodePoints = [...left].map((character) => character.codePointAt(0)!);
+  const rightCodePoints = [...right].map((character) => character.codePointAt(0)!);
+  const length = Math.min(leftCodePoints.length, rightCodePoints.length);
+  for (let index = 0; index < length; index += 1) {
+    const difference = leftCodePoints[index]! - rightCodePoints[index]!;
+    if (difference !== 0) return difference;
+  }
+  return leftCodePoints.length - rightCodePoints.length;
 }
 
 export async function drainPendingSnapshot(

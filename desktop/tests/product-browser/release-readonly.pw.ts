@@ -7,7 +7,7 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 
 const DESKTOP_ENDPOINT = "http://127.0.0.1:43117";
 const DESKTOP_SESSION_TOKEN = "release-readonly-session-token-000000000001";
-const OPENAPI_SHA256 = "3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57";
+const OPENAPI_SHA256 = "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb";
 const FEATURE_FLAGS = [
   "remote_profiles",
   "project_validation",

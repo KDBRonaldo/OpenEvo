@@ -1813,7 +1813,20 @@ function Timeline({ entries }: { entries: readonly DesktopProductSnapshot["timel
   return (
     <ol className="run-timeline">
       {visible.map((entry) => (
-        <li key={entry.id} className={entry.status} data-sequence={entry.sequence} data-phase={entry.phase}>
+        <li
+          key={entry.id}
+          className={entry.status}
+          data-timeline-id={entry.id}
+          data-sequence={entry.sequence}
+          data-phase={entry.phase}
+          data-status={entry.status}
+          data-content-sha256={entry.content_sha256}
+          data-attempt-id={entry.attempt_id ?? ""}
+          data-service-id={entry.service_id}
+          data-occurred-at={entry.occurred_at}
+          data-artifact-ids={JSON.stringify(entry.artifact_ids)}
+          data-error={JSON.stringify(entry.error)}
+        >
           <span className="timeline-marker">{entry.status === "succeeded" ? <Check size={11} /> : entry.status === "running" ? <LoaderCircle className="spin" size={11} /> : null}</span>
           <div><strong>{entry.title}</strong><span>{entry.message}</span></div>
         </li>
@@ -1930,7 +1943,19 @@ function SessionOutput({
             <div className="session-output-limit">Showing the latest 200 matching records.</div>
           ) : null}
           {visible.map((entry) => (
-            <article key={entry.id} className={`session-output-entry ${entry.level}`}>
+            <article
+              key={entry.id}
+              className={`session-output-entry ${entry.level}`}
+              data-log-id={entry.id}
+              data-sequence={entry.sequence}
+              data-stream={entry.stream}
+              data-level={entry.level}
+              data-content-sha256={entry.content_sha256}
+              data-run-id={entry.run_id ?? ""}
+              data-occurred-at={entry.occurred_at}
+              data-attempt-id={entry.attempt_id ?? ""}
+              data-service-id={entry.service_id}
+            >
               <div className="session-output-meta">
                 <span className={`session-stream ${entry.stream}`}>{sessionStreamLabel(entry.stream)}</span>
                 <time dateTime={entry.occurred_at}>{formatTime(entry.occurred_at)}</time>
@@ -2191,26 +2216,44 @@ function ArtifactContent({ content }: { content: ArtifactContentV1 }) {
   const document = content.documents.find((item) => item.document_id === documentId) ?? content.documents[0];
   const documentIndex = document ? content.documents.findIndex((item) => item.document_id === document.document_id) : -1;
   return (
-    <>
+    <div
+      className="artifact-content-view"
+      data-artifact-id={content.artifact_id}
+      data-artifact-type={content.artifact_type}
+      data-artifact-content-sha256={content.artifact_content_sha256}
+      data-total-documents={content.total_documents}
+      data-total-utf8-bytes={content.total_utf8_bytes}
+      data-returned-utf8-bytes={content.returned_utf8_bytes}
+      data-truncated={String(content.truncated)}
+    >
       {content.truncated ? <InlineNotice tone="warning" title="Preview is truncated" detail={`Showing ${content.documents.length} of ${content.total_documents} documents.`} /> : null}
       {content.documents.length > 1 ? (
         <div className="document-tabs" role="tablist" aria-label="Artifact documents" onKeyDown={handleTablistKeyDown}>
-          {content.documents.map((item, index) => <button id={`artifact-document-tab-${index}`} aria-controls="artifact-document-panel" role="tab" aria-selected={item.document_id === document?.document_id} tabIndex={item.document_id === document?.document_id ? 0 : -1} key={item.document_id} type="button" className={item.document_id === document?.document_id ? "active" : ""} onClick={() => setDocumentId(item.document_id)}>{item.display_name}</button>)}
+          {content.documents.map((item, index) => <button id={`artifact-document-tab-${index}`} aria-controls="artifact-document-panel" role="tab" aria-selected={item.document_id === document?.document_id} tabIndex={item.document_id === document?.document_id ? 0 : -1} key={item.document_id} type="button" className={item.document_id === document?.document_id ? "active" : ""} data-document-id={item.document_id} data-display-name={item.display_name} data-relative-path={item.relative_path ?? ""} data-mime-type={item.mime_type} data-content-sha256={item.content_sha256} data-byte-size={item.byte_size} data-truncated={String(item.truncated)} onClick={() => setDocumentId(item.document_id)}>{item.display_name}</button>)}
         </div>
       ) : null}
-      {document ? <pre id="artifact-document-panel" role={content.documents.length > 1 ? "tabpanel" : undefined} aria-labelledby={content.documents.length > 1 ? `artifact-document-tab-${documentIndex}` : undefined} className="artifact-document">{document.content}</pre> : null}
-    </>
+      {document ? <pre id="artifact-document-panel" role={content.documents.length > 1 ? "tabpanel" : undefined} aria-labelledby={content.documents.length > 1 ? `artifact-document-tab-${documentIndex}` : undefined} className="artifact-document" data-document-id={document.document_id} data-display-name={document.display_name} data-relative-path={document.relative_path ?? ""} data-mime-type={document.mime_type} data-content-sha256={document.content_sha256} data-byte-size={document.byte_size} data-truncated={String(document.truncated)}>{document.content}</pre> : null}
+    </div>
   );
 }
 
 function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
   if (diff.document_changes.length === 0) return <div className="quiet-empty"><FileDiff size={22} /><p>No document changes are available for this revision.</p></div>;
   return (
-    <div className="diff-view">
+    <div
+      className="diff-view"
+      data-artifact-id={diff.artifact_id}
+      data-artifact-content-sha256={diff.artifact_content_sha256}
+      data-previous-artifact-id={diff.previous_artifact_id}
+      data-previous-artifact-content-sha256={diff.previous_artifact_content_sha256}
+      data-truncated={String(diff.truncated)}
+    >
       {diff.truncated ? <InlineNotice tone="warning" title="Change preview is truncated" detail="Some changes are not shown in this preview." /> : null}
       {diff.document_changes.map((change, changeIndex) => {
         const oldPath = "old_document" in change ? change.old_document.relative_path : null;
         const newPath = "new_document" in change ? change.new_document.relative_path : null;
+        const oldDocument = "old_document" in change ? change.old_document : null;
+        const newDocument = "new_document" in change ? change.new_document : null;
         const heading = change.kind === "renamed" ? `${oldPath} to ${newPath}` : (newPath ?? oldPath);
         const emptyMessage = change.kind === "renamed"
           ? "Renamed without content changes."
@@ -2219,9 +2262,44 @@ function ArtifactDiff({ diff }: { diff: ArtifactDiffV1 }) {
             : change.kind === "removed"
               ? "Empty document removed."
               : "Content identity changed without line changes.";
-        return <section key={`${change.kind}-${changeIndex}`} className="diff-hunk">
+        return <section
+          key={`${change.kind}-${changeIndex}`}
+          className="diff-hunk"
+          data-change-index={changeIndex}
+          data-kind={change.kind}
+          data-old-document-id={oldDocument?.document_id ?? ""}
+          data-old-path={oldDocument?.relative_path ?? ""}
+          data-old-content-sha256={oldDocument?.content_sha256 ?? ""}
+          data-new-document-id={newDocument?.document_id ?? ""}
+          data-new-path={newDocument?.relative_path ?? ""}
+          data-new-content-sha256={newDocument?.content_sha256 ?? ""}
+        >
           <div className="diff-document-heading"><span>{change.kind}</span><h3>{heading}</h3></div>
-          {change.hunks.map((hunk, hunkIndex) => hunk.lines.map((line, lineIndex) => <div key={`${change.kind}-${changeIndex}-${hunkIndex}-${lineIndex}`} className={`diff-line ${line.kind}`}><span>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}</span><code>{line.text}</code></div>))}
+          {change.hunks.map((hunk, hunkIndex) => (
+            <div
+              key={`${change.kind}-${changeIndex}-${hunkIndex}`}
+              className="diff-hunk-block"
+              data-hunk-index={hunkIndex}
+              data-old-start={hunk.old_start}
+              data-old-count={hunk.old_count}
+              data-new-start={hunk.new_start}
+              data-new-count={hunk.new_count}
+            >
+              {hunk.lines.map((line, lineIndex) => (
+                <div
+                  key={`${change.kind}-${changeIndex}-${hunkIndex}-${lineIndex}`}
+                  className={`diff-line ${line.kind}`}
+                  data-line-index={lineIndex}
+                  data-kind={line.kind}
+                  data-old-line-number={line.old_line_number ?? ""}
+                  data-new-line-number={line.new_line_number ?? ""}
+                >
+                  <span>{line.kind === "added" ? "+" : line.kind === "removed" ? "-" : " "}</span>
+                  <code>{line.text}</code>
+                </div>
+              ))}
+            </div>
+          ))}
           {change.hunks.length === 0 ? <p className="diff-document-empty">{emptyMessage}</p> : null}
         </section>
       })}
@@ -3860,7 +3938,9 @@ function sameRevisionRef(left: RevisionRefV1, right: RevisionRefV1): boolean {
 }
 
 function artifactContentIdentityError(artifact: ArtifactV1, content: ArtifactContentV1): string | null {
-  return content.artifact_id === artifact.id && content.artifact_type === artifact.artifact_type
+  return content.artifact_id === artifact.id
+    && content.artifact_type === artifact.artifact_type
+    && content.artifact_content_sha256 === artifact.content_sha256
     ? null
     : "Artifact content identity does not match the selected artifact. Refetch before viewing it.";
 }

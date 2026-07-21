@@ -944,6 +944,7 @@ export const artifactContentV1Schema = z
     schema_version: schemaVersionV1Schema,
     artifact_id: coreOpaqueIdSchema,
     artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory"]),
+    artifact_content_sha256: sha256DigestSchema,
     documents: z.array(artifactDocumentV1Schema).max(MAX_ARTIFACT_PREVIEW_DOCUMENTS),
     total_documents: nonNegativeSafeIntegerSchema,
     total_utf8_bytes: nonNegativeSafeIntegerSchema,

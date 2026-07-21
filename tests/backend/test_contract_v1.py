@@ -343,7 +343,7 @@ def test_openapi_snapshot_is_exactly_rebuildable() -> None:
     rebuilt = canonical_json_bytes(build_openapi_document())
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
-    assert openapi_sha256() == ("2c68afc2b6490bf83a20b294b88398ac53fad4a7c449a66b687a13d71a87ef50")
+    assert openapi_sha256() == ("0553a38f229c4fe091b29c609c7557e12d0d30354170d19ba8377da04469ee48")
 
 
 def test_event_schema_snapshot_is_exactly_rebuildable() -> None:
@@ -1521,6 +1521,7 @@ def test_artifact_content_is_one_bounded_document_preview_shape() -> None:
         "schema_version": "1",
         "artifact_id": "artifact-1",
         "artifact_type": "skill_bundle",
+        "artifact_content_sha256": "a" * 64,
         "documents": [document],
         "total_documents": 1,
         "total_utf8_bytes": 5,

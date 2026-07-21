@@ -283,7 +283,7 @@ leave an unowned sidecar or publish/reuse their session token. A bounded native
 cleanup failure remains visible as retryable startup failure.
 
 The Local API release digest is
-`3cc2cef7911f20f2db0b1145670bbb75de21768098dccdf02c030d6d4a40bb57`.
+`26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb`.
 The checked-in TypeScript mirror and contract fixtures use that frozen digest.
 The product UI and simulator consume the final Local/Core v1 DTOs directly and
 construct simulator resources through the same strict Zod schemas as release

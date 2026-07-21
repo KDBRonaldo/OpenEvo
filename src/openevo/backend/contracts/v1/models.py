@@ -1905,6 +1905,7 @@ class ArtifactContentV1(ContractModel):
     schema_version: Literal["1"] = "1"
     artifact_id: OpaqueId
     artifact_type: ArtifactType
+    artifact_content_sha256: Sha256Digest
     documents: list[ArtifactDocumentPreviewV1] = Field(
         max_length=MAX_ARTIFACT_PREVIEW_DOCUMENTS
     )
