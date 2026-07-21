@@ -74,6 +74,11 @@ DAEMON_V6 = CoreDaemonBundleIdentity(
     canonical_manifest_sha256="1" * 64,
     lifecycle_compatibility=6,
 )
+DAEMON_V7 = CoreDaemonBundleIdentity(
+    bundle_sha256="c" * 64,
+    canonical_manifest_sha256="2" * 64,
+    lifecycle_compatibility=7,
+)
 
 
 class FakeController:
@@ -1606,6 +1611,49 @@ def test_compatibility_v6_reader_stops_v5_daemon_and_upgrades_its_floor(
     assert upgraded.lifecycle_compatibility == 6
     assert upgraded_ledger["schema_version"] == 5
     assert upgraded_ledger["lifecycle_compatibility"] == 6
+
+
+def test_v7_candidate_starts_after_conditional_stop_persists_v6_floor(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V6,
+        process_controller=controller,
+    )
+
+    stopped = service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=old.generation,
+        expected_release_identity=old.release_identity,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        floor = pinned.read_json("service.json")
+
+    upgraded = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V7,
+        process_controller=controller,
+    )
+
+    assert stopped is True
+    assert floor["state"] == "stopped"
+    assert floor["lifecycle_compatibility"] == 6
+    assert upgraded.attached is False
+    assert upgraded.generation != old.generation
+    assert upgraded.lifecycle_compatibility == 7
 
 
 def test_dead_newer_daemon_floor_rejects_stale_desktop_downgrade(
