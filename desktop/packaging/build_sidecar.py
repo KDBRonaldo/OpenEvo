@@ -43,6 +43,15 @@ DAEMON_ARCHIVE_ROOT = Path("openevo/daemon")
 DAEMON_BUNDLE_BASENAME = "openevo-daemon-linux-x86_64"
 DAEMON_MANIFEST_BASENAME = "openevo-daemon-bundle.json"
 CORE_FRAMEWORK_LOCK_BASENAME = "framework-lock.json"
+REMOTE_RELEASE_ARCHIVE_ROOTS = (
+    CORE_WHEEL_ARCHIVE_ROOT,
+    MANAGED_RUNTIME_ARCHIVE_ROOT,
+    DAEMON_ARCHIVE_ROOT,
+)
+# Python and the local Desktop API dependencies remain onefile, but remote release
+# assets must stay in the DMG resource directory. This leaves substantial headroom
+# for dependency updates while catching accidental re-embedding of the runtime.
+MAX_SIDECAR_BINARY_BYTES = 128 * 1024 * 1024
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
         "openevo/evolution/terminal_bench_bridge.py",
@@ -1374,11 +1383,7 @@ def _snapshot_core_release_input(
     try:
         destination_fd = os.open(
             source.name,
-            os.O_WRONLY
-            | os.O_CREAT
-            | os.O_EXCL
-            | os.O_CLOEXEC
-            | os.O_NOFOLLOW,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
             0o600,
             dir_fd=directory_fd,
         )
@@ -1615,9 +1620,8 @@ def _publish_core_release_inputs_once(
 
         published = os.stat(output.name, dir_fd=parent_fd, follow_symlinks=False)
         held = os.fstat(staging_fd)
-        if (
-            (published.st_dev, published.st_ino) != (held.st_dev, held.st_ino)
-            or not stat.S_ISDIR(published.st_mode)
+        if (published.st_dev, published.st_ino) != (held.st_dev, held.st_ino) or not stat.S_ISDIR(
+            published.st_mode
         ):
             raise RuntimeError("Published Core release directory identity changed")
         for source in sources:
@@ -2216,9 +2220,7 @@ def _load_daemon_release_manifest(
     }
     if not isinstance(value, dict) or set(value) != expected_keys:
         raise RuntimeError("Daemon release manifest does not use the closed schema")
-    canonical = (
-        json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
-    ).encode("utf-8")
+    canonical = (json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
     if payload != canonical:
         raise RuntimeError("Daemon release manifest is not canonical")
     artifact = value.get("artifact")
@@ -2251,8 +2253,7 @@ def _load_daemon_release_manifest(
     runtime = value.get("runtime")
     if (
         not isinstance(runtime, dict)
-        or set(runtime)
-        != {"format", "python", "system_python_required", "target_pypi_required"}
+        or set(runtime) != {"format", "python", "system_python_required", "target_pypi_required"}
         or runtime.get("format") != "pyinstaller-onefile"
         or runtime.get("system_python_required") is not False
         or runtime.get("target_pypi_required") is not False
@@ -2304,7 +2305,9 @@ def _validate_daemon_manifest_core(
         "size": wheel_size,
         "version": version,
     }:
-        raise RuntimeError("Daemon release manifest does not bind the embedded Core wheel and lock")
+        raise RuntimeError(
+            "Daemon release manifest does not bind the embedded Core wheel and lock"
+        )
 
 
 def _validate_embedded_daemon_release_inputs(
@@ -2336,6 +2339,24 @@ def _validate_embedded_daemon_release_inputs(
             raise RuntimeError(
                 f"sidecar embedded Daemon release input differs from its source: {source.name}"
             )
+
+
+def _validate_sidecar_excludes_remote_release_assets(executable: Path) -> None:
+    """Reject release assets in the onefile archive before publishing the sidecar."""
+
+    byte_size = executable.stat().st_size
+    if byte_size > MAX_SIDECAR_BINARY_BYTES:
+        raise RuntimeError(
+            "Desktop sidecar exceeds the local-only archive size limit: "
+            f"{byte_size} bytes > {MAX_SIDECAR_BINARY_BYTES} bytes"
+        )
+    forbidden = sorted(
+        name
+        for name in _archive_member_names(executable)
+        if any(name.startswith(f"{root.as_posix()}/") for root in REMOTE_RELEASE_ARCHIVE_ROOTS)
+    )
+    if forbidden:
+        raise RuntimeError(f"Desktop sidecar must not embed remote release assets: {forbidden}")
 
 
 def _open_daemon_release_input_pair(
@@ -2390,26 +2411,20 @@ def build_sidecar(
     static_root = packaging_root / "web"
 
     if release_build and (
-        managed_runtime_archive is None
+        core_wheel is None
+        or core_framework_lock is None
+        or managed_runtime_archive is None
         or daemon_bundle is None
         or daemon_manifest is None
     ):
         raise RuntimeError(
-            "release sidecar build requires the managed runtime archive and Daemon inputs"
+            "release sidecar build requires the exact Core wheel, framework lock, "
+            "managed runtime archive, and Daemon inputs"
         )
     if (daemon_bundle is None) != (daemon_manifest is None):
         raise RuntimeError("Daemon bundle and manifest must be provided together")
     if (core_wheel is None) != (core_framework_lock is None):
         raise RuntimeError("Core wheel and framework lock inputs must be provided together")
-    if (
-        release_build
-        and daemon_bundle is not None
-        and core_wheel is None
-    ):
-        raise RuntimeError(
-            "release sidecar build with Daemon inputs requires the exact Core wheel "
-            "and framework lock inputs"
-        )
     if core_wheel is not None and core_wheel_output_dir is not None:
         raise RuntimeError(
             "Core wheel input pair cannot be combined with a Core wheel output directory"
@@ -2545,10 +2560,6 @@ def build_sidecar(
             "--collect-submodules",
             "openevo",
             "--add-data",
-            f"{core_wheel}{os.pathsep}{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}",
-            "--add-data",
-            f"{core_framework_lock}{os.pathsep}{CORE_WHEEL_ARCHIVE_ROOT.as_posix()}",
-            "--add-data",
             f"{static_root}{os.pathsep}desktop/packaging/web",
             "--add-data",
             (
@@ -2565,27 +2576,6 @@ def build_sidecar(
             "uvicorn.protocols.websockets.auto",
             str(entrypoint),
         ]
-        if managed_runtime_archive is not None:
-            command[-1:-1] = [
-                "--add-data",
-                (
-                    f"{managed_runtime_archive}{os.pathsep}"
-                    f"{MANAGED_RUNTIME_ARCHIVE_ROOT.as_posix()}"
-                ),
-            ]
-        if daemon_bundle_source is not None and daemon_manifest_source is not None:
-            command[-1:-1] = [
-                "--add-data",
-                (
-                    f"{daemon_bundle_source.path}{os.pathsep}"
-                    f"{DAEMON_ARCHIVE_ROOT.as_posix()}"
-                ),
-                "--add-data",
-                (
-                    f"{daemon_manifest_source.path}{os.pathsep}"
-                    f"{DAEMON_ARCHIVE_ROOT.as_posix()}"
-                ),
-            ]
         pyinstaller_env = os.environ.copy()
         pyinstaller_env["PYTHONPATH"] = os.pathsep.join(
             filter(
@@ -2607,22 +2597,8 @@ def build_sidecar(
         if not built.is_file():
             raise RuntimeError(f"PyInstaller did not produce expected sidecar: {built}")
         _validate_fd_bound_bootloader(built)
-        _validate_embedded_core_wheel(built, core_release_wheel)
-        _validate_embedded_core_framework_lock(
-            built,
-            core_release_wheel,
-            core_release_lock,
-            version=core_version,
-        )
+        _validate_sidecar_excludes_remote_release_assets(built)
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
-        if managed_runtime_archive is not None:
-            _validate_embedded_managed_runtime_archive(built, managed_runtime_archive)
-        if daemon_bundle_source is not None and daemon_manifest_source is not None:
-            _validate_embedded_daemon_release_inputs(
-                built,
-                daemon_bundle_source,
-                daemon_manifest_source,
-            )
         if provided_core_wheel is not None and provided_core_lock is not None:
             _verify_core_release_input(provided_core_wheel)
             _verify_core_release_input(provided_core_lock)
@@ -2648,7 +2624,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--core-wheel-output-dir",
         type=Path,
-        help="Preserve the exact embedded Core wheel and framework lock in this output directory.",
+        help="Preserve the exact verified Core wheel and framework lock in this output directory.",
     )
     parser.add_argument(
         "--core-wheel",
@@ -2665,30 +2641,30 @@ def main(argv: list[str] | None = None) -> int:
         "--managed-runtime-archive",
         type=Path,
         help=(
-            "Embed the exact managed subscription Science runtime archive. "
-            "Dev/debug builds may omit it."
+            "Verify the exact managed subscription Science runtime archive for the "
+            "separate Desktop release-asset tree. Dev/debug builds may omit it."
         ),
     )
     parser.add_argument(
         "--daemon-bundle",
         type=Path,
         help=(
-            "Embed the verified Linux x86_64 Daemon binary at "
-            f"{DAEMON_ARCHIVE_ROOT.as_posix()}/. Dev/debug builds may omit it."
+            "Verify the Linux x86_64 Daemon binary for the separate Desktop "
+            "release-asset tree. Dev/debug builds may omit it."
         ),
     )
     parser.add_argument(
         "--daemon-manifest",
         type=Path,
         help=(
-            "Embed the canonical Daemon release manifest at "
-            f"{DAEMON_ARCHIVE_ROOT.as_posix()}/. Dev/debug builds may omit it."
+            "Verify the canonical Daemon release manifest for the separate Desktop "
+            "release-asset tree. Dev/debug builds may omit it."
         ),
     )
     parser.add_argument(
         "--release-build",
         action="store_true",
-        help="Fail closed unless the managed subscription Science runtime is embedded.",
+        help="Fail closed unless all remote release assets are supplied and verified.",
     )
     args = parser.parse_args(argv)
     target = build_sidecar(

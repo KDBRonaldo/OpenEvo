@@ -3816,6 +3816,7 @@ def _write_fake_sidecar(path: Path) -> None:
                 "parser = argparse.ArgumentParser()",
                 "parser.add_argument('--host', default='127.0.0.1')",
                 "parser.add_argument('--desktop-config-root')",
+                "parser.add_argument('--release-assets-root', required=True)",
                 "parser.add_argument('--listener-fd', type=int, required=True)",
                 "parser.add_argument('--native-instance-stdin', action='store_true', required=True)",
                 "args = parser.parse_args()",

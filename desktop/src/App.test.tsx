@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DesktopApiError } from "./api/v1/client";
 import { AppShell, ReleaseDesktopProductShell } from "./App";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./product/fixtureProvider";
 
@@ -151,6 +152,41 @@ describe("ReleaseDesktopProductShell", () => {
     expect(reportReady).toHaveBeenCalledTimes(1);
   });
 
+  it("restarts the sidecar after the first authoritative snapshot fails", async () => {
+    const failedProvider = createFixtureDesktopProductProvider({ startOnline: true });
+    failedProvider.failNextRefresh();
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const factory = vi.fn()
+      .mockResolvedValueOnce(failedProvider)
+      .mockResolvedValueOnce(provider);
+    const stop = vi.fn(async () => {});
+    const reportStage = vi.fn();
+
+    root = await renderReleaseShell(factory, stop, vi.fn(async () => {}), reportStage);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[data-testid="release-startup-sample"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
+    expect(reportStage).toHaveBeenCalledWith("initial_snapshot_failed");
+
+    await act(async () => {
+      button("Add remote workspace").click();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(stop.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("Server connection");
+    failedProvider.dispose();
+  });
+
   it("restarts native bootstrap after a failed release startup", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const lifecycle: string[] = [];
@@ -196,6 +232,88 @@ describe("ReleaseDesktopProductShell", () => {
     const firstStart = lifecycle.indexOf("start-1");
     const secondStart = lifecycle.indexOf("start-2");
     expect(lifecycle.slice(firstStart + 1, secondStart)).toContain("stop");
+  });
+
+  it("shows renderer-owned text for a typed startup failure and keeps remote workspace intent", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const retry = deferred<FixtureDesktopProductProvider>();
+    const factory = vi.fn()
+      .mockRejectedValueOnce(startupApiError(
+        "The local Desktop service rejected the startup request.",
+        "Retry after checking the local connection.",
+      ))
+      .mockReturnValueOnce(retry.promise);
+
+    root = await renderReleaseShell(factory, vi.fn(async () => {}), vi.fn(async () => {}));
+
+    expect(document.body.textContent).toContain("The local OpenEvo Desktop service reported a startup error.");
+    expect(document.body.textContent).not.toContain("The local Desktop service rejected the startup request.");
+    expect(document.body.textContent).not.toContain("Retry after checking the local connection.");
+
+    await act(async () => {
+      button("Add remote workspace").click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(factory).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Retrying OpenEvo Desktop");
+    expect(document.body.textContent).toContain("Your remote workspace will open when OpenEvo Desktop is ready.");
+    expect(button("Retrying").disabled).toBe(true);
+    button("Retrying").click();
+    expect(factory).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      retry.resolve(provider!);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(document.body.textContent).toContain("Server connection");
+  });
+
+  it("acknowledges a remote workspace request while startup is still loading", async () => {
+    const pending = deferred<FixtureDesktopProductProvider>();
+    root = await renderReleaseShell(() => pending.promise, vi.fn(async () => {}), vi.fn(async () => {}));
+
+    await act(async () => {
+      button("Add remote workspace").click();
+    });
+
+    expect(document.body.textContent).toContain("Starting OpenEvo Desktop");
+    expect(document.body.textContent).toContain("Your remote workspace will open when OpenEvo Desktop is ready.");
+  });
+
+  it("shows only closed native startup diagnostics", async () => {
+    const nativeFailure = {
+      code: "sidecar_exited_during_startup",
+      message: "OpenEvo Desktop could not start. Startup diagnostic: python_launcher/provider_store_failed.",
+    };
+    root = await renderReleaseShell(
+      vi.fn(async () => { throw nativeFailure; }),
+      vi.fn(async () => {}),
+      vi.fn(async () => {}),
+    );
+
+    expect(document.body.textContent).toContain(nativeFailure.message);
+
+    await act(async () => {
+      root?.unmount();
+      root = null;
+    });
+    root = await renderReleaseShell(
+      vi.fn(async () => {
+        throw { ...nativeFailure, debug_path: "/Users/alice/private" };
+      }),
+      vi.fn(async () => {}),
+      vi.fn(async () => {}),
+    );
+
+    expect(document.body.textContent).not.toContain("/Users/alice/private");
+    expect(document.body.textContent).not.toContain(nativeFailure.message);
+    expect(document.body.textContent).toContain("The local OpenEvo Desktop service could not be started.");
   });
 
   it("keeps the startup fallback renderer-owned and mutation-closed", async () => {
@@ -380,6 +498,28 @@ describe("ReleaseDesktopProductShell", () => {
     expect(document.body.textContent).not.toContain("native renderer contract mismatch");
   });
 
+  it("shows a typed readiness failure after the product shell commits", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    const reportReady = vi.fn(async () => {
+      throw startupApiError(
+        "OpenEvo Desktop could not confirm the local startup state.",
+        "Retry after the local service is available.",
+      );
+    });
+
+    root = await renderReleaseShell(
+      vi.fn(async () => provider!),
+      vi.fn(async () => {}),
+      reportReady,
+    );
+
+    expect(reportReady).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("The local OpenEvo Desktop service reported a startup error.");
+    expect(document.body.textContent).not.toContain("OpenEvo Desktop could not confirm the local startup state.");
+    expect(document.body.textContent).not.toContain("Retry after the local service is available.");
+    expect(button("Retry").disabled).toBe(false);
+  });
+
   it("keeps bootstrap diagnostics outside product readiness authority", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const factory = vi.fn(async () => provider!);
@@ -463,4 +603,21 @@ function deferred<T>(): {
     resolve = done;
   });
   return { promise, resolve };
+}
+
+function startupApiError(message: string, nextAction: string): DesktopApiError {
+  return new DesktopApiError({
+    schema_version: "1",
+    request_id: "desktop-startup-request",
+    code: "desktop_startup_failed",
+    http_status: 503,
+    message,
+    severity: "blocking",
+    category: "service",
+    retryable: true,
+    repair_action: "openevo_can_retry",
+    next_action: nextAction,
+    details: { field_issues: [], conflicts: [] },
+    logs_ref: null,
+  });
 }

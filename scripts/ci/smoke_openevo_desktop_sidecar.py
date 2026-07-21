@@ -369,6 +369,8 @@ def _launch_native_sidecar(
         "--listener-fd",
         str(NATIVE_LISTENER_FD),
         "--native-instance-stdin",
+        "--release-assets-root",
+        str((config_root.parent / "openevo-release-assets").absolute()),
         "--desktop-config-root",
         str(config_root),
     ]

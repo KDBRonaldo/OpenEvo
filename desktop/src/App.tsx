@@ -11,6 +11,11 @@ import {
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
+import {
+  ContractVersionUnsupportedError,
+  DesktopApiError,
+  DesktopContractError,
+} from "./api/v1/client";
 import { Dashboard } from "./routes/Dashboard";
 import { TasksList } from "./routes/TasksList";
 import { TaskDetail } from "./routes/TaskDetail";
@@ -160,7 +165,7 @@ export function OpenEvoDesktopOnlyShell({
   onConnectionSettingsOpened,
 }: {
   provider?: DesktopProductProvider;
-  onInitialSnapshotFailed?: () => void;
+  onInitialSnapshotFailed?: (error: unknown) => void;
   onReady?: () => void;
   openConnectionSettings?: boolean;
   onConnectionSettingsOpened?: () => void;
@@ -188,14 +193,70 @@ export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly
 }
 
 type ReleaseDesktopStartupState =
-  | { readonly status: "loading" }
+  | { readonly status: "loading"; readonly retrying: boolean }
   | {
       readonly status: "committing";
       readonly provider: DesktopProductProvider;
       readonly generation: number;
     }
   | { readonly status: "ready"; readonly provider: DesktopProductProvider }
-  | { readonly status: "failed"; readonly stage: "bootstrap" | "readiness" };
+  | {
+      readonly status: "failed";
+      readonly stage: "bootstrap" | "readiness";
+      readonly failure: ReleaseDesktopStartupFailure;
+    };
+
+type ReleaseDesktopStartupFailure = {
+  readonly message: string;
+  readonly nextAction: string | null;
+};
+
+function safeNativeHostFailure(error: unknown): ReleaseDesktopStartupFailure | null {
+  if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
+  const record = error as Record<string, unknown>;
+  if (
+    Object.keys(record).some((key) => key !== "code" && key !== "message")
+    || typeof record.code !== "string"
+    || !/^[a-z][a-z0-9_]{2,63}$/.test(record.code)
+    || typeof record.message !== "string"
+    || record.message.length < 1
+    || record.message.length > 768
+    || /[^\x20-\x7e]/.test(record.message)
+  ) {
+    return null;
+  }
+  return {
+    message: record.message,
+    nextAction: record.code.includes("missing")
+      || record.code.includes("packaged_")
+      || record.code.includes("bundled_")
+      ? "Reinstall OpenEvo Desktop, then try again."
+      : "Retry startup. If the problem continues, restart OpenEvo Desktop.",
+  };
+}
+
+function safeStartupFailure(error: unknown): ReleaseDesktopStartupFailure {
+  if (error instanceof DesktopApiError) {
+    return {
+      message: "The local OpenEvo Desktop service reported a startup error.",
+      nextAction: error.apiError.retryable
+        ? "Retry startup. If the problem continues, restart OpenEvo Desktop."
+        : "Restart OpenEvo Desktop. If the problem continues, install the latest version.",
+    };
+  }
+  if (error instanceof DesktopContractError || error instanceof ContractVersionUnsupportedError) {
+    return {
+      message: error.message,
+      nextAction: "Retry startup. If the problem continues, update OpenEvo Desktop.",
+    };
+  }
+  const nativeFailure = safeNativeHostFailure(error);
+  if (nativeFailure !== null) return nativeFailure;
+  return {
+    message: "The local OpenEvo Desktop service could not be started.",
+    nextAction: "Retry startup. If the problem continues, restart OpenEvo Desktop.",
+  };
+}
 
 type ReadonlySampleWorkspace = "research" | "evolution" | "system";
 
@@ -203,10 +264,16 @@ function ReleaseStartupSample({
   onRetry,
   onAddRemoteWorkspace,
   startupPending = false,
+  retrying = false,
+  failure = null,
+  connectionRequested = false,
 }: {
   onRetry: () => void;
   onAddRemoteWorkspace: () => void;
   startupPending?: boolean;
+  retrying?: boolean;
+  failure?: ReleaseDesktopStartupFailure | null;
+  connectionRequested?: boolean;
 }) {
   const [workspace, setWorkspace] = useState<ReadonlySampleWorkspace>("research");
   const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
@@ -319,15 +386,28 @@ function ReleaseStartupSample({
           </button>
         </header>
         <main className="product-main">
-          <div className="initial-sync-notice" role="alert">
+          <div
+            className="initial-sync-notice"
+            role={startupPending ? "status" : "alert"}
+            aria-live={startupPending ? "polite" : undefined}
+          >
             <AlertCircle size={18} />
             <div>
-              <strong>{startupPending ? "Starting OpenEvo Desktop" : "OpenEvo Desktop could not start"}</strong>
+              <strong>
+                {startupPending
+                  ? retrying ? "Retrying OpenEvo Desktop" : "Starting OpenEvo Desktop"
+                  : "OpenEvo Desktop could not start"}
+              </strong>
+              {failure ? <span>{failure.message}</span> : null}
+              {failure?.nextAction ? <span>{failure.nextAction}</span> : null}
+              {connectionRequested ? (
+                <span>Your remote workspace will open when OpenEvo Desktop is ready.</span>
+              ) : null}
             </div>
             {startupPending ? (
-              <span className="product-loading-row" role="status" aria-live="polite">
-                <LoaderCircle className="spin" size={16} /> Starting
-              </span>
+              <button type="button" className="secondary-button" disabled>
+                <LoaderCircle className="spin" size={15} /> {retrying ? "Retrying" : "Starting"}
+              </button>
             ) : (
               <button type="button" className="secondary-button" onClick={onRetry}>
                 <RefreshCw size={15} /> Retry
@@ -361,7 +441,8 @@ export function ReleaseDesktopProductShell({
   const generation = useRef(0);
   const readinessGeneration = useRef<number | null>(null);
   const lifecycle = useRef<Promise<void>>(Promise.resolve());
-  const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading" });
+  const startupInFlight = useRef(false);
+  const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading", retrying: false });
   const [connectionRequested, setConnectionRequested] = useState(false);
 
   const reportStageBestEffort = useCallback((stage: ReleaseDesktopBootstrapStage): void => {
@@ -385,10 +466,12 @@ export function ReleaseDesktopProductShell({
     lifecycle.current = Promise.all([lifecycle.current.catch(() => {}), cancellation]).then(() => {});
   }, [stopProvider]);
 
-  const start = useCallback(() => {
+  const start = useCallback((retrying = false) => {
+    if (startupInFlight.current) return;
+    startupInFlight.current = true;
     const requestGeneration = generation.current + 1;
     generation.current = requestGeneration;
-    setStartup({ status: "loading" });
+    setStartup({ status: "loading", retrying });
     void enqueueLifecycle(async () => {
       try {
         // Revoke the previous native session before requesting another
@@ -408,15 +491,21 @@ export function ReleaseDesktopProductShell({
           return;
         }
         setStartup({ status: "committing", provider, generation: requestGeneration });
-      } catch {
+      } catch (error) {
         try {
           await stopProvider();
         } catch {
           // Native cleanup is bounded; startup remains explicitly retryable.
         }
         if (generation.current === requestGeneration) {
-          setStartup({ status: "failed", stage: "bootstrap" });
+          setStartup({
+            status: "failed",
+            stage: "bootstrap",
+            failure: safeStartupFailure(error),
+          });
         }
+      } finally {
+        if (generation.current === requestGeneration) startupInFlight.current = false;
       }
     });
   }, [createProvider, enqueueLifecycle, reportStageBestEffort, stopProvider]);
@@ -438,22 +527,48 @@ export function ReleaseDesktopProductShell({
         if (generation.current === committingGeneration) {
           setStartup({ status: "ready", provider });
         }
-      } catch {
+      } catch (error) {
         try {
           await stopProvider();
         } catch {
           // Native cleanup is bounded; startup remains explicitly retryable.
         }
         if (generation.current === committingGeneration) {
-          setStartup({ status: "failed", stage: "readiness" });
+          setStartup({
+            status: "failed",
+            stage: "readiness",
+            failure: safeStartupFailure(error),
+          });
         }
       }
     });
   }, [enqueueLifecycle, reportReady, reportStageBestEffort, stopProvider]);
 
+  const reportInitialSnapshotFailed = useCallback((
+    committingGeneration: number,
+    error: unknown,
+  ) => {
+    if (generation.current !== committingGeneration) return;
+    generation.current += 1;
+    startupInFlight.current = false;
+    reportStageBestEffort("initial_snapshot_failed");
+    setStartup({
+      status: "failed",
+      stage: "readiness",
+      failure: safeStartupFailure(error),
+    });
+    void enqueueLifecycle(async () => {
+      try {
+        await stopProvider();
+      } catch {
+        // Retry performs another bounded cleanup before creating a provider.
+      }
+    });
+  }, [enqueueLifecycle, reportStageBestEffort, stopProvider]);
+
   const requestRemoteWorkspace = useCallback(() => {
     setConnectionRequested(true);
-    if (startup.status === "failed") start();
+    if (startup.status === "failed") start(true);
   }, [start, startup.status]);
 
   const connectionSettingsOpened = useCallback(() => {
@@ -464,6 +579,7 @@ export function ReleaseDesktopProductShell({
     start();
     return () => {
       generation.current += 1;
+      startupInFlight.current = false;
       cancelLifecycle();
     };
   }, [cancelLifecycle, start]);
@@ -472,7 +588,10 @@ export function ReleaseDesktopProductShell({
     return (
       <OpenEvoDesktopOnlyShell
         provider={startup.provider}
-        onInitialSnapshotFailed={() => reportStageBestEffort("initial_snapshot_failed")}
+        onInitialSnapshotFailed={(error) => reportInitialSnapshotFailed(
+          startup.generation,
+          error,
+        )}
         onReady={() => reportCommittedProduct(startup.generation, startup.provider)}
         openConnectionSettings={connectionRequested}
         onConnectionSettingsOpened={connectionSettingsOpened}
@@ -491,8 +610,10 @@ export function ReleaseDesktopProductShell({
   if (startup.status === "failed") {
     return (
       <ReleaseStartupSample
-        onRetry={start}
+        onRetry={() => start(true)}
         onAddRemoteWorkspace={requestRemoteWorkspace}
+        failure={startup.failure}
+        connectionRequested={connectionRequested}
       />
     );
   }
@@ -501,6 +622,8 @@ export function ReleaseDesktopProductShell({
       onRetry={start}
       onAddRemoteWorkspace={requestRemoteWorkspace}
       startupPending
+      retrying={startup.retrying}
+      connectionRequested={connectionRequested}
     />
   );
 }

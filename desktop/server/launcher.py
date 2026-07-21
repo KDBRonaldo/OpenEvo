@@ -30,7 +30,6 @@ from desktop.sidecar.native_workspace import (
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import NATIVE_SIDECAR_PROTOCOL
-from desktop.sidecar.release_runtime import bundled_core_asset_root
 from desktop.sidecar.workspace_identity import (
     native_import_id_for_action,
     ownership_for_native_import,
@@ -318,6 +317,7 @@ def create_app(
     source_commit: str,
     build_channel: Literal["release", "development", "test"],
     core_assets_root: Path | str | None = None,
+    release_assets_root: Path | str | None = None,
 ) -> FastAPI:
     _validate_source_commit(source_commit, build_channel=build_channel)
     owned_apps: list[FastAPI] = []
@@ -329,6 +329,7 @@ def create_app(
             source_commit=source_commit,
             build_channel=build_channel,
             core_assets_root=core_assets_root,
+            release_assets_root=release_assets_root,
             owned_apps=owned_apps,
         )
     except PackagedLauncherStartupError:
@@ -357,6 +358,7 @@ def _create_app(
     source_commit: str,
     build_channel: Literal["release", "development", "test"],
     core_assets_root: Path | str | None = None,
+    release_assets_root: Path | str | None = None,
     owned_apps: list[FastAPI],
 ) -> FastAPI:
     startup_phase = "bundled_core_assets"
@@ -373,8 +375,10 @@ def _create_app(
         else DEFAULT_DESKTOP_CONFIG_ROOT.expanduser()
     )
     try:
-        if build_channel == "release" and core_assets_root is None:
-            core_assets_root = bundled_core_asset_root()
+        if build_channel == "release" and release_assets_root is None and core_assets_root is None:
+            raise ValueError("release assets root must be provided by the native host")
+        if release_assets_root is not None and not Path(release_assets_root).is_absolute():
+            raise ValueError("release assets root must be an absolute native-owned path")
         app = create_release_desktop_local_api_app(
             state_root=config_root / LOCAL_API_STATE_DIRECTORY,
             session_token=native_frame.session_token,
@@ -383,6 +387,7 @@ def _create_app(
             source_commit=source_commit,
             build_channel=build_channel,
             core_assets_root=core_assets_root,
+            release_assets_root=release_assets_root,
             startup_phase=record_startup_phase if build_channel == "release" else None,
             close_on_shutdown=build_channel != "release",
         )
@@ -710,6 +715,7 @@ def main(
     )
     parser.add_argument("--listener-fd", type=int, required=True)
     parser.add_argument("--native-instance-stdin", action="store_true", required=True)
+    parser.add_argument("--release-assets-root", type=Path, default=None)
     if packaged_source_commit is None:
         parser.add_argument("--source-commit", required=True)
         parser.add_argument(
@@ -747,6 +753,7 @@ def main(
         native_frame=native_frame,
         source_commit=source_commit,
         build_channel=build_channel,
+        release_assets_root=args.release_assets_root,
     )
     listener: socket.socket | None = None
     try:

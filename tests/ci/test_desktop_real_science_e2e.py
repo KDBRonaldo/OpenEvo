@@ -153,8 +153,7 @@ def test_renderer_expectations_bind_successful_sessions_and_latest_artifacts() -
         target_id: f"method_{target_id}" for target_id in module.REQUIRED_TARGET_IDS
     }
     workflow._allowed_concrete_method_ids = {
-        target_id: frozenset({f"method_{target_id}"})
-        for target_id in module.REQUIRED_TARGET_IDS
+        target_id: frozenset({f"method_{target_id}"}) for target_id in module.REQUIRED_TARGET_IDS
     }
     first_revision = _revision("revision-1", 1)
     successor = _revision("revision-3", 3)
@@ -212,20 +211,14 @@ def test_renderer_expectations_bind_successful_sessions_and_latest_artifacts() -
     assert expectations["method_ids"] == workflow._method_ids
     assert expectations["project_head_generation"] == 3
     assert [item["run_id"] for item in expectations["sessions"]] == ["run-1", "run-2"]
-    assert {
-        item["artifact_id"] for item in expectations["artifacts"]
-    } == {
+    assert {item["artifact_id"] for item in expectations["artifacts"]} == {
         f"artifact-{target_id}-latest" for target_id in module.REQUIRED_TARGET_IDS
     }
-    assert {
-        item["target_id"] for item in expectations["artifacts"]
-    } == set(module.REQUIRED_TARGET_IDS)
-    assert {item["artifact_content_sha256"] for item in expectations["artifacts"]} == {
-        "b" * 64
-    }
-    assert {item["runtime_document_sha256"] for item in expectations["artifacts"]} == {
-        "d" * 64
-    }
+    assert {item["target_id"] for item in expectations["artifacts"]} == set(
+        module.REQUIRED_TARGET_IDS
+    )
+    assert {item["artifact_content_sha256"] for item in expectations["artifacts"]} == {"b" * 64}
+    assert {item["runtime_document_sha256"] for item in expectations["artifacts"]} == {"d" * 64}
 
 
 def test_renderer_result_validation_binds_live_observations() -> None:
@@ -314,13 +307,16 @@ def test_renderer_result_validation_binds_live_observations() -> None:
         "screenshot_sha256": "b" * 64,
     }
 
-    assert module._validate_renderer_result(
-        payload,
-        expectations=expectations,
-        source_commit="f" * 40,
-        packaged_web_build_digest=digest,
-        screenshot_sha256="b" * 64,
-    ) == payload
+    assert (
+        module._validate_renderer_result(
+            payload,
+            expectations=expectations,
+            source_commit="f" * 40,
+            packaged_web_build_digest=digest,
+            screenshot_sha256="b" * 64,
+        )
+        == payload
+    )
 
     payload["renderer_ready"] = False
     with pytest.raises(module.E2EFailure, match="renderer_result_identity_mismatch"):
@@ -601,9 +597,7 @@ def test_renderer_candidate_binding_pins_release_and_packaged_web_bytes(
     ).encode()
     root_manifest = packaged_root / ".openevo-product-web.json"
     root_manifest.write_bytes(packaged_manifest_payload)
-    packaged_manifest = write_bytes(
-        "packaged-web-manifest.json", packaged_manifest_payload
-    )
+    packaged_manifest = write_bytes("packaged-web-manifest.json", packaged_manifest_payload)
     packaged_manifest_sha256 = hashlib.sha256(packaged_manifest_payload).hexdigest()
     source_commit = "b" * 40
     playwright_payload = json.dumps(
@@ -624,9 +618,7 @@ def test_renderer_candidate_binding_pins_release_and_packaged_web_bytes(
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
-    playwright_evidence = write_bytes(
-        "playwright-candidate-evidence.json", playwright_payload
-    )
+    playwright_evidence = write_bytes("playwright-candidate-evidence.json", playwright_payload)
     dmg = write_bytes("OpenEvo-Desktop-0.1.4-aarch64.dmg", b"dmg")
     app_smoke_payload = json.dumps(
         {
@@ -699,15 +691,12 @@ def test_renderer_candidate_binding_pins_release_and_packaged_web_bytes(
         assert binding.version == "0.1.4"
         assert binding.build_digest == build_digest
         assert binding.evidence["desktop_dmg_sha256"] == hashlib.sha256(b"dmg").hexdigest()
-        assert binding.evidence["candidate_packaged_sidecar_sha256"] == hashlib.sha256(
-            b"candidate-sidecar"
-        ).hexdigest()
-        assert binding.evidence["science_sidecar_sha256"] == hashlib.sha256(
-            b"sidecar"
-        ).hexdigest()
-        module._audit_evidence(
-            {"renderer_candidate_binding": binding.evidence}, private_values=()
+        assert (
+            binding.evidence["candidate_packaged_sidecar_sha256"]
+            == hashlib.sha256(b"candidate-sidecar").hexdigest()
         )
+        assert binding.evidence["science_sidecar_sha256"] == hashlib.sha256(b"sidecar").hexdigest()
+        module._audit_evidence({"renderer_candidate_binding": binding.evidence}, private_values=())
     finally:
         binding.close()
         assets.close()
@@ -864,10 +853,16 @@ def test_sidecar_launch_does_not_inherit_release_proxy(
 
     class FakeAssets:
         sidecar = tmp_path / "source-sidecar"
+        release_assets_root = tmp_path / "openevo-release-assets"
 
         @staticmethod
         def authority(_path: Path) -> FakeAuthority:
             return FakeAuthority()
+
+        @classmethod
+        def external_release_assets_root(cls) -> Path:
+            cls.release_assets_root.mkdir(mode=0o700)
+            return cls.release_assets_root
 
     class FakeProcess:
         pid = 4321
@@ -876,8 +871,9 @@ def test_sidecar_launch_does_not_inherit_release_proxy(
         def __init__(self) -> None:
             self.stdin = BytesIO()
 
-    def fake_popen(_command: list[str], **kwargs: object) -> FakeProcess:
+    def fake_popen(command: list[str], **kwargs: object) -> FakeProcess:
         captured["environment"] = kwargs["env"]
+        captured["command"] = command
         return FakeProcess()
 
     monkeypatch.setattr(module, "_fixed_descriptors", lambda *_args: nullcontext())
@@ -890,6 +886,11 @@ def test_sidecar_launch_does_not_inherit_release_proxy(
         environment = captured["environment"]
         assert isinstance(environment, dict)
         assert all(name not in environment for name in proxy_values)
+        command = captured["command"]
+        assert isinstance(command, list)
+        assert command[command.index("--release-assets-root") + 1] == str(
+            (tmp_path / "openevo-release-assets").absolute()
+        )
     finally:
         native.process_log.close()
 
@@ -913,9 +914,7 @@ def test_renderer_launch_does_not_inherit_release_proxy(
     packaged_web_root.mkdir()
     build_digest = "b" * 64
     (packaged_web_root / ".openevo-product-web.json").write_text(
-        json.dumps(
-            {"schema_version": "1", "build_digest": build_digest, "files": []}
-        ),
+        json.dumps({"schema_version": "1", "build_digest": build_digest, "files": []}),
         encoding="utf-8",
     )
     source_commit = "a" * 40
@@ -978,7 +977,7 @@ def test_renderer_timeout_reserves_process_exit_grace(
     assert module._renderer_process_timeout_seconds(requested_seconds) == process_seconds
 
 
-def test_external_assets_bind_exact_embedded_managed_runtime(
+def test_external_assets_stage_exact_release_tree_and_exclude_embedded_assets(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -997,80 +996,90 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
     daemon_bundle.write_bytes(b"exact-daemon")
     daemon_bundle.chmod(0o700)
     daemon_manifest.write_bytes(b"exact-manifest")
-    runtime_digest = hashlib.sha256(runtime_archive.read_bytes()).hexdigest()
+    source_commit = "a" * 40
+    registry_digest = "b" * 64
+    daemon_manifest.write_text(
+        json.dumps(
+            {
+                "artifact": {},
+                "core": {"registry_digest": registry_digest},
+                "release": {"source_commit": source_commit},
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="utf-8",
+    )
     calls: list[tuple[object, ...]] = []
 
     class FakeBuilder:
-        class Source:
-            def __init__(self, path: Path) -> None:
-                self.name = path.name
-                self.path = path
-                self.byte_size = path.stat().st_size
-                self.sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
-
-            def close(self) -> None:
-                calls.append(("close", self.path))
-
-        @staticmethod
-        def _validate_managed_runtime_archive(archive: Path) -> tuple[int, str]:
-            calls.append(("runtime", archive))
-            return archive.stat().st_size, runtime_digest
-
         @staticmethod
         def _validate_fd_bound_bootloader(executable: Path) -> None:
             calls.append(("bootloader", executable))
 
         @staticmethod
-        def _validate_embedded_core_wheel(executable: Path, core_wheel: Path) -> None:
-            calls.append(("wheel", executable, core_wheel))
+        def _validate_sidecar_excludes_remote_release_assets(executable: Path) -> None:
+            calls.append(("slim_sidecar", executable))
 
+    class FakeStager:
         @staticmethod
-        def _validate_embedded_core_framework_lock(
-            executable: Path,
-            core_wheel: Path,
-            framework_lock: Path,
-            *,
-            version: str,
-        ) -> None:
-            calls.append(("lock", executable, core_wheel, framework_lock, version))
-
-        @staticmethod
-        def _validate_embedded_managed_runtime_archive(
-            executable: Path,
-            archive: Path,
-        ) -> None:
-            calls.append(("embedded_runtime", executable, archive))
-
-        @classmethod
-        def _open_daemon_release_input_pair(
-            cls,
-            bundle: Path,
-            manifest: Path,
-            *,
-            repo: Path,
-        ):
-            calls.append(("daemon_pair", bundle, manifest, repo))
-            return cls.Source(bundle), cls.Source(manifest), {"core": {}}
-
-        @staticmethod
-        def _validate_daemon_manifest_core(
-            manifest: dict[str, object],
-            *,
-            wheel: Path,
-            framework_lock: Path,
-            version: str,
-        ) -> None:
-            calls.append(("daemon_core", manifest, wheel, framework_lock, version))
-
-        @staticmethod
-        def _validate_embedded_daemon_release_inputs(
-            executable: Path,
-            bundle: object,
-            manifest: object,
-        ) -> None:
-            calls.append(("embedded_daemon", executable, bundle, manifest))
+        def stage_release_assets(**kwargs: object) -> None:
+            calls.append(("stage", kwargs))
+            output = kwargs["output_dir"]
+            assert isinstance(output, Path)
+            wheel_input = kwargs["wheel"]
+            lock_input = kwargs["framework_lock"]
+            runtime_input = kwargs["managed_runtime_archive"]
+            bundle_input = kwargs["bundle"]
+            manifest_input = kwargs["manifest"]
+            assert all(
+                isinstance(item, Path)
+                for item in (
+                    wheel_input,
+                    lock_input,
+                    runtime_input,
+                    bundle_input,
+                    manifest_input,
+                )
+            )
+            output.mkdir(mode=0o700)
+            for directory in ("core", "daemon", "runtime"):
+                (output / directory).mkdir()
+            staged = {
+                f"core/{lock_input.name}": (lock_input, 0o644),
+                f"core/{wheel_input.name}": (wheel_input, 0o644),
+                f"daemon/{manifest_input.name}": (manifest_input, 0o644),
+                f"daemon/{bundle_input.name}": (bundle_input, 0o755),
+                f"runtime/{runtime_input.name}": (runtime_input, 0o644),
+            }
+            entries: list[dict[str, object]] = []
+            for relative_path, (source, mode) in sorted(staged.items()):
+                destination = output / relative_path
+                destination.write_bytes(source.read_bytes())
+                destination.chmod(mode)
+                entries.append(
+                    {
+                        "relative_path": relative_path,
+                        "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                        "byte_size": source.stat().st_size,
+                    }
+                )
+            (output / "release-assets.json").write_text(
+                json.dumps(
+                    {
+                        "files": entries,
+                        "schema_version": 1,
+                        "source_commit": kwargs["source_commit"],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
     monkeypatch.setattr(module, "_load_sidecar_builder", lambda: FakeBuilder())
+    monkeypatch.setattr(module, "_load_release_assets_stager", lambda: FakeStager())
 
     assets = module._inspect_release_assets(
         sidecar,
@@ -1083,20 +1092,25 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
     )
 
     validated_root = tmp_path / "validated-assets"
-    validated_sidecar = validated_root / sidecar.name
-    validated_runtime = validated_root / runtime_archive.name
-    assert ("runtime", validated_runtime) in calls
-    assert ("embedded_runtime", validated_sidecar, validated_runtime) in calls
-    assert any(call[0] == "embedded_daemon" for call in calls)
-    assert assets.sidecar == validated_sidecar
-    assert assets.wheel == validated_root / wheel.name
+    release_assets_root = validated_root / "external-assets" / "openevo-release-assets"
+    assert ("slim_sidecar", validated_root / "sidecar" / sidecar.name) in calls
+    stage_kwargs = next(call[1] for call in calls if call[0] == "stage")
+    assert stage_kwargs["source_commit"] == source_commit
+    assert stage_kwargs["registry_digest"] == registry_digest
+    assert assets.sidecar == validated_root / "sidecar" / sidecar.name
+    assert assets.wheel == release_assets_root / "core" / wheel.name
+    assert assets.external_release_assets_root() == release_assets_root
+    assert assets.source_commit == source_commit
+    assert assets.registry_digest == registry_digest
     assert stat.S_IMODE(validated_root.stat().st_mode) == 0o700
-    assert all(authority.path.parent == validated_root for authority in assets.authorities)
     assert assets.evidence["managed_runtime_archive"] == {
-        "sha256": runtime_digest,
+        "sha256": hashlib.sha256(runtime_archive.read_bytes()).hexdigest(),
         "byte_size": runtime_archive.stat().st_size,
     }
-    assert assets.evidence["exact_embedded_assets_verified"] is True
+    assert assets.evidence["exact_external_release_assets_verified"] is True
+    assert assets.evidence["slim_sidecar_excludes_remote_release_assets_verified"] is True
+    assert assets.evidence["external_release_assets"]["source_commit"] == source_commit
+    assert assets.evidence["external_release_assets"]["registry_digest"] == registry_digest
     assert (
         assets.evidence["daemon_bundle"]["sha256"]
         == hashlib.sha256(daemon_bundle.read_bytes()).hexdigest()
@@ -1106,6 +1120,120 @@ def test_external_assets_bind_exact_embedded_managed_runtime(
         == hashlib.sha256(daemon_manifest.read_bytes()).hexdigest()
     )
     module._audit_evidence(assets.evidence, private_values=())
+    assets.close()
+
+
+def test_external_release_manifest_rejects_tampering_and_source_commit_mismatch(
+    tmp_path: Path,
+) -> None:
+    module = _load_runner()
+    source_commit = "a" * 40
+    root = tmp_path / "openevo-release-assets"
+    for directory in ("core", "daemon", "runtime"):
+        (root / directory).mkdir(parents=True, exist_ok=True)
+    paths = {
+        "core/framework-lock.json": root / "core/framework-lock.json",
+        "core/openevo-0.1.0-py3-none-any.whl": root / "core/openevo-0.1.0-py3-none-any.whl",
+        "daemon/openevo-daemon-bundle.json": root / "daemon/openevo-daemon-bundle.json",
+        "daemon/openevo-daemon-linux-x86_64": root / "daemon/openevo-daemon-linux-x86_64",
+        "runtime/managed-runtime.tar": root / "runtime/managed-runtime.tar",
+    }
+    for relative_path, path in paths.items():
+        path.write_bytes(relative_path.encode("ascii"))
+        path.chmod(0o700 if path.name == "openevo-daemon-linux-x86_64" else 0o600)
+    authorities = {
+        relative_path: module.HeldReleaseAsset.open(path) for relative_path, path in paths.items()
+    }
+    manifest_path = root / "release-assets.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {
+                        "relative_path": relative_path,
+                        "sha256": authority.sha256,
+                        "byte_size": authority.byte_size,
+                    }
+                    for relative_path, authority in sorted(authorities.items())
+                ],
+                "schema_version": 1,
+                "source_commit": source_commit,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    manifest = module.HeldReleaseAsset.open(manifest_path)
+    try:
+        with pytest.raises(module.E2EFailure, match="external_release_assets_manifest_invalid"):
+            module._validate_external_release_assets_manifest(
+                manifest,
+                source_commit="c" * 40,
+                assets=authorities,
+            )
+        manifest_path.write_text("{}\n", encoding="utf-8")
+        with pytest.raises(module.E2EFailure, match="release_asset_authority_changed"):
+            module._validate_external_release_assets_manifest(
+                manifest,
+                source_commit=source_commit,
+                assets=authorities,
+            )
+    finally:
+        manifest.close()
+        for authority in authorities.values():
+            authority.close()
+
+
+def test_inspection_rejects_sidecar_with_remote_release_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    sidecar = tmp_path / "openevo-desktop-sidecar"
+    wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
+    lock = tmp_path / "framework-lock.json"
+    runtime = tmp_path / "managed-runtime.tar"
+    bundle = tmp_path / "openevo-daemon-linux-x86_64"
+    manifest = tmp_path / "openevo-daemon-bundle.json"
+    sidecar.write_bytes(b"legacy embedded sidecar")
+    sidecar.chmod(0o700)
+    _write_wheel(wheel)
+    _write_lock(lock, wheel)
+    runtime.write_bytes(b"runtime")
+    bundle.write_bytes(b"daemon")
+    bundle.chmod(0o700)
+    manifest.write_text(
+        json.dumps(
+            {
+                "core": {"registry_digest": "b" * 64},
+                "release": {"source_commit": "a" * 40},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class LegacyBuilder:
+        @staticmethod
+        def _validate_fd_bound_bootloader(_sidecar: Path) -> None:
+            return None
+
+        @staticmethod
+        def _validate_sidecar_excludes_remote_release_assets(_sidecar: Path) -> None:
+            raise RuntimeError("legacy embedded remote asset")
+
+    monkeypatch.setattr(module, "_load_sidecar_builder", lambda: LegacyBuilder())
+    with pytest.raises(module.E2EFailure, match="sidecar_remote_release_assets_present"):
+        module._inspect_release_assets(
+            sidecar,
+            wheel,
+            lock,
+            runtime,
+            bundle,
+            manifest,
+            validation_root=tmp_path / "validated-assets",
+        )
 
 
 def test_successor_reuse_requires_the_second_real_session_pin() -> None:
@@ -1312,8 +1440,7 @@ def test_successful_session_requires_typed_transcript_dataset_artifacts() -> Non
     module = _load_runner()
     workflow = _workflow(module)
     workflow._allowed_concrete_method_ids = {
-        target_id: frozenset({f"method-{target_id}"})
-        for target_id in module.REQUIRED_TARGET_IDS
+        target_id: frozenset({f"method-{target_id}"}) for target_id in module.REQUIRED_TARGET_IDS
     }
     predecessor = _revision("revision-0", 0)
     successor = _revision("revision-1", 1)
@@ -1536,9 +1663,7 @@ def test_artifact_content_retries_only_the_transient_publication_error(
     sleeps: list[float] = []
     monkeypatch.setattr(module.time, "sleep", sleeps.append)
 
-    assert workflow._artifact_content("artifact-1", ordinal=2) == {
-        "artifact_id": "artifact-1"
-    }
+    assert workflow._artifact_content("artifact-1", ordinal=2) == {"artifact_id": "artifact-1"}
     assert sleeps == list(module.ARTIFACT_CONTENT_RETRY_DELAYS_SECONDS[:2])
 
 

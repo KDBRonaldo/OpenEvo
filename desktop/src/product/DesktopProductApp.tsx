@@ -183,7 +183,7 @@ type SnapshotRefreshPublication =
 
 export interface DesktopProductAppProps {
   provider?: DesktopProductProvider;
-  onInitialSnapshotFailed?: () => void;
+  onInitialSnapshotFailed?: (error: unknown) => void;
   onReady?: () => void;
   openConnectionSettings?: boolean;
   onConnectionSettingsOpened?: () => void;
@@ -252,11 +252,11 @@ export function DesktopProductApp({
     setPendingRetryPoll((current) => current === pending ? null : current);
   }, []);
 
-  const reportInitialSnapshotFailure = useCallback((): void => {
+  const reportInitialSnapshotFailure = useCallback((error: unknown): void => {
     if (authoritativeSnapshotPublished.current || initialSnapshotFailureReported.current) return;
     initialSnapshotFailureReported.current = true;
     try {
-      onInitialSnapshotFailed?.();
+      onInitialSnapshotFailed?.(error);
     } catch {
       // Bootstrap diagnostics cannot alter the product error state.
     }
@@ -271,7 +271,7 @@ export function DesktopProductApp({
       return;
     }
     if (publication.kind === "rejected") {
-      reportInitialSnapshotFailure();
+      reportInitialSnapshotFailure(publication.error);
       setSnapshot((current) => current ? {
         ...current,
         stream: {
@@ -310,12 +310,15 @@ export function DesktopProductApp({
       });
     }
     if (result.status !== "fresh") {
-      if (result.status === "error") reportInitialSnapshotFailure();
+      const resultError = retryRecoveryReadFailed
+        ? retryRecoveryFailure
+        : result.status === "error"
+          ? result.stream.error
+          : null;
+      if (result.status === "error") reportInitialSnapshotFailure(resultError);
       setSnapshot((current) => current ? { ...current, stream: result.stream } : current);
       if (result.status === "error") {
-        setLoadError(userMessage(
-          retryRecoveryReadFailed ? retryRecoveryFailure : result.stream.error,
-        ));
+        setLoadError(userMessage(resultError));
       }
       return;
     }

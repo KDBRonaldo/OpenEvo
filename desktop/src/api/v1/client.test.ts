@@ -162,6 +162,35 @@ describe("Desktop Local API v1 client", () => {
     expect(new Headers(init?.headers).has(DESKTOP_SESSION_HEADER)).toBe(false);
   });
 
+  it("bounds Local API requests and aborts a stalled fetch", async () => {
+    vi.useFakeTimers();
+    try {
+      let requestSignal: AbortSignal | null = null;
+      const fetchMock = vi.fn<FetchLike>().mockImplementation((_input, init) => {
+        requestSignal = init?.signal ?? null;
+        return new Promise<Response>(() => {});
+      });
+      const client = createDesktopApiClient({
+        fetch: fetchMock,
+        bootstrap: vi.fn().mockResolvedValue(CONTRACT_FIXTURE_V1.bootstrap),
+        requestTimeoutMs: 25,
+        acceptedOpenApiDigests: [CONTRACT_FIXTURE_V1.version.openapi_sha256],
+        allowedProviderKinds: ["contract_simulator"],
+      });
+      const outcome = client.version().catch((error: unknown) => error);
+
+      await vi.advanceTimersByTimeAsync(25);
+
+      expect(await outcome).toMatchObject({
+        name: "DesktopContractError",
+        message: "Desktop Local API request timed out",
+      });
+      expect((requestSignal as AbortSignal | null)?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("throws a typed ApiError for a strict HTTP 426 envelope", async () => {
     const fetchMock = vi
       .fn<FetchLike>()

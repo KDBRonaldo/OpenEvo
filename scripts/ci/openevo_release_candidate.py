@@ -28,7 +28,8 @@ DAEMON_BUNDLE_NAME = "openevo-daemon-linux-x86_64"
 DAEMON_MANIFEST_NAME = "openevo-daemon-bundle.json"
 DAEMON_MOUNTED_EVIDENCE_NAME = "daemon-mounted-resource.json"
 DAEMON_COPY_EVIDENCE_NAME = "daemon-copy-resource.json"
-DAEMON_RESOURCE_ROOT = "Contents/Resources/openevo-daemon"
+RELEASE_ASSETS_RESOURCE_ROOT = "Contents/Resources/openevo-release-assets"
+RELEASE_ASSETS_MANIFEST_NAME = "release-assets.json"
 MINIMUM_MACOS_VERSION = "12.0"
 RUST_TOOLCHAIN_VERSION = "1.95.0"
 TAURI_EXECUTABLE_NAME = "openevo-desktop"
@@ -317,11 +318,7 @@ def _validate_packaged_web_manifest(path: Path) -> dict[str, object]:
     }:
         raise CandidateError("packaged web manifest does not use the closed schema")
     files = manifest.get("files")
-    if (
-        manifest.get("schema_version") != "1"
-        or type(files) is not list
-        or not files
-    ):
+    if manifest.get("schema_version") != "1" or type(files) is not list or not files:
         raise CandidateError("packaged web manifest is invalid")
     normalized_files: list[dict[str, object]] = []
     paths: set[str] = set()
@@ -344,9 +341,7 @@ def _validate_packaged_web_manifest(path: Path) -> dict[str, object]:
             raise CandidateError("packaged web manifest file size is invalid")
         digest = _require_digest(entry.get("sha256"), "packaged web file digest")
         paths.add(relative_path)
-        normalized_files.append(
-            {"path": relative_path, "sha256": digest, "byte_size": byte_size}
-        )
+        normalized_files.append({"path": relative_path, "sha256": digest, "byte_size": byte_size})
     if normalized_files != sorted(normalized_files, key=lambda entry: str(entry["path"])):
         raise CandidateError("packaged web manifest file order is not canonical")
     expected_build_digest = hashlib.sha256(
@@ -423,7 +418,9 @@ def _playwright_test_results(report_path: Path) -> list[dict[str, object]]:
                 or type(tests) is not list
                 or len(tests) != 1
             ):
-                raise CandidateError("Playwright test specification did not pass the closed contract")
+                raise CandidateError(
+                    "Playwright test specification did not pass the closed contract"
+                )
             test = tests[0]
             if type(test) is not dict:
                 raise CandidateError("Playwright test result is invalid")
@@ -469,8 +466,7 @@ def _playwright_test_results(report_path: Path) -> list[dict[str, object]]:
     if not results:
         raise CandidateError("Playwright report contains no test results")
     observed_cases = {
-        (str(entry["project"]), str(entry["file"]), str(entry["title"]))
-        for entry in results
+        (str(entry["project"]), str(entry["file"]), str(entry["title"])) for entry in results
     }
     if observed_cases != PLAYWRIGHT_REQUIRED_CASES:
         raise CandidateError("Playwright report does not cover the exact candidate test matrix")
@@ -595,8 +591,7 @@ def _validate_sanitized_playwright_report(
         ),
     )
     observed_cases = {
-        (str(entry["project"]), str(entry["file"]), str(entry["title"]))
-        for entry in normalized
+        (str(entry["project"]), str(entry["file"]), str(entry["title"])) for entry in normalized
     }
     if normalized != expected_order or observed_cases != PLAYWRIGHT_REQUIRED_CASES:
         raise CandidateError("sanitized Playwright report does not cover the exact test matrix")
@@ -730,7 +725,9 @@ def _validate_playwright_candidate_evidence(
         browser_version=browser.get("version"),
     )
     if evidence != expected or evidence_path.read_bytes() != _canonical_json(evidence):
-        raise CandidateError("Playwright evidence does not match its report and packaged web build")
+        raise CandidateError(
+            "Playwright evidence does not match its report and packaged web build"
+        )
 
 
 def render_candidate_release_notes(
@@ -1061,46 +1058,76 @@ def _validate_daemon_resource_evidence(
     *,
     launch_origin: str,
     dmg_path: Path,
+    wheel_entry: dict[str, object],
+    framework_lock_entry: dict[str, object],
     bundle_entry: dict[str, object],
     manifest_entry: dict[str, object],
+    source_commit: str,
 ) -> None:
     evidence = _load_json(path)
     if type(evidence) is not dict or set(evidence) != {
-        "daemon_bundle",
-        "daemon_manifest",
         "launch_origin",
+        "release_assets",
         "schema_version",
         "source_dmg",
     }:
-        raise CandidateError(f"{path.name} does not use the closed Daemon resource schema")
-    if evidence.get("schema_version") != 1 or evidence.get("launch_origin") != launch_origin:
-        raise CandidateError(f"{path.name} Daemon resource origin is invalid")
+        raise CandidateError(f"{path.name} does not use the closed release asset resource schema")
+    if evidence.get("schema_version") != 2 or evidence.get("launch_origin") != launch_origin:
+        raise CandidateError(f"{path.name} release asset resource origin is invalid")
     if evidence.get("source_dmg") != {
         "filename": dmg_path.name,
         "sha256": _sha256(dmg_path),
     }:
         raise CandidateError(f"{path.name} does not bind the exact source DMG")
-    expected_resources = {
-        "daemon_bundle": (
-            bundle_entry,
-            f"{DAEMON_RESOURCE_ROOT}/{DAEMON_BUNDLE_NAME}",
-        ),
-        "daemon_manifest": (
-            manifest_entry,
-            f"{DAEMON_RESOURCE_ROOT}/{DAEMON_MANIFEST_NAME}",
-        ),
+    release_assets = evidence.get("release_assets")
+    if type(release_assets) is not dict or set(release_assets) != {"files", "manifest"}:
+        raise CandidateError(f"{path.name} release asset inventory is invalid")
+    expected_files = [
+        {
+            "relative_path": "core/framework-lock.json",
+            "sha256": framework_lock_entry["sha256"],
+            "byte_size": framework_lock_entry["byte_size"],
+        },
+        {
+            "relative_path": f"core/{wheel_entry['filename']}",
+            "sha256": wheel_entry["sha256"],
+            "byte_size": wheel_entry["byte_size"],
+        },
+        {
+            "relative_path": f"daemon/{DAEMON_MANIFEST_NAME}",
+            "sha256": manifest_entry["sha256"],
+            "byte_size": manifest_entry["byte_size"],
+        },
+        {
+            "relative_path": f"daemon/{DAEMON_BUNDLE_NAME}",
+            "sha256": bundle_entry["sha256"],
+            "byte_size": bundle_entry["byte_size"],
+        },
+        {
+            "relative_path": f"runtime/{MANAGED_RUNTIME_ARCHIVE_NAME}",
+            "sha256": MANAGED_RUNTIME_ARCHIVE_SHA256,
+            "byte_size": MANAGED_RUNTIME_ARCHIVE_SIZE,
+        },
+    ]
+    if expected_files != sorted(expected_files, key=lambda entry: entry["relative_path"]):
+        raise CandidateError("release asset inventory ordering is invalid")
+    if release_assets.get("files") != [
+        {**entry, "relative_path": f"{RELEASE_ASSETS_RESOURCE_ROOT}/{entry['relative_path']}"}
+        for entry in expected_files
+    ]:
+        raise CandidateError(f"{path.name} does not bind the exact packaged release assets")
+    expected_manifest = _canonical_json(
+        {"files": expected_files, "schema_version": 1, "source_commit": source_commit}
+    )
+    expected_manifest_entry = {
+        "byte_size": len(expected_manifest),
+        "relative_path": f"{RELEASE_ASSETS_RESOURCE_ROOT}/{RELEASE_ASSETS_MANIFEST_NAME}",
+        "sha256": hashlib.sha256(expected_manifest).hexdigest(),
     }
-    for field, (entry, relative_path) in expected_resources.items():
-        value = evidence.get(field)
-        if (
-            type(value) is not dict
-            or set(value) != {"byte_size", "filename", "relative_path", "sha256"}
-            or value.get("byte_size") != entry["byte_size"]
-            or value.get("filename") != entry["filename"]
-            or value.get("relative_path") != relative_path
-            or value.get("sha256") != entry["sha256"]
-        ):
-            raise CandidateError(f"{path.name} does not bind the exact packaged {field}")
+    if release_assets.get("manifest") != expected_manifest_entry:
+        raise CandidateError(
+            f"{path.name} does not bind the exact packaged release asset manifest"
+        )
 
 
 def _validate_mach_o_observation(payload: object, *, subject: str) -> list[str]:
@@ -1532,15 +1559,21 @@ def create_candidate_manifest(
         paths["daemon_mounted_resource"],
         launch_origin="mounted_dmg",
         dmg_path=paths["desktop_dmg"],
+        wheel_entry=_file_entry("core_wheel", wheel),
+        framework_lock_entry=_file_entry("framework_lock", paths["framework_lock"]),
         bundle_entry=_file_entry("daemon_bundle", paths["daemon_bundle"]),
         manifest_entry=_file_entry("daemon_manifest", paths["daemon_manifest"]),
+        source_commit=source_commit,
     )
     _validate_daemon_resource_evidence(
         paths["daemon_copy_resource"],
         launch_origin="detached_copy",
         dmg_path=paths["desktop_dmg"],
+        wheel_entry=_file_entry("core_wheel", wheel),
+        framework_lock_entry=_file_entry("framework_lock", paths["framework_lock"]),
         bundle_entry=_file_entry("daemon_bundle", paths["daemon_bundle"]),
         manifest_entry=_file_entry("daemon_manifest", paths["daemon_manifest"]),
+        source_commit=source_commit,
     )
     if _load_json(paths["managed_runtime_source"]) != _managed_runtime_source_evidence():
         raise CandidateError("managed runtime source evidence is invalid")
@@ -1811,15 +1844,21 @@ def _validate_candidate_manifest(
         root / str(by_role["daemon_mounted_resource"]["filename"]),
         launch_origin="mounted_dmg",
         dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
+        wheel_entry=by_role["core_wheel"],
+        framework_lock_entry=by_role["framework_lock"],
         bundle_entry=by_role["daemon_bundle"],
         manifest_entry=by_role["daemon_manifest"],
+        source_commit=str(manifest["source_commit"]),
     )
     _validate_daemon_resource_evidence(
         root / str(by_role["daemon_copy_resource"]["filename"]),
         launch_origin="detached_copy",
         dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
+        wheel_entry=by_role["core_wheel"],
+        framework_lock_entry=by_role["framework_lock"],
         bundle_entry=by_role["daemon_bundle"],
         manifest_entry=by_role["daemon_manifest"],
+        source_commit=str(manifest["source_commit"]),
     )
     if (
         _load_json(root / str(by_role["managed_runtime_source"]["filename"]))
@@ -1829,9 +1868,7 @@ def _validate_candidate_manifest(
     _validate_playwright_candidate_evidence(
         root / str(by_role["playwright_evidence"]["filename"]),
         report_path=root / str(by_role["playwright_report"]["filename"]),
-        packaged_web_manifest_path=root / str(
-            by_role["packaged_web_manifest"]["filename"]
-        ),
+        packaged_web_manifest_path=root / str(by_role["packaged_web_manifest"]["filename"]),
         expected_source_commit=source_commit,
     )
     _validate_release_notes(
@@ -2101,7 +2138,9 @@ def _candidate_preview_identity(
         expected_manifest_sha256,
         "Expected release-candidate manifest digest",
     ):
-        raise CandidateError("release-candidate manifest digest does not match the expected digest")
+        raise CandidateError(
+            "release-candidate manifest digest does not match the expected digest"
+        )
     errors = validate_candidate_manifest(
         manifest_path,
         expected_source_commit=expected_source_commit,
@@ -2187,8 +2226,7 @@ def write_preview_release_snapshot(
     observed_assets = normalized["assets"]
     assert isinstance(observed_assets, list)
     if [
-        {key: asset[key] for key in ("name", "sha256", "size")}
-        for asset in observed_assets
+        {key: asset[key] for key in ("name", "sha256", "size")} for asset in observed_assets
     ] != expected_assets:
         raise CandidateError("Preview release assets do not exactly match the candidate manifest")
     for asset in observed_assets:
@@ -2224,7 +2262,9 @@ def write_preview_release_snapshot(
         expected = dict(baseline)
         expected["draft"] = expected_draft
         if snapshot != expected:
-            raise CandidateError("Preview release metadata or assets changed after draft validation")
+            raise CandidateError(
+                "Preview release metadata or assets changed after draft validation"
+            )
     _write_private_new(output, _canonical_json(snapshot))
 
 

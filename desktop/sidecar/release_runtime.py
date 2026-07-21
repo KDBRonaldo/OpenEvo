@@ -12,8 +12,11 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import threading
 from typing import Any, BinaryIO
+
+import httpx
 
 from desktop.sidecar.contracts.v1 import models as local_v1
 from desktop.sidecar.core_bridge_adapters_v1 import (
@@ -26,7 +29,12 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
     SealedManagedRuntimeArchiveV1,
 )
 from desktop.sidecar.core_bridge_store_v1 import DesktopCoreBridgeStoreV1
-from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
+from desktop.sidecar.core_bridge_v1 import (
+    CoreHostAttachmentV1,
+    CoreTunnelHandleV1,
+    DesktopCoreBridgeErrorV1,
+    DesktopCoreBridgeV1,
+)
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
 from desktop.sidecar.remote_lifecycle import DesktopRemoteLifecycle
@@ -48,9 +56,11 @@ _LOGGER = logging.getLogger(__name__)
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_ASSET_DIRECTORY_ENTRIES = 8
-_CORE_ASSET_DIRECTORY = Path("openevo/wheels")
-_DAEMON_ASSET_DIRECTORY = Path("openevo/daemon")
-_MANAGED_RUNTIME_ASSET_DIRECTORY = Path("openevo/runtime-assets")
+_RELEASE_ASSETS_MANIFEST_NAME = "release-assets.json"
+_RELEASE_ASSETS_MANIFEST_MAX_BYTES = 1024 * 1024
+_CORE_ASSET_DIRECTORY_NAME = "core"
+_DAEMON_ASSET_DIRECTORY_NAME = "daemon"
+_MANAGED_RUNTIME_ASSET_DIRECTORY_NAME = "runtime"
 _FRAMEWORK_LOCK_NAME = "framework-lock.json"
 _DAEMON_BUNDLE_NAME = "openevo-daemon-linux-x86_64"
 _DAEMON_MANIFEST_NAME = "openevo-daemon-bundle.json"
@@ -66,6 +76,82 @@ class ReleaseRuntimeConfigurationError(RuntimeError):
 
 class _CoreEventSequenceGapError(RuntimeError):
     """Force replay when a stream skips past the committed event sequence."""
+
+
+class _DeferredCoreSshBridgeAdapterV1:
+    """Load and verify remote release assets only when Core is first needed."""
+
+    def __init__(
+        self,
+        lifecycle: DesktopRemoteLifecycle,
+        bootstrap_loader: Callable[[], CoreBootstrapConfigV1],
+    ) -> None:
+        if not isinstance(lifecycle, DesktopRemoteLifecycle):
+            raise TypeError("lifecycle must be DesktopRemoteLifecycle")
+        if not callable(bootstrap_loader):
+            raise TypeError("bootstrap_loader must be callable")
+        self._lifecycle = lifecycle
+        self._bootstrap_loader = bootstrap_loader
+        self._lock = threading.Lock()
+        self._adapter: DesktopCoreSshBridgeAdapterV1 | None = None
+
+    def ensure_core(
+        self,
+        profile_id: str,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV1:
+        return self._resolve().ensure_core(
+            profile_id,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+
+    def open_tunnel(
+        self,
+        *,
+        profile_id: str,
+        remote_port: int,
+        session_id: str,
+        deadline: float,
+    ) -> CoreTunnelHandleV1:
+        return self._resolve().open_tunnel(
+            profile_id=profile_id,
+            remote_port=remote_port,
+            session_id=session_id,
+            deadline=deadline,
+        )
+
+    def new_http_transport(self) -> httpx.BaseTransport:
+        return self._resolve().new_http_transport()
+
+    def _resolve(self) -> DesktopCoreSshBridgeAdapterV1:
+        with self._lock:
+            if self._adapter is not None:
+                return self._adapter
+            try:
+                bootstrap = self._bootstrap_loader()
+            except (OSError, ReleaseRuntimeConfigurationError) as exc:
+                raise DesktopCoreBridgeErrorV1(
+                    core_v1.ApiErrorV1(
+                        request_id="release-assets-initialization",
+                        code="release_assets_initialization_failed",
+                        http_status=503,
+                        message=("OpenEvo Desktop could not verify its remote release assets."),
+                        severity=core_v1.ErrorSeverity.BLOCKING,
+                        category=core_v1.ErrorCategory.SERVICE,
+                        retryable=True,
+                        repair_action=core_v1.RepairAction.OPENEVO_CAN_RETRY,
+                        next_action=(
+                            "Retry remote project activation. If the problem continues, "
+                            "reinstall OpenEvo Desktop."
+                        ),
+                    )
+                ) from exc
+            adapter = DesktopCoreSshBridgeAdapterV1(self._lifecycle, bootstrap)
+            self._adapter = adapter
+            return adapter
 
 
 def _collect_cleanup_failure(
@@ -88,6 +174,45 @@ def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
 class _SealedFile:
     asset: SealedCoreBootstrapAssetV1
     payload: bytes | None
+
+
+@dataclass(frozen=True, slots=True)
+class _ReleaseAssetsManifest:
+    root: Path
+    files: tuple[dict[str, object], ...]
+    allowed_owner_ids: frozenset[int]
+
+
+def _canonical_absolute_directory(path: Path | str) -> Path:
+    absolute = Path(os.path.abspath(Path(path)))
+    if sys.platform == "darwin" and len(absolute.parts) > 1:
+        alias = Path("/") / absolute.parts[1]
+        if alias in {Path("/etc"), Path("/tmp"), Path("/var")}:
+            try:
+                metadata = alias.lstat()
+                target = alias.resolve(strict=True)
+            except OSError:
+                pass
+            else:
+                expected = Path("/private") / alias.name
+                if stat.S_ISLNK(metadata.st_mode) and target == expected:
+                    absolute = target.joinpath(*absolute.parts[2:])
+    return absolute
+
+
+def _open_directory_without_symlinks(path: Path | str) -> tuple[Path, int]:
+    absolute = _canonical_absolute_directory(path)
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    current_fd = os.open(os.sep, flags)
+    try:
+        for part in absolute.parts[1:]:
+            next_fd = os.open(part, flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return absolute, current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
 
 
 @dataclass(frozen=True, slots=True)
@@ -322,66 +447,264 @@ class DesktopReleaseCoreRuntimeV1:
                 raise failure
 
 
-def bundled_core_asset_root() -> Path:
-    """Return the PyInstaller extraction root for embedded Core release assets."""
-
-    import sys
-
-    bundle_root = getattr(sys, "_MEIPASS", None)
-    if not isinstance(bundle_root, str) or not Path(bundle_root).is_absolute():
+def _load_release_assets_manifest(
+    asset_root: Path | str,
+    *,
+    source_commit: str,
+    allowed_owner_ids: frozenset[int],
+) -> _ReleaseAssetsManifest:
+    try:
+        root, root_fd = _open_directory_without_symlinks(asset_root)
+    except OSError as exc:
         raise ReleaseRuntimeConfigurationError(
-            "release sidecar has no absolute packaged resource root"
+            "packaged release asset root is unavailable"
+        ) from exc
+    try:
+        metadata = os.fstat(root_fd)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid not in allowed_owner_ids
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "packaged release asset root is not owner controlled"
+            )
+        names = tuple(sorted(entry.name for entry in os.scandir(root_fd)))
+        if names != (
+            _CORE_ASSET_DIRECTORY_NAME,
+            _DAEMON_ASSET_DIRECTORY_NAME,
+            _RELEASE_ASSETS_MANIFEST_NAME,
+            _MANAGED_RUNTIME_ASSET_DIRECTORY_NAME,
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "packaged release asset root has an unexpected inventory"
+            )
+        sealed = _seal_file(
+            root_fd,
+            root,
+            _RELEASE_ASSETS_MANIFEST_NAME,
+            max_bytes=_RELEASE_ASSETS_MANIFEST_MAX_BYTES,
+            retain_payload=True,
+            allowed_owner_ids=allowed_owner_ids,
         )
-    return Path(bundle_root) / _CORE_ASSET_DIRECTORY
-
-
-def bundled_managed_runtime_asset_root() -> Path:
-    """Return the PyInstaller extraction root for the offline runtime archive."""
-
-    import sys
-
-    bundle_root = getattr(sys, "_MEIPASS", None)
-    if not isinstance(bundle_root, str) or not Path(bundle_root).is_absolute():
+    except OSError as exc:
         raise ReleaseRuntimeConfigurationError(
-            "release sidecar has no absolute packaged resource root"
+            "packaged release asset manifest could not be verified"
+        ) from exc
+    finally:
+        os.close(root_fd)
+    assert sealed.payload is not None
+
+    def reject_duplicates(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        parsed: dict[str, object] = {}
+        for key, value in pairs:
+            if key in parsed:
+                raise ValueError("duplicate release asset manifest key")
+            parsed[key] = value
+        return parsed
+
+    try:
+        value = json.loads(
+            sealed.payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicates,
         )
-    return Path(bundle_root) / _MANAGED_RUNTIME_ASSET_DIRECTORY
-
-
-def bundled_daemon_asset_root() -> Path:
-    """Return the PyInstaller extraction root for the Linux Daemon release assets."""
-
-    import sys
-
-    bundle_root = getattr(sys, "_MEIPASS", None)
-    if not isinstance(bundle_root, str) or not Path(bundle_root).is_absolute():
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ReleaseRuntimeConfigurationError(
-            "release sidecar has no absolute packaged resource root"
+            "packaged release asset manifest is invalid"
+        ) from exc
+    canonical = (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode("utf-8")
+    files = value.get("files") if isinstance(value, dict) else None
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"files", "schema_version", "source_commit"}
+        or value.get("schema_version") != 1
+        or value.get("source_commit") != source_commit
+        or sealed.payload != canonical
+        or not isinstance(files, list)
+        or len(files) != 5
+    ):
+        raise ReleaseRuntimeConfigurationError(
+            "packaged release asset manifest does not bind this release"
         )
-    return Path(bundle_root) / _DAEMON_ASSET_DIRECTORY
+    paths: list[str] = []
+    for entry in files:
+        if (
+            not isinstance(entry, dict)
+            or set(entry) != {"relative_path", "sha256", "byte_size"}
+            or not isinstance(entry.get("relative_path"), str)
+            or not isinstance(entry.get("sha256"), str)
+            or _DIGEST_PATTERN.fullmatch(entry["sha256"]) is None
+            or type(entry.get("byte_size")) is not int
+            or not 0
+            < entry["byte_size"]
+            <= max(
+                MAX_CORE_WHEEL_BYTES,
+                MAX_FRAMEWORK_LOCK_BYTES,
+                _MAX_DAEMON_MANIFEST_BYTES,
+                MANAGED_RUNTIME_ARCHIVE_RELEASE.byte_size,
+            )
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "packaged release asset manifest entry is invalid"
+            )
+        relative_path = entry["relative_path"]
+        parts = Path(relative_path).parts
+        if (
+            Path(relative_path).is_absolute()
+            or len(parts) != 2
+            or parts[0]
+            not in {
+                _CORE_ASSET_DIRECTORY_NAME,
+                _DAEMON_ASSET_DIRECTORY_NAME,
+                _MANAGED_RUNTIME_ASSET_DIRECTORY_NAME,
+            }
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "packaged release asset manifest path is invalid"
+            )
+        paths.append(relative_path)
+    if paths != sorted(paths) or len(set(paths)) != len(paths):
+        raise ReleaseRuntimeConfigurationError(
+            "packaged release asset manifest inventory is not canonical"
+        )
+    return _ReleaseAssetsManifest(
+        root=root,
+        files=tuple(files),
+        allowed_owner_ids=allowed_owner_ids,
+    )
+
+
+def _validate_release_assets_manifest_inventory(
+    manifest: _ReleaseAssetsManifest,
+    config: CoreBootstrapConfigV1,
+) -> None:
+    daemon = config.daemon_bundle
+    runtime = config.managed_runtime_archive
+    if daemon is None or runtime is None:
+        raise ReleaseRuntimeConfigurationError("packaged release asset inventory is incomplete")
+    daemon_root = manifest.root / _DAEMON_ASSET_DIRECTORY_NAME
+    try:
+        canonical_daemon_root, daemon_root_fd = _open_directory_without_symlinks(daemon_root)
+    except OSError as exc:
+        raise ReleaseRuntimeConfigurationError("packaged Daemon manifest is unavailable") from exc
+    try:
+        daemon_manifest = _seal_file(
+            daemon_root_fd,
+            canonical_daemon_root,
+            _DAEMON_MANIFEST_NAME,
+            max_bytes=_MAX_DAEMON_MANIFEST_BYTES,
+            allowed_owner_ids=manifest.allowed_owner_ids,
+        ).asset
+    except OSError as exc:
+        raise ReleaseRuntimeConfigurationError(
+            "packaged Daemon manifest could not be verified"
+        ) from exc
+    finally:
+        os.close(daemon_root_fd)
+    if daemon_manifest.sha256 != daemon.manifest_sha256:
+        raise ReleaseRuntimeConfigurationError(
+            "packaged Daemon manifest changed during release verification"
+        )
+    expected = tuple(
+        sorted(
+            (
+                {
+                    "relative_path": f"core/{_FRAMEWORK_LOCK_NAME}",
+                    "sha256": config.framework_lock.sha256,
+                    "byte_size": config.framework_lock.byte_size,
+                },
+                {
+                    "relative_path": f"core/{Path(config.wheel.local_path).name}",
+                    "sha256": config.wheel.sha256,
+                    "byte_size": config.wheel.byte_size,
+                },
+                {
+                    "relative_path": f"daemon/{_DAEMON_MANIFEST_NAME}",
+                    "sha256": daemon_manifest.sha256,
+                    "byte_size": daemon_manifest.byte_size,
+                },
+                {
+                    "relative_path": f"daemon/{_DAEMON_BUNDLE_NAME}",
+                    "sha256": daemon.sha256,
+                    "byte_size": daemon.byte_size,
+                },
+                {
+                    "relative_path": f"runtime/{Path(runtime.local_path).name}",
+                    "sha256": runtime.sha256,
+                    "byte_size": runtime.byte_size,
+                },
+            ),
+            key=lambda entry: str(entry["relative_path"]),
+        )
+    )
+    if manifest.files != expected:
+        raise ReleaseRuntimeConfigurationError(
+            "packaged release asset manifest differs from the verified files"
+        )
 
 
 def load_core_bootstrap_config(
     asset_root: Path | str,
     *,
+    release_assets_root: Path | str | None = None,
     daemon_asset_root: Path | str | None = None,
     runtime_asset_root: Path | str | None = None,
     source_commit: str,
+    packaged_resource_assets: bool = False,
 ) -> CoreBootstrapConfigV1:
     """Load one exact embedded wheel/lock pair through a pinned directory fd."""
 
     if _SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise ReleaseRuntimeConfigurationError("Core bootstrap source commit is invalid")
-    root = Path(asset_root).resolve(strict=True)
-    root_fd = os.open(
-        root,
-        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
+    allowed_owner_ids = (
+        frozenset({0, os.getuid()}) if packaged_resource_assets else frozenset({os.getuid()})
     )
+    release_manifest: _ReleaseAssetsManifest | None = None
+    if packaged_resource_assets:
+        if release_assets_root is None:
+            raise ReleaseRuntimeConfigurationError(
+                "packaged release assets require their canonical root"
+            )
+        release_manifest = _load_release_assets_manifest(
+            release_assets_root,
+            source_commit=source_commit,
+            allowed_owner_ids=allowed_owner_ids,
+        )
+        expected_core_root = release_manifest.root / _CORE_ASSET_DIRECTORY_NAME
+        expected_daemon_root = release_manifest.root / _DAEMON_ASSET_DIRECTORY_NAME
+        expected_runtime_root = release_manifest.root / _MANAGED_RUNTIME_ASSET_DIRECTORY_NAME
+        if _canonical_absolute_directory(asset_root) != expected_core_root:
+            raise ReleaseRuntimeConfigurationError(
+                "packaged Core assets are outside the release asset root"
+            )
+        if daemon_asset_root is not None and (
+            _canonical_absolute_directory(daemon_asset_root) != expected_daemon_root
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "packaged Daemon assets are outside the release asset root"
+            )
+        if runtime_asset_root is not None and (
+            _canonical_absolute_directory(runtime_asset_root) != expected_runtime_root
+        ):
+            raise ReleaseRuntimeConfigurationError(
+                "packaged runtime assets are outside the release asset root"
+            )
+        daemon_asset_root = expected_daemon_root
+        runtime_asset_root = expected_runtime_root
+    try:
+        root, root_fd = _open_directory_without_symlinks(asset_root)
+    except OSError as exc:
+        raise ReleaseRuntimeConfigurationError(
+            "Core release asset directory could not be verified"
+        ) from exc
     try:
         root_stat = os.fstat(root_fd)
         if (
             not stat.S_ISDIR(root_stat.st_mode)
-            or root_stat.st_uid != os.getuid()
+            or root_stat.st_uid not in allowed_owner_ids
             or stat.S_IMODE(root_stat.st_mode) & 0o022
         ):
             raise ReleaseRuntimeConfigurationError(
@@ -400,31 +723,41 @@ def load_core_bootstrap_config(
             raise ReleaseRuntimeConfigurationError(
                 "Core release assets must contain exactly one wheel and framework lock"
             )
-        wheel = _seal_file(root_fd, root, wheel_names[0], max_bytes=MAX_CORE_WHEEL_BYTES)
+        wheel = _seal_file(
+            root_fd,
+            root,
+            wheel_names[0],
+            max_bytes=MAX_CORE_WHEEL_BYTES,
+            allowed_owner_ids=allowed_owner_ids,
+        )
         lock = _seal_file(
             root_fd,
             root,
             _FRAMEWORK_LOCK_NAME,
             max_bytes=MAX_FRAMEWORK_LOCK_BYTES,
             retain_payload=True,
+            allowed_owner_ids=allowed_owner_ids,
         )
         assert lock.payload is not None
         _validate_framework_lock(lock.payload, wheel.asset)
         daemon_bundle = _load_daemon_bundle(
             daemon_asset_root
             if daemon_asset_root is not None
-            else root.parent / _DAEMON_ASSET_DIRECTORY.name,
+            else root.parent / _DAEMON_ASSET_DIRECTORY_NAME,
             wheel=wheel.asset,
             framework_lock=lock.asset,
             framework_lock_payload=lock.payload,
             source_commit=source_commit,
+            allowed_owner_ids=allowed_owner_ids,
         )
         runtime_archive = _load_managed_runtime_archive(
             runtime_asset_root
             if runtime_asset_root is not None
-            else root.parent / _MANAGED_RUNTIME_ASSET_DIRECTORY.name
+            else root.parent / _MANAGED_RUNTIME_ASSET_DIRECTORY_NAME,
+            allowed_owner_ids=allowed_owner_ids,
+            require_private=not packaged_resource_assets,
         )
-        return CoreBootstrapConfigV1(
+        config = CoreBootstrapConfigV1(
             source_commit=source_commit,
             wheel=wheel.asset,
             framework_lock=lock.asset,
@@ -432,6 +765,9 @@ def load_core_bootstrap_config(
             managed_runtime_archive=runtime_archive,
             replace_mismatched=True,
         )
+        if release_manifest is not None:
+            _validate_release_assets_manifest_inventory(release_manifest, config)
+        return config
     except OSError as exc:
         raise ReleaseRuntimeConfigurationError(
             "Core release assets could not be verified"
@@ -447,13 +783,14 @@ def create_release_core_runtime(
     remote_lifecycle: DesktopRemoteLifecycle,
     asset_root: Path | str,
     source_commit: str,
+    release_assets_root: Path | str | None = None,
+    daemon_asset_root: Path | str | None = None,
+    runtime_asset_root: Path | str | None = None,
+    packaged_resource_assets: bool = False,
     startup_phase: Callable[[str], None] | None = None,
 ) -> DesktopReleaseCoreRuntimeV1:
     """Compose the production Core runtime used by the packaged Desktop sidecar."""
 
-    if startup_phase is not None:
-        startup_phase("core_assets")
-    bootstrap = load_core_bootstrap_config(asset_root, source_commit=source_commit)
     if startup_phase is not None:
         startup_phase("core_bridge_store")
     bridge_store = DesktopCoreBridgeStoreV1(provider_store.state_root / "core-bridge-v1")
@@ -465,7 +802,17 @@ def create_release_core_runtime(
         broker = DesktopEventBrokerV1()
         if startup_phase is not None:
             startup_phase("core_adapter")
-        adapter = DesktopCoreSshBridgeAdapterV1(remote_lifecycle, bootstrap)
+        adapter = _DeferredCoreSshBridgeAdapterV1(
+            remote_lifecycle,
+            lambda: load_core_bootstrap_config(
+                asset_root,
+                release_assets_root=release_assets_root,
+                daemon_asset_root=daemon_asset_root,
+                runtime_asset_root=runtime_asset_root,
+                source_commit=source_commit,
+                packaged_resource_assets=packaged_resource_assets,
+            ),
+        )
         archive_source = ProviderWorkspaceArchiveSourceV1(provider_store, workspace_store)
         if startup_phase is not None:
             startup_phase("core_bridge")
@@ -483,7 +830,7 @@ def create_release_core_runtime(
             bridge=bridge,
             event_broker=broker,
             bridge_store=bridge_store,
-            managed_runtime_available=bootstrap.managed_runtime_archive is not None,
+            managed_runtime_available=runtime_asset_root is not None,
         )
     except BaseException:
         if bridge is not None:
@@ -502,9 +849,12 @@ def _seal_file(
     max_bytes: int,
     retain_payload: bool = False,
     require_private: bool = False,
+    allowed_owner_ids: frozenset[int] | None = None,
 ) -> _SealedFile:
     if Path(name).name != name or name in {"", ".", ".."}:
         raise ReleaseRuntimeConfigurationError("Core release asset name is invalid")
+    if allowed_owner_ids is None:
+        allowed_owner_ids = frozenset({os.getuid()})
     descriptor = os.open(
         name,
         os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
@@ -514,7 +864,7 @@ def _seal_file(
         metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
+            or metadata.st_uid not in allowed_owner_ids
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) & 0o022
             or (require_private and stat.S_IMODE(metadata.st_mode) & 0o077)
@@ -558,7 +908,12 @@ def _seal_file(
 
 def _load_managed_runtime_archive(
     asset_root: Path | str,
+    *,
+    allowed_owner_ids: frozenset[int] | None = None,
+    require_private: bool = True,
 ) -> SealedManagedRuntimeArchiveV1 | None:
+    if allowed_owner_ids is None:
+        allowed_owner_ids = frozenset({os.getuid()})
     root = Path(asset_root)
     try:
         root_lstat = root.lstat()
@@ -569,21 +924,7 @@ def _load_managed_runtime_archive(
             "managed runtime release asset directory is invalid"
         )
     try:
-        absolute_root = Path(os.path.abspath(root))
-        current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        try:
-            for part in absolute_root.parts[1:]:
-                next_fd = os.open(
-                    part,
-                    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-                    dir_fd=current_fd,
-                )
-                os.close(current_fd)
-                current_fd = next_fd
-            root_fd = current_fd
-        except BaseException:
-            os.close(current_fd)
-            raise
+        absolute_root, root_fd = _open_directory_without_symlinks(root)
     except OSError as exc:
         raise ReleaseRuntimeConfigurationError(
             "managed runtime release assets could not be verified"
@@ -592,8 +933,8 @@ def _load_managed_runtime_archive(
         metadata = os.fstat(root_fd)
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or metadata.st_uid not in allowed_owner_ids
+            or stat.S_IMODE(metadata.st_mode) & (0o077 if require_private else 0o022)
         ):
             raise ReleaseRuntimeConfigurationError(
                 "managed runtime release asset directory is not private owner-controlled storage"
@@ -609,7 +950,8 @@ def _load_managed_runtime_archive(
             absolute_root,
             release.filename,
             max_bytes=release.byte_size,
-            require_private=True,
+            require_private=require_private,
+            allowed_owner_ids=allowed_owner_ids,
         ).asset
         if sealed.byte_size != release.byte_size or sealed.sha256 != release.sha256:
             raise ReleaseRuntimeConfigurationError(
@@ -644,7 +986,10 @@ def _load_daemon_bundle(
     framework_lock: SealedCoreBootstrapAssetV1,
     framework_lock_payload: bytes,
     source_commit: str,
+    allowed_owner_ids: frozenset[int] | None = None,
 ) -> SealedDaemonBundleV1 | None:
+    if allowed_owner_ids is None:
+        allowed_owner_ids = frozenset({os.getuid()})
     root = Path(asset_root)
     try:
         root_lstat = root.lstat()
@@ -653,11 +998,7 @@ def _load_daemon_bundle(
     if stat.S_ISLNK(root_lstat.st_mode):
         raise ReleaseRuntimeConfigurationError("Daemon release asset directory is invalid")
     try:
-        root = root.resolve(strict=True)
-        root_fd = os.open(
-            root,
-            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0),
-        )
+        root, root_fd = _open_directory_without_symlinks(root)
     except OSError as exc:
         raise ReleaseRuntimeConfigurationError(
             "Daemon release assets could not be verified"
@@ -666,7 +1007,7 @@ def _load_daemon_bundle(
         metadata = os.fstat(root_fd)
         if (
             not stat.S_ISDIR(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
+            or metadata.st_uid not in allowed_owner_ids
             or stat.S_IMODE(metadata.st_mode) & 0o022
         ):
             raise ReleaseRuntimeConfigurationError(
@@ -682,6 +1023,7 @@ def _load_daemon_bundle(
             root,
             _DAEMON_BUNDLE_NAME,
             max_bytes=MAX_CORE_WHEEL_BYTES,
+            allowed_owner_ids=allowed_owner_ids,
         )
         manifest = _seal_file(
             root_fd,
@@ -689,6 +1031,7 @@ def _load_daemon_bundle(
             _DAEMON_MANIFEST_NAME,
             max_bytes=_MAX_DAEMON_MANIFEST_BYTES,
             retain_payload=True,
+            allowed_owner_ids=allowed_owner_ids,
         )
         assert manifest.payload is not None
         value = _validate_daemon_manifest(
@@ -876,7 +1219,7 @@ def _validate_framework_lock(
         or payload != canonical
     ):
         raise ReleaseRuntimeConfigurationError(
-            "Core framework lock does not bind the exact embedded wheel"
+            "Core framework lock does not bind the exact packaged wheel"
         )
 
 
@@ -885,9 +1228,6 @@ __all__ = (
     "DesktopReleaseCoreRuntimeV1",
     "ProviderWorkspaceArchiveSourceV1",
     "ReleaseRuntimeConfigurationError",
-    "bundled_core_asset_root",
-    "bundled_daemon_asset_root",
-    "bundled_managed_runtime_asset_root",
     "create_release_core_runtime",
     "load_core_bootstrap_config",
 )

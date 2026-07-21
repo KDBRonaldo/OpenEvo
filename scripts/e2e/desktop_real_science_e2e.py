@@ -131,6 +131,7 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "started_at",
         "finished_at",
         "release_assets",
+        "external_release_assets",
         "sidecar",
         "core_wheel",
         "framework_lock",
@@ -143,7 +144,10 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "distribution",
         "version",
         "distribution_digest",
+        # Historical evidence remains auditable while new runs emit the external name.
         "exact_embedded_assets_verified",
+        "exact_external_release_assets_verified",
+        "slim_sidecar_excludes_remote_release_assets_verified",
         "desktop",
         "source_commit",
         "build_version",
@@ -466,6 +470,54 @@ class HeldReleaseAsset:
 
 
 @dataclass(frozen=True)
+class HeldReleaseAssetsRoot:
+    """FD-bound authority for the staged external release-asset tree."""
+
+    path: Path
+    descriptor: int = field(repr=False, compare=False)
+    identity: tuple[int, ...] = field(repr=False)
+
+    @classmethod
+    def open(cls, path: Path) -> HeldReleaseAssetsRoot:
+        descriptor = -1
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            )
+            opened = os.fstat(descriptor)
+            named = path.lstat()
+            identity = _release_asset_identity(opened)
+            if (
+                _release_asset_identity(named) != identity
+                or not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.getuid()
+                or stat.S_IMODE(opened.st_mode) != 0o700
+            ):
+                raise OSError("release asset root identity is invalid")
+            return cls(path=path, descriptor=descriptor, identity=identity)
+        except OSError as exc:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise E2EFailure("release_assets", "release_asset_root_authority_invalid") from exc
+
+    def verify_unchanged(self) -> None:
+        try:
+            opened = os.fstat(self.descriptor)
+            named = self.path.lstat()
+            if (
+                _release_asset_identity(opened) != self.identity
+                or _release_asset_identity(named) != self.identity
+            ):
+                raise OSError("release asset root changed")
+        except OSError as exc:
+            raise E2EFailure("release_assets", "release_asset_root_authority_changed") from exc
+
+    def close(self) -> None:
+        os.close(self.descriptor)
+
+
+@dataclass(frozen=True)
 class ReleaseAssets:
     sidecar: Path
     wheel: Path
@@ -479,6 +531,15 @@ class ReleaseAssets:
         repr=False,
         compare=False,
     )
+    release_assets_root: Path | None = None
+    release_assets_manifest: Path | None = None
+    source_commit: str | None = None
+    registry_digest: str | None = None
+    root_authority: HeldReleaseAssetsRoot | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
     def authority(self, path: Path) -> HeldReleaseAsset:
         matches = [authority for authority in self.authorities if authority.path == path]
@@ -486,9 +547,22 @@ class ReleaseAssets:
             raise E2EFailure("release_assets", "release_asset_authority_missing")
         return matches[0]
 
+    def external_release_assets_root(self) -> Path:
+        if self.release_assets_root is None or self.root_authority is None:
+            raise E2EFailure("release_assets", "release_asset_root_authority_missing")
+        self.root_authority.verify_unchanged()
+        return self.release_assets_root
+
+    def verify_unchanged(self) -> None:
+        self.external_release_assets_root()
+        for authority in self.authorities:
+            authority.verify_unchanged()
+
     def close(self) -> None:
         for authority in self.authorities:
             authority.close()
+        if self.root_authority is not None:
+            self.root_authority.close()
 
 
 @dataclass(frozen=True)
@@ -904,15 +978,11 @@ class DesktopScienceWorkflow:
                 if target_id not in REQUIRED_TARGET_IDS:
                     continue
                 artifact_content_sha256 = artifact.get("content_sha256")
-                runtime_document_sha256 = observation.document_sha256_by_target.get(
-                    target_id
-                )
+                runtime_document_sha256 = observation.document_sha256_by_target.get(target_id)
                 if not _is_sha256(artifact_content_sha256) or not _is_sha256(
                     runtime_document_sha256
                 ):
-                    raise E2EFailure(
-                        "renderer", "renderer_artifact_expectation_invalid"
-                    )
+                    raise E2EFailure("renderer", "renderer_artifact_expectation_invalid")
                 artifact_by_target[target_id] = {
                     "artifact_id": _text(artifact, "id", "renderer"),
                     "artifact_type": _text(artifact, "artifact_type", "renderer"),
@@ -2114,12 +2184,23 @@ def _inspect_release_assets(
             or stat.S_IMODE(root_metadata.st_mode) != 0o700
         ):
             raise E2EFailure("release_assets", "release_asset_snapshot_root_invalid")
-        source_by_path = {
-            authority.path: authority for authority in source_authorities
-        }
+        source_root = validation_root / "source-inputs"
+        sidecar_root = validation_root / "sidecar"
+        external_parent = validation_root / "external-assets"
+        for directory in (source_root, sidecar_root, external_parent):
+            directory.mkdir(mode=0o700)
+            metadata = directory.stat()
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.getuid()
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise E2EFailure("release_assets", "release_asset_snapshot_root_invalid")
+        source_by_path = {authority.path: authority for authority in source_authorities}
         for path, _code, executable in inputs:
+            destination = sidecar_root / path.name if path == sidecar else source_root / path.name
             source_by_path[path].copy_to(
-                validation_root / path.name,
+                destination,
                 executable=executable,
                 failure_stage="release_assets",
                 failure_code="release_asset_snapshot_failed",
@@ -2132,68 +2213,72 @@ def _inspect_release_assets(
         for authority in source_authorities:
             authority.close()
 
-    sidecar = validation_root / sidecar.name
-    wheel = validation_root / wheel.name
-    lock = validation_root / lock.name
-    managed_runtime_archive = validation_root / managed_runtime_archive.name
-    daemon_bundle = validation_root / daemon_bundle.name
-    daemon_manifest = validation_root / daemon_manifest.name
-    validated_inputs = (
-        sidecar,
-        wheel,
-        lock,
-        managed_runtime_archive,
-        daemon_bundle,
-        daemon_manifest,
-    )
+    sidecar = validation_root / "sidecar" / sidecar.name
+    source_root = validation_root / "source-inputs"
+    wheel = source_root / wheel.name
+    lock = source_root / lock.name
+    managed_runtime_archive = source_root / managed_runtime_archive.name
+    daemon_bundle = source_root / daemon_bundle.name
+    daemon_manifest = source_root / daemon_manifest.name
+    release_assets_root = validation_root / "external-assets" / "openevo-release-assets"
     authorities: list[HeldReleaseAsset] = []
+    root_authority: HeldReleaseAssetsRoot | None = None
     try:
-        authorities.extend(HeldReleaseAsset.open(path) for path in validated_inputs)
-        authority_by_path = {authority.path: authority for authority in authorities}
         name, version, wheel_digest = _validate_wheel_lock(wheel, lock)
-        if wheel_digest != authority_by_path[wheel].sha256:
-            raise E2EFailure("release_assets", "framework_lock_wheel_mismatch")
-        builder = _load_sidecar_builder()
-        runtime_size, runtime_digest = builder._validate_managed_runtime_archive(
-            managed_runtime_archive
+        source_commit, registry_digest = _release_asset_identity_from_daemon_manifest(
+            daemon_manifest
         )
-        if (
-            runtime_size != authority_by_path[managed_runtime_archive].byte_size
-            or runtime_digest != authority_by_path[managed_runtime_archive].sha256
-        ):
-            raise E2EFailure("release_assets", "managed_runtime_archive_changed")
+        builder = _load_sidecar_builder()
         builder._validate_fd_bound_bootloader(sidecar)
-        builder._validate_embedded_core_wheel(sidecar, wheel)
-        builder._validate_embedded_core_framework_lock(
+        try:
+            builder._validate_sidecar_excludes_remote_release_assets(sidecar)
+        except Exception as exc:
+            raise E2EFailure("release_assets", "sidecar_remote_release_assets_present") from exc
+        stager = _load_release_assets_stager()
+        stager.stage_release_assets(
+            bundle=daemon_bundle,
+            manifest=daemon_manifest,
+            wheel=wheel,
+            framework_lock=lock,
+            managed_runtime_archive=managed_runtime_archive,
+            source_commit=source_commit,
+            registry_digest=registry_digest,
+            output_dir=release_assets_root,
+        )
+        root_authority = HeldReleaseAssetsRoot.open(release_assets_root)
+        wheel = release_assets_root / "core" / wheel.name
+        lock = release_assets_root / "core" / lock.name
+        managed_runtime_archive = release_assets_root / "runtime" / managed_runtime_archive.name
+        daemon_bundle = release_assets_root / "daemon" / daemon_bundle.name
+        daemon_manifest = release_assets_root / "daemon" / daemon_manifest.name
+        release_assets_manifest = release_assets_root / "release-assets.json"
+        staged_inputs = (
             sidecar,
             wheel,
             lock,
-            version=version,
-        )
-        builder._validate_embedded_managed_runtime_archive(
-            sidecar,
             managed_runtime_archive,
-        )
-        bundle_source, manifest_source, daemon_identity = builder._open_daemon_release_input_pair(
             daemon_bundle,
             daemon_manifest,
-            repo=REPOSITORY_ROOT,
+            release_assets_manifest,
         )
-        try:
-            builder._validate_daemon_manifest_core(
-                daemon_identity,
-                wheel=wheel,
-                framework_lock=lock,
-                version=version,
-            )
-            builder._validate_embedded_daemon_release_inputs(
-                sidecar,
-                bundle_source,
-                manifest_source,
-            )
-        finally:
-            manifest_source.close()
-            bundle_source.close()
+        authorities.extend(HeldReleaseAsset.open(path) for path in staged_inputs)
+        authority_by_path = {authority.path: authority for authority in authorities}
+        if wheel_digest != authority_by_path[wheel].sha256:
+            raise E2EFailure("release_assets", "framework_lock_wheel_mismatch")
+        _validate_external_release_assets_manifest(
+            authority_by_path[release_assets_manifest],
+            source_commit=source_commit,
+            assets={
+                "core/framework-lock.json": authority_by_path[lock],
+                f"core/{wheel.name}": authority_by_path[wheel],
+                "daemon/openevo-daemon-bundle.json": authority_by_path[daemon_manifest],
+                "daemon/openevo-daemon-linux-x86_64": authority_by_path[daemon_bundle],
+                f"runtime/{managed_runtime_archive.name}": authority_by_path[
+                    managed_runtime_archive
+                ],
+            },
+        )
+        root_authority.verify_unchanged()
         for authority in authorities:
             authority.verify_unchanged()
         evidence = {
@@ -2208,21 +2293,29 @@ def _inspect_release_assets(
                 **authority_by_path[lock].evidence(),
                 "distribution_digest": wheel_digest,
             },
-            "managed_runtime_archive": {
-                "sha256": runtime_digest,
-                "byte_size": runtime_size,
-            },
+            "managed_runtime_archive": authority_by_path[managed_runtime_archive].evidence(),
             "daemon_bundle": authority_by_path[daemon_bundle].evidence(),
             "daemon_manifest": authority_by_path[daemon_manifest].evidence(),
-            "exact_embedded_assets_verified": True,
+            "external_release_assets": {
+                "source_commit": source_commit,
+                "registry_digest": registry_digest,
+                "manifest_sha256": authority_by_path[release_assets_manifest].sha256,
+                "byte_size": authority_by_path[release_assets_manifest].byte_size,
+            },
+            "exact_external_release_assets_verified": True,
+            "slim_sidecar_excludes_remote_release_assets_verified": True,
         }
     except E2EFailure:
         for authority in authorities:
             authority.close()
+        if root_authority is not None:
+            root_authority.close()
         raise
     except Exception as exc:
         for authority in authorities:
             authority.close()
+        if root_authority is not None:
+            root_authority.close()
         raise E2EFailure("release_assets", "packaged_assets_not_exact") from exc
     return ReleaseAssets(
         sidecar=sidecar,
@@ -2233,7 +2326,74 @@ def _inspect_release_assets(
         daemon_manifest=daemon_manifest,
         authorities=tuple(authorities),
         evidence=evidence,
+        release_assets_root=release_assets_root,
+        release_assets_manifest=release_assets_manifest,
+        source_commit=source_commit,
+        registry_digest=registry_digest,
+        root_authority=root_authority,
     )
+
+
+def _release_asset_identity_from_daemon_manifest(manifest_path: Path) -> tuple[str, str]:
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        release = payload.get("release") if isinstance(payload, dict) else None
+        core = payload.get("core") if isinstance(payload, dict) else None
+        source_commit = release.get("source_commit") if isinstance(release, dict) else None
+        registry_digest = core.get("registry_digest") if isinstance(core, dict) else None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise E2EFailure("release_assets", "release_asset_identity_unavailable") from exc
+    if (
+        not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or not _is_sha256(registry_digest)
+    ):
+        raise E2EFailure("release_assets", "release_asset_identity_unavailable")
+    return source_commit, registry_digest
+
+
+def _load_release_assets_stager() -> ModuleType:
+    path = REPOSITORY_ROOT / "scripts/ci/openevo_desktop_daemon_resource.py"
+    spec = importlib.util.spec_from_file_location("openevo_e2e_release_assets_stager", path)
+    if spec is None or spec.loader is None:
+        raise E2EFailure("release_assets", "release_assets_stager_unavailable")
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as exc:
+        raise E2EFailure("release_assets", "release_assets_stager_unavailable") from exc
+    if not callable(getattr(module, "stage_release_assets", None)):
+        raise E2EFailure("release_assets", "release_assets_stager_unavailable")
+    return module
+
+
+def _validate_external_release_assets_manifest(
+    manifest: HeldReleaseAsset,
+    *,
+    source_commit: str,
+    assets: Mapping[str, HeldReleaseAsset],
+) -> None:
+    manifest.verify_unchanged()
+    try:
+        payload = os.pread(manifest.descriptor, manifest.byte_size, 0)
+        parsed = json.loads(payload.decode("utf-8", errors="strict"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise E2EFailure("release_assets", "external_release_assets_manifest_invalid") from exc
+    expected = {
+        "files": [
+            {
+                "relative_path": relative_path,
+                "sha256": authority.sha256,
+                "byte_size": authority.byte_size,
+            }
+            for relative_path, authority in sorted(assets.items())
+        ],
+        "schema_version": 1,
+        "source_commit": source_commit,
+    }
+    if payload != _canonical_json(expected) or parsed != expected:
+        raise E2EFailure("release_assets", "external_release_assets_manifest_invalid")
+    manifest.verify_unchanged()
 
 
 def _validate_wheel_lock(wheel: Path, lock: Path) -> tuple[str, str, str]:
@@ -2318,6 +2478,8 @@ def _launch_sidecar(
         "--listener-fd",
         str(LISTENER_FD),
         "--native-instance-stdin",
+        "--release-assets-root",
+        str(assets.external_release_assets_root().absolute()),
         "--desktop-config-root",
         str(root / "state"),
     ]
@@ -2728,13 +2890,15 @@ def _held_json(authority: HeldReleaseAsset, *, code: str) -> tuple[bytes, dict[s
 
 def _candidate_file(candidate: Mapping[str, object], role: str) -> dict[str, object]:
     files = candidate.get("files")
-    matches = [
-        item
-        for item in files
+    matches = (
+        [
+            item
+            for item in files
+            if isinstance(files, list) and isinstance(item, dict) and item.get("role") == role
+        ]
         if isinstance(files, list)
-        and isinstance(item, dict)
-        and item.get("role") == role
-    ] if isinstance(files, list) else []
+        else []
+    )
     if len(matches) != 1:
         raise E2EFailure("renderer", "renderer_candidate_manifest_invalid")
     item = matches[0]
@@ -2811,12 +2975,8 @@ def _validate_renderer_candidate_binding(
             packaged_web_root / ".openevo-product-web.json"
         )
         opened.append(root_manifest_authority)
-        _, candidate = _held_json(
-            candidate_authority, code="renderer_candidate_manifest_invalid"
-        )
-        _, app_smoke = _held_json(
-            app_smoke_authority, code="renderer_candidate_app_smoke_invalid"
-        )
+        _, candidate = _held_json(candidate_authority, code="renderer_candidate_manifest_invalid")
+        _, app_smoke = _held_json(app_smoke_authority, code="renderer_candidate_app_smoke_invalid")
         packaged_manifest_bytes, packaged_manifest_payload = _held_json(
             packaged_manifest_authority,
             code="renderer_candidate_packaged_web_manifest_invalid",
@@ -2912,9 +3072,7 @@ def _validate_renderer_candidate_binding(
         build_digest = packaged_manifest_payload.get("build_digest")
         packaged_evidence = playwright_evidence.get("packaged_web")
         evidence_manifest = (
-            packaged_evidence.get("manifest")
-            if isinstance(packaged_evidence, dict)
-            else None
+            packaged_evidence.get("manifest") if isinstance(packaged_evidence, dict) else None
         )
         if (
             not _is_sha256(build_digest)
@@ -3064,8 +3222,7 @@ def _validate_renderer_result(
             or item.get("artifact_type") != expected.get("artifact_type")
             or item.get("artifact_id_sha256") != _digest_text(str(expected["artifact_id"]))
             or item.get("content_sha256") != expected.get("artifact_content_sha256")
-            or item.get("runtime_document_sha256")
-            != expected.get("runtime_document_sha256")
+            or item.get("runtime_document_sha256") != expected.get("runtime_document_sha256")
             or not isinstance(item.get("document_count"), int)
             or item["document_count"] < 1
             or not isinstance(item.get("total_utf8_bytes"), int)
@@ -3712,10 +3869,7 @@ def _renderer_test_timeout_seconds(requested_seconds: float) -> float:
 
 
 def _renderer_process_timeout_seconds(requested_seconds: float) -> float:
-    return (
-        _renderer_test_timeout_seconds(requested_seconds)
-        + RENDERER_PROCESS_EXIT_GRACE_SECONDS
-    )
+    return _renderer_test_timeout_seconds(requested_seconds) + RENDERER_PROCESS_EXIT_GRACE_SECONDS
 
 
 def _terminate_process_group(
@@ -3869,9 +4023,7 @@ def _nonnegative_seconds_at_most(maximum: float) -> Callable[[str], float]:
         except ValueError as exc:
             raise argparse.ArgumentTypeError("must be a finite non-negative number") from exc
         if not math.isfinite(parsed) or parsed < 0 or parsed > maximum:
-            raise argparse.ArgumentTypeError(
-                f"must be a finite number between 0 and {maximum:g}"
-            )
+            raise argparse.ArgumentTypeError(f"must be a finite number between 0 and {maximum:g}")
         return parsed
 
     return parse
@@ -4157,6 +4309,8 @@ def main(argv: list[str] | None = None) -> int:
                 health_check=native.assert_log_budget,
             )
             desktop_identity = _release_identity(api)
+            if desktop_identity.get("source_commit") != assets.source_commit:
+                raise E2EFailure("release_assets", "release_asset_source_commit_mismatch")
             evidence["desktop"] = desktop_identity
             workflow = DesktopScienceWorkflow(
                 api,
@@ -4196,8 +4350,7 @@ def main(argv: list[str] | None = None) -> int:
                 verification_scope = evidence.get("verification_scope")
                 if isinstance(verification_scope, list):
                     verification_scope.append("packaged_renderer_local_api_observability")
-            for authority in assets.authorities:
-                authority.verify_unchanged()
+            assets.verify_unchanged()
             if renderer_binding is not None:
                 renderer_binding.verify_unchanged()
             evidence["outcome"] = "passed"

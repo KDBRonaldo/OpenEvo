@@ -1,8 +1,7 @@
 {
   "bundle": {
     "resources": {
-      "release-resources/openevo-daemon/openevo-daemon-bundle.json": "openevo-daemon/openevo-daemon-bundle.json",
-      "release-resources/openevo-daemon/openevo-daemon-linux-x86_64": "openevo-daemon/openevo-daemon-linux-x86_64"
+      "release-resources/openevo-release-assets": "openevo-release-assets"
     }
   }
 }

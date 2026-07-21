@@ -318,6 +318,7 @@ def create_release_desktop_local_api_app(
     clock: Callable[[], datetime] | None = None,
     remote_lifecycle: DesktopRemoteLifecycle | None = None,
     core_assets_root: Path | str | None = None,
+    release_assets_root: Path | str | None = None,
     core_bridge: DesktopCoreBridgeV1 | None = None,
     event_broker: DesktopEventBrokerV1 | None = None,
     startup_phase: Callable[[str], None] | None = None,
@@ -331,7 +332,11 @@ def create_release_desktop_local_api_app(
         or re.search(r"[\x00-\x1f\x7f]", session_token) is not None
     ):
         raise ValueError("Desktop session token must be 32-4096 characters without controls")
-    if core_assets_root is not None and (core_bridge is not None or event_broker is not None):
+    if core_assets_root is not None and release_assets_root is not None:
+        raise ValueError("embedded and packaged release assets cannot be combined")
+    if (core_assets_root is not None or release_assets_root is not None) and (
+        core_bridge is not None or event_broker is not None
+    ):
         raise ValueError("packaged Core assets cannot be combined with injected Core resources")
     encoded_session_token = session_token.encode("utf-8")
     if startup_phase is not None:
@@ -359,13 +364,29 @@ def create_release_desktop_local_api_app(
             store.state_root / "workspace-imports",
             reconcile_on_open=False,
         )
-        if core_assets_root is not None:
+        if core_assets_root is not None or release_assets_root is not None:
+            if release_assets_root is None:
+                core_root = core_assets_root
+                daemon_root = None
+                runtime_root = None
+                packaged_resource_assets = False
+            else:
+                packaged_root = Path(release_assets_root)
+                core_root = packaged_root / "core"
+                daemon_root = packaged_root / "daemon"
+                runtime_root = packaged_root / "runtime"
+                packaged_resource_assets = True
+            assert core_root is not None
             core_runtime = create_release_core_runtime(
                 provider_store=store,
                 workspace_store=workspace_import_store,
                 remote_lifecycle=lifecycle,
-                asset_root=core_assets_root,
+                asset_root=core_root,
                 source_commit=source_commit,
+                release_assets_root=release_assets_root,
+                daemon_asset_root=daemon_root,
+                runtime_asset_root=runtime_root,
+                packaged_resource_assets=packaged_resource_assets,
                 startup_phase=startup_phase,
             )
         if startup_phase is not None:
@@ -489,9 +510,7 @@ def create_release_desktop_local_api_app(
             next_action="Reconnect and activate the saved project.",
         )
 
-    @register_release_handler(
-        app.exception_handler, LocalOperationCancellationUnavailableError
-    )
+    @register_release_handler(app.exception_handler, LocalOperationCancellationUnavailableError)
     async def handle_local_operation_cancellation_unavailable(
         request: Request, exc: LocalOperationCancellationUnavailableError
     ) -> JSONResponse:

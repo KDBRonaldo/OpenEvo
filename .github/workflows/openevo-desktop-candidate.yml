@@ -399,16 +399,17 @@ jobs:
           test "${#registry_digest}" = 64
           echo "OPENEVO_REGISTRY_DIGEST=$registry_digest" >> "$GITHUB_ENV"
 
-      - name: Verify and stage controlled Daemon Tauri resources
+      - name: Verify and stage controlled Tauri release assets
         run: |
           uv run python scripts/ci/openevo_desktop_daemon_resource.py stage \
             --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
             --manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
             --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
             --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
+            --managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" \
             --source-commit "$GITHUB_SHA" \
             --registry-digest "$OPENEVO_REGISTRY_DIGEST" \
-            --output-dir desktop/src-tauri/release-resources/openevo-daemon
+            --output-dir desktop/src-tauri/release-resources/openevo-release-assets
 
       - name: Validate locked release-mode Tauri dependency graph
         working-directory: desktop/src-tauri
@@ -505,26 +506,14 @@ jobs:
             2> "$RUNNER_TEMP/openevo-candidate-codesign.txt"
           grep -F "Signature=adhoc" \
             "$RUNNER_TEMP/openevo-candidate-codesign.txt"
-          uv run python - "$mounted_sidecar" "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" <<'PY'
-          import importlib.util
-          from pathlib import Path
-          import sys
-
-          builder_path = Path("desktop/packaging/build_sidecar.py").resolve()
-          spec = importlib.util.spec_from_file_location("openevo_candidate_sidecar", builder_path)
-          if spec is None or spec.loader is None:
-              raise SystemExit("Desktop sidecar packaging validator is unavailable")
-          builder = importlib.util.module_from_spec(spec)
-          spec.loader.exec_module(builder)
-          builder._validate_embedded_managed_runtime_archive(
-              Path(sys.argv[1]),
-              Path(sys.argv[2]),
-          )
-          PY
           uv run python scripts/ci/openevo_desktop_daemon_resource.py verify-app \
             --app "$mounted_app" \
             --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
             --manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
+            --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
+            --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
+            --managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" \
+            --source-commit "$GITHUB_SHA" \
             --source-dmg "$dmg" \
             --launch-origin mounted_dmg \
             --evidence-out candidate-artifacts/daemon-mounted-resource.json
@@ -549,6 +538,10 @@ jobs:
             --app "$copied_app" \
             --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
             --manifest "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-bundle.json" \
+            --wheel "$OPENEVO_CANDIDATE_CORE"/openevo-*.whl \
+            --framework-lock "$OPENEVO_CANDIDATE_CORE/framework-lock.json" \
+            --managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE" \
+            --source-commit "$GITHUB_SHA" \
             --source-dmg "$dmg" \
             --launch-origin detached_copy \
             --evidence-out candidate-artifacts/daemon-copy-resource.json

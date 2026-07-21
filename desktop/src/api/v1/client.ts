@@ -83,6 +83,7 @@ export type NonEmptyReadonlyArray<T> = readonly [T, ...T[]];
 export interface DesktopClientOptions {
   readonly fetch: FetchLike;
   readonly bootstrap: BootstrapContextProvider;
+  readonly requestTimeoutMs?: number;
   readonly supportedMajors?: readonly number[];
   readonly acceptedOpenApiDigests: NonEmptyReadonlyArray<string>;
   readonly allowedProviderKinds?: readonly DesktopBootstrapContextV1["negotiated_contract"]["provider_kind"][];
@@ -138,6 +139,8 @@ const acceptedOpenApiDigestsSchema = z
   .array(sha256DigestSchema)
   .min(1)
   .refine((digests) => new Set(digests).size === digests.length);
+const requestTimeoutMsSchema = z.number().int().min(1).max(120_000);
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 
 export class DesktopApiError extends Error {
   readonly apiError: ApiErrorV1;
@@ -285,7 +288,28 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
   const supportedMajors = options.supportedMajors ?? [1];
   const acceptedOpenApiDigests = parseAcceptedOpenApiDigests(options.acceptedOpenApiDigests);
   const allowedProviderKinds = options.allowedProviderKinds ?? ["desktop_sidecar"];
+  const requestTimeoutMs = requestTimeoutMsSchema.parse(
+    options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS,
+  );
   let bootstrapPromise: Promise<DesktopBootstrapContextV1> | null = null;
+
+  async function withRequestDeadline<T>(
+    operation: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => {
+        reject(new DesktopContractError("Desktop Local API request timed out"));
+        controller.abort();
+      }, requestTimeoutMs);
+    });
+    try {
+      return await Promise.race([operation(controller.signal), deadline]);
+    } finally {
+      if (timeout !== undefined) clearTimeout(timeout);
+    }
+  }
 
   async function context(): Promise<DesktopBootstrapContextV1> {
     if (!bootstrapPromise) {
@@ -335,31 +359,34 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
       headers.set("Content-Type", "application/json");
     }
 
-    const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
-      method,
-      headers,
-      body,
-      credentials: "omit",
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      const payload = await readJson(response);
-      const parsedError = parseResponse(apiErrorV1Schema, payload, response.status, "error");
-      if (parsedError.http_status !== response.status) {
-        throw new DesktopContractError("ApiError HTTP status does not match the response", {
-          status: response.status,
-        });
+    return withRequestDeadline(async (signal) => {
+      const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
+        method,
+        headers,
+        body,
+        credentials: "omit",
+        cache: "no-store",
+        signal,
+      });
+      if (!response.ok) {
+        const payload = await readJson(response);
+        const parsedError = parseResponse(apiErrorV1Schema, payload, response.status, "error");
+        if (parsedError.http_status !== response.status) {
+          throw new DesktopContractError("ApiError HTTP status does not match the response", {
+            status: response.status,
+          });
+        }
+        throw new DesktopApiError(parsedError);
       }
-      throw new DesktopApiError(parsedError);
-    }
-    if (response.status !== expectedStatus) {
-      throw new DesktopContractError(
-        `Desktop Local API returned HTTP ${response.status}; expected HTTP ${expectedStatus}`,
-        { status: response.status },
-      );
-    }
-    const payload = await readJson(response);
-    return parseResponse(responseSchema, payload, response.status, "success");
+      if (response.status !== expectedStatus) {
+        throw new DesktopContractError(
+          `Desktop Local API returned HTTP ${response.status}; expected HTTP ${expectedStatus}`,
+          { status: response.status },
+        );
+      }
+      const payload = await readJson(response);
+      return parseResponse(responseSchema, payload, response.status, "success");
+    });
   }
 
   async function requestNoContent(
@@ -374,23 +401,26 @@ export function createDesktopApiClient(options: DesktopClientOptions): DesktopAp
     if (requestOptions.idempotencyKey !== undefined) {
       headers.set("Idempotency-Key", idempotencyKeySchema.parse(requestOptions.idempotencyKey));
     }
-    const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
-      method,
-      headers,
-      credentials: "omit",
-      cache: "no-store",
-    });
-    if (!response.ok) {
-      const payload = await readJson(response);
-      const parsedError = parseResponse(apiErrorV1Schema, payload, response.status, "error");
-      if (parsedError.http_status !== response.status) {
-        throw new DesktopContractError("ApiError HTTP status does not match the response", { status: response.status });
+    await withRequestDeadline(async (signal) => {
+      const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
+        method,
+        headers,
+        credentials: "omit",
+        cache: "no-store",
+        signal,
+      });
+      if (!response.ok) {
+        const payload = await readJson(response);
+        const parsedError = parseResponse(apiErrorV1Schema, payload, response.status, "error");
+        if (parsedError.http_status !== response.status) {
+          throw new DesktopContractError("ApiError HTTP status does not match the response", { status: response.status });
+        }
+        throw new DesktopApiError(parsedError);
       }
-      throw new DesktopApiError(parsedError);
-    }
-    if (response.status !== 204) {
-      throw new DesktopContractError("Desktop Local API delete did not return HTTP 204", { status: response.status });
-    }
+      if (response.status !== 204) {
+        throw new DesktopContractError("Desktop Local API delete did not return HTTP 204", { status: response.status });
+      }
+    });
   }
 
   const action = (

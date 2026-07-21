@@ -116,9 +116,7 @@ def _artifact(target: str, ordinal: int, produced: dict[str, object]) -> dict[st
         "promoted": target != "skill_bundle",
         "release_enabled": True,
         "source_artifact_count": 0 if ordinal == 1 else 1,
-        "source_artifact_ids_sha256": []
-        if ordinal == 1
-        else [_digest(f"artifact-1-{target}")],
+        "source_artifact_ids_sha256": [] if ordinal == 1 else [_digest(f"artifact-1-{target}")],
         "source_dataset_count": 1,
         "produced_revision": produced,
     }
@@ -197,7 +195,8 @@ def _payload(
     ]
     latest = sessions[1]
     latest_artifacts = {
-        artifact["target_id"]: artifact for artifact in latest["artifacts"]  # type: ignore[index]
+        artifact["target_id"]: artifact
+        for artifact in latest["artifacts"]  # type: ignore[index]
     }
     latest_inspections = latest["artifact_inspections"]  # type: ignore[assignment]
     return {
@@ -233,7 +232,14 @@ def _payload(
                 "sha256": roles["daemon_manifest"]["sha256"],
                 "byte_size": roles["daemon_manifest"]["byte_size"],
             },
-            "exact_embedded_assets_verified": True,
+            "external_release_assets": {
+                "source_commit": source,
+                "registry_digest": _digest("registry"),
+                "manifest_sha256": _digest("release-assets-manifest"),
+                "byte_size": 2048,
+            },
+            "exact_external_release_assets_verified": True,
+            "slim_sidecar_excludes_remote_release_assets_verified": True,
         },
         "renderer_candidate_binding": {
             "source_commit": source,
@@ -387,9 +393,7 @@ def _fixture(
 
 def test_exact_candidate_two_session_evidence_passes(tmp_path: Path) -> None:
     module = _load_validator()
-    evidence, digest, candidate, app_smoke, candidate_digest, source = _fixture(
-        module, tmp_path
-    )
+    evidence, digest, candidate, app_smoke, candidate_digest, source = _fixture(module, tmp_path)
 
     validated = module.validate_evidence(
         evidence,
@@ -438,6 +442,19 @@ def test_minimal_verdict_claim_fails_closed(tmp_path: Path) -> None:
     ("path", "value"),
     [
         (("cross_session_reuse_verified",), False),
+        (("release_assets", "exact_external_release_assets_verified"), False),
+        (
+            ("release_assets", "slim_sidecar_excludes_remote_release_assets_verified"),
+            False,
+        ),
+        (
+            ("release_assets", "external_release_assets", "source_commit"),
+            "f" * 40,
+        ),
+        (
+            ("release_assets", "external_release_assets", "registry_digest"),
+            _digest("wrong-registry"),
+        ),
         (("renderer_candidate_binding", "source_checkout_verified"), False),
         (
             ("renderer_candidate_binding", "candidate_packaged_sidecar_sha256"),

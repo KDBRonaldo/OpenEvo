@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import shutil
 from types import ModuleType
 from zipfile import ZipFile
 
@@ -30,29 +32,26 @@ def _sha256(path: Path) -> str:
 
 def _write_json(path: Path, value: object) -> None:
     path.write_text(
-        json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n",
-        encoding="utf-8",
+        json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8"
     )
 
 
-def _release_inputs(root: Path) -> dict[str, Path]:
+def _release_inputs(
+    module: ModuleType, root: Path, monkeypatch: pytest.MonkeyPatch
+) -> dict[str, Path]:
     root.mkdir(parents=True, exist_ok=True)
     wheel = root / "openevo-0.1.0-py3-none-any.whl"
     with ZipFile(wheel, "w") as archive:
         archive.writestr(
             "openevo-0.1.0.dist-info/METADATA",
-            "Metadata-Version: 2.4\n"
-            "Name: openevo\n"
-            "Version: 0.1.0\n"
-            "Requires-Python: >=3.11\n\n",
+            "Metadata-Version: 2.4\nName: openevo\nVersion: 0.1.0\nRequires-Python: >=3.11\n\n",
         )
         archive.writestr(
             "openevo-0.1.0.dist-info/entry_points.txt",
-            "[console_scripts]\n"
-            "openevo-backend = openevo.backend.launcher:main\n"
-            "openevo-core-service = openevo.backend.service:main\n",
+            "[console_scripts]\nopenevo-backend = openevo.backend.launcher:main\nopenevo-core-service = openevo.backend.service:main\n",
         )
         archive.writestr("openevo/__init__.py", "__version__ = '0.1.0'\n")
+    wheel.chmod(0o600)
     lock = root / "framework-lock.json"
     _write_json(
         lock,
@@ -64,6 +63,7 @@ def _release_inputs(root: Path) -> dict[str, Path]:
             "wheel_filename": wheel.name,
         },
     )
+    lock.chmod(0o600)
     bundle = root / "openevo-daemon-linux-x86_64"
     bundle.write_bytes(b"linux daemon bundle")
     bundle.chmod(0o755)
@@ -81,10 +81,7 @@ def _release_inputs(root: Path) -> dict[str, Path]:
                 {"name": "pyinstaller", "version": "6.0.0"},
             ],
             "core": {
-                "framework_lock": {
-                    "filename": lock.name,
-                    "sha256": _sha256(lock),
-                },
+                "framework_lock": {"filename": lock.name, "sha256": _sha256(lock)},
                 "registry_digest": REGISTRY_DIGEST,
                 "wheel": {
                     "filename": wheel.name,
@@ -93,10 +90,7 @@ def _release_inputs(root: Path) -> dict[str, Path]:
                     "version": "0.1.0",
                 },
             },
-            "dependency_lock": {
-                "filename": "uv.lock",
-                "sha256": _sha256(REPO_ROOT / "uv.lock"),
-            },
+            "dependency_lock": {"filename": "uv.lock", "sha256": _sha256(REPO_ROOT / "uv.lock")},
             "platform": {"architecture": "x86_64", "system": "linux"},
             "release": {"identity": "b" * 64, "source_commit": SOURCE_COMMIT},
             "runtime": {
@@ -113,98 +107,158 @@ def _release_inputs(root: Path) -> dict[str, Path]:
             },
         },
     )
+    manifest.chmod(0o600)
+    runtime = root / module.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+    runtime.write_bytes(b"managed subscription runtime")
+    runtime.chmod(0o600)
+    release = dataclasses.replace(
+        module.MANAGED_RUNTIME_ARCHIVE_RELEASE,
+        byte_size=runtime.stat().st_size,
+        sha256=_sha256(runtime),
+        asset_api_digest=f"sha256:{_sha256(runtime)}",
+    )
+    monkeypatch.setattr(module, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    monkeypatch.setattr(module, "verify_managed_runtime_archive", lambda *_args, **_kwargs: None)
     return {
         "bundle": bundle,
         "manifest": manifest,
         "wheel": wheel,
         "framework_lock": lock,
+        "runtime": runtime,
     }
 
 
 def _stage(module: ModuleType, inputs: dict[str, Path], output: Path) -> None:
-    module.stage_daemon_resource(
+    module.stage_release_assets(
         bundle=inputs["bundle"],
         manifest=inputs["manifest"],
         wheel=inputs["wheel"],
         framework_lock=inputs["framework_lock"],
+        managed_runtime_archive=inputs["runtime"],
         source_commit=SOURCE_COMMIT,
         registry_digest=REGISTRY_DIGEST,
         output_dir=output,
     )
 
 
-def test_stage_daemon_resource_requires_exact_candidate_identity(tmp_path: Path) -> None:
+def test_stage_release_assets_writes_closed_canonical_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = _load_module()
-    inputs = _release_inputs(tmp_path)
-    output = tmp_path / "resource"
+    inputs = _release_inputs(module, tmp_path / "inputs", monkeypatch)
+    output = tmp_path / module.RELEASE_ASSETS_DIRECTORY
 
     _stage(module, inputs, output)
 
-    assert (output / module.DAEMON_BUNDLE_NAME).read_bytes() == inputs["bundle"].read_bytes()
-    assert (output / module.DAEMON_MANIFEST_NAME).read_bytes() == inputs["manifest"].read_bytes()
-    assert (output / module.DAEMON_BUNDLE_NAME).stat().st_mode & 0o777 == 0o755
+    assert sorted(
+        path.relative_to(output).as_posix() for path in output.rglob("*") if path.is_file()
+    ) == [
+        "core/framework-lock.json",
+        "core/openevo-0.1.0-py3-none-any.whl",
+        "daemon/openevo-daemon-bundle.json",
+        "daemon/openevo-daemon-linux-x86_64",
+        "release-assets.json",
+        f"runtime/{inputs['runtime'].name}",
+    ]
+    manifest = json.loads(
+        (output / module.RELEASE_ASSETS_MANIFEST_NAME).read_text(encoding="utf-8")
+    )
+    assert manifest["schema_version"] == 1
+    assert manifest["source_commit"] == SOURCE_COMMIT
+    assert manifest["files"] == sorted(manifest["files"], key=lambda entry: entry["relative_path"])
+    assert all(
+        set(entry) == {"relative_path", "sha256", "byte_size"} for entry in manifest["files"]
+    )
+    assert not any("/" in str(value) for value in manifest.values() if isinstance(value, str))
+    assert (output / "daemon" / module.DAEMON_BUNDLE_NAME).stat().st_mode & 0o777 == 0o755
     with pytest.raises(module.ResourceCompositionError, match="must not already exist"):
         _stage(module, inputs, output)
 
 
-def test_stage_daemon_resource_rejects_mismatched_or_symbolic_inputs(tmp_path: Path) -> None:
+def test_stage_release_assets_rejects_symbolic_or_changed_inputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = _load_module()
-    inputs = _release_inputs(tmp_path)
-    inputs["wheel"].write_bytes(inputs["wheel"].read_bytes() + b"tampered")
-    with pytest.raises(module.ResourceCompositionError, match="exact Core wheel"):
-        _stage(module, inputs, tmp_path / "mismatch")
-
-    inputs = _release_inputs(tmp_path / "second")
-    symlink = tmp_path / "daemon-link"
-    symlink.symlink_to(inputs["bundle"])
-    inputs["bundle"] = symlink
-    with pytest.raises(module.ResourceCompositionError, match="canonical regular release binary"):
-        _stage(module, inputs, tmp_path / "symlink-output")
+    inputs = _release_inputs(module, tmp_path / "inputs", monkeypatch)
+    linked_runtime = tmp_path / module.MANAGED_RUNTIME_ARCHIVE_RELEASE.filename
+    linked_runtime.symlink_to(inputs["runtime"])
+    inputs["runtime"] = linked_runtime
+    with pytest.raises(module.ResourceCompositionError, match="symlink|identity"):
+        _stage(module, inputs, tmp_path / module.RELEASE_ASSETS_DIRECTORY)
 
 
-def test_verify_app_resource_binds_fixed_dmg_resource_paths(tmp_path: Path) -> None:
+def test_verify_app_resource_binds_all_release_assets_for_both_origins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     module = _load_module()
-    inputs_root = tmp_path / "inputs"
-    inputs_root.mkdir()
-    inputs = _release_inputs(inputs_root)
+    inputs = _release_inputs(module, tmp_path / "inputs", monkeypatch)
+    staged = tmp_path / module.RELEASE_ASSETS_DIRECTORY
+    _stage(module, inputs, staged)
     app = tmp_path / "OpenEvo Desktop.app"
-    resource = app / module.MACOS_RESOURCE_ROOT
-    resource.mkdir(parents=True)
-    packaged_bundle = resource / module.DAEMON_BUNDLE_NAME
-    packaged_bundle.write_bytes(inputs["bundle"].read_bytes())
-    packaged_bundle.chmod(0o755)
-    (resource / module.DAEMON_MANIFEST_NAME).write_bytes(inputs["manifest"].read_bytes())
+    resource_parent = app / module.MACOS_RESOURCE_ROOT.parent
+    resource_parent.mkdir(parents=True)
+    shutil.copytree(staged, resource_parent / module.RELEASE_ASSETS_DIRECTORY)
     dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"candidate dmg")
-    evidence = tmp_path / "daemon-mounted-resource.json"
-
-    module.verify_app_resource(
-        app=app,
-        bundle=inputs["bundle"],
-        manifest=inputs["manifest"],
-        source_dmg=dmg,
-        launch_origin="mounted_dmg",
-        evidence_out=evidence,
+    dmg.chmod(0o600)
+    runtime_loads: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        module,
+        "_validate_packaged_runtime_loader",
+        lambda root, *, source_commit: runtime_loads.append((root, source_commit)),
     )
 
-    payload = json.loads(evidence.read_text(encoding="utf-8"))
-    assert payload["source_dmg"] == {"filename": dmg.name, "sha256": _sha256(dmg)}
-    assert payload["daemon_bundle"]["relative_path"] == (
-        "Contents/Resources/openevo-daemon/openevo-daemon-linux-x86_64"
-    )
-    packaged_bundle.write_bytes(b"mutable fallback")
-    with pytest.raises(module.ResourceCompositionError, match="differ from verified inputs"):
+    for origin, evidence in (
+        ("mounted_dmg", tmp_path / "mounted.json"),
+        ("detached_copy", tmp_path / "copy.json"),
+    ):
         module.verify_app_resource(
             app=app,
             bundle=inputs["bundle"],
             manifest=inputs["manifest"],
+            wheel=inputs["wheel"],
+            framework_lock=inputs["framework_lock"],
+            managed_runtime_archive=inputs["runtime"],
+            source_commit=SOURCE_COMMIT,
             source_dmg=dmg,
-            launch_origin="detached_copy",
-            evidence_out=tmp_path / "daemon-copy-resource.json",
+            launch_origin=origin,
+            evidence_out=evidence,
+        )
+        payload = json.loads(evidence.read_text(encoding="utf-8"))
+        assert payload["schema_version"] == 2
+        assert payload["launch_origin"] == origin
+        assert payload["release_assets"]["manifest"]["relative_path"] == (
+            "Contents/Resources/openevo-release-assets/release-assets.json"
+        )
+        assert [entry["relative_path"] for entry in payload["release_assets"]["files"]] == [
+            f"Contents/Resources/openevo-release-assets/{entry['relative_path']}"
+            for entry in json.loads((staged / "release-assets.json").read_text())["files"]
+        ]
+
+    assert runtime_loads == [
+        (app / module.MACOS_RESOURCE_ROOT, SOURCE_COMMIT),
+        (app / module.MACOS_RESOURCE_ROOT, SOURCE_COMMIT),
+    ]
+
+    (app / module.MACOS_RESOURCE_ROOT / "runtime" / inputs["runtime"].name).write_bytes(
+        b"tampered"
+    )
+    with pytest.raises(module.ResourceCompositionError, match="differs from verified input"):
+        module.verify_app_resource(
+            app=app,
+            bundle=inputs["bundle"],
+            manifest=inputs["manifest"],
+            wheel=inputs["wheel"],
+            framework_lock=inputs["framework_lock"],
+            managed_runtime_archive=inputs["runtime"],
+            source_commit=SOURCE_COMMIT,
+            source_dmg=dmg,
+            launch_origin="mounted_dmg",
+            evidence_out=tmp_path / "tampered.json",
         )
 
 
-def test_release_workflow_uses_verified_linux_artifact_without_fallback() -> None:
+def test_release_workflow_stages_one_release_asset_tree_without_sidecar_embedding() -> None:
     workflow = (REPO_ROOT / ".github/workflows/openevo-desktop-candidate.yml").read_text(
         encoding="utf-8"
     )
@@ -213,42 +267,18 @@ def test_release_workflow_uses_verified_linux_artifact_without_fallback() -> Non
     )
     linux_job, macos_and_later = workflow.split("  macos-candidate:\n", maxsplit=1)
     macos_job = macos_and_later.split("  linux-core-candidate:\n", maxsplit=1)[0]
-    artifact_name = (
-        "openevo-desktop-daemon-${{ github.sha }}-"
-        "${{ github.run_id }}-${{ github.run_attempt }}"
-    )
 
     assert "linux-daemon-bundle:" in linux_job
-    assert "runs-on: ubuntu-24.04" in linux_job
-    assert "test \"$(uname -m)\" = \"x86_64\"" in linux_job
     assert "openevo_desktop_daemon_resource.py build" in linux_job
-    assert linux_job.count(artifact_name) == 1
     assert "needs: linux-daemon-bundle" in macos_job
-    assert macos_job.count(artifact_name) == 1
     assert "openevo_desktop_daemon_resource.py stage" in macos_job
-    assert (
-        '--daemon-bundle "$OPENEVO_DAEMON_INPUTS/daemon/'
-        'openevo-daemon-linux-x86_64"'
-    ) in macos_job
-    assert (
-        '--daemon-manifest "$OPENEVO_DAEMON_INPUTS/daemon/'
-        'openevo-daemon-bundle.json"'
-    ) in macos_job
+    assert '--managed-runtime-archive "$OPENEVO_MANAGED_RUNTIME_ARCHIVE"' in macos_job
+    assert "--output-dir desktop/src-tauri/release-resources/openevo-release-assets" in macos_job
     assert macos_job.index("openevo_desktop_daemon_resource.py stage") < macos_job.index(
         "npm run tauri:build"
     )
-    assert "--config src-tauri/tauri.release.conf.json" in macos_job
     assert macos_job.count("openevo_desktop_daemon_resource.py verify-app") == 2
-    assert macos_job.index("openevo_desktop_daemon_resource.py verify-app") < macos_job.index(
-        "openevo_release_candidate.py create"
-    )
-    assert "curl " not in linux_job
-    assert "latest" not in artifact_name
+    assert "_validate_embedded_managed_runtime_archive" not in macos_job
     assert release_config["bundle"]["resources"] == {
-        "release-resources/openevo-daemon/openevo-daemon-bundle.json": (
-            "openevo-daemon/openevo-daemon-bundle.json"
-        ),
-        "release-resources/openevo-daemon/openevo-daemon-linux-x86_64": (
-            "openevo-daemon/openevo-daemon-linux-x86_64"
-        ),
+        "release-resources/openevo-release-assets": "openevo-release-assets"
     }

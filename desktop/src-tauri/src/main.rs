@@ -28,6 +28,7 @@ use tempfile::TempDir;
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
 
 const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
+const RELEASE_ASSETS_DIRECTORY: &str = "openevo-release-assets";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
@@ -117,6 +118,9 @@ const WORKSPACE_CANCELLATION_TOKEN_BYTES: usize = 32;
 const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
 // A cold PyInstaller onefile launch can approach 15 seconds on macOS runners.
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const SIDECAR_STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES: usize = 32 * 1024;
+const SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES: usize = 160;
+const SIDECAR_STARTUP_DIAGNOSTIC_DRAIN_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
@@ -169,6 +173,75 @@ impl NativeHostError {
             code: code.to_string(),
             message: message.to_string(),
         }
+    }
+
+    fn with_startup_diagnostic(mut self, diagnostic: Option<StartupDiagnostic>) -> Self {
+        if let Some(diagnostic) = diagnostic {
+            self.message.push_str(" Startup diagnostic: ");
+            self.message.push_str(diagnostic.stage);
+            self.message.push('/');
+            self.message.push_str(diagnostic.code);
+            if let Some(errno) = diagnostic.errno {
+                self.message.push_str(" errno=");
+                self.message.push_str(&errno.to_string());
+            }
+            self.message.push('.');
+        }
+        self
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct StartupDiagnostic {
+    stage: &'static str,
+    code: &'static str,
+    errno: Option<u64>,
+}
+
+struct StartupDiagnosticSink {
+    last: Mutex<Option<StartupDiagnostic>>,
+    generation: AtomicU64,
+    reader_closed: AtomicBool,
+}
+
+impl StartupDiagnosticSink {
+    fn new() -> Self {
+        Self {
+            last: Mutex::new(None),
+            generation: AtomicU64::new(0),
+            reader_closed: AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self) -> u64 {
+        let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Ok(mut last) = self.last.lock() {
+            *last = None;
+        }
+        self.reader_closed.store(false, Ordering::Release);
+        generation
+    }
+
+    fn record(&self, generation: u64, diagnostic: StartupDiagnostic) {
+        if self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        if let Ok(mut last) = self.last.lock() {
+            if self.generation.load(Ordering::Acquire) != generation {
+                return;
+            }
+            *last = Some(diagnostic);
+        }
+    }
+
+    fn close_reader(&self, generation: u64) {
+        if self.generation.load(Ordering::Acquire) == generation {
+            self.reader_closed.store(true, Ordering::Release);
+        }
+    }
+
+    fn last(&self) -> Option<StartupDiagnostic> {
+        self.last.lock().ok().and_then(|last| *last)
     }
 }
 
@@ -535,6 +608,227 @@ impl PreparedCommand {
             .take()
             .ok_or_else(sidecar_state_error)
     }
+}
+
+fn spawn_prepared_sidecar_with_startup_diagnostics(
+    prepared: &mut PreparedCommand,
+    diagnostics: Arc<StartupDiagnosticSink>,
+    generation: u64,
+) -> std::io::Result<Child> {
+    let mut child = prepared.spawn()?;
+    if let Err(error) = start_startup_diagnostic_drain(&mut child, diagnostics, generation) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
+}
+
+fn start_startup_diagnostic_drain(
+    child: &mut Child,
+    diagnostics: Arc<StartupDiagnosticSink>,
+    generation: u64,
+) -> std::io::Result<()> {
+    let stderr = child.stderr.take().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "sidecar stderr pipe is unavailable",
+        )
+    })?;
+    thread::Builder::new()
+        .name("openevo-sidecar-stderr".to_string())
+        .spawn(move || drain_startup_diagnostics(stderr, &diagnostics, generation))?;
+    Ok(())
+}
+
+fn drain_startup_diagnostics(
+    mut stderr: impl Read,
+    diagnostics: &StartupDiagnosticSink,
+    generation: u64,
+) {
+    let mut scanner = StartupDiagnosticScanner::new();
+    let mut chunk = [0_u8; 1024];
+    loop {
+        match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => scanner.push(&chunk[..count], diagnostics, generation),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    scanner.finish(diagnostics, generation);
+    diagnostics.close_reader(generation);
+}
+
+struct StartupDiagnosticScanner {
+    scanned: usize,
+    scan_exhausted: bool,
+    line: [u8; SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES],
+    line_len: usize,
+    line_overflowed: bool,
+}
+
+impl StartupDiagnosticScanner {
+    fn new() -> Self {
+        Self {
+            scanned: 0,
+            scan_exhausted: false,
+            line: [0; SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES],
+            line_len: 0,
+            line_overflowed: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8], diagnostics: &StartupDiagnosticSink, generation: u64) {
+        for &byte in bytes {
+            if self.scanned == SIDECAR_STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES {
+                self.scan_exhausted = true;
+                continue;
+            }
+            self.scanned += 1;
+            if byte == b'\n' {
+                self.record_line(diagnostics, generation);
+                self.line_len = 0;
+                self.line_overflowed = false;
+            } else if self.line_len < self.line.len() {
+                self.line[self.line_len] = byte;
+                self.line_len += 1;
+            } else {
+                self.line_overflowed = true;
+            }
+        }
+    }
+
+    fn finish(&mut self, diagnostics: &StartupDiagnosticSink, generation: u64) {
+        if !self.scan_exhausted && self.line_len > 0 {
+            self.record_line(diagnostics, generation);
+        }
+    }
+
+    fn record_line(&self, diagnostics: &StartupDiagnosticSink, generation: u64) {
+        if self.line_overflowed {
+            return;
+        }
+        if let Some(diagnostic) = parse_startup_diagnostic(&self.line[..self.line_len]) {
+            diagnostics.record(generation, diagnostic);
+        }
+    }
+}
+
+fn parse_startup_diagnostic(line: &[u8]) -> Option<StartupDiagnostic> {
+    const PREFIX: &[u8] = b"OPENEVO_STARTUP_V1 stage=";
+    const CODE_SEPARATOR: &[u8] = b" code=";
+    const ERRNO_SEPARATOR: &[u8] = b" errno=";
+
+    if line.len() > SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES {
+        return None;
+    }
+    let line = line.strip_prefix(PREFIX)?;
+    let (stage, code_and_errno) = split_once_bytes(line, CODE_SEPARATOR)?;
+    let (code, errno) = match split_once_bytes(code_and_errno, ERRNO_SEPARATOR) {
+        Some((code, errno)) => (code, Some(parse_startup_diagnostic_errno(errno)?)),
+        None => (code_and_errno, None),
+    };
+    let (stage, code) = startup_diagnostic_pair(stage, code)?;
+    Some(StartupDiagnostic { stage, code, errno })
+}
+
+fn split_once_bytes<'a>(value: &'a [u8], separator: &[u8]) -> Option<(&'a [u8], &'a [u8])> {
+    let index = value
+        .windows(separator.len())
+        .position(|window| window == separator)?;
+    Some((&value[..index], &value[index + separator.len()..]))
+}
+
+fn parse_startup_diagnostic_errno(value: &[u8]) -> Option<u64> {
+    if !(1..=10).contains(&value.len()) || value[0] == b'0' || !value.is_ascii() {
+        return None;
+    }
+    let mut errno = 0_u64;
+    for &byte in value {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        errno = errno.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(errno)
+}
+
+fn startup_diagnostic_pair(stage: &[u8], code: &[u8]) -> Option<(&'static str, &'static str)> {
+    const ALLOWLIST: &[(&str, &str)] = &[
+        ("bootloader_resolver", "native_env_invalid"),
+        ("bootloader_resolver", "native_path_unexpected"),
+        ("bootloader_resolver", "native_path_invalid"),
+        ("bootloader_resolver", "native_path_length_invalid"),
+        ("bootloader_resolver", "native_path_not_canonical"),
+        ("bootloader_resolver", "native_basename_invalid"),
+        ("bootloader_resolver", "native_path_character_invalid"),
+        ("bootloader_resolver", "native_path_resolve_failed"),
+        ("bootloader_resolver", "native_identity_invalid"),
+        ("bootloader_resolver", "resolved_path_length_invalid"),
+        ("bootloader_resolver", "platform_unsupported"),
+        ("bootloader_resolver", "handoff_prepare_failed"),
+        ("bootloader_resolver", "native_env_incomplete"),
+        ("bootloader_archive", "native_fd_invalid"),
+        ("bootloader_archive", "platform_unsupported"),
+        ("bootloader_archive", "archive_open_failed"),
+        ("bootloader_handoff", "listener_fstat_failed"),
+        ("bootloader_handoff", "archive_fstat_failed"),
+        ("bootloader_handoff", "listener_type_invalid"),
+        ("bootloader_handoff", "archive_type_invalid"),
+        ("bootloader_handoff", "listener_accept_probe_failed"),
+        ("bootloader_handoff", "listener_accept_size_invalid"),
+        ("bootloader_handoff", "listener_not_accepting"),
+        ("bootloader_handoff", "listener_info_probe_failed"),
+        ("bootloader_handoff", "listener_identity_invalid"),
+        ("bootloader_handoff", "listener_endpoint_probe_failed"),
+        ("bootloader_handoff", "listener_endpoint_size_invalid"),
+        ("bootloader_handoff", "listener_endpoint_invalid"),
+        ("bootloader_handoff", "guard_state_invalid"),
+        ("bootloader_handoff", "listener_guard_failed"),
+        ("bootloader_handoff", "archive_guard_failed"),
+        ("bootloader_restore", "cloexec_clear_failed"),
+        ("bootloader_restore", "descriptor_restore_failed"),
+        ("bootloader_restore", "finish_failed"),
+        ("bootloader_exec", "restore_failed"),
+        ("bootloader_restart", "restore_failed"),
+        ("bootloader_child", "handoff_finish_failed"),
+        ("python_import", "owned_subprocess_import_failed"),
+        ("python_import", "launcher_import_failed"),
+        ("python_owned_subprocess", "execution_failed"),
+        ("python_handoff", "listener_fd_invalid"),
+        ("python_handoff", "archive_fd_invalid"),
+        ("python_metadata", "load_failed"),
+        ("python_launcher", "execution_failed"),
+        ("python_launcher", "bundled_core_assets_failed"),
+        ("python_launcher", "provider_store_failed"),
+        ("python_launcher", "credential_reset_failed"),
+        ("python_launcher", "remote_lifecycle_failed"),
+        ("python_launcher", "workspace_store_failed"),
+        ("python_launcher", "core_assets_failed"),
+        ("python_launcher", "core_bridge_store_failed"),
+        ("python_launcher", "event_broker_failed"),
+        ("python_launcher", "core_adapter_failed"),
+        ("python_launcher", "core_bridge_failed"),
+        ("python_launcher", "core_runtime_failed"),
+        ("python_launcher", "release_provider_failed"),
+        ("python_launcher", "contract_app_failed"),
+        ("python_launcher", "release_routes_failed"),
+        ("python_launcher", "static_app_failed"),
+        ("python_launcher", "native_frame_failed"),
+        ("python_launcher", "native_routes_failed"),
+        ("python_launcher", "server_import_failed"),
+        ("python_launcher", "listener_failed"),
+        ("python_launcher", "server_failed"),
+        ("python_launcher", "shutdown_failed"),
+    ];
+
+    ALLOWLIST
+        .iter()
+        .copied()
+        .find(|(allowed_stage, allowed_code)| {
+            stage == allowed_stage.as_bytes() && code == allowed_code.as_bytes()
+        })
 }
 
 struct AllocatedSidecarListener {
@@ -937,6 +1231,7 @@ impl ManagedSidecar {
 
 struct DesktopHostStateInner {
     sidecar: Mutex<Option<ManagedSidecar>>,
+    startup_diagnostics: Arc<StartupDiagnosticSink>,
     run_retry_recovery: Mutex<()>,
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
@@ -964,6 +1259,7 @@ impl Default for DesktopHostState {
     fn default() -> Self {
         Self(Arc::new(DesktopHostStateInner {
             sidecar: Mutex::new(None),
+            startup_diagnostics: Arc::new(StartupDiagnosticSink::new()),
             run_retry_recovery: Mutex::new(()),
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
@@ -1530,16 +1826,37 @@ fn release_sidecar_launch_spec(
     _port: u16,
 ) -> HostResult<SidecarLaunchSpec> {
     let source = bundled_path.ok_or_else(bundled_sidecar_missing_error)?;
+    let release_assets_root = packaged_release_assets_root(source)?;
     let (verified_executable, private_launch_dir) = prepare_packaged_sidecar(source)?;
     let program = release_execution_path(&private_launch_dir);
+    let mut args = local_sidecar_args();
+    args.push("--release-assets-root".to_string());
+    args.push(
+        release_assets_root
+            .to_str()
+            .ok_or_else(packaged_release_assets_path_error)?
+            .to_string(),
+    );
     Ok(SidecarLaunchSpec {
         program,
-        args: local_sidecar_args(),
+        args,
         current_dir: None,
         remove_env: &RELEASE_FORBIDDEN_SIDECAR_ENV,
         private_launch_dir: Some(private_launch_dir),
         verified_executable: Some(verified_executable),
     })
+}
+
+fn packaged_release_assets_root(sidecar: &Path) -> HostResult<PathBuf> {
+    let contents = sidecar
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(packaged_release_assets_path_error)?;
+    let root = contents.join("Resources").join(RELEASE_ASSETS_DIRECTORY);
+    if !root.is_absolute() {
+        return Err(packaged_release_assets_path_error());
+    }
+    Ok(root)
 }
 
 fn prepare_packaged_sidecar(
@@ -2166,6 +2483,13 @@ fn bundled_sidecar_missing_error() -> NativeHostError {
     )
 }
 
+fn packaged_release_assets_path_error() -> NativeHostError {
+    NativeHostError::new(
+        "packaged_release_assets_path_invalid",
+        "OpenEvo Desktop could not bind its packaged remote release assets. Reinstall the app.",
+    )
+}
+
 fn packaged_sidecar_identity_error() -> NativeHostError {
     NativeHostError::new(
         "bundled_sidecar_identity_changed",
@@ -2405,7 +2729,7 @@ fn command_from_launch_spec(
         .args(&launch.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     for name in launch.remove_env {
         command.env_remove(name);
     }
@@ -3425,6 +3749,25 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
     )
 }
 
+fn settle_startup_diagnostics(state: &DesktopHostState) {
+    let deadline = Instant::now() + SIDECAR_STARTUP_DIAGNOSTIC_DRAIN_SETTLE_TIMEOUT;
+    while !state
+        .startup_diagnostics
+        .reader_closed
+        .load(Ordering::Acquire)
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn startup_error_with_diagnostic(
+    state: &DesktopHostState,
+    startup_error: NativeHostError,
+) -> NativeHostError {
+    startup_error.with_startup_diagnostic(state.startup_diagnostics.last())
+}
+
 fn wait_for_sidecar_ready_with_inspection(
     port: u16,
     credential: &NativeInstanceCredential,
@@ -4360,6 +4703,8 @@ fn fail_state_owned_startup_with_bounds<C: ProcessControl>(
     term_timeout: Duration,
     kill_timeout: Duration,
 ) -> NativeHostError {
+    settle_startup_diagnostics(state);
+    let startup_error = startup_error_with_diagnostic(state, startup_error);
     let _ = abort_parent_liveness(state, state_lock_timeout);
     if let Err(error) = cleanup_spawn_handoff_with_bounds(
         state,
@@ -4657,6 +5002,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     let mut credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
     let parent_liveness_writer = prepared.take_parent_liveness_writer()?;
+    let startup_diagnostic_generation = state.startup_diagnostics.begin();
     let status = LifecycleStatus {
         state: "starting".to_string(),
         port: Some(port),
@@ -4686,7 +5032,14 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         resolve_unstarted_spawn(state, startup_epoch);
         return Err(fail_state_owned_startup(state, control, error));
     }
-    if let Err(error) = spawn_sidecar_gated(state, startup_epoch, || prepared.spawn()) {
+    let startup_diagnostics = Arc::clone(&state.startup_diagnostics);
+    if let Err(error) = spawn_sidecar_gated(state, startup_epoch, || {
+        spawn_prepared_sidecar_with_startup_diagnostics(
+            &mut prepared,
+            startup_diagnostics,
+            startup_diagnostic_generation,
+        )
+    }) {
         return Err(fail_state_owned_startup(state, control, error));
     }
     if let Err(error) = finalize_state_owned_private_executable(state) {
@@ -5478,19 +5831,24 @@ fn write_run_retry_recovery(
 }
 
 #[tauri::command]
-fn start_sidecar(
+async fn start_sidecar(
     _app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
 ) -> HostResult<DesktopBootstrapContextV1> {
-    emit_renderer_stage("sidecar_start_requested");
-    let bundled_path = bundled_sidecar_path();
-    let result = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref());
-    emit_renderer_stage(if result.is_ok() {
-        "sidecar_start_returned"
-    } else {
-        "sidecar_start_failed"
-    });
-    result
+    let state = state.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        emit_renderer_stage("sidecar_start_requested");
+        let bundled_path = bundled_sidecar_path();
+        let result = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref());
+        emit_renderer_stage(if result.is_ok() {
+            "sidecar_start_returned"
+        } else {
+            "sidecar_start_failed"
+        });
+        result
+    })
+    .await
+    .map_err(|_| sidecar_start_task_error())?
 }
 
 #[tauri::command]
@@ -5714,6 +6072,13 @@ fn sidecar_state_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_state_unavailable",
         "OpenEvo Desktop sidecar state is temporarily unavailable.",
+    )
+}
+
+fn sidecar_start_task_error() -> NativeHostError {
+    NativeHostError::new(
+        "sidecar_start_task_failed",
+        "OpenEvo Desktop could not complete its local service startup task.",
     )
 }
 
@@ -6678,9 +7043,19 @@ mod tests {
         assert_eq!(fs::read_dir(private_root).unwrap().count(), 0);
         #[cfg(target_os = "macos")]
         assert_eq!(fs::read_dir(private_root).unwrap().count(), 1);
+        let expected_assets = packaged_release_assets_root(fixture.path())
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             spec.args,
-            vec!["--listener-fd", "3", "--native-instance-stdin",]
+            vec![
+                "--listener-fd",
+                "3",
+                "--native-instance-stdin",
+                "--release-assets-root",
+                expected_assets.as_str(),
+            ]
         );
         assert!(spec.current_dir.is_none());
         assert_eq!(spec.remove_env, RELEASE_FORBIDDEN_SIDECAR_ENV);
@@ -8588,6 +8963,121 @@ mod tests {
     }
 
     #[test]
+    fn startup_diagnostics_keep_only_the_last_allowlisted_marker() {
+        let state = DesktopHostState::default();
+        let diagnostics = &state.startup_diagnostics;
+        let generation = diagnostics.begin();
+        drain_startup_diagnostics(
+            &b"/private/secret-sidecar token=super-secret\n\
+OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed\n\
+OPENEVO_STARTUP_V1 stage=python_metadata code=load_failed token=leak\n\
+OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
+            diagnostics,
+            generation,
+        );
+
+        assert_eq!(
+            diagnostics.last(),
+            Some(StartupDiagnostic {
+                stage: "python_launcher",
+                code: "server_failed",
+                errno: Some(13),
+            })
+        );
+        let error = startup_error_with_diagnostic(
+            &state,
+            NativeHostError::new("sidecar_exited_during_startup", "generic"),
+        );
+        assert_eq!(
+            error.message,
+            "generic Startup diagnostic: python_launcher/server_failed errno=13."
+        );
+        assert!(!error.message.contains("secret"));
+        assert!(!error.message.contains("token"));
+    }
+
+    #[test]
+    fn startup_diagnostics_reject_malformed_and_over_budget_records() {
+        let diagnostics = StartupDiagnosticSink::new();
+        let generation = diagnostics.begin();
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            b"OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed\n",
+        );
+        payload.extend(std::iter::repeat_n(
+            b'x',
+            SIDECAR_STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES - payload.len(),
+        ));
+        payload
+            .extend_from_slice(b"\nOPENEVO_STARTUP_V1 stage=python_launcher code=server_failed\n");
+        drain_startup_diagnostics(&payload[..], &diagnostics, generation);
+
+        assert_eq!(
+            diagnostics.last(),
+            Some(StartupDiagnostic {
+                stage: "bootloader_archive",
+                code: "archive_open_failed",
+                errno: None,
+            })
+        );
+        assert_eq!(
+            parse_startup_diagnostic(
+                b"OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed trailing"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_startup_diagnostic(
+                b"OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=01"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn startup_diagnostic_drain_prevents_stderr_backpressure() {
+        let allocated = allocate_sidecar_listener().unwrap();
+        let launch = SidecarLaunchSpec {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_string(),
+                "printf 'OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed\\n' >&2; \
+                 dd if=/dev/zero bs=1024 count=128 1>&2 2>/dev/null"
+                    .to_string(),
+            ],
+            current_dir: None,
+            remove_env: &[],
+            private_launch_dir: None,
+            verified_executable: None,
+        };
+        let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
+        let diagnostics = Arc::new(StartupDiagnosticSink::new());
+        let generation = diagnostics.begin();
+        let mut child = spawn_prepared_sidecar_with_startup_diagnostics(
+            &mut prepared,
+            Arc::clone(&diagnostics),
+            generation,
+        )
+        .unwrap();
+
+        assert!(child.stderr.is_none());
+        assert!(child.wait().unwrap().success());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !diagnostics.reader_closed.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "stderr drain did not finish");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            diagnostics.last(),
+            Some(StartupDiagnostic {
+                stage: "python_launcher",
+                code: "server_failed",
+                errno: None,
+            })
+        );
+    }
+
+    #[test]
     fn startup_timeout_returns_child_ownership_to_the_caller() {
         let mut child = spawn_test_process_group("sleep 30");
         let process_group = child.id() as i32;
@@ -9452,7 +9942,11 @@ mod tests {
             verified_executable: None,
         };
         let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
-        let mut child = prepared.spawn().unwrap();
+        let diagnostics = Arc::new(StartupDiagnosticSink::new());
+        let generation = diagnostics.begin();
+        let mut child =
+            spawn_prepared_sidecar_with_startup_diagnostics(&mut prepared, diagnostics, generation)
+                .unwrap();
         let process_group = child.id() as i32;
         drop(child.stdin.take());
 

@@ -4,8 +4,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import sys
 import threading
+import time
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
@@ -26,9 +26,6 @@ from desktop.sidecar.release_runtime import (
     DesktopCoreEventRelayV1,
     DesktopReleaseCoreRuntimeV1,
     ReleaseRuntimeConfigurationError,
-    bundled_core_asset_root,
-    bundled_daemon_asset_root,
-    bundled_managed_runtime_asset_root,
     create_release_core_runtime,
     load_core_bootstrap_config,
 )
@@ -113,6 +110,59 @@ def _daemon_assets(
         encoding="utf-8",
     )
     return root
+
+
+def _write_release_assets_manifest(root: Path, *, source_commit: str = SOURCE_COMMIT) -> None:
+    files = []
+    for path in sorted(
+        (
+            root / "core/framework-lock.json",
+            *tuple((root / "core").glob("openevo-*.whl")),
+            root / "daemon/openevo-daemon-bundle.json",
+            root / "daemon/openevo-daemon-linux-x86_64",
+            root / "runtime" / RUNTIME_FILENAME,
+        ),
+        key=lambda candidate: candidate.relative_to(root).as_posix(),
+    ):
+        payload = path.read_bytes()
+        files.append(
+            {
+                "relative_path": path.relative_to(root).as_posix(),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "byte_size": len(payload),
+            }
+        )
+    (root / "release-assets.json").write_text(
+        json.dumps(
+            {
+                "files": files,
+                "schema_version": 1,
+                "source_commit": source_commit,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _packaged_release_assets(
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, object]:
+    from desktop.sidecar import core_bridge_adapters_v1
+
+    root.mkdir(mode=0o700, parents=True)
+    wheel_root = _assets(root / "core")
+    _daemon_assets(root / "daemon", wheel_root)
+    runtime_root = root / "runtime"
+    runtime_root.mkdir(mode=0o700)
+    expected = write_test_managed_runtime_archive(runtime_root / RUNTIME_FILENAME)
+    monkeypatch.setattr(release_runtime, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
+    monkeypatch.setattr(core_bridge_adapters_v1, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
+    _write_release_assets_manifest(root)
+    return wheel_root, expected
 
 
 def test_load_core_bootstrap_config_binds_exact_packaged_pair(tmp_path: Path) -> None:
@@ -200,19 +250,6 @@ def test_load_core_bootstrap_config_rejects_unsealed_assets(
         load_core_bootstrap_config(root, source_commit=SOURCE_COMMIT)
 
 
-def test_bundled_asset_root_requires_absolute_pyinstaller_root(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    monkeypatch.setattr(sys, "_MEIPASS", str(tmp_path), raising=False)
-    assert bundled_core_asset_root() == tmp_path / "openevo" / "wheels"
-    assert bundled_daemon_asset_root() == tmp_path / "openevo" / "daemon"
-    assert bundled_managed_runtime_asset_root() == tmp_path / "openevo" / "runtime-assets"
-    monkeypatch.setattr(sys, "_MEIPASS", "relative")
-    with pytest.raises(ReleaseRuntimeConfigurationError):
-        bundled_core_asset_root()
-
-
 def test_load_core_bootstrap_config_without_runtime_archive_is_not_release_ready(
     tmp_path: Path,
 ) -> None:
@@ -237,7 +274,11 @@ def test_load_core_bootstrap_config_seals_exact_candidate_runtime_archive(
     monkeypatch.setattr(release_runtime, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
     monkeypatch.setattr(core_bridge_adapters_v1, "MANAGED_RUNTIME_ARCHIVE_RELEASE", expected)
 
-    config = load_core_bootstrap_config(wheel_root, source_commit=SOURCE_COMMIT)
+    config = load_core_bootstrap_config(
+        wheel_root,
+        runtime_asset_root=runtime_root,
+        source_commit=SOURCE_COMMIT,
+    )
 
     assert config.managed_runtime_archive is not None
     assert config.managed_runtime_archive.sha256 == expected.sha256
@@ -276,6 +317,95 @@ def test_candidate_runtime_archive_rejects_unsealed_input(
         )
 
 
+def test_packaged_release_manifest_binds_all_lazy_bootstrap_assets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_root = tmp_path / "openevo-release-assets"
+    wheel_root, expected_runtime = _packaged_release_assets(release_root, monkeypatch)
+
+    config = load_core_bootstrap_config(
+        wheel_root,
+        release_assets_root=release_root,
+        source_commit=SOURCE_COMMIT,
+        packaged_resource_assets=True,
+    )
+
+    assert config.daemon_bundle is not None
+    assert config.managed_runtime_archive is not None
+    assert config.managed_runtime_archive.sha256 == expected_runtime.sha256
+
+
+@pytest.mark.parametrize("linked_entry", ("root", "core"))
+def test_packaged_release_assets_reject_linked_resource_directories(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    linked_entry: str,
+) -> None:
+    real_root = tmp_path / "real-release-assets"
+    _packaged_release_assets(real_root, monkeypatch)
+    release_root = tmp_path / "openevo-release-assets"
+    if linked_entry == "root":
+        release_root.symlink_to(real_root, target_is_directory=True)
+    else:
+        release_root.mkdir(mode=0o700)
+        for name in ("daemon", "runtime", "release-assets.json"):
+            source = real_root / name
+            destination = release_root / name
+            if source.is_dir():
+                source.rename(destination)
+            else:
+                destination.write_bytes(source.read_bytes())
+        (release_root / "core").symlink_to(real_root / "core", target_is_directory=True)
+
+    with pytest.raises(ReleaseRuntimeConfigurationError):
+        load_core_bootstrap_config(
+            release_root / "core",
+            release_assets_root=release_root,
+            source_commit=SOURCE_COMMIT,
+            packaged_resource_assets=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("source_commit", "file_digest", "extra_root", "noncanonical"),
+)
+def test_packaged_release_manifest_rejects_composition_drift(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    release_root = tmp_path / "openevo-release-assets"
+    wheel_root, _expected_runtime = _packaged_release_assets(release_root, monkeypatch)
+    manifest_path = release_root / "release-assets.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if mutation == "source_commit":
+        manifest["source_commit"] = "f" * 40
+    elif mutation == "file_digest":
+        manifest["files"][0]["sha256"] = "f" * 64
+    elif mutation == "extra_root":
+        (release_root / "unexpected").mkdir()
+    else:
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    if mutation not in {"extra_root", "noncanonical"}:
+        manifest_path.write_text(
+            json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(ReleaseRuntimeConfigurationError):
+        load_core_bootstrap_config(
+            wheel_root,
+            release_assets_root=release_root,
+            source_commit=SOURCE_COMMIT,
+            packaged_resource_assets=True,
+        )
+
+
 def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> None:
     assets = _assets(tmp_path / "assets")
     provider_store = DesktopProviderStore(tmp_path / "state")
@@ -306,6 +436,99 @@ def test_release_runtime_composes_and_closes_owned_resources(tmp_path: Path) -> 
         session_lost=lambda _binding, _error: None,
     )
     runtime.close()
+    runtime.close()
+    lifecycle.close()
+    workspace_store.close()
+    provider_store.close()
+
+
+def test_release_runtime_does_not_read_remote_assets_before_first_core_use(
+    tmp_path: Path,
+) -> None:
+    provider_store = DesktopProviderStore(tmp_path / "state")
+    workspace_store = WorkspaceImportStore(
+        provider_store.state_root / "workspace-imports",
+        reconcile_on_open=False,
+    )
+    lifecycle = DesktopRemoteLifecycle(
+        ProviderKnownHostStore(
+            provider_store.state_root / "ssh-host-keys",
+            secure_ancestor=provider_store.state_root,
+        )
+    )
+    missing_assets = tmp_path / "assets-that-must-not-be-opened"
+
+    runtime = create_release_core_runtime(
+        provider_store=provider_store,
+        workspace_store=workspace_store,
+        remote_lifecycle=lifecycle,
+        asset_root=missing_assets / "core",
+        release_assets_root=missing_assets,
+        daemon_asset_root=missing_assets / "daemon",
+        runtime_asset_root=missing_assets / "runtime",
+        source_commit=SOURCE_COMMIT,
+        packaged_resource_assets=True,
+    )
+
+    assert not missing_assets.exists()
+    with pytest.raises(DesktopCoreBridgeErrorV1) as exc_info:
+        runtime.core_bridge._host_service.ensure_core(
+            "profile-1",
+            deadline=time.monotonic() + 1,
+        )
+    assert exc_info.value.error.code == "release_assets_initialization_failed"
+    assert exc_info.value.error.retryable is True
+
+    runtime.close()
+    lifecycle.close()
+    workspace_store.close()
+    provider_store.close()
+
+
+def test_deferred_release_asset_initialization_retries_after_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assets = _assets(tmp_path / "assets")
+    provider_store = DesktopProviderStore(tmp_path / "state")
+    workspace_store = WorkspaceImportStore(
+        provider_store.state_root / "workspace-imports",
+        reconcile_on_open=False,
+    )
+    lifecycle = DesktopRemoteLifecycle(
+        ProviderKnownHostStore(
+            provider_store.state_root / "ssh-host-keys",
+            secure_ancestor=provider_store.state_root,
+        )
+    )
+    original_loader = release_runtime.load_core_bootstrap_config
+    calls = 0
+
+    def load(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ReleaseRuntimeConfigurationError("injected first load failure")
+        return original_loader(*args, **kwargs)
+
+    monkeypatch.setattr(release_runtime, "load_core_bootstrap_config", load)
+    runtime = create_release_core_runtime(
+        provider_store=provider_store,
+        workspace_store=workspace_store,
+        remote_lifecycle=lifecycle,
+        asset_root=assets,
+        source_commit=SOURCE_COMMIT,
+    )
+    deferred = runtime.core_bridge._host_service
+
+    with pytest.raises(DesktopCoreBridgeErrorV1):
+        deferred._resolve()
+    resolved = deferred._resolve()
+
+    assert isinstance(resolved, release_runtime.DesktopCoreSshBridgeAdapterV1)
+    assert deferred._resolve() is resolved
+    assert calls == 2
+
     runtime.close()
     lifecycle.close()
     workspace_store.close()
@@ -593,9 +816,7 @@ def test_core_event_relay_skips_heartbeat_and_invalidates_on_change() -> None:
         SimpleNamespace(id="heartbeat-1", data=SimpleNamespace(root=heartbeat)),
         SimpleNamespace(
             id="run-change-1",
-            data=SimpleNamespace(
-                root=SimpleNamespace(sequence=2, event="run.updated.v1")
-            ),
+            data=SimpleNamespace(root=SimpleNamespace(sequence=2, event="run.updated.v1")),
         ),
         SimpleNamespace(id="project-change-1", data=SimpleNamespace(root=project_change)),
     )

@@ -105,9 +105,7 @@ def test_candidate_workflow_closes_managed_subscription_runtime_release() -> Non
 
 
 def test_candidate_workflow_roundtrips_closed_playwright_evidence() -> None:
-    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
-        encoding="utf-8"
-    )
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(encoding="utf-8")
     linux = workflow[
         workflow.index("  linux-daemon-bundle:") : workflow.index("  macos-candidate:")
     ]
@@ -131,9 +129,9 @@ def test_candidate_workflow_roundtrips_closed_playwright_evidence() -> None:
         '--raw-report "$RUNNER_TEMP/playwright-raw-report.json"',
         '--sanitized-report-output "$evidence_dir/playwright-report.json"',
         "validate-playwright-evidence",
-        "--source-commit \"$GITHUB_SHA\"",
-        "--run-id \"$GITHUB_RUN_ID\"",
-        "--run-attempt \"$GITHUB_RUN_ATTEMPT\"",
+        '--source-commit "$GITHUB_SHA"',
+        '--run-id "$GITHUB_RUN_ID"',
+        '--run-attempt "$GITHUB_RUN_ATTEMPT"',
         "playwright-candidate-evidence.json",
         "playwright-report.json",
         "packaged-web-manifest.json",
@@ -141,35 +139,39 @@ def test_candidate_workflow_roundtrips_closed_playwright_evidence() -> None:
     ):
         assert marker in linux
     preview_step = linux[
-        linux.index("      - name: Gate non-release simulator preview") :
-        linux.index("      - name: Produce packaged release-composition Playwright report")
+        linux.index("      - name: Gate non-release simulator preview") : linux.index(
+            "      - name: Produce packaged release-composition Playwright report"
+        )
     ]
     release_step = linux[
-        linux.index("      - name: Produce packaged release-composition Playwright report") :
-        linux.index("      - uses: actions/setup-python")
+        linux.index(
+            "      - name: Produce packaged release-composition Playwright report"
+        ) : linux.index("      - uses: actions/setup-python")
     ]
     assert "PLAYWRIGHT_BLOB_OUTPUT_FILE" not in preview_step
     assert "merge-reports" not in preview_step
     assert "test:product-browser:preview" not in release_step
-    assert linux.index("npm run test:product-browser:preview") < linux.index(
-        "npm run test:product-browser:release-readonly"
-    ) < linux.index("npx playwright merge-reports") < linux.index(
-        "write-playwright-evidence"
-    ) < linux.index(
-        "Upload immutable candidate Playwright evidence"
+    assert (
+        linux.index("npm run test:product-browser:preview")
+        < linux.index("npm run test:product-browser:release-readonly")
+        < linux.index("npx playwright merge-reports")
+        < linux.index("write-playwright-evidence")
+        < linux.index("Upload immutable candidate Playwright evidence")
     )
     for marker in (
         artifact_name,
         "Revalidate candidate Playwright evidence on macOS",
         "validate-playwright-evidence",
-        "cmp \"$RUNNER_TEMP/openevo-desktop-playwright/packaged-web-manifest.json\"",
+        'cmp "$RUNNER_TEMP/openevo-desktop-playwright/packaged-web-manifest.json"',
         "candidate-artifacts/",
     ):
         assert marker in macos
     copy_step = macos[macos.index("      - name: Copy exact candidate bytes") :]
-    assert macos.index("Download exact candidate Playwright evidence") < macos.index(
-        "Revalidate candidate Playwright evidence on macOS"
-    ) < macos.index("Build unsigned Desktop DMG")
+    assert (
+        macos.index("Download exact candidate Playwright evidence")
+        < macos.index("Revalidate candidate Playwright evidence on macOS")
+        < macos.index("Build unsigned Desktop DMG")
+    )
     assert copy_step.index("playwright-candidate-evidence.json") < copy_step.index(
         "openevo_release_candidate.py create"
     )
@@ -537,10 +539,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     assert by_role["managed_runtime_source"]["filename"] == "managed-runtime-source.json"
     assert by_role["playwright_evidence"]["filename"] == candidate.PLAYWRIGHT_EVIDENCE_NAME
     assert by_role["playwright_report"]["filename"] == candidate.PLAYWRIGHT_REPORT_NAME
-    assert (
-        by_role["packaged_web_manifest"]["filename"]
-        == candidate.PACKAGED_WEB_MANIFEST_NAME
-    )
+    assert by_role["packaged_web_manifest"]["filename"] == candidate.PACKAGED_WEB_MANIFEST_NAME
     assert payload["core"]["registry_digest"] == "a" * 64
     assert payload["daemon"]["artifact_sha256"] == by_role["daemon_bundle"]["sha256"]
     assert payload["daemon"]["manifest_sha256"] == by_role["daemon_manifest"]["sha256"]
@@ -621,10 +620,14 @@ def test_candidate_manifest_rejects_unverified_daemon_dmg_evidence(tmp_path: Pat
     _write_candidate_inputs(tmp_path)
     evidence_path = tmp_path / candidate.DAEMON_COPY_EVIDENCE_NAME
     evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-    evidence["daemon_bundle"]["sha256"] = "f" * 64
+    next(
+        entry
+        for entry in evidence["release_assets"]["files"]
+        if entry["relative_path"].endswith("/openevo-daemon-linux-x86_64")
+    )["sha256"] = "f" * 64
     _write_json(evidence_path, evidence)
 
-    with pytest.raises(candidate.CandidateError, match="exact packaged daemon_bundle"):
+    with pytest.raises(candidate.CandidateError, match="exact packaged release assets"):
         candidate.create_candidate_manifest(
             tmp_path,
             source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
@@ -810,9 +813,7 @@ def test_playwright_candidate_evidence_binds_report_web_build_and_run(
         "release-packaged-1024",
         "release-packaged-760",
     }
-    assert evidence["packaged_web"]["manifest"]["sha256"] == _sha256(
-        paths["web_manifest"]
-    )
+    assert evidence["packaged_web"]["manifest"]["sha256"] == _sha256(paths["web_manifest"])
     assert evidence["report"]["sha256"] == _sha256(paths["report"])
     sanitized_report = paths["report"].read_text(encoding="utf-8")
     assert "/home/runner" not in sanitized_report
@@ -1673,31 +1674,61 @@ def _write_candidate_inputs(
         copied_smoke_evidence["mach_o"][binary]["slices"] = dmg_slices or ["arm64"]
     _write_json(root / "app-bundle-smoke.json", mounted_smoke_evidence)
     _write_json(root / "dmg-copy-smoke.json", copied_smoke_evidence)
-    daemon_resource = {
-        "daemon_bundle": {
-            "byte_size": daemon_bundle.stat().st_size,
-            "filename": daemon_bundle.name,
-            "relative_path": "Contents/Resources/openevo-daemon/openevo-daemon-linux-x86_64",
-            "sha256": _sha256(daemon_bundle),
+    candidate = _load_module()
+    source_commit = "8e45af371eef49a86530a849041f7dcf047620ec"
+    release_files = [
+        {
+            "relative_path": "core/framework-lock.json",
+            "sha256": _sha256(framework_lock),
+            "byte_size": framework_lock.stat().st_size,
         },
-        "daemon_manifest": {
-            "byte_size": daemon_manifest.stat().st_size,
-            "filename": daemon_manifest.name,
-            "relative_path": "Contents/Resources/openevo-daemon/openevo-daemon-bundle.json",
+        {
+            "relative_path": f"core/{wheel.name}",
+            "sha256": _sha256(wheel),
+            "byte_size": wheel.stat().st_size,
+        },
+        {
+            "relative_path": f"daemon/{daemon_manifest.name}",
             "sha256": _sha256(daemon_manifest),
+            "byte_size": daemon_manifest.stat().st_size,
         },
+        {
+            "relative_path": f"daemon/{daemon_bundle.name}",
+            "sha256": _sha256(daemon_bundle),
+            "byte_size": daemon_bundle.stat().st_size,
+        },
+        {
+            "relative_path": f"runtime/{candidate.MANAGED_RUNTIME_ARCHIVE_NAME}",
+            "sha256": candidate.MANAGED_RUNTIME_ARCHIVE_SHA256,
+            "byte_size": candidate.MANAGED_RUNTIME_ARCHIVE_SIZE,
+        },
+    ]
+    release_manifest = candidate._canonical_json(
+        {"files": release_files, "schema_version": 1, "source_commit": source_commit}
+    )
+    daemon_resource = {
         "launch_origin": "mounted_dmg",
-        "schema_version": 1,
-        "source_dmg": {
-            "filename": dmg.name,
-            "sha256": _sha256(dmg),
+        "release_assets": {
+            "files": [
+                {
+                    **entry,
+                    "relative_path": f"{candidate.RELEASE_ASSETS_RESOURCE_ROOT}/{entry['relative_path']}",
+                }
+                for entry in release_files
+            ],
+            "manifest": {
+                "byte_size": len(release_manifest),
+                "relative_path": f"{candidate.RELEASE_ASSETS_RESOURCE_ROOT}/{candidate.RELEASE_ASSETS_MANIFEST_NAME}",
+                "sha256": hashlib.sha256(release_manifest).hexdigest(),
+            },
         },
+        "schema_version": 2,
+        "source_dmg": {"filename": dmg.name, "sha256": _sha256(dmg)},
     }
     _write_json(root / "daemon-mounted-resource.json", daemon_resource)
     copied_daemon_resource = json.loads(json.dumps(daemon_resource))
     copied_daemon_resource["launch_origin"] = "detached_copy"
     _write_json(root / "daemon-copy-resource.json", copied_daemon_resource)
-    candidate = _load_module()
     _write_json(
         root / candidate.MANAGED_RUNTIME_SOURCE_NAME,
         candidate._managed_runtime_source_evidence(),
@@ -1839,8 +1870,7 @@ def _write_playwright_inputs(
             "config": {
                 "rootDir": "/home/runner/work/private-checkout/desktop/tests/product-browser",
                 "projects": [
-                    {"id": project, "name": project}
-                    for project in candidate.PLAYWRIGHT_VIEWPORTS
+                    {"id": project, "name": project} for project in candidate.PLAYWRIGHT_VIEWPORTS
                 ],
                 "webServer": {
                     "command": "npm run dev -- --host 127.0.0.1",

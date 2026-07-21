@@ -248,10 +248,9 @@ def _require_asset_match(
     candidate: Mapping[str, object],
     label: str,
 ) -> None:
-    if (
-        evidence.get("sha256") != candidate.get("sha256")
-        or evidence.get("byte_size") != candidate.get("byte_size")
-    ):
+    if evidence.get("sha256") != candidate.get("sha256") or evidence.get(
+        "byte_size"
+    ) != candidate.get("byte_size"):
         raise EvidenceError(f"{label} does not match the candidate manifest")
 
 
@@ -347,10 +346,7 @@ def _artifact(
         artifact["source_artifact_count"], f"{label} source artifact count"
     )
     source_artifact_ids = artifact["source_artifact_ids_sha256"]
-    if (
-        not isinstance(source_artifact_ids, list)
-        or len(source_artifact_ids) != source_artifacts
-    ):
+    if not isinstance(source_artifact_ids, list) or len(source_artifact_ids) != source_artifacts:
         raise EvidenceError(f"{label} source artifact identities are incomplete")
     for index, source_artifact_id in enumerate(source_artifact_ids):
         _sha256(source_artifact_id, f"{label} source artifact {index}")
@@ -497,7 +493,10 @@ def _session(value: object, *, ordinal: int) -> dict[str, object]:
         raise EvidenceError(f"{label} runtime context is invalid")
     receipt = session["runtime_context_receipt_sha256"]
     if ordinal == 1:
-        if receipt is not None or session["runtime_context_receipt_core_provenance_verified"] is not False:
+        if (
+            receipt is not None
+            or session["runtime_context_receipt_core_provenance_verified"] is not False
+        ):
             raise EvidenceError("session 1 unexpectedly reports successor injection")
     else:
         _sha256(receipt, "session 2 runtime-context receipt")
@@ -659,7 +658,9 @@ def validate_evidence(
             "managed_runtime_archive",
             "daemon_bundle",
             "daemon_manifest",
-            "exact_embedded_assets_verified",
+            "external_release_assets",
+            "exact_external_release_assets_verified",
+            "slim_sidecar_excludes_remote_release_assets_verified",
         },
     )
     _asset_identity(assets["sidecar"], "Desktop sidecar")
@@ -685,8 +686,21 @@ def validate_evidence(
     managed_runtime = _asset_identity(assets["managed_runtime_archive"], "managed runtime")
     daemon_bundle = _asset_identity(assets["daemon_bundle"], "Daemon bundle")
     daemon_manifest = _asset_identity(assets["daemon_manifest"], "Daemon manifest")
-    if assets["exact_embedded_assets_verified"] is not True:
-        raise EvidenceError("embedded release assets were not verified")
+    external_assets = _exact_mapping(
+        assets["external_release_assets"],
+        "external release assets",
+        {"source_commit", "registry_digest", "manifest_sha256", "byte_size"},
+    )
+    if external_assets["source_commit"] != expected_source_commit:
+        raise EvidenceError("external release assets do not bind the candidate source")
+    _sha256(external_assets["registry_digest"], "external release asset registry")
+    _sha256(external_assets["manifest_sha256"], "external release asset manifest")
+    _positive_int(external_assets["byte_size"], "external release asset manifest byte size")
+    if (
+        assets["exact_external_release_assets_verified"] is not True
+        or assets["slim_sidecar_excludes_remote_release_assets_verified"] is not True
+    ):
+        raise EvidenceError("external release assets were not verified")
     for evidence_asset, role, label in (
         (wheel, roles["core_wheel"], "Core wheel"),
         (framework_lock, roles["framework_lock"], "framework lock"),
@@ -763,18 +777,15 @@ def validate_evidence(
     if (
         binding["source_commit"] != expected_source_commit
         or binding["candidate_version"] != candidate["version"]
-        or binding["release_candidate_manifest_sha256"]
-        != expected_candidate_manifest_sha256
+        or binding["release_candidate_manifest_sha256"] != expected_candidate_manifest_sha256
         or binding["source_checkout_verified"] is not True
         or binding["candidate_native_sidecar_smoke_verified"] is not True
         or binding["cross_platform_source_equivalent_verified"] is not True
         or binding["desktop_dmg_sha256"] != roles["desktop_dmg"]["sha256"]
         or binding["app_bundle_smoke_sha256"] != roles["app_bundle_smoke"]["sha256"]
-        or binding["candidate_packaged_sidecar_sha256"]
-        != candidate_packaged_sidecar_sha256
+        or binding["candidate_packaged_sidecar_sha256"] != candidate_packaged_sidecar_sha256
         or binding["science_sidecar_sha256"] != assets["sidecar"]["sha256"]
-        or binding["packaged_web_manifest_sha256"]
-        != roles["packaged_web_manifest"]["sha256"]
+        or binding["packaged_web_manifest_sha256"] != roles["packaged_web_manifest"]["sha256"]
         or binding["playwright_candidate_evidence_sha256"]
         != roles["playwright_evidence"]["sha256"]
     ):
@@ -808,6 +819,8 @@ def validate_evidence(
     )
     _sha256(project["project_id_sha256"], "project ID")
     _sha256(project["registry_digest"], "project registry")
+    if project["registry_digest"] != external_assets["registry_digest"]:
+        raise EvidenceError("project registry differs from the packaged release assets")
     _positive_int(project["validation_check_count"], "project validation checks")
     method_ids = _exact_mapping(project["method_ids"], "method identities", set(TARGETS))
     allowed_concrete = _exact_mapping(
@@ -819,7 +832,10 @@ def validate_evidence(
         if (
             not isinstance(values, list)
             or not values
-            or any(not isinstance(value, str) or not value or value.strip() != value for value in values)
+            or any(
+                not isinstance(value, str) or not value or value.strip() != value
+                for value in values
+            )
             or values != sorted(set(values))
         ):
             raise EvidenceError(f"allowed concrete methods for {target_id} are invalid")
@@ -846,14 +862,18 @@ def validate_evidence(
     session_values = document["sessions"]
     if not isinstance(session_values, list) or len(session_values) != 2:
         raise EvidenceError("real-science evidence does not contain two sessions")
-    sessions = [_session(value, ordinal=ordinal) for ordinal, value in enumerate(session_values, 1)]
+    sessions = [
+        _session(value, ordinal=ordinal) for ordinal, value in enumerate(session_values, 1)
+    ]
     first, second = sessions
     if first["run_id_sha256"] == second["run_id_sha256"]:
         raise EvidenceError("real-science sessions do not have distinct run identities")
     for session in sessions:
         for target_id, artifact in session["artifacts_by_target"].items():
             if artifact["method_id"] not in allowed_concrete[target_id]:
-                raise EvidenceError("artifact method is not bound to the remote capability selection")
+                raise EvidenceError(
+                    "artifact method is not bound to the remote capability selection"
+                )
     if second["pinned_revision"] != first["produced_revision"]:
         raise EvidenceError("session 2 did not pin session 1's successor")
     for target_id in TARGETS:
@@ -898,8 +918,7 @@ def validate_evidence(
     successor_revision = _revision(reuse["successor_project_head"], "reuse successor")
     if (
         successor_revision != first["produced_revision"]
-        or reuse["runtime_context_receipt_sha256"]
-        != second["runtime_context_receipt_sha256"]
+        or reuse["runtime_context_receipt_sha256"] != second["runtime_context_receipt_sha256"]
     ):
         raise EvidenceError("cross-session reuse identities are inconsistent")
 
@@ -933,25 +952,21 @@ def validate_evidence(
         or renderer["outcome"] != "passed"
         or renderer["provider_kind"] != "desktop_sidecar"
         or renderer["source_commit"] != expected_source_commit
-        or renderer["packaged_web_build_digest"]
-        != binding["packaged_web_build_digest"]
+        or renderer["packaged_web_build_digest"] != binding["packaged_web_build_digest"]
         or renderer["renderer_ready"] is not True
         or renderer["builtin_sample_count"] != 2
         or renderer["independent_target_controls_verified"] is not True
         or renderer["remote_method_selection_verified"] is not True
         or renderer["project_id_sha256"] != project["project_id_sha256"]
         or renderer["session_count"] != 2
-        or renderer["project_head_generation"]
-        != second["produced_revision"]["generation"]
+        or renderer["project_head_generation"] != second["produced_revision"]["generation"]
     ):
         raise EvidenceError("renderer result is not bound to the completed workflow")
     renderer_timeline = _exact_mapping(
         renderer["timeline"], "renderer timeline", {"count", "phase_values"}
     )
     expected_phase_values = {
-        phase
-        for session in sessions
-        for phase in session["timeline"]["phase_values"]
+        phase for session in sessions for phase in session["timeline"]["phase_values"]
     }
     if (
         renderer_timeline["count"]
@@ -969,10 +984,7 @@ def validate_evidence(
     ):
         raise EvidenceError("renderer logs do not include the latest session")
     renderer_artifacts = renderer["artifacts"]
-    if (
-        not isinstance(renderer_artifacts, list)
-        or len(renderer_artifacts) != len(TARGETS)
-    ):
+    if not isinstance(renderer_artifacts, list) or len(renderer_artifacts) != len(TARGETS):
         raise EvidenceError("renderer did not observe all release evolution targets")
     observed_renderer_targets: set[str] = set()
     for value in renderer_artifacts:
@@ -1001,8 +1013,7 @@ def validate_evidence(
             or item["content_sha256"] != expected_artifact["content_sha256"]
             or item["document_count"] != expected_inspection["document_count"]
             or item["total_utf8_bytes"] != expected_inspection["total_utf8_bytes"]
-            or item["runtime_document_sha256"]
-            != expected_inspection["runtime_document_sha256"]
+            or item["runtime_document_sha256"] != expected_inspection["runtime_document_sha256"]
         ):
             raise EvidenceError("renderer artifact does not match session 2")
         observed_renderer_targets.add(target_id)
