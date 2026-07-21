@@ -86,6 +86,17 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   await expect(page.getByRole("heading", { name: "Enzyme Kinetics Model Review" })).toBeVisible();
   await assertViewportSafety(page, testInfo.project.name);
   await expect(page).toHaveScreenshot("release-packaged-research.png");
+  let researchCoveredThrough = page.viewportSize()?.height ?? 0;
+  if (testInfo.project.name === "release-packaged-760") {
+    await page.evaluate(() => window.scrollTo(0, 600));
+    await expect(page).toHaveScreenshot("release-packaged-research-middle-1.png");
+    await page.evaluate(() => window.scrollTo(0, 1_200));
+    await expect(page).toHaveScreenshot("release-packaged-research-middle-2.png");
+    researchCoveredThrough = 1_800;
+  }
+  await scrollToPageEndWithoutCoverageGap(page, researchCoveredThrough);
+  await expect(page.locator(".sample-trace-entry").last()).toBeVisible();
+  await expect(page).toHaveScreenshot("release-packaged-research-detail.png");
 
   const selectedSession = page.locator('.sample-session-card[aria-selected="true"]');
   await selectedSession.focus();
@@ -122,14 +133,18 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   const agentSystemArtifact = page.getByText("AGENTS.md", { exact: true });
   await agentSystemArtifact.scrollIntoViewIfNeeded();
   await assertViewportSafety(page, testInfo.project.name);
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await expect(page.getByRole("heading", { name: "How OpenEvo improved this project" })).toBeInViewport();
+  await expect(page).toHaveScreenshot("release-packaged-evolution.png");
+  let evolutionCoveredThrough = page.viewportSize()?.height ?? 0;
   if (testInfo.project.name === "release-packaged-760") {
-    await expect(agentSystemArtifact).toBeInViewport();
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await expect(page.getByRole("heading", { name: "How OpenEvo improved this project" })).toBeInViewport();
-    await expect(page).toHaveScreenshot("release-packaged-evolution.png");
-  } else {
-    await expect(page).toHaveScreenshot("release-packaged-evolution.png");
+    await page.evaluate(() => window.scrollTo(0, 600));
+    await expect(page).toHaveScreenshot("release-packaged-evolution-middle.png");
+    evolutionCoveredThrough = 1_200;
   }
+  await scrollToPageEndWithoutCoverageGap(page, evolutionCoveredThrough);
+  await expect(page.locator(".sample-artifact-document pre")).toBeVisible();
+  await expect(page).toHaveScreenshot("release-packaged-evolution-detail.png");
 
   const system = page.getByRole("button", { name: "System", exact: true });
   await system.focus();
@@ -479,6 +494,24 @@ async function assertAccessibility(page: Page): Promise<void> {
     (violation) => violation.impact === "serious" || violation.impact === "critical",
   );
   expect(blockingViolations, JSON.stringify(blockingViolations, null, 2)).toEqual([]);
+}
+
+async function scrollToPageEndWithoutCoverageGap(
+  page: Page,
+  coveredThrough: number,
+): Promise<void> {
+  const position = await page.evaluate(() => {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    return {
+      scrollTop: window.scrollY,
+      viewportHeight: window.innerHeight,
+      scrollHeight: document.documentElement.scrollHeight,
+    };
+  });
+  expect(position.scrollTop, "the final visual snapshot must overlap prior coverage")
+    .toBeLessThanOrEqual(coveredThrough);
+  expect(position.scrollTop + position.viewportHeight)
+    .toBeGreaterThanOrEqual(position.scrollHeight - 1);
 }
 
 async function assertViewportSafety(page: Page, projectName: string): Promise<void> {

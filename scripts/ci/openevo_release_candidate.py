@@ -81,7 +81,7 @@ PLAYWRIGHT_REQUIRED_CASES = frozenset(
                 "release-packaged-760",
             ),
             "release-readonly.pw.ts",
-            "first launch uses the release sidecar composition and keeps its sample read-only",
+            "first launch uses the release sidecar composition and keeps demo navigation non-mutating",
         ),
     )
     for project in projects

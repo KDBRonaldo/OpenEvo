@@ -1807,7 +1807,7 @@ def _write_playwright_inputs(
         ): 66,
         (
             "release-readonly.pw.ts",
-            "first launch uses the release sidecar composition and keeps its sample read-only",
+            "first launch uses the release sidecar composition and keeps demo navigation non-mutating",
         ): 33,
     }
     for project, file, title in sorted(candidate.PLAYWRIGHT_REQUIRED_CASES):

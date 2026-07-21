@@ -16,9 +16,18 @@ test("first-run sample is accessible, keyboard-operable, and viewport-safe", asy
   await expect(page.getByText("3 components improved", { exact: true })).toBeVisible();
   await assertViewportSafety(page);
   await assertAccessibility(page);
-  await expect(page).toHaveScreenshot("scientific-project-research.png", {
-    fullPage: true,
-  });
+  await expect(page).toHaveScreenshot("scientific-project-research.png");
+  let researchCoveredThrough = page.viewportSize()?.height ?? 0;
+  if (page.viewportSize()?.width === 760) {
+    await page.evaluate(() => window.scrollTo(0, 600));
+    await expect(page).toHaveScreenshot("scientific-project-research-middle-1.png");
+    await page.evaluate(() => window.scrollTo(0, 1_200));
+    await expect(page).toHaveScreenshot("scientific-project-research-middle-2.png");
+    researchCoveredThrough = 1_800;
+  }
+  await scrollToPageEndWithoutCoverageGap(page, researchCoveredThrough);
+  await expect(page.locator(".sample-trace-entry").last()).toBeVisible();
+  await expect(page).toHaveScreenshot("scientific-project-research-detail.png");
 
   const selectedSession = page.locator('.sample-session-card[aria-selected="true"]');
   await selectedSession.focus();
@@ -40,9 +49,16 @@ test("first-run sample is accessible, keyboard-operable, and viewport-safe", asy
   await assertViewportSafety(page);
   await assertAccessibility(page);
   await page.evaluate(() => window.scrollTo(0, 0));
-  await expect(page).toHaveScreenshot("scientific-project-evolution.png", {
-    fullPage: true,
-  });
+  await expect(page).toHaveScreenshot("scientific-project-evolution.png");
+  let evolutionCoveredThrough = page.viewportSize()?.height ?? 0;
+  if (page.viewportSize()?.width === 760) {
+    await page.evaluate(() => window.scrollTo(0, 600));
+    await expect(page).toHaveScreenshot("scientific-project-evolution-middle.png");
+    evolutionCoveredThrough = 1_200;
+  }
+  await scrollToPageEndWithoutCoverageGap(page, evolutionCoveredThrough);
+  await expect(page.locator(".sample-artifact-document pre")).toBeVisible();
+  await expect(page).toHaveScreenshot("scientific-project-evolution-detail.png");
 });
 
 async function assertAccessibility(page: import("@playwright/test").Page): Promise<void> {
@@ -53,6 +69,24 @@ async function assertAccessibility(page: import("@playwright/test").Page): Promi
     (violation) => violation.impact === "serious" || violation.impact === "critical",
   );
   expect(blockingViolations, JSON.stringify(blockingViolations, null, 2)).toEqual([]);
+}
+
+async function scrollToPageEndWithoutCoverageGap(
+  page: import("@playwright/test").Page,
+  coveredThrough: number,
+): Promise<void> {
+  const position = await page.evaluate(() => {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+    return {
+      scrollTop: window.scrollY,
+      viewportHeight: window.innerHeight,
+      scrollHeight: document.documentElement.scrollHeight,
+    };
+  });
+  expect(position.scrollTop, "the final visual snapshot must overlap prior coverage")
+    .toBeLessThanOrEqual(coveredThrough);
+  expect(position.scrollTop + position.viewportHeight)
+    .toBeGreaterThanOrEqual(position.scrollHeight - 1);
 }
 
 async function assertViewportSafety(page: import("@playwright/test").Page): Promise<void> {
