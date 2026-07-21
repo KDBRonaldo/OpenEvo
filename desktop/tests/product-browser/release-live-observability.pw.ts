@@ -299,7 +299,9 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
   await page.getByRole("button", { name: "Edit project", exact: true }).click();
   await expect(page.getByRole("dialog", { name: "Research configuration" })).toBeVisible();
   await expect(page.getByLabel("Codex model", { exact: true })).toHaveValue(handoff.expected.codex_model);
-  await expect(page.getByLabel("Reasoning effort", { exact: true })).toHaveValue(handoff.expected.reasoning_effort);
+  await expect(page.getByRole("combobox", { name: "Reasoning effort", exact: true })).toHaveValue(
+    handoff.expected.reasoning_effort,
+  );
   for (const target of TARGETS) {
     const targetRow = page.locator(`.target-toggle[data-target-id="${target}"]`);
     await expect(targetRow.getByRole("switch")).toBeChecked();
