@@ -1,4 +1,4 @@
-# OpenEvo Preview User Documentation
+# OpenEvo Desktop User Guide
 
 OpenEvo Preview has two applications:
 
@@ -11,8 +11,8 @@ Version `0.1.3` is the current immutable Preview described by these guides. Its
 exact DMG and `SHA256SUMS` are available in the
 [OpenEvo Desktop 0.1.3 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.3-exhibition.29756612736.1).
 The Preview DMG is unsigned and not notarized. Open it only after checking the
-exact checksum in the quickstart. Earlier Preview releases are retained only as
-historical evidence.
+exact checksum in the quickstart. Use the current release unless a maintainer
+has asked you to reproduce an older version.
 
 ## Start Here
 
@@ -37,10 +37,9 @@ This Preview packages:
 
 It does not support Self-Deployed execution, parameter or adapter evolution,
 other agent harnesses, a public CLI or PyPI installation, in-session evolution,
-or automatic Codex login. Its publication workflow verifies the exact Desktop
-and Daemon package composition, but it has no canonical two-session science gate
-or general clean-host support evidence. Use it only for the documented
-exhibition profile.
+or automatic Codex login. It supports only the documented exhibition host
+profile and should not be treated as a general Linux deployment or a
+production-critical research service.
 
 Desktop uploads and installs the version-matched OpenEvo Daemon and managed
 science runtime, starts the remote services, and maintains the private tunnel.

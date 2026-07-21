@@ -1,9 +1,7 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the published `0.1.3` exhibition Preview. The Preview
-publication workflow verifies the exact packaged applications and assets, but
-it does not establish the canonical two-session science gate or general host
-support.
+This guide describes the published `0.1.3` exhibition Preview and its supported
+Apple Silicon Mac plus Linux Docker-host profile.
 
 ## Before You Start
 
@@ -122,10 +120,10 @@ to operate OpenEvo.
    artifacts and their changes.
 4. Start a second session in the same project.
 
-The canonical product requires evolution to affect only later sessions and
-requires Desktop to block stale or partial successor state. The `0.1.3` v1
-Preview does not yet prove that complete authority contract. Do not use it for
-work that depends on atomic cross-session guarantees.
+Evolution is designed to affect only later sessions. Wait until Desktop shows
+that the current session and its evolution work have completed before starting
+the next session. Treat successor state in this Preview as experimental and do
+not use it for production-critical work.
 
 Transcript mode does not provide token IDs, loss masks, or token-level
 log-probability metrics.

@@ -184,16 +184,32 @@ jobs:
             exit 1
           fi
 
-      - name: Download the exact candidate manifest by validated asset ID
+      - name: Download candidate-owned publication verification inputs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: openevo-desktop-publication-inputs-${{ inputs.expected_source_sha }}-${{ inputs.candidate_workflow_run_id }}-${{ inputs.candidate_workflow_run_attempt }}
+          path: ${{ runner.temp }}/candidate-publication-inputs
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.candidate_workflow_run_id }}
+
+      - name: Bind the exact candidate manifest from the validated workflow run
         env:
           EXPECTED_MANIFEST_SHA256: ${{ inputs.expected_release_candidate_manifest_sha256 }}
-          GH_TOKEN: ${{ github.token }}
         run: |
+          inputs="$RUNNER_TEMP/candidate-publication-inputs"
+          test "$(find "$inputs" -mindepth 1 -maxdepth 1 | wc -l | tr -d ' ')" = 2
+          test "$(find "$inputs" -maxdepth 1 -type f | wc -l | tr -d ' ')" = 2
+          test -z "$(find "$inputs" -type l -print -quit)"
+          source="$inputs/release-candidate.json"
+          target="$RUNNER_TEMP/candidate-verification/release-candidate.json"
+          test -f "$source"
+          test ! -L "$source"
           asset_id="$(python - <<'PY'
           import json
           import os
           from pathlib import Path
 
+          source = Path(os.environ["RUNNER_TEMP"]) / "candidate-publication-inputs/release-candidate.json"
           snapshot = json.loads(
               (Path(os.environ["RUNNER_TEMP"]) / "candidate-verification/preview-release-snapshot.json")
               .read_text(encoding="utf-8")
@@ -203,22 +219,19 @@ jobs:
               for asset in snapshot.get("assets", [])
               if asset.get("name") == "release-candidate.json"
               and asset.get("sha256") == os.environ["EXPECTED_MANIFEST_SHA256"]
+              and asset.get("size") == source.stat().st_size
           ]
           if len(matches) != 1 or type(matches[0].get("id")) is not int or matches[0]["id"] < 1:
               raise SystemExit("Validated snapshot does not identify release-candidate.json")
           print(matches[0]["id"])
           PY
           )"
-          target="$RUNNER_TEMP/candidate-verification/release-candidate.json"
-          gh api \
-            -H "Accept: application/octet-stream" \
-            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-            > "$target"
+          [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
+          test "$(sha256sum "$source" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
+          install -m 0600 "$source" "$target"
           test "$(sha256sum "$target" | awk '{print $1}')" = "$EXPECTED_MANIFEST_SHA256"
 
-      - name: Download the exact candidate native-sidecar smoke by validated asset ID
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Bind the exact candidate native-sidecar smoke from the validated workflow run
         run: |
           python - <<'PY' > "$RUNNER_TEMP/candidate-app-smoke-identity.txt"
           import json
@@ -250,11 +263,13 @@ jobs:
           [[ "$asset_id" =~ ^[1-9][0-9]*$ ]]
           [[ "$expected_sha256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$expected_size" =~ ^[1-9][0-9]*$ ]]
+          source="$RUNNER_TEMP/candidate-publication-inputs/app-bundle-smoke.json"
           target="$RUNNER_TEMP/candidate-verification/app-bundle-smoke.json"
-          gh api \
-            -H "Accept: application/octet-stream" \
-            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-            > "$target"
+          test -f "$source"
+          test ! -L "$source"
+          test "$(sha256sum "$source" | awk '{print $1}')" = "$expected_sha256"
+          test "$(stat -c '%s' "$source")" = "$expected_size"
+          install -m 0600 "$source" "$target"
           test "$(sha256sum "$target" | awk '{print $1}')" = "$expected_sha256"
           test "$(stat -c '%s' "$target")" = "$expected_size"
 

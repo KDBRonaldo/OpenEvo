@@ -2635,6 +2635,30 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "${{ github.run_id }}-${{ github.run_attempt }}"
     )
     assert text.count(candidate_artifact_name) == 3
+    publication_inputs_name = (
+        "openevo-desktop-publication-inputs-${{ github.sha }}-"
+        "${{ github.run_id }}-${{ github.run_attempt }}"
+    )
+    assert text.count(publication_inputs_name) == 1
+    parsed_candidate = yaml.safe_load(text)
+    publication_upload = next(
+        step
+        for step in parsed_candidate["jobs"]["macos-candidate"]["steps"]
+        if step.get("name") == "Upload immutable publication verification inputs"
+    )
+    assert publication_upload == {
+        "name": "Upload immutable publication verification inputs",
+        "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+        "with": {
+            "name": publication_inputs_name,
+            "path": (
+                "candidate-artifacts/release-candidate.json\n"
+                "candidate-artifacts/app-bundle-smoke.json\n"
+            ),
+            "if-no-files-found": "error",
+            "retention-days": 14,
+        },
+    }
     assert "openevo-desktop-candidate-${{ github.sha }}\n" not in text
     assert "if: failure() && steps.release.outputs.tag != ''" not in text
     assert text.count("contents: write") == 1
@@ -2858,7 +2882,7 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert workflow.count("write-preview-asset-plan") == 1
     assert workflow.count("snapshot-preview") == 1
     assert "postpublication-release-rest.json" in workflow
-    assert workflow.count("releases/assets/${asset_id}") == 3
+    assert workflow.count("releases/assets/${asset_id}") == 1
     assert workflow.count('test ! -e "$public_dir"') == 1
     assert workflow.count('method="PATCH"') == 1
     assert workflow.count("b'{\"draft\":false}'") == 1
@@ -2903,10 +2927,11 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert "After candidate creation, stable may add only" in read_only_job
     assert "/releases?" not in read_only_job
     assert "/releases/${EXPECTED_RELEASE_ID}" not in read_only_job
-    assert read_only_job.count("releases/assets/${asset_id}") == 2
+    assert "releases/assets/${asset_id}" not in read_only_job
     assert '--candidate-manifest "$RUNNER_TEMP/candidate-verification/release-candidate.json"' in read_only_job
     assert '--candidate-app-bundle-smoke "$RUNNER_TEMP/candidate-verification/app-bundle-smoke.json"' in read_only_job
     assert "contents: write" in write_job
+    assert 'with open_asset(asset["id"]) as response:' in write_job
     assert "actions/checkout@" not in write_job
     assert "scripts/ci/" not in write_job
     assert "data only" in write_job
@@ -2931,6 +2956,49 @@ def test_preview_publisher_is_numeric_id_visibility_only_and_fail_closed() -> No
     assert "needs: publish-preview" in post_job
 
     parsed = yaml.safe_load(workflow)
+    verify_steps = parsed["jobs"]["verify-preview"]["steps"]
+    publication_download = next(
+        step
+        for step in verify_steps
+        if step.get("name") == "Download candidate-owned publication verification inputs"
+    )
+    assert publication_download == {
+        "name": "Download candidate-owned publication verification inputs",
+        "uses": "actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093",
+        "with": {
+            "name": (
+                "openevo-desktop-publication-inputs-${{ inputs.expected_source_sha }}-"
+                "${{ inputs.candidate_workflow_run_id }}-"
+                "${{ inputs.candidate_workflow_run_attempt }}"
+            ),
+            "path": "${{ runner.temp }}/candidate-publication-inputs",
+            "github-token": "${{ github.token }}",
+            "run-id": "${{ inputs.candidate_workflow_run_id }}",
+        },
+    }
+    manifest_binding = next(
+        step
+        for step in verify_steps
+        if step.get("name")
+        == "Bind the exact candidate manifest from the validated workflow run"
+    )["run"]
+    assert 'find "$inputs" -mindepth 1 -maxdepth 1' in manifest_binding
+    assert 'find "$inputs" -maxdepth 1 -type f' in manifest_binding
+    assert 'find "$inputs" -type l -print -quit' in manifest_binding
+    assert 'asset.get("size") == source.stat().st_size' in manifest_binding
+    assert 'sha256sum "$source"' in manifest_binding
+    assert 'install -m 0600 "$source" "$target"' in manifest_binding
+    smoke_binding = next(
+        step
+        for step in verify_steps
+        if step.get("name")
+        == "Bind the exact candidate native-sidecar smoke from the validated workflow run"
+    )["run"]
+    assert 'asset.get("sha256") == role.get("sha256")' in smoke_binding
+    assert 'asset.get("size") == role.get("byte_size")' in smoke_binding
+    assert 'sha256sum "$source"' in smoke_binding
+    assert 'stat -c \'%s\' "$source"' in smoke_binding
+    assert 'install -m 0600 "$source" "$target"' in smoke_binding
     publish_steps = parsed["jobs"]["publish-preview"]["steps"]
     fixed_step = next(
         step
@@ -3129,11 +3197,11 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
     assert "A public Preview carrying these notes has passed the separate signed publication gate" in notes
     assert "Remote Core" not in notes
     assert "Self-Deployed Reference mode: unavailable in this Preview." in notes
-    assert "canonical External Beta requires both modes" in normalized_readme
     assert (
-        "current build exposes a narrow Subscription path for development, "
-        "marks Self-Deployed unavailable"
+        "Codex subscription with transcript capture"
     ) in normalized_readme
+    assert "Self-deployed inference" in normalized_readme
+    assert "Do not install a Python package" in normalized_readme
     assert "persistent WebView storage" not in readme
     assert (
         "Tauri native host app-data directory for `org.openevo.desktop`"
@@ -3450,26 +3518,29 @@ def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
     assert "GET /openevo-api/backend/artifacts/{artifact_id}/content" in text
 
 
-def test_readme_release_checklist_matches_frontend_audit_gate() -> None:
-    readme = Path("README.md")
+def test_maintainer_docs_own_release_checklist_and_frontend_audit_gate() -> None:
+    contributing = Path("CONTRIBUTING.md").read_text(encoding="utf-8")
+    release_process = Path("docs/maintainer/release-process.md").read_text(
+        encoding="utf-8"
+    )
 
-    text = readme.read_text(encoding="utf-8")
-    release_section = text[text.index("## Preview And External Beta") :]
-
-    assert "npm ci" in text
-    assert "npm audit --audit-level=high" in text
-    assert text.index("npm ci") < text.index("npm audit --audit-level=high")
-    assert text.index("npm audit --audit-level=high") < text.index("npm test -- --run")
-    assert "npm run typecheck" in text
-    assert release_section.startswith("## Preview And External Beta")
-    assert "GitHub Release" in release_section
-    assert "PyPI" in release_section
-    assert "unsigned, non-gating Preview" in release_section
-    assert "docs/maintainer/productization/spec.md" in release_section
-    assert "scripts/ci/smoke_openevo_desktop_wheel.py" not in release_section
-    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" not in release_section
-    assert "PyPI trusted publishing" not in text
-    assert "pypa/gh-action-pypi-publish@release/v1" not in text
+    assert "npm ci" in contributing
+    assert "npm audit --audit-level=high" in contributing
+    assert contributing.index("npm ci") < contributing.index(
+        "npm audit --audit-level=high"
+    )
+    assert contributing.index("npm audit --audit-level=high") < contributing.index(
+        "npm test -- --run"
+    )
+    assert "npm run typecheck" in contributing
+    assert "OpenEvo Desktop unsigned draft prerelease" in release_process
+    assert "PyPI" in release_process
+    assert "unsigned, non-gating" in release_process
+    assert "docs/maintainer/productization/spec.md" in release_process
+    assert "scripts/ci/smoke_openevo_desktop_wheel.py" not in release_process
+    assert ".openevo-wheel-smoke/bin/openevo-backend run --help" not in release_process
+    assert "PyPI trusted publishing" not in contributing
+    assert "pypa/gh-action-pypi-publish@release/v1" not in contributing
 
 
 def _write_wheel(

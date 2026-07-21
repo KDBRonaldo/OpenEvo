@@ -5,9 +5,9 @@ to a remote Linux server and installs, starts, updates, repairs, and attaches
 the OpenEvo Daemon under the selected SSH account. The Daemon is an internal
 remote service; ordinary users do not SSH to it or run its commands.
 
-The packaged managed science runtime is Linux amd64. The `0.1.3` Preview has no
-general clean-host matrix; the requirements below describe the exhibition
-profile, not general Linux support.
+The packaged managed science runtime is Linux amd64. Version `0.1.3` supports
+only the exhibition profile below; other Linux architectures, container
+policies, and host layouts are not supported by this Preview.
 
 ## Host Prerequisites
 

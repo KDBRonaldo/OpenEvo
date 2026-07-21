@@ -1,190 +1,226 @@
+<p align="center">
+  <img src="assets/openevo-logo.svg" alt="OpenEvo" width="520">
+</p>
+
 # OpenEvo
 
-OpenEvo runs scientific tasks through a real agent harness and evolves selected
-textual context between sessions. Version `0.1.3` is the ordinary-user
-exhibition Preview released on July 20, 2026; earlier Preview releases are
-retained only as historical evidence. OpenEvo has exactly two user-facing
-applications:
+OpenEvo runs scientific tasks through a real agent harness and evolves reusable
+context between sessions. Researchers work entirely in the macOS Desktop app;
+OpenEvo installs and controls its matching Daemon on a remote Linux server.
 
-- **OpenEvo Desktop Client** is the macOS application used to connect a remote
-  server, configure projects, run tasks, and inspect evolution.
-- **OpenEvo Daemon** runs under the user's account on the remote Linux server
-  and owns execution, transcript capture, projects, artifacts, revisions, and
-  managed services.
+OpenEvo has two user-facing applications:
 
-`src/openevo/` contains the Core implementation assembled into OpenEvo Daemon.
-Core is not a third product that users install or operate.
+- **OpenEvo Desktop Client** is the macOS interface researchers install and use.
+- **OpenEvo Daemon** is the Linux service that Desktop installs and controls on
+  the selected remote server.
 
-Ordinary users operate only OpenEvo Desktop. Desktop performs the remote SSH
-bootstrap and lifecycle management required for the Daemon; users do not SSH
-to the server to install, start, stop, repair, or update OpenEvo.
+[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.3-exhibition.29756612736.1)
+| [Read the user guide](docs/user/README.md)
+| [Report a problem](https://github.com/CompLifeLab-ZJU/OpenEvo/issues)
 
-## Install The Preview
+![OpenEvo Desktop showing a built-in scientific project](docs/user/assets/openevo-desktop-research.png)
 
-Ordinary users should download the exact `0.1.3` DMG and `SHA256SUMS` from the
-[OpenEvo Desktop 0.1.3 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.3-exhibition.29756612736.1),
-then start with the [Preview user guide](docs/user/README.md). Do not install
-OpenEvo from PyPI or use a repository checkout as the Desktop installation.
+## What OpenEvo Does
 
-The first Preview DMG is unsigned and not notarized. After verifying the release
-checksum, follow the [Desktop quickstart](docs/user/desktop-quickstart.md) to
-clear quarantine from the exact installed app or use macOS **Open Anyway**.
+- Runs literature, data, coding, and analysis tasks with Codex on your remote
+  server.
+- Captures each task's timeline and transcript without exposing raw private
+  chain-of-thought.
+- Evolves any user-selected combination of textual memory, reusable skills,
+  and agent-system instructions.
+- Applies accepted evolution artifacts to the next task, never midway through
+  the task that produced them.
+- Shows task execution, Project Head progression, evolution revisions,
+  readable artifacts, and previous-versus-current diffs in Desktop.
+- Keeps server installation, upgrades, service checks, repair, and private
+  tunnelling behind the Desktop interface.
 
-## Preview Scope
+OpenEvo does not replace Codex or call a model API directly in the current
+subscription mode. It runs the existing Codex CLI harness on the selected
+server, captures its transcript, and wraps it with project and evolution
+lifecycle management.
 
-The `0.1.3` Preview composition packages:
+## Try It Before Connecting A Server
 
-- one Apple Silicon macOS 12+ Desktop DMG;
-- the matching Linux x86-64 OpenEvo Daemon Bundle and managed runtime;
-- SSH agent authentication with explicit host-key confirmation;
-- the intended Codex subscription transcript path and the three textual
-  evolution targets.
+The first launch includes two read-only synthetic projects:
 
-Its publication workflow requires candidate-bound browser, mounted-DMG,
-detached-copy, Daemon Bundle, managed-runtime, checksum, and asset-roundtrip
-verification. It does not claim a general clean-host matrix or the canonical
-two-session science gate. Treat it as an exhibition artifact, not a generally
-supported release. The Preview host must already have Codex CLI installed and
-signed in to a subscription and must match the documented Docker user-container
-assumptions. Desktop checks those host prerequisites, uploads the
-version-matched Daemon Bundle, prepares the controlled science runtime, and
-manages the remote Daemon; users do not upload a runtime image or operate the
-Daemon manually.
+- **Enzyme kinetics model review** follows a failed baseline through corrected
+  fitting and held-out validation.
+- **Protein stability evidence integration** combines plate-aware DSF analysis
+  with orthogonal SEC evidence.
 
-Self-Deployed execution, parameter or adapter evolution, other harnesses,
-in-session evolution, a public CLI, and PyPI distribution are not supported in
-this Preview.
+Each project contains three task sessions and complete textual-memory,
+trajectory-to-skill, and agent-system evolution histories. The examples require
+no account, server, or network access and never create authoritative project
+state.
 
-The published `0.1.3` Preview proves only its real DMG, packaged sidecar and
-renderer, Daemon Bundle, and managed-runtime packaging smoke. It is unsigned
-and non-gating: it does not prove the canonical science E2E, G2 clean-user
-lifecycle, G3 clean-host/network matrix, G12 publication gate, or full External
-Beta readiness. Earlier Preview releases remain historical evidence. The
-published release is immutable; corrections must use a new candidate and
-version.
+## Current Preview
 
-## Target User Workflow
+The current public release is **OpenEvo Desktop 0.1.3 Preview**. It supports the
+following exhibition profile:
 
-```text
-install the unsigned Desktop DMG
--> inspect the two built-in read-only scientific project tours
--> add a remote server and SSH user
--> verify the SSH host fingerprint
--> let Desktop install or attach OpenEvo Daemon and its managed runtime
--> create and activate a Codex subscription project
--> select textual memory, skills, and/or agent-system evolution
--> run a session and inspect its transcript and textual artifacts
--> run a later session after the evolved context is ready
-```
+| Component | Current support |
+| --- | --- |
+| Desktop | Apple Silicon Mac, macOS 12 or later |
+| Remote host | Linux x86-64 with SSH and Docker user-container access |
+| Harness | Codex CLI already installed and signed in for the SSH user |
+| Execution | Codex subscription with transcript capture |
+| Evolution | Textual memory, trajectory-to-skill, and agent-system evolution |
+| Network | Direct HTTPS or a remote HTTP/HTTPS proxy configured in Desktop |
 
-The canonical product contract requires cross-session-only evolution and atomic
-successor state. The current v1 Preview does not yet prove that complete
-authority contract; the required v2 cutover remains release-blocking.
+Self-deployed inference, parameter or adapter evolution, other harnesses,
+automatic Codex installation/login, Intel Mac builds, and a general clean-host
+matrix are not part of this Preview. It is unsigned and not notarized. Use the
+documented host profile and do not depend on it for production-critical work.
 
-Closing Desktop does not stop a remote run. Reopen it, restore access to the
-Mac's SSH agent if needed, and reconnect to recover remote state.
+## Install On macOS
 
-## User Documentation
+1. Open the immutable
+   [OpenEvo Desktop 0.1.3 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.3-exhibition.29756612736.1).
+2. Download `OpenEvo-Desktop-0.1.3-aarch64.dmg` and `SHA256SUMS`.
+3. Verify the DMG before opening it:
 
-- [Preview overview](docs/user/README.md)
+   ```bash
+   grep '  OpenEvo-Desktop-0.1.3-aarch64.dmg$' SHA256SUMS \
+     | shasum -a 256 -c -
+   ```
+
+4. Open the DMG and move **OpenEvo Desktop** to **Applications**.
+5. Because this Preview is unsigned, either choose **Open Anyway** in
+   **System Settings > Privacy & Security**, or clear quarantine from only the
+   checksum-verified application:
+
+   ```bash
+   xattr -dr com.apple.quarantine "/Applications/OpenEvo Desktop.app"
+   ```
+
+Do not install a Python package or clone this repository to install Desktop.
+See the [Desktop quickstart](docs/user/desktop-quickstart.md) for the complete
+installation and removal procedure.
+
+## Prepare A Remote Server
+
+The remote account must be reachable over SSH and provide:
+
+- a writable home directory with enough project and container storage;
+- Docker access for the selected user;
+- outbound HTTPS, directly or through the proxy saved in Desktop;
+- Codex CLI installed and authenticated to a subscription for that same user.
+
+Your SSH identity must be available through the macOS SSH agent. Desktop does
+not accept or upload private-key bytes. On first connection, compare the shown
+`SHA256:` host fingerprint with a value obtained from the server administrator
+through a trusted channel.
+
+Desktop then transfers the release-matched Daemon, prepares the managed science
+runtime, starts or attaches services, verifies compatibility, and establishes
+the private tunnel. Users do not upload an image, install OpenEvo on the server,
+or operate the Daemon through SSH. Host-level Docker policy and Codex login are
+administrator prerequisites in this Preview.
+
+See [Remote server setup](docs/user/remote-server-setup.md) and
+[proxy configuration](docs/user/proxy-and-network.md) for details.
+
+## Run Your First Project
+
+1. In Desktop, choose **Add workspace** and enter the server address, SSH port,
+   and remote user.
+2. Connect and confirm the server fingerprint.
+3. Create a project with a task objective and either an empty managed workspace
+   or a snapshot of a local folder.
+4. Select the Codex model and reasoning effort available on the server.
+5. Enable only the evolution carriers you want. For every enabled carrier,
+   choose one of the methods reported by the connected Daemon.
+6. Save and activate the project. Desktop checks Codex, Docker, the managed
+   runtime, the Daemon, and the selected evolution methods before allowing a
+   run.
+7. Start the task and follow the timeline, safe transcript summaries, tool
+   activity, and output in **Research**.
+8. After evolution completes, inspect memory, skills, agent-system artifacts,
+   and diffs in **Evolution**.
+9. Start another task to use the accepted successor Project Head.
+
+You can enable one, several, or none of the available evolution carriers; a run
+does not implicitly enable all methods. Evolution is cross-session: outputs
+from one completed task become eligible only for a later task.
+
+Closing Desktop does not stop a remote task. Reopen the app, make the SSH key
+available to the macOS agent, and reconnect to recover authoritative state and
+missed events.
+
+## Data And Security
+
+- Task inputs and required context are sent through the remote user's Codex
+  subscription according to that service's terms.
+- Transcripts, project snapshots, and evolution artifacts are stored on the
+  remote server under the selected user account.
+- SSH private keys remain in the macOS SSH agent. Desktop stores the explicitly
+  accepted host identity and fails closed on an unexplained key change.
+- Desktop and Daemon communicate through an authenticated private SSH tunnel;
+  the Daemon API is not exposed as a normal user surface.
+- The two built-in demonstrations are synthetic, local, and read-only.
+
+Review the [security policy](SECURITY.md) before using private research data.
+
+## Troubleshooting
+
+- **macOS says the app is damaged or cannot be verified:** verify the DMG
+  checksum, then use **Open Anyway** or the scoped `xattr` command above.
+- **SSH connection fails:** check the host, port, user, network, and that the
+  correct key is loaded in the macOS SSH agent.
+- **The server identity changed:** stop and confirm the new fingerprint with
+  the administrator. Never bypass host-key verification.
+- **Activation reports missing Codex or Docker:** these are host prerequisites
+  in this Preview. Ask the administrator to prepare the same SSH account, then
+  choose **Retry** in Desktop.
+- **A restricted network blocks downloads:** save the remote proxy settings in
+  the workspace and retry the Desktop-managed preparation.
+- **The next task is not ready:** wait for the current task and its successor
+  evolution revision to finish; OpenEvo will not silently use partial state.
+
+Typed errors include a stable code and a next action. The
+[troubleshooting guide](docs/user/troubleshooting.md) explains the common codes
+and safe recovery flow.
+
+## Documentation
+
+### For Researchers
+
+- [User documentation](docs/user/README.md)
 - [Desktop quickstart](docs/user/desktop-quickstart.md)
 - [Remote server setup](docs/user/remote-server-setup.md)
 - [Proxy and network settings](docs/user/proxy-and-network.md)
 - [Troubleshooting](docs/user/troubleshooting.md)
 - [Security policy](SECURITY.md)
 
-## Contributor Notes
+### For Maintainers And Contributors
 
-The Python package and command entrypoints are implementation, Daemon,
-maintenance, and CI surfaces. They are not ordinary-user installation methods.
+Ordinary users should not run repository command entrypoints, install OpenEvo
+from PyPI, or operate the Daemon manually. The Python and command-line surfaces
+in this repository are backend launchers, maintenance tools, CI tools, and
+benchmark automation.
 
-Repository layout:
+- [Contribution guide](CONTRIBUTING.md)
+- [Repository development rules](AGENTS.md)
+- [Architecture documentation](docs/architecture/README.md)
+- [Product and release contract](docs/maintainer/productization/spec.md)
+- [Maintainer testing guide](docs/maintainer/testing.md)
+- [Release process](docs/maintainer/release-process.md)
+
+Repository boundaries:
 
 ```text
-src/openevo/   Core implementation and OpenEvo Daemon backend
-desktop/       OpenEvo Desktop Client, native host, and private sidecar
-benchmarks/    standalone maintainer benchmark automation; not shipped by either app
-docs/          user, architecture, Core, and maintainer documentation
-tests/         Python and contract regression tests
+src/openevo/   OpenEvo Core and Daemon backend
+desktop/       macOS Desktop Client, native host, and private sidecar
+benchmarks/    standalone maintainer benchmark automation
+docs/          user, architecture, and maintainer documentation
+tests/         contract, regression, integration, and release tests
 ```
 
-The product dependency direction is
-`Desktop Client -> versioned Daemon contracts -> Core implementation`.
-`benchmarks/` may import and exercise Core capabilities, but Core and Desktop
-must not import or package benchmark-specific automation.
+OpenEvo Core is shared implementation used by the Daemon, not a third product.
+Benchmark packages call Core capabilities but are not bundled into Desktop or
+Daemon.
 
-### Daemon Maintainer Entrypoints
+## License
 
-<!-- openevo:maintainer-only-command -->
-```bash {.openevo-maintainer-only}
-openevo-backend --help
-openevo-backend serve --help
-openevo-backend run --help
-```
-
-`openevo-backend serve` starts the typed Daemon API used through Desktop's
-private SSH tunnel. `openevo-backend run` is maintenance automation, not a user
-CLI.
-
-### Development Setup
-
-<!-- openevo:maintainer-only-command -->
-```bash {.openevo-maintainer-only}
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
-pip install pytest pytest-asyncio ruff build
-```
-
-Focused Python checks:
-
-<!-- openevo:maintainer-only-command -->
-```bash {.openevo-maintainer-only}
-ruff check src tests scripts
-PYTHONPATH=src:. python -m pytest tests/ci tests/openevo tests/evolution -q
-```
-
-Desktop checks:
-
-<!-- openevo:maintainer-only-command -->
-```bash {.openevo-maintainer-only}
-cd desktop
-npm ci
-npm audit --audit-level=high
-npm test -- --run
-npm run typecheck
-npm run build:openevo
-cd src-tauri
-cargo metadata --locked --format-version 1
-cargo test --locked
-```
-
-These commands validate a source checkout. They do not publish or install an
-ordinary-user release. Release candidates use an exact DMG, Daemon bundle,
-managed runtime, manifest, checksums, and release evidence; PyPI is not a
-Preview release surface.
-
-## Preview And External Beta
-
-Preview publication preserves the exact source, tag, Desktop DMG,
-self-contained Daemon Bundle, assets, and checksums that passed its real
-packaging smoke. The GitHub Release is the only Preview distribution surface;
-it does not publish OpenEvo to PyPI.
-
-The current build exposes a narrow Subscription path for development, marks
-Self-Deployed unavailable, and is released as an unsigned, non-gating Preview.
-That Preview is not reused as a release candidate. The canonical External Beta
-requires both modes and must satisfy the complete acceptance contract in
-`docs/maintainer/productization/spec.md` against a new immutable candidate.
-
-## Architecture And Contributing
-
-- Release contract: `docs/maintainer/productization/spec.md`
-- Architecture index: `docs/architecture/README.md`
-- Daemon API: `docs/core/backend-api.md`
-- Repository workflow: `AGENTS.md`
-- Contribution guide: `CONTRIBUTING.md`
-
-OpenEvo is in Preview. Non-trivial changes should start from a GitHub issue,
-preserve the release boundary, update affected documentation, and pass focused
-tests before review.
+OpenEvo is distributed under the terms in [LICENSE](LICENSE).

@@ -432,9 +432,12 @@ workflow's own `github.workflow_sha`, never the candidate source, and requires
 the Actions API to identify that exact run as a successful, completed
 `workflow_dispatch` of
 `.github/workflows/openevo-desktop-candidate.yml` on `stable` at the expected
-source SHA. It then downloads that run's canonical snapshot, re-resolves the
-tag in the authenticated paginated release inventory, and re-reads metadata by
-the expected numeric ID. It also validates the fixed candidate-tag evidence path
+source SHA. The candidate run publishes a small immutable Actions artifact
+containing only `release-candidate.json` and `app-bundle-smoke.json`; the
+read-only job downloads it together with that run's canonical draft snapshot
+and binds both files to the snapshot's asset IDs, sizes, and SHA-256 values.
+This avoids granting draft-release read/write authority to the verification
+job. It also validates the fixed candidate-tag evidence path
 with `validate_desktop_real_science_e2e.py`, requiring the exact source and
 candidate-manifest identities, the exact candidate native-sidecar smoke,
 candidate-source public key and protected trust anchor, trusted evidence
@@ -445,7 +448,9 @@ It also requires the publication-policy commit to descend from the candidate
 source and permits exactly two added paths in that delta: the candidate-tag
 evidence and its signature.
 
-The fixed publication receipt records the candidate workflow identity,
+The write-authorized job then re-reads the draft by numeric ID and downloads
+every draft asset by immutable asset ID before changing visibility. The fixed
+publication receipt records the candidate workflow identity,
 candidate-manifest digest, publication-policy commit, durable evidence and
 signature paths and digests, signer-key digest, release identity, and immutable
 publication result. The receipt is retained for 90 days; the canonical evidence

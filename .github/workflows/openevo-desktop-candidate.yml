@@ -592,6 +592,16 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload immutable publication verification inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-desktop-publication-inputs-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            candidate-artifacts/release-candidate.json
+            candidate-artifacts/app-bundle-smoke.json
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Retain failed supply-chain summaries
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
