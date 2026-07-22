@@ -10902,10 +10902,16 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             ("_PYI_UNKNOWN_PRIVATE_STATE", "poisoned"),
             (PYINSTALLER_RESET_ENVIRONMENT, "0"),
         ]);
-        let path = PathBuf::from(
+        let raw_path = PathBuf::from(
             std::env::var_os("OPENEVO_PACKAGED_SIDECAR_PATH")
                 .expect("OPENEVO_PACKAGED_SIDECAR_PATH is required"),
         );
+        #[cfg(target_os = "macos")]
+        let packaged_fixture = SidecarFixture::from_existing(&raw_path);
+        #[cfg(target_os = "macos")]
+        let path = packaged_fixture.path().to_path_buf();
+        #[cfg(not(target_os = "macos"))]
+        let path = raw_path;
         let state = DesktopHostState::default();
 
         let context = start_sidecar_inner(&state, LaunchPolicy::Release, Some(&path)).unwrap();

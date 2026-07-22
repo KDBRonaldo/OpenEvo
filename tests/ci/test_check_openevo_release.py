@@ -3437,6 +3437,9 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
             "fn debug_policy_uses_structured_override_without_shell_parsing"
         )
     ]
+    packaged_sidecar_smoke = main[
+        main.index("fn packaged_external_bin_native_launch_smoke") : main.index("fn serve_health(")
+    ]
     process_group_termination = main[
         main.index("fn terminate_process_group_with") : main.index(
             "fn signal_verified_process_group"
@@ -3572,6 +3575,8 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "let program = source.to_path_buf();" in main
     assert "fd_execution_path()" not in macos_bundle_launch_test
     assert "assert_eq!(launch.program, fixture.path());" in macos_bundle_launch_test
+    assert "let packaged_fixture = SidecarFixture::from_existing(&raw_path);" in packaged_sidecar_smoke
+    assert "let path = packaged_fixture.path().to_path_buf();" in packaged_sidecar_smoke
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
     assert "fn monitor_running_sidecar(" in main
