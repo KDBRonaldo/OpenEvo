@@ -36,6 +36,10 @@ class SmokeFailure(RuntimeError):
     """A release acceptance condition was not met."""
 
 
+class SidecarNotReady(SmokeFailure):
+    """The owned listener exists but has not served the version contract yet."""
+
+
 @dataclass(frozen=True, order=True)
 class ProcessIdentity:
     pid: int
@@ -275,8 +279,10 @@ class DarwinSystem:
                 if response.status != 200 or response.geturl() != url:
                     raise SmokeFailure("sidecar /version did not return a direct success response")
                 body = response.read(HTTP_RESPONSE_MAX_BYTES + 1)
-        except (HTTPError, URLError, TimeoutError, OSError) as exc:
-            raise SmokeFailure("sidecar /version is not ready") from exc
+        except HTTPError as exc:
+            raise SmokeFailure("sidecar /version returned an unexpected HTTP response") from exc
+        except (URLError, TimeoutError, OSError) as exc:
+            raise SidecarNotReady("sidecar /version is not ready") from exc
         if len(body) > HTTP_RESPONSE_MAX_BYTES:
             raise SmokeFailure("sidecar /version response exceeded the bounded size")
         return body
@@ -453,7 +459,15 @@ def smoke_launchservices(
             if listener is not None:
                 listener_observed = True
                 try:
-                    validate_version(_strict_json(tools.http_version(listener.port, min(1.0, max(0.1, deadline - time.monotonic())))), expected_version)
+                    version_bytes = tools.http_version(
+                        listener.port,
+                        min(1.0, max(0.1, deadline - time.monotonic())),
+                    )
+                except SidecarNotReady:
+                    time.sleep(0.1)
+                    continue
+                try:
+                    validate_version(_strict_json(version_bytes), expected_version)
                 except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
                     raise SmokeFailure("sidecar /version is malformed") from exc
                 ready = True

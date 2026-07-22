@@ -265,6 +265,76 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, m
     assert evidence["cleanup"]["authority_limited_to_observed_tree"] is True
 
 
+def test_smoke_retries_owned_listener_until_version_is_ready(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_module()
+    app, executable = _app_bundle(tmp_path)
+    app_identity = smoke.ProcessIdentity(50, "Mon Jan  2 03:04:05 2023")
+    sidecar_identity = smoke.ProcessIdentity(51, "Mon Jan  2 03:04:06 2023")
+    rows = [
+        smoke.ProcessRow(app_identity, 1, str(executable)),
+        _row(smoke, 51, 50, "Mon Jan  2 03:04:06 2023"),
+    ]
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
+    monkeypatch.setattr(smoke.platform, "mac_ver", lambda: ("15.5", (15, 5, 0), ""))
+    monkeypatch.setattr(smoke.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
+    version = {
+        "schema_version": "1",
+        "api_name": "openevo-desktop-local-api",
+        "preferred_major": 1,
+        "supported_majors": [1],
+        "openapi_sha256": "a" * 64,
+        "build_version": "0.1.7",
+        "source_commit": "b" * 40,
+        "build_channel": "release",
+        "provider_kind": "desktop_sidecar",
+        "feature_flags": [],
+    }
+
+    class System:
+        launched = False
+        alive = True
+        attempts = 0
+
+        def snapshot(self):
+            return rows if self.launched and self.alive else []
+
+        def process_path(self, pid):
+            return str(executable) if pid == 50 else "/tmp/openevo-desktop-sidecar"
+
+        def remove_quarantine(self, _app):
+            pass
+
+        def launch(self, _app):
+            self.launched = True
+
+        def listener_rows(self, identity):
+            return [smoke.Listener(identity, 41111)] if identity == sidecar_identity else []
+
+        def http_version(self, _port, _timeout):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise smoke.SidecarNotReady("not ready")
+            return json.dumps(version).encode()
+
+        def signal(self, _identity, _sig):
+            self.alive = False
+            return True
+
+    system = System()
+    smoke.smoke_launchservices(
+        app,
+        expected_version="0.1.7",
+        timeout_seconds=2,
+        evidence_out=tmp_path / "evidence.json",
+        system=system,
+    )
+    assert system.attempts == 2
+
+
 def _app_bundle(tmp_path: Path) -> tuple[Path, Path]:
     app = (tmp_path / "OpenEvo Desktop.app").resolve()
     executable = app / "Contents" / "MacOS" / "openevo-desktop"
