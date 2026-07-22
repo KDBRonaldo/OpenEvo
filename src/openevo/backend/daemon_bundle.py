@@ -63,7 +63,7 @@ _CORE_METADATA_KEYS = {
 _FILE_METADATA_KEYS = {"filename", "sha256"}
 _PLATFORM_METADATA_KEYS = {"architecture", "system"}
 _PYTHON_METADATA_KEYS = {"implementation", "version"}
-_LIFECYCLE_COMPATIBILITY = 7
+_LIFECYCLE_COMPATIBILITY = 8
 
 
 class DaemonBundleError(RuntimeError):
