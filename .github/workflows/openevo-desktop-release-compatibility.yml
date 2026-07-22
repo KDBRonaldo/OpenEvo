@@ -29,6 +29,17 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11.9"
+
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: "0.11.29"
+
+      - name: Install frozen smoke dependencies
+        run: uv sync --frozen --group dev
+
       - name: Require Apple Silicon runner
         run: |
           test "$(uname -s)" = "Darwin"
@@ -65,7 +76,7 @@ jobs:
           app="$mount_dir/OpenEvo Desktop.app"
           test -d "$app"
           codesign --verify --deep --strict --verbose=2 "$app"
-          python3 scripts/ci/smoke_openevo_desktop_bundle.py \
+          uv run python scripts/ci/smoke_openevo_desktop_bundle.py \
             "$app" \
             --launch-origin mounted_dmg \
             --source-dmg "$OPENEVO_PUBLISHED_DMG" \
