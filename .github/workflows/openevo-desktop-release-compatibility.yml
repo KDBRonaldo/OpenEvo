@@ -64,9 +64,11 @@ jobs:
       - name: Mount and exercise the published app
         run: |
           mount_dir="$(mktemp -d)"
+          installed_root="$RUNNER_TEMP/openevo-installed-app"
           cleanup() {
             hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
             rm -rf "$mount_dir"
+            rm -rf "$installed_root"
           }
           trap cleanup EXIT
           hdiutil attach "$OPENEVO_PUBLISHED_DMG" \
@@ -83,11 +85,26 @@ jobs:
             --timeout-seconds 180 \
             --evidence-out "$RUNNER_TEMP/published-app-smoke.json"
 
+          mkdir -m 700 "$installed_root"
+          installed_app="$installed_root/OpenEvo Desktop.app"
+          ditto "$app" "$installed_app"
+          codesign --verify --deep --strict --verbose=2 "$installed_app"
+          expected_version="$(/usr/libexec/PlistBuddy \
+            -c 'Print :CFBundleShortVersionString' \
+            "$installed_app/Contents/Info.plist")"
+          uv run python scripts/ci/smoke_openevo_desktop_launchservices.py \
+            "$installed_app" \
+            --expected-version "$expected_version" \
+            --timeout-seconds 180 \
+            --evidence-out "$RUNNER_TEMP/published-launchservices-smoke.json"
+
       - name: Upload compatibility evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: openevo-published-app-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/published-app-smoke.json
+          path: |
+            ${{ runner.temp }}/published-app-smoke.json
+            ${{ runner.temp }}/published-launchservices-smoke.json
           if-no-files-found: warn
           retention-days: 14

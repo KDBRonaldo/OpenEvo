@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Exercise a quarantined-then-allowed OpenEvo Desktop app through LaunchServices."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import platform
+import plistlib
+import re
+import signal
+import subprocess
+import sys
+import time
+from typing import Iterable
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+
+
+APP_NAME_SUFFIX = ".app"
+SIDECAR_BASENAME = "openevo-desktop-sidecar"
+EVIDENCE_SCHEMA_VERSION = 1
+LAUNCH_ORIGIN = "launchservices_open_n_post_quarantine_allow"
+MAX_TIMEOUT_SECONDS = 300.0
+COMMAND_TIMEOUT_SECONDS = 5.0
+HTTP_RESPONSE_MAX_BYTES = 16 * 1024
+PROCESS_ROW_LIMIT = 16_384
+
+
+class SmokeFailure(RuntimeError):
+    """A release acceptance condition was not met."""
+
+
+@dataclass(frozen=True, order=True)
+class ProcessIdentity:
+    pid: int
+    birth: str
+
+
+@dataclass(frozen=True)
+class ProcessRow:
+    identity: ProcessIdentity
+    parent_pid: int
+    command: str
+
+
+@dataclass(frozen=True)
+class Listener:
+    owner: ProcessIdentity
+    port: int
+
+
+_PS_ROW = re.compile(
+    r"^\s*([1-9][0-9]{0,9})\s+([0-9][0-9]{0,9})\s+"
+    r"([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$"
+)
+_LOOPBACK_LISTENER = re.compile(r"^(?:127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$")
+_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[.+-][A-Za-z0-9._-]+)?$")
+
+
+def parse_ps_rows(payload: str) -> list[ProcessRow]:
+    """Parse the fixed Darwin ps projection without accepting partial rows."""
+    rows: list[ProcessRow] = []
+    for line in payload.splitlines():
+        match = _PS_ROW.fullmatch(line)
+        if match is None:
+            continue
+        pid, parent = int(match.group(1)), int(match.group(2))
+        if parent > 2**31 - 1 or pid > 2**31 - 1:
+            continue
+        rows.append(
+            ProcessRow(
+                identity=ProcessIdentity(pid, match.group(3)),
+                parent_pid=parent,
+                command=match.group(4),
+            )
+        )
+        if len(rows) > PROCESS_ROW_LIMIT:
+            raise SmokeFailure("Darwin process inventory exceeded the bounded row limit")
+    return rows
+
+
+def parse_lsof_listeners(payload: str, owner: ProcessIdentity) -> list[Listener]:
+    """Return only TCP listeners on numeric loopback endpoints for one owned PID."""
+    records: list[dict[str, str]] = []
+    record: dict[str, str] = {}
+    for line in payload.splitlines():
+        if not line:
+            continue
+        field, value = line[0], line[1:]
+        if field == "f":
+            if record:
+                records.append(record)
+            record = {"f": value}
+        elif field in {"t", "n"} and record and field not in record:
+            record[field] = value
+        elif field == "T" and record and value == "ST=LISTEN":
+            record["listen"] = value
+    if record:
+        records.append(record)
+
+    listeners: list[Listener] = []
+    for record in records:
+        endpoint = record.get("n")
+        if record.get("t") not in {"IPv4", "IPv6"} or endpoint is None:
+            continue
+        if "listen" not in record and not endpoint.endswith(" (LISTEN)"):
+            continue
+        endpoint = endpoint.removesuffix(" (LISTEN)")
+        match = _LOOPBACK_LISTENER.fullmatch(endpoint)
+        if match is None:
+            continue
+        port = int(match.group(1))
+        if port <= 65_535:
+            listeners.append(Listener(owner=owner, port=port))
+    return listeners
+
+
+def _strict_json(payload: bytes) -> object:
+    def reject_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate JSON key")
+            result[key] = value
+        return result
+
+    return json.loads(payload.decode("utf-8"), object_pairs_hook=reject_duplicate_keys)
+
+
+def validate_version(payload: object, expected_version: str) -> None:
+    required = {
+        "schema_version",
+        "api_name",
+        "preferred_major",
+        "supported_majors",
+        "openapi_sha256",
+        "build_version",
+        "source_commit",
+        "build_channel",
+        "provider_kind",
+        "feature_flags",
+    }
+    if type(payload) is not dict or set(payload) != required:
+        raise SmokeFailure("sidecar /version does not use the closed release schema")
+    if (
+        payload["schema_version"] != "1"
+        or payload["api_name"] != "openevo-desktop-local-api"
+        or payload["build_version"] != expected_version
+        or payload["build_channel"] != "release"
+        or payload["provider_kind"] != "desktop_sidecar"
+    ):
+        raise SmokeFailure("sidecar /version does not identify the expected release provider")
+    preferred = payload["preferred_major"]
+    supported = payload["supported_majors"]
+    if (
+        type(preferred) is not int
+        or isinstance(preferred, bool)
+        or not 1 <= preferred <= 255
+        or type(supported) is not list
+        or not supported
+        or any(type(item) is not int or isinstance(item, bool) or not 1 <= item <= 255 for item in supported)
+        or len(set(supported)) != len(supported)
+        or preferred not in supported
+        or type(payload["openapi_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["openapi_sha256"]) is None
+        or type(payload["source_commit"]) is not str
+        or re.fullmatch(r"[0-9a-f]{40}", payload["source_commit"]) is None
+        or type(payload["feature_flags"]) is not list
+        or any(type(item) is not str or not item or len(item) > 128 for item in payload["feature_flags"])
+    ):
+        raise SmokeFailure("sidecar /version is malformed")
+
+
+def descendants(rows: Iterable[ProcessRow], roots: Iterable[ProcessIdentity]) -> set[ProcessIdentity]:
+    """Return the current tree below exact process identities, never PID-only roots."""
+    inventory = list(rows)
+    current = {row.identity for row in inventory}
+    owned = set(roots) & current
+    # Parent links are PID based, but a process joins only after its ancestor identity is current.
+    changed = True
+    while changed:
+        changed = False
+        owned_pids = {identity.pid for identity in owned}
+        for row in inventory:
+            if row.parent_pid in owned_pids and row.identity not in owned:
+                owned.add(row.identity)
+                changed = True
+    return owned
+
+
+class _NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, *args: object, **kwargs: object) -> None:
+        return None
+
+
+class DarwinSystem:
+    """Small injectable boundary around the fixed macOS tools used by this smoke."""
+
+    def command(self, arguments: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                arguments,
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=timeout,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise SmokeFailure("required macOS system tool is unavailable") from exc
+
+    def snapshot(self) -> list[ProcessRow]:
+        result = self.command(["/bin/ps", "-axo", "pid=,ppid=,lstart=,command="])
+        if result.returncode != 0:
+            raise SmokeFailure("Darwin process inventory is unavailable")
+        return parse_ps_rows(result.stdout)
+
+    def process_path(self, pid: int) -> str | None:
+        # lsof's txt entry is an exact executable pathname on Darwin; it is not a name match.
+        result = self.command(["/usr/sbin/lsof", "-n", "-a", "-p", str(pid), "-d", "txt", "-Fn"])
+        if result.returncode != 0:
+            return None
+        names = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
+        return names[0] if len(names) == 1 and names[0].startswith("/") else None
+
+    def listener_rows(self, identity: ProcessIdentity) -> list[Listener]:
+        result = self.command(
+            [
+                "/usr/sbin/lsof", "-nP", "-a", "-p", str(identity.pid), "-iTCP",
+                "-sTCP:LISTEN", "-FnT",
+            ]
+        )
+        if result.returncode != 0:
+            return []
+        return parse_lsof_listeners(result.stdout, identity)
+
+    def remove_quarantine(self, app: Path) -> None:
+        probe = self.command(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(app)])
+        if probe.returncode != 0:
+            return
+        result = self.command(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(app)])
+        if result.returncode != 0:
+            raise SmokeFailure("could not allow the quarantined app for LaunchServices")
+        if self.command(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(app)]).returncode == 0:
+            raise SmokeFailure("could not allow the quarantined app for LaunchServices")
+
+    def launch(self, app: Path) -> None:
+        result = self.command(["/usr/bin/open", "-n", str(app)], timeout=COMMAND_TIMEOUT_SECONDS)
+        if result.returncode != 0:
+            raise SmokeFailure("LaunchServices could not launch OpenEvo Desktop")
+
+    def http_version(self, port: int, timeout: float) -> bytes:
+        url = f"http://127.0.0.1:{port}/version"
+        opener = build_opener(ProxyHandler({}), _NoRedirect())
+        try:
+            with opener.open(Request(url, method="GET"), timeout=timeout) as response:
+                if response.status != 200 or response.geturl() != url:
+                    raise SmokeFailure("sidecar /version did not return a direct success response")
+                body = response.read(HTTP_RESPONSE_MAX_BYTES + 1)
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            raise SmokeFailure("sidecar /version is not ready") from exc
+        if len(body) > HTTP_RESPONSE_MAX_BYTES:
+            raise SmokeFailure("sidecar /version response exceeded the bounded size")
+        return body
+
+    def signal(self, identity: ProcessIdentity, sig: signal.Signals) -> bool:
+        current = {row.identity for row in self.snapshot()}
+        if identity not in current:
+            return False
+        try:
+            os.kill(identity.pid, sig)
+        except ProcessLookupError:
+            return False
+        except PermissionError as exc:
+            raise SmokeFailure("cannot terminate the LaunchServices-owned app process") from exc
+        return True
+
+
+def _app_executable(app: Path) -> Path:
+    if not app.is_absolute() or app.name == APP_NAME_SUFFIX or not app.name.endswith(APP_NAME_SUFFIX):
+        raise SmokeFailure("the app argument must be an exact absolute .app path")
+    if app.is_symlink() or not app.is_dir():
+        raise SmokeFailure("the app argument must name a real app bundle")
+    try:
+        resolved_app = app.resolve(strict=True)
+    except OSError as exc:
+        raise SmokeFailure("the app bundle cannot be resolved") from exc
+    info = resolved_app / "Contents" / "Info.plist"
+    try:
+        with info.open("rb") as stream:
+            plist = plistlib.load(stream)
+    except (OSError, plistlib.InvalidFileException) as exc:
+        raise SmokeFailure("the app Info.plist is unavailable") from exc
+    executable_name = plist.get("CFBundleExecutable") if type(plist) is dict else None
+    if (
+        type(executable_name) is not str
+        or not executable_name
+        or executable_name in {".", ".."}
+        or "/" in executable_name
+        or "\x00" in executable_name
+    ):
+        raise SmokeFailure("the app Info.plist has an invalid executable name")
+    executable = resolved_app / "Contents" / "MacOS" / executable_name
+    if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+        raise SmokeFailure("the app executable is unavailable")
+    return executable.resolve(strict=True)
+
+
+def _app_roots(system: DarwinSystem, rows: list[ProcessRow], executable: Path) -> set[ProcessIdentity]:
+    expected = str(executable)
+    roots: set[ProcessIdentity] = set()
+    for row in rows:
+        # Avoid an lsof subprocess for every process on the host. The command is
+        # only a bounded candidate filter; lsof still provides the exact check.
+        if expected not in row.command:
+            continue
+        path = system.process_path(row.identity.pid)
+        if path is not None and os.path.realpath(path) == expected:
+            roots.add(row.identity)
+    return roots
+
+
+def _sidecar_tree(
+    system: DarwinSystem,
+    rows: list[ProcessRow],
+    owned: set[ProcessIdentity],
+) -> set[ProcessIdentity]:
+    sidecars = {
+        identity
+        for identity in owned
+        if (path := system.process_path(identity.pid)) is not None
+        and Path(path).name == SIDECAR_BASENAME
+    }
+    return descendants(rows, sidecars)
+
+
+def _single_listener(system: DarwinSystem, sidecar_tree: set[ProcessIdentity]) -> Listener | None:
+    listeners = [listener for identity in sorted(sidecar_tree) for listener in system.listener_rows(identity)]
+    ports = {listener.port for listener in listeners}
+    if len(ports) > 1:
+        raise SmokeFailure("multiple loopback listeners were owned by this sidecar tree")
+    return listeners[0] if listeners else None
+
+
+def _cleanup(system: DarwinSystem, owned: set[ProcessIdentity], timeout_seconds: float) -> bool:
+    """Signal only identities observed in this launch tree, then prove they are gone."""
+    deadline = time.monotonic() + min(15.0, max(2.0, timeout_seconds))
+    for sig, grace in ((signal.SIGTERM, 1.5), (signal.SIGKILL, 0.0)):
+        current_rows = system.snapshot()
+        current = {row.identity for row in current_rows}
+        live = owned & current
+        # Descendant-first ordering keeps graceful shutdown scoped to this app tree.
+        for identity in sorted(live, reverse=True):
+            system.signal(identity, sig)
+        phase_deadline = min(deadline, time.monotonic() + grace)
+        while time.monotonic() < phase_deadline:
+            if not (owned & {row.identity for row in system.snapshot()}):
+                return True
+            time.sleep(0.05)
+    while time.monotonic() < deadline:
+        if not (owned & {row.identity for row in system.snapshot()}):
+            return True
+        time.sleep(0.05)
+    return not (owned & {row.identity for row in system.snapshot()})
+
+
+def _os_major() -> int:
+    version = platform.mac_ver()[0]
+    match = re.fullmatch(r"([1-9][0-9]{0,2})(?:\.[0-9]+){0,2}", version)
+    if match is None:
+        raise SmokeFailure("macOS version is unavailable")
+    return int(match.group(1))
+
+
+def _evidence(expected_version: str, sidecar_ready: bool, cleanup: bool) -> dict[str, object]:
+    architecture = platform.machine()
+    if architecture not in {"arm64", "x86_64"}:
+        raise SmokeFailure("macOS architecture is unsupported")
+    return {
+        "architecture": architecture,
+        "build_version": expected_version,
+        "cleanup": {
+            "authority_limited_to_observed_tree": True,
+            "owned_processes_exited": cleanup,
+            "sidecar_descendants_exited": cleanup,
+        },
+        "launch_origin": LAUNCH_ORIGIN,
+        "os_major": _os_major(),
+        "schema_version": EVIDENCE_SCHEMA_VERSION,
+        "sidecar_ready": sidecar_ready,
+        "version_verified": sidecar_ready,
+    }
+
+
+def _write_evidence(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+
+
+def smoke_launchservices(
+    app: Path,
+    *,
+    expected_version: str,
+    timeout_seconds: float,
+    evidence_out: Path,
+    system: DarwinSystem | None = None,
+) -> dict[str, object]:
+    if sys.platform != "darwin":
+        raise SmokeFailure("LaunchServices smoke is supported only on Darwin")
+    if _VERSION.fullmatch(expected_version) is None:
+        raise SmokeFailure("expected version is invalid")
+    if not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
+        raise SmokeFailure("timeout must be positive and bounded")
+    executable = _app_executable(app)
+    tools = system or DarwinSystem()
+    if _app_roots(tools, tools.snapshot(), executable):
+        raise SmokeFailure("an instance of this exact app bundle is already active")
+
+    tools.remove_quarantine(app)
+    tools.launch(app)
+    deadline = time.monotonic() + timeout_seconds
+    owned: set[ProcessIdentity] = set()
+    captured: BaseException | None = None
+    ready = False
+    try:
+        while time.monotonic() < deadline:
+            rows = tools.snapshot()
+            roots = _app_roots(tools, rows, executable)
+            if roots:
+                owned.update(descendants(rows, roots))
+            sidecar = _sidecar_tree(tools, rows, owned & {row.identity for row in rows})
+            owned.update(sidecar)
+            listener = _single_listener(tools, sidecar)
+            if listener is not None:
+                try:
+                    validate_version(_strict_json(tools.http_version(listener.port, min(1.0, max(0.1, deadline - time.monotonic())))), expected_version)
+                except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+                    raise SmokeFailure("sidecar /version is malformed") from exc
+                ready = True
+                break
+            time.sleep(0.1)
+        if not ready:
+            raise SmokeFailure("timed out waiting for an owned sidecar loopback listener")
+    except BaseException as exc:
+        captured = exc
+    cleanup = _cleanup(tools, owned, timeout_seconds)
+    if not cleanup:
+        failure = SmokeFailure("the launched app or its observed descendants did not exit")
+        if captured is not None:
+            raise failure from captured
+        raise failure
+    if captured is not None:
+        raise captured
+    evidence = _evidence(expected_version, ready, cleanup)
+    _write_evidence(evidence_out, evidence)
+    return evidence
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("app", type=Path)
+    parser.add_argument("--expected-version", required=True)
+    parser.add_argument("--timeout-seconds", type=float, required=True)
+    parser.add_argument("--evidence-out", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        evidence = smoke_launchservices(
+            args.app,
+            expected_version=args.expected_version,
+            timeout_seconds=args.timeout_seconds,
+            evidence_out=args.evidence_out,
+        )
+    except SmokeFailure as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(json.dumps(evidence, separators=(",", ":"), sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
