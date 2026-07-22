@@ -257,13 +257,21 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
     "Add workspace",
     "Create project",
     "Check",
-    "Diagnostics",
     "Repair",
     "Restart OpenEvo runtime",
     "Clean diagnostic history",
   ]) {
     await expect(page.getByRole("button", { name, exact: true })).toHaveCount(0);
   }
+
+  const startupDiagnostics = page.getByRole("button", { name: "Diagnostics", exact: true });
+  await expect(startupDiagnostics).toBeVisible();
+  await expect(startupDiagnostics).toHaveAttribute("aria-expanded", "false");
+  await startupDiagnostics.click();
+  await expect(startupDiagnostics).toHaveAttribute("aria-expanded", "true");
+  await expect(page.getByRole("button", { name: "View logs", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Reveal in Finder", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Export diagnostics", exact: true })).toBeVisible();
 
   const failedObservation = await readHarnessObservation(page);
   expect(sidecarObservation.httpCalls).toEqual([]);
