@@ -3556,8 +3556,11 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "permission_denied_leader_inspection_is_not_a_signal_outcome" in main
     assert "permission_denied_group_signal_retains_ownership_with_a_reported_descendant" in main
     assert "permission_denied_group_signal_does_not_override_inspection_failure" in main
-    assert "program: release_execution_path(&private_launch_dir)" in poisoned_environment_test
-    assert "program: fd_execution_path()" not in poisoned_environment_test
+    assert "program: fd_execution_path()" in poisoned_environment_test
+    assert "program: release_execution_path(&private_launch_dir)" not in poisoned_environment_test
+    assert "let verified_executable = prepare_packaged_bundle_sidecar(source)?;" in main
+    assert "let private_launch_dir = None;" in main
+    assert "let program = source.to_path_buf();" in main
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
     assert "fn monitor_running_sidecar(" in main
