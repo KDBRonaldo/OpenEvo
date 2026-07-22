@@ -120,7 +120,8 @@ const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const SIDECAR_STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES: usize = 32 * 1024;
 const SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES: usize = 160;
-const SIDECAR_STARTUP_DIAGNOSTIC_DRAIN_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
+const SIDECAR_STARTUP_DIAGNOSTIC_DRAIN_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+const NATIVE_HOST_ERROR_MESSAGE_MAX_BYTES: usize = 767;
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 const SIDECAR_HEALTH_RESPONSE_MAX_BYTES: usize = 4096;
@@ -176,19 +177,50 @@ impl NativeHostError {
     }
 
     fn with_startup_diagnostic(mut self, diagnostic: Option<StartupDiagnostic>) -> Self {
+        self.normalize_startup_message();
         if let Some(diagnostic) = diagnostic {
-            self.message.push_str(" Startup diagnostic: ");
-            self.message.push_str(diagnostic.stage);
-            self.message.push('/');
-            self.message.push_str(diagnostic.code);
+            let mut detail = format!(
+                " Startup diagnostic: {}/{}",
+                diagnostic.stage, diagnostic.code
+            );
             if let Some(errno) = diagnostic.errno {
-                self.message.push_str(" errno=");
-                self.message.push_str(&errno.to_string());
+                detail.push_str(" errno=");
+                detail.push_str(&errno.to_string());
             }
-            self.message.push('.');
+            detail.push('.');
+            self.append_startup_detail(&detail);
         }
         self
     }
+
+    fn with_startup_exit_disposition(mut self, disposition: StartupExitDisposition) -> Self {
+        let detail = match disposition {
+            StartupExitDisposition::Code(code) => format!(" Sidecar exit: code={code}."),
+            StartupExitDisposition::Signal(signal) => format!(" Sidecar exit: signal={signal}."),
+        };
+        self.append_startup_detail(&detail);
+        self
+    }
+
+    fn normalize_startup_message(&mut self) {
+        self.message.retain(|character| character.is_ascii());
+        self.message.truncate(NATIVE_HOST_ERROR_MESSAGE_MAX_BYTES);
+    }
+
+    fn append_startup_detail(&mut self, text: &str) {
+        debug_assert!(text.is_ascii());
+        self.normalize_startup_message();
+        debug_assert!(text.len() <= NATIVE_HOST_ERROR_MESSAGE_MAX_BYTES);
+        self.message
+            .truncate(NATIVE_HOST_ERROR_MESSAGE_MAX_BYTES - text.len());
+        self.message.push_str(text);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupExitDisposition {
+    Code(u32),
+    Signal(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1457,6 +1489,10 @@ struct VersionInfoV1 {
 
 trait ProcessControl {
     fn leader_exited(&self, child: &Child) -> std::io::Result<bool>;
+    fn leader_exit_disposition(
+        &self,
+        child: &Child,
+    ) -> std::io::Result<Option<StartupExitDisposition>>;
     fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>>;
     fn signal_group(&self, process_group: i32, signal: libc::c_int) -> std::io::Result<()>;
     fn group_has_members_except_leader(
@@ -1473,6 +1509,13 @@ struct OsProcessControl;
 impl ProcessControl for OsProcessControl {
     fn leader_exited(&self, child: &Child) -> std::io::Result<bool> {
         leader_exited_without_reaping(child)
+    }
+
+    fn leader_exit_disposition(
+        &self,
+        child: &Child,
+    ) -> std::io::Result<Option<StartupExitDisposition>> {
+        leader_exit_disposition_without_reaping(child)
     }
 
     fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
@@ -1512,6 +1555,12 @@ impl ProcessControl for OsProcessControl {
 }
 
 fn leader_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
+    leader_exit_disposition_without_reaping(child).map(|disposition| disposition.is_some())
+}
+
+fn leader_exit_disposition_without_reaping(
+    child: &Child,
+) -> std::io::Result<Option<StartupExitDisposition>> {
     loop {
         let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
         let result = unsafe {
@@ -1523,7 +1572,24 @@ fn leader_exited_without_reaping(child: &Child) -> std::io::Result<bool> {
             )
         };
         if result == 0 {
-            return Ok(unsafe { info.assume_init().si_pid() } != 0);
+            let info = unsafe { info.assume_init() };
+            if unsafe { info.si_pid() } == 0 {
+                return Ok(None);
+            }
+            return match info.si_code {
+                libc::CLD_EXITED => Ok(Some(StartupExitDisposition::Code(unsafe {
+                    info.si_status() as u32
+                }))),
+                libc::CLD_KILLED | libc::CLD_DUMPED => {
+                    Ok(Some(StartupExitDisposition::Signal(unsafe {
+                        info.si_status() as u32
+                    })))
+                }
+                _ => Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "unexpected leader wait status",
+                )),
+            };
         }
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::EINTR) {
@@ -3716,7 +3782,7 @@ fn wait_for_sidecar_ready(
 ) -> HostResult<NegotiatedContractV1> {
     wait_for_sidecar_ready_with_inspection(port, credential, timeout, is_cancelled, || {
         OsProcessControl
-            .leader_exited(child)
+            .leader_exit_disposition(child)
             .map_err(|_| sidecar_inspection_error())
     })
 }
@@ -3738,8 +3804,8 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
             let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
             let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
             let child = managed.child_mut()?;
-            match control.leader_exited(child) {
-                Ok(exited) => Ok(exited),
+            match control.leader_exit_disposition(child) {
+                Ok(disposition) => Ok(disposition),
                 Err(_) => {
                     managed.mark_cleanup_pending();
                     Err(sidecar_inspection_error())
@@ -3773,18 +3839,19 @@ fn wait_for_sidecar_ready_with_inspection(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
-    mut child_exited: impl FnMut() -> HostResult<bool>,
+    mut child_exit_disposition: impl FnMut() -> HostResult<Option<StartupExitDisposition>>,
 ) -> HostResult<NegotiatedContractV1> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_cancelled() {
             return Err(sidecar_start_cancelled_error());
         }
-        if child_exited()? {
+        if let Some(disposition) = child_exit_disposition()? {
             return Err(NativeHostError::new(
                 "sidecar_exited_during_startup",
                 "The OpenEvo Desktop sidecar exited before it became ready.",
-            ));
+            )
+            .with_startup_exit_disposition(disposition));
         }
         if check_sidecar_health(port, credential).is_ok() {
             let contract = check_sidecar_contract(port)?;
@@ -4703,35 +4770,35 @@ fn fail_state_owned_startup_with_bounds<C: ProcessControl>(
     term_timeout: Duration,
     kill_timeout: Duration,
 ) -> NativeHostError {
+    let final_error = (|| -> HostResult<NativeHostError> {
+        // Closing the liveness channel and stopping the whole process group lets the
+        // dedicated stderr reader reach EOF before we publish its allowlisted marker.
+        let _ = abort_parent_liveness(state, state_lock_timeout);
+        cleanup_spawn_handoff_with_bounds(
+            state,
+            control,
+            state_lock_timeout,
+            term_timeout,
+            kill_timeout,
+        )?;
+        let mut sidecar = lock_sidecar_bounded(state, state_lock_timeout)?;
+        let Some(managed) = sidecar.as_mut() else {
+            return Ok(startup_error);
+        };
+        if managed.lifecycle == ManagedLifecycle::Running {
+            return Ok(sidecar_state_error());
+        }
+        match cleanup_managed_sidecar_with_bounds(control, managed, term_timeout, kill_timeout) {
+            Ok(()) => match remove_cleaned_sidecar(state, &mut sidecar) {
+                Ok(()) => Ok(startup_error),
+                Err(error) => Ok(error),
+            },
+            Err(error) => Ok(error),
+        }
+    })()
+    .unwrap_or_else(|error| error);
     settle_startup_diagnostics(state);
-    let startup_error = startup_error_with_diagnostic(state, startup_error);
-    let _ = abort_parent_liveness(state, state_lock_timeout);
-    if let Err(error) = cleanup_spawn_handoff_with_bounds(
-        state,
-        control,
-        state_lock_timeout,
-        term_timeout,
-        kill_timeout,
-    ) {
-        return error;
-    }
-    let mut sidecar = match lock_sidecar_bounded(state, state_lock_timeout) {
-        Ok(sidecar) => sidecar,
-        Err(error) => return error,
-    };
-    let Some(managed) = sidecar.as_mut() else {
-        return startup_error;
-    };
-    if managed.lifecycle == ManagedLifecycle::Running {
-        return sidecar_state_error();
-    }
-    match cleanup_managed_sidecar_with_bounds(control, managed, term_timeout, kill_timeout) {
-        Ok(()) => match remove_cleaned_sidecar(state, &mut sidecar) {
-            Ok(()) => startup_error,
-            Err(error) => error,
-        },
-        Err(error) => error,
-    }
+    startup_error_with_diagnostic(state, final_error)
 }
 
 fn validate_state_owned_executable(state: &DesktopHostState) -> HostResult<()> {
@@ -8482,7 +8549,7 @@ mod tests {
             &credential,
             Duration::from_secs(1),
             || false,
-            || Ok(false),
+            || Ok(None),
         )
         .unwrap_err();
         server.join().unwrap();
@@ -9075,6 +9142,184 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
                 errno: None,
             })
         );
+    }
+
+    #[test]
+    fn startup_exit_disposition_reports_code_without_reaping() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 23"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let disposition = loop {
+            if let Some(disposition) = leader_exit_disposition_without_reaping(&child).unwrap() {
+                break disposition;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit");
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(disposition, StartupExitDisposition::Code(23));
+        assert_eq!(child.wait().unwrap().code(), Some(23));
+    }
+
+    #[test]
+    fn startup_exit_disposition_reports_terminating_signal_without_reaping() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "kill -TERM $$"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let disposition = loop {
+            if let Some(disposition) = leader_exit_disposition_without_reaping(&child).unwrap() {
+                break disposition;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit");
+            thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!(
+            disposition,
+            StartupExitDisposition::Signal(libc::SIGTERM as u32)
+        );
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+    }
+
+    #[test]
+    fn startup_failure_settles_marker_after_leader_exit_and_cleanup() {
+        let state = DesktopHostState::default();
+        let generation = state.startup_diagnostics.begin();
+        let mut child = Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf 'OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed\\n' >&2; exit 23",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        start_startup_diagnostic_drain(
+            &mut child,
+            Arc::clone(&state.startup_diagnostics),
+            generation,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let disposition = loop {
+            if let Some(disposition) = leader_exit_disposition_without_reaping(&child).unwrap() {
+                break disposition;
+            }
+            assert!(Instant::now() < deadline, "leader did not exit");
+            thread::sleep(Duration::from_millis(1));
+        };
+        child.wait().unwrap();
+
+        settle_startup_diagnostics(&state);
+        let error = startup_error_with_diagnostic(
+            &state,
+            NativeHostError::new(
+                "sidecar_exited_during_startup",
+                "The OpenEvo Desktop sidecar exited before it became ready.",
+            )
+            .with_startup_exit_disposition(disposition),
+        );
+
+        assert_eq!(error.code, "sidecar_exited_during_startup");
+        assert_eq!(
+            error.message,
+            "The OpenEvo Desktop sidecar exited before it became ready. Sidecar exit: code=23. Startup diagnostic: python_launcher/server_failed."
+        );
+    }
+
+    #[test]
+    fn startup_failure_without_marker_reports_exit_disposition() {
+        let state = DesktopHostState::default();
+        let generation = state.startup_diagnostics.begin();
+        state.startup_diagnostics.close_reader(generation);
+        let error = startup_error_with_diagnostic(
+            &state,
+            NativeHostError::new(
+                "sidecar_exited_during_startup",
+                "The OpenEvo Desktop sidecar exited before it became ready.",
+            )
+            .with_startup_exit_disposition(StartupExitDisposition::Signal(libc::SIGKILL as u32)),
+        );
+
+        assert_eq!(
+            error.message,
+            "The OpenEvo Desktop sidecar exited before it became ready. Sidecar exit: signal=9."
+        );
+        assert!(error.message.is_ascii());
+        assert!(error.message.len() < 768);
+    }
+
+    #[test]
+    fn startup_cleanup_error_keeps_only_allowlisted_diagnostics() {
+        let state = DesktopHostState::default();
+        let diagnostics = &state.startup_diagnostics;
+        let generation = diagnostics.begin();
+        drain_startup_diagnostics(
+            &b"raw stderr token=super-secret\nOPENEVO_STARTUP_V1 stage=python_launcher code=server_failed\n"[..],
+            diagnostics,
+            generation,
+        );
+        let error = startup_error_with_diagnostic(
+            &state,
+            sidecar_stop_error().with_startup_exit_disposition(StartupExitDisposition::Code(23)),
+        );
+
+        assert_eq!(error.code, "sidecar_stop_failed_owned");
+        assert!(error.message.contains("Sidecar exit: code=23."));
+        assert!(error.message.contains("python_launcher/server_failed"));
+        assert!(!error.message.contains("secret"));
+        assert!(!error.message.contains("token"));
+        assert!(error.message.is_ascii());
+        assert!(error.message.len() < 768);
+    }
+
+    #[test]
+    fn startup_diagnostic_retry_ignores_a_prior_generation() {
+        let diagnostics = StartupDiagnosticSink::new();
+        let first_generation = diagnostics.begin();
+        let second_generation = diagnostics.begin();
+        diagnostics.record(
+            first_generation,
+            StartupDiagnostic {
+                stage: "python_launcher",
+                code: "server_failed",
+                errno: None,
+            },
+        );
+
+        assert_eq!(diagnostics.last(), None);
+        diagnostics.record(
+            second_generation,
+            StartupDiagnostic {
+                stage: "bootloader_archive",
+                code: "archive_open_failed",
+                errno: None,
+            },
+        );
+        diagnostics.close_reader(first_generation);
+
+        assert_eq!(
+            diagnostics.last(),
+            Some(StartupDiagnostic {
+                stage: "bootloader_archive",
+                code: "archive_open_failed",
+                errno: None,
+            })
+        );
+        assert!(!diagnostics.reader_closed.load(Ordering::Acquire));
+        diagnostics.close_reader(second_generation);
+        assert!(diagnostics.reader_closed.load(Ordering::Acquire));
     }
 
     #[test]
@@ -10524,6 +10769,14 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             }
         }
 
+        fn leader_exit_disposition(
+            &self,
+            child: &Child,
+        ) -> std::io::Result<Option<StartupExitDisposition>> {
+            self.leader_exited(child)
+                .map(|exited| exited.then_some(StartupExitDisposition::Code(0)))
+        }
+
         fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
             self.events.lock().unwrap().push("reap_leader");
             OsProcessControl.reap_leader(child)
@@ -10630,6 +10883,14 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             } else {
                 Ok(true)
             }
+        }
+
+        fn leader_exit_disposition(
+            &self,
+            child: &Child,
+        ) -> std::io::Result<Option<StartupExitDisposition>> {
+            self.leader_exited(child)
+                .map(|exited| exited.then_some(StartupExitDisposition::Code(0)))
         }
 
         fn reap_leader(&self, child: &mut Child) -> std::io::Result<Option<ExitStatus>> {
