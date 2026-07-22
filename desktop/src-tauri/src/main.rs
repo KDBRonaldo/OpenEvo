@@ -9170,12 +9170,7 @@ mod tests {
         );
         let mut child = spawn_test_process_group(&script);
         let process_group = child.id() as i32;
-        wait_for_file(&descendant_pid_path);
-        let descendant_pid: i32 = fs::read_to_string(&descendant_pid_path)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
+        let descendant_pid = wait_for_pid_file(&descendant_pid_path);
 
         terminate_process_group(
             &mut child,
@@ -9213,12 +9208,7 @@ mod tests {
         let parent_liveness = prepared.take_parent_liveness_writer().unwrap();
         let child = prepared.spawn().unwrap();
         let process_group = child.id() as i32;
-        wait_for_file(&descendant_pid_path);
-        let descendant_pid = fs::read_to_string(&descendant_pid_path)
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        let descendant_pid = wait_for_pid_file(&descendant_pid_path);
         let old_token = "11".repeat(SESSION_TOKEN_BYTES);
         let state = DesktopHostState::default();
         install_parent_liveness(&state, parent_liveness).unwrap();
@@ -11209,6 +11199,22 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
         let deadline = Instant::now() + Duration::from_secs(2);
         while !path.exists() {
             assert!(Instant::now() < deadline, "timed out waiting for pid file");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_pid_file(path: &Path) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for complete pid file"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }
