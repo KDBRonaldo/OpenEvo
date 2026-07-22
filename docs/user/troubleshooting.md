@@ -8,11 +8,11 @@ SSH keys, Codex credentials, full transcripts, or private research data.
 
 ## Desktop Startup Diagnostics
 
-When Desktop opens but startup fails or remains incomplete, open **Diagnostics**.
-Choose **View logs** to review the local startup events, **Reveal in Finder** to
-open their directory, or **Export diagnostics** to create the support artifact.
-Support requests the exported JSON rather than screenshots, raw terminal output,
-or copies of local log files.
+While startup is still in progress, open **Diagnostics** and choose **View
+logs** to review local startup events. After the attempt succeeds or fails,
+**Reveal in Finder** opens the log directory and **Export diagnostics** creates
+the support artifact. Support requests the exported JSON rather than
+screenshots, raw terminal output, or copies of local log files.
 
 ## Common Typed Errors
 

@@ -1,6 +1,6 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the published `0.1.7` exhibition Preview and its supported
+This guide describes the published `0.1.8` exhibition Preview and its supported
 Apple Silicon Mac plus Linux Docker-host profile.
 
 ## Before You Start
@@ -23,13 +23,13 @@ a runtime image manually.
 ## Install The Unsigned DMG
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.7 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.7-v017-startup-final.29894444050.1),
-   confirm the title **OpenEvo Desktop 0.1.7 Preview**, then download
-   `OpenEvo-Desktop-0.1.7-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.8 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.8-v018-startup-logs.29947490201.1),
+   confirm the title **OpenEvo Desktop 0.1.8 Preview**, then download
+   `OpenEvo-Desktop-0.1.8-aarch64.dmg` and `SHA256SUMS`.
 2. Verify the exact DMG checksum recorded by that release:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.7-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.8-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -51,18 +51,19 @@ Do not clear quarantine from a parent directory or from an unverified download.
 
 ## Startup Diagnostics
 
-If Desktop opens but startup fails or remains incomplete, open **Diagnostics**.
-Use **View logs** to inspect local startup events, **Reveal in Finder** to open
-their directory, or **Export diagnostics** to create the support artifact.
-When contacting support, provide the exported JSON together with the displayed
-error code and Desktop version; do not send raw terminal output, SSH material,
-credentials, transcripts, or research data.
+If Desktop opens but startup is still in progress, open **Diagnostics** and use
+**View logs** to inspect local startup events. After the attempt succeeds or
+fails, **Reveal in Finder** opens the log directory and **Export diagnostics**
+creates the support artifact. When contacting support, provide the exported
+JSON together with the displayed error code and Desktop version; do not send
+raw terminal output, SSH material, credentials, transcripts, or research data.
 
-Version `0.1.7` starts with a new local Preview-state namespace and does not
-import projects or retry records created by older Preview builds. Removing an
-older application does not remove those files, but they cannot prevent `0.1.7`
-from starting. Add the remote workspace again in `0.1.7`; remote project and
-Daemon data are not deleted by this local reset.
+Version `0.1.7` introduced the current local Preview-state namespace and stopped
+importing projects or retry records created by older Preview builds. Version
+`0.1.8` keeps that namespace, so workspaces saved by `0.1.7` remain available.
+Removing an older application does not remove pre-`0.1.7` files, but those
+files are not read by the current release and cannot block its startup. Remote
+project and Daemon data are not deleted by this local isolation.
 
 ## Explore The Built-In Projects
 
@@ -167,9 +168,9 @@ managed runtime, or the OpenEvo Daemon.
 Local workspace profiles, accepted host keys, and recovery state are also kept
 when only the application is removed. Current releases store that data under
 `~/Library/Application Support/org.openevo.desktop`. The older Preview directory
-`~/.openevo/desktop` is preserved but is not read by v0.1.7. To clear all local
-OpenEvo Desktop state after quitting the app, remove both directories. This does
-not delete remote data.
+`~/.openevo/desktop` is preserved but is not read by v0.1.7 or later. To clear
+all local OpenEvo Desktop state after quitting the app, remove both directories.
+This does not delete remote data.
 
 The first Preview does not expose a complete in-app OpenEvo Daemon uninstall or
 remote project-erasure workflow. Do not manually edit or delete OpenEvo remote

@@ -72,7 +72,7 @@ the remote-host E2E does not execute the final macOS Tauri process, and the
 clean-host matrix, protected-performance gates, signing, notarization, and
 External Beta gates remain open.
 
-Version `0.1.7` is the current public immutable unsigned exhibition Preview,
+Version `0.1.7` is the previous public immutable unsigned exhibition Preview,
 published on July 22, 2026 from source
 `61190cdb3066377b3c511b35a0df420d70b7c665`, candidate run `29894444050`, and
 publication run `29907242726` under tag
@@ -86,6 +86,20 @@ remote Codex subscription sessions, all three text-evolution targets,
 next-session artifact reuse, and packaged-renderer observability. It retains
 the same non-gating Preview boundary as `0.1.6` and is not a G1-G12 candidate.
 
+Version `0.1.8` is the current public immutable unsigned exhibition Preview,
+published on July 22, 2026 from source
+`dde71c6a940d7e17bbfdb7c41ae7f7ee098618b9`, candidate run `29947490201`, and
+publication run `29949667800` under tag
+`openevo-desktop-v0.1.8-v018-startup-logs.29947490201.1`. It executes the exact
+sidecar embedded in the macOS application bundle instead of copying it through
+a temporary pre-Python launch path, and adds bounded, redacted native startup
+logs with in-app viewing, Finder reveal, and diagnostics export. The exact
+candidate passed mounted-DMG and copied-app startup checks. Signed
+candidate-bound evidence verifies two real remote Codex subscription sessions,
+all three text-evolution targets, next-session artifact reuse, and packaged
+renderer observability. It retains the non-gating Preview boundary and is not a
+G1-G12 candidate.
+
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
 architecture, mounts the exact candidate DMG, launches its real Tauri app,
@@ -97,10 +111,10 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-The checked-in evidence for `0.1.4`, `0.1.6`, and `0.1.7` is bound to each exact
-candidate manifest and signed by the release host. It proves the stated
-Preview paths, but it does not by itself satisfy G2, G3, G4, G7, G12, or the
-full ordinary-user qualification matrix.
+The checked-in evidence for `0.1.4`, `0.1.6`, `0.1.7`, and `0.1.8` is bound to
+each exact candidate manifest and signed by the release host. It proves the
+stated Preview paths, but it does not by itself satisfy G2, G3, G4, G7, G12, or
+the full ordinary-user qualification matrix.
 
 Final External Beta publication remains disabled while productization work
 tracked by #131/#163 is in progress. PyPI is not part of either the Preview or
