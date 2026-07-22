@@ -263,18 +263,29 @@ jobs:
         run: |
           version="$(uv run python - <<'PY'
           import json
+          import re
           import tomllib
           from pathlib import Path
 
           root = Path.cwd()
           with (root / "pyproject.toml").open("rb") as stream:
               version = tomllib.load(stream)["project"]["version"]
+          core_init = (root / "src/openevo/__init__.py").read_text(encoding="utf-8")
+          core_match = re.search(
+              r'^__version__\s*=\s*["\']([^"\']+)["\']$',
+              core_init,
+              re.MULTILINE,
+          )
+          if core_match is None:
+              raise SystemExit("Core package version is unavailable")
           renderer = json.loads((root / "desktop/package.json").read_text(encoding="utf-8"))["version"]
+          with (root / "desktop/src-tauri/Cargo.toml").open("rb") as stream:
+              native = tomllib.load(stream)["package"]["version"]
           tauri = json.loads(
               (root / "desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8")
           )["version"]
-          if renderer != version or tauri != version:
-              raise SystemExit("Core, renderer, and Tauri versions do not match")
+          if {core_match.group(1), renderer, native, tauri} != {version}:
+              raise SystemExit("Core, renderer, native host, and Tauri versions do not match")
           print(version)
           PY
           )"
@@ -594,11 +605,14 @@ jobs:
             --existing-home "$HOME" \
             --evidence-out "$RUNNER_TEMP/legacy-state-app-bundle-smoke.json"
 
+          xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"
+          test "$(xattr -p com.apple.quarantine "$copied_app")" = "$quarantine_value"
           uv run python scripts/ci/smoke_openevo_desktop_launchservices.py \
             "$copied_app" \
             --expected-version "$OPENEVO_VERSION" \
+            --source-dmg "$dmg" \
             --timeout-seconds 120 \
-            --evidence-out "$RUNNER_TEMP/launchservices-state-isolation-smoke.json"
+            --evidence-out candidate-artifacts/launchservices-smoke.json
 
           test -f "$current_state/provider.sqlite3"
           test -f "$current_native_state/.c41d73e981bf4a56"
@@ -620,7 +634,7 @@ jobs:
           name: openevo-desktop-launchservices-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/legacy-state-app-bundle-smoke.json
-            ${{ runner.temp }}/launchservices-state-isolation-smoke.json
+            candidate-artifacts/launchservices-smoke.json
           if-no-files-found: warn
           retention-days: 14
 

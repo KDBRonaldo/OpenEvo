@@ -7,6 +7,7 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleDot,
+  Download,
   FileDiff,
   FileText,
   FolderOpen,
@@ -31,6 +32,10 @@ import {
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { DesktopApiError } from "../api/v1/client";
+import {
+  exportDesktopDiagnostics,
+  revealDesktopLogDirectory,
+} from "../api/desktopLogs";
 import { OpenEvoMark } from "../components/OpenEvoMark";
 import type { OpenEvoJsonObject } from "../api/evolutionConfigSchema";
 import type {
@@ -2401,6 +2406,7 @@ function SystemWorkspace({
   const [activity, setActivity] = useState<SystemActivity | null>(null);
   const [lastDoctorOperation, setLastDoctorOperation] = useState<LocalOperationV1 | null>(null);
   const [maintenanceError, setMaintenanceError] = useState<string | null>(null);
+  const [desktopDiagnosticsStatus, setDesktopDiagnosticsStatus] = useState<string | null>(null);
   const maintenanceGeneration = useRef(0);
   const ownsMaintenanceBusy = useRef(false);
   const confirmationTrigger = useRef<HTMLElement | null>(null);
@@ -2754,6 +2760,52 @@ function SystemWorkspace({
           </button>
         </div>
       </section> : null}
+      <section className="services-section">
+        <div className="section-heading">
+          <div><FileText size={17} /><h2>Desktop diagnostics</h2></div>
+        </div>
+        <div className="maintenance-row">
+          <div>
+            <strong>Local application logs</strong>
+            <span>Review or export private OpenEvo Desktop lifecycle and startup diagnostics.</span>
+            {desktopDiagnosticsStatus ? <span role="status">{desktopDiagnosticsStatus}</span> : null}
+          </div>
+          <div className="system-button-row">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                setDesktopDiagnosticsStatus(null);
+                void revealDesktopLogDirectory().then((result) => {
+                  setDesktopDiagnosticsStatus(
+                    result.status === "revealed" ? "Log folder opened." : "Log folder is unavailable.",
+                  );
+                });
+              }}
+            >
+              <FolderOpen size={15} /> Reveal logs
+            </button>
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => {
+                setDesktopDiagnosticsStatus(null);
+                void exportDesktopDiagnostics().then((result) => {
+                  setDesktopDiagnosticsStatus(
+                    result.status === "exported"
+                      ? "Diagnostics exported."
+                      : result.status === "cancelled"
+                        ? "Export cancelled."
+                        : "Diagnostics export is unavailable.",
+                  );
+                });
+              }}
+            >
+              <Download size={15} /> Export diagnostics
+            </button>
+          </div>
+        </div>
+      </section>
     </div>
     {confirmation ? (
       <SystemConfirmationDialog

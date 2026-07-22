@@ -422,6 +422,98 @@ pre.json {
   border: 0;
 }
 
+.startup-diagnostics {
+  margin: -8px 0 16px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+}
+
+.startup-diagnostics-toggle {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 12px;
+  border: 0;
+  color: #48514b;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.startup-diagnostics-toggle:hover {
+  color: var(--ink);
+}
+
+.startup-diagnostics-panel {
+  padding: 0 12px 12px;
+  border-top: 1px solid var(--line);
+}
+
+.startup-diagnostics-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.startup-diagnostics-actions .secondary-button {
+  min-height: 30px;
+  padding: 0 9px;
+  font-size: 12px;
+}
+
+.startup-diagnostics-status {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.startup-log-tail {
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.startup-log-entry {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 7px 12px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.startup-log-entry > div {
+  min-width: 0;
+}
+
+.startup-log-entry span,
+.startup-log-entry strong {
+  display: block;
+}
+
+.startup-log-entry span {
+  color: var(--subtle);
+  font-size: 10px;
+  font-weight: 650;
+  text-transform: uppercase;
+}
+
+.startup-log-entry strong {
+  overflow-wrap: anywhere;
+  margin-top: 2px;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.35;
+}
+
 .workspace-stack {
   display: flex;
   flex-direction: column;

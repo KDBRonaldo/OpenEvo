@@ -267,10 +267,10 @@ jobs:
         timeout-minutes: 45
         run: cargo test --locked --release -- --test-threads=1
 
-      - name: Exercise macOS private executable handoff
+      - name: Exercise macOS verified bundle executable handoff
         working-directory: desktop/src-tauri
         timeout-minutes: 10
-        run: cargo test --locked tests::macos_release_spawns_from_the_populated_private_path -- --exact
+        run: cargo test --locked tests::macos_release_spawns_verified_bundle_path_without_private_copy -- --exact
 
       - name: Exercise packaged macOS externalBin launch
         working-directory: desktop/src-tauri

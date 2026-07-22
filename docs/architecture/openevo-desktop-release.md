@@ -91,9 +91,10 @@ The repository currently provides:
   packaged sidecar readiness, inherited listener FD 3, executable FD 4, and
   bounded process-group cleanup. A credential-free native process marker binds
   the observed process group and FD 4 device, inode, and size to the digest that
-  Rust computed from the verified bundled externalBin bytes. The observer never
-  reopens the private launch pathname retained for the macOS PyInstaller
-  lifecycle; it trusts the marker-bound live FD identity instead.
+  Rust computed from the verified bundled externalBin bytes. On macOS the
+  observer also uses `proc_pidpath` to require the running process image to be
+  that exact bundle member, then matches its filesystem identity to the
+  retained FD; it never treats an `lsof` display pathname as authority.
   The dependent Linux job downloads the complete candidate manifest and
   installs, framework-verifies, and service-smokes the same final Core wheel
   bytes. The service smoke uses the installed launcher's canonical
@@ -186,55 +187,33 @@ group/world writable. A same-UID process remains inside this phase-one trust
 boundary.
 
 The source must be a non-empty, link-count-one regular executable that is not
-group/world writable. Native code hashes the held source FD before copying,
-copies and hashes it, then hashes it again. Before and after those reads it
-requires the source FD and parent-relative pathname to retain the same device,
-inode, size, mode, link count, owner, mtime, and ctime. All three digests must
-match. The private destination is created exclusively in a native-created
-`0700` directory and opened once for writing and separately read-only. After
-`fsync` and mode `0500`, writer and reader identity, size, platform-specific link
-count, and digest are checked again. Linux then unlinks the inode before use and
-retains only the read-only FD. macOS retains the link-count-one private pathname
-for the PyInstaller lifecycle described below and unlinks it during verified
-native cleanup. The `0700` directory is not treated as protection from another
-same-UID process. Its owner retains a directory FD and performs only
-identity-checked non-recursive cleanup, so pathname replacement cannot cause
-recursive deletion.
+group/world writable. Native code verifies the held source FD and its
+parent-relative pathname before and after hashing: device, inode, size, mode,
+link count, owner, mtime, ctime, and digest must remain stable.
 
-Linux execution and archive reads use inherited FD 4 through `/proc/self/fd/4`.
-On macOS, archive reads still use verified FD 4 through `/dev/fd/4`, but the
-PyInstaller onefile parent cannot use that device path for its later child
-`execvp`. The native host therefore supplies a second non-secret, closed
-environment field, `OPENEVO_NATIVE_EXECUTABLE_PATH`, containing only the private
-`.../openevo-desktop-sidecar` pathname whose final inode was matched to FD 4 in
-the Rust `pre_exec` hook. `OPENEVO_NATIVE_EXECUTABLE_FD` remains exactly `4`.
-Both names must be removed from the inherited environment allowlist before the
-native host sets its own values; Linux must leave the pathname field absent.
+Linux retains the private unlinked-copy launch design. Native code copies the
+verified source into an exclusively created `0700` directory, fsyncs and
+re-verifies its bytes and mode, unlinks that inode, and launches through the
+retained executable FD. Linux execution and archive reads use inherited FD 4
+through `/proc/self/fd/4`; the private directory FD is retained only for
+identity-checked non-recursive cleanup.
 
-The custom bootloader treats the two values as one protocol. A path without the
-FD marker, an FD value other than `4`, a macOS FD launch without the path, or a
-Linux FD launch with the path fails closed. On macOS it requires an absolute
-path with the fixed basename and no control or dot-segment components, then
-compares both the original and resolved pathname `lstat` identities with
-`fstat(4)`, requires a link-count-one regular file, rejects group/world write,
-and accepts only root or effective-user ownership. It resolves parent-component
-aliases such as macOS `/var` to `/private/var` within those checks.
-`pyi_ctx->executable_filename`
-receives that resolved private path solely for onefile child execution;
-`_pyi_main_resolve_pkg_archive` independently opens
-`/dev/fd/4`, so parent and child archive bytes remain FD-bound. The packaged
-Python entry point removes both protocol fields before launcher `main` runs.
+macOS does not make a random temporary copy. It directly executes the verified
+`Contents/MacOS/openevo-desktop-sidecar` bundle member after validating the
+source FD, digest, bundle path, device, and inode. The native host retains the
+relevant bundle and parent directory FDs through launch, and retains FD 4 as the
+archive binding. The PyInstaller archive is read through verified FD 4 via
+`/dev/fd/4`; the launched executable remains the verified bundle member rather
+than a temporary pathname. This replaces the v0.1.7 macOS private-copy launch.
 
 The sidecar builder downloads only the exact size/SHA-256 PyInstaller sdist
 recorded in `uv.lock`, applies exact-source resolver and archive patches, and
-rebuilds it. The parent validates private FD identity and digest before and after
-spawn, and the Rust child validates its inherited FD against the private
-parent-relative pathname immediately before exec. Typed failures contain a
-stable code and user-readable message without either host path. The retained
-macOS pathname is still inside the phase-one same-UID trust boundary: a same-UID
-process can race replacement after identity validation and before a later
-pathname-based `execvp`. Code signing or notarization alone does not close this
-pathname TOCTOU, and this design does not claim otherwise.
+rebuilds it. The parent validates the retained executable FD identity and digest
+before and after spawn, and the Rust child revalidates the bundle path/device/
+inode binding immediately before exec. Typed failures contain a stable code and
+user-readable message without a host path. The retained macOS FDs anchor the
+verified launch traversal; this phase-one unsigned-preview boundary does not
+claim isolation from a malicious same-UID process.
 
 For release observation, the native host emits the closed
 `OPENEVO_DESKTOP_SIDECAR_PROCESS_V2` marker only for a packaged launch. It
@@ -250,10 +229,12 @@ birth identity returned by `proc_pidinfo(PROC_PIDTBSDINFO)`. It then locates a
 single process in that group holding both an IPv4 `127.0.0.1` listening FD 3
 and a regular FD 4 with the marker-bound device, inode, and size. The SHA-256
 binding comes from the native host's already verified instance of that exact
-FD. The private pathname remains inside the documented same-UID trust boundary
-until native cleanup; the smoke does not reopen an `lsof` pathname because the
-marker and live FD identity, rather than that pathname, are the observation
-authority. The separate `OPENEVO_DESKTOP_RENDERER_READY_V2` acknowledgement is
+FD. The retained bundle and parent FDs remain inside the documented same-UID
+trust boundary through launch. The smoke independently resolves the process
+image with `proc_pidpath` and requires it to match the bundle sidecar; any
+`lsof` pathname remains non-authoritative. The marker, process-image identity,
+and live FD must all agree. The separate
+`OPENEVO_DESKTOP_RENDERER_READY_V2` acknowledgement is
 emitted only after the invoking Tauri WebView is the `main` window with a
 non-zero inner size and the renderer has loaded an authoritative Local API
 snapshot and committed the product shell. The digest-bound marker therefore
@@ -532,15 +513,13 @@ direct-backend fallback. Debug builds retain a development launcher behind
 `cfg(debug_assertions)`: an optional program plus JSON string-array argv is
 passed directly to `Command` without shell parsing, and the local host and port
 arguments, inherited listener, and instance channel remain native-host owned.
-Linux executes the verified anonymous file through `/proc/self/fd`. macOS keeps
-the same digest-verified inode linked inside an owner-only `0700` launch
-directory for the complete PyInstaller onefile parent/child process lifecycle,
-passes its open descriptor to the FD-aware sidecar bootloader, and unlinks the
-private pathname only after process-group cleanup is confirmed. This avoids
-relying on macOS Mach-O execution through `/dev/fd` while preserving
-descriptor-bound archive reads. The pathname is private native-host state and is
-never renderer-visible, but it intentionally remains available for PyInstaller's
-later child `execvp` until the owned process lifecycle has ended.
+Linux executes the verified anonymous file through `/proc/self/fd`. macOS
+directly executes the digest-verified
+`Contents/MacOS/openevo-desktop-sidecar` bundle member after its path, device,
+and inode have been matched to the retained FDs. The native host retains the
+bundle and parent FDs through the process lifecycle and preserves descriptor-bound
+archive reads through FD 4; it does not create a temporary launch directory or
+make a private macOS copy. The bundle pathname is never renderer-visible.
 The release host bounds that cold onefile initialization at 60 seconds. Release
 candidate app smokes use a 120-second readiness deadline so renderer
 acknowledgement and FD/window observation still have time after a cold start.
@@ -769,10 +748,14 @@ no log. Once the watchdog exists, closing the liveness writer terminates a child
 blocked in a later pre-exec hook or exec/error-channel handoff without making
 stop or exit wait on that channel.
 
-Sidecar stdout and stderr are connected to the null device. There is no native
-raw-log buffer and no `app_logs` Tauri command, so renderer JavaScript cannot
-receive child output; sidecar status also omits command, path, argv, credential,
-and backend details.
+Sidecar stdout and stderr are connected to the null device. Native structured
+logs are instead persisted under the Tauri app-data directory in `logs-v1`, with
+closed fields only and bounded rotation. The log stream covers native startup,
+sidecar lifecycle, and renderer-stage events; it never records raw stderr,
+paths, argv, environment values, tokens, or other secrets. Tauri exposes only a
+bounded log tail plus the `Diagnostics` actions to view logs, reveal the log
+directory in Finder, and export diagnostics JSON. Sidecar status likewise omits
+command, path, argv, credential, and backend details.
 
 The native host and packaged Python launcher share the four-key frame and strict
 Local API v1 inventory described above. `/health` is provided by the release

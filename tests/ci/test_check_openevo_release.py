@@ -767,6 +767,7 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
     smoke = _load_bundle_smoke_module()
     sidecar = tmp_path / "openevo-desktop-sidecar"
     sidecar.write_bytes(b"observed sidecar")
+    sidecar_identity = sidecar.stat()
     executable = tmp_path / "OpenEvo Desktop"
     executable.write_bytes(b"native executable")
     monkeypatch.setattr(
@@ -793,8 +794,8 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
             ),
             size=None if descriptor == 3 else len(sidecar.read_bytes()),
             tcp_state="LISTEN" if descriptor == 3 else None,
-            device=None if descriptor == 3 else 42,
-            inode=None if descriptor == 3 else 99,
+            device=None if descriptor == 3 else sidecar_identity.st_dev,
+            inode=None if descriptor == 3 else sidecar_identity.st_ino,
         ),
     )
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
@@ -804,8 +805,8 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
             process_group=41,
             session_id=41,
             birth_identity="darwin:1700000000:123",
-            executable_device=42,
-            executable_inode=99,
+            executable_device=sidecar_identity.st_dev,
+            executable_inode=sidecar_identity.st_ino,
             executable_sha256=digest,
             executable_size=len(sidecar.read_bytes()),
         ),
@@ -841,8 +842,8 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
             ),
             size=None if descriptor == 3 else len(sidecar.read_bytes()),
             tcp_state="LISTEN" if descriptor == 3 else None,
-            device=None if descriptor == 3 else 42,
-            inode=None if descriptor == 3 else 100,
+            device=None if descriptor == 3 else sidecar_identity.st_dev,
+            inode=None if descriptor == 3 else sidecar_identity.st_ino + 1,
         ),
     )
     rejected, _groups, rejected_stage = smoke._macos_native_evidence(
@@ -856,6 +857,62 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
     )
     assert rejected is None
     assert rejected_stage == "executable_fd_unavailable"
+
+
+def test_bundle_smoke_rejects_darwin_process_image_outside_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    sidecar = tmp_path / "app" / "openevo-desktop-sidecar"
+    sidecar.parent.mkdir()
+    sidecar.write_bytes(b"bundled sidecar")
+    other = tmp_path / "private-copy" / "openevo-desktop-sidecar"
+    other.parent.mkdir()
+    other.write_bytes(sidecar.read_bytes())
+    executable = tmp_path / "OpenEvo Desktop"
+    executable.write_bytes(b"native executable")
+    identity = sidecar.stat()
+    digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
+    marker = smoke.NativeSidecarProcessMarker(
+        pid=41,
+        process_group=41,
+        session_id=41,
+        birth_identity="darwin:1700000000:123",
+        executable_device=identity.st_dev,
+        executable_inode=identity.st_ino,
+        executable_sha256=digest,
+        executable_size=identity.st_size,
+    )
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        smoke,
+        "_descendants",
+        lambda _pid, _deadline: [(41, 40, 41, "openevo-desktop-sidecar")],
+    )
+    monkeypatch.setattr(smoke.os, "getpgid", lambda _pid: 41)
+    monkeypatch.setattr(smoke.os, "getsid", lambda _pid: 41)
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_birth_identity",
+        lambda _pid: marker.birth_identity,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_executable_path",
+        lambda _pid: str(other),
+    )
+
+    with pytest.raises(smoke.SmokeFailure, match="process image"):
+        smoke._macos_native_evidence(
+            40,
+            executable,
+            sidecar,
+            {},
+            digest,
+            smoke.NativeHostObservation(marker, True, frozenset({41})),
+            smoke.time.monotonic() + 5,
+        )
 
 
 def test_bundle_smoke_parses_lsof_machine_fields(
@@ -921,6 +978,7 @@ def test_bundle_smoke_lsof_deadline_does_not_replace_product_readiness(
     smoke = _load_bundle_smoke_module()
     sidecar = tmp_path / "openevo-desktop-sidecar"
     sidecar.write_bytes(b"observed sidecar")
+    sidecar_identity = sidecar.stat()
     executable = tmp_path / "OpenEvo Desktop"
     executable.write_bytes(b"native executable")
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
@@ -929,8 +987,8 @@ def test_bundle_smoke_lsof_deadline_does_not_replace_product_readiness(
         process_group=41,
         session_id=41,
         birth_identity="darwin:1700000000:123",
-        executable_device=42,
-        executable_inode=99,
+        executable_device=sidecar_identity.st_dev,
+        executable_inode=sidecar_identity.st_ino,
         executable_sha256=digest,
         executable_size=sidecar.stat().st_size,
     )
@@ -1074,6 +1132,7 @@ def test_bundle_smoke_caps_observed_sidecar_group_members(
     smoke = _load_bundle_smoke_module()
     sidecar = tmp_path / "openevo-desktop-sidecar"
     sidecar.write_bytes(b"observed sidecar")
+    sidecar_identity = sidecar.stat()
     executable = tmp_path / "OpenEvo Desktop"
     executable.write_bytes(b"native executable")
     digest = hashlib.sha256(sidecar.read_bytes()).hexdigest()
@@ -1082,8 +1141,8 @@ def test_bundle_smoke_caps_observed_sidecar_group_members(
         process_group=41,
         session_id=41,
         birth_identity="darwin:1700000000:123",
-        executable_device=42,
-        executable_inode=99,
+        executable_device=sidecar_identity.st_dev,
+        executable_inode=sidecar_identity.st_ino,
         executable_sha256=digest,
         executable_size=sidecar.stat().st_size,
     )
@@ -2559,9 +2618,14 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert macos_candidate.count("copied_app=") == 1
     assert mounted_smoke in shipped_app_smoke
     assert copied_smoke in shipped_app_smoke
+    assert "--evidence-out candidate-artifacts/launchservices-smoke.json" in shipped_app_smoke
+    assert '--source-dmg "$dmg"' in shipped_app_smoke
     assert 'codesign --verify --deep --strict --verbose=2 "$mounted_app"' in shipped_app_smoke
     assert 'grep -F "Signature=adhoc"' in shipped_app_smoke
     assert 'xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"' in shipped_app_smoke
+    assert shipped_app_smoke.count(
+        'xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"'
+    ) == 2
     assert 'xattr -dr com.apple.quarantine "$copied_app"' in shipped_app_smoke
     assert 'codesign --verify --deep --strict --verbose=2 "$copied_app"' in shipped_app_smoke
     mounted_smoke_position = shipped_app_smoke.index(mounted_smoke)
@@ -2577,6 +2641,14 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert mounted_smoke_position < copy_position < release_detach
     assert release_detach < quarantine_position < quarantine_removal_position
     assert quarantine_removal_position < copied_smoke_position
+    second_quarantine_position = shipped_app_smoke.index(
+        'xattr -w com.apple.quarantine "$quarantine_value" "$copied_app"',
+        quarantine_position + 1,
+    )
+    launchservices_position = shipped_app_smoke.index(
+        "scripts/ci/smoke_openevo_desktop_launchservices.py"
+    )
+    assert copied_smoke_position < second_quarantine_position < launchservices_position
     assert "trap cleanup EXIT" in shipped_app_smoke
     assert (
         'hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true'
@@ -2600,6 +2672,23 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert 'trap \'rm -rf -- "$ssh_test_root"\' EXIT' in candidate_ssh_step
     assert '--basetemp="$ssh_test_root/pytest"' in candidate_ssh_step
     assert "$RUNNER_TEMP" not in candidate_ssh_step
+
+    version_step = text.split(
+        "      - name: Resolve exact product version and runner architecture\n",
+        maxsplit=1,
+    )[1].split(
+        "      - name: Download and verify controlled managed subscription runtime asset\n",
+        maxsplit=1,
+    )[0]
+    for version_source in (
+        "pyproject.toml",
+        "src/openevo/__init__.py",
+        "desktop/package.json",
+        "desktop/src-tauri/Cargo.toml",
+        "desktop/src-tauri/tauri.conf.json",
+    ):
+        assert version_source in version_step
+    assert "Core, renderer, native host, and Tauri versions do not match" in version_step
 
     for marker in (
         "unsigned and not notarized",
@@ -3331,6 +3420,9 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     ]
     workflow = Path(".github/workflows/openevo-desktop.yml").read_text(encoding="utf-8")
     macos_workflow = workflow[workflow.index("  macos-native-launch-smoke:") :]
+    bundle_smoke = Path("scripts/ci/smoke_openevo_desktop_bundle.py").read_text(
+        encoding="utf-8"
+    )
     release_test_command = "cargo test --locked --release -- --test-threads=1"
     sidecar_builder = Path("desktop/packaging/build_sidecar.py")
     sidecar_entry = Path("desktop/packaging/sidecar_entry.py")
@@ -3451,12 +3543,18 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "openevo-desktop-sidecar" in main
     assert "check_sidecar_health" in main
     assert "wait_for_sidecar_ready" in main
+    assert (
+        "Native host did not execute the verified sidecar inside the macOS app bundle"
+        in bundle_smoke
+    )
     assert "fn host_status(" in main
     assert "fn start_sidecar(" in main
     assert "fn stop_sidecar(" in main
     assert "fn create_ssh_tunnel(" not in main
     assert "fn keychain_reference(" not in main
-    assert "fn app_logs(" not in main
+    assert "fn get_desktop_log_tail(" in main
+    assert "fn reveal_desktop_log_directory(" in main
+    assert "fn export_desktop_diagnostics(" in main
     assert "desktop.server.launcher" in main
     assert "Command::new" in main
     assert "Stdio::null()" in main
@@ -3467,12 +3565,16 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert release_test_command in macos_workflow
     assert macos_workflow.index("npm run build:sidecar") < macos_workflow.index(
         release_test_command
-    ) < macos_workflow.index("tests::macos_release_spawns_from_the_populated_private_path")
+    ) < macos_workflow.index(
+        "tests::macos_release_spawns_verified_bundle_path_without_private_copy"
+    )
     assert workflow.index("npm run build:sidecar") < workflow.index(
         "tests::packaged_external_bin_native_launch_smoke"
     )
     assert "macOS FD-bound packaged sidecar launch smoke" in workflow
-    assert "tests::macos_release_spawns_from_the_populated_private_path" in workflow
+    assert (
+        "tests::macos_release_spawns_verified_bundle_path_without_private_copy" in workflow
+    )
     assert "if: always()" in workflow
     assert 'rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"' in workflow
     assert "cargo build --locked --release" in workflow

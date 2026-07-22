@@ -102,6 +102,7 @@ REQUIRED_INPUT_ROLES = (
     ("python_requirements", "python-requirements.txt"),
     ("app_bundle_smoke", "app-bundle-smoke.json"),
     ("dmg_copy_smoke", "dmg-copy-smoke.json"),
+    ("launchservices_smoke", "launchservices-smoke.json"),
     ("managed_runtime_source", MANAGED_RUNTIME_SOURCE_NAME),
     ("playwright_evidence", PLAYWRIGHT_EVIDENCE_NAME),
     ("playwright_report", PLAYWRIGHT_REPORT_NAME),
@@ -1160,6 +1161,7 @@ def _validate_evidence(
     *,
     architecture: str,
     dmg_path: Path,
+    version: str,
 ) -> dict[str, list[str]]:
     dependency = _load_json(root / "dependency-inventory.json")
     license_inventory = _load_json(root / "license-inventory.json")
@@ -1307,6 +1309,56 @@ def _validate_evidence(
         raise CandidateError("Mounted-DMG app and detached-copy Mach-O evidence do not match")
     if smoke_payloads[0]["binary_sha256"] != smoke_payloads[1]["binary_sha256"]:
         raise CandidateError("Mounted-DMG app and detached-copy binary digests do not match")
+
+    launchservices = _load_json(root / "launchservices-smoke.json")
+    launchservices_keys = {
+        "architecture",
+        "binary_sha256",
+        "build_version",
+        "cleanup",
+        "launch_origin",
+        "os_major",
+        "process_image_bound",
+        "quarantine_present_before_allow",
+        "quarantine_removed_before_launch",
+        "schema_version",
+        "sidecar_ready",
+        "source_dmg",
+        "version_verified",
+    }
+    if type(launchservices) is not dict or set(launchservices) != launchservices_keys:
+        raise CandidateError("LaunchServices evidence does not use the closed schema")
+    cleanup = launchservices.get("cleanup")
+    if type(cleanup) is not dict or cleanup != {
+        "authority_limited_to_observed_tree": True,
+        "owned_processes_exited": True,
+        "sidecar_descendants_exited": True,
+    }:
+        raise CandidateError("LaunchServices cleanup evidence did not pass")
+    if launchservices.get("source_dmg") != expected_dmg_identity:
+        raise CandidateError("LaunchServices evidence does not bind the exact source DMG")
+    if launchservices.get("binary_sha256") != smoke_payloads[0]["binary_sha256"]:
+        raise CandidateError("LaunchServices evidence does not bind the candidate binaries")
+    if (
+        launchservices.get("schema_version") != 1
+        or launchservices.get("architecture") != ARCHITECTURE_SLICES[architecture]
+        or launchservices.get("build_version") != version
+        or launchservices.get("launch_origin")
+        != "launchservices_open_n_post_quarantine_allow"
+        or type(launchservices.get("os_major")) is not int
+        or launchservices["os_major"] < 12
+        or any(
+            launchservices.get(key) is not True
+            for key in (
+                "process_image_bound",
+                "quarantine_present_before_allow",
+                "quarantine_removed_before_launch",
+                "sidecar_ready",
+                "version_verified",
+            )
+        )
+    ):
+        raise CandidateError("LaunchServices quarantine-allow evidence did not pass")
     expected_slice = ARCHITECTURE_SLICES[architecture]
     mach_o = smoke_payloads[0]["mach_o"]
     assert isinstance(mach_o, dict)
@@ -1554,6 +1606,7 @@ def create_candidate_manifest(
         root,
         architecture=architecture,
         dmg_path=paths["desktop_dmg"],
+        version=version,
     )
     _validate_daemon_resource_evidence(
         paths["daemon_mounted_resource"],
@@ -1642,7 +1695,7 @@ def create_candidate_manifest(
             "notarized": False,
             "quarantine_removal_tested": True,
         },
-        "schema_version": 6,
+        "schema_version": 7,
         "source_commit": source_commit,
         "version": version,
     }
@@ -1685,7 +1738,7 @@ def _validate_candidate_manifest(
     core = manifest.get("core")
     daemon = manifest.get("daemon")
     files = manifest.get("files")
-    if manifest.get("schema_version") != 6:
+    if manifest.get("schema_version") != 7:
         raise CandidateError("candidate manifest schema version is invalid")
     if type(source_commit) is not str or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("candidate source commit is invalid")
@@ -1837,6 +1890,7 @@ def _validate_candidate_manifest(
         root,
         architecture=architecture,
         dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
+        version=version,
     )
     if observed_native_architectures != native_architectures:
         raise CandidateError("candidate manifest Mach-O slices do not match native evidence")

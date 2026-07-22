@@ -3,8 +3,16 @@
 OpenEvo errors include a stable `code`, a user-safe message, whether retry is
 allowed, a `repair_action`, and a `next_action`. Follow `next_action` first.
 When reporting a problem, include the code, Desktop and Daemon release
-identities, the operation phase, and any displayed logs reference. Do not share
+identities, the operation phase, and the exported diagnostics JSON. Do not share
 SSH keys, Codex credentials, full transcripts, or private research data.
+
+## Desktop Startup Diagnostics
+
+When Desktop opens but startup fails or remains incomplete, open **Diagnostics**.
+Choose **View logs** to review the local startup events, **Reveal in Finder** to
+open their directory, or **Export diagnostics** to create the support artifact.
+Support requests the exported JSON rather than screenshots, raw terminal output,
+or copies of local log files.
 
 ## Common Typed Errors
 
@@ -78,7 +86,14 @@ again. Do not run against the prior revision.
 Confirm that the DMG and checksum came from the intended GitHub Release. Then
 open **System Settings > Privacy & Security** and choose **Open Anyway** for
 OpenEvo. This is a manual exception for an unsigned, non-notarized Preview; it
-does not make the app signed.
+does not make the app signed. After verifying the checksum, command-line
+recovery may instead remove quarantine from only the installed app:
+
+```bash
+xattr -dr com.apple.quarantine "/Applications/OpenEvo Desktop.app"
+```
+
+Do not remove quarantine from a parent directory or an unverified download.
 
 ## SSH Credential Is Unavailable
 

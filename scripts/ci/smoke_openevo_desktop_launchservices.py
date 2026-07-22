@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -259,7 +260,7 @@ class DarwinSystem:
     def remove_quarantine(self, app: Path) -> None:
         probe = self.command(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(app)])
         if probe.returncode != 0:
-            return
+            raise SmokeFailure("the copied app was not quarantined before the allow flow")
         result = self.command(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(app)])
         if result.returncode != 0:
             raise SmokeFailure("could not allow the quarantined app for LaunchServices")
@@ -344,12 +345,14 @@ def _sidecar_tree(
     system: DarwinSystem,
     rows: list[ProcessRow],
     owned: set[ProcessIdentity],
+    expected_executable: Path,
 ) -> set[ProcessIdentity]:
+    expected = str(expected_executable)
     sidecars = {
         identity
         for identity in owned
         if (path := system.process_path(identity.pid)) is not None
-        and Path(path).name == SIDECAR_BASENAME
+        and os.path.realpath(path) == expected
     }
     return descendants(rows, sidecars)
 
@@ -392,12 +395,70 @@ def _os_major() -> int:
     return int(match.group(1))
 
 
-def _evidence(expected_version: str, sidecar_ready: bool, cleanup: bool) -> dict[str, object]:
+def _file_identity(path: Path) -> tuple[int, int, int, int, int]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise SmokeFailure("candidate file identity is unavailable") from exc
+    if path.is_symlink() or not path.is_file():
+        raise SmokeFailure("candidate file must be a regular non-symlink file")
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _sha256(path: Path) -> str:
+    expected = _file_identity(path)
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if (
+                opened.st_dev,
+                opened.st_ino,
+                opened.st_size,
+                opened.st_mtime_ns,
+                opened.st_ctime_ns,
+            ) != expected:
+                raise SmokeFailure("candidate file changed before hashing")
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+            final = os.fstat(stream.fileno())
+    except OSError as exc:
+        raise SmokeFailure("candidate file could not be hashed") from exc
+    if (
+        final.st_dev,
+        final.st_ino,
+        final.st_size,
+        final.st_mtime_ns,
+        final.st_ctime_ns,
+    ) != expected or _file_identity(path) != expected:
+        raise SmokeFailure("candidate file changed while hashing")
+    return digest.hexdigest()
+
+
+def _evidence(
+    expected_version: str,
+    sidecar_ready: bool,
+    cleanup: bool,
+    *,
+    executable: Path,
+    sidecar_executable: Path,
+    source_dmg: Path,
+) -> dict[str, object]:
     architecture = platform.machine()
     if architecture not in {"arm64", "x86_64"}:
         raise SmokeFailure("macOS architecture is unsupported")
     return {
         "architecture": architecture,
+        "binary_sha256": {
+            "bundled_external_bin": _sha256(sidecar_executable),
+            "native_executable": _sha256(executable),
+        },
         "build_version": expected_version,
         "cleanup": {
             "authority_limited_to_observed_tree": True,
@@ -406,8 +467,15 @@ def _evidence(expected_version: str, sidecar_ready: bool, cleanup: bool) -> dict
         },
         "launch_origin": LAUNCH_ORIGIN,
         "os_major": _os_major(),
+        "process_image_bound": sidecar_ready,
+        "quarantine_present_before_allow": True,
+        "quarantine_removed_before_launch": True,
         "schema_version": EVIDENCE_SCHEMA_VERSION,
         "sidecar_ready": sidecar_ready,
+        "source_dmg": {
+            "filename": source_dmg.name,
+            "sha256": _sha256(source_dmg),
+        },
         "version_verified": sidecar_ready,
     }
 
@@ -423,6 +491,7 @@ def smoke_launchservices(
     expected_version: str,
     timeout_seconds: float,
     evidence_out: Path,
+    source_dmg: Path,
     system: DarwinSystem | None = None,
 ) -> dict[str, object]:
     if sys.platform != "darwin":
@@ -432,6 +501,14 @@ def smoke_launchservices(
     if not 0 < timeout_seconds <= MAX_TIMEOUT_SECONDS:
         raise SmokeFailure("timeout must be positive and bounded")
     executable = _app_executable(app)
+    sidecar_executable = executable.parent / SIDECAR_BASENAME
+    if (
+        sidecar_executable.is_symlink()
+        or not sidecar_executable.is_file()
+        or not os.access(sidecar_executable, os.X_OK)
+    ):
+        raise SmokeFailure("the app-bundle sidecar executable is unavailable")
+    sidecar_executable = sidecar_executable.resolve(strict=True)
     tools = system or DarwinSystem()
     if _app_roots(tools, tools.snapshot(), executable):
         raise SmokeFailure("an instance of this exact app bundle is already active")
@@ -452,7 +529,12 @@ def smoke_launchservices(
             if roots:
                 app_observed = True
                 owned.update(descendants(rows, roots))
-            sidecar = _sidecar_tree(tools, rows, owned & {row.identity for row in rows})
+            sidecar = _sidecar_tree(
+                tools,
+                rows,
+                owned & {row.identity for row in rows},
+                sidecar_executable,
+            )
             sidecar_observed = sidecar_observed or bool(sidecar)
             owned.update(sidecar)
             listener = _single_listener(tools, sidecar)
@@ -490,7 +572,14 @@ def smoke_launchservices(
         raise failure
     if captured is not None:
         raise captured
-    evidence = _evidence(expected_version, ready, cleanup)
+    evidence = _evidence(
+        expected_version,
+        ready,
+        cleanup,
+        executable=executable,
+        sidecar_executable=sidecar_executable,
+        source_dmg=source_dmg,
+    )
     _write_evidence(evidence_out, evidence)
     return evidence
 
@@ -499,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("app", type=Path)
     parser.add_argument("--expected-version", required=True)
+    parser.add_argument("--source-dmg", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--evidence-out", type=Path, required=True)
     args = parser.parse_args(argv)
@@ -508,6 +598,7 @@ def main(argv: list[str] | None = None) -> int:
             expected_version=args.expected_version,
             timeout_seconds=args.timeout_seconds,
             evidence_out=args.evidence_out,
+            source_dmg=args.source_dmg,
         )
     except SmokeFailure as exc:
         print(str(exc), file=sys.stderr)

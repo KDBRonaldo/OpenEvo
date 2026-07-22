@@ -503,7 +503,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         == []
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 6
+    assert payload["schema_version"] == 7
     assert payload["release"] == {
         "app_bundle_signature": "adhoc",
         "channel": "unsigned-preview",
@@ -537,6 +537,7 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
     assert by_role["checksums"]["filename"] == "SHA256SUMS"
     assert by_role["app_bundle_smoke"]["filename"] == "app-bundle-smoke.json"
     assert by_role["dmg_copy_smoke"]["filename"] == "dmg-copy-smoke.json"
+    assert by_role["launchservices_smoke"]["filename"] == "launchservices-smoke.json"
     assert by_role["managed_runtime_source"]["filename"] == "managed-runtime-source.json"
     assert by_role["playwright_evidence"]["filename"] == candidate.PLAYWRIGHT_EVIDENCE_NAME
     assert by_role["playwright_report"]["filename"] == candidate.PLAYWRIGHT_REPORT_NAME
@@ -1085,6 +1086,48 @@ def test_candidate_manifest_rejects_wrong_smoke_launch_origin(tmp_path: Path) ->
     _write_json(evidence_path, evidence)
 
     with pytest.raises(candidate.CandidateError, match="launch origin"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+
+def test_candidate_manifest_rejects_failed_launchservices_quarantine_evidence(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / "launchservices-smoke.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["quarantine_present_before_allow"] = False
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="quarantine-allow evidence"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+
+def test_candidate_manifest_rejects_launchservices_evidence_from_another_build(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    evidence_path = tmp_path / "launchservices-smoke.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    evidence["binary_sha256"]["bundled_external_bin"] = "f" * 64
+    _write_json(evidence_path, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="candidate binaries"):
         candidate.create_candidate_manifest(
             tmp_path,
             source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
@@ -1675,6 +1718,28 @@ def _write_candidate_inputs(
         copied_smoke_evidence["mach_o"][binary]["slices"] = dmg_slices or ["arm64"]
     _write_json(root / "app-bundle-smoke.json", mounted_smoke_evidence)
     _write_json(root / "dmg-copy-smoke.json", copied_smoke_evidence)
+    _write_json(
+        root / "launchservices-smoke.json",
+        {
+            "architecture": "arm64",
+            "binary_sha256": mounted_smoke_evidence["binary_sha256"],
+            "build_version": "0.1.0",
+            "cleanup": {
+                "authority_limited_to_observed_tree": True,
+                "owned_processes_exited": True,
+                "sidecar_descendants_exited": True,
+            },
+            "launch_origin": "launchservices_open_n_post_quarantine_allow",
+            "os_major": 14,
+            "process_image_bound": True,
+            "quarantine_present_before_allow": True,
+            "quarantine_removed_before_launch": True,
+            "schema_version": 1,
+            "sidecar_ready": True,
+            "source_dmg": mounted_smoke_evidence["source_dmg"],
+            "version_verified": True,
+        },
+    )
     candidate = _load_module()
     source_commit = "8e45af371eef49a86530a849041f7dcf047620ec"
     release_files = [

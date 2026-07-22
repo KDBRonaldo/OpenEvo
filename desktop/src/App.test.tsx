@@ -10,6 +10,10 @@ import { DesktopApiError } from "./api/v1/client";
 import { AppShell, ReleaseDesktopProductShell } from "./App";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./product/fixtureProvider";
 
+const invokeMock = vi.hoisted(() => vi.fn());
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
+
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 function renderShell(path: string, desktopOnly: boolean) {
@@ -57,6 +61,9 @@ describe("ReleaseDesktopProductShell", () => {
 
   beforeEach(() => {
     document.body.innerHTML = "";
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue(undefined);
+    (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
   });
 
   afterEach(async () => {
@@ -67,6 +74,7 @@ describe("ReleaseDesktopProductShell", () => {
       root = null;
     }
     document.body.innerHTML = "";
+    delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   });
 
   it("exposes both renderer-owned samples while native sidecar startup is pending", async () => {
@@ -314,6 +322,111 @@ describe("ReleaseDesktopProductShell", () => {
     expect(document.body.textContent).not.toContain("/Users/alice/private");
     expect(document.body.textContent).not.toContain(nativeFailure.message);
     expect(document.body.textContent).toContain("The local OpenEvo Desktop service could not be started.");
+  });
+
+  it("opens closed native logs after a sidecar startup failure without a provider", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_log_tail") {
+        return {
+          schema_version: "1",
+          availability: "available",
+          entries: [{
+            schema_version: "1",
+            sequence: 1,
+            occurred_at: "1970-01-01T00:00:00.000Z",
+            source: "sidecar",
+            level: "error",
+            event: "sidecar_exited_before_ready",
+            code: "python_launcher_failed",
+            exit_code: 255,
+            signal: null,
+            errno: null,
+          }],
+          dropped_count: 0,
+        };
+      }
+      if (command === "reveal_desktop_log_directory") return { status: "revealed" };
+      if (command === "export_desktop_diagnostics") return { status: "exported" };
+      return undefined;
+    });
+
+    root = await renderReleaseShell(
+      vi.fn(async () => { throw new Error("sidecar failed before provider creation"); }),
+      vi.fn(async () => {}),
+      vi.fn(async () => {}),
+      vi.fn(),
+    );
+
+    expect(document.body.textContent).toContain("OpenEvo Desktop could not start");
+    expect(document.body.textContent).not.toContain("sidecar failed before provider creation");
+    await act(async () => {
+      button("Diagnostics").click();
+    });
+    await act(async () => {
+      button("View logs").click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("sidecar_exited_before_ready");
+    expect(document.body.textContent).toContain("python_launcher_failed");
+    expect(document.body.textContent).toContain("255");
+
+    await act(async () => {
+      button("Reveal in Finder").click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(document.body.textContent).toContain("Log folder opened.");
+    await act(async () => {
+      button("Export diagnostics").click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(invokeMock).toHaveBeenCalledWith("get_desktop_log_tail", { limit: 80 });
+    expect(invokeMock).toHaveBeenCalledWith("reveal_desktop_log_directory");
+    expect(invokeMock).toHaveBeenCalledWith("export_desktop_diagnostics");
+    expect(document.body.textContent).toContain("Diagnostics exported.");
+  });
+
+  it("does not expose native log invoke errors", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "get_desktop_log_tail") {
+        throw new Error("/Users/alice/private-token stderr stack trace");
+      }
+      return undefined;
+    });
+    root = await renderReleaseShell(
+      vi.fn(async () => { throw new Error("sidecar failed"); }),
+      vi.fn(async () => {}),
+      vi.fn(async () => {}),
+      vi.fn(),
+    );
+
+    await act(async () => {
+      button("Diagnostics").click();
+    });
+    await act(async () => {
+      button("View logs").click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Native logs are unavailable.");
+    expect(document.body.textContent).not.toContain("/Users/alice/private-token");
+    expect(document.body.textContent).not.toContain("stderr stack trace");
+  });
+
+  it("does not request diagnostics during a normal startup", async () => {
+    provider = createFixtureDesktopProductProvider({ startOnline: true });
+    root = await renderReleaseShell(
+      vi.fn(async () => provider!),
+      vi.fn(async () => {}),
+      vi.fn(async () => {}),
+      vi.fn(),
+    );
+
+    expect(document.body.textContent).toContain("Research brief");
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 
   it("keeps the startup fallback renderer-owned and mutation-closed", async () => {

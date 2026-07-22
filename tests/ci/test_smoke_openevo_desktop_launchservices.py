@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import plistlib
@@ -174,11 +175,14 @@ def test_smoke_times_out_when_no_owned_sidecar_appears(tmp_path: Path, monkeypat
             raise AssertionError("nothing was owned")
 
     with pytest.raises(smoke.SmokeFailure, match="timed out"):
+        source_dmg = tmp_path / "OpenEvo-Desktop-0.1.7-aarch64.dmg"
+        source_dmg.write_bytes(b"candidate dmg")
         smoke.smoke_launchservices(
             app,
             expected_version="0.1.7",
             timeout_seconds=1,
             evidence_out=tmp_path / "evidence.json",
+            source_dmg=source_dmg,
             system=System(),
         )
 
@@ -205,6 +209,7 @@ def test_cleanup_signals_only_observed_identity_not_pid_reuse(monkeypatch: pytes
 def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     smoke = _load_module()
     app, executable = _app_bundle(tmp_path)
+    sidecar = executable.parent / "openevo-desktop-sidecar"
     app_identity = smoke.ProcessIdentity(50, "Mon Jan  2 03:04:05 2023")
     sidecar_identity = smoke.ProcessIdentity(51, "Mon Jan  2 03:04:06 2023")
     rows = [
@@ -234,7 +239,7 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, m
             if pid == app_identity.pid:
                 return str(executable)
             if pid == sidecar_identity.pid:
-                return "/private/var/folders/x/openevo-desktop-sidecar"
+                return str(sidecar)
             return None
 
         def remove_quarantine(self, _app):
@@ -254,15 +259,35 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, m
             return True
 
     evidence_path = tmp_path / "evidence.json"
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.7-aarch64.dmg"
+    source_dmg.write_bytes(b"candidate dmg")
     evidence = smoke.smoke_launchservices(
-        app, expected_version="0.1.7", timeout_seconds=2, evidence_out=evidence_path, system=System()
+        app,
+        expected_version="0.1.7",
+        timeout_seconds=2,
+        evidence_out=evidence_path,
+        source_dmg=source_dmg,
+        system=System(),
     )
     assert evidence == json.loads(evidence_path.read_text())
     assert set(evidence) == {
-        "architecture", "build_version", "cleanup", "launch_origin", "os_major",
-        "schema_version", "sidecar_ready", "version_verified",
+        "architecture", "binary_sha256", "build_version", "cleanup", "launch_origin", "os_major",
+        "process_image_bound", "quarantine_present_before_allow",
+        "quarantine_removed_before_launch", "schema_version", "sidecar_ready",
+        "source_dmg", "version_verified",
     }
     assert evidence["cleanup"]["authority_limited_to_observed_tree"] is True
+    assert evidence["quarantine_present_before_allow"] is True
+    assert evidence["quarantine_removed_before_launch"] is True
+    assert evidence["process_image_bound"] is True
+    assert evidence["source_dmg"] == {
+        "filename": source_dmg.name,
+        "sha256": hashlib.sha256(source_dmg.read_bytes()).hexdigest(),
+    }
+    assert evidence["binary_sha256"] == {
+        "bundled_external_bin": hashlib.sha256(sidecar.read_bytes()).hexdigest(),
+        "native_executable": hashlib.sha256(executable.read_bytes()).hexdigest(),
+    }
 
 
 def test_smoke_retries_owned_listener_until_version_is_ready(
@@ -271,6 +296,7 @@ def test_smoke_retries_owned_listener_until_version_is_ready(
 ) -> None:
     smoke = _load_module()
     app, executable = _app_bundle(tmp_path)
+    sidecar = executable.parent / "openevo-desktop-sidecar"
     app_identity = smoke.ProcessIdentity(50, "Mon Jan  2 03:04:05 2023")
     sidecar_identity = smoke.ProcessIdentity(51, "Mon Jan  2 03:04:06 2023")
     rows = [
@@ -303,7 +329,7 @@ def test_smoke_retries_owned_listener_until_version_is_ready(
             return rows if self.launched and self.alive else []
 
         def process_path(self, pid):
-            return str(executable) if pid == 50 else "/tmp/openevo-desktop-sidecar"
+            return str(executable) if pid == 50 else str(sidecar)
 
         def remove_quarantine(self, _app):
             pass
@@ -325,11 +351,14 @@ def test_smoke_retries_owned_listener_until_version_is_ready(
             return True
 
     system = System()
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.7-aarch64.dmg"
+    source_dmg.write_bytes(b"candidate dmg")
     smoke.smoke_launchservices(
         app,
         expected_version="0.1.7",
         timeout_seconds=2,
         evidence_out=tmp_path / "evidence.json",
+        source_dmg=source_dmg,
         system=system,
     )
     assert system.attempts == 2
@@ -341,6 +370,9 @@ def _app_bundle(tmp_path: Path) -> tuple[Path, Path]:
     executable.parent.mkdir(parents=True)
     executable.write_text("#!/bin/sh\n", encoding="utf-8")
     executable.chmod(0o755)
+    sidecar = executable.parent / "openevo-desktop-sidecar"
+    sidecar.write_text("#!/bin/sh\n", encoding="utf-8")
+    sidecar.chmod(0o755)
     with (app / "Contents" / "Info.plist").open("wb") as stream:
         plistlib.dump({"CFBundleExecutable": executable.name}, stream)
     return app, executable

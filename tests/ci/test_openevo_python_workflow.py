@@ -249,9 +249,9 @@ def test_openevo_desktop_workflow_runs_frontend_and_tauri_checks() -> None:
             "cargo test --locked --release -- --test-threads=1",
         ),
         (
-            "Exercise macOS private executable handoff",
+            "Exercise macOS verified bundle executable handoff",
             10,
-            "tests::macos_release_spawns_from_the_populated_private_path",
+            "tests::macos_release_spawns_verified_bundle_path_without_private_copy",
         ),
         (
             "Exercise packaged macOS externalBin launch",

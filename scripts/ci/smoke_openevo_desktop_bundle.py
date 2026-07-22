@@ -51,6 +51,7 @@ NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
 PROBE_REAP_TIMEOUT_SECONDS = 2.0
 PROBE_DESCENDANT_SNAPSHOT_TIMEOUT_SECONDS = 0.5
+DARWIN_PROCESS_PATH_MAX_BYTES = 4096
 NATIVE_READINESS_STAGES = (
     "native_marker_absent",
     "native_process_unavailable",
@@ -738,6 +739,24 @@ def _darwin_process_birth_identity(pid: int) -> str | None:
     return f"darwin:{info.pbi_start_tvsec}:{info.pbi_start_tvusec}"
 
 
+def _darwin_process_executable_path(pid: int) -> str | None:
+    if sys.platform != "darwin":
+        return None
+    try:
+        library = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+        proc_pidpath = library.proc_pidpath
+        proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+        proc_pidpath.restype = ctypes.c_int
+        buffer = ctypes.create_string_buffer(DARWIN_PROCESS_PATH_MAX_BYTES)
+        length = proc_pidpath(pid, buffer, len(buffer))
+    except (AttributeError, OSError, ValueError):
+        return None
+    if length <= 0 or length >= len(buffer):
+        return None
+    path = os.fsdecode(buffer.value)
+    return path if path.startswith("/") and "\x00" not in path else None
+
+
 def _lsof_fd(
     pid: int,
     descriptor: int,
@@ -872,6 +891,27 @@ def _macos_native_evidence(
         return None, process_groups, "native_process_unavailable"
     if observed_birth_identity != marker.birth_identity:
         raise SmokeFailure("Native host sidecar birth identity changed during smoke")
+    bundled_identity = sidecar.stat()
+    if (
+        marker.executable_device != bundled_identity.st_dev
+        or marker.executable_inode != bundled_identity.st_ino
+        or marker.executable_size != bundled_identity.st_size
+    ):
+        raise SmokeFailure(
+            "Native host did not execute the verified sidecar inside the macOS app bundle"
+        )
+    if sys.platform == "darwin":
+        process_path = _darwin_process_executable_path(marker.pid)
+        if process_path is None:
+            return None, process_groups, "native_process_unavailable"
+        process_image = Path(process_path)
+        if (
+            os.path.realpath(process_image) != os.path.realpath(sidecar)
+            or _file_identity(process_image) != _file_identity(sidecar)
+        ):
+            raise SmokeFailure(
+                "Native host sidecar process image is not the verified app-bundle executable"
+            )
 
     listener_seen = False
     sidecar_rows = [row for row in rows if row[2] == marker.process_group]

@@ -49,6 +49,15 @@ a runtime image manually.
 The wording and location of **Open Anyway** can vary by macOS version.
 Do not clear quarantine from a parent directory or from an unverified download.
 
+## Startup Diagnostics
+
+If Desktop opens but startup fails or remains incomplete, open **Diagnostics**.
+Use **View logs** to inspect local startup events, **Reveal in Finder** to open
+their directory, or **Export diagnostics** to create the support artifact.
+When contacting support, provide the exported JSON together with the displayed
+error code and Desktop version; do not send raw terminal output, SSH material,
+credentials, transcripts, or research data.
+
 Version `0.1.7` starts with a new local Preview-state namespace and does not
 import projects or retry records created by older Preview builds. Removing an
 older application does not remove those files, but they cannot prevent `0.1.7`

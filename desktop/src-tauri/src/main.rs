@@ -24,6 +24,10 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
 
+mod desktop_log;
+
+use desktop_log::{DesktopLogLevel, DesktopLogSource, DesktopLogStore, DesktopLogTailV1};
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
 
@@ -169,6 +173,19 @@ struct NativeHostError {
     message: String,
 }
 
+#[derive(Clone, Debug, Serialize)]
+struct DesktopDiagnosticsActionV1 {
+    status: String,
+}
+
+#[derive(Serialize)]
+struct DesktopDiagnosticsExportV1 {
+    schema_version: &'static str,
+    product: &'static str,
+    product_version: &'static str,
+    logs: DesktopLogTailV1,
+}
+
 impl NativeHostError {
     fn new(code: &str, message: &str) -> Self {
         Self {
@@ -233,16 +250,20 @@ struct StartupDiagnostic {
 
 struct StartupDiagnosticSink {
     last: Mutex<Option<StartupDiagnostic>>,
+    exit_disposition: Mutex<Option<StartupExitDisposition>>,
     generation: AtomicU64,
     reader_closed: AtomicBool,
+    desktop_logs: Arc<DesktopLogStore>,
 }
 
 impl StartupDiagnosticSink {
-    fn new() -> Self {
+    fn new(desktop_logs: Arc<DesktopLogStore>) -> Self {
         Self {
             last: Mutex::new(None),
+            exit_disposition: Mutex::new(None),
             generation: AtomicU64::new(0),
             reader_closed: AtomicBool::new(false),
+            desktop_logs,
         }
     }
 
@@ -250,6 +271,9 @@ impl StartupDiagnosticSink {
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
         if let Ok(mut last) = self.last.lock() {
             *last = None;
+        }
+        if let Ok(mut disposition) = self.exit_disposition.lock() {
+            *disposition = None;
         }
         self.reader_closed.store(false, Ordering::Release);
         generation
@@ -265,6 +289,85 @@ impl StartupDiagnosticSink {
             }
             *last = Some(diagnostic);
         }
+        self.desktop_logs.record(
+            DesktopLogSource::Startup,
+            DesktopLogLevel::Error,
+            "sidecar_startup_diagnostic",
+            Some(&format!("{}_{}", diagnostic.stage, diagnostic.code)),
+            None,
+            None,
+            diagnostic.errno,
+        );
+    }
+
+    fn record_exit(&self, disposition: StartupExitDisposition) {
+        if let Ok(mut current) = self.exit_disposition.lock() {
+            *current = Some(disposition);
+        }
+        let (exit_code, signal) = match disposition {
+            StartupExitDisposition::Code(code) => (Some(code), None),
+            StartupExitDisposition::Signal(signal) => (None, Some(signal)),
+        };
+        self.desktop_logs.record(
+            DesktopLogSource::Startup,
+            DesktopLogLevel::Error,
+            "sidecar_exited_before_ready",
+            None,
+            exit_code,
+            signal,
+            None,
+        );
+    }
+
+    fn record_unstructured_output(&self, generation: u64, count: u32) {
+        if count == 0 || self.generation.load(Ordering::Acquire) != generation {
+            return;
+        }
+        self.desktop_logs.record(
+            DesktopLogSource::Sidecar,
+            DesktopLogLevel::Warning,
+            "sidecar_unstructured_output_discarded",
+            Some("bounded_output_discarded"),
+            None,
+            None,
+            None,
+        );
+    }
+
+    fn record_final_failure(&self, code: &str) {
+        let diagnostic_missing = self.last().is_none();
+        let disposition = self
+            .exit_disposition
+            .lock()
+            .ok()
+            .and_then(|current| *current);
+        if diagnostic_missing {
+            if let Some(disposition) = disposition {
+                let (exit_code, signal) = match disposition {
+                    StartupExitDisposition::Code(value) => (Some(value), None),
+                    StartupExitDisposition::Signal(value) => (None, Some(value)),
+                };
+                self.desktop_logs.record(
+                    DesktopLogSource::Startup,
+                    DesktopLogLevel::Error,
+                    "sidecar_pre_python_exit",
+                    Some(code),
+                    exit_code,
+                    signal,
+                    None,
+                );
+                return;
+            }
+        }
+        self.desktop_logs.record(
+            DesktopLogSource::Startup,
+            DesktopLogLevel::Error,
+            "sidecar_start_failed",
+            Some(code),
+            None,
+            None,
+            None,
+        );
     }
 
     fn close_reader(&self, generation: u64) {
@@ -524,6 +627,21 @@ struct VerifiedExecutableFile {
     file: File,
     identity: FileIdentity,
     digest: [u8; 32],
+    binding: VerifiedExecutableBinding,
+}
+
+#[derive(Debug)]
+enum VerifiedExecutableBinding {
+    PrivateCopy,
+    #[cfg(target_os = "macos")]
+    PackagedBundle {
+        parent: File,
+        parent_identity: FileIdentity,
+        parent_path: CString,
+        name: CString,
+        program_path: CString,
+        owner_policy: PackagedSourceOwnerPolicy,
+    },
 }
 
 #[derive(Debug)]
@@ -535,6 +653,7 @@ struct PrivateLaunchDirectory {
 }
 
 impl PrivateLaunchDirectory {
+    #[cfg(any(test, target_os = "linux"))]
     fn create() -> HostResult<Self> {
         let temp_dir = tempfile::Builder::new()
             .prefix("openevo-sidecar-")
@@ -596,19 +715,71 @@ impl Drop for PrivateLaunchDirectory {
 
 impl VerifiedExecutableFile {
     fn validate(&self) -> HostResult<()> {
-        let identity = file_identity(&self.file).map_err(|_| private_sidecar_error())?;
+        let identity = file_identity(&self.file).map_err(|_| executable_binding_error(self))?;
         let access_mode = unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_GETFL) };
         if identity != self.identity
-            || identity.links > 1
-            || identity.mode & 0o777 != 0o500
             || access_mode == -1
             || access_mode & libc::O_ACCMODE != libc::O_RDONLY
-            || hash_file_at(&self.file, identity.size).map_err(|_| private_sidecar_error())?
+            || hash_file_at(&self.file, identity.size)
+                .map_err(|_| executable_binding_error(self))?
                 != self.digest
         {
-            return Err(private_sidecar_error());
+            return Err(executable_binding_error(self));
+        }
+        match &self.binding {
+            VerifiedExecutableBinding::PrivateCopy => {
+                if identity.links > 1 || identity.mode & 0o777 != 0o500 {
+                    return Err(private_sidecar_error());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            VerifiedExecutableBinding::PackagedBundle {
+                parent,
+                parent_identity,
+                parent_path,
+                name,
+                program_path,
+                owner_policy,
+            } => {
+                validate_packaged_source_identity(&identity, *owner_policy)?;
+                validate_anchored_extended_acl(&self.file)?;
+                let current_parent =
+                    file_identity(parent).map_err(|_| packaged_sidecar_identity_error())?;
+                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if current_parent != *parent_identity
+                    || unsafe {
+                        libc::fstatat(
+                            libc::AT_FDCWD,
+                            parent_path.as_ptr(),
+                            stat.as_mut_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    } == -1
+                    || file_identity_from_stat(unsafe { &stat.assume_init() }) != *parent_identity
+                    || source_identity_at(parent, name)? != identity
+                    || unsafe {
+                        libc::fstatat(
+                            libc::AT_FDCWD,
+                            program_path.as_ptr(),
+                            stat.as_mut_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    } == -1
+                    || file_identity_from_stat(unsafe { &stat.assume_init() }) != identity
+                {
+                    return Err(packaged_sidecar_identity_error());
+                }
+            }
         }
         Ok(())
+    }
+}
+
+fn executable_binding_error(executable: &VerifiedExecutableFile) -> NativeHostError {
+    match &executable.binding {
+        VerifiedExecutableBinding::PrivateCopy => private_sidecar_error(),
+        #[cfg(target_os = "macos")]
+        VerifiedExecutableBinding::PackagedBundle { .. } => packaged_sidecar_identity_error(),
     }
 }
 
@@ -699,6 +870,7 @@ struct StartupDiagnosticScanner {
     line: [u8; SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES],
     line_len: usize,
     line_overflowed: bool,
+    discarded_lines: u32,
 }
 
 impl StartupDiagnosticScanner {
@@ -709,6 +881,7 @@ impl StartupDiagnosticScanner {
             line: [0; SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES],
             line_len: 0,
             line_overflowed: false,
+            discarded_lines: 0,
         }
     }
 
@@ -736,14 +909,21 @@ impl StartupDiagnosticScanner {
         if !self.scan_exhausted && self.line_len > 0 {
             self.record_line(diagnostics, generation);
         }
+        if self.scan_exhausted {
+            self.discarded_lines = self.discarded_lines.saturating_add(1);
+        }
+        diagnostics.record_unstructured_output(generation, self.discarded_lines);
     }
 
-    fn record_line(&self, diagnostics: &StartupDiagnosticSink, generation: u64) {
+    fn record_line(&mut self, diagnostics: &StartupDiagnosticSink, generation: u64) {
         if self.line_overflowed {
+            self.discarded_lines = self.discarded_lines.saturating_add(1);
             return;
         }
         if let Some(diagnostic) = parse_startup_diagnostic(&self.line[..self.line_len]) {
             diagnostics.record(generation, diagnostic);
+        } else if self.line_len > 0 {
+            self.discarded_lines = self.discarded_lines.saturating_add(1);
         }
     }
 }
@@ -1265,6 +1445,7 @@ impl ManagedSidecar {
 struct DesktopHostStateInner {
     sidecar: Mutex<Option<ManagedSidecar>>,
     startup_diagnostics: Arc<StartupDiagnosticSink>,
+    desktop_logs: Arc<DesktopLogStore>,
     run_retry_recovery: Mutex<()>,
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
@@ -1290,9 +1471,11 @@ impl Deref for DesktopHostState {
 
 impl Default for DesktopHostState {
     fn default() -> Self {
+        let desktop_logs = Arc::new(DesktopLogStore::default());
         Self(Arc::new(DesktopHostStateInner {
             sidecar: Mutex::new(None),
-            startup_diagnostics: Arc::new(StartupDiagnosticSink::new()),
+            startup_diagnostics: Arc::new(StartupDiagnosticSink::new(Arc::clone(&desktop_logs))),
+            desktop_logs,
             run_retry_recovery: Mutex::new(()),
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
@@ -1891,8 +2074,16 @@ fn release_sidecar_launch_spec(
 ) -> HostResult<SidecarLaunchSpec> {
     let source = bundled_path.ok_or_else(bundled_sidecar_missing_error)?;
     let release_assets_root = packaged_release_assets_root(source)?;
+    #[cfg(target_os = "linux")]
     let (verified_executable, private_launch_dir) = prepare_packaged_sidecar(source)?;
+    #[cfg(target_os = "linux")]
     let program = release_execution_path(&private_launch_dir);
+    #[cfg(target_os = "macos")]
+    let verified_executable = prepare_packaged_bundle_sidecar(source)?;
+    #[cfg(target_os = "macos")]
+    let private_launch_dir = None;
+    #[cfg(target_os = "macos")]
+    let program = source.to_path_buf();
     let mut args = local_sidecar_args();
     args.push("--release-assets-root".to_string());
     args.push(
@@ -1906,7 +2097,10 @@ fn release_sidecar_launch_spec(
         args,
         current_dir: None,
         remove_env: &RELEASE_FORBIDDEN_SIDECAR_ENV,
+        #[cfg(target_os = "linux")]
         private_launch_dir: Some(private_launch_dir),
+        #[cfg(target_os = "macos")]
+        private_launch_dir,
         verified_executable: Some(verified_executable),
     })
 }
@@ -1923,12 +2117,14 @@ fn packaged_release_assets_root(sidecar: &Path) -> HostResult<PathBuf> {
     Ok(root)
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn prepare_packaged_sidecar(
     path: &Path,
 ) -> HostResult<(VerifiedExecutableFile, PrivateLaunchDirectory)> {
     prepare_packaged_sidecar_with_hooks(path, || {}, || {}, || {})
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn prepare_packaged_sidecar_with_hooks(
     path: &Path,
     before_copy: impl FnOnce(),
@@ -2059,10 +2255,58 @@ fn prepare_packaged_sidecar_with_hooks(
         file: reader,
         identity: final_reader_identity,
         digest: copied_digest,
+        binding: VerifiedExecutableBinding::PrivateCopy,
     };
     verified.validate()?;
     private_dir.validate()?;
     Ok((verified, private_dir))
+}
+
+#[cfg(target_os = "macos")]
+fn prepare_packaged_bundle_sidecar(path: &Path) -> HostResult<VerifiedExecutableFile> {
+    let owner_policy = packaged_source_owner_policy()?;
+    let (parent, name) = open_trusted_source_parent(path)?;
+    let parent_identity = file_identity(&parent).map_err(|_| packaged_sidecar_identity_error())?;
+    let parent_path = path.parent().ok_or_else(packaged_path_error)?;
+    let parent_path =
+        CString::new(parent_path.as_os_str().as_bytes()).map_err(|_| packaged_path_error())?;
+    let program_path =
+        CString::new(path.as_os_str().as_bytes()).map_err(|_| packaged_path_error())?;
+    let initial_identity = source_identity_at(&parent, &name)?;
+    validate_packaged_source_identity(&initial_identity, owner_policy)?;
+    let source = openat_file(
+        parent.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| packaged_sidecar_identity_error())?;
+    if file_identity(&source).map_err(|_| packaged_sidecar_identity_error())? != initial_identity {
+        return Err(packaged_sidecar_identity_error());
+    }
+    validate_anchored_extended_acl(&source)?;
+    let digest = hash_file_at(&source, initial_identity.size)
+        .map_err(|_| packaged_sidecar_identity_error())?;
+    if file_identity(&source).map_err(|_| packaged_sidecar_identity_error())? != initial_identity
+        || source_identity_at(&parent, &name)? != initial_identity
+    {
+        return Err(packaged_sidecar_identity_error());
+    }
+    let verified = VerifiedExecutableFile {
+        file: source,
+        identity: initial_identity,
+        digest,
+        binding: VerifiedExecutableBinding::PackagedBundle {
+            parent,
+            parent_identity,
+            parent_path,
+            name,
+            program_path,
+            owner_policy,
+        },
+    };
+    verified.validate()?;
+    Ok(verified)
 }
 
 fn packaged_source_owner_policy() -> HostResult<PackagedSourceOwnerPolicy> {
@@ -2354,6 +2598,7 @@ fn openat_file(
     }
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn copy_and_hash(source: &mut File, target: &mut File, expected_size: u64) -> HostResult<[u8; 32]> {
     let mut hasher = Sha256::new();
     let mut copied = 0_u64;
@@ -2445,11 +2690,6 @@ fn release_execution_path(_private_dir: &PrivateLaunchDirectory) -> PathBuf {
     fd_execution_path()
 }
 
-#[cfg(target_os = "macos")]
-fn release_execution_path(private_dir: &PrivateLaunchDirectory) -> PathBuf {
-    private_dir.path().join(BUNDLED_SIDECAR_BINARY)
-}
-
 #[cfg(target_os = "linux")]
 fn finalize_private_executable_after_spawn(
     _private_dir: Option<&PrivateLaunchDirectory>,
@@ -2463,6 +2703,16 @@ fn finalize_private_executable_after_spawn(
     private_dir: Option<&PrivateLaunchDirectory>,
     executable: Option<&mut VerifiedExecutableFile>,
 ) -> HostResult<()> {
+    if private_dir.is_none()
+        && executable.as_ref().is_some_and(|value| {
+            matches!(
+                &value.binding,
+                VerifiedExecutableBinding::PackagedBundle { .. }
+            )
+        })
+    {
+        return executable.expect("checked packaged executable").validate();
+    }
     let (private_dir, executable) = match (private_dir, executable) {
         (None, None) => return Ok(()),
         (Some(private_dir), Some(executable)) => (private_dir, executable),
@@ -2493,6 +2743,16 @@ fn cleanup_private_executable(
     private_dir: Option<&mut PrivateLaunchDirectory>,
     executable: Option<&mut VerifiedExecutableFile>,
 ) -> HostResult<()> {
+    if private_dir.is_none()
+        && executable.as_ref().is_some_and(|value| {
+            matches!(
+                &value.binding,
+                VerifiedExecutableBinding::PackagedBundle { .. }
+            )
+        })
+    {
+        return executable.expect("checked packaged executable").validate();
+    }
     let (private_dir, executable) = match (private_dir, executable) {
         (None, None) => return Ok(()),
         (Some(private_dir), Some(executable)) => (private_dir, executable),
@@ -2785,6 +3045,35 @@ fn command_from_launch_spec(
                 Some(program_path),
             )
         }
+        #[cfg(target_os = "macos")]
+        (None, Some(executable)) => match &executable.binding {
+            VerifiedExecutableBinding::PackagedBundle {
+                parent,
+                parent_identity,
+                parent_path,
+                name,
+                program_path,
+                ..
+            } => {
+                executable.validate()?;
+                let fd = duplicate_fd_at_least(parent.as_raw_fd(), 10)
+                    .map_err(|_| packaged_sidecar_identity_error())?;
+                let guard = unsafe { File::from_raw_fd(fd) };
+                if file_identity(&guard).map_err(|_| packaged_sidecar_identity_error())?
+                    != *parent_identity
+                {
+                    return Err(packaged_sidecar_identity_error());
+                }
+                (
+                    Some(guard),
+                    Some(parent_identity.clone()),
+                    Some(parent_path.clone()),
+                    Some(name.clone()),
+                    Some(program_path.clone()),
+                )
+            }
+            VerifiedExecutableBinding::PrivateCopy => return Err(private_sidecar_error()),
+        },
         _ => (None, None, None, None, None),
     };
     let private_directory_fd = private_directory_guard.as_ref().map(AsRawFd::as_raw_fd);
@@ -3803,7 +4092,12 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
             let managed = sidecar.as_mut().ok_or_else(sidecar_state_error)?;
             let child = managed.child_mut()?;
             match control.leader_exit_disposition(child) {
-                Ok(disposition) => Ok(disposition),
+                Ok(disposition) => {
+                    if let Some(disposition) = disposition {
+                        state.startup_diagnostics.record_exit(disposition);
+                    }
+                    Ok(disposition)
+                }
                 Err(_) => {
                     managed.mark_cleanup_pending();
                     Err(sidecar_inspection_error())
@@ -4796,6 +5090,9 @@ fn fail_state_owned_startup_with_bounds<C: ProcessControl>(
     })()
     .unwrap_or_else(|error| error);
     settle_startup_diagnostics(state);
+    state
+        .startup_diagnostics
+        .record_final_failure(&final_error.code);
     startup_error_with_diagnostic(state, final_error)
 }
 
@@ -4956,13 +5253,26 @@ fn monitor_running_sidecar(state: DesktopHostState, instance_id: [u8; INSTANCE_I
                 .ok_or_else(sidecar_state_error)
                 .and_then(|child| {
                     OsProcessControl
-                        .leader_exited(child)
+                        .leader_exit_disposition(child)
                         .map_err(|_| sidecar_inspection_error())
                 }) {
-                Ok(false) => false,
-                Ok(true) => {
+                Ok(None) => false,
+                Ok(Some(disposition)) => {
                     managed.status.state = "exited".to_string();
                     managed.status.url = None;
+                    let (exit_code, signal) = match disposition {
+                        StartupExitDisposition::Code(value) => (Some(value), None),
+                        StartupExitDisposition::Signal(value) => (None, Some(value)),
+                    };
+                    state.desktop_logs.record(
+                        DesktopLogSource::Sidecar,
+                        DesktopLogLevel::Error,
+                        "sidecar_runtime_exited",
+                        Some("process_exited"),
+                        exit_code,
+                        signal,
+                        None,
+                    );
                     true
                 }
                 Err(_) => {
@@ -5900,6 +6210,185 @@ fn write_run_retry_recovery(
     )
 }
 
+fn initialize_desktop_logs(app: &tauri::AppHandle, state: &DesktopHostState) {
+    let persistent = app
+        .path()
+        .app_data_dir()
+        .ok()
+        .is_some_and(|root| state.desktop_logs.bind_app_data_root(&root));
+    state.desktop_logs.record(
+        DesktopLogSource::Native,
+        if persistent {
+            DesktopLogLevel::Info
+        } else {
+            DesktopLogLevel::Warning
+        },
+        "application_started",
+        Some(if persistent {
+            "persistent_log_ready"
+        } else {
+            "memory_log_only"
+        }),
+        None,
+        None,
+        None,
+    );
+    #[cfg(target_os = "macos")]
+    if std::env::current_exe().ok().is_some_and(|path| {
+        path.as_os_str()
+            .as_bytes()
+            .windows(b"/AppTranslocation/".len())
+            .any(|window| window == b"/AppTranslocation/")
+    }) {
+        state.desktop_logs.record(
+            DesktopLogSource::Native,
+            DesktopLogLevel::Warning,
+            "app_translocation_detected",
+            Some("gatekeeper_translocated"),
+            None,
+            None,
+            None,
+        );
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn get_desktop_log_tail(
+    state: tauri::State<'_, DesktopHostState>,
+    limit: Option<usize>,
+) -> DesktopLogTailV1 {
+    state.desktop_logs.tail(limit)
+}
+
+#[tauri::command]
+fn reveal_desktop_log_directory(
+    state: tauri::State<'_, DesktopHostState>,
+) -> DesktopDiagnosticsActionV1 {
+    let Some(_root) = state.desktop_logs.persistent_root() else {
+        return DesktopDiagnosticsActionV1 {
+            status: "unavailable".to_string(),
+        };
+    };
+    #[cfg(target_os = "macos")]
+    let opened = Command::new("/usr/bin/open")
+        .arg(&_root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok();
+    #[cfg(target_os = "linux")]
+    let opened = false;
+    if opened {
+        state.desktop_logs.record(
+            DesktopLogSource::Native,
+            DesktopLogLevel::Info,
+            "log_directory_revealed",
+            None,
+            None,
+            None,
+            None,
+        );
+    }
+    DesktopDiagnosticsActionV1 {
+        status: if opened { "revealed" } else { "unavailable" }.to_string(),
+    }
+}
+
+#[tauri::command]
+async fn export_desktop_diagnostics(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<DesktopDiagnosticsActionV1> {
+    let state = state.inner().clone();
+    let selection = tauri::async_runtime::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name("OpenEvo-Desktop-Diagnostics.json")
+            .add_filter("JSON", &["json"])
+            .blocking_save_file()
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(selection) = selection else {
+        return Ok(DesktopDiagnosticsActionV1 {
+            status: "cancelled".to_string(),
+        });
+    };
+    let path = match selection.into_path() {
+        Ok(path) => path,
+        Err(_) => {
+            return Ok(DesktopDiagnosticsActionV1 {
+                status: "unavailable".to_string(),
+            })
+        }
+    };
+    let logs = state.desktop_logs.export_snapshot();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        write_desktop_diagnostics_export(&path, &logs)
+    })
+    .await;
+    let status = if matches!(result, Ok(Ok(()))) {
+        state.desktop_logs.record(
+            DesktopLogSource::Native,
+            DesktopLogLevel::Info,
+            "diagnostics_exported",
+            None,
+            None,
+            None,
+            None,
+        );
+        "exported"
+    } else {
+        "unavailable"
+    };
+    Ok(DesktopDiagnosticsActionV1 {
+        status: status.to_string(),
+    })
+}
+
+fn write_desktop_diagnostics_export(path: &Path, logs: &DesktopLogTailV1) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "diagnostics path has no parent",
+        )
+    })?;
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "diagnostics target is unsafe",
+            ));
+        }
+    }
+    let parent_directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent)?;
+    let document = DesktopDiagnosticsExportV1 {
+        schema_version: "1",
+        product: "OpenEvo Desktop",
+        product_version: env!("CARGO_PKG_VERSION"),
+        logs: logs.clone(),
+    };
+    let encoded = serde_json::to_vec_pretty(&document)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".openevo-desktop-diagnostics-")
+        .tempfile_in(parent)?;
+    fs::set_permissions(temporary.path(), fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(&encoded)?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path).map_err(|error| error.error)?;
+    parent_directory.sync_all()
+}
+
 #[tauri::command]
 async fn start_sidecar(
     _app: tauri::AppHandle,
@@ -5908,8 +6397,34 @@ async fn start_sidecar(
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         emit_renderer_stage("sidecar_start_requested");
+        state.desktop_logs.record(
+            DesktopLogSource::Native,
+            DesktopLogLevel::Info,
+            "sidecar_start_requested",
+            None,
+            None,
+            None,
+            None,
+        );
         let bundled_path = bundled_sidecar_path();
         let result = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref());
+        state.desktop_logs.record(
+            DesktopLogSource::Native,
+            if result.is_ok() {
+                DesktopLogLevel::Info
+            } else {
+                DesktopLogLevel::Error
+            },
+            if result.is_ok() {
+                "sidecar_start_succeeded"
+            } else {
+                "sidecar_start_failed"
+            },
+            result.as_ref().err().map(|error| error.code.as_str()),
+            None,
+            None,
+            None,
+        );
         emit_renderer_stage(if result.is_ok() {
             "sidecar_start_returned"
         } else {
@@ -5923,11 +6438,50 @@ async fn start_sidecar(
 
 #[tauri::command]
 fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
-    stop_sidecar_inner(&state)
+    state.desktop_logs.record(
+        DesktopLogSource::Native,
+        DesktopLogLevel::Info,
+        "sidecar_stop_requested",
+        None,
+        None,
+        None,
+        None,
+    );
+    let result = stop_sidecar_inner(&state);
+    state.desktop_logs.record(
+        DesktopLogSource::Native,
+        if result.is_ok() {
+            DesktopLogLevel::Info
+        } else {
+            DesktopLogLevel::Error
+        },
+        if result.is_ok() {
+            "sidecar_stop_succeeded"
+        } else {
+            "sidecar_stop_failed"
+        },
+        result.as_ref().err().map(|error| error.code.as_str()),
+        None,
+        None,
+        None,
+    );
+    result
 }
 
 #[tauri::command]
-fn renderer_bootstrap_stage(stage: RendererBootstrapStageV1) {
+fn renderer_bootstrap_stage(
+    state: tauri::State<'_, DesktopHostState>,
+    stage: RendererBootstrapStageV1,
+) {
+    state.desktop_logs.record(
+        DesktopLogSource::Renderer,
+        DesktopLogLevel::Info,
+        "renderer_stage",
+        Some(stage.as_str()),
+        None,
+        None,
+        None,
+    );
     emit_renderer_stage(stage.as_str());
 }
 
@@ -6170,10 +6724,18 @@ fn main() {
     let app = match tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(DesktopHostState::default())
+        .setup(|app| {
+            let state = app.state::<DesktopHostState>();
+            initialize_desktop_logs(app.handle(), &state);
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             host_status,
             read_run_retry_recovery,
             write_run_retry_recovery,
+            get_desktop_log_tail,
+            reveal_desktop_log_directory,
+            export_desktop_diagnostics,
             start_sidecar,
             stop_sidecar,
             renderer_bootstrap_stage,
@@ -7114,7 +7676,7 @@ mod tests {
     }
 
     #[test]
-    fn release_policy_executes_only_a_verified_private_copy() {
+    fn release_policy_ignores_runtime_overrides_and_verifies_executable() {
         let _guard = ENV_LOCK.lock().unwrap();
         clear_sidecar_env();
         let fixture = SidecarFixture::executable(b"packaged-sidecar-v1");
@@ -7125,19 +7687,32 @@ mod tests {
         let spec = sidecar_launch_spec(LaunchPolicy::Release, Some(fixture.path()), 49152).unwrap();
         clear_sidecar_env();
 
+        #[cfg(target_os = "linux")]
         assert_eq!(
             spec.program,
             release_execution_path(spec.private_launch_dir.as_ref().unwrap())
         );
+        #[cfg(target_os = "macos")]
+        assert_eq!(spec.program, fixture.path());
         let executable = spec.verified_executable.as_ref().unwrap();
         executable.validate().unwrap();
         assert_eq!(read_verified_file(executable), b"packaged-sidecar-v1");
         #[cfg(target_os = "linux")]
         assert_eq!(executable.identity.links, 0);
         #[cfg(target_os = "macos")]
-        assert_eq!(executable.identity.links, 1);
+        {
+            assert_eq!(executable.identity.links, 1);
+            assert!(matches!(
+                &executable.binding,
+                VerifiedExecutableBinding::PackagedBundle { .. }
+            ));
+            assert!(spec.private_launch_dir.is_none());
+        }
+        #[cfg(target_os = "linux")]
         assert_eq!(executable.identity.mode & 0o777, 0o500);
+        #[cfg(target_os = "linux")]
         let private_root = spec.private_launch_dir.as_ref().unwrap().path();
+        #[cfg(target_os = "linux")]
         assert_eq!(
             fs::symlink_metadata(private_root)
                 .unwrap()
@@ -7148,8 +7723,6 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         assert_eq!(fs::read_dir(private_root).unwrap().count(), 0);
-        #[cfg(target_os = "macos")]
-        assert_eq!(fs::read_dir(private_root).unwrap().count(), 1);
         let expected_assets = packaged_release_assets_root(fixture.path())
             .unwrap()
             .to_string_lossy()
@@ -7706,35 +8279,21 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_release_spawns_from_the_populated_private_path() {
+    fn macos_release_spawns_verified_bundle_path_without_private_copy() {
         assert_eq!(fd_execution_path(), PathBuf::from("/dev/fd/4"));
         let fixture = SidecarFixture::from_existing(Path::new("/usr/bin/true"));
-        let (verified_executable, private) = prepare_packaged_sidecar(fixture.path()).unwrap();
-        let initial_directory_identity = private.identity.clone();
-        let populated_directory_identity = file_identity(&private.directory).unwrap();
-        assert_eq!(
-            (
-                populated_directory_identity.device,
-                populated_directory_identity.inode,
-            ),
-            (
-                initial_directory_identity.device,
-                initial_directory_identity.inode,
-            )
-        );
-        assert_ne!(populated_directory_identity, initial_directory_identity);
-        let private_root = private.path().to_path_buf();
-        assert_eq!(
-            release_execution_path(&private),
-            private.path().join(BUNDLED_SIDECAR_BINARY)
-        );
+        let verified_executable = prepare_packaged_bundle_sidecar(fixture.path()).unwrap();
+        assert!(matches!(
+            &verified_executable.binding,
+            VerifiedExecutableBinding::PackagedBundle { .. }
+        ));
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = SidecarLaunchSpec {
-            program: release_execution_path(&private),
+            program: fixture.path().to_path_buf(),
             args: Vec::new(),
             current_dir: None,
             remove_env: &[],
-            private_launch_dir: Some(private),
+            private_launch_dir: None,
             verified_executable: Some(verified_executable),
         };
 
@@ -7743,12 +8302,7 @@ mod tests {
         drop(child.stdin.take());
 
         assert!(child.wait().unwrap().success());
-        launch
-            .private_launch_dir
-            .as_ref()
-            .unwrap()
-            .validate()
-            .unwrap();
+        assert!(launch.private_launch_dir.is_none());
         launch
             .verified_executable
             .as_ref()
@@ -7757,7 +8311,7 @@ mod tests {
             .unwrap();
         drop(prepared);
         drop(launch);
-        assert!(!private_root.exists());
+        assert!(fixture.path().exists());
     }
 
     #[cfg(debug_assertions)]
@@ -9105,7 +9659,7 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
 
     #[test]
     fn startup_diagnostics_reject_malformed_and_over_budget_records() {
-        let diagnostics = StartupDiagnosticSink::new();
+        let diagnostics = StartupDiagnosticSink::new(Arc::new(DesktopLogStore::default()));
         let generation = diagnostics.begin();
         let mut payload = Vec::new();
         payload.extend_from_slice(
@@ -9158,7 +9712,9 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             verified_executable: None,
         };
         let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
-        let diagnostics = Arc::new(StartupDiagnosticSink::new());
+        let diagnostics = Arc::new(StartupDiagnosticSink::new(Arc::new(
+            DesktopLogStore::default(),
+        )));
         let generation = diagnostics.begin();
         let mut child = spawn_prepared_sidecar_with_startup_diagnostics(
             &mut prepared,
@@ -9301,6 +9857,76 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
     }
 
     #[test]
+    fn pre_python_exit_is_persisted_as_closed_native_diagnostics() {
+        let state = DesktopHostState::default();
+        let generation = state.startup_diagnostics.begin();
+        state
+            .startup_diagnostics
+            .record_exit(StartupExitDisposition::Code(255));
+        state.startup_diagnostics.close_reader(generation);
+        state
+            .startup_diagnostics
+            .record_final_failure("sidecar_exited_during_startup");
+
+        let tail = state.desktop_logs.tail(Some(10));
+        let exit = tail
+            .entries
+            .iter()
+            .find(|entry| entry.event == "sidecar_pre_python_exit")
+            .expect("pre-Python failure was not retained");
+        assert_eq!(exit.code.as_deref(), Some("sidecar_exited_during_startup"));
+        assert_eq!(exit.exit_code, Some(255));
+        assert_eq!(exit.signal, None);
+        let encoded = serde_json::to_string(&tail).unwrap();
+        assert!(!encoded.contains("stderr"));
+        assert!(!encoded.contains("/Users/"));
+    }
+
+    #[test]
+    fn pre_python_exit_survives_restart_and_diagnostics_export() {
+        let app_data = tempfile::tempdir().unwrap();
+        let state = DesktopHostState::default();
+        assert!(state.desktop_logs.bind_app_data_root(app_data.path()));
+        let generation = state.startup_diagnostics.begin();
+        state
+            .startup_diagnostics
+            .record_exit(StartupExitDisposition::Code(255));
+        state.startup_diagnostics.close_reader(generation);
+        state
+            .startup_diagnostics
+            .record_final_failure("sidecar_exited_during_startup");
+        drop(state);
+
+        let recovered = DesktopLogStore::default();
+        assert!(recovered.bind_app_data_root(app_data.path()));
+        let snapshot = recovered.export_snapshot();
+        let exit = snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.event == "sidecar_pre_python_exit")
+            .expect("pre-Python failure was not recovered from persistent logs");
+        assert_eq!(exit.exit_code, Some(255));
+
+        let export_root = tempfile::tempdir().unwrap();
+        let export = export_root.path().join("OpenEvo-Desktop-Diagnostics.json");
+        write_desktop_diagnostics_export(&export, &snapshot).unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&fs::read(export).unwrap()).unwrap();
+        assert_eq!(document["schema_version"], "1");
+        assert_eq!(document["product"], "OpenEvo Desktop");
+        assert!(document["logs"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry["event"] == "sidecar_pre_python_exit" && entry["exit_code"] == 255
+            }));
+        let encoded = serde_json::to_string(&document).unwrap();
+        assert!(!encoded.contains("stderr"));
+        assert!(!encoded.contains("/Users/"));
+    }
+
+    #[test]
     fn startup_cleanup_error_keeps_only_allowlisted_diagnostics() {
         let state = DesktopHostState::default();
         let diagnostics = &state.startup_diagnostics;
@@ -9326,7 +9952,7 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
 
     #[test]
     fn startup_diagnostic_retry_ignores_a_prior_generation() {
-        let diagnostics = StartupDiagnosticSink::new();
+        let diagnostics = StartupDiagnosticSink::new(Arc::new(DesktopLogStore::default()));
         let first_generation = diagnostics.begin();
         let second_generation = diagnostics.begin();
         diagnostics.record(
@@ -10227,7 +10853,9 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             verified_executable: None,
         };
         let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
-        let diagnostics = Arc::new(StartupDiagnosticSink::new());
+        let diagnostics = Arc::new(StartupDiagnosticSink::new(Arc::new(
+            DesktopLogStore::default(),
+        )));
         let generation = diagnostics.begin();
         let mut child =
             spawn_prepared_sidecar_with_startup_diagnostics(&mut prepared, diagnostics, generation)
@@ -10279,6 +10907,7 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             .unwrap()
             .parse::<u16>()
             .unwrap();
+        #[cfg(target_os = "linux")]
         let private_root = {
             let sidecar = state.sidecar.lock().unwrap();
             let managed = sidecar.as_ref().unwrap();
@@ -10290,21 +10919,31 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
             );
             let executable = managed.verified_executable.as_ref().unwrap();
             executable.validate().unwrap();
-            #[cfg(target_os = "linux")]
             assert_eq!(executable.identity.links, 0);
-            #[cfg(target_os = "macos")]
-            assert_eq!(executable.identity.links, 1);
             let root = managed._private_launch_dir.as_ref().unwrap().path();
-            #[cfg(target_os = "linux")]
             assert_eq!(fs::read_dir(root).unwrap().count(), 0);
-            #[cfg(target_os = "macos")]
-            assert_eq!(fs::read_dir(root).unwrap().count(), 1);
             root.to_path_buf()
         };
+        #[cfg(target_os = "macos")]
+        {
+            let sidecar = state.sidecar.lock().unwrap();
+            let managed = sidecar.as_ref().unwrap();
+            assert_eq!(managed.lifecycle, ManagedLifecycle::Running);
+            assert_eq!(managed.status.port, Some(endpoint_port));
+            let executable = managed.verified_executable.as_ref().unwrap();
+            executable.validate().unwrap();
+            assert_eq!(executable.identity.links, 1);
+            assert!(matches!(
+                &executable.binding,
+                VerifiedExecutableBinding::PackagedBundle { .. }
+            ));
+            assert!(managed._private_launch_dir.is_none());
+        }
 
         stop_sidecar_inner(&state).unwrap();
 
         assert!(state.sidecar.lock().unwrap().is_none());
+        #[cfg(target_os = "linux")]
         assert!(!private_root.exists());
         assert!(path.exists());
         fs::remove_dir_all(test_home).unwrap();

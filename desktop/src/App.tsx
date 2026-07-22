@@ -2,7 +2,11 @@ import {
   Activity,
   AlertCircle,
   BookOpen,
+  ChevronDown,
+  ChevronRight,
   CircleDot,
+  Download,
+  FolderOpen,
   LoaderCircle,
   Plus,
   RefreshCw,
@@ -40,6 +44,12 @@ import {
   stopReleaseDesktopProductProvider,
   type ReleaseDesktopBootstrapStage,
 } from "./product/releaseProvider";
+import {
+  exportDesktopDiagnostics,
+  getDesktopLogTail,
+  revealDesktopLogDirectory,
+  type DesktopLogTailV1,
+} from "./api/desktopLogs";
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
@@ -260,6 +270,106 @@ function safeStartupFailure(error: unknown): ReleaseDesktopStartupFailure {
 
 type ReadonlySampleWorkspace = "research" | "evolution" | "system";
 
+function StartupDiagnostics({ startupPending }: { startupPending: boolean }) {
+  const [open, setOpen] = useState(false);
+  const [tail, setTail] = useState<DesktopLogTailV1 | null>(null);
+  const [loadingLogs, setLoadingLogs] = useState(false);
+  const [actionStatus, setActionStatus] = useState<string | null>(null);
+
+  const viewLogs = useCallback(() => {
+    setLoadingLogs(true);
+    setActionStatus(null);
+    void getDesktopLogTail(80).then((result) => {
+      setTail(result);
+      setLoadingLogs(false);
+    });
+  }, []);
+
+  const revealLogs = useCallback(() => {
+    setActionStatus(null);
+    void revealDesktopLogDirectory().then((result) => {
+      setActionStatus(result.status === "revealed" ? "Log folder opened." : "Log folder is unavailable.");
+    });
+  }, []);
+
+  const exportDiagnostics = useCallback(() => {
+    setActionStatus(null);
+    void exportDesktopDiagnostics().then((result) => {
+      setActionStatus(
+        result.status === "exported"
+          ? "Diagnostics exported."
+          : result.status === "cancelled" ? "Export cancelled." : "Diagnostics export is unavailable.",
+      );
+    });
+  }, []);
+
+  return (
+    <section className="startup-diagnostics" aria-label="Startup diagnostics">
+      <button
+        type="button"
+        className="startup-diagnostics-toggle"
+        aria-expanded={open}
+        aria-controls="startup-diagnostics-panel"
+        onClick={() => setOpen((current) => !current)}
+      >
+        {open ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+        Diagnostics
+      </button>
+      {open ? (
+        <div id="startup-diagnostics-panel" className="startup-diagnostics-panel">
+          <div className="startup-diagnostics-actions">
+            <button type="button" className="secondary-button" onClick={viewLogs} disabled={loadingLogs}>
+              <BookOpen size={15} /> {loadingLogs ? "Loading logs" : "View logs"}
+            </button>
+            {!startupPending ? (
+              <>
+                <button type="button" className="secondary-button" onClick={revealLogs}>
+                  <FolderOpen size={15} /> Reveal in Finder
+                </button>
+                <button type="button" className="secondary-button" onClick={exportDiagnostics}>
+                  <Download size={15} /> Export diagnostics
+                </button>
+              </>
+            ) : null}
+          </div>
+          {tail ? <StartupLogTail tail={tail} /> : null}
+          {actionStatus ? <p className="startup-diagnostics-status" role="status">{actionStatus}</p> : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function StartupLogTail({ tail }: { tail: DesktopLogTailV1 }) {
+  if (tail.availability === "unavailable") {
+    return <p className="startup-diagnostics-status" role="status">Native logs are unavailable.</p>;
+  }
+  return (
+    <div className="startup-log-tail" aria-live="polite">
+      {tail.availability === "memory_only" ? (
+        <p className="startup-diagnostics-status">Showing in-memory logs only.</p>
+      ) : null}
+      {tail.dropped_count > 0 ? (
+        <p className="startup-diagnostics-status">{tail.dropped_count} earlier events were not retained.</p>
+      ) : null}
+      {tail.entries.length === 0 ? <p className="startup-diagnostics-status">No diagnostic events available.</p> : null}
+      {tail.entries.map((entry) => (
+        <div className="startup-log-entry" key={entry.sequence}>
+          <div><span>Sequence</span><strong>{entry.sequence}</strong></div>
+          <div><span>Time</span><strong>{entry.occurred_at}</strong></div>
+          <div><span>Source</span><strong>{entry.source}</strong></div>
+          <div><span>Level</span><strong>{entry.level}</strong></div>
+          <div><span>Event</span><strong>{entry.event}</strong></div>
+          <div><span>Code</span><strong>{entry.code ?? "None"}</strong></div>
+          <div><span>Exit code</span><strong>{entry.exit_code ?? "None"}</strong></div>
+          <div><span>Signal</span><strong>{entry.signal ?? "None"}</strong></div>
+          <div><span>Errno</span><strong>{entry.errno ?? "None"}</strong></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ReleaseStartupSample({
   onRetry,
   onAddRemoteWorkspace,
@@ -414,6 +524,7 @@ function ReleaseStartupSample({
               </button>
             )}
           </div>
+          <StartupDiagnostics startupPending={startupPending} />
           <div className="initial-sync-sample">
             <SampleScientificProjectView
               workspace={workspace}
