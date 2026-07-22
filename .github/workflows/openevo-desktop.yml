@@ -15,6 +15,7 @@ on:
       - "scripts/ci/openevo_desktop_daemon_resource.py"
       - "scripts/ci/openevo_release_candidate.py"
       - "scripts/ci/smoke_openevo_desktop_bundle.py"
+      - "scripts/ci/smoke_openevo_desktop_launchservices.py"
       - "scripts/ci/smoke_openevo_desktop_sidecar.py"
       - "scripts/ci/write_sha256.py"
       - "tests/ci/test_build_sidecar.py"

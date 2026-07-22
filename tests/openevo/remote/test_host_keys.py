@@ -256,6 +256,49 @@ def test_store_rejects_known_hosts_option_path_injection(
         ProviderKnownHostStore(tmp_path / suffix, runner=KeyscanRunner(""))
 
 
+def test_store_allows_only_the_standard_macos_application_support_space(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "Research User"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    state_root = (
+        home
+        / "Library"
+        / "Application Support"
+        / "org.openevo.desktop"
+        / "state-v2"
+    )
+    state_root.mkdir(parents=True, mode=0o700)
+    ProviderKnownHostStore(
+        state_root / "ssh-host-keys",
+        secure_ancestor=state_root,
+        runner=KeyscanRunner(""),
+    )
+
+    with pytest.raises(ValueError, match="path contains unsupported"):
+        ProviderKnownHostStore(
+            state_root / "unexpected space" / "ssh-host-keys",
+            secure_ancestor=state_root / "unexpected space",
+            runner=KeyscanRunner(""),
+        )
+
+    lookalike_root = (
+        tmp_path
+        / "Library"
+        / "Application Support"
+        / "org.openevo.desktop"
+        / "state-v2"
+    )
+    with pytest.raises(ValueError, match="path contains unsupported"):
+        ProviderKnownHostStore(
+            lookalike_root / "ssh-host-keys",
+            secure_ancestor=lookalike_root,
+            runner=KeyscanRunner(""),
+        )
+
+
 def test_confirm_requires_exact_choice_and_unchanged_probe(tmp_path: Path) -> None:
     profile = _profile()
     first_output = _valid_output(profile, marker=b"first")

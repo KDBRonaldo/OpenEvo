@@ -205,9 +205,7 @@ def _import_directory(config_root: Path, source: dict[str, object]) -> Path:
     assert isinstance(import_ref, dict)
     import_id = import_ref["import_id"]
     assert isinstance(import_id, str)
-    return (
-        config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "workspace-imports" / import_id
-    )
+    return config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports" / import_id
 
 
 def test_picker_discard_and_failed_save_remove_pending_imports(tmp_path: Path) -> None:
@@ -389,7 +387,7 @@ def test_native_import_cancel_stops_archive_work_and_rejects_stale_identity(
     assert len(responses) == 1
     assert responses[0].status_code == 409
     assert responses[0].json()["code"] == "workspace_import_cancelled"
-    import_root = config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "workspace-imports"
+    import_root = config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports"
     assert list(import_root.iterdir()) == []
 
 
@@ -421,7 +419,7 @@ def test_native_import_cancel_before_begin_is_identity_bound_and_fail_closed(
         pending = _import_pending(client, source_root, action_id=stale_action)
         assert _discard_pending(client, pending, action_id=stale_action).status_code == 204
 
-    import_root = config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "workspace-imports"
+    import_root = config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports"
     assert list(import_root.iterdir()) == []
 
 
@@ -460,7 +458,7 @@ def test_cancel_after_atomic_publication_discards_the_recoverable_lease(
     assert len(responses) == 1
     assert responses[0].status_code == 409
     assert responses[0].json()["code"] == "workspace_import_cancelled"
-    import_root = config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "workspace-imports"
+    import_root = config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports"
     assert list(import_root.iterdir()) == []
 
 

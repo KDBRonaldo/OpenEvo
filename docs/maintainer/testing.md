@@ -360,10 +360,10 @@ document the exact tested quarantine-removal path without claiming a signing
 gate. This checksum-bound packaging draft may be published unchanged only as a
 Preview; a future External Beta path must create and revalidate a new candidate
 inventory.
-It also states that uninstalling the application retains local data under
-`~/.openevo/desktop`, the Tauri native host app-data directory for
-`org.openevo.desktop` (including run-retry recovery state), and remote Core
-state, task data, models, and caches.
+It also states that uninstalling the application retains current local data
+under `~/Library/Application Support/org.openevo.desktop` (including run-retry
+recovery state), preserved legacy Preview data under `~/.openevo/desktop`, and
+remote Core state, task data, models, and caches.
 
 After asset redownload, the candidate workflow queries the GitHub draft and
 validates its exact body, title, tag, target commit, draft flag, and prerelease

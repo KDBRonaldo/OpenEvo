@@ -327,7 +327,15 @@ the handoff credential only for hidden native workspace routes. It
 mounts only that release Local API and the audited product web. It does not
 construct the legacy sidecar app, expose `/openevo-api/*`, translate the Desktop
 session header into a legacy mutation token, or accept a backend base URL. Its
-durable provider state is isolated under `<Desktop config root>/local-api-v1`.
+durable provider state is isolated under `<Desktop config root>/state-v2`. On
+Darwin, the default Desktop config root is
+`~/Library/Application Support/org.openevo.desktop`; Linux development and test
+launches retain `~/.openevo/desktop` unless `--desktop-config-root` explicitly
+selects another root. `state-v2` is a storage namespace, not a Local API contract
+version. OpenEvo Desktop v0.1.7 does not read, migrate, remove, rename, chmod, or
+otherwise modify the old Preview
+`~/.openevo/desktop/local-api-v1` state, so a damaged or locked Preview state
+cannot prevent the new Desktop state from starting.
 The release Local API wraps the complete FastAPI/Starlette application,
 including its server-error boundary, in strict CORS so bounded failures remain
 readable by the packaged renderer. It allows exactly

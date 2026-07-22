@@ -375,8 +375,9 @@ PYTHONPATH=src:. python -m pytest tests/ci/test_openevo_python_workflow.py tests
 The former Python Desktop and sidecar console-script entrypoints are not
 exposed after the Core Backend package migration. Desktop-created projects can
 start from a no-config sidecar. In that mode the sidecar receives a writable
-local config root from `--desktop-config-root`; the local launcher defaults to
-`~/.openevo/desktop`.
+local config root from `--desktop-config-root`; without an override it uses
+`~/Library/Application Support/org.openevo.desktop` on macOS and
+`~/.openevo/desktop` for Linux development and tests.
 
 In this mode the sidecar reads the local Science Project YAML and remote profile
 YAML, validates them, builds the existing sidecar science plan, and derives a

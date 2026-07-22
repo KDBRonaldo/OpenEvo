@@ -150,10 +150,11 @@ the Trash. This does not delete remote projects, transcripts, artifacts, the
 managed runtime, or the OpenEvo Daemon.
 
 Local workspace profiles, accepted host keys, and recovery state are also kept
-when only the application is removed. To clear this Preview's local state after
-quitting Desktop, remove `~/.openevo/desktop` and, if present,
-`~/Library/Application Support/org.openevo.desktop` on the Mac. This does not
-delete remote data.
+when only the application is removed. Current releases store that data under
+`~/Library/Application Support/org.openevo.desktop`. The older Preview directory
+`~/.openevo/desktop` is preserved but is not read by v0.1.7. To clear all local
+OpenEvo Desktop state after quitting the app, remove both directories. This does
+not delete remote data.
 
 The first Preview does not expose a complete in-app OpenEvo Daemon uninstall or
 remote project-erasure workflow. Do not manually edit or delete OpenEvo remote

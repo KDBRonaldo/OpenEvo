@@ -7,6 +7,7 @@ from typing import Annotated, Callable
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import platform
 import re
 import secrets
 import signal
@@ -41,8 +42,9 @@ from desktop.sidecar.workspace_imports import (
 )
 
 
-DEFAULT_DESKTOP_CONFIG_ROOT = Path("~/.openevo/desktop")
-LOCAL_API_STATE_DIRECTORY = "local-api-v1"
+DARWIN_DESKTOP_CONFIG_ROOT = Path("~/Library/Application Support/org.openevo.desktop")
+LINUX_DESKTOP_CONFIG_ROOT = Path("~/.openevo/desktop")
+DESKTOP_STATE_DIRECTORY = "state-v2"
 NATIVE_INSTANCE_FRAME_MAX_BYTES = 512
 NATIVE_SESSION_HEADER = "X-OpenEvo-Desktop-Session"
 _NATIVE_SESSION_HEADER_BYTES = NATIVE_SESSION_HEADER.lower().encode("ascii")
@@ -83,6 +85,38 @@ _PACKAGED_STARTUP_PHASES = frozenset(
 _PACKAGED_STARTUP_CODES = frozenset(
     {"execution_failed", *(f"{phase}_failed" for phase in _PACKAGED_STARTUP_PHASES)}
 )
+
+
+def resolve_desktop_config_root(
+    desktop_config_root: Path | str | None = None,
+    *,
+    platform_name: str | None = None,
+) -> Path:
+    """Return the private Desktop config root without inspecting any state."""
+    if desktop_config_root is not None:
+        return Path(desktop_config_root).expanduser()
+
+    resolved_platform = platform.system() if platform_name is None else platform_name
+    if resolved_platform == "Darwin":
+        return DARWIN_DESKTOP_CONFIG_ROOT.expanduser()
+    if resolved_platform == "Linux":
+        return LINUX_DESKTOP_CONFIG_ROOT.expanduser()
+    raise ValueError(f"unsupported Desktop platform: {resolved_platform!r}")
+
+
+def resolve_desktop_state_root(
+    desktop_config_root: Path | str | None = None,
+    *,
+    platform_name: str | None = None,
+) -> Path:
+    """Return the current Desktop storage generation under its config root."""
+    return (
+        resolve_desktop_config_root(
+            desktop_config_root,
+            platform_name=platform_name,
+        )
+        / DESKTOP_STATE_DIRECTORY
+    )
 
 
 class PackagedLauncherStartupError(RuntimeError):
@@ -369,18 +403,14 @@ def _create_app(
             raise ValueError("invalid packaged startup phase")
         startup_phase = value
 
-    config_root = (
-        Path(desktop_config_root).expanduser()
-        if desktop_config_root is not None
-        else DEFAULT_DESKTOP_CONFIG_ROOT.expanduser()
-    )
+    state_root = resolve_desktop_state_root(desktop_config_root)
     try:
         if build_channel == "release" and release_assets_root is None and core_assets_root is None:
             raise ValueError("release assets root must be provided by the native host")
         if release_assets_root is not None and not Path(release_assets_root).is_absolute():
             raise ValueError("release assets root must be an absolute native-owned path")
         app = create_release_desktop_local_api_app(
-            state_root=config_root / LOCAL_API_STATE_DIRECTORY,
+            state_root=state_root,
             session_token=native_frame.session_token,
             instance_id=native_frame.instance_id,
             readiness_key=native_frame.readiness_key,
@@ -455,7 +485,7 @@ def _create_app(
                     _ingest_native_workspace,
                     workspace_import_store,
                     parsed,
-                    config_root / LOCAL_API_STATE_DIRECTORY,
+                    state_root,
                     operation.cancelled.is_set,
                 )
             except (NativeWorkspaceArchiveCancelled, WorkspaceImportCancelled):
@@ -711,7 +741,7 @@ def main(
     parser.add_argument(
         "--desktop-config-root",
         type=Path,
-        default=DEFAULT_DESKTOP_CONFIG_ROOT,
+        default=None,
     )
     parser.add_argument("--listener-fd", type=int, required=True)
     parser.add_argument("--native-instance-stdin", action="store_true", required=True)

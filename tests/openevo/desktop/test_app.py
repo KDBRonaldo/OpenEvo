@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+import fcntl
 import hashlib
 import hmac
 from html.parser import HTMLParser
@@ -28,7 +29,7 @@ from desktop.server import (
 )
 
 import desktop.server.launcher as desktop_launcher
-from desktop.server.launcher import DEFAULT_DESKTOP_CONFIG_ROOT, create_app
+from desktop.server.launcher import create_app
 import desktop.packaging.sidecar_entry as sidecar_entry
 import desktop.sidecar.release_app as release_app
 from desktop.sidecar.workspace_identity import project_id_for_native_import
@@ -207,34 +208,107 @@ def test_create_desktop_app_redirects_root_to_openevo(tmp_path: Path) -> None:
     assert response.headers["location"] == "/openevo"
 
 
-def test_create_app_launcher_uses_default_config_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("platform_name", "expected_relative_root"),
+    [
+        ("Darwin", Path("Library/Application Support/org.openevo.desktop")),
+        ("Linux", Path(".openevo/desktop")),
+    ],
+)
+def test_resolve_desktop_config_root_uses_the_platform_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform_name: str,
+    expected_relative_root: Path,
 ) -> None:
-    home = tmp_path / "home"
+    home = tmp_path / "Research User"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    app = create_app(
-        static_root=_static_root(tmp_path),
-        native_frame=desktop_launcher._NativeLauncherFrame(
-            instance_id="1a" * 16,
-            readiness_key=bytes.fromhex("5a" * 32),
-            session_token="7c" * 32,
-            handoff_token="8d" * 32,
-        ),
-        source_commit="89baeb26",
-        build_channel="test",
-    )
-    with TestClient(app) as client:
-        assert client.get("/openevo").status_code == 200
-        assert client.get("/openevo-api/desktop/shell").status_code == 404
-    assert DEFAULT_DESKTOP_CONFIG_ROOT.as_posix() == "~/.openevo/desktop"
+
     assert (
+        desktop_launcher.resolve_desktop_config_root(platform_name=platform_name)
+        == home / expected_relative_root
+    )
+    assert (
+        desktop_launcher.resolve_desktop_state_root(platform_name=platform_name)
+        == home / expected_relative_root / desktop_launcher.DESKTOP_STATE_DIRECTORY
+    )
+
+
+def test_resolve_desktop_config_root_preserves_explicit_override(
+    tmp_path: Path,
+) -> None:
+    override = tmp_path / "explicit-config"
+
+    assert (
+        desktop_launcher.resolve_desktop_config_root(
+            override,
+            platform_name="Darwin",
+        )
+        == override
+    )
+    assert (
+        desktop_launcher.resolve_desktop_state_root(
+            override,
+            platform_name="Linux",
+        )
+        == override / desktop_launcher.DESKTOP_STATE_DIRECTORY
+    )
+
+
+def test_resolve_desktop_config_root_rejects_unsupported_platform() -> None:
+    with pytest.raises(ValueError, match="unsupported Desktop platform"):
+        desktop_launcher.resolve_desktop_config_root(platform_name="Windows")
+
+
+def test_create_app_launcher_uses_new_darwin_state_namespace_when_preview_is_damaged_and_locked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "Research User"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(desktop_launcher.platform, "system", lambda: "Darwin")
+    preview_state = home / ".openevo" / "desktop" / "local-api-v1"
+    preview_state.mkdir(parents=True)
+    preview_state_mode = preview_state.stat().st_mode
+    preview_database = preview_state / "provider.sqlite3"
+    preview_database.write_text("corrupt preview state", encoding="utf-8")
+    preview_lock = preview_state / "provider.lock"
+    lock_descriptor = os.open(preview_lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    try:
+        app = create_app(
+            static_root=_static_root(tmp_path),
+            native_frame=desktop_launcher._NativeLauncherFrame(
+                instance_id="1a" * 16,
+                readiness_key=bytes.fromhex("5a" * 32),
+                session_token="7c" * 32,
+                handoff_token="8d" * 32,
+            ),
+            source_commit="89baeb26",
+            build_channel="test",
+        )
+        with TestClient(app) as client:
+            assert client.get("/openevo").status_code == 200
+            assert client.get("/openevo-api/desktop/shell").status_code == 404
+    finally:
+        fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        os.close(lock_descriptor)
+
+    state_root = (
         home
-        / ".openevo"
-        / "desktop"
-        / desktop_launcher.LOCAL_API_STATE_DIRECTORY
-        / "provider.sqlite3"
-    ).is_file()
+        / "Library"
+        / "Application Support"
+        / "org.openevo.desktop"
+        / desktop_launcher.DESKTOP_STATE_DIRECTORY
+    )
+    assert (state_root / "provider.sqlite3").is_file()
+    assert preview_database.read_text(encoding="utf-8") == "corrupt preview state"
+    assert preview_state.stat().st_mode == preview_state_mode
+    assert sorted(entry.name for entry in preview_state.iterdir()) == [
+        "provider.lock",
+        "provider.sqlite3",
+    ]
 
 
 def _native_instance_frame(
@@ -631,10 +705,8 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
         assert client.get("/desktop/v1/state").status_code == 401
         assert client.get("/openevo-api/backend/status").status_code == 404
 
-    assert (config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY).is_dir()
-    assert (
-        config_root / desktop_launcher.LOCAL_API_STATE_DIRECTORY / "provider.sqlite3"
-    ).is_file()
+    assert (config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY).is_dir()
+    assert (config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "provider.sqlite3").is_file()
 
 
 def test_release_removes_native_credential_route_and_rejects_native_authentication(

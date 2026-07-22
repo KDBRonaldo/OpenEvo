@@ -432,8 +432,9 @@ verifies:
   modes, known limitations, `0 of 3` benchmark gates with all three rescue
   counts `pending`, that Codex Subscription is packaged/declared but has no
   exact-candidate real science E2E verdict, privacy/security behavior, and
-  install/upgrade/uninstall retention for `~/.openevo/desktop`, the Tauri native
-  host app-data directory for `org.openevo.desktop`, and remote data;
+  install/upgrade/uninstall retention for the current
+  `~/Library/Application Support/org.openevo.desktop` state, preserved legacy
+  Preview data under `~/.openevo/desktop`, and remote data;
 - the GitHub draft title, tag, target commit, body, draft state, and prerelease
   state match the candidate at the discrete API read immediately after asset
   redownload. Its repository-bound API URL supplies the immutable numeric

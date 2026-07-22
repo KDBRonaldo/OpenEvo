@@ -552,6 +552,45 @@ jobs:
             --timeout-seconds 120 \
             --evidence-out candidate-artifacts/dmg-copy-smoke.json
 
+          legacy_state="$HOME/.openevo/desktop/local-api-v1"
+          current_state="$HOME/Library/Application Support/org.openevo.desktop/state-v2"
+          test ! -e "$legacy_state"
+          test ! -e "$current_state"
+          mkdir -p "$legacy_state"
+          chmod 700 "$legacy_state"
+          printf '%s\n' 'intentionally corrupt Preview database' \
+            > "$legacy_state/provider.sqlite3"
+          printf '%s\n' 'intentionally stale Preview lock' \
+            > "$legacy_state/provider.lock"
+          chmod 600 "$legacy_state/provider.sqlite3" "$legacy_state/provider.lock"
+          cp "$legacy_state/provider.sqlite3" "$RUNNER_TEMP/legacy-provider.sqlite3"
+          cp "$legacy_state/provider.lock" "$RUNNER_TEMP/legacy-provider.lock"
+          legacy_directory_mode="$(stat -f '%Lp' "$legacy_state")"
+          legacy_database_mode="$(stat -f '%Lp' "$legacy_state/provider.sqlite3")"
+          legacy_lock_mode="$(stat -f '%Lp' "$legacy_state/provider.lock")"
+
+          uv run python scripts/ci/smoke_openevo_desktop_launchservices.py \
+            "$copied_app" \
+            --expected-version "$OPENEVO_VERSION" \
+            --timeout-seconds 120 \
+            --evidence-out "$RUNNER_TEMP/launchservices-state-isolation-smoke.json"
+
+          test -f "$current_state/provider.sqlite3"
+          cmp "$legacy_state/provider.sqlite3" "$RUNNER_TEMP/legacy-provider.sqlite3"
+          cmp "$legacy_state/provider.lock" "$RUNNER_TEMP/legacy-provider.lock"
+          test "$(stat -f '%Lp' "$legacy_state")" = "$legacy_directory_mode"
+          test "$(stat -f '%Lp' "$legacy_state/provider.sqlite3")" = "$legacy_database_mode"
+          test "$(stat -f '%Lp' "$legacy_state/provider.lock")" = "$legacy_lock_mode"
+
+      - name: Retain LaunchServices state-isolation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-desktop-launchservices-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/launchservices-state-isolation-smoke.json
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Write release notes and authoritative candidate manifest
         id: candidate
         run: |

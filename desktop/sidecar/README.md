@@ -221,6 +221,10 @@ application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`
 for the process lifetime and
 requires the native host to supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
+The launcher assigns that root to the `state-v2` Desktop storage namespace. This
+name is independent of the Local API v1 contract. On macOS it is rooted at
+`~/Library/Application Support/org.openevo.desktop`; v0.1.7 preserves and does
+not read or alter the old Preview `~/.openevo/desktop/local-api-v1` state.
 The release application wraps the complete FastAPI/Starlette stack with CORS,
 including the server-error boundary, so bounded error responses remain readable
 by the packaged renderer. Only

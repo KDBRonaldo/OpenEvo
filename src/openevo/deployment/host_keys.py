@@ -1672,9 +1672,24 @@ def _validate_path_text(path: Path) -> None:
         or "\\" in text
         or '"' in text
         or "'" in text
-        or any(character.isspace() or ord(character) == 127 for character in text)
+        or any(
+            (character.isspace() and character != " ") or ord(character) == 127
+            for character in text
+        )
+        or (" " in text and not _is_macos_desktop_config_path(path))
     ):
         raise ValueError("provider known-host store path contains unsupported characters")
+
+
+def _is_macos_desktop_config_path(path: Path) -> bool:
+    desktop_root = (
+        Path.home() / "Library" / "Application Support" / "org.openevo.desktop"
+    )
+    try:
+        relative = path.relative_to(desktop_root)
+    except ValueError:
+        return False
+    return all(" " not in component for component in relative.parts)
 
 
 def _keyscan_timeout(timeout_seconds: float) -> int:

@@ -2342,7 +2342,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         release_test_command,
         "npm run tauri:build -- --ci",
         "hdiutil attach",
-        "smoke_openevo_desktop_bundle.py",
+            "smoke_openevo_desktop_bundle.py",
+            "smoke_openevo_desktop_launchservices.py",
         "--evidence-out candidate-artifacts/app-bundle-smoke.json",
         "--evidence-out candidate-artifacts/dmg-copy-smoke.json",
         "scripts/ci/openevo_release_candidate.py create",
@@ -2495,6 +2496,17 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert shipped_app_smoke.count(
         "uv run python scripts/ci/smoke_openevo_desktop_bundle.py"
     ) == 2
+    assert shipped_app_smoke.count(
+        "uv run python scripts/ci/smoke_openevo_desktop_launchservices.py"
+    ) == 1
+    assert 'legacy_state="$HOME/.openevo/desktop/local-api-v1"' in shipped_app_smoke
+    assert (
+        'current_state="$HOME/Library/Application Support/org.openevo.desktop/state-v2"'
+        in shipped_app_smoke
+    )
+    assert "intentionally corrupt Preview database" in shipped_app_smoke
+    assert "intentionally stale Preview lock" in shipped_app_smoke
+    assert 'test -f "$current_state/provider.sqlite3"' in shipped_app_smoke
     assert shipped_app_smoke.count('dmg="candidate-artifacts/OpenEvo-Desktop-') == 1
     assert (
         'hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -readonly'
@@ -2568,7 +2580,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
         "Credential-canary verification for release assets: pending.",
-        "Local Desktop data under ~/.openevo/desktop is retained",
+        "Current local Desktop data under ~/Library/Application Support/org.openevo.desktop",
+        "Legacy Preview data under ~/.openevo/desktop is preserved without being read",
         "org.openevo.desktop",
         "run-retry recovery",
         "## Install, Upgrade, And Uninstall",
@@ -3229,9 +3242,8 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
     assert "Self-deployed inference" in normalized_readme
     assert "Do not install a Python package" in normalized_readme
     assert "persistent WebView storage" not in readme
-    assert (
-        "Tauri native host app-data directory for `org.openevo.desktop`"
-        in normalized_release_process
+    assert "`~/Library/Application Support/org.openevo.desktop` state" in (
+        normalized_release_process
     )
 
 

@@ -793,7 +793,7 @@ def render_candidate_release_notes(
             "",
             'Install: copy OpenEvo Desktop to Applications, run `xattr -dr com.apple.quarantine "/Applications/OpenEvo Desktop.app"`, then open it. This workflow validates synthetic browser quarantine, that documented removal command, the ad-hoc app signature, and launch; the interactive Privacy & Security UI remains unvalidated.',
             "Upgrade: this Preview has no automatic updater; quit the app and replace it with a newer reviewed DMG. OpenEvo Daemon upgrade compatibility is not proven by this packaging-only Preview.",
-            "Uninstall: quit OpenEvo Desktop and remove it from Applications. Local Desktop data under ~/.openevo/desktop is retained unless deleted separately. The Tauri native host app data directory for org.openevo.desktop, including run-retry recovery state, is also retained unless deleted separately. OpenEvo Daemon state, task data, model downloads, and runtime caches are also retained.",
+            "Uninstall: quit OpenEvo Desktop and remove it from Applications. Current local Desktop data under ~/Library/Application Support/org.openevo.desktop, including run-retry recovery state, is retained unless deleted separately. Legacy Preview data under ~/.openevo/desktop is preserved without being read and is also retained unless deleted separately. OpenEvo Daemon state, task data, model downloads, and runtime caches are also retained.",
             "",
         )
     )

@@ -73,7 +73,8 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
     assert "openevo-science-runtime-0.1.1-linux-amd64.tar.gz" in notes
     assert "Managed Science runtime source asset ID: 481361975." in notes
     assert "Credential-canary verification for release assets: pending." in notes
-    assert "Local Desktop data under ~/.openevo/desktop is retained" in notes
+    assert "Current local Desktop data under ~/Library/Application Support" in notes
+    assert "Legacy Preview data under ~/.openevo/desktop is preserved without being read" in notes
     assert "org.openevo.desktop" in notes
     assert "run-retry recovery" in notes
 
