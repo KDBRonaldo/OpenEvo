@@ -632,6 +632,7 @@ struct VerifiedExecutableFile {
 
 #[derive(Debug)]
 enum VerifiedExecutableBinding {
+    #[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
     PrivateCopy,
     #[cfg(target_os = "macos")]
     PackagedBundle {
@@ -7850,7 +7851,7 @@ mod tests {
             prepare_packaged_sidecar(fixture.path()).unwrap();
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = SidecarLaunchSpec {
-            program: release_execution_path(&private_launch_dir),
+            program: fd_execution_path(),
             args: vec![
                 "-c".to_string(),
                 concat!(
