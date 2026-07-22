@@ -80,7 +80,7 @@ def test_multiple_sidecar_listeners_fail_closed() -> None:
         smoke._single_listener(System(), {one, two})
 
 
-def test_app_roots_only_probes_exact_executable_candidates(tmp_path: Path) -> None:
+def test_app_roots_uses_exact_process_paths_not_command_text(tmp_path: Path) -> None:
     smoke = _load_module()
     _app, executable = _app_bundle(tmp_path)
     candidate = smoke.ProcessRow(
@@ -99,13 +99,13 @@ def test_app_roots_only_probes_exact_executable_candidates(tmp_path: Path) -> No
 
         def process_path(self, pid):
             self.probed.append(pid)
-            return str(executable)
+            return str(executable) if pid == candidate.identity.pid else "/usr/bin/unrelated"
 
     system = System()
     assert smoke._app_roots(system, [candidate, unrelated], executable) == {
         candidate.identity
     }
-    assert system.probed == [candidate.identity.pid]
+    assert system.probed == [candidate.identity.pid, unrelated.identity.pid]
 
 
 def test_validate_version_rejects_malformed_release_provider() -> None:

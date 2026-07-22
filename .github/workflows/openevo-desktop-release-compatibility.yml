@@ -95,7 +95,7 @@ jobs:
           uv run python scripts/ci/smoke_openevo_desktop_launchservices.py \
             "$installed_app" \
             --expected-version "$expected_version" \
-            --timeout-seconds 180 \
+            --timeout-seconds 60 \
             --evidence-out "$RUNNER_TEMP/published-launchservices-smoke.json"
 
       - name: Upload compatibility evidence

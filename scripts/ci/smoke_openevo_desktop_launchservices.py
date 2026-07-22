@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import dataclass
 import json
 import os
@@ -28,6 +29,7 @@ MAX_TIMEOUT_SECONDS = 300.0
 COMMAND_TIMEOUT_SECONDS = 5.0
 HTTP_RESPONSE_MAX_BYTES = 16 * 1024
 PROCESS_ROW_LIMIT = 16_384
+PROC_PIDPATHINFO_MAXSIZE = 4_096
 
 
 class SmokeFailure(RuntimeError):
@@ -200,6 +202,18 @@ class _NoRedirect(HTTPRedirectHandler):
 class DarwinSystem:
     """Small injectable boundary around the fixed macOS tools used by this smoke."""
 
+    def __init__(self) -> None:
+        try:
+            self._libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+            self._libproc.proc_pidpath.argtypes = [
+                ctypes.c_int,
+                ctypes.c_void_p,
+                ctypes.c_uint32,
+            ]
+            self._libproc.proc_pidpath.restype = ctypes.c_int
+        except (AttributeError, OSError) as exc:
+            raise SmokeFailure("macOS process identity service is unavailable") from exc
+
     def command(self, arguments: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(
@@ -220,12 +234,12 @@ class DarwinSystem:
         return parse_ps_rows(result.stdout)
 
     def process_path(self, pid: int) -> str | None:
-        # lsof's txt entry is an exact executable pathname on Darwin; it is not a name match.
-        result = self.command(["/usr/sbin/lsof", "-n", "-a", "-p", str(pid), "-d", "txt", "-Fn"])
-        if result.returncode != 0:
+        buffer = ctypes.create_string_buffer(PROC_PIDPATHINFO_MAXSIZE)
+        length = self._libproc.proc_pidpath(pid, buffer, len(buffer))
+        if length <= 0 or length >= len(buffer):
             return None
-        names = [line[1:] for line in result.stdout.splitlines() if line.startswith("n")]
-        return names[0] if len(names) == 1 and names[0].startswith("/") else None
+        path = os.fsdecode(buffer.value)
+        return path if path.startswith("/") and "\x00" not in path else None
 
     def listener_rows(self, identity: ProcessIdentity) -> list[Listener]:
         result = self.command(
@@ -314,10 +328,6 @@ def _app_roots(system: DarwinSystem, rows: list[ProcessRow], executable: Path) -
     expected = str(executable)
     roots: set[ProcessIdentity] = set()
     for row in rows:
-        # Avoid an lsof subprocess for every process on the host. The command is
-        # only a bounded candidate filter; lsof still provides the exact check.
-        if expected not in row.command:
-            continue
         path = system.process_path(row.identity.pid)
         if path is not None and os.path.realpath(path) == expected:
             roots.add(row.identity)
@@ -426,16 +436,22 @@ def smoke_launchservices(
     owned: set[ProcessIdentity] = set()
     captured: BaseException | None = None
     ready = False
+    app_observed = False
+    sidecar_observed = False
+    listener_observed = False
     try:
         while time.monotonic() < deadline:
             rows = tools.snapshot()
             roots = _app_roots(tools, rows, executable)
             if roots:
+                app_observed = True
                 owned.update(descendants(rows, roots))
             sidecar = _sidecar_tree(tools, rows, owned & {row.identity for row in rows})
+            sidecar_observed = sidecar_observed or bool(sidecar)
             owned.update(sidecar)
             listener = _single_listener(tools, sidecar)
             if listener is not None:
+                listener_observed = True
                 try:
                     validate_version(_strict_json(tools.http_version(listener.port, min(1.0, max(0.1, deadline - time.monotonic())))), expected_version)
                 except (UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
@@ -444,7 +460,12 @@ def smoke_launchservices(
                 break
             time.sleep(0.1)
         if not ready:
-            raise SmokeFailure("timed out waiting for an owned sidecar loopback listener")
+            raise SmokeFailure(
+                "timed out waiting for an owned sidecar loopback listener "
+                f"(app_process_observed={str(app_observed).lower()}; "
+                f"sidecar_process_observed={str(sidecar_observed).lower()}; "
+                f"listener_observed={str(listener_observed).lower()})"
+            )
     except BaseException as exc:
         captured = exc
     cleanup = _cleanup(tools, owned, timeout_seconds)
