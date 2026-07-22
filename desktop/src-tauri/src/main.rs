@@ -2681,9 +2681,17 @@ fn fd_execution_path() -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{INHERITED_EXECUTABLE_FD}"))
 }
 
-#[cfg(all(target_os = "macos", test))]
-fn fd_execution_path() -> PathBuf {
-    PathBuf::from(format!("/dev/fd/{INHERITED_EXECUTABLE_FD}"))
+#[cfg(test)]
+fn private_copy_test_execution_path(private_dir: &PrivateLaunchDirectory) -> PathBuf {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = private_dir;
+        fd_execution_path()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        private_dir.path().join(BUNDLED_SIDECAR_BINARY)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -7851,7 +7859,7 @@ mod tests {
             prepare_packaged_sidecar(fixture.path()).unwrap();
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = SidecarLaunchSpec {
-            program: fd_execution_path(),
+            program: private_copy_test_execution_path(&private_launch_dir),
             args: vec![
                 "-c".to_string(),
                 concat!(
@@ -8281,7 +8289,6 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_release_spawns_verified_bundle_path_without_private_copy() {
-        assert_eq!(fd_execution_path(), PathBuf::from("/dev/fd/4"));
         let fixture = SidecarFixture::from_existing(Path::new("/usr/bin/true"));
         let verified_executable = prepare_packaged_bundle_sidecar(fixture.path()).unwrap();
         assert!(matches!(
@@ -8297,6 +8304,7 @@ mod tests {
             private_launch_dir: None,
             verified_executable: Some(verified_executable),
         };
+        assert_eq!(launch.program, fixture.path());
 
         let mut prepared = command_from_launch_spec(&launch, &allocated.listener).unwrap();
         let mut child = prepared.spawn().unwrap();

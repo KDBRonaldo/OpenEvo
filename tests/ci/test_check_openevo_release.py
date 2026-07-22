@@ -3432,6 +3432,11 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
             "fn verified_packaged_launch_rejects_poisoned_pyinstaller_environment"
         ) : main.index("fn packaged_launch_owns_the_native_executable_environment")
     ]
+    macos_bundle_launch_test = main[
+        main.index("fn macos_release_spawns_verified_bundle_path_without_private_copy") : main.index(
+            "fn debug_policy_uses_structured_override_without_shell_parsing"
+        )
+    ]
     process_group_termination = main[
         main.index("fn terminate_process_group_with") : main.index(
             "fn signal_verified_process_group"
@@ -3523,7 +3528,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "libc::O_NOFOLLOW" in main
     assert "acl_get_fd_np" in main
     assert '#[cfg(target_os = "linux")]\nfn fd_execution_path()' in main
-    assert '#[cfg(all(target_os = "macos", test))]\nfn fd_execution_path()' in main
+    assert '#[cfg(test)]\nfn private_copy_test_execution_path(' in main
     assert "fn test_temp_root(temp: &TempDir) -> PathBuf" in main
     assert "fs::canonicalize(temp.path()).unwrap()" in main
     assert 'test_temp_root(temp).join("app-data")' in main
@@ -3556,11 +3561,17 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "permission_denied_leader_inspection_is_not_a_signal_outcome" in main
     assert "permission_denied_group_signal_retains_ownership_with_a_reported_descendant" in main
     assert "permission_denied_group_signal_does_not_override_inspection_failure" in main
-    assert "program: fd_execution_path()" in poisoned_environment_test
+    assert (
+        "program: private_copy_test_execution_path(&private_launch_dir)"
+        in poisoned_environment_test
+    )
     assert "program: release_execution_path(&private_launch_dir)" not in poisoned_environment_test
+    assert "private_dir.path().join(BUNDLED_SIDECAR_BINARY)" in main
     assert "let verified_executable = prepare_packaged_bundle_sidecar(source)?;" in main
     assert "let private_launch_dir = None;" in main
     assert "let program = source.to_path_buf();" in main
+    assert "fd_execution_path()" not in macos_bundle_launch_test
+    assert "assert_eq!(launch.program, fixture.path());" in macos_bundle_launch_test
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
     assert "fn monitor_running_sidecar(" in main
