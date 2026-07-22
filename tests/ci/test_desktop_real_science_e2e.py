@@ -644,7 +644,7 @@ def test_renderer_candidate_binding_pins_release_and_packaged_web_bytes(
     ).encode()
     app_smoke = write_bytes("app-bundle-smoke.json", app_smoke_payload)
     candidate_payload = {
-        "schema_version": 6,
+        "schema_version": 7,
         "source_commit": source_commit,
         "version": "0.1.4",
         "files": [

@@ -18,6 +18,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 MANIFEST_NAME = "release-candidate.json"
+RELEASE_CANDIDATE_SCHEMA_VERSION = 7
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
@@ -1695,7 +1696,7 @@ def create_candidate_manifest(
             "notarized": False,
             "quarantine_removal_tested": True,
         },
-        "schema_version": 7,
+        "schema_version": RELEASE_CANDIDATE_SCHEMA_VERSION,
         "source_commit": source_commit,
         "version": version,
     }
@@ -1738,7 +1739,7 @@ def _validate_candidate_manifest(
     core = manifest.get("core")
     daemon = manifest.get("daemon")
     files = manifest.get("files")
-    if manifest.get("schema_version") != 7:
+    if manifest.get("schema_version") != RELEASE_CANDIDATE_SCHEMA_VERSION:
         raise CandidateError("candidate manifest schema version is invalid")
     if type(source_commit) is not str or SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None:
         raise CandidateError("candidate source commit is invalid")

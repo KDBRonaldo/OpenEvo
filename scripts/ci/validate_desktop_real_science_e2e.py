@@ -17,6 +17,7 @@ from typing import Mapping
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+RELEASE_CANDIDATE_SCHEMA_VERSION = 7
 MAX_EVIDENCE_BYTES = 128 * 1024
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -133,7 +134,7 @@ def _read_candidate_manifest(
         raise EvidenceError("candidate manifest is not valid JSON") from exc
     manifest = dict(_mapping(payload, "candidate manifest"))
     if (
-        manifest.get("schema_version") != 6
+        manifest.get("schema_version") != RELEASE_CANDIDATE_SCHEMA_VERSION
         or manifest.get("source_commit") != expected_source_commit
         or not isinstance(manifest.get("version"), str)
         or not manifest["version"]

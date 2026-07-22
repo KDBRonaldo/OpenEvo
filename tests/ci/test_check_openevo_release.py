@@ -8,6 +8,7 @@ from pathlib import Path
 import plistlib
 import re
 import subprocess
+import sys
 from types import SimpleNamespace
 import tomllib
 from zipfile import ZipFile
@@ -67,6 +68,26 @@ def _load_release_candidate_module():
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
+
+
+def _load_real_science_validator_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/validate_desktop_real_science_e2e.py"
+    spec = importlib.util.spec_from_file_location("validate_desktop_real_science_e2e", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_real_science_validator_tracks_release_candidate_schema() -> None:
+    candidate = _load_release_candidate_module()
+    validator = _load_real_science_validator_module()
+
+    assert (
+        validator.RELEASE_CANDIDATE_SCHEMA_VERSION
+        == candidate.RELEASE_CANDIDATE_SCHEMA_VERSION
+    )
 
 
 def _load_framework_wheel_smoke_module():
