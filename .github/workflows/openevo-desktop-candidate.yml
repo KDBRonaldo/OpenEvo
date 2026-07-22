@@ -261,7 +261,8 @@ jobs:
 
       - name: Resolve exact product version and runner architecture
         run: |
-          version="$(uv run python - <<'PY'
+          version_output="$RUNNER_TEMP/openevo-product-version"
+          uv run python - > "$version_output" <<'PY'
           import json
           import re
           import tomllib
@@ -288,7 +289,9 @@ jobs:
               raise SystemExit("Core, renderer, native host, and Tauri versions do not match")
           print(version)
           PY
-          )"
+          IFS= read -r version < "$version_output"
+          rm -f -- "$version_output"
+          test -n "$version"
           triple="$(rustc --print host-tuple)"
           case "$triple" in
             aarch64-apple-darwin) architecture="aarch64" ;;

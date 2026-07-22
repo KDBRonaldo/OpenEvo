@@ -2707,6 +2707,12 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     ):
         assert version_source in version_step
     assert "Core, renderer, native host, and Tauri versions do not match" in version_step
+    assert "$(uv run python - <<" not in version_step
+    assert 'version="$(uv run python - <<\'PY\'' not in version_step
+    assert 'version_output="$RUNNER_TEMP/openevo-product-version"' in version_step
+    assert 'uv run python - > "$version_output" <<\'PY\'' in version_step
+    assert 'IFS= read -r version < "$version_output"' in version_step
+    assert 'rm -f -- "$version_output"' in version_step
 
     for marker in (
         "unsigned and not notarized",
