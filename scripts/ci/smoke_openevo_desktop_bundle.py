@@ -89,6 +89,28 @@ NATIVE_RENDERER_STAGES = frozenset(
         "ready_validation_failed",
     }
 )
+REQUIRED_RENDERER_COMPLETION_STAGES = frozenset(
+    {
+        "retry_recovery_ready",
+        "provider_created",
+        "product_committed",
+        "ready_requested",
+    }
+)
+RENDERER_FAILURE_STAGES = frozenset(
+    {
+        "sidecar_start_failed",
+        "bootstrap_context_failed",
+        "local_api_version_failed",
+        "retry_recovery_failed",
+        "provider_adapter_failed",
+        "provider_create_failed",
+        "initial_snapshot_failed",
+        "window_identity_invalid",
+        "window_not_visible",
+        "ready_validation_failed",
+    }
+)
 _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
     rb"pid=([1-9][0-9]{0,9}) pgid=([1-9][0-9]{0,9}) "
@@ -974,6 +996,32 @@ def _write_evidence(path: Path, payload: dict[str, object]) -> None:
     )
 
 
+def _validate_renderer_completion_stages(stages: set[str]) -> None:
+    failures = stages & RENDERER_FAILURE_STAGES
+    if failures:
+        raise SmokeFailure("Renderer reported a release startup failure stage")
+    if not REQUIRED_RENDERER_COMPLETION_STAGES.issubset(stages):
+        raise SmokeFailure("Renderer readiness omitted required release startup stages")
+
+
+def _validate_existing_home(path: Path) -> Path:
+    if not path.is_absolute():
+        raise SmokeFailure("Existing smoke HOME must be absolute")
+    try:
+        metadata = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise SmokeFailure("Existing smoke HOME is unavailable") from exc
+    if (
+        path.is_symlink()
+        or not path.is_dir()
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & 0o022 != 0
+    ):
+        raise SmokeFailure("Existing smoke HOME is not an owner-controlled directory")
+    return resolved
+
+
 def smoke_bundle(
     bundle_root: Path,
     *,
@@ -981,6 +1029,7 @@ def smoke_bundle(
     source_dmg: Path,
     timeout_seconds: float,
     evidence_out: Path | None = None,
+    existing_home: Path | None = None,
 ) -> dict[str, object]:
     if timeout_seconds <= 0:
         raise SmokeFailure("Bundle smoke timeout must be positive")
@@ -1013,8 +1062,11 @@ def smoke_bundle(
     with tempfile.TemporaryDirectory(prefix="openevo-desktop-app-smoke-") as temporary:
         smoke_root = Path(temporary)
         emitted_path = smoke_root / "app-evidence.json"
-        home = smoke_root / "home"
-        home.mkdir(mode=0o700)
+        if existing_home is None:
+            home = smoke_root / "home"
+            home.mkdir(mode=0o700)
+        else:
+            home = _validate_existing_home(existing_home)
         environment = os.environ.copy()
         environment.update(
             {
@@ -1076,6 +1128,7 @@ def smoke_bundle(
                         )
                         process_groups.update(observed_groups)
                         if evidence is not None:
+                            _validate_renderer_completion_stages(observed_renderer_stages)
                             break
                         readiness_stage = _advance_readiness_stage(
                             readiness_stage,
@@ -1149,6 +1202,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--source-dmg", type=Path, required=True)
     parser.add_argument("--timeout-seconds", type=float, default=30.0)
     parser.add_argument("--evidence-out", type=Path)
+    parser.add_argument(
+        "--existing-home",
+        type=Path,
+        help="Use an existing owner-controlled HOME for an explicit state-compatibility smoke.",
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -1158,6 +1216,7 @@ def main(argv: list[str] | None = None) -> int:
             source_dmg=args.source_dmg,
             timeout_seconds=args.timeout_seconds,
             evidence_out=args.evidence_out,
+            existing_home=args.existing_home,
         )
     except SmokeFailure as exc:
         print(str(exc), file=sys.stderr)

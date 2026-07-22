@@ -288,6 +288,36 @@ def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(
     assert json.loads(evidence_path.read_text(encoding="utf-8")) == evidence
 
 
+def test_bundle_smoke_existing_home_must_be_owner_controlled(tmp_path: Path) -> None:
+    smoke = _load_bundle_smoke_module()
+    home = tmp_path / "existing-home"
+    home.mkdir(mode=0o755)
+
+    assert smoke._validate_existing_home(home) == home.resolve()
+
+    home.chmod(0o777)
+    with pytest.raises(smoke.SmokeFailure, match="owner-controlled"):
+        smoke._validate_existing_home(home)
+
+    home.chmod(0o755)
+    linked_home = tmp_path / "linked-home"
+    linked_home.symlink_to(home, target_is_directory=True)
+    with pytest.raises(smoke.SmokeFailure, match="owner-controlled"):
+        smoke._validate_existing_home(linked_home)
+
+
+def test_bundle_smoke_requires_successful_renderer_provider_stages() -> None:
+    smoke = _load_bundle_smoke_module()
+    successful = set(smoke.REQUIRED_RENDERER_COMPLETION_STAGES)
+
+    smoke._validate_renderer_completion_stages(successful)
+
+    with pytest.raises(smoke.SmokeFailure, match="omitted required"):
+        smoke._validate_renderer_completion_stages(successful - {"provider_created"})
+    with pytest.raises(smoke.SmokeFailure, match="failure stage"):
+        smoke._validate_renderer_completion_stages(successful | {"retry_recovery_failed"})
+
+
 def test_bundle_smoke_failure_still_runs_bounded_group_cleanup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2406,7 +2436,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     ) < linux_candidate.index("- name: Download exact final candidate bytes")
     assert macos_candidate.count(
         "scripts/ci/smoke_openevo_desktop_bundle.py"
-    ) == 2
+    ) == 3
     assert macos_candidate.index(
         "- name: Validate locked release-mode Tauri dependency graph"
     ) < (
@@ -2495,18 +2525,29 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )
     assert shipped_app_smoke.count(
         "uv run python scripts/ci/smoke_openevo_desktop_bundle.py"
-    ) == 2
+    ) == 3
     assert shipped_app_smoke.count(
         "uv run python scripts/ci/smoke_openevo_desktop_launchservices.py"
     ) == 1
     assert 'legacy_state="$HOME/.openevo/desktop/local-api-v1"' in shipped_app_smoke
     assert (
-        'current_state="$HOME/Library/Application Support/org.openevo.desktop/state-v2"'
+        'current_root="$HOME/Library/Application Support/org.openevo.desktop"'
         in shipped_app_smoke
     )
+    assert 'current_state="$current_root/state-v2"' in shipped_app_smoke
+    assert 'current_native_state="$current_root/native-state-v2"' in shipped_app_smoke
+    assert 'legacy_native_retry="$current_root/.7f3d8b24c1a94762"' in shipped_app_smoke
+    assert 'legacy_native_lock="$current_root/.c41d73e981bf4a56"' in shipped_app_smoke
     assert "intentionally corrupt Preview database" in shipped_app_smoke
     assert "intentionally stale Preview lock" in shipped_app_smoke
+    assert "intentionally stale native Preview recovery state" in shipped_app_smoke
+    assert "intentionally stale native Preview recovery lock" in shipped_app_smoke
+    assert '--existing-home "$HOME"' in shipped_app_smoke
+    assert "legacy-state-app-bundle-smoke.json" in shipped_app_smoke
     assert 'test -f "$current_state/provider.sqlite3"' in shipped_app_smoke
+    assert 'test -f "$current_native_state/.c41d73e981bf4a56"' in shipped_app_smoke
+    assert 'cmp "$legacy_native_retry" "$RUNNER_TEMP/legacy-native-retry"' in shipped_app_smoke
+    assert 'cmp "$legacy_native_lock" "$RUNNER_TEMP/legacy-native-lock"' in shipped_app_smoke
     assert shipped_app_smoke.count('dmg="candidate-artifacts/OpenEvo-Desktop-') == 1
     assert (
         'hdiutil attach "$dmg" -mountpoint "$mount_dir" -nobrowse -readonly'

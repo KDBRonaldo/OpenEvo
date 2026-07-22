@@ -354,12 +354,18 @@ forbidden.
 This changes WebKit transport permission only; the bootstrap schema still
 rejects every non-numeric-loopback endpoint and CORS remains independently
 closed.
-The native run-retry journal lives under Tauri's app-data directory for
-`org.openevo.desktop`. Its no-follow traversal first maps only Darwin's fixed
+The native run-retry journal lives in the versioned private
+`native-state-v2` child of Tauri's app-data directory for
+`org.openevo.desktop`. v0.1.7 does not read or modify the opaque retry files
+that older Preview builds placed directly in the app-data directory. Keeping
+the private leaf separate also allows the shared app-data parent to use the
+normal owner-controlled `0755` mode created by the Python sidecar. Its
+no-follow traversal first maps only Darwin's fixed
 `/var` and `/tmp` system aliases to `/private/var` and `/private/tmp`; this is
 required when a release smoke or user environment supplies an app-data path
 through the OS alias. The journal still rejects every other symlink, requires
-an owner-private `0700` root and link-count-one `0600` files, and revalidates
+the `native-state-v2` leaf to be owner-private `0700` with link-count-one
+`0600` files, and revalidates
 directory and file identity around each locked read or compare-and-swap write.
 SQLite may report an OS-canonical spelling of that database path, including the
 macOS `/var` to `/private/var` alias. The provider therefore requires an absolute

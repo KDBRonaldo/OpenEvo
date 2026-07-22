@@ -133,6 +133,7 @@ const NATIVE_WORKSPACE_IO_POLL: Duration = Duration::from_millis(50);
 const MAX_PENDING_WORKSPACE_IMPORTS: usize = 64;
 const MAX_CANCELLED_PICKER_ACTIONS: usize = 64;
 const RUN_RETRY_RECOVERY_MAX_BYTES: usize = 1024 * 1024;
+const RUN_RETRY_RECOVERY_DIRECTORY_NAME: &str = "native-state-v2";
 const RUN_RETRY_RECOVERY_FILE_NAME: &str = ".7f3d8b24c1a94762";
 const RUN_RETRY_RECOVERY_TEMP_PREFIX: &str = ".7f3d8b24c1a94762.tmp.";
 const RUN_RETRY_RECOVERY_LOCK_FILE_NAME: &str = ".c41d73e981bf4a56";
@@ -5397,7 +5398,12 @@ impl Drop for RunRetryRecoveryTemp<'_> {
 fn run_retry_recovery_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
     app.path()
         .app_data_dir()
+        .map(|path| run_retry_recovery_root_from_app_data(&path))
         .map_err(|_| run_retry_recovery_error())
+}
+
+fn run_retry_recovery_root_from_app_data(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(RUN_RETRY_RECOVERY_DIRECTORY_NAME)
 }
 
 #[cfg(target_os = "linux")]
@@ -6264,6 +6270,43 @@ mod tests {
         write_run_retry_recovery_at(&root, None).unwrap();
         assert_eq!(read_run_retry_recovery_at(&root).unwrap(), None);
         assert!(!run_retry_recovery_target(&root).exists());
+    }
+
+    #[test]
+    fn run_retry_recovery_uses_an_isolated_private_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let app_data = test_temp_root(&temp).join("app-data");
+        fs::create_dir(&app_data).unwrap();
+        fs::set_permissions(&app_data, fs::Permissions::from_mode(0o755)).unwrap();
+        let legacy_target = app_data.join(RUN_RETRY_RECOVERY_FILE_NAME);
+        let legacy_lock = app_data.join(RUN_RETRY_RECOVERY_LOCK_FILE_NAME);
+        fs::write(&legacy_target, b"legacy-preview-state").unwrap();
+        fs::write(&legacy_lock, b"legacy-preview-lock").unwrap();
+        fs::set_permissions(&legacy_target, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&legacy_lock, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let root = run_retry_recovery_root_from_app_data(&app_data);
+        write_run_retry_recovery_at(&root, Some("current-state")).unwrap();
+
+        assert_eq!(root, app_data.join(RUN_RETRY_RECOVERY_DIRECTORY_NAME));
+        assert_eq!(fs::read(&legacy_target).unwrap(), b"legacy-preview-state");
+        assert_eq!(fs::read(&legacy_lock).unwrap(), b"legacy-preview-lock");
+        assert_eq!(
+            fs::symlink_metadata(&app_data)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::symlink_metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            read_run_retry_recovery_at(&root).unwrap().as_deref(),
+            Some("current-state")
+        );
     }
 
     #[cfg(target_os = "macos")]
