@@ -770,6 +770,7 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
     sidecar_identity = sidecar.stat()
     executable = tmp_path / "OpenEvo Desktop"
     executable.write_bytes(b"native executable")
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
     monkeypatch.setattr(
         smoke,
         "_descendants",
@@ -781,6 +782,11 @@ def test_bundle_smoke_observes_verified_fd_from_native_digest_marker(
         smoke,
         "_darwin_process_birth_identity",
         lambda _pid: "darwin:1700000000:123",
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_executable_path",
+        lambda _pid: str(sidecar),
     )
     monkeypatch.setattr(
         smoke,
@@ -992,6 +998,7 @@ def test_bundle_smoke_lsof_deadline_does_not_replace_product_readiness(
         executable_sha256=digest,
         executable_size=sidecar.stat().st_size,
     )
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
     monkeypatch.setattr(
         smoke,
         "_descendants",
@@ -1003,6 +1010,11 @@ def test_bundle_smoke_lsof_deadline_does_not_replace_product_readiness(
         smoke,
         "_darwin_process_birth_identity",
         lambda _pid: marker.birth_identity,
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_executable_path",
+        lambda _pid: str(sidecar),
     )
     monkeypatch.setattr(
         smoke,
@@ -1146,6 +1158,7 @@ def test_bundle_smoke_caps_observed_sidecar_group_members(
         executable_sha256=digest,
         executable_size=sidecar.stat().st_size,
     )
+    monkeypatch.setattr(smoke.sys, "platform", "darwin")
     monkeypatch.setattr(
         smoke,
         "_descendants",
@@ -1160,6 +1173,11 @@ def test_bundle_smoke_caps_observed_sidecar_group_members(
         smoke,
         "_darwin_process_birth_identity",
         lambda _pid: "darwin:1700000000:123",
+    )
+    monkeypatch.setattr(
+        smoke,
+        "_darwin_process_executable_path",
+        lambda _pid: str(sidecar),
     )
 
     with pytest.raises(smoke.SmokeFailure, match="exceeded the observation limit"):
