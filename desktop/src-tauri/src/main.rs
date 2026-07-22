@@ -1585,10 +1585,7 @@ fn leader_exit_disposition_without_reaping(
                         info.si_status() as u32
                     })))
                 }
-                _ => Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    "unexpected leader wait status",
-                )),
+                _ => Err(std::io::Error::other("unexpected leader wait status")),
             };
         }
         let error = std::io::Error::last_os_error();
