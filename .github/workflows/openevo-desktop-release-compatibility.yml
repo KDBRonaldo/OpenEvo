@@ -1,0 +1,82 @@
+name: OpenEvo Desktop published release compatibility
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Immutable Desktop release tag to exercise
+        required: true
+        default: openevo-desktop-v0.1.6-v016.29850844088.1
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openevo-desktop-release-compatibility-${{ inputs.release_tag }}
+  cancel-in-progress: true
+
+jobs:
+  published-app-smoke:
+    name: Published app smoke (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - macos-26
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Require Apple Silicon runner
+        run: |
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          sw_vers
+
+      - name: Download immutable published DMG
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          release_dir="$RUNNER_TEMP/openevo-published-release"
+          mkdir -m 700 "$release_dir"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$release_dir" \
+            --pattern 'OpenEvo-Desktop-*-aarch64.dmg'
+          test "$(find "$release_dir" -maxdepth 1 -type f -name '*.dmg' | wc -l | tr -d ' ')" = 1
+          echo "OPENEVO_PUBLISHED_DMG=$(find "$release_dir" -maxdepth 1 -type f -name '*.dmg' -print)" \
+            >> "$GITHUB_ENV"
+
+      - name: Mount and exercise the published app
+        run: |
+          mount_dir="$(mktemp -d)"
+          cleanup() {
+            hdiutil detach "$mount_dir" -quiet >/dev/null 2>&1 || true
+            rm -rf "$mount_dir"
+          }
+          trap cleanup EXIT
+          hdiutil attach "$OPENEVO_PUBLISHED_DMG" \
+            -mountpoint "$mount_dir" \
+            -nobrowse \
+            -readonly
+          app="$mount_dir/OpenEvo Desktop.app"
+          test -d "$app"
+          codesign --verify --deep --strict --verbose=2 "$app"
+          python3 scripts/ci/smoke_openevo_desktop_bundle.py \
+            "$app" \
+            --launch-origin mounted_dmg \
+            --source-dmg "$OPENEVO_PUBLISHED_DMG" \
+            --timeout-seconds 180 \
+            --evidence-out "$RUNNER_TEMP/published-app-smoke.json"
+
+      - name: Upload compatibility evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openevo-published-app-${{ matrix.runner }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/published-app-smoke.json
+          if-no-files-found: warn
+          retention-days: 14
