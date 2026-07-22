@@ -38,10 +38,11 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-Version `0.1.6` is the current public, installable unsigned exhibition Preview.
+Version `0.1.7` is the current public, installable unsigned exhibition Preview.
 It proves the real mounted and copied DMG, bounded Desktop startup, packaged
-sidecar and renderer, a self-contained Daemon Bundle, managed upgrade from
-`0.1.5`, managed-runtime packaging, and immutable release asset roundtrip.
+sidecar and renderer, isolation from corrupt older Preview state, a
+self-contained Daemon Bundle, managed-runtime packaging, and immutable release
+asset roundtrip.
 Signed candidate-bound evidence additionally proves two real remote Codex
 Subscription sessions, all three text-evolution targets, and next-session
 artifact reuse through the packaged renderer and live Desktop Local API. It has
@@ -122,7 +123,7 @@ artifacts, revisions, recovery, and both execution modes.
 
 **Current state:** a real versioned control API, durable project/run stores,
 remote bootstrap, tunnel routing, Subscription prerequisite checks, and child
-service supervision exist. The published `0.1.6` Preview ships a self-contained
+service supervision exist. The published `0.1.7` Preview ships a self-contained
 Daemon Bundle and has packaging, managed-runtime, managed-upgrade, and signed
 candidate-bound Docker plus Codex science evidence. It has no clean-host matrix
 evidence. Clean-host preparation and lifecycle evidence, mediated
@@ -154,7 +155,7 @@ capabilities, task execution, retry/cancel, timeline/transcript, and evolution
 inspection are implemented. First launch exposes two read-only synthetic
 science projects, each demonstrating three cross-session tasks and
 textual-memory, trajectory-to-skill, and agent-system evolution without
-creating authoritative or remote state. The public `0.1.6` Preview launches
+creating authoritative or remote state. The public `0.1.7` Preview launches
 from the real DMG with its packaged renderer and startup-bounded sidecar. G2
 clean-user lifecycle evidence, Files, History, System maintenance, mediated
 credential choices, and several recovery flows remain incomplete.
@@ -177,7 +178,7 @@ GitHub releases present one coherent Desktop-plus-Daemon product.
 documentation, issue state, package inventory, release metadata, dependency
 evidence, and cleanup work still reflect intermediate implementation states.
 The exact source, tag, assets, checksums, and publication evidence for the
-public `0.1.6` Preview must remain available as non-gating release records;
+public `0.1.7` Preview must remain available as non-gating release records;
 earlier Preview releases remain historical evidence.
 
 **Owning issues:** #131 and #193.
@@ -193,7 +194,7 @@ G1 and G12. PyPI remains outside this release.
 **Outcome:** one immutable candidate satisfies every G1-G12 gate.
 
 **Current state:** component and subsystem tests exist, and the published
-`0.1.6` Preview has complete packaging, downloaded-release verification, and
+`0.1.7` Preview has complete packaging, downloaded-release verification, and
 signed candidate-bound two-session science evidence, but there is no candidate
 with complete clean-host Desktop/Daemon evidence, both
 execution modes, all evolution gates, protected performance, recovery/security

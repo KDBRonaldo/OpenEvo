@@ -1,6 +1,6 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the published `0.1.6` exhibition Preview and its supported
+This guide describes the published `0.1.7` exhibition Preview and its supported
 Apple Silicon Mac plus Linux Docker-host profile.
 
 ## Before You Start
@@ -23,13 +23,13 @@ a runtime image manually.
 ## Install The Unsigned DMG
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.6 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.6-v016.29850844088.1),
-   confirm the title **OpenEvo Desktop 0.1.6 Preview**, then download
-   `OpenEvo-Desktop-0.1.6-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.7 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.7-v017-startup-final.29894444050.1),
+   confirm the title **OpenEvo Desktop 0.1.7 Preview**, then download
+   `OpenEvo-Desktop-0.1.7-aarch64.dmg` and `SHA256SUMS`.
 2. Verify the exact DMG checksum recorded by that release:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.6-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.7-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -48,6 +48,12 @@ a runtime image manually.
 
 The wording and location of **Open Anyway** can vary by macOS version.
 Do not clear quarantine from a parent directory or from an unverified download.
+
+Version `0.1.7` starts with a new local Preview-state namespace and does not
+import projects or retry records created by older Preview builds. Removing an
+older application does not remove those files, but they cannot prevent `0.1.7`
+from starting. Add the remote workspace again in `0.1.7`; remote project and
+Daemon data are not deleted by this local reset.
 
 ## Explore The Built-In Projects
 

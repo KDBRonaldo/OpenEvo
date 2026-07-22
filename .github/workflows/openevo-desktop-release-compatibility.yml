@@ -6,7 +6,7 @@ on:
       release_tag:
         description: Immutable Desktop release tag to exercise
         required: true
-        default: openevo-desktop-v0.1.6-v016.29850844088.1
+        default: openevo-desktop-v0.1.7-v017-startup-final.29894444050.1
 
 permissions:
   contents: read

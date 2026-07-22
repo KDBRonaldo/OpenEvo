@@ -10,11 +10,14 @@ evidence.
 Use focused tests for ordinary changes and broaden the suite when touching
 shared contracts.
 
-Version `0.1.3` is published as an unsigned, non-gating Preview. Its real DMG,
-packaged sidecar and renderer, self-contained Daemon Bundle, managed runtime,
-packaging smoke, and immutable asset roundtrip are current Preview evidence.
-No checked-in, candidate-bound science E2E exists for it, and it is not G2, G3,
-or G12 evidence. Earlier Preview releases remain historical evidence.
+Version `0.1.7` is the current unsigned, non-gating Preview. Its real mounted
+and copied DMG, packaged sidecar and renderer, self-contained Daemon Bundle,
+managed runtime, legacy-state startup smoke, and immutable asset roundtrip are
+current Preview evidence. Checked-in, signed candidate-bound evidence also
+covers two real remote Codex subscription sessions, all three text-evolution
+targets, next-session artifact reuse, and packaged-renderer observability. It
+is still not G2, G3, G12, or full External Beta evidence. Earlier Preview
+releases remain historical evidence.
 
 ## Focused Tests
 

@@ -1,10 +1,13 @@
 # OpenEvo Architecture Docs
 
 This directory describes the current architecture and External Beta target.
-OpenEvo `0.1.3` is the current installable unsigned exhibition Preview with a
+OpenEvo `0.1.7` is the current installable unsigned exhibition Preview with a
 real Desktop DMG, packaged sidecar and renderer, self-contained Daemon Bundle,
-managed-runtime packaging smoke, and immutable release asset verification. It
-has no checked-in candidate-bound science E2E or clean-host evidence. Target
+managed-runtime packaging smoke, legacy-state startup isolation, and immutable
+release asset verification. Signed candidate-bound evidence covers two real
+remote Codex subscription sessions, all three text-evolution targets,
+next-session artifact reuse, and packaged-renderer observability. It has no
+clean-host matrix or full macOS Tauri-to-remote-host E2E evidence. Target
 documents must not be read as proof that the Preview satisfies the full
 External Beta contract or G1-G12. Earlier Preview releases are historical
 evidence. The product surfaces are:
