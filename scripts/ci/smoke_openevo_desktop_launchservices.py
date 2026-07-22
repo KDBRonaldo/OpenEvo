@@ -245,7 +245,7 @@ class DarwinSystem:
         result = self.command(
             [
                 "/usr/sbin/lsof", "-nP", "-a", "-p", str(identity.pid), "-iTCP",
-                "-sTCP:LISTEN", "-FnT",
+                "-sTCP:LISTEN", "-FftnT",
             ]
         )
         if result.returncode != 0:

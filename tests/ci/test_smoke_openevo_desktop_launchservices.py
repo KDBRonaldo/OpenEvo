@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import plistlib
+import subprocess
 import sys
 
 import pytest
@@ -55,6 +56,27 @@ def test_parse_lsof_listeners_only_accepts_loopback_listening_records() -> None:
     )
 
     assert listeners == [smoke.Listener(owner, 41731)]
+
+
+def test_listener_inventory_requests_every_field_required_by_parser() -> None:
+    smoke = _load_module()
+    owner = smoke.ProcessIdentity(71, "Mon Jan  2 03:04:05 2023")
+    observed: list[list[str]] = []
+
+    class System(smoke.DarwinSystem):
+        def __init__(self):
+            pass
+
+        def command(self, arguments, timeout=smoke.COMMAND_TIMEOUT_SECONDS):
+            observed.append(arguments)
+            return subprocess.CompletedProcess(
+                arguments,
+                0,
+                stdout="f3\ntIPv4\nn127.0.0.1:41731\nTST=LISTEN\n",
+            )
+
+    assert System().listener_rows(owner) == [smoke.Listener(owner, 41731)]
+    assert observed[0][-1] == "-FftnT"
 
 
 def test_descendants_do_not_adopt_pid_reuse_or_sibling_processes() -> None:
