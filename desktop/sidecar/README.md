@@ -49,6 +49,35 @@ the user-selected system-OpenSSH profile and a complete `ScienceProjectConfigV2`
 that passes strict validation. The v2 store persists only that canonical config
 and its digest, never a cached v1 remote state or generic revision.
 
+## V2 Core bridge authority
+
+`core_client_v2.py`, `core_bridge_v2.py`, and `core_bridge_adapters_v2.py`
+implement the strict project-bound Core Control API v2 boundary. Before Core is
+compatible, the adapter may stage and start the sealed Daemon bundle through the
+selected system-OpenSSH profile. After compatibility negotiation, every project,
+workspace, task, attempt, service, artifact, diagnostic, and event operation uses
+only that active project's verified loopback tunnel. The HTTP transport accepts
+only its fixed private loopback origin and cannot fall back to a launcher URL,
+shared backend URL, v1 route, or direct SSH business command.
+
+The client verifies the exact release, OpenAPI, event-schema, registry, runtime,
+and Daemon identities before publishing an authority generation. JSON and SSE
+inputs are duplicate-key rejecting and bounded before model validation; cache
+updates are copy-on-write, results are generation-sealed, and shutdown has a
+global bounded close capacity. Remote failures cross the bridge only as closed
+Local API errors without URLs, bearer values, SSH commands, host paths, or
+upstream validation objects.
+
+`core_bridge_store_v2.py` owns a separate private SQLite namespace for exact
+Desktop profile/project-to-Core authority mappings and mutation replay records.
+Mappings preserve distinct Project Head, Evolution Revision, Runtime Context,
+execution snapshot, registry, runtime, Daemon, and event-cursor identities; no
+context-dependent generic revision exists. Mutations are recorded before send,
+move through explicit unknown-outcome recovery, and become applied only after an
+exact typed authority result. `event_broker_v2.py` provides bounded canonical
+local replay and subscriber queues. Release-provider routing and renderer-facing
+Local API v2 composition are wired separately.
+
 ## Release execution modes
 
 The exact sidecar release composition publishes the required

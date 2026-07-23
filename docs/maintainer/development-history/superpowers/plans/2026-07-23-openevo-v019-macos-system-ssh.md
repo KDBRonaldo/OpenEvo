@@ -733,19 +733,20 @@ The exact broader gate is added in Task 18 after every slice is present.
 - Create: `tests/openevo/sidecar/test_core_client_v2.py`
 - Create: `tests/openevo/sidecar/test_core_bridge_v2.py`
 - Create: `tests/openevo/sidecar/test_core_bridge_store_v2.py`
+- Create: `tests/openevo/sidecar/test_core_bridge_adapters_v2.py`
 - Create: `tests/openevo/sidecar/test_event_broker_v2.py`
 
-- [ ] Port strict bounded JSON/SSE validation, copy-on-write cache authority,
+- [x] Port strict bounded JSON/SSE validation, copy-on-write cache authority,
   generation sealing, global close capacity, idempotency, and replay ledgers
   from v1 without aliasing v1 models.
-- [ ] Write RED malicious-upstream tests before each ported behavior.
-- [ ] Persist exact Desktop project/profile/head mapping with distinct identity
+- [x] Write RED malicious-upstream tests before each ported behavior.
+- [x] Persist exact Desktop project/profile/head mapping with distinct identity
   fields and reject any drift or context-dependent generic revision.
-- [ ] Use only the active project's system-SSH tunnel. Never fall back to a
+- [x] Use only the active project's system-SSH tunnel. Never fall back to a
   shared backend URL or launcher URL.
-- [ ] Map remote errors to the closed Local API without Pydantic, URL, token,
+- [x] Map remote errors to the closed Local API without Pydantic, URL, token,
   host path, or command leakage.
-- [ ] Run focused bridge/client tests and commit:
+- [x] Run focused bridge/client tests and commit:
   `feat(sidecar): bridge strict Core v2 authority`
 
 ### Task 21: Wire v2 release provider and remote lifecycle
