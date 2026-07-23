@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime
 import hmac
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -16,7 +17,10 @@ from starlette.types import ASGIApp
 
 from desktop.sidecar.contracts.v1.app import DESKTOP_SESSION_HEADER, create_contract_app
 from desktop.sidecar.contracts.v1.models import ApiErrorV1
+from desktop.sidecar.contracts.v2.app import create_desktop_local_v2_contract_app
+from desktop.sidecar.contracts.v2.models import DesktopErrorV2
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1, DesktopCoreBridgeV1
+from desktop.sidecar.core_bridge_v2 import DesktopCoreBridgeErrorV2
 from desktop.sidecar.core_client_v1 import (
     CoreClientErrorV1,
     CoreClientLocalErrorV1,
@@ -45,6 +49,15 @@ from desktop.sidecar.provider_store import (
     ResourceInUseError,
     ResourceNotFoundError,
 )
+from desktop.sidecar.provider_store_v2 import (
+    ProviderCapacityV2Error,
+    ProviderConflictV2,
+    ProviderContractV2Error,
+    ProviderIdempotencyConflictV2,
+    ProviderNotFoundV2,
+    ProviderPreconditionFailedV2,
+    ProviderStoreV2Error,
+)
 from desktop.sidecar.release_provider import (
     ActiveProjectMismatchError,
     DesktopReleaseProvider,
@@ -53,6 +66,11 @@ from desktop.sidecar.release_provider import (
     InvalidNativeChallengeError,
     LocalOperationCancellationUnavailableError,
     ProviderCapabilityUnavailableError,
+    ConfiguredSshHostCatalogProviderV2,
+)
+from desktop.sidecar.release_provider_v2 import (
+    DesktopReleaseProviderV2,
+    DesktopReleaseProviderV2Error,
 )
 from desktop.sidecar.release_capabilities import (
     RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
@@ -60,17 +78,25 @@ from desktop.sidecar.release_capabilities import (
 )
 from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
+    DesktopReleaseCoreRuntimeV2,
+    ReleaseLocalStateV2,
     create_release_core_runtime,
+    create_release_core_runtime_v2,
+    create_release_local_state_v2,
 )
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
     RemoteCredentialUnavailableError,
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
+    SystemOpenSshRemoteLifecycleV2,
 )
+from desktop.sidecar.ssh_config_catalog import OpenSshHostCatalogLoader
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     SystemOpenSshHostTrust,
+    SystemOpenSshSession,
+    SystemOpenSshSessionOwner,
 )
 from desktop.sidecar.workspace_imports import (
     WorkspaceImportError,
@@ -115,7 +141,9 @@ _TAURI_RELEASE_HEADERS = (
     "If-Match",
     "Last-Event-ID",
     "Pragma",
+    "X-OpenEvo-Resource-Generation",
 )
+_V2_WORKSPACE_STATE_DIRECTORY = "workspace-imports-v2"
 
 
 class _ReleaseDesktopLocalApiApp(FastAPI):
@@ -784,4 +812,391 @@ def create_release_desktop_local_api_app(
     return app
 
 
-__all__ = ("create_release_desktop_local_api_app",)
+def _v2_error_response(
+    *,
+    status_code: int,
+    code: str,
+    summary: str,
+    retryable: bool,
+    action: Literal[
+        "retry",
+        "rescan",
+        "review_host_key",
+        "rebind",
+        "reconnect",
+        "install_repair_daemon",
+        "administrator_action",
+        "correct_project",
+        "wait_for_successor",
+        "none",
+    ],
+    affected_resource_id: str | None = None,
+) -> JSONResponse:
+    error = DesktopErrorV2(
+        code=code,
+        summary=summary,
+        retryable=retryable,
+        action=action,
+        affected_resource_id=affected_resource_id,
+    )
+    return JSONResponse(status_code=status_code, content=error.model_dump(mode="json"))
+
+
+def create_packaged_release_desktop_local_api_v2_app(
+    *,
+    state_root: Path | str,
+    session_token: str,
+    instance_id: str,
+    source_commit: str,
+    system_ssh_askpass_helper: AskpassHelperAuthority,
+    system_ssh_host_trust: SystemOpenSshHostTrust,
+    core_assets_root: Path | str | None = None,
+    release_assets_root: Path | str | None = None,
+    build_version: str = OPENEVO_VERSION,
+    build_channel: Literal["release", "development", "test"] = "release",
+    home: Path | str | None = None,
+    inherited_environment: Mapping[str, str] | None = None,
+    clock: Callable[[], datetime] | None = None,
+    startup_phase: Callable[[str], None] | None = None,
+    close_on_shutdown: bool = True,
+) -> FastAPI:
+    """Compose the complete v0.1.9 Local API around system OpenSSH and Core v2."""
+
+    if type(system_ssh_askpass_helper) is not AskpassHelperAuthority:
+        raise TypeError("packaged Local API v2 requires the sealed askpass helper")
+    if type(system_ssh_host_trust) is not SystemOpenSshHostTrust:
+        raise TypeError("packaged Local API v2 requires system OpenSSH trust authority")
+    if core_assets_root is not None and release_assets_root is not None:
+        raise ValueError("embedded and packaged release assets cannot be combined")
+    if core_assets_root is None and release_assets_root is None:
+        raise ValueError("packaged Local API v2 requires verified Core release assets")
+    environment = dict(os.environ if inherited_environment is None else inherited_environment)
+    if any(type(key) is not str or type(value) is not str for key, value in environment.items()):
+        raise TypeError("system OpenSSH environment must contain only text")
+    home_value = home if home is not None else environment.get("HOME")
+    if home_value is None:
+        raise ValueError("system OpenSSH HOME is unavailable")
+    home_path = Path(os.path.abspath(os.path.expanduser(os.fspath(home_value))))
+    if not home_path.is_absolute():
+        raise ValueError("system OpenSSH HOME must be absolute")
+
+    local_state: ReleaseLocalStateV2 | None = None
+    workspace_store: WorkspaceImportStore | None = None
+    lifecycle: SystemOpenSshRemoteLifecycleV2 | None = None
+    core_runtime: DesktopReleaseCoreRuntimeV2 | None = None
+    provider: DesktopReleaseProviderV2 | None = None
+    try:
+        if startup_phase is not None:
+            startup_phase("provider_store_v2")
+        local_state = create_release_local_state_v2(state_root, clock=clock)
+        if startup_phase is not None:
+            startup_phase("restart_reconciliation_v2")
+        local_state.provider_store.reconcile_process_restart()
+
+        if startup_phase is not None:
+            startup_phase("workspace_store_v2")
+        root = Path(os.path.abspath(os.fspath(Path(state_root).expanduser())))
+        workspace_store = WorkspaceImportStore(
+            root / _V2_WORKSPACE_STATE_DIRECTORY,
+            reconcile_on_open=True,
+        )
+
+        if startup_phase is not None:
+            startup_phase("ssh_catalog_v2")
+        catalog = ConfiguredSshHostCatalogProviderV2(
+            OpenSshHostCatalogLoader(
+                config_path=home_path / ".ssh" / "config",
+                user_ssh_dir=home_path / ".ssh",
+            ),
+            clock=clock,
+        )
+
+        if startup_phase is not None:
+            startup_phase("remote_lifecycle_v2")
+
+        def create_system_ssh_session(profile, connection_generation):
+            return SystemOpenSshSession(
+                profile,
+                connection_generation=connection_generation,
+                askpass_helper=system_ssh_askpass_helper,
+                home=home_path,
+                inherited_environment=environment,
+                owns_askpass_helper=False,
+                host_trust=system_ssh_host_trust,
+            )
+
+        session_owner = SystemOpenSshSessionOwner(create_system_ssh_session)
+        lifecycle = SystemOpenSshRemoteLifecycleV2(
+            session_owner,
+            system_ssh_host_trust,
+            owned_askpass_helper=system_ssh_askpass_helper,
+        )
+
+        if release_assets_root is None:
+            core_root = core_assets_root
+            daemon_root = None
+            runtime_root = None
+            packaged_resource_assets = False
+        else:
+            packaged_root = Path(release_assets_root)
+            core_root = packaged_root / "core"
+            daemon_root = packaged_root / "daemon"
+            runtime_root = packaged_root / "runtime"
+            packaged_resource_assets = True
+        assert core_root is not None
+        core_runtime = create_release_core_runtime_v2(
+            provider_store=local_state.provider_store,
+            remote_lifecycle=lifecycle,
+            asset_root=core_root,
+            source_commit=source_commit,
+            release_assets_root=release_assets_root,
+            daemon_asset_root=daemon_root,
+            runtime_asset_root=runtime_root,
+            packaged_resource_assets=packaged_resource_assets,
+            startup_phase=startup_phase,
+        )
+        if startup_phase is not None:
+            startup_phase("release_provider_v2")
+        provider = DesktopReleaseProviderV2(
+            store=local_state.provider_store,
+            catalog=catalog,
+            lifecycle=lifecycle,
+            core_connector=core_runtime.core_connector,
+            bridge=core_runtime.core_bridge,
+            bridge_store=core_runtime.bridge_store,
+            workspace_import_store=workspace_store,
+            event_broker=core_runtime.event_broker,
+            build_version=build_version,
+            source_commit=source_commit,
+            build_channel=build_channel,
+            instance_id=instance_id,
+            clock=clock,
+            own_resources=True,
+        )
+        if startup_phase is not None:
+            startup_phase("contract_app_v2")
+        app = create_release_desktop_local_api_v2_app(
+            session_token=session_token,
+            provider=provider,
+            close_on_shutdown=close_on_shutdown,
+        )
+        app.state.desktop_legacy_import_report = local_state.legacy_import
+        return app
+    except BaseException:
+        if provider is not None:
+            _cleanup_after_primary_failure(provider.close)
+        else:
+            if core_runtime is not None:
+                _cleanup_after_primary_failure(core_runtime.close)
+            if lifecycle is not None:
+                _cleanup_after_primary_failure(lifecycle.close)
+            else:
+                _cleanup_after_primary_failure(system_ssh_host_trust.close)
+                _cleanup_after_primary_failure(system_ssh_askpass_helper.close)
+            if workspace_store is not None:
+                _cleanup_after_primary_failure(workspace_store.close)
+            if local_state is not None:
+                _cleanup_after_primary_failure(local_state.close)
+        raise
+
+
+def create_release_desktop_local_api_v2_app(
+    *,
+    session_token: str,
+    provider: DesktopReleaseProviderV2,
+    close_on_shutdown: bool = True,
+) -> FastAPI:
+    """Mount the packaged 0.1.9 provider on Local API v2 only."""
+
+    if (
+        type(session_token) is not str
+        or not 32 <= len(session_token) <= 4096
+        or re.search(r"[\x00-\x1f\x7f]", session_token) is not None
+    ):
+        raise ValueError("Desktop session token must be 32-4096 characters without controls")
+    if type(provider) is not DesktopReleaseProviderV2:
+        raise TypeError("Local API v2 requires the exact release provider")
+    if type(close_on_shutdown) is not bool:
+        raise TypeError("shutdown ownership must be boolean")
+    validate_v019_release_composition(
+        provider_kind="desktop_sidecar",
+        local_api_major=2,
+        core_transport="active_project_ssh_tunnel",
+        allow_direct_core_url=False,
+        allow_legacy_route_fallback=False,
+    )
+    encoded_session_token = session_token.encode("utf-8")
+    app = create_desktop_local_v2_contract_app(
+        provider,
+        _app_factory=_ReleaseDesktopLocalApiApp,
+    )
+    app.state.desktop_release_provider = provider
+
+    @app.middleware("http")
+    async def authenticate_desktop_v2_session(request: Request, call_next):
+        path = request.url.path
+        if path == "/desktop/v2" or path.startswith("/desktop/v2/"):
+            header_name = DESKTOP_SESSION_HEADER.lower().encode("ascii")
+            candidates = [
+                value for name, value in request.scope["headers"] if name == header_name
+            ]
+            candidate = candidates[0] if len(candidates) == 1 else b""
+            if len(candidates) != 1 or not hmac.compare_digest(
+                candidate, encoded_session_token
+            ):
+                return _v2_error_response(
+                    status_code=401,
+                    code="desktop_session_invalid",
+                    summary="The Desktop session credential is missing or invalid.",
+                    retryable=True,
+                    action="reconnect",
+                )
+        return await call_next(request)
+
+    @app.exception_handler(DesktopReleaseProviderV2Error)
+    async def handle_v2_provider_error(
+        request: Request,
+        exc: DesktopReleaseProviderV2Error,
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.error.model_dump(mode="json"),
+        )
+
+    @app.exception_handler(DesktopCoreBridgeErrorV2)
+    async def handle_v2_core_bridge_error(
+        request: Request,
+        exc: DesktopCoreBridgeErrorV2,
+    ) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=exc.error.model_dump(mode="json"),
+        )
+
+    @app.exception_handler(ProviderStoreV2Error)
+    async def handle_v2_store_error(
+        request: Request,
+        exc: ProviderStoreV2Error,
+    ) -> JSONResponse:
+        del request
+        if isinstance(exc, ProviderNotFoundV2):
+            return _v2_error_response(
+                status_code=404,
+                code="resource_not_found",
+                summary="The requested local resource was not found.",
+                retryable=False,
+                action="none",
+            )
+        if isinstance(exc, ProviderPreconditionFailedV2):
+            generation = "generation" in str(exc).lower()
+            return _v2_error_response(
+                status_code=412,
+                code=(
+                    "profile_generation_changed"
+                    if generation
+                    else "etag_precondition_failed"
+                ),
+                summary=(
+                    "The remote-workspace profile generation changed."
+                    if generation
+                    else "The local resource changed since it was loaded."
+                ),
+                retryable=True,
+                action="reconnect" if generation else "retry",
+            )
+        if isinstance(exc, ProviderIdempotencyConflictV2):
+            return _v2_error_response(
+                status_code=409,
+                code="idempotency_key_reused",
+                summary="The action key is already bound to another request.",
+                retryable=False,
+                action="none",
+            )
+        if isinstance(exc, ProviderConflictV2):
+            return _v2_error_response(
+                status_code=409,
+                code="local_resource_conflict",
+                summary="The local resource authority conflicts with this action.",
+                retryable=False,
+                action="none",
+            )
+        if isinstance(exc, ProviderContractV2Error):
+            return _v2_error_response(
+                status_code=422,
+                code="contract_validation_failed",
+                summary="The request does not satisfy Desktop Local API v2.",
+                retryable=False,
+                action="none",
+            )
+        return _v2_error_response(
+            status_code=503,
+            code="local_provider_unavailable",
+            summary="The local Desktop provider is unavailable.",
+            retryable=isinstance(exc, ProviderCapacityV2Error),
+            action="retry" if isinstance(exc, ProviderCapacityV2Error) else "none",
+        )
+
+    @app.exception_handler(WorkspaceImportError)
+    async def handle_v2_workspace_import_error(
+        request: Request,
+        exc: WorkspaceImportError,
+    ) -> JSONResponse:
+        del request
+        invalid = isinstance(
+            exc,
+            (WorkspaceImportIntegrityError, WorkspaceImportNotFoundError),
+        )
+        return _v2_error_response(
+            status_code=422 if invalid else 503,
+            code="workspace_import_invalid" if invalid else "local_provider_unavailable",
+            summary=(
+                "The selected native workspace snapshot is unavailable."
+                if invalid
+                else "The local Desktop provider is unavailable."
+            ),
+            retryable=False,
+            action="correct_project" if invalid else "none",
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def handle_v2_validation(
+        request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        del request, exc
+        return _v2_error_response(
+            status_code=422,
+            code="contract_validation_failed",
+            summary="The request does not satisfy Desktop Local API v2.",
+            retryable=False,
+            action="none",
+        )
+
+    async def handle_v2_internal_contract_error(
+        request: Request,
+        exc: TypeError | ValueError,
+    ) -> JSONResponse:
+        del request, exc
+        return _v2_error_response(
+            status_code=422,
+            code="contract_validation_failed",
+            summary="The request does not satisfy Desktop Local API v2.",
+            retryable=False,
+            action="none",
+        )
+
+    app.add_exception_handler(TypeError, handle_v2_internal_contract_error)
+    app.add_exception_handler(ValueError, handle_v2_internal_contract_error)
+
+    if close_on_shutdown:
+        app.router.add_event_handler("shutdown", provider.close)
+    return app
+
+
+__all__ = (
+    "create_packaged_release_desktop_local_api_v2_app",
+    "create_release_desktop_local_api_app",
+    "create_release_desktop_local_api_v2_app",
+)

@@ -761,18 +761,18 @@ The exact broader gate is added in Task 18 after every slice is present.
 - Create: `tests/openevo/sidecar/test_release_local_api_v2.py`
 - Create: `tests/openevo/sidecar/test_release_core_routing_v2.py`
 
-- [ ] Write RED end-to-end Local API tests for catalog, profile/rebind,
+- [x] Write RED end-to-end Local API tests for catalog, profile/rebind,
   connect/prompt/trust, bootstrap, exact Daemon compatibility, tunnel, project,
   task, transition, artifact, diagnostic, disconnect, reconnect, and restart.
-- [ ] Require current profile/project/session generations at every mutation.
-- [ ] Keep SSH authority limited to inspection, bundle stage/ensure,
+- [x] Require current profile/project/session generations at every mutation.
+- [x] Keep SSH authority limited to inspection, bundle stage/ensure,
   activation/rollback, tunnel, and manifest-bound maintenance while Core cannot
   start.
-- [ ] Prove every post-compatibility business action calls v2 Core and that
+- [x] Prove every post-compatibility business action calls v2 Core and that
   injected Core failures do not call SSH.
-- [ ] Mount only v2 mutation routes in release; v1 remains read-only migration
+- [x] Mount only v2 mutation routes in release; v1 remains read-only migration
   input outside renderer reach.
-- [ ] Run focused provider/routing tests and commit:
+- [x] Run focused provider/routing tests and commit:
   `feat(sidecar): expose the v2 remote workspace workflow`
 
 ---

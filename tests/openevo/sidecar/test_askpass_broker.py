@@ -235,6 +235,52 @@ def test_prompt_completion_is_bound_to_the_authorized_helper_and_has_no_secret(
         broker.close()
 
 
+def test_prompt_observer_receives_only_generation_kind_and_state(
+    runtime_dir: Path,
+) -> None:
+    helper_pid = os.getpid()
+    owner = _identity(175, parent_id=50, executable="/usr/bin/ssh")
+    helper = _identity(helper_pid, parent_id=175, executable="/tmp/helper")
+    observations: list[object] = []
+    broker = AskpassAuthorizationBroker(
+        runtime_dir / "a",
+        helper_path=helper.executable_path,
+        inspector=_Inspector({175: owner, helper_pid: helper}),
+        hmac_key=b"p" * 32,
+        observation_callback=observations.append,
+    )
+    try:
+        broker.start()
+        capability = broker.issue_capability(connection_generation=11)
+        broker.bind_owner(capability, owner)
+        authorization = _request(
+            capability=capability.value,
+            generation=11,
+            helper_pid=helper_pid,
+            ssh_parent_pid=175,
+            owner_pid=175,
+            kind="passphrase",
+        )
+        peer = UnixPeerAuthority(process_id=helper_pid, user_id=os.geteuid())
+
+        assert broker.authorize_payload(authorization, peer=peer)
+        assert broker.complete_payload(
+            _completion(authorization, outcome="accepted"),
+            peer=peer,
+        )
+
+        assert [
+            (item.connection_generation, item.kind, item.state)
+            for item in observations
+        ] == [
+            (11, "passphrase", "pending"),
+            (11, "passphrase", "completed"),
+        ]
+        assert all(not hasattr(item, "prompt") for item in observations)
+    finally:
+        broker.close()
+
+
 def test_proxyjump_descendant_shape_is_bound_to_the_outer_owned_ssh(
     runtime_dir: Path,
 ) -> None:

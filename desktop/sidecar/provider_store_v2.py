@@ -29,8 +29,10 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, model_
 from desktop.sidecar.contracts.v2 import models as m
 from openevo.backend.contracts.v2.models import (
     ScienceProjectConfigV2,
+    VersionResponseV2,
     project_config_sha256_for,
 )
+from openevo.deployment.host_keys import PendingSystemHostKeyReview
 
 
 STORE_NAMESPACE = "openevo.desktop.provider.v2"
@@ -696,6 +698,617 @@ class DesktopProviderStoreV2:
         if not isinstance(result, m.RemoteWorkspaceProfileV2):
             raise ProviderDataV2Error("legacy rebind replay has the wrong type")
         return result
+
+    def begin_profile_action(
+        self,
+        profile_id: str,
+        request: m.ProfileConnectionActionV2 | m.HostKeyReviewRequestV2,
+        *,
+        action: Literal["connect", "disconnect", "host_key_review"],
+        resource_generation: int,
+        if_match: str,
+        idempotency_key: str,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Durably reserve one generation-replacing system-SSH action."""
+
+        self._validate_profile_id(profile_id)
+        request_type: type[m.ProfileConnectionActionV2]
+        if action == "host_key_review":
+            request_type = m.HostKeyReviewRequestV2
+        elif action in {"connect", "disconnect"}:
+            request_type = m.ProfileConnectionActionV2
+        else:
+            raise ProviderContractV2Error("profile action is outside the closed v2 set")
+        validated = self._validate_model(request_type, request)
+        self._validate_etag(if_match)
+        if (
+            type(resource_generation) is not int
+            or not 1 <= resource_generation <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+        ):
+            raise ProviderContractV2Error("profile generation is outside v2 bounds")
+
+        operation = {
+            "connect": "connectProfileV2",
+            "disconnect": "disconnectProfileV2",
+            "host_key_review": "reviewHostKeyV2",
+        }[action]
+
+        def mutation(connection: sqlite3.Connection) -> BaseModel:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profiles must be rebound before connection")
+            if (
+                current.connection_generation != resource_generation
+                or validated.expected_connection_generation != resource_generation
+            ):
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if not hmac.compare_digest(current.etag, if_match):
+                raise ProviderPreconditionFailedV2("profile ETag changed")
+            current_version = cast(int, row["resource_version"])
+            if (
+                current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER
+                or current.connection_generation >= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            ):
+                raise ProviderCapacityV2Error("profile generation is exhausted")
+            version = current_version + 1
+            generation = current.connection_generation + 1
+            timestamp = self._timestamp()
+            trust_state: Literal["unverified", "trusted", "repairing"]
+            if action == "host_key_review":
+                trust_state = "repairing"
+            elif current.trust.state == "trusted":
+                trust_state = "trusted"
+            else:
+                trust_state = "unverified"
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=generation,
+                connection_state=("disconnecting" if action == "disconnect" else "connecting"),
+                prompt=None,
+                trust=m.SshTrustStateV2(
+                    connection_generation=generation,
+                    state=trust_state,
+                    review_id=None,
+                    review_sha256=None,
+                    key_fingerprints=[],
+                    repair_support="not_needed",
+                ),
+                failure=None,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=timestamp,
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+        result = self._execute_idempotent(
+            operation=operation,
+            resource_scope=profile_id,
+            idempotency_key=idempotency_key,
+            request_value={
+                "profile_id": profile_id,
+                "request": validated.model_dump(mode="json"),
+                "resource_generation": resource_generation,
+                "if_match": if_match,
+            },
+            response_kind="profile",
+            mutation=mutation,
+        )
+        if not isinstance(result, m.RemoteWorkspaceProfileV2):
+            raise ProviderDataV2Error("profile action replay has the wrong type")
+        return result
+
+    def complete_profile_connection(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        core_version: VersionResponseV2,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Publish exact compatible Core identity for one connected generation."""
+
+        self._validate_profile_id(profile_id)
+        if type(core_version) is not VersionResponseV2:
+            raise ProviderContractV2Error("Core version authority has the wrong type")
+        offer = next(
+            (item for item in core_version.contracts if item.api_major == 2),
+            None,
+        )
+        if offer is None or not offer.mutation_compatible:
+            raise ProviderContractV2Error("Core v2 mutation authority is unavailable")
+        with self._transaction(write=True, operation="completeProfileConnectionV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own a connection")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            expected_identity = (
+                2,
+                offer.openapi_sha256,
+                offer.event_schema_sha256,
+                core_version.registry_sha256,
+            )
+            current_identity = (
+                current.core_api_major,
+                current.core_openapi_sha256,
+                current.core_event_schema_sha256,
+                current.core_registry_sha256,
+            )
+            if current.connection_state == "connected":
+                if current_identity != expected_identity:
+                    raise ProviderConflictV2("connected Core identity changed")
+                return current
+            if current.connection_state not in {"connecting", "bootstrapping", "negotiating"}:
+                raise ProviderConflictV2("profile is not completing a connection")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="connected",
+                prompt=None,
+                trust=m.SshTrustStateV2(
+                    connection_generation=current.connection_generation,
+                    state="trusted",
+                    review_id=None,
+                    review_sha256=None,
+                    key_fingerprints=[],
+                    repair_support="not_needed",
+                ),
+                failure=None,
+                active_project_id=current.active_project_id,
+                core_api_major=2,
+                core_openapi_sha256=offer.openapi_sha256,
+                core_event_schema_sha256=offer.event_schema_sha256,
+                core_registry_sha256=core_version.registry_sha256,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+    def publish_profile_host_key_review(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        review: PendingSystemHostKeyReview,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Persist only the path-free, digest-bound part of a changed-key review."""
+
+        self._validate_profile_id(profile_id)
+        if type(review) is not PendingSystemHostKeyReview or (
+            review.profile_id != profile_id
+            or review.connection_generation != connection_generation
+        ):
+            raise ProviderContractV2Error("host-key review authority changed")
+        try:
+            fingerprints = [
+                m.SshHostKeyFingerprintV2(
+                    algorithm=algorithm,
+                    sha256_fingerprint=fingerprint,
+                    role="presented",
+                )
+                for algorithm, fingerprint in review.key_fingerprints
+            ]
+        except (TypeError, ValueError, ValidationError) as exc:
+            raise ProviderContractV2Error(
+                "host-key review fingerprints are invalid"
+            ) from exc
+        trust = m.SshTrustStateV2(
+            connection_generation=connection_generation,
+            state="changed_key_blocked",
+            review_id=review.review_id,
+            review_sha256=review.review_sha256,
+            key_fingerprints=fingerprints,
+            repair_support=review.repair_support,
+        )
+        with self._transaction(write=True, operation="publishHostKeyReviewV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own a host-key review")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.connection_state == "host_key_review":
+                if current.trust != trust:
+                    raise ProviderConflictV2("host-key review authority changed")
+                return current
+            if current.connection_state != "connecting":
+                raise ProviderConflictV2("profile is not awaiting a host-key review")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="host_key_review",
+                prompt=None,
+                trust=trust,
+                failure=None,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+    def observe_profile_prompt(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        kind: Literal["password", "passphrase", "host_confirmation"],
+        state: Literal["pending", "completed", "rejected", "cancelled"],
+    ) -> m.RemoteWorkspaceProfileV2 | None:
+        """Project a text-free native askpass observation into the live generation."""
+
+        self._validate_profile_id(profile_id)
+        if kind not in {"password", "passphrase", "host_confirmation"} or state not in {
+            "pending",
+            "completed",
+            "rejected",
+            "cancelled",
+        }:
+            raise ProviderContractV2Error("SSH prompt observation is invalid")
+        projected_kind: Literal["password", "passphrase", "confirmation"] = (
+            "confirmation" if kind == "host_confirmation" else kind
+        )
+        with self._transaction(write=True, operation="observeProfilePromptV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                return None
+            if current.connection_generation != connection_generation:
+                return None
+            if state == "pending":
+                if current.connection_state == "prompt_pending":
+                    if current.prompt is None or current.prompt.kind != projected_kind:
+                        raise ProviderConflictV2("SSH prompt authority changed")
+                    return current
+                if current.connection_state != "connecting":
+                    return None
+                timestamp = self._timestamp()
+                prompt = m.SshPromptStateV2(
+                    connection_generation=connection_generation,
+                    kind=projected_kind,
+                    state="pending",
+                    requested_at=timestamp,
+                )
+                connection_state: m.ConnectionStateV2 = "prompt_pending"
+            else:
+                if current.connection_state != "prompt_pending":
+                    return current if current.connection_state == "connecting" else None
+                if current.prompt is None or current.prompt.kind != projected_kind:
+                    raise ProviderConflictV2("SSH prompt authority changed")
+                timestamp = self._timestamp()
+                prompt = None
+                connection_state = "connecting"
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state=connection_state,
+                prompt=prompt,
+                trust=current.trust,
+                failure=None,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=timestamp,
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+    def fail_profile_connection(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        failure: m.DesktopErrorV2,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Close one live connection generation with a renderer-safe failure."""
+
+        self._validate_profile_id(profile_id)
+        if type(failure) is not m.DesktopErrorV2:
+            raise ProviderContractV2Error("profile failure has the wrong type")
+        with self._transaction(write=True, operation="failProfileConnectionV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own a connection failure")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.connection_state == "failed":
+                if current.failure != failure:
+                    raise ProviderConflictV2("profile failure authority changed")
+                return current
+            if current.connection_state not in {
+                "connecting",
+                "prompt_pending",
+                "bootstrapping",
+                "negotiating",
+            }:
+                raise ProviderConflictV2("profile cannot fail from its current state")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="failed",
+                prompt=None,
+                trust=m.SshTrustStateV2(
+                    connection_generation=current.connection_generation,
+                    state="unverified",
+                    review_id=None,
+                    review_sha256=None,
+                    key_fingerprints=[],
+                    repair_support="not_needed",
+                ),
+                failure=failure,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+    def complete_profile_rejection(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Consume an exact review as a disconnected, rejected generation."""
+
+        self._validate_profile_id(profile_id)
+        with self._transaction(write=True, operation="completeProfileRejectionV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot reject host trust")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.connection_state != "connecting" or current.trust.state != "repairing":
+                raise ProviderConflictV2("profile is not completing a host-key rejection")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="disconnected",
+                prompt=None,
+                trust=m.SshTrustStateV2(
+                    connection_generation=current.connection_generation,
+                    state="rejected",
+                    review_id=None,
+                    review_sha256=None,
+                    key_fingerprints=[],
+                    repair_support="not_needed",
+                ),
+                failure=None,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+    def complete_profile_disconnect(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+    ) -> m.RemoteWorkspaceProfileV2:
+        self._validate_profile_id(profile_id)
+        with self._transaction(write=True, operation="completeProfileDisconnectV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own a connection")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.connection_state == "disconnected":
+                return current
+            if current.connection_state != "disconnecting":
+                raise ProviderConflictV2("profile is not completing a disconnect")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="disconnected",
+                prompt=None,
+                trust=m.SshTrustStateV2(
+                    connection_generation=current.connection_generation,
+                    state="unverified",
+                    review_id=None,
+                    review_sha256=None,
+                    key_fingerprints=[],
+                    repair_support="not_needed",
+                ),
+                failure=None,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
+    def reconcile_process_restart(self) -> tuple[m.RemoteWorkspaceProfileV2, ...]:
+        """Invalidate process-local SSH/Core authority while retaining project intent."""
+
+        recovered: list[m.RemoteWorkspaceProfileV2] = []
+        with self._transaction(write=True, operation="reconcileProcessRestartV2") as connection:
+            rows = connection.execute(
+                f"SELECT {_PROFILE_SELECT_COLUMNS} FROM profiles ORDER BY profile_id"
+            ).fetchall()
+            for raw_row in rows:
+                row = cast(sqlite3.Row, raw_row)
+                current = self._profile_from_row(row)
+                if (
+                    not isinstance(current, m.RemoteWorkspaceProfileV2)
+                    or current.connection_state == "disconnected"
+                ):
+                    continue
+                current_version = cast(int, row["resource_version"])
+                if (
+                    current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER
+                    or current.connection_generation >= m.MAX_JAVASCRIPT_SAFE_INTEGER
+                ):
+                    raise ProviderCapacityV2Error(
+                        "profile restart generation is exhausted"
+                    )
+                version = current_version + 1
+                generation = current.connection_generation + 1
+                recovered_profile = m.RemoteWorkspaceProfileV2(
+                    profile_id=current.profile_id,
+                    display_name=current.display_name,
+                    ssh_host_alias=current.ssh_host_alias,
+                    catalog_generation=current.catalog_generation,
+                    connection_generation=generation,
+                    connection_state="disconnected",
+                    prompt=None,
+                    trust=m.SshTrustStateV2(
+                        connection_generation=generation,
+                        state="unverified",
+                        review_id=None,
+                        review_sha256=None,
+                        key_fingerprints=[],
+                        repair_support="not_needed",
+                    ),
+                    failure=None,
+                    active_project_id=current.active_project_id,
+                    core_api_major=None,
+                    core_openapi_sha256=None,
+                    core_event_schema_sha256=None,
+                    core_registry_sha256=None,
+                    created_at=current.created_at,
+                    updated_at=self._timestamp(),
+                    etag=self._etag("profile", current.profile_id, version),
+                )
+                self._update_profile(connection, recovered_profile, version=version)
+                recovered.append(recovered_profile)
+        return tuple(recovered)
+
+    def bind_active_project(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        project_id: str,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Bind one remote Core project to the connected profile generation."""
+
+        self._validate_profile_id(profile_id)
+        self._validate_profile_id(project_id)
+        if (
+            type(connection_generation) is not int
+            or not 1 <= connection_generation <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+        ):
+            raise ProviderContractV2Error("profile generation is outside v2 bounds")
+        with self._transaction(write=True, operation="bindActiveProjectV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own an active project")
+            if (
+                current.connection_generation != connection_generation
+                or current.connection_state != "connected"
+            ):
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.active_project_id == project_id:
+                return current
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state=current.connection_state,
+                prompt=current.prompt,
+                trust=current.trust,
+                failure=current.failure,
+                active_project_id=project_id,
+                core_api_major=current.core_api_major,
+                core_openapi_sha256=current.core_openapi_sha256,
+                core_event_schema_sha256=current.core_event_schema_sha256,
+                core_registry_sha256=current.core_registry_sha256,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
 
     def copy_legacy_draft(
         self,
@@ -1408,6 +2021,9 @@ class DesktopProviderStoreV2:
             "createSystemOpenSshProfileV2": "profile",
             "renameProfileV2": "profile",
             "rebindLegacyProfileV2": "profile",
+            "connectProfileV2": "profile",
+            "disconnectProfileV2": "profile",
+            "reviewHostKeyV2": "profile",
             "copyLegacyDraftV2": "draft",
         }
         if (
@@ -1476,7 +2092,12 @@ class DesktopProviderStoreV2:
                 and isinstance(response, m.RemoteWorkspaceProfileV2)
                 and typed_current_row["rebound_from_sha256"] is None
             )
-        elif operation == "renameProfileV2":
+        elif operation in {
+            "renameProfileV2",
+            "connectProfileV2",
+            "disconnectProfileV2",
+            "reviewHostKeyV2",
+        }:
             valid_binding = scope == resource_id
         elif operation == "rebindLegacyProfileV2":
             legacy_row = connection.execute(

@@ -95,6 +95,31 @@ def test_native_workspace_action_and_store_ingest_are_idempotent(tmp_path: Path)
     assert native_import_id_for_action("native-source-action-0002") == first.import_id
 
 
+def test_workspace_import_store_inspects_only_verified_internal_authority(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "research"
+    source.mkdir()
+    (source / "notes.txt").write_text("observation", encoding="utf-8")
+    private_root = tmp_path / "private"
+    private_root.mkdir(mode=0o700)
+    store = WorkspaceImportStore(private_root / "imports")
+
+    with _prepare(source, private_root, "native-source-inspect-0001") as prepared:
+        ownership = ownership_for_native_import(prepared.import_ref)
+        pending = store.ingest_pending(
+            prepared.stream,
+            ownership=ownership,
+            import_id=prepared.import_ref.import_id,
+        )
+
+    authority = store.inspect(pending.import_ref.import_id)
+
+    assert authority.import_ref == pending.import_ref
+    assert authority.ownership == ownership
+    assert authority.pending is True
+
+
 def test_native_workspace_cancellation_stops_before_the_second_inventory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

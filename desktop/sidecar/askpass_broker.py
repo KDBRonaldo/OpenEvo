@@ -162,6 +162,7 @@ class AskpassAuthorizationBroker:
         inspector: ProcessInspector | None = None,
         hmac_key: bytes | None = None,
         peer_authority: Callable[[socket.socket], UnixPeerAuthority] | None = None,
+        observation_callback: Callable[[AskpassPromptObservation], None] | None = None,
     ) -> None:
         self._socket_path = _validate_socket_path(socket_path)
         self._helper_path = _validate_helper_path(helper_path)
@@ -172,6 +173,9 @@ class AskpassAuthorizationBroker:
         self._hmac_key = bytearray(hmac_key)
         self._inspector = inspector or SystemProcessInspector()
         self._peer_authority = peer_authority or _unix_peer_authority
+        if observation_callback is not None and not callable(observation_callback):
+            raise TypeError("askpass observation callback must be callable")
+        self._observation_callback = observation_callback
         self._guard = threading.Lock()
         self._bound = threading.Condition(self._guard)
         self._record: _CapabilityRecord | None = None
@@ -336,6 +340,7 @@ class AskpassAuthorizationBroker:
         request = _validate_authorization_request(payload)
         if request is None or not isinstance(peer, UnixPeerAuthority):
             return False
+        observation: AskpassPromptObservation | None = None
         with self._bound:
             record = self._record
             if record is not None and record.owner is None and not record.cancelled:
@@ -368,7 +373,13 @@ class AskpassAuthorizationBroker:
             record.helper_identity = helper_identity
             _zero(record.nonce)
             self._authorized_prompt_count += 1
-            return True
+            observation = AskpassPromptObservation(
+                connection_generation=record.generation,
+                kind=request["prompt_kind"],  # type: ignore[arg-type]
+                state="pending",
+            )
+        self._notify_observation(observation)
+        return True
 
     def complete_payload(
         self,
@@ -379,6 +390,7 @@ class AskpassAuthorizationBroker:
         request = _validate_completion_request(payload)
         if request is None or not isinstance(peer, UnixPeerAuthority):
             return False
+        observation: AskpassPromptObservation | None = None
         with self._bound:
             record = self._record
             if (
@@ -405,7 +417,29 @@ class AskpassAuthorizationBroker:
             record.completion_outcome = request["outcome"]
             _zero(record.capability_digest)
             self._bound.notify_all()
-            return True
+            state = {
+                "accepted": "completed",
+                "rejected": "rejected",
+                "cancelled": "cancelled",
+            }[request["outcome"]]
+            observation = AskpassPromptObservation(
+                connection_generation=record.generation,
+                kind=request["prompt_kind"],  # type: ignore[arg-type]
+                state=state,  # type: ignore[arg-type]
+            )
+        self._notify_observation(observation)
+        return True
+
+    def _notify_observation(self, observation: AskpassPromptObservation) -> None:
+        callback = self._observation_callback
+        if callback is None:
+            return
+        try:
+            callback(observation)
+        except Exception:
+            # Renderer projection is best-effort and must never alter the native
+            # OpenSSH authentication decision.
+            pass
 
     def verify_socket_binding(self) -> None:
         with self._guard:

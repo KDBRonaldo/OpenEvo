@@ -116,6 +116,39 @@ PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
 CoreConnectionStarter = Callable[[list[str], int], "TunnelProcess"]
 
+
+class SystemOpenSshFollowerAuthority(Protocol):
+    """One owned system-OpenSSH master used by the rich deployment transport."""
+
+    ssh_host_alias: str
+    remote_user: str
+
+    def command_argv(self, remote_command: str) -> list[str]: ...
+
+    def rsync_argv(
+        self,
+        *,
+        local_path: Path,
+        remote_path: str,
+        arguments: tuple[str, ...],
+        remote_rsync_path: str | None,
+    ) -> list[str]: ...
+
+    def core_tunnel_argv(self, *, remote_port: int) -> list[str]: ...
+
+    def run_argv(
+        self,
+        argv: list[str],
+        timeout_seconds: float,
+        *,
+        stdin_fd: int | None,
+        cancel_event: threading.Event | None,
+    ) -> subprocess.CompletedProcess[str]: ...
+
+    def start_tunnel(self, argv: list[str], stream_fd: int) -> TunnelProcess: ...
+
+    def verify_authority(self) -> None: ...
+
 logger = logging.getLogger(__name__)
 
 _TUNNEL_CLOSE_GRACE_SECONDS = 1.0
@@ -742,13 +775,15 @@ class _CoreTunnelEndpoint:
         *,
         connection_starter: CoreConnectionStarter | None,
         connection_argv: list[str],
-        trust_lease: AbstractContextManager[Path],
-        trusted_host: TrustedKnownHostsBinding,
+        trust_lease: AbstractContextManager[Path] | None,
+        trusted_host: TrustedKnownHostsBinding | None,
         agent_socket_source: SshAgentSocketSource | None,
+        authority_verifier: Callable[[], None] | None = None,
     ) -> None:
         self._connection_starter = connection_starter
         self._connection_argv = connection_argv
         self._agent_socket_source = agent_socket_source
+        self._authority_verifier = authority_verifier
         self._trust_lease: AbstractContextManager[Path] | None = trust_lease
         self._guard = threading.RLock()
         self._close_guard = threading.Lock()
@@ -759,14 +794,15 @@ class _CoreTunnelEndpoint:
         self._finalized = threading.Event()
         self._orphaned = False
         self._unregister: Callable[[], None] | None = None
-        try:
-            self._unregister = trusted_host._register_tunnel(self.close)
-        except BaseException:
+        if trusted_host is not None:
             try:
-                self._finalize()
+                self._unregister = trusted_host._register_tunnel(self.close)
             except BaseException:
-                pass
-            raise
+                try:
+                    self._finalize()
+                except BaseException:
+                    pass
+                raise
 
     def verify_authority(self, *, timeout_seconds: float = 1.0) -> None:
         del timeout_seconds
@@ -912,6 +948,8 @@ class _CoreTunnelEndpoint:
     def _verify_locked(self) -> None:
         if self._close_requested or self._finalized.is_set():
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+        if self._authority_verifier is not None:
+            self._authority_verifier()
         completed: list[int] = []
         for generation, child in self._children.items():
             process = child.process
@@ -1272,26 +1310,57 @@ class SshRemoteExecutorTransport:
         tunnel_starter: TunnelStarter | None = None,
         port_allocator: PortAllocator | None = None,
         core_connection_starter: CoreConnectionStarter | None = None,
+        system_openssh_authority: SystemOpenSshFollowerAuthority | None = None,
     ) -> None:
         invalid_request = False
-        try:
-            _validate_supported_auth(profile)
-            _validate_remote_identity(profile.user, "user", _REMOTE_USER_RE)
-            _validate_remote_host(profile.host)
-            _validate_port(profile.port, "remote profile port")
-        except Exception:
-            invalid_request = True
-        if invalid_request or trusted_host is None:
-            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
-        host_key_invalid = False
-        try:
-            trusted_host.validate_for(profile)
-        except Exception:
-            host_key_invalid = True
-        if host_key_invalid:
-            raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
+        if system_openssh_authority is None:
+            try:
+                _validate_supported_auth(profile)
+                _validate_remote_identity(profile.user, "user", _REMOTE_USER_RE)
+                _validate_remote_host(profile.host)
+                _validate_port(profile.port, "remote profile port")
+            except Exception:
+                invalid_request = True
+            if invalid_request or trusted_host is None:
+                raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+            host_key_invalid = False
+            try:
+                trusted_host.validate_for(profile)
+            except Exception:
+                host_key_invalid = True
+            if host_key_invalid:
+                raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
+        else:
+            try:
+                required = (
+                    "command_argv",
+                    "rsync_argv",
+                    "core_tunnel_argv",
+                    "run_argv",
+                    "start_tunnel",
+                    "verify_authority",
+                )
+                if (
+                    trusted_host is not None
+                    or runner is not None
+                    or streaming_runner is not None
+                    or tunnel_starter is not None
+                    or core_connection_starter is not None
+                    or any(
+                        not callable(getattr(system_openssh_authority, name, None))
+                        for name in required
+                    )
+                    or profile.host != system_openssh_authority.ssh_host_alias
+                    or profile.user != system_openssh_authority.remote_user
+                ):
+                    raise ValueError("system OpenSSH authority is inconsistent")
+                _validate_remote_identity(profile.user, "user", _REMOTE_USER_RE)
+                system_openssh_authority.verify_authority()
+            except Exception:
+                raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         self._profile = profile
         self._trusted_host = trusted_host
+        self._system_openssh_authority = system_openssh_authority
         self._runner = runner or _run_subprocess
         self._uses_default_runner = runner is None
         self._streaming_runner = streaming_runner or _run_streaming_subprocess
@@ -1300,7 +1369,11 @@ class SshRemoteExecutorTransport:
         self._port_allocator = port_allocator or _allocate_local_port
         self._core_connection_starter = core_connection_starter
         self._subprocess_environment: dict[str, str] = {}
-        self._agent_socket_source = SshAgentSocketSource.from_environment(profile.auth.method)
+        self._agent_socket_source = (
+            SshAgentSocketSource.from_environment(profile.auth.method)
+            if system_openssh_authority is None
+            else None
+        )
         self._closed = False
         self._core_asset_authority_lock = threading.Lock()
         self._core_asset_authorities: dict[
@@ -1376,6 +1449,28 @@ class SshRemoteExecutorTransport:
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         _raise_if_cancelled(cancel_event)
         self._require_open()
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            try:
+                system_authority.verify_authority()
+                argv = argv_factory(Path("/dev/null"))
+                completed = system_authority.run_argv(
+                    argv,
+                    timeout_seconds,
+                    stdin_fd=None,
+                    cancel_event=cancel_event,
+                )
+                system_authority.verify_authority()
+                _raise_if_cancelled(cancel_event)
+                self._require_open()
+                return completed, Path("/dev/null")
+            except _SubprocessCancelled:
+                raise
+            except subprocess.TimeoutExpired:
+                raise
+            except Exception:
+                raise RuntimeError("system OpenSSH follower failed") from None
+        assert self._trusted_host is not None
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
         try:
             known_hosts_file = trust_lease.__enter__()
@@ -1430,6 +1525,28 @@ class SshRemoteExecutorTransport:
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         _raise_if_cancelled(cancel_event)
         self._require_open()
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            try:
+                system_authority.verify_authority()
+                argv = argv_factory(Path("/dev/null"))
+                completed = system_authority.run_argv(
+                    argv,
+                    timeout_seconds,
+                    stdin_fd=stdin_fd,
+                    cancel_event=cancel_event,
+                )
+                system_authority.verify_authority()
+                _raise_if_cancelled(cancel_event)
+                self._require_open()
+                return completed, Path("/dev/null")
+            except _SubprocessCancelled:
+                raise
+            except subprocess.TimeoutExpired:
+                raise
+            except Exception:
+                raise RuntimeError("system OpenSSH follower failed") from None
+        assert self._trusted_host is not None
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
         try:
             known_hosts_file = trust_lease.__enter__()
@@ -1531,11 +1648,12 @@ class SshRemoteExecutorTransport:
         if remote_return_code is not None and int(completed.returncode) != remote_return_code:
             _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
-        stderr = _redact_trust_paths(
-            stderr,
-            known_hosts_file,
-            self._trusted_host.known_hosts_file,
-        )
+        if self._trusted_host is not None:
+            stderr = _redact_trust_paths(
+                stderr,
+                known_hosts_file,
+                self._trusted_host.known_hosts_file,
+            )
         return RemoteCommandResult(
             command=command,
             return_code=(
@@ -1714,11 +1832,12 @@ class SshRemoteExecutorTransport:
             _log_transport_failure(SshTransportErrorCode.CONNECTION_FAILED)
             raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
         if remote_return_code != 0:
-            _redact_trust_paths(
-                stderr,
-                known_hosts_file,
-                self._trusted_host.known_hosts_file,
-            )
+            if self._trusted_host is not None:
+                _redact_trust_paths(
+                    stderr,
+                    known_hosts_file,
+                    self._trusted_host.known_hosts_file,
+                )
             _log_transport_failure(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
             raise SshTransportError(SshTransportErrorCode.DAEMON_BUNDLE_FAILED)
         try:
@@ -2934,6 +3053,11 @@ class SshRemoteExecutorTransport:
         timeout_seconds: float = 10.0,
     ) -> SshTunnel:
         _retry_orphaned_tunnel_cleanup()
+        if self._system_openssh_authority is not None:
+            # The release system-OpenSSH composition permits only the owned
+            # stdio Core channel. Ambient/configured and explicit local
+            # forwards remain cleared.
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         invalid_request = False
         try:
             _validate_port(remote_port, "remote_port")
@@ -2947,6 +3071,7 @@ class SshRemoteExecutorTransport:
         if invalid_request or local_port is None:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         forward_spec = f"{local_host}:{local_port}:{remote_host}:{remote_port}"
+        assert self._trusted_host is not None
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
         try:
             known_hosts_file = trust_lease.__enter__()
@@ -3063,6 +3188,33 @@ class SshRemoteExecutorTransport:
         except Exception:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
 
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            try:
+                system_authority.verify_authority()
+                connection_argv = system_authority.core_tunnel_argv(
+                    remote_port=remote_port
+                )
+                endpoint = _CoreTunnelEndpoint(
+                    connection_starter=system_authority.start_tunnel,
+                    connection_argv=connection_argv,
+                    trust_lease=None,
+                    trusted_host=None,
+                    agent_socket_source=None,
+                    authority_verifier=system_authority.verify_authority,
+                )
+                tunnel = SshCoreTunnel(endpoint)
+                self._register_tunnel(tunnel)
+                if wait_for_ready:
+                    endpoint.verify_authority(timeout_seconds=timeout_seconds)
+                return tunnel
+            except SshTransportError:
+                raise
+            except Exception:
+                _log_transport_failure(SshTransportErrorCode.START_FAILED)
+                raise SshTransportError(SshTransportErrorCode.START_FAILED) from None
+
+        assert self._trusted_host is not None
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
         try:
             known_hosts_file = trust_lease.__enter__()
@@ -3109,6 +3261,9 @@ class SshRemoteExecutorTransport:
         return tunnel
 
     def _ssh_argv(self, remote_command: str, known_hosts_file: Path) -> list[str]:
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            return system_authority.command_argv(remote_command)
         return [
             *self._ssh_base_argv(known_hosts_file),
             "--",
@@ -3117,8 +3272,11 @@ class SshRemoteExecutorTransport:
         ]
 
     def _ssh_base_argv(self, known_hosts_file: Path) -> list[str]:
+        if self._system_openssh_authority is not None:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         profile = self._profile
         trusted_host = self._trusted_host
+        assert trusted_host is not None
         argv = [SSH_EXECUTABLE, "-F", "/dev/null", "-p", str(profile.port)]
         if profile.auth.method == "private_key":
             key_path = Path(str(profile.auth.private_key_path)).expanduser()
@@ -3189,6 +3347,14 @@ class SshRemoteExecutorTransport:
         remote_path: str,
         known_hosts_file: Path,
     ) -> list[str]:
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            return system_authority.rsync_argv(
+                local_path=local,
+                remote_path=remote_path,
+                arguments=("--archive", "--delete"),
+                remote_rsync_path=None,
+            )
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             RSYNC_EXECUTABLE,
@@ -3209,6 +3375,25 @@ class SshRemoteExecutorTransport:
         authority: _CoreAssetTransferAuthority,
     ) -> list[str]:
         _validate_remote_absolute_path(remote_root, "remote_root")
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            return system_authority.rsync_argv(
+                local_path=local_root,
+                remote_path=remote_root,
+                arguments=(
+                    "--recursive",
+                    "--delete",
+                    f"--filter=protect /{CORE_ASSET_TRANSFER_LEASE}",
+                    "--chmod=F600,D700",
+                    "--no-owner",
+                    "--no-group",
+                ),
+                remote_rsync_path=build_core_asset_rsync_path(
+                    service_root=authority.service_root,
+                    bundle_id=authority.bundle_id,
+                    transfer_id=authority.transfer_id,
+                ),
+            )
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             RSYNC_EXECUTABLE,
@@ -3238,6 +3423,26 @@ class SshRemoteExecutorTransport:
         *,
         archive_size: int,
     ) -> list[str]:
+        system_authority = self._system_openssh_authority
+        if system_authority is not None:
+            return system_authority.rsync_argv(
+                local_path=local_root,
+                remote_path=transfer.incoming_root,
+                arguments=(
+                    "--recursive",
+                    "--inplace",
+                    "--delete",
+                    f"--max-size={archive_size}",
+                    f"--filter=protect /{MANAGED_RUNTIME_TRANSFER_LEASE}",
+                    "--chmod=F600,D700",
+                    "--no-owner",
+                    "--no-group",
+                ),
+                remote_rsync_path=build_managed_runtime_rsync_path(
+                    transfer,
+                    archive_size=archive_size,
+                ),
+            )
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             RSYNC_EXECUTABLE,

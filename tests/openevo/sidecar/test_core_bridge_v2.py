@@ -65,6 +65,36 @@ def _create_request(connection_generation: int = 3) -> local_v2.ProjectCreateV2:
     )
 
 
+def _native_create_request(connection_generation: int = 3) -> local_v2.ProjectCreateV2:
+    payload = _config().model_dump(mode="json")
+    payload["workspace"] = {
+        "kind": "native_folder_snapshot",
+        "display_name": "Selected workspace",
+    }
+    return local_v2.ProjectCreateV2(
+        profile_id="profile-1",
+        profile_connection_generation=connection_generation,
+        display_name="Project",
+        config=m.ScienceProjectConfigV2.model_validate(payload),
+    )
+
+
+def _native_project() -> m.ProjectV2:
+    request = _native_create_request()
+    return m.ProjectV2(
+        project_id="project-1",
+        display_name=request.display_name,
+        config=request.config,
+        project_config_sha256=m.project_config_sha256_for(request.config),
+        active_project_head=None,
+        admission_etag=None,
+        state="not_ready",
+        created_at="2026-07-23T06:00:00Z",
+        updated_at="2026-07-23T06:00:00Z",
+        etag='"' + "8" * 64 + '"',
+    )
+
+
 def _submit_request() -> m.TaskSubmitRequestV2:
     project = _project()
     head = project.active_project_head
@@ -248,6 +278,35 @@ def test_activation_bootstraps_only_through_private_project_tunnel_and_persists_
             if request.url.path != "/version"
         )
         assert not hasattr(bridge, "backend_url")
+        bridge.close()
+    assert len(tunnels.closed) == 1
+
+
+def test_activation_accepts_exact_initial_native_workspace_authority(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    remote = _native_project()
+    tunnels = _TunnelFactory()
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=tunnels,
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(
+                _base_handler(requests, project=remote)
+            ),
+        )
+
+        activation = bridge.activate_project(
+            "desktop-project-native",
+            _native_create_request(),
+            idempotency_key="activate-native-workspace-0001",
+        )
+
+        assert activation.project == remote
+        assert activation.mapping.active_project_head is None
+        assert activation.mapping.project_admission_etag is None
         bridge.close()
     assert len(tunnels.closed) == 1
 

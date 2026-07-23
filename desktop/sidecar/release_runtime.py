@@ -12,14 +12,17 @@ import logging
 import os
 from pathlib import Path
 import re
+import secrets
 import stat
 import sys
 import threading
+import time
 from typing import Any, BinaryIO
 
 import httpx
 
 from desktop.sidecar.contracts.v1 import models as local_v1
+from desktop.sidecar.contracts.v2 import models as local_v2
 from desktop.sidecar.core_bridge_adapters_v1 import (
     AdoptedWorkspaceArchiveSourceV1,
     AdoptedWorkspaceImportV1,
@@ -30,26 +33,50 @@ from desktop.sidecar.core_bridge_adapters_v1 import (
     SealedManagedRuntimeArchiveV1,
 )
 from desktop.sidecar.core_bridge_store_v1 import DesktopCoreBridgeStoreV1
+from desktop.sidecar.core_bridge_adapters_v2 import (
+    CoreBootstrapConfigV2,
+    DesktopCoreSshBridgeAdapterV2,
+    SealedCoreBootstrapAssetV2,
+    SealedDaemonBundleV2,
+    SealedManagedRuntimeArchiveV2,
+)
+from desktop.sidecar.core_bridge_store_v2 import DesktopCoreBridgeStoreV2
 from desktop.sidecar.core_bridge_v1 import (
     CoreHostAttachmentV1,
     CoreTunnelHandleV1,
     DesktopCoreBridgeErrorV1,
     DesktopCoreBridgeV1,
 )
+from desktop.sidecar.core_bridge_v2 import (
+    CoreHostAttachmentV2,
+    CoreTunnelHandleV2,
+    DesktopCoreBridgeErrorV2,
+    DesktopCoreBridgeV2,
+)
+from desktop.sidecar.core_client_v2 import (
+    CoreBootstrapTunnelConnectionV2,
+    CoreClientErrorV2,
+    CoreProjectBootstrapClientV2,
+)
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
+from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.legacy_v1_import import (
     LegacyV1ImportReport,
     import_legacy_v1_state,
 )
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
 from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
-from desktop.sidecar.remote_lifecycle import DesktopRemoteLifecycle
+from desktop.sidecar.remote_lifecycle import (
+    DesktopRemoteLifecycle,
+    SystemOpenSshRemoteLifecycleV2,
+)
 from desktop.sidecar.workspace_identity import ownership_for_native_import
 from desktop.sidecar.workspace_imports import (
     WorkspaceImportNotFoundError,
     WorkspaceImportStore,
 )
 from openevo.backend.contracts.v1 import models as core_v1
+from openevo.backend.contracts.v2 import models as core_v2
 from openevo.deployment.core_assets import MAX_CORE_WHEEL_BYTES, MAX_FRAMEWORK_LOCK_BYTES
 from openevo.runtime.managed import (
     MANAGED_RUNTIME_ARCHIVE_RELEASE,
@@ -159,6 +186,217 @@ class _DeferredCoreSshBridgeAdapterV1:
             adapter = DesktopCoreSshBridgeAdapterV1(self._lifecycle, bootstrap)
             self._adapter = adapter
             return adapter
+
+
+class _DeferredCoreSshBridgeAdapterV2:
+    """Verify packaged v2 bootstrap assets only when a profile connects."""
+
+    def __init__(
+        self,
+        lifecycle: SystemOpenSshRemoteLifecycleV2,
+        bootstrap_loader: Callable[[], CoreBootstrapConfigV2],
+    ) -> None:
+        if not callable(getattr(lifecycle, "active_transport", None)):
+            raise TypeError("v2 lifecycle lacks a generation-bound transport")
+        if not callable(bootstrap_loader):
+            raise TypeError("v2 bootstrap loader must be callable")
+        self._lifecycle = lifecycle
+        self._bootstrap_loader = bootstrap_loader
+        self._lock = threading.Lock()
+        self._adapter: DesktopCoreSshBridgeAdapterV2 | None = None
+
+    def ensure_core(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        *,
+        deadline: float,
+    ) -> CoreHostAttachmentV2:
+        return self._resolve().ensure_core(
+            profile_id,
+            profile_connection_generation,
+            deadline=deadline,
+        )
+
+    def open_tunnel(
+        self,
+        *,
+        profile_id: str,
+        profile_connection_generation: int,
+        remote_port: int,
+        session_id: str,
+        deadline: float,
+    ) -> CoreTunnelHandleV2:
+        return self._resolve().open_tunnel(
+            profile_id=profile_id,
+            profile_connection_generation=profile_connection_generation,
+            remote_port=remote_port,
+            session_id=session_id,
+            deadline=deadline,
+        )
+
+    def new_http_transport(self) -> httpx.BaseTransport:
+        return self._resolve().new_http_transport()
+
+    def _resolve(self) -> DesktopCoreSshBridgeAdapterV2:
+        with self._lock:
+            if self._adapter is not None:
+                return self._adapter
+            try:
+                bootstrap = self._bootstrap_loader()
+            except (OSError, ReleaseRuntimeConfigurationError, TypeError, ValueError):
+                raise DesktopCoreBridgeErrorV2(
+                    503,
+                    local_v2.DesktopErrorV2(
+                        code="release_assets_initialization_failed",
+                        summary=(
+                            "OpenEvo Desktop could not verify its remote release assets."
+                        ),
+                        retryable=True,
+                        action="install_repair_daemon",
+                        affected_resource_id=None,
+                    ),
+                ) from None
+            adapter = DesktopCoreSshBridgeAdapterV2(self._lifecycle, bootstrap)
+            self._adapter = adapter
+            return adapter
+
+
+class DesktopCoreProfileConnectorV2:
+    """Negotiate one temporary verified Daemon tunnel before profile publication."""
+
+    def __init__(
+        self,
+        adapter: _DeferredCoreSshBridgeAdapterV2 | DesktopCoreSshBridgeAdapterV2,
+        *,
+        timeout_seconds: float = 300.0,
+    ) -> None:
+        if any(
+            not callable(getattr(adapter, method, None))
+            for method in ("ensure_core", "open_tunnel", "new_http_transport")
+        ):
+            raise TypeError("Core v2 profile connector adapter is invalid")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or not 0 < timeout_seconds <= 900.0
+        ):
+            raise ValueError("Core v2 profile connector timeout is invalid")
+        self._adapter = adapter
+        self._timeout_seconds = float(timeout_seconds)
+        self._transition = threading.Lock()
+        self._closed = False
+
+    def connect_profile(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+    ) -> core_v2.VersionResponseV2:
+        with self._transition:
+            if self._closed:
+                raise _runtime_v2_error(
+                    "core_connector_closed",
+                    "The OpenEvo Daemon connector is closed.",
+                    action="reconnect",
+                )
+            deadline = time.monotonic() + self._timeout_seconds
+            tunnel: CoreTunnelHandleV2 | None = None
+            client: CoreProjectBootstrapClientV2 | None = None
+            primary: BaseException | None = None
+            try:
+                attachment = self._adapter.ensure_core(
+                    profile_id,
+                    profile_connection_generation,
+                    deadline=deadline,
+                )
+                session_id = f"core-profile-{secrets.token_hex(20)}"
+                tunnel = self._adapter.open_tunnel(
+                    profile_id=profile_id,
+                    profile_connection_generation=profile_connection_generation,
+                    remote_port=attachment.remote_port,
+                    session_id=session_id,
+                    deadline=deadline,
+                )
+                connection = CoreBootstrapTunnelConnectionV2(
+                    endpoint=tunnel.endpoint,
+                    bearer_token=attachment.bearer_token,
+                    profile_id=profile_id,
+                    profile_connection_generation=profile_connection_generation,
+                    session_id=session_id,
+                )
+                client = CoreProjectBootstrapClientV2(
+                    connection,
+                    transport=self._adapter.new_http_transport(),
+                    timeout=min(60.0, max(0.001, deadline - time.monotonic())),
+                )
+                version = client.version()
+                health = client.health()
+                status = client.system_status()
+                if health.status != "healthy" or status.status != "ready":
+                    raise _runtime_v2_error(
+                        "core_not_ready",
+                        "The OpenEvo Daemon is not ready for project operations.",
+                        retryable=True,
+                        action="install_repair_daemon",
+                        affected_resource_id=profile_id,
+                    )
+                return version
+            except (DesktopCoreBridgeErrorV2, CoreClientErrorV2) as exc:
+                primary = exc
+                if isinstance(exc, DesktopCoreBridgeErrorV2):
+                    raise
+                raise _runtime_v2_error(
+                    "core_negotiation_failed",
+                    "Desktop could not negotiate the OpenEvo Daemon.",
+                    retryable=True,
+                    action="install_repair_daemon",
+                    affected_resource_id=profile_id,
+                ) from None
+            except BaseException as exc:
+                primary = exc
+                raise
+            finally:
+                cleanup_failure: BaseException | None = None
+                if client is not None:
+                    cleanup_failure = _collect_cleanup_failure(
+                        client.close,
+                        cleanup_failure,
+                    )
+                if tunnel is not None:
+                    close_deadline = max(
+                        time.monotonic() + 0.001,
+                        min(deadline, time.monotonic() + 5.0),
+                    )
+                    cleanup_failure = _collect_cleanup_failure(
+                        lambda: tunnel.close(deadline=close_deadline),
+                        cleanup_failure,
+                    )
+                if primary is None and cleanup_failure is not None:
+                    raise cleanup_failure
+
+    def close(self) -> None:
+        with self._transition:
+            self._closed = True
+
+
+def _runtime_v2_error(
+    code: str,
+    summary: str,
+    *,
+    retryable: bool = False,
+    action: local_v2.DesktopActionV2,
+    affected_resource_id: str | None = None,
+) -> DesktopCoreBridgeErrorV2:
+    return DesktopCoreBridgeErrorV2(
+        503,
+        local_v2.DesktopErrorV2(
+            code=code,
+            summary=summary,
+            retryable=retryable,
+            action=action,
+            affected_resource_id=affected_resource_id,
+        ),
+    )
 
 
 def _collect_cleanup_failure(
@@ -510,6 +748,38 @@ class DesktopReleaseCoreRuntimeV1:
                 raise failure
 
 
+class DesktopReleaseCoreRuntimeV2:
+    """Own the strict v2 bridge, profile connector, broker, and mapping store."""
+
+    def __init__(
+        self,
+        *,
+        bridge: DesktopCoreBridgeV2,
+        connector: DesktopCoreProfileConnectorV2,
+        event_broker: DesktopEventBrokerV2,
+        bridge_store: DesktopCoreBridgeStoreV2,
+        managed_runtime_available: bool,
+    ) -> None:
+        self.core_bridge = bridge
+        self.core_connector = connector
+        self.event_broker = event_broker
+        self.bridge_store = bridge_store
+        self.managed_runtime_available = managed_runtime_available
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        failure = _collect_cleanup_failure(self.core_bridge.close, None)
+        failure = _collect_cleanup_failure(self.core_connector.close, failure)
+        failure = _collect_cleanup_failure(self.event_broker.close, failure)
+        failure = _collect_cleanup_failure(self.bridge_store.close, failure)
+        if failure is not None:
+            raise failure
+
 def _load_release_assets_manifest(
     asset_root: Path | str,
     *,
@@ -839,6 +1109,74 @@ def load_core_bootstrap_config(
         os.close(root_fd)
 
 
+def load_core_bootstrap_config_v2(
+    asset_root: Path | str,
+    *,
+    release_assets_root: Path | str | None = None,
+    daemon_asset_root: Path | str | None = None,
+    runtime_asset_root: Path | str | None = None,
+    source_commit: str,
+    packaged_resource_assets: bool = False,
+) -> CoreBootstrapConfigV2:
+    """Reuse the sealed asset verifier while issuing only exact v2 identities."""
+
+    legacy = load_core_bootstrap_config(
+        asset_root,
+        release_assets_root=release_assets_root,
+        daemon_asset_root=daemon_asset_root,
+        runtime_asset_root=runtime_asset_root,
+        source_commit=source_commit,
+        packaged_resource_assets=packaged_resource_assets,
+    )
+    wheel = SealedCoreBootstrapAssetV2(
+        local_path=legacy.wheel.local_path,
+        sha256=legacy.wheel.sha256,
+        byte_size=legacy.wheel.byte_size,
+    )
+    framework_lock = SealedCoreBootstrapAssetV2(
+        local_path=legacy.framework_lock.local_path,
+        sha256=legacy.framework_lock.sha256,
+        byte_size=legacy.framework_lock.byte_size,
+    )
+    daemon = legacy.daemon_bundle
+    runtime = legacy.managed_runtime_archive
+    return CoreBootstrapConfigV2(
+        source_commit=legacy.source_commit,
+        wheel=wheel,
+        framework_lock=framework_lock,
+        daemon_bundle=(
+            None
+            if daemon is None
+            else SealedDaemonBundleV2(
+                local_path=daemon.local_path,
+                sha256=daemon.sha256,
+                byte_size=daemon.byte_size,
+                manifest_sha256=daemon.manifest_sha256,
+                release_identity=daemon.release_identity,
+                registry_digest=daemon.registry_digest,
+                source_commit=daemon.source_commit,
+                wheel_sha256=daemon.wheel_sha256,
+                dependency_lock_sha256=daemon.dependency_lock_sha256,
+                framework_lock_sha256=daemon.framework_lock_sha256,
+            )
+        ),
+        managed_runtime_archive=(
+            None
+            if runtime is None
+            else SealedManagedRuntimeArchiveV2(
+                local_path=runtime.local_path,
+                sha256=runtime.sha256,
+                byte_size=runtime.byte_size,
+                platform=runtime.platform,
+                config_id=runtime.config_id,
+                oci_index_id=runtime.oci_index_id,
+            )
+        ),
+        remote_port=legacy.remote_port,
+        replace_mismatched=legacy.replace_mismatched,
+    )
+
+
 def create_release_core_runtime(
     *,
     provider_store: DesktopProviderStore,
@@ -898,6 +1236,82 @@ def create_release_core_runtime(
     except BaseException:
         if bridge is not None:
             _cleanup_after_primary_failure(bridge.close)
+        if broker is not None:
+            _cleanup_after_primary_failure(broker.close)
+        _cleanup_after_primary_failure(bridge_store.close)
+        raise
+
+
+def create_release_core_runtime_v2(
+    *,
+    provider_store: DesktopProviderStoreV2,
+    remote_lifecycle: SystemOpenSshRemoteLifecycleV2,
+    asset_root: Path | str,
+    source_commit: str,
+    release_assets_root: Path | str | None = None,
+    daemon_asset_root: Path | str | None = None,
+    runtime_asset_root: Path | str | None = None,
+    packaged_resource_assets: bool = False,
+    startup_phase: Callable[[str], None] | None = None,
+) -> DesktopReleaseCoreRuntimeV2:
+    """Compose the v0.1.9 Core-only business authority."""
+
+    if type(provider_store) is not DesktopProviderStoreV2:
+        raise TypeError("v2 Core runtime requires the exact provider store")
+    if not callable(getattr(remote_lifecycle, "active_transport", None)):
+        raise TypeError("v2 Core runtime requires generation-bound system OpenSSH")
+    if startup_phase is not None:
+        startup_phase("core_bridge_store_v2")
+    bridge_store = DesktopCoreBridgeStoreV2(
+        provider_store.state_root / "core-bridge-v2"
+    )
+    broker: DesktopEventBrokerV2 | None = None
+    connector: DesktopCoreProfileConnectorV2 | None = None
+    bridge: DesktopCoreBridgeV2 | None = None
+    try:
+        if startup_phase is not None:
+            startup_phase("event_broker_v2")
+        broker = DesktopEventBrokerV2()
+        if startup_phase is not None:
+            startup_phase("core_adapter_v2")
+        adapter = _DeferredCoreSshBridgeAdapterV2(
+            remote_lifecycle,
+            lambda: load_core_bootstrap_config_v2(
+                asset_root,
+                release_assets_root=release_assets_root,
+                daemon_asset_root=daemon_asset_root,
+                runtime_asset_root=runtime_asset_root,
+                source_commit=source_commit,
+                packaged_resource_assets=packaged_resource_assets,
+            ),
+        )
+        connector = DesktopCoreProfileConnectorV2(adapter)
+        if startup_phase is not None:
+            startup_phase("core_bridge_v2")
+        bridge = DesktopCoreBridgeV2(
+            host_service=adapter,
+            tunnel_factory=adapter,
+            persistence=bridge_store,
+            transport_factory=adapter.new_http_transport,
+            event_publisher=broker,
+            activation_timeout=_RELEASE_ACTIVATION_TIMEOUT_SECONDS,
+        )
+        if startup_phase is not None:
+            startup_phase("core_runtime_v2")
+        return DesktopReleaseCoreRuntimeV2(
+            bridge=bridge,
+            connector=connector,
+            event_broker=broker,
+            bridge_store=bridge_store,
+            managed_runtime_available=(
+                runtime_asset_root is not None or packaged_resource_assets
+            ),
+        )
+    except BaseException:
+        if bridge is not None:
+            _cleanup_after_primary_failure(bridge.close)
+        if connector is not None:
+            _cleanup_after_primary_failure(connector.close)
         if broker is not None:
             _cleanup_after_primary_failure(broker.close)
         _cleanup_after_primary_failure(bridge_store.close)
@@ -1293,11 +1707,15 @@ def _validate_framework_lock(
 
 __all__ = (
     "CoreRuntimeSessionBinding",
+    "DesktopCoreProfileConnectorV2",
     "DesktopReleaseCoreRuntimeV1",
+    "DesktopReleaseCoreRuntimeV2",
     "ProviderWorkspaceArchiveSourceV1",
     "ReleaseLocalStateV2",
     "ReleaseRuntimeConfigurationError",
     "create_release_core_runtime",
+    "create_release_core_runtime_v2",
     "create_release_local_state_v2",
     "load_core_bootstrap_config",
+    "load_core_bootstrap_config_v2",
 )

@@ -3,19 +3,36 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
+import re
 import time
 from typing import Literal, Protocol
 
 from desktop.sidecar.contracts.v1.models import HostKeyAcceptV1, RemoteProfileV1
+from desktop.sidecar.contracts.v2 import models as local_v2
+from desktop.sidecar.askpass_broker import AskpassPromptObservation
+from desktop.sidecar.system_ssh_session import (
+    AskpassHelperAuthority,
+    SystemOpenSshFollowerTransportAuthority,
+    SystemOpenSshHostTrust,
+    SystemOpenSshSession,
+    SystemOpenSshSessionError,
+    SystemOpenSshSessionOwner,
+)
 from openevo.deployment.host_keys import (
     HostKeyCandidate,
     HostKeyAlgorithm,
+    PendingSystemHostKeyReview,
     PendingHostKeyProbe,
     ProviderKnownHostStore,
     TrustedKnownHostsBinding,
 )
 from openevo.deployment.preflight import RemoteCommandResult
-from openevo.deployment.profile import ProxySettings, RemoteProfileConfig, SSHAuthConfig
+from openevo.deployment.profile import (
+    ProxySettings,
+    RemoteProfileConfig,
+    SSHAuthConfig,
+    SystemOpenSshAliasProfile,
+)
 from openevo.deployment.ssh import SshRemoteExecutorTransport
 
 
@@ -452,6 +469,376 @@ class DesktopRemoteLifecycle:
                 pass
 
 
+class _SystemSessionOwnerV2(Protocol):
+    def connect(
+        self,
+        profile: SystemOpenSshAliasProfile,
+        *,
+        connection_generation: int,
+        prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
+    ) -> object: ...
+
+    def active_session(self) -> SystemOpenSshSession: ...
+
+    def disconnect(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
+class _SystemHostTrustV2(Protocol):
+    def replace_changed_key(
+        self,
+        review: PendingSystemHostKeyReview,
+        *,
+        profile: SystemOpenSshAliasProfile,
+        connection_generation: int,
+        review_id: str,
+        review_sha256: str,
+        timeout_seconds: float = 5.0,
+    ) -> None: ...
+
+    def close(self) -> None: ...
+
+
+SystemTransportFactoryV2 = Callable[[RemoteProfileConfig, object, str], _RemoteTransport]
+SystemPromptObserverV2 = Callable[[str, AskpassPromptObservation], None]
+_SYSTEM_REMOTE_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]{0,127}\Z", re.ASCII)
+
+
+@dataclass(slots=True)
+class _ActiveSystemRemoteV2:
+    profile_id: str
+    connection_generation: int
+    transport: _RemoteTransport
+
+
+def _system_transport_factory_v2(
+    config: RemoteProfileConfig,
+    session: object,
+    remote_user: str,
+) -> _RemoteTransport:
+    if type(session) is not SystemOpenSshSession:
+        raise TypeError("system OpenSSH lifecycle requires an exact owned session")
+    authority = SystemOpenSshFollowerTransportAuthority(
+        session,
+        remote_user=remote_user,
+    )
+    return SshRemoteExecutorTransport(
+        config,
+        system_openssh_authority=authority,
+    )
+
+
+class SystemOpenSshRemoteLifecycleV2:
+    """Own one generation-bound rich transport behind a literal SSH alias."""
+
+    def __init__(
+        self,
+        session_owner: SystemOpenSshSessionOwner,
+        host_trust: SystemOpenSshHostTrust,
+        *,
+        transport_factory: SystemTransportFactoryV2 = _system_transport_factory_v2,
+        discovery_timeout_seconds: float = 30.0,
+        owned_askpass_helper: AskpassHelperAuthority | None = None,
+    ) -> None:
+        if any(
+            not callable(getattr(session_owner, method, None))
+            for method in ("connect", "active_session", "disconnect", "close")
+        ):
+            raise TypeError("system OpenSSH session owner is invalid")
+        if any(
+            not callable(getattr(host_trust, method, None))
+            for method in ("replace_changed_key", "close")
+        ):
+            raise TypeError("system OpenSSH host trust authority is invalid")
+        if not callable(transport_factory):
+            raise TypeError("system OpenSSH transport factory is invalid")
+        if owned_askpass_helper is not None and type(owned_askpass_helper) is not AskpassHelperAuthority:
+            raise TypeError("owned system OpenSSH askpass helper is invalid")
+        if (
+            isinstance(discovery_timeout_seconds, bool)
+            or not isinstance(discovery_timeout_seconds, (int, float))
+            or not 0 < discovery_timeout_seconds <= 30.0
+        ):
+            raise ValueError("system OpenSSH user discovery timeout is invalid")
+        self._session_owner: _SystemSessionOwnerV2 = session_owner
+        self._host_trust: _SystemHostTrustV2 = host_trust
+        self._owned_askpass_helper = owned_askpass_helper
+        self._transport_factory = transport_factory
+        self._discovery_timeout_seconds = float(discovery_timeout_seconds)
+        self._transition = Lock()
+        self._state = Lock()
+        self._active: _ActiveSystemRemoteV2 | None = None
+        self._pending_reviews: dict[str, PendingSystemHostKeyReview] = {}
+        self._prompt_observer: SystemPromptObserverV2 | None = None
+        self._closed = False
+
+    def set_prompt_observer(self, observer: SystemPromptObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("system OpenSSH prompt observer is invalid")
+        with self._state:
+            if self._closed or self._active is not None or self._prompt_observer is not None:
+                raise RemoteConnectionFailedError(
+                    "The system SSH prompt observer cannot be changed."
+                )
+            self._prompt_observer = observer
+
+    def connect(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
+        self._validate_connect_profile(profile)
+        with self._transition:
+            self._require_open()
+            self._close_active()
+            self._connect_locked(profile)
+
+    def active_transport(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+    ) -> _RemoteTransport:
+        with self._state:
+            active = self._active
+            if (
+                self._closed
+                or active is None
+                or active.profile_id != profile_id
+                or active.connection_generation != profile_connection_generation
+            ):
+                raise RemoteConnectionFailedError(
+                    "The requested remote profile is not connected."
+                )
+            return active.transport
+
+    def disconnect(self, profile_id: str, connection_generation: int) -> None:
+        with self._transition:
+            self._require_open()
+            with self._state:
+                active = self._active
+                if (
+                    active is None
+                    or active.profile_id != profile_id
+                    or active.connection_generation + 1 != connection_generation
+                ):
+                    raise RemoteConnectionFailedError(
+                        "The requested remote profile is not connected."
+                    )
+            self._close_active()
+            self._pending_reviews.pop(profile_id, None)
+
+    def review_host_key(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        request: local_v2.HostKeyReviewRequestV2,
+    ) -> Literal["connected", "rejected"]:
+        self._validate_connect_profile(profile)
+        if type(request) is not local_v2.HostKeyReviewRequestV2:
+            raise TypeError("host-key review request has the wrong type")
+        with self._transition:
+            self._require_open()
+            pending = self._pending_reviews.get(profile.profile_id)
+            if (
+                pending is None
+                or pending.profile_id != profile.profile_id
+                or pending.connection_generation != request.expected_connection_generation
+                or profile.connection_generation != pending.connection_generation + 1
+                or pending.review_id != request.review_id
+                or pending.review_sha256 != request.review_sha256
+            ):
+                raise RemoteConnectionFailedError(
+                    "The pending SSH host key is no longer current."
+                )
+            if request.action == "reject":
+                self._pending_reviews.pop(profile.profile_id, None)
+                self._close_active()
+                return "rejected"
+            if request.action != "replace_changed_key":
+                raise RemoteConnectionFailedError(
+                    "First-use trust is handled by the native system SSH prompt."
+                )
+            alias = self._alias_profile(profile)
+            try:
+                self._host_trust.replace_changed_key(
+                    pending,
+                    profile=alias,
+                    connection_generation=pending.connection_generation,
+                    review_id=request.review_id,
+                    review_sha256=request.review_sha256,
+                )
+            except SystemOpenSshSessionError:
+                raise
+            except Exception:
+                raise RemoteConnectionFailedError(
+                    "The SSH host key could not be confirmed."
+                ) from None
+            self._pending_reviews.pop(profile.profile_id, None)
+            self._connect_locked(profile)
+            return "connected"
+
+    def close(self) -> None:
+        with self._transition:
+            with self._state:
+                if self._closed:
+                    return
+                self._closed = True
+            failure: BaseException | None = None
+            try:
+                self._close_active()
+            except BaseException as exc:
+                failure = exc
+            self._pending_reviews.clear()
+            cleanups = [self._session_owner.close, self._host_trust.close]
+            if self._owned_askpass_helper is not None:
+                cleanups.append(self._owned_askpass_helper.close)
+            for close in cleanups:
+                try:
+                    close()
+                except BaseException as exc:
+                    if failure is None:
+                        failure = exc
+            if failure is not None:
+                raise failure
+
+    def _connect_locked(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
+        alias = self._alias_profile(profile)
+        transport: _RemoteTransport | None = None
+        try:
+            with self._state:
+                observer = self._prompt_observer
+
+            def observe_prompt(observation: AskpassPromptObservation) -> None:
+                if (
+                    observer is not None
+                    and observation.connection_generation
+                    == profile.connection_generation
+                ):
+                    observer(profile.profile_id, observation)
+
+            self._session_owner.connect(
+                alias,
+                connection_generation=profile.connection_generation,
+                prompt_observer=observe_prompt if observer is not None else None,
+            )
+            session = self._session_owner.active_session()
+            result = session.run(
+                "id -un",
+                timeout_seconds=self._discovery_timeout_seconds,
+            )
+            remote_user = self._remote_user(result)
+            config = RemoteProfileConfig(
+                id=profile.profile_id,
+                name=profile.display_name,
+                host=profile.ssh_host_alias,
+                port=22,
+                user=remote_user,
+                auth=SSHAuthConfig(method="ssh_agent"),
+            )
+            transport = self._transport_factory(config, session, remote_user)
+            if not callable(getattr(transport, "run", None)) or not callable(
+                getattr(transport, "close", None)
+            ):
+                raise TypeError("system OpenSSH rich transport is invalid")
+            with self._state:
+                if self._closed:
+                    raise RemoteConnectionFailedError(
+                        "The requested remote profile is not connected."
+                    )
+                self._active = _ActiveSystemRemoteV2(
+                    profile_id=profile.profile_id,
+                    connection_generation=profile.connection_generation,
+                    transport=transport,
+                )
+        except SystemOpenSshSessionError as exc:
+            review = exc.host_key_review
+            if review is not None:
+                if (
+                    review.profile_id != profile.profile_id
+                    or review.connection_generation != profile.connection_generation
+                ):
+                    raise RemoteConnectionFailedError(
+                        "The pending SSH host key is no longer current."
+                    ) from None
+                self._pending_reviews[profile.profile_id] = review
+            self._cleanup_failed_connect(transport)
+            raise
+        except RemoteLifecycleError:
+            self._cleanup_failed_connect(transport)
+            raise
+        except Exception:
+            self._cleanup_failed_connect(transport)
+            raise RemoteConnectionFailedError(
+                "The SSH connection could not be established."
+            ) from None
+
+    def _cleanup_failed_connect(self, transport: _RemoteTransport | None) -> None:
+        if transport is not None:
+            self._close_transport(transport)
+        try:
+            self._session_owner.disconnect()
+        except Exception:
+            pass
+        with self._state:
+            self._active = None
+
+    def _close_active(self) -> None:
+        with self._state:
+            active, self._active = self._active, None
+        failure: BaseException | None = None
+        if active is not None:
+            try:
+                self._close_transport(active.transport)
+            except BaseException as exc:
+                failure = exc
+        if active is not None:
+            try:
+                self._session_owner.disconnect()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
+
+    @staticmethod
+    def _close_transport(transport: _RemoteTransport) -> None:
+        transport.close()
+
+    @staticmethod
+    def _remote_user(result: RemoteCommandResult) -> str:
+        if not result.ok or type(result.stdout) is not str:
+            raise RemoteConnectionFailedError(
+                "The SSH remote user could not be discovered."
+            )
+        lines = result.stdout.splitlines()
+        if len(lines) != 1 or _SYSTEM_REMOTE_USER.fullmatch(lines[0]) is None:
+            raise RemoteConnectionFailedError(
+                "The SSH remote user could not be discovered."
+            )
+        return lines[0]
+
+    @staticmethod
+    def _alias_profile(
+        profile: local_v2.RemoteWorkspaceProfileV2,
+    ) -> SystemOpenSshAliasProfile:
+        return SystemOpenSshAliasProfile(
+            profile_id=profile.profile_id,
+            ssh_host_alias=profile.ssh_host_alias,
+        )
+
+    @staticmethod
+    def _validate_connect_profile(profile: local_v2.RemoteWorkspaceProfileV2) -> None:
+        if type(profile) is not local_v2.RemoteWorkspaceProfileV2 or profile.connection_state not in {
+            "connecting",
+            "bootstrapping",
+            "negotiating",
+        }:
+            raise TypeError("system OpenSSH lifecycle profile is invalid")
+
+    def _require_open(self) -> None:
+        with self._state:
+            if self._closed:
+                raise RemoteConnectionFailedError(
+                    "The requested remote profile is not connected."
+                )
+
+
 __all__ = (
     "DesktopRemoteLifecycle",
     "RemoteConnectionFailedError",
@@ -459,6 +846,7 @@ __all__ = (
     "RemoteCredentialUnavailableError",
     "RemoteLifecycleSnapshot",
     "RemoteLifecycleSupersededError",
+    "SystemOpenSshRemoteLifecycleV2",
     "remote_profile_config",
     "ssh_agent_auth_for_release",
 )

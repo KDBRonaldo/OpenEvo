@@ -12,6 +12,7 @@ import socket
 import subprocess
 import struct
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -92,6 +93,12 @@ def _allow_test_python_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
         return production_prepare(argv)
 
     monkeypatch.setattr(ssh_module, "_prepare_verified_spawn", prepare)
+
+
+@pytest.fixture
+def short_socket_tmp_path() -> Path:
+    with tempfile.TemporaryDirectory(prefix="oe-st-", dir="/tmp") as directory:
+        yield Path(directory)
 
 
 class FailSecondCallRunner(RecordingRunner):
@@ -180,6 +187,65 @@ class FakeTunnelProcess:
         self.return_code = return_code
 
 
+class RecordingSystemOpenSshAuthority:
+    ssh_host_alias = "gpu-lab"
+    remote_user = "alice"
+
+    def __init__(self) -> None:
+        self.commands: list[str] = []
+        self.runs: list[tuple[list[str], int | None]] = []
+        self.tunnels: list[tuple[list[str], int]] = []
+        self.streams: list[socket.socket] = []
+
+    def command_argv(self, remote_command: str) -> list[str]:
+        self.commands.append(remote_command)
+        return ["/usr/bin/ssh", "-S", "/private/tmp/owned-master", "--", "gpu-lab", remote_command]
+
+    def rsync_argv(
+        self,
+        *,
+        local_path: Path,
+        remote_path: str,
+        arguments: tuple[str, ...],
+        remote_rsync_path: str | None,
+    ) -> list[str]:
+        del local_path, remote_path, arguments, remote_rsync_path
+        return ["/usr/bin/rsync", "--version"]
+
+    def core_tunnel_argv(self, *, remote_port: int) -> list[str]:
+        return [
+            "/usr/bin/ssh",
+            "-S",
+            "/private/tmp/owned-master",
+            "-W",
+            f"127.0.0.1:{remote_port}",
+            "--",
+            "gpu-lab",
+        ]
+
+    def run_argv(
+        self,
+        argv: list[str],
+        timeout_seconds: float,
+        *,
+        stdin_fd: int | None,
+        cancel_event: threading.Event | None,
+    ) -> subprocess.CompletedProcess[str]:
+        del timeout_seconds, cancel_event
+        self.runs.append((argv, stdin_fd))
+        marker = re.search(r"(__OPENEVO_REMOTE_COMPLETION_[0-9a-f]+__=)", argv[-1])
+        stderr = "" if marker is None else f"{marker.group(1)}0\n"
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr=stderr)
+
+    def start_tunnel(self, argv: list[str], stream_fd: int) -> FakeTunnelProcess:
+        self.tunnels.append((argv, stream_fd))
+        self.streams.append(socket.socket(fileno=os.dup(stream_fd)))
+        return FakeTunnelProcess()
+
+    def verify_authority(self) -> None:
+        return None
+
+
 def _profile(**extra) -> RemoteProfileConfig:
     payload = {
         "version": 1,
@@ -190,6 +256,35 @@ def _profile(**extra) -> RemoteProfileConfig:
     }
     payload.update(extra)
     return RemoteProfileConfig.model_validate(payload)
+
+
+def test_system_openssh_authority_drives_commands_and_owned_core_tunnel() -> None:
+    authority = RecordingSystemOpenSshAuthority()
+    profile = _profile(host="gpu-lab", port=22, user="alice")
+    transport = SshRemoteExecutorTransport(
+        profile,
+        system_openssh_authority=authority,
+    )
+
+    result = transport.run("true")
+    tunnel = transport.open_core_tunnel(remote_port=8765)
+    stream = tunnel.open_verified_socket(timeout_seconds=1.0)
+    stream.close()
+    tunnel.close()
+    for child_stream in authority.streams:
+        child_stream.close()
+
+    assert result.ok
+    assert authority.commands and "\ntrue\n" in authority.commands[0]
+    assert authority.runs[0][0][0:3] == [
+        "/usr/bin/ssh",
+        "-S",
+        "/private/tmp/owned-master",
+    ]
+    assert authority.tunnels[0][0] == authority.core_tunnel_argv(remote_port=8765)
+    assert "-F" not in authority.tunnels[0][0]
+    assert "-W" in authority.tunnels[0][0]
+    transport.close()
 
 
 def _trusted_binding(
@@ -2452,10 +2547,11 @@ def test_source_birth_launcher_uses_platform_bound_execution_target() -> None:
 
 
 def test_owned_ssh_spawn_exposes_only_private_agent_proxy_and_cleans_it(
-    tmp_path: Path,
+    short_socket_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    tmp_path = short_socket_tmp_path
     upstream_path = tmp_path / "upstream-agent.sock"
     upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     upstream.bind(str(upstream_path))
@@ -2503,10 +2599,11 @@ def test_owned_ssh_spawn_exposes_only_private_agent_proxy_and_cleans_it(
 
 
 def test_upstream_agent_replacement_during_spawn_never_starts_forwarding(
-    tmp_path: Path,
+    short_socket_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    tmp_path = short_socket_tmp_path
     upstream_path = tmp_path / "upstream-agent.sock"
     upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -2564,10 +2661,11 @@ def test_upstream_agent_replacement_during_spawn_never_starts_forwarding(
 
 @pytest.mark.parametrize("failure", [OSError("spawn failed"), KeyboardInterrupt()])
 def test_agent_proxy_is_closed_when_spawn_fails_or_is_cancelled(
-    tmp_path: Path,
+    short_socket_tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     failure: BaseException,
 ) -> None:
+    tmp_path = short_socket_tmp_path
     upstream_path = tmp_path / "upstream-agent.sock"
     upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     upstream.bind(str(upstream_path))

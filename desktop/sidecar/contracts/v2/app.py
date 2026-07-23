@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from functools import wraps
 from typing import Annotated, Protocol
 
@@ -176,10 +176,12 @@ def _catalog_error(
 
 def create_desktop_local_v2_contract_app(
     provider: DesktopLocalApiProviderV2 | None = None,
+    *,
+    _app_factory: Callable[..., FastAPI] = FastAPI,
 ) -> FastAPI:
     """Build the Local API v2 schema source with no business implementation."""
 
-    app = FastAPI(
+    app = _app_factory(
         title="OpenEvo Desktop Local API v2 Contract (Schema Only)",
         summary="Strict renderer-to-sidecar system-OpenSSH and Core projection contract.",
         description=(

@@ -274,6 +274,27 @@ class DesktopCoreBridgeStoreV2:
                 return None
             return self._mapping_from_sized_row(connection, "mappings", row)
 
+    def load_mapping_by_core_project_id(
+        self,
+        core_project_id: str,
+    ) -> CoreProjectMappingV2 | None:
+        """Resolve a renderer-visible Core project to its private Desktop identity."""
+
+        _validate_id(core_project_id)
+        with self._transaction(write=False) as connection:
+            row = connection.execute(
+                """
+                SELECT desktop_project_id, profile_id, core_project_id,
+                       mapping_generation, document_sha256,
+                       length(CAST(document_json AS BLOB)) AS document_size
+                FROM mappings WHERE core_project_id = ?
+                """,
+                (core_project_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._mapping_from_sized_row(connection, "mappings", row)
+
     def load_mapping_history(self, desktop_project_id: str) -> tuple[CoreProjectMappingV2, ...]:
         _validate_id(desktop_project_id)
         with self._transaction(write=False) as connection:

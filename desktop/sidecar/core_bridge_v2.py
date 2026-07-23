@@ -888,6 +888,21 @@ class DesktopCoreBridgeV2:
         self._refresh_mapping(session, project=project)
         return project
 
+    def list_projects(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+        *,
+        limit: int = 50,
+        after: str | None = None,
+    ) -> core_v2.ProjectPageV2:
+        session = self._session(desktop_project_id, profile_connection_generation)
+        return self._session_core(
+            session,
+            lambda: session.client.list_projects(limit=limit, after=after),
+            desktop_project_id,
+        )
+
     def capabilities(
         self,
         desktop_project_id: str,
@@ -2298,14 +2313,23 @@ class DesktopCoreBridgeV2:
         project: core_v2.ProjectV2,
         request: core_v2.ProjectCreateV2,
     ) -> None:
-        if (
+        common_mismatch = (
             project.display_name != request.display_name
             or project.config != request.config
             or project.project_config_sha256 != core_v2.project_config_sha256_for(request.config)
-            or project.state != "ready"
-            or project.active_project_head is None
-            or project.admission_etag is None
-        ):
+        )
+        if request.config.workspace.kind == "native_folder_snapshot":
+            if project.active_project_head is None:
+                invalid_authority = (
+                    project.state != "not_ready" or project.admission_etag is not None
+                )
+            else:
+                invalid_authority = project.admission_etag is None
+        else:
+            invalid_authority = (
+                project.active_project_head is None or project.admission_etag is None
+            )
+        if common_mismatch or invalid_authority:
             raise _bridge_error(
                 "core_project_intent_mismatch",
                 "The Core project differs from the saved Desktop project intent.",

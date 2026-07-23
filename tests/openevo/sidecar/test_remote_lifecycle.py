@@ -8,27 +8,62 @@ from typing import Callable, cast
 
 import pytest
 
+from desktop.sidecar.askpass_broker import AskpassPromptObservation
 from desktop.sidecar.contracts.v1.models import (
     HostKeyAcceptV1,
     RemoteProfileV1,
 )
+from desktop.sidecar.contracts.v2 import models as local_v2
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
     RemoteConnectionFailedError,
     RemoteCredentialUnavailableError,
     RemoteLifecycleSupersededError,
+    SystemOpenSshRemoteLifecycleV2,
     remote_profile_config,
 )
+from desktop.sidecar.system_ssh_session import SystemOpenSshSessionError
 from openevo.deployment.host_keys import (
     HostKeyCandidate,
     PendingHostKeyProbe,
+    PendingSystemHostKeyReview,
+    SystemKnownHostsPolicy,
     TrustedKnownHostsBinding,
 )
 from openevo.deployment.preflight import RemoteCommandResult
-from openevo.deployment.profile import SSHAuthConfig
+from openevo.deployment.profile import SSHAuthConfig, SystemOpenSshAliasProfile
 
 
 TIMESTAMP = "2026-07-14T12:00:00.000000Z"
+
+
+def _system_profile(*, generation: int = 2) -> local_v2.RemoteWorkspaceProfileV2:
+    return local_v2.RemoteWorkspaceProfileV2(
+        profile_id="profile-system-1",
+        display_name="Configured GPU",
+        ssh_host_alias="gpu-via-config",
+        catalog_generation=3,
+        connection_generation=generation,
+        connection_state="connecting",
+        prompt=None,
+        trust=local_v2.SshTrustStateV2(
+            connection_generation=generation,
+            state="unverified",
+            review_id=None,
+            review_sha256=None,
+            key_fingerprints=[],
+            repair_support="not_needed",
+        ),
+        failure=None,
+        active_project_id=None,
+        core_api_major=None,
+        core_openapi_sha256=None,
+        core_event_schema_sha256=None,
+        core_registry_sha256=None,
+        created_at=TIMESTAMP,
+        updated_at=TIMESTAMP,
+        etag=f'"{"2" * 64}"',
+    )
 
 
 def _profile(
@@ -502,3 +537,204 @@ def test_remote_profile_projection_has_no_credential_or_local_path() -> None:
     assert config.auth.password_ref is None
     assert config.path is None
     assert config.workspace_root is None
+
+
+class _SystemSession:
+    def __init__(self, alias: str, *, remote_user: str = "researcher") -> None:
+        self.ssh_host_alias = alias
+        self.remote_user = remote_user
+        self.commands: list[str] = []
+
+    def snapshot(self) -> object:
+        return object()
+
+    def run(self, command: str, *, timeout_seconds: float = 30.0) -> RemoteCommandResult:
+        assert 0 < timeout_seconds <= 30.0
+        self.commands.append(command)
+        return RemoteCommandResult(
+            command=command,
+            return_code=0,
+            stdout=f"{self.remote_user}\n",
+        )
+
+
+class _SystemSessionOwner:
+    def __init__(self) -> None:
+        self.active: _SystemSession | None = None
+        self.failures: list[SystemOpenSshSessionError] = []
+        self.connections: list[tuple[SystemOpenSshAliasProfile, int]] = []
+        self.disconnects = 0
+        self.prompt_observer: Callable[[AskpassPromptObservation], None] | None = None
+
+    def connect(
+        self,
+        profile: SystemOpenSshAliasProfile,
+        *,
+        connection_generation: int,
+        prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
+    ) -> object:
+        self.connections.append((profile, connection_generation))
+        self.prompt_observer = prompt_observer
+        if self.failures:
+            raise self.failures.pop(0)
+        self.active = _SystemSession(profile.ssh_host_alias)
+        return object()
+
+    def active_session(self) -> _SystemSession:
+        assert self.active is not None
+        return self.active
+
+    def disconnect(self) -> None:
+        self.disconnects += 1
+        self.active = None
+
+    close = disconnect
+
+
+class _SystemTransport(FakeTransport):
+    pass
+
+
+class _SystemHostTrust:
+    def __init__(self) -> None:
+        self.replacements: list[tuple[object, ...]] = []
+
+    def replace_changed_key(self, review: object, **arguments: object) -> None:
+        self.replacements.append((review, arguments))
+
+    def close(self) -> None:
+        return None
+
+
+def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -> None:
+    owner = _SystemSessionOwner()
+    seen: list[tuple[object, object, str]] = []
+    transport = _SystemTransport()
+
+    def transport_factory(config: object, session: object, remote_user: str) -> object:
+        seen.append((config, session, remote_user))
+        return transport
+
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=transport_factory,
+    )
+    profile = _system_profile()
+
+    lifecycle.connect(profile)
+
+    alias_profile, generation = owner.connections[0]
+    assert alias_profile == SystemOpenSshAliasProfile(
+        profile_id=profile.profile_id,
+        ssh_host_alias="gpu-via-config",
+    )
+    assert generation == profile.connection_generation
+    config, session, remote_user = seen[0]
+    assert config.host == "gpu-via-config"
+    assert config.user == remote_user == "researcher"
+    assert config.port == 22
+    assert config.path is None
+    assert session is owner.active
+    assert owner.active is not None
+    assert owner.active.commands == ["id -un"]
+    assert (
+        lifecycle.active_transport(profile.profile_id, profile.connection_generation)
+        is transport
+    )
+    with pytest.raises(RemoteConnectionFailedError):
+        lifecycle.active_transport(profile.profile_id, profile.connection_generation - 1)
+
+    lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
+    assert transport.closed
+    assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_replaces_only_the_exact_changed_key_review() -> None:
+    owner = _SystemSessionOwner()
+    policy = SystemKnownHostsPolicy(
+        repair_support="automatic_replacement_available",
+        reason="test",
+        known_hosts_file=None,
+        lookup_token=None,
+        _file_identity=None,
+    )
+    review = PendingSystemHostKeyReview(
+        review_id="host-review-1",
+        review_sha256="e" * 64,
+        profile_id="profile-system-1",
+        connection_generation=2,
+        key_fingerprints=(("ssh-ed25519", "SHA256:" + ("A" * 43)),),
+        repair_support="automatic_replacement_available",
+        _policy=policy,
+        _authority_token=object(),
+    )
+    owner.failures.append(
+        SystemOpenSshSessionError(
+            "ssh_host_key_changed",
+            "The configured server identity changed and requires review.",
+            host_key_review=review,
+        )
+    )
+    trust = _SystemHostTrust()
+    transports: list[_SystemTransport] = []
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, trust),
+        transport_factory=lambda *_: transports.append(_SystemTransport()) or transports[-1],
+    )
+
+    with pytest.raises(SystemOpenSshSessionError) as failure:
+        lifecycle.connect(_system_profile(generation=2))
+    assert failure.value.host_key_review is review
+
+    request = local_v2.HostKeyReviewRequestV2(
+        expected_connection_generation=2,
+        review_id=review.review_id,
+        review_sha256=review.review_sha256,
+        action="replace_changed_key",
+    )
+    lifecycle.review_host_key(_system_profile(generation=3), request)
+
+    assert len(trust.replacements) == 1
+    replaced, arguments = trust.replacements[0]
+    assert replaced is review
+    assert arguments["connection_generation"] == 2
+    assert arguments["review_id"] == review.review_id
+    assert arguments["review_sha256"] == review.review_sha256
+    assert owner.connections[-1][1] == 3
+    assert lifecycle.active_transport("profile-system-1", 3) is transports[0]
+
+
+def test_v2_lifecycle_binds_text_free_native_prompt_observations_to_profile() -> None:
+    owner = _SystemSessionOwner()
+    observed: list[tuple[str, AskpassPromptObservation]] = []
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: _SystemTransport(),
+    )
+    lifecycle.set_prompt_observer(
+        lambda profile_id, observation: observed.append((profile_id, observation))
+    )
+
+    lifecycle.connect(_system_profile())
+    assert owner.prompt_observer is not None
+    owner.prompt_observer(
+        AskpassPromptObservation(
+            connection_generation=2,
+            kind="password",
+            state="pending",
+        )
+    )
+
+    assert observed == [
+        (
+            "profile-system-1",
+            AskpassPromptObservation(
+                connection_generation=2,
+                kind="password",
+                state="pending",
+            ),
+        )
+    ]

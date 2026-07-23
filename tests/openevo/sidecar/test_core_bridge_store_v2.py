@@ -123,6 +123,8 @@ def test_store_uses_private_separate_namespace_and_atomic_mapping_history(
     store.commit_mapping(first, expected_previous=None)
     store.commit_mapping(first, expected_previous=None)
     assert store.load_mapping("desktop-project-1") == first
+    assert store.load_mapping_by_core_project_id(first.core_project_id) == first
+    assert store.load_mapping_by_core_project_id("project-missing") is None
     assert store.load_mapping_history("desktop-project-1") == (first,)
     assert store.database_path.name == "core-bridge-v2.sqlite3"
     assert len(store.schema_fingerprint) == 64

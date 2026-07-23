@@ -187,6 +187,15 @@ class PendingWorkspaceImport:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkspaceImportAuthority:
+    """Verified store-internal authority for one opaque workspace import."""
+
+    import_ref: WorkspaceImportRefV1
+    ownership: WorkspaceImportOwnership
+    pending: bool
+
+
+@dataclass(frozen=True, slots=True)
 class _FileIdentity:
     device: int
     inode: int
@@ -2909,6 +2918,33 @@ class WorkspaceImportStore:
             )
             os.close(archive_descriptor)
 
+    def inspect(self, import_id: str) -> WorkspaceImportAuthority:
+        """Return authenticated internal metadata after full archive verification."""
+
+        self._require_store_import_id(import_id)
+        with self._locked_root() as root_descriptor:
+            import_ref, ownership, archive_descriptor, _directory_identity = (
+                self._validate_import_contents(
+                    root_descriptor,
+                    import_id,
+                    None,
+                    expected_ownership=None,
+                )
+            )
+            try:
+                pending = self._archive_is_pending(
+                    archive_descriptor,
+                    import_ref,
+                    ownership,
+                )
+            finally:
+                os.close(archive_descriptor)
+        return WorkspaceImportAuthority(
+            import_ref=import_ref,
+            ownership=ownership,
+            pending=pending,
+        )
+
     def adopt_pending(
         self,
         import_ref: WorkspaceImportRefV1,
@@ -3330,6 +3366,7 @@ __all__ = [
     "PendingWorkspaceImport",
     "WorkspaceArchiveValidationError",
     "WorkspaceImportCancelled",
+    "WorkspaceImportAuthority",
     "WorkspaceImportError",
     "WorkspaceImportIntegrityError",
     "WorkspaceImportNotFoundError",

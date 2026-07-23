@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import sqlite3
 import pytest
 
 from desktop.sidecar.contracts.v2.models import (
+    ProfileConnectionActionV2,
     ProfileDisplayNamePatchV2,
     ProfileRebindV2,
     SystemOpenSshProfileCreateV2,
@@ -25,7 +27,12 @@ from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
 )
 from desktop.sidecar.release_runtime import create_release_local_state_v2
-from openevo.backend.contracts.v2.models import ScienceProjectConfigV2
+from desktop.sidecar.release_capabilities import V019_RELEASE_AUTHORITY_POLICY
+from openevo.backend.contracts.v2.models import (
+    ContractOfferV2,
+    ScienceProjectConfigV2,
+    VersionResponseV2,
+)
 
 
 class _Clock:
@@ -78,6 +85,38 @@ def _legacy_profile(*, state: str = "rebind_required") -> LegacyProfileImportV2:
             "created_at": "2026-07-22T01:00:00.000000Z",
             "updated_at": "2026-07-22T02:00:00.000000Z",
         }
+    )
+
+
+def _core_version() -> VersionResponseV2:
+    features = list(V019_RELEASE_AUTHORITY_POLICY.required_core_feature_flags)
+    encoded = json.dumps(features, separators=(",", ":")).encode("ascii")
+    return VersionResponseV2(
+        api_name="openevo-core-control-api",
+        preferred_major=2,
+        supported_majors=[2],
+        mutation_major=2,
+        contracts=[
+            ContractOfferV2(
+                api_major=2,
+                openapi_sha256=V019_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
+                event_schema_sha256=(
+                    V019_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
+                ),
+                access="mutation",
+                mutation_compatible=True,
+            )
+        ],
+        release_version="0.1.9",
+        build_id="b" * 64,
+        source_commit="a" * 40,
+        build_channel="release",
+        provider_kind="openevo_daemon",
+        feature_flags=features,
+        feature_set_sha256=hashlib.sha256(encoded).hexdigest(),
+        registry_sha256="c" * 64,
+        runtime_contract_sha256="d" * 64,
+        mutation_compatible=True,
     )
 
 
@@ -183,6 +222,136 @@ def test_profile_create_replay_conflict_etag_and_restart_are_exact(
         )
     finally:
         reopened.close()
+
+
+def test_disconnect_and_process_restart_preserve_the_reconnect_project_binding(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=7,
+        idempotency_key="reconnect-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=created.connection_generation
+        ),
+        action="connect",
+        resource_generation=created.connection_generation,
+        if_match=created.etag,
+        idempotency_key="reconnect-profile-connect-001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    bound = store.bind_active_project(
+        created.profile_id,
+        connection_generation=connected.connection_generation,
+        project_id="desktop-project-reconnect",
+    )
+
+    disconnecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=bound.connection_generation
+        ),
+        action="disconnect",
+        resource_generation=bound.connection_generation,
+        if_match=bound.etag,
+        idempotency_key="reconnect-profile-disconnect-1",
+    )
+    assert disconnecting.active_project_id == "desktop-project-reconnect"
+    disconnected = store.complete_profile_disconnect(
+        created.profile_id,
+        connection_generation=disconnecting.connection_generation,
+    )
+    assert disconnected.active_project_id == "desktop-project-reconnect"
+
+    reconnecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=disconnected.connection_generation
+        ),
+        action="connect",
+        resource_generation=disconnected.connection_generation,
+        if_match=disconnected.etag,
+        idempotency_key="reconnect-profile-connect-002",
+    )
+    reconnected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=reconnecting.connection_generation,
+        core_version=_core_version(),
+    )
+    assert reconnected.active_project_id == "desktop-project-reconnect"
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        recovered = reopened.reconcile_process_restart()
+        assert [item.profile_id for item in recovered] == [created.profile_id]
+        current = reopened.get_profile(created.profile_id)
+        assert current.connection_state == "disconnected"
+        assert current.connection_generation == reconnected.connection_generation + 1
+        assert current.active_project_id == "desktop-project-reconnect"
+        assert current.core_api_major is None
+    finally:
+        reopened.close()
+
+
+def test_native_prompt_observation_is_generation_bound_and_never_persists_text(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    try:
+        created = store.create_system_profile(
+            _profile(),
+            catalog_generation=1,
+            idempotency_key="prompt-profile-create-0001",
+        )
+        connecting = store.begin_profile_action(
+            created.profile_id,
+            ProfileConnectionActionV2(expected_connection_generation=1),
+            action="connect",
+            resource_generation=1,
+            if_match=created.etag,
+            idempotency_key="prompt-profile-connect-0001",
+        )
+        pending = store.observe_profile_prompt(
+            created.profile_id,
+            connection_generation=connecting.connection_generation,
+            kind="passphrase",
+            state="pending",
+        )
+        assert pending is not None
+        assert pending.connection_state == "prompt_pending"
+        assert pending.prompt is not None
+        assert pending.prompt.kind == "passphrase"
+
+        resumed = store.observe_profile_prompt(
+            created.profile_id,
+            connection_generation=connecting.connection_generation,
+            kind="passphrase",
+            state="completed",
+        )
+        assert resumed is not None
+        assert resumed.connection_state == "connecting"
+        assert resumed.prompt is None
+        assert (
+            store.observe_profile_prompt(
+                created.profile_id,
+                connection_generation=1,
+                kind="password",
+                state="pending",
+            )
+            is None
+        )
+    finally:
+        store.close()
 
 
 def test_legacy_rebind_preserves_nonconnectable_record_and_creates_new_profile(

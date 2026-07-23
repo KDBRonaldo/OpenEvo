@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
+import httpx
 import pytest
 
 import desktop.sidecar.release_runtime as release_runtime
@@ -17,22 +18,41 @@ from tests.managed_runtime_testkit import (
     write_test_managed_runtime_archive,
 )
 from desktop.sidecar.core_bridge_v1 import DesktopCoreBridgeErrorV1
+from desktop.sidecar.core_bridge_adapters_v2 import (
+    CoreBootstrapConfigV2,
+    SealedCoreBootstrapAssetV2,
+    SealedDaemonBundleV2,
+)
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError
+from desktop.sidecar.core_bridge_v2 import (
+    CoreHostAttachmentV2,
+    CoreTunnelHandleV2,
+    DesktopCoreBridgeErrorV2,
+)
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
+from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.release_runtime import (
     CoreRuntimeSessionBinding,
     DesktopCoreEventRelayV1,
     DesktopReleaseCoreRuntimeV1,
+    DesktopReleaseCoreRuntimeV2,
     ReleaseRuntimeConfigurationError,
     create_release_core_runtime,
+    create_release_core_runtime_v2,
     load_core_bootstrap_config,
+    load_core_bootstrap_config_v2,
 )
 from desktop.sidecar.remote_lifecycle import DesktopRemoteLifecycle
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.deployment.host_keys import ProviderKnownHostStore
+from tests.openevo.sidecar.test_core_bridge_v2 import _status as _core_v2_status
+from tests.openevo.sidecar.test_core_client_v2 import (
+    _TOKEN as CORE_V2_TOKEN,
+    _version as _core_v2_version,
+)
 
 
 SOURCE_COMMIT = "a" * 40
@@ -196,6 +216,26 @@ def test_load_core_bootstrap_config_binds_exact_daemon_bundle(tmp_path: Path) ->
     assert str(tmp_path) not in repr(config.daemon_bundle)
 
 
+def test_v2_bootstrap_loader_reissues_only_exact_v2_asset_identities(
+    tmp_path: Path,
+) -> None:
+    wheel_root = _assets(tmp_path / "openevo" / "wheels")
+    daemon_root = _daemon_assets(tmp_path / "openevo" / "daemon", wheel_root)
+
+    config = load_core_bootstrap_config_v2(
+        wheel_root,
+        daemon_asset_root=daemon_root,
+        source_commit=SOURCE_COMMIT,
+    )
+
+    assert type(config) is CoreBootstrapConfigV2
+    assert type(config.wheel) is SealedCoreBootstrapAssetV2
+    assert type(config.framework_lock) is SealedCoreBootstrapAssetV2
+    assert type(config.daemon_bundle) is SealedDaemonBundleV2
+    assert config.daemon_bundle.source_commit == SOURCE_COMMIT
+    assert "V1" not in repr(config)
+
+
 @pytest.mark.parametrize("mutation", ["binary", "manifest", "source_commit", "extra"])
 def test_daemon_bundle_rejects_release_identity_drift(
     tmp_path: Path,
@@ -345,6 +385,8 @@ def test_packaged_release_assets_accept_root_owned_read_only_media(
     release_root = tmp_path / "openevo-release-assets"
     wheel_root, _expected_runtime = _packaged_release_assets(release_root, monkeypatch)
     owner_id = release_root.stat().st_uid
+    if owner_id != 0:
+        pytest.skip("root-owned packaged media fixture requires a root test process")
     monkeypatch.setattr(release_runtime.os, "getuid", lambda: owner_id + 1)
 
     config = load_core_bootstrap_config(
@@ -504,6 +546,130 @@ def test_release_runtime_does_not_read_remote_assets_before_first_core_use(
     lifecycle.close()
     workspace_store.close()
     provider_store.close()
+
+
+def test_v2_release_runtime_is_deferred_and_owns_only_v2_bridge_state(
+    tmp_path: Path,
+) -> None:
+    provider_store = DesktopProviderStoreV2(tmp_path / "state" / "provider-v2")
+    missing_assets = tmp_path / "assets-that-must-not-be-opened-v2"
+    lifecycle = SimpleNamespace(active_transport=lambda *_args: object())
+
+    runtime = create_release_core_runtime_v2(
+        provider_store=provider_store,
+        remote_lifecycle=lifecycle,
+        asset_root=missing_assets / "core",
+        release_assets_root=missing_assets,
+        daemon_asset_root=missing_assets / "daemon",
+        runtime_asset_root=missing_assets / "runtime",
+        source_commit=SOURCE_COMMIT,
+        packaged_resource_assets=True,
+    )
+    try:
+        assert type(runtime) is DesktopReleaseCoreRuntimeV2
+        assert runtime.bridge_store.state_root.name == "core-bridge-v2"
+        assert not missing_assets.exists()
+        with pytest.raises(DesktopCoreBridgeErrorV2) as exc_info:
+            runtime.core_bridge._host_service.ensure_core(
+                "profile-1",
+                2,
+                deadline=time.monotonic() + 1,
+            )
+        assert exc_info.value.error.code == "release_assets_initialization_failed"
+    finally:
+        runtime.close()
+        provider_store.close()
+
+
+class _ProfileConnectorAdapterV2:
+    def __init__(self, *, health: str = "healthy") -> None:
+        self.health = health
+        self.requests: list[httpx.Request] = []
+        self.closed: list[str] = []
+
+    def ensure_core(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        *,
+        deadline: float,
+    ) -> CoreHostAttachmentV2:
+        assert deadline > time.monotonic()
+        return CoreHostAttachmentV2(
+            profile_id=profile_id,
+            profile_connection_generation=profile_connection_generation,
+            remote_port=8765,
+            bearer_token=CORE_V2_TOKEN,
+            bearer_identity=hashlib.sha256(CORE_V2_TOKEN.encode()).hexdigest(),
+        )
+
+    def open_tunnel(
+        self,
+        *,
+        profile_id: str,
+        profile_connection_generation: int,
+        remote_port: int,
+        session_id: str,
+        deadline: float,
+    ) -> CoreTunnelHandleV2:
+        assert remote_port == 8765
+        assert deadline > time.monotonic()
+        return CoreTunnelHandleV2(
+            endpoint="http://127.0.0.1:49201",
+            profile_id=profile_id,
+            profile_connection_generation=profile_connection_generation,
+            session_id=session_id,
+            close_callback=lambda: self.closed.append(session_id),
+        )
+
+    def new_http_transport(self) -> httpx.BaseTransport:
+        def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            if request.url.path == "/version":
+                return httpx.Response(200, json=_core_v2_version())
+            if request.url.path == "/health":
+                return httpx.Response(
+                    200,
+                    json={
+                        "schema_version": "2",
+                        "status": self.health,
+                        "checked_at": "2026-07-23T06:00:00Z",
+                    },
+                )
+            if request.url.path == "/v2/system/status":
+                return httpx.Response(200, json=_core_v2_status())
+            raise AssertionError(f"unexpected connector request: {request.url.path}")
+
+        return httpx.MockTransport(handler)
+
+
+def test_v2_profile_connector_negotiates_then_closes_its_temporary_tunnel() -> None:
+    adapter = _ProfileConnectorAdapterV2()
+    connector = release_runtime.DesktopCoreProfileConnectorV2(adapter)
+
+    version = connector.connect_profile("profile-1", 3)
+
+    assert version.release_version == "0.1.9"
+    assert [request.url.path for request in adapter.requests] == [
+        "/version",
+        "/health",
+        "/v2/system/status",
+    ]
+    assert "authorization" not in adapter.requests[0].headers
+    assert "authorization" not in adapter.requests[1].headers
+    assert adapter.requests[2].headers["authorization"] == f"Bearer {CORE_V2_TOKEN}"
+    assert len(adapter.closed) == 1
+
+
+def test_v2_profile_connector_refuses_degraded_daemon_readiness() -> None:
+    adapter = _ProfileConnectorAdapterV2(health="degraded")
+    connector = release_runtime.DesktopCoreProfileConnectorV2(adapter)
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as exc_info:
+        connector.connect_profile("profile-1", 3)
+
+    assert exc_info.value.error.code == "core_not_ready"
+    assert len(adapter.closed) == 1
 
 
 def test_deferred_release_asset_initialization_retries_after_failure(

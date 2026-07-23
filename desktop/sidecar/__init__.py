@@ -45,8 +45,13 @@ from desktop.sidecar.core_client_v1 import (
     CoreTunnelConnectionV1,
 )
 from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
-from desktop.sidecar.release_app import create_release_desktop_local_api_app
+from desktop.sidecar.release_app import (
+    create_packaged_release_desktop_local_api_v2_app,
+    create_release_desktop_local_api_app,
+    create_release_desktop_local_api_v2_app,
+)
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.release_provider_v2 import DesktopReleaseProviderV2
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     SystemOpenSshHostTrust,
@@ -83,6 +88,7 @@ from openevo.deployment.workspace import (
 __all__ = [
     "DesktopExecutionStatus",
     "DesktopReleaseProvider",
+    "DesktopReleaseProviderV2",
     "AskpassHelperAuthority",
     "BackendClient",
     "BackendConnection",
@@ -133,6 +139,8 @@ __all__ = [
     "create_sidecar_app",
     "create_sidecar_app_for_project",
     "create_release_desktop_local_api_app",
+    "create_packaged_release_desktop_local_api_v2_app",
+    "create_release_desktop_local_api_v2_app",
     "default_desktop_shell_status",
     "list_desktop_project_configs",
     "load_desktop_project_config",
