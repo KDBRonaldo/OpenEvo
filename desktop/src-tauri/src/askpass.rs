@@ -108,6 +108,21 @@ impl fmt::Debug for AuthorizationRequest<'_> {
 
 pub trait PromptAuthorizer: Send + Sync {
     fn authorize(&self, request: &AuthorizationRequest<'_>) -> Result<(), AskpassError>;
+
+    fn complete(
+        &self,
+        _request: &AuthorizationRequest<'_>,
+        _outcome: PromptCompletionOutcome,
+    ) -> Result<(), AskpassError> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PromptCompletionOutcome {
+    Accepted,
+    Rejected,
+    Cancelled,
 }
 
 pub fn classify_prompt(prompt: &[u8]) -> Result<ClassifiedPrompt, AskpassError> {
@@ -211,7 +226,7 @@ pub fn execute_askpass(
     let prompt_digest = Sha256::digest(prompt);
     let mut prompt_sha256 = [0_u8; 32];
     prompt_sha256.copy_from_slice(&prompt_digest);
-    authorizer.authorize(&AuthorizationRequest {
+    let request = AuthorizationRequest {
         capability,
         connection_generation,
         helper_pid,
@@ -219,7 +234,8 @@ pub fn execute_askpass(
         prompt_kind: classified.kind,
         prompt_sha256,
         prompt_bytes: prompt.len(),
-    })?;
+    };
+    authorizer.authorize(&request)?;
 
     match dialog.present(&classified)? {
         DialogOutcome::Secret(secret)
@@ -237,15 +253,29 @@ pub fn execute_askpass(
             {
                 return Err(AskpassError::InvalidResponse);
             }
+            authorizer.complete(&request, PromptCompletionOutcome::Accepted)?;
             output
                 .write_all(&secret.0)
                 .and_then(|_| output.write_all(b"\n"))
                 .map_err(|_| AskpassError::OutputFailed)
         }
-        DialogOutcome::Confirm(answer) if classified.kind == PromptKind::HostConfirmation => output
-            .write_all(if answer { b"yes\n" } else { b"no\n" })
-            .map_err(|_| AskpassError::OutputFailed),
-        DialogOutcome::Cancelled => Err(AskpassError::Cancelled),
+        DialogOutcome::Confirm(answer) if classified.kind == PromptKind::HostConfirmation => {
+            authorizer.complete(
+                &request,
+                if answer {
+                    PromptCompletionOutcome::Accepted
+                } else {
+                    PromptCompletionOutcome::Rejected
+                },
+            )?;
+            output
+                .write_all(if answer { b"yes\n" } else { b"no\n" })
+                .map_err(|_| AskpassError::OutputFailed)
+        }
+        DialogOutcome::Cancelled => {
+            authorizer.complete(&request, PromptCompletionOutcome::Cancelled)?;
+            Err(AskpassError::Cancelled)
+        }
         DialogOutcome::Secret(_) | DialogOutcome::Confirm(_) => Err(AskpassError::InvalidResponse),
     }
 }
@@ -391,6 +421,7 @@ impl ProcessInspector for DarwinProcessInspector {
 #[derive(Serialize)]
 struct BrokerAuthorizationRequest<'a> {
     schema_version: u8,
+    event: &'static str,
     capability: &'a str,
     connection_generation: u64,
     helper_pid: u32,
@@ -399,6 +430,21 @@ struct BrokerAuthorizationRequest<'a> {
     prompt_kind: &'static str,
     prompt_sha256: String,
     prompt_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct BrokerCompletionRequest<'a> {
+    schema_version: u8,
+    event: &'static str,
+    capability: &'a str,
+    connection_generation: u64,
+    helper_pid: u32,
+    ssh_parent_pid: u32,
+    owner_pid: u32,
+    prompt_kind: &'static str,
+    prompt_sha256: String,
+    prompt_bytes: usize,
+    outcome: &'static str,
 }
 
 #[derive(Deserialize)]
@@ -433,15 +479,10 @@ impl BrokerAuthorizer {
 
 impl PromptAuthorizer for BrokerAuthorizer {
     fn authorize(&self, request: &AuthorizationRequest<'_>) -> Result<(), AskpassError> {
-        let mut stream = UnixStream::connect(&self.socket_path)
-            .map_err(|_| AskpassError::AuthorizationDenied)?;
-        stream
-            .set_read_timeout(Some(BROKER_TIMEOUT))
-            .and_then(|_| stream.set_write_timeout(Some(BROKER_TIMEOUT)))
-            .map_err(|_| AskpassError::AuthorizationDenied)?;
         let encoded_digest = hex_digest(&request.prompt_sha256);
         let payload = BrokerAuthorizationRequest {
             schema_version: 1,
+            event: "authorize",
             capability: request.capability,
             connection_generation: request.connection_generation,
             helper_pid: request.helper_pid,
@@ -451,8 +492,42 @@ impl PromptAuthorizer for BrokerAuthorizer {
             prompt_sha256: encoded_digest,
             prompt_bytes: request.prompt_bytes,
         };
+        self.exchange(&payload)
+    }
+
+    fn complete(
+        &self,
+        request: &AuthorizationRequest<'_>,
+        outcome: PromptCompletionOutcome,
+    ) -> Result<(), AskpassError> {
+        let encoded_digest = hex_digest(&request.prompt_sha256);
+        let payload = BrokerCompletionRequest {
+            schema_version: 1,
+            event: "complete",
+            capability: request.capability,
+            connection_generation: request.connection_generation,
+            helper_pid: request.helper_pid,
+            ssh_parent_pid: request.ssh_parent_pid,
+            owner_pid: self.owner_pid,
+            prompt_kind: prompt_kind_name(request.prompt_kind),
+            prompt_sha256: encoded_digest,
+            prompt_bytes: request.prompt_bytes,
+            outcome: completion_outcome_name(outcome),
+        };
+        self.exchange(&payload)
+    }
+}
+
+impl BrokerAuthorizer {
+    fn exchange(&self, payload: &impl Serialize) -> Result<(), AskpassError> {
+        let mut stream = UnixStream::connect(&self.socket_path)
+            .map_err(|_| AskpassError::AuthorizationDenied)?;
+        stream
+            .set_read_timeout(Some(BROKER_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(BROKER_TIMEOUT)))
+            .map_err(|_| AskpassError::AuthorizationDenied)?;
         let mut encoded =
-            serde_json::to_vec(&payload).map_err(|_| AskpassError::AuthorizationDenied)?;
+            serde_json::to_vec(payload).map_err(|_| AskpassError::AuthorizationDenied)?;
         if encoded.len() >= BROKER_RESPONSE_MAX_BYTES {
             encoded.fill(0);
             return Err(AskpassError::AuthorizationDenied);
@@ -494,6 +569,14 @@ fn prompt_kind_name(kind: PromptKind) -> &'static str {
         PromptKind::Password => "password",
         PromptKind::Passphrase => "passphrase",
         PromptKind::HostConfirmation => "host_confirmation",
+    }
+}
+
+fn completion_outcome_name(outcome: PromptCompletionOutcome) -> &'static str {
+    match outcome {
+        PromptCompletionOutcome::Accepted => "accepted",
+        PromptCompletionOutcome::Rejected => "rejected",
+        PromptCompletionOutcome::Cancelled => "cancelled",
     }
 }
 
@@ -1076,6 +1159,78 @@ mod tests {
     }
 
     #[test]
+    fn reports_bounded_prompt_completion_before_releasing_any_response() {
+        struct CompletionAuthorizer {
+            completions: Mutex<Vec<PromptCompletionOutcome>>,
+            deny_completion: bool,
+        }
+
+        impl PromptAuthorizer for CompletionAuthorizer {
+            fn authorize(&self, _request: &AuthorizationRequest<'_>) -> Result<(), AskpassError> {
+                Ok(())
+            }
+
+            fn complete(
+                &self,
+                _request: &AuthorizationRequest<'_>,
+                outcome: PromptCompletionOutcome,
+            ) -> Result<(), AskpassError> {
+                self.completions.lock().unwrap().push(outcome);
+                if self.deny_completion {
+                    Err(AskpassError::AuthorizationDenied)
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let accepted = CompletionAuthorizer {
+            completions: Mutex::new(Vec::new()),
+            deny_completion: false,
+        };
+        let dialog = FakeDialog::new(vec![DialogOutcome::Secret(SecretResponse::new(
+            b"secret".to_vec(),
+        ))]);
+        let mut output = Vec::new();
+        execute_with(&accepted, &dialog, &mut output).unwrap();
+        assert_eq!(
+            *accepted.completions.lock().unwrap(),
+            vec![PromptCompletionOutcome::Accepted]
+        );
+        assert_eq!(output, b"secret\n");
+
+        let cancelled = CompletionAuthorizer {
+            completions: Mutex::new(Vec::new()),
+            deny_completion: false,
+        };
+        let dialog = FakeDialog::new(vec![DialogOutcome::Cancelled]);
+        let mut output = Vec::new();
+        assert_eq!(
+            execute_with(&cancelled, &dialog, &mut output),
+            Err(AskpassError::Cancelled)
+        );
+        assert_eq!(
+            *cancelled.completions.lock().unwrap(),
+            vec![PromptCompletionOutcome::Cancelled]
+        );
+        assert!(output.is_empty());
+
+        let denied = CompletionAuthorizer {
+            completions: Mutex::new(Vec::new()),
+            deny_completion: true,
+        };
+        let dialog = FakeDialog::new(vec![DialogOutcome::Secret(SecretResponse::new(
+            b"must-not-leave".to_vec(),
+        ))]);
+        let mut output = Vec::new();
+        assert_eq!(
+            execute_with(&denied, &dialog, &mut output),
+            Err(AskpassError::AuthorizationDenied)
+        );
+        assert!(output.is_empty());
+    }
+
+    #[test]
     fn one_use_authorization_blocks_repeated_prompt_before_dialog() {
         let authorizer = OneUseAuthorizer::new();
         let dialog = FakeDialog::new(vec![
@@ -1289,6 +1444,7 @@ mod tests {
             HashSet::from([
                 "capability".to_string(),
                 "connection_generation".to_string(),
+                "event".to_string(),
                 "helper_pid".to_string(),
                 "owner_pid".to_string(),
                 "prompt_bytes".to_string(),
@@ -1301,5 +1457,61 @@ mod tests {
         assert!(!request.contains("alice"));
         assert!(!request.contains("private.example"));
         assert!(!request.contains("never-send-an-ssh-secret"));
+    }
+
+    #[test]
+    fn broker_completion_payload_contains_only_prompt_identity_and_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket_path = directory.path().join("broker.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                stream
+                    .write_all(b"{\"schema_version\":1,\"authorized\":true}\n")
+                    .unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        let prompt = b"password: ";
+        let digest = Sha256::digest(prompt);
+        let mut prompt_sha256 = [0_u8; 32];
+        prompt_sha256.copy_from_slice(&digest);
+        let capability = "b".repeat(64);
+        let authorizer = BrokerAuthorizer {
+            socket_path,
+            owner_pid: 200,
+        };
+        let request = AuthorizationRequest {
+            capability: &capability,
+            connection_generation: 92,
+            helper_pid: 300,
+            ssh_parent_pid: 250,
+            prompt_kind: PromptKind::Password,
+            prompt_sha256,
+            prompt_bytes: prompt.len(),
+        };
+
+        authorizer.authorize(&request).unwrap();
+        authorizer
+            .complete(&request, PromptCompletionOutcome::Cancelled)
+            .unwrap();
+
+        let requests = server.join().unwrap();
+        let authorization: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        let completion: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        assert_eq!(authorization["event"], "authorize");
+        assert_eq!(completion["event"], "complete");
+        assert_eq!(completion["outcome"], "cancelled");
+        assert_eq!(completion.as_object().unwrap().len(), 11);
+        assert!(!requests[1].contains("password:"));
+        assert!(!requests[1].contains("response"));
+        assert!(!requests[1].contains("secret"));
     }
 }

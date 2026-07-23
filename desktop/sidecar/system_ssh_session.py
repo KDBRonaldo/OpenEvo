@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import locale
 import os
@@ -20,20 +20,32 @@ from typing import Protocol
 from desktop.sidecar.askpass_broker import (
     AskpassAuthorizationBroker,
     AskpassBrokerError,
+    AskpassPromptObservation,
     ProcessIdentity,
     ProcessInspector,
     SystemProcessInspector,
 )
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import SystemOpenSshAliasProfile
+from openevo.deployment.host_keys import (
+    PendingSystemHostKeyReview,
+    SystemHostKeyFailureCode,
+    SystemHostKeyFailureEvidence,
+    SystemHostKeyReviewAuthority,
+    SystemKnownHostsPolicy,
+    classify_system_openssh_host_key_failure,
+    inspect_system_known_hosts_policy,
+)
 from openevo.deployment.ssh import (
     SystemOpenSshAskpassEnvironment,
     build_system_openssh_command_argv,
     build_system_openssh_control_argv,
     build_system_openssh_core_tunnel_argv,
     build_system_openssh_environment,
+    build_system_openssh_probe_argv,
     build_system_openssh_master_argv,
     build_system_openssh_upload_argv,
+    build_system_ssh_keygen_remove_argv,
 )
 from openevo.deployment.system_executables import (
     SSH_EXECUTABLE,
@@ -45,6 +57,7 @@ from openevo.deployment.system_executables import (
 _MAX_SAFE_GENERATION = (1 << 53) - 1
 _MAX_HELPER_BYTES = 16 * 1024 * 1024
 _MAX_CAPTURE_BYTES = 4 * 1024 * 1024
+_MAX_MASTER_DIAGNOSTIC_BYTES = 64 * 1024
 _CAPTURE_CHUNK_BYTES = 64 * 1024
 _STARTUP_POLL_SECONDS = 0.02
 _DEFAULT_STARTUP_TIMEOUT_SECONDS = 20.0
@@ -112,8 +125,17 @@ os.execve(execution_path, argv, environment)
 class SystemOpenSshSessionError(RuntimeError):
     """A fixed, renderer-safe owned-session failure."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        host_key_evidence: SystemHostKeyFailureEvidence | None = None,
+        host_key_review: PendingSystemHostKeyReview | None = None,
+    ) -> None:
         self.code = code
+        self.host_key_evidence = host_key_evidence
+        self.host_key_review = host_key_review
         super().__init__(message)
 
 
@@ -143,6 +165,170 @@ SessionRunner = Callable[
     [list[str], dict[str, str], float],
     subprocess.CompletedProcess[bytes],
 ]
+
+
+@dataclass(frozen=True, slots=True)
+class SystemOpenSshTrustFailure:
+    code: str
+    evidence: SystemHostKeyFailureEvidence = field(repr=False)
+    review: PendingSystemHostKeyReview | None
+
+
+class SystemOpenSshHostTrust:
+    """Mediate changed-key evidence without owning a second trust database."""
+
+    def __init__(
+        self,
+        *,
+        home: Path | str,
+        inherited_environment: Mapping[str, str],
+        review_authority: SystemHostKeyReviewAuthority | None = None,
+        runner: SessionRunner | None = None,
+    ) -> None:
+        self._home = Path(home)
+        self._inherited_environment = dict(inherited_environment)
+        self._owns_review_authority = review_authority is None
+        self._review_authority = review_authority or SystemHostKeyReviewAuthority()
+        self._runner = runner or _run_verified_bounded_subprocess
+        self._closed = False
+
+    @property
+    def review_authority(self) -> SystemHostKeyReviewAuthority:
+        return self._review_authority
+
+    def evaluate_failure(
+        self,
+        profile: SystemOpenSshAliasProfile,
+        *,
+        connection_generation: int,
+        stderr: bytes,
+        conditional_config: bool = False,
+        timeout_seconds: float = 5.0,
+    ) -> SystemOpenSshTrustFailure:
+        if self._closed:
+            raise _session_error(
+                "ssh_host_trust_unavailable", "System SSH host trust is unavailable."
+            )
+        evidence = classify_system_openssh_host_key_failure(stderr)
+        if evidence.code is not SystemHostKeyFailureCode.CHANGED:
+            return SystemOpenSshTrustFailure(
+                code=evidence.code.value,
+                evidence=evidence,
+                review=None,
+            )
+        if conditional_config:
+            policy = SystemKnownHostsPolicy(
+                repair_support="administrator_required",
+                reason="conditional_config",
+                known_hosts_file=None,
+                lookup_token=None,
+                _file_identity=None,
+            )
+        else:
+            policy = self._inspect_policy(
+                profile,
+                offending_known_hosts_file=evidence.offending_known_hosts_file,
+                timeout_seconds=timeout_seconds,
+            )
+        review = self._review_authority.issue(
+            profile,
+            connection_generation=connection_generation,
+            evidence=evidence,
+            policy=policy,
+        )
+        return SystemOpenSshTrustFailure(
+            code=evidence.code.value,
+            evidence=evidence,
+            review=review,
+        )
+
+    def replace_changed_key(
+        self,
+        review: PendingSystemHostKeyReview,
+        *,
+        profile: SystemOpenSshAliasProfile,
+        connection_generation: int,
+        review_id: str,
+        review_sha256: str,
+        timeout_seconds: float = 5.0,
+    ) -> None:
+        if self._closed:
+            raise _session_error(
+                "ssh_host_trust_unavailable", "System SSH host trust is unavailable."
+            )
+        try:
+            replacement = self._review_authority.claim_replacement(
+                review,
+                profile=profile,
+                connection_generation=connection_generation,
+                review_id=review_id,
+                review_sha256=review_sha256,
+            )
+            replacement.verify_current()
+        except (OSError, TypeError, ValueError) as exc:
+            raise _session_error(
+                "ssh_host_key_review_invalid",
+                "The changed host-key review is no longer current.",
+            ) from exc
+        try:
+            completed = self._runner(
+                build_system_ssh_keygen_remove_argv(
+                    lookup_token=replacement.lookup_token,
+                    known_hosts_file=replacement.known_hosts_file,
+                ),
+                self._environment(),
+                timeout_seconds,
+            )
+            if completed.returncode != 0:
+                raise ValueError("system ssh-keygen replacement failed")
+            replacement.verify_replaced()
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            raise _session_error(
+                "ssh_host_key_repair_failed",
+                "The changed host key could not be removed from the user trust store.",
+            ) from exc
+
+    def _inspect_policy(
+        self,
+        profile: SystemOpenSshAliasProfile,
+        *,
+        offending_known_hosts_file: Path | None,
+        timeout_seconds: float,
+    ) -> SystemKnownHostsPolicy:
+        try:
+            completed = self._runner(
+                build_system_openssh_probe_argv(profile),
+                self._environment(),
+                timeout_seconds,
+            )
+            if completed.returncode != 0 or type(completed.stdout) is not bytes:
+                raise ValueError("effective OpenSSH config is unavailable")
+            return inspect_system_known_hosts_policy(
+                completed.stdout,
+                home=self._home,
+                offending_known_hosts_file=offending_known_hosts_file,
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired, SystemOpenSshSessionError):
+            return SystemKnownHostsPolicy(
+                repair_support="administrator_required",
+                reason="effective_config_unavailable",
+                known_hosts_file=None,
+                lookup_token=None,
+                _file_identity=None,
+            )
+
+    def _environment(self) -> dict[str, str]:
+        return build_system_openssh_environment(
+            home=os.fspath(self._home),
+            inherited=self._inherited_environment,
+        )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_review_authority:
+            self._review_authority.close()
 
 
 @dataclass(frozen=True, slots=True)
@@ -299,6 +485,74 @@ class SystemOpenSshSessionSnapshot:
     control_socket_inode: int
 
 
+class _CapturedSshMasterProcess:
+    """Drain bounded SSH diagnostics without ever exposing the raw stream."""
+
+    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+        if process.stderr is None:
+            raise ValueError("system OpenSSH diagnostic stream is unavailable")
+        self._process = process
+        self._stream = process.stderr
+        self._guard = threading.Lock()
+        self._captured = bytearray()
+        self._overflow = False
+        self._finished = threading.Event()
+        self._thread = threading.Thread(
+            target=self._drain,
+            name="openevo-system-ssh-diagnostics",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    def poll(self) -> int | None:
+        return self._process.poll()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return self._process.wait(timeout=timeout)
+
+    def terminate(self) -> None:
+        self._process.terminate()
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def captured_stderr(self) -> bytes:
+        if self._process.poll() is not None:
+            self._finished.wait(0.5)
+        with self._guard:
+            if not self._finished.is_set() or self._overflow:
+                return b""
+            return bytes(self._captured)
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                chunk = self._stream.read(8_192)
+                if not chunk:
+                    break
+                with self._guard:
+                    if self._overflow:
+                        continue
+                    if len(self._captured) + len(chunk) > _MAX_MASTER_DIAGNOSTIC_BYTES:
+                        self._captured[:] = b"\0" * len(self._captured)
+                        self._captured.clear()
+                        self._overflow = True
+                    else:
+                        self._captured.extend(chunk)
+        except OSError:
+            with self._guard:
+                self._captured[:] = b"\0" * len(self._captured)
+                self._captured.clear()
+                self._overflow = True
+        finally:
+            self._stream.close()
+            self._finished.set()
+
+
 class _SystemSshMasterLauncher:
     def spawn(
         self,
@@ -325,14 +579,14 @@ class _SystemSshMasterLauncher:
                 executable=launcher,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 close_fds=True,
                 pass_fds=(executable.descriptor,),
                 start_new_session=False,
                 env=environment,
             )
             executable.verify_path_binding()
-            return process
+            return _CapturedSshMasterProcess(process)
         finally:
             executable.close()
 
@@ -428,6 +682,8 @@ class SystemOpenSshSession:
         inspector: ProcessInspector | None = None,
         launcher: SshMasterLauncher | None = None,
         runner: SessionRunner | None = None,
+        host_trust: SystemOpenSshHostTrust | None = None,
+        conditional_config: bool = False,
         startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
         cleanup_timeout_seconds: float = _DEFAULT_CLEANUP_TIMEOUT_SECONDS,
     ) -> None:
@@ -442,6 +698,10 @@ class SystemOpenSshSession:
             raise TypeError("system OpenSSH session requires a sealed askpass helper")
         if type(owns_askpass_helper) is not bool:
             raise TypeError("askpass helper ownership must be boolean")
+        if host_trust is not None and not isinstance(host_trust, SystemOpenSshHostTrust):
+            raise TypeError("system OpenSSH host trust authority is invalid")
+        if type(conditional_config) is not bool:
+            raise TypeError("conditional OpenSSH config flag must be boolean")
         if not 0 < startup_timeout_seconds <= _MAX_STARTUP_TIMEOUT_SECONDS:
             raise ValueError("SSH startup timeout is invalid")
         if not 0 < cleanup_timeout_seconds <= _MAX_CLEANUP_TIMEOUT_SECONDS:
@@ -456,6 +716,12 @@ class SystemOpenSshSession:
         self._inspector = inspector or SystemProcessInspector()
         self._launcher = launcher or _SystemSshMasterLauncher()
         self._runner = runner or _run_bounded_subprocess
+        self._owns_host_trust = host_trust is None
+        self._host_trust = host_trust or SystemOpenSshHostTrust(
+            home=home,
+            inherited_environment=inherited_environment,
+        )
+        self._conditional_config = conditional_config
         self._startup_timeout = startup_timeout_seconds
         self._cleanup_timeout = cleanup_timeout_seconds
         self._guard = threading.RLock()
@@ -488,6 +754,12 @@ class SystemOpenSshSession:
     def poisoned(self) -> bool:
         with self._guard:
             return self._poisoned
+
+    @property
+    def prompt_observation(self) -> AskpassPromptObservation | None:
+        with self._guard:
+            broker = self._broker
+            return broker.prompt_observation if broker is not None else None
 
     def start(self) -> SystemOpenSshSessionSnapshot:
         with self._guard:
@@ -727,6 +999,12 @@ class SystemOpenSshSession:
             except BaseException as exc:
                 if failure is None:
                     failure = exc
+        if self._owns_host_trust:
+            try:
+                self._host_trust.close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
         if failure is not None:
             if isinstance(failure, SystemOpenSshSessionError):
                 raise failure
@@ -744,9 +1022,7 @@ class SystemOpenSshSession:
     ) -> ProcessIdentity:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise _session_error(
-                    "ssh_master_exited", "System OpenSSH master exited during startup."
-                )
+                raise self._master_exit_error(process, during_startup=True)
             identity = self._inspector.inspect(process.pid)
             if identity is not None and identity.executable_path == SSH_EXECUTABLE:
                 if (
@@ -773,9 +1049,7 @@ class SystemOpenSshSession:
     ) -> _SocketIdentity:
         while time.monotonic() < deadline:
             if process.poll() is not None:
-                raise _session_error(
-                    "ssh_master_exited", "System OpenSSH master exited during startup."
-                )
+                raise self._master_exit_error(process, during_startup=True)
             try:
                 metadata = os.lstat(control_path)
             except FileNotFoundError:
@@ -835,7 +1109,7 @@ class SystemOpenSshSession:
         assert runtime is not None and control_identity is not None
         if process.poll() is not None:
             self._poisoned = True
-            raise _session_error("ssh_master_exited", "System OpenSSH master exited.")
+            raise self._master_exit_error(process, during_startup=False)
         if not self._same_owner(owner):
             self._poisoned = True
             raise _session_error(
@@ -859,6 +1133,65 @@ class SystemOpenSshSession:
 
     def _same_owner(self, owner: ProcessIdentity) -> bool:
         return self._inspector.inspect(owner.process_id) == owner
+
+    def _master_exit_error(
+        self,
+        process: OwnedSshMasterProcess,
+        *,
+        during_startup: bool,
+    ) -> SystemOpenSshSessionError:
+        observation = self.prompt_observation
+        if observation is not None:
+            if observation.state == "cancelled":
+                return _session_error(
+                    "ssh_prompt_cancelled",
+                    "The system SSH prompt was cancelled.",
+                )
+            if observation.state == "rejected" and observation.kind == "host_confirmation":
+                return _session_error(
+                    "ssh_host_key_rejected",
+                    "The first-use server identity was not approved.",
+                )
+            if observation.state == "completed" and observation.kind == "host_confirmation":
+                return _session_error(
+                    "ssh_first_host_accepted_reconnect_required",
+                    "The first-use server identity was approved; authentication must reconnect.",
+                )
+        stderr = _captured_master_stderr(process)
+        lowered = stderr.lower()
+        if (
+            b"host key verification failed" in lowered
+            or b"remote host identification has changed" in lowered
+        ):
+            failure = self._host_trust.evaluate_failure(
+                self._profile,
+                connection_generation=self._generation,
+                stderr=stderr,
+                conditional_config=self._conditional_config,
+            )
+            messages = {
+                SystemHostKeyFailureCode.CHANGED.value: (
+                    "The configured server identity changed and requires review."
+                ),
+                SystemHostKeyFailureCode.FIRST_USE_FORBIDDEN.value: (
+                    "The effective SSH policy forbids first-use host approval."
+                ),
+                SystemHostKeyFailureCode.VERIFICATION_FAILED.value: (
+                    "System OpenSSH could not verify the server host key."
+                ),
+            }
+            return _session_error(
+                failure.code,
+                messages[failure.code],
+                host_key_evidence=failure.evidence,
+                host_key_review=failure.review,
+            )
+        message = (
+            "System OpenSSH master exited during startup."
+            if during_startup
+            else "System OpenSSH master exited."
+        )
+        return _session_error("ssh_master_exited", message)
 
     @staticmethod
     def _verify_control_socket(path: Path, expected: _SocketIdentity) -> None:
@@ -909,17 +1242,25 @@ class SystemOpenSshSessionOwner:
             previous, self._active = self._active, None
             if previous is not None:
                 previous.close()
-            session = self._factory(profile, connection_generation)
-            try:
-                snapshot = session.start()
-            except BaseException:
+            for attempt in range(2):
+                session = self._factory(profile, connection_generation)
                 try:
-                    session.close()
-                except BaseException:
-                    pass
-                raise
-            self._active = session
-            return snapshot
+                    snapshot = session.start()
+                except BaseException as exc:
+                    try:
+                        session.close()
+                    except BaseException:
+                        pass
+                    if (
+                        attempt == 0
+                        and isinstance(exc, SystemOpenSshSessionError)
+                        and exc.code == "ssh_first_host_accepted_reconnect_required"
+                    ):
+                        continue
+                    raise
+                self._active = session
+                return snapshot
+            raise AssertionError("system OpenSSH reconnect loop exhausted")
 
     def disconnect(self) -> None:
         with self._guard:
@@ -966,6 +1307,43 @@ def _run_bounded_subprocess(
         close_fds=True,
         start_new_session=False,
     )
+    return _collect_bounded_process(process, argv, timeout_seconds)
+
+
+def _run_verified_bounded_subprocess(
+    argv: list[str],
+    environment: dict[str, str],
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[bytes]:
+    if not argv:
+        raise ValueError("verified SSH subprocess argv is empty")
+    executable = VerifiedSystemExecutable.open(argv[0])
+    try:
+        executable.verify_path_binding()
+        process = subprocess.Popen(
+            argv,
+            executable=executable.execution_path,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            close_fds=True,
+            pass_fds=(executable.descriptor,),
+            start_new_session=False,
+        )
+        executable.verify_path_binding()
+        return _collect_bounded_process(process, argv, timeout_seconds)
+    finally:
+        executable.close()
+
+
+def _collect_bounded_process(
+    process: subprocess.Popen[bytes],
+    argv: list[str],
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[bytes]:
+    if not 0 < timeout_seconds <= 3600:
+        raise ValueError("SSH subprocess timeout is invalid")
     assert process.stdout is not None and process.stderr is not None
     deadline = time.monotonic() + timeout_seconds
     selector = selectors.DefaultSelector()
@@ -988,8 +1366,9 @@ def _run_bounded_subprocess(
                     continue
                 captured += len(chunk)
                 if captured > _MAX_CAPTURE_BYTES:
-                    raise SystemOpenSshSessionError(
-                        "ssh_output_limit_exceeded", "SSH command output exceeded its limit."
+                    raise _session_error(
+                        "ssh_output_limit_exceeded",
+                        "SSH command output exceeded its limit.",
                     )
                 chunks[key.data].append(chunk)
         remaining = deadline - time.monotonic()
@@ -1013,6 +1392,19 @@ def _run_bounded_subprocess(
         stdout=b"".join(chunks["stdout"]),
         stderr=b"".join(chunks["stderr"]),
     )
+
+
+def _captured_master_stderr(process: OwnedSshMasterProcess) -> bytes:
+    capture = getattr(process, "captured_stderr", None)
+    if not callable(capture):
+        return b""
+    try:
+        value = capture()
+    except BaseException:
+        return b""
+    if type(value) is not bytes or len(value) > _MAX_MASTER_DIAGNOSTIC_BYTES:
+        return b""
+    return value
 
 
 def _wait_process(process: OwnedSshMasterProcess, timeout_seconds: float) -> bool:
@@ -1134,16 +1526,29 @@ def _decode_output(value: bytes | str | None) -> str:
     return value.decode(locale.getpreferredencoding(False), errors="replace")
 
 
-def _session_error(code: str, message: str) -> SystemOpenSshSessionError:
-    return SystemOpenSshSessionError(code, message)
+def _session_error(
+    code: str,
+    message: str,
+    *,
+    host_key_evidence: SystemHostKeyFailureEvidence | None = None,
+    host_key_review: PendingSystemHostKeyReview | None = None,
+) -> SystemOpenSshSessionError:
+    return SystemOpenSshSessionError(
+        code,
+        message,
+        host_key_evidence=host_key_evidence,
+        host_key_review=host_key_review,
+    )
 
 
 __all__ = (
     "AskpassHelperAuthority",
     "OwnedSshMasterProcess",
     "SshMasterLauncher",
+    "SystemOpenSshHostTrust",
     "SystemOpenSshSession",
     "SystemOpenSshSessionError",
     "SystemOpenSshSessionOwner",
     "SystemOpenSshSessionSnapshot",
+    "SystemOpenSshTrustFailure",
 )

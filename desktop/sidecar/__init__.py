@@ -49,6 +49,7 @@ from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
+    SystemOpenSshHostTrust,
     SystemOpenSshSession,
     SystemOpenSshSessionError,
     SystemOpenSshSessionOwner,
@@ -112,6 +113,7 @@ __all__ = [
     "SSHAuthConfig",
     "SidecarHealth",
     "SidecarSciencePlan",
+    "SystemOpenSshHostTrust",
     "SystemOpenSshSession",
     "SystemOpenSshSessionError",
     "SystemOpenSshSessionOwner",

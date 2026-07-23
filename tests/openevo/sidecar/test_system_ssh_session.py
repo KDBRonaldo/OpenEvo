@@ -1,31 +1,42 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import socket
 import stat
+import struct
 import subprocess
 import tempfile
 
 import pytest
 
 from desktop.sidecar import system_ssh_session as session_module
-from desktop.sidecar.askpass_broker import ProcessIdentity
+from desktop.sidecar.askpass_broker import AskpassPromptObservation, ProcessIdentity
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     OwnedSshMasterProcess,
+    SystemOpenSshHostTrust,
     SystemOpenSshSession,
     SystemOpenSshSessionError,
     SystemOpenSshSessionOwner,
+    SystemOpenSshSessionSnapshot,
 )
 from openevo.deployment import SystemOpenSshAliasProfile
+from openevo.deployment.host_keys import (
+    PendingSystemHostKeyReview,
+    SystemHostKeyReviewAuthority,
+    classify_system_openssh_host_key_failure,
+    inspect_system_known_hosts_policy,
+)
 from openevo.deployment.ssh import (
     SystemOpenSshAskpassEnvironment,
     build_system_openssh_environment,
 )
-from openevo.deployment.system_executables import SSH_EXECUTABLE
+from openevo.deployment.system_executables import SSH_EXECUTABLE, SSH_KEYGEN_EXECUTABLE
 
 
 @pytest.fixture
@@ -52,11 +63,12 @@ def _profile(profile_id: str = "profile-1", alias: str = "evolab") -> SystemOpen
 
 
 class _FakeProcess(OwnedSshMasterProcess):
-    def __init__(self, pid: int) -> None:
+    def __init__(self, pid: int, *, failure_stderr: bytes = b"") -> None:
         self.pid = pid
         self.returncode: int | None = None
         self.terminate_calls = 0
         self.kill_calls = 0
+        self._failure_stderr = failure_stderr
 
     def poll(self) -> int | None:
         return self.returncode
@@ -74,6 +86,9 @@ class _FakeProcess(OwnedSshMasterProcess):
     def kill(self) -> None:
         self.kill_calls += 1
         self.returncode = -9
+
+    def captured_stderr(self) -> bytes:
+        return self._failure_stderr
 
 
 class _Inspector:
@@ -137,6 +152,24 @@ def _helper(tmp_path: Path) -> AskpassHelperAuthority:
         path,
         expected_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
     )
+
+
+def _system_known_hosts(tmp_path: Path) -> Path:
+    ssh_directory = tmp_path / ".ssh"
+    ssh_directory.mkdir(mode=0o700, exist_ok=True)
+    known_hosts = ssh_directory / "known_hosts"
+    known_hosts.write_text("gpu.internal ssh-ed25519 AAAATEST\n", encoding="ascii")
+    known_hosts.chmod(0o600)
+    return known_hosts
+
+
+def _valid_ed25519_public_key(marker: bytes) -> str:
+    key_type = b"ssh-ed25519"
+    key_data = hashlib.sha256(marker).digest()
+    blob = b"".join(
+        struct.pack(">I", len(field)) + field for field in (key_type, key_data)
+    )
+    return f"ssh-ed25519 {base64.b64encode(blob).decode('ascii')}"
 
 
 def _session(
@@ -410,3 +443,453 @@ def test_default_owner_launcher_execs_the_verified_system_ssh_image(
     )
 
     assert process.wait(timeout=3.0) == 0
+
+
+def test_changed_host_key_failure_issues_path_free_review_from_effective_config(
+    short_tmp_path: Path,
+) -> None:
+    known_hosts = _system_known_hosts(short_tmp_path)
+    stderr = (
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        f"SHA256:{'A' * 43}.\n"
+        f"Offending ED25519 key in {known_hosts}:1\n"
+        "Host key verification failed.\n"
+    ).encode()
+    runner = _Runner()
+    runner_results = [
+        subprocess.CompletedProcess(
+            [SSH_EXECUTABLE, "-G", "--", "evolab"],
+            0,
+            (
+                "hostname gpu.internal\n"
+                "port 22\n"
+                "canonicalizehostname false\n"
+                "hashknownhosts no\n"
+                f"userknownhostsfile {known_hosts}\n"
+                "globalknownhostsfile /etc/ssh/ssh_known_hosts\n"
+            ).encode(),
+            b"",
+        )
+    ]
+
+    def run(
+        argv: list[str], environment: dict[str, str], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        runner.calls.append((list(argv), dict(environment), timeout_seconds))
+        return runner_results.pop(0)
+
+    trust = SystemOpenSshHostTrust(
+        home=short_tmp_path,
+        inherited_environment={"LANG": "en_US.UTF-8"},
+        review_authority=SystemHostKeyReviewAuthority(hmac_key=b"t" * 32),
+        runner=run,
+    )
+    failure = trust.evaluate_failure(_profile(), connection_generation=4, stderr=stderr)
+
+    assert failure.code == "ssh_host_key_changed"
+    assert failure.review is not None
+    assert failure.review.repair_support == "automatic_replacement_available"
+    assert str(known_hosts) not in repr(failure)
+    assert runner.calls[0][0] == [SSH_EXECUTABLE, "-G", "--", "evolab"]
+    assert set(runner.calls[0][1]) == {"HOME", "LANG", "PATH"}
+
+
+def test_conditional_config_never_runs_ssh_g_and_requires_administrator(
+    short_tmp_path: Path,
+) -> None:
+    known_hosts = _system_known_hosts(short_tmp_path)
+    stderr = (
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        f"SHA256:{'B' * 43}.\n"
+        f"Offending ED25519 key in {known_hosts}:1\n"
+        "Host key verification failed.\n"
+    ).encode()
+    runner = _Runner()
+    trust = SystemOpenSshHostTrust(
+        home=short_tmp_path,
+        inherited_environment={},
+        runner=runner,
+    )
+
+    failure = trust.evaluate_failure(
+        _profile(),
+        connection_generation=5,
+        stderr=stderr,
+        conditional_config=True,
+    )
+
+    assert runner.calls == []
+    assert failure.review is not None
+    assert failure.review.repair_support == "administrator_required"
+
+
+def test_review_replacement_uses_exact_verified_keygen_action(
+    short_tmp_path: Path,
+) -> None:
+    known_hosts = _system_known_hosts(short_tmp_path)
+    stderr = (
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        f"SHA256:{'C' * 43}.\n"
+        f"Offending ED25519 key in {known_hosts}:1\n"
+        "Host key verification failed.\n"
+    ).encode()
+    calls: list[tuple[list[str], dict[str, str], float]] = []
+
+    def run(
+        argv: list[str], environment: dict[str, str], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        calls.append((list(argv), dict(environment), timeout_seconds))
+        if argv[0] == SSH_EXECUTABLE:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                (
+                    "hostname gpu.internal\n"
+                    "port 22\n"
+                    "canonicalizehostname false\n"
+                    "hashknownhosts no\n"
+                    f"userknownhostsfile {known_hosts}\n"
+                    "globalknownhostsfile /etc/ssh/ssh_known_hosts\n"
+                ).encode(),
+                b"",
+            )
+        known_hosts.write_text("", encoding="ascii")
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    trust = SystemOpenSshHostTrust(
+        home=short_tmp_path,
+        inherited_environment={},
+        review_authority=SystemHostKeyReviewAuthority(hmac_key=b"u" * 32),
+        runner=run,
+    )
+    failure = trust.evaluate_failure(_profile(), connection_generation=6, stderr=stderr)
+    assert failure.review is not None
+
+    trust.replace_changed_key(
+        failure.review,
+        profile=_profile(),
+        connection_generation=6,
+        review_id=failure.review.review_id,
+        review_sha256=failure.review.review_sha256,
+    )
+
+    assert calls[-1][0] == [
+        SSH_KEYGEN_EXECUTABLE,
+        "-R",
+        "gpu.internal",
+        "-f",
+        str(known_hosts),
+    ]
+    assert set(calls[-1][1]) == {"HOME", "PATH"}
+
+
+def test_review_replacement_maps_stale_or_failed_mutation_to_closed_error(
+    short_tmp_path: Path,
+) -> None:
+    known_hosts = _system_known_hosts(short_tmp_path)
+    stderr = (
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        f"SHA256:{'F' * 43}.\n"
+        f"Offending ED25519 key in {known_hosts}:1\n"
+        "Host key verification failed.\n"
+    ).encode()
+
+    def issue_review(
+        runner: session_module.SessionRunner,
+        *,
+        generation: int,
+    ) -> tuple[SystemOpenSshHostTrust, PendingSystemHostKeyReview]:
+        trust = SystemOpenSshHostTrust(
+            home=short_tmp_path,
+            inherited_environment={},
+            runner=runner,
+        )
+        failure = trust.evaluate_failure(
+            _profile(),
+            connection_generation=generation,
+            stderr=stderr,
+        )
+        assert failure.review is not None
+        return trust, failure.review
+
+    config = (
+        "hostname gpu.internal\n"
+        "port 22\n"
+        "canonicalizehostname false\n"
+        "hashknownhosts no\n"
+        f"userknownhostsfile {known_hosts}\n"
+        "globalknownhostsfile /etc/ssh/ssh_known_hosts\n"
+    ).encode()
+
+    def stale_runner(
+        argv: list[str], environment: dict[str, str], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        del environment, timeout_seconds
+        return subprocess.CompletedProcess(argv, 0, config, b"")
+
+    stale_trust, stale_review = issue_review(stale_runner, generation=11)
+    known_hosts.write_text("changed concurrently\n", encoding="ascii")
+    with pytest.raises(SystemOpenSshSessionError) as stale_error:
+        stale_trust.replace_changed_key(
+            stale_review,
+            profile=_profile(),
+            connection_generation=11,
+            review_id=stale_review.review_id,
+            review_sha256=stale_review.review_sha256,
+        )
+    assert stale_error.value.code == "ssh_host_key_review_invalid"
+    assert str(known_hosts) not in str(stale_error.value)
+
+    known_hosts.write_text("gpu.internal ssh-ed25519 AAAATEST\n", encoding="ascii")
+
+    def failed_runner(
+        argv: list[str], environment: dict[str, str], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        del environment, timeout_seconds
+        if argv[0] == SSH_EXECUTABLE:
+            return subprocess.CompletedProcess(argv, 0, config, b"")
+        return subprocess.CompletedProcess(argv, 1, b"private path", b"private detail")
+
+    failed_trust, failed_review = issue_review(failed_runner, generation=12)
+    with pytest.raises(SystemOpenSshSessionError) as failed_error:
+        failed_trust.replace_changed_key(
+            failed_review,
+            profile=_profile(),
+            connection_generation=12,
+            review_id=failed_review.review_id,
+            review_sha256=failed_review.review_sha256,
+        )
+    assert failed_error.value.code == "ssh_host_key_repair_failed"
+    assert "private" not in str(failed_error.value)
+
+
+def test_review_replacement_executes_system_keygen_against_exact_user_file(
+    short_tmp_path: Path,
+) -> None:
+    known_hosts = _system_known_hosts(short_tmp_path)
+    known_hosts.write_text(
+        "\n".join(
+            (
+                f"gpu.internal {_valid_ed25519_public_key(b'old-gpu-key')}",
+                f"other.internal {_valid_ed25519_public_key(b'other-key')}",
+                "",
+            )
+        ),
+        encoding="ascii",
+    )
+    known_hosts.chmod(0o600)
+    stderr = (
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        f"SHA256:{'E' * 43}.\n"
+        f"Offending ED25519 key in {known_hosts}:1\n"
+        "Host key verification failed.\n"
+    ).encode()
+    evidence = classify_system_openssh_host_key_failure(stderr)
+    policy = inspect_system_known_hosts_policy(
+        (
+            "hostname gpu.internal\n"
+            "port 22\n"
+            "canonicalizehostname false\n"
+            "hashknownhosts no\n"
+            f"userknownhostsfile {known_hosts}\n"
+            "globalknownhostsfile /etc/ssh/ssh_known_hosts\n"
+        ).encode(),
+        home=short_tmp_path,
+        offending_known_hosts_file=known_hosts,
+    )
+    authority = SystemHostKeyReviewAuthority(hmac_key=b"v" * 32)
+    review = authority.issue(
+        _profile(),
+        connection_generation=10,
+        evidence=evidence,
+        policy=policy,
+    )
+    trust = SystemOpenSshHostTrust(
+        home=short_tmp_path,
+        inherited_environment={},
+        review_authority=authority,
+    )
+
+    trust.replace_changed_key(
+        review,
+        profile=_profile(),
+        connection_generation=10,
+        review_id=review.review_id,
+        review_sha256=review.review_sha256,
+    )
+
+    rewritten = known_hosts.read_text(encoding="ascii")
+    assert "gpu.internal" not in rewritten
+    assert "other.internal" in rewritten
+    assert stat.S_IMODE(known_hosts.stat().st_mode) == 0o600
+
+
+def test_session_maps_master_changed_key_exit_without_retaining_raw_stderr(
+    short_tmp_path: Path,
+) -> None:
+    known_hosts = _system_known_hosts(short_tmp_path)
+    raw = (
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!\n"
+        "The fingerprint for the ED25519 key sent by the remote host is\n"
+        f"SHA256:{'D' * 43}.\n"
+        f"Offending ED25519 key in {known_hosts}:1\n"
+        "Host key verification failed.\n"
+    ).encode()
+    identity = ProcessIdentity(
+        process_id=991,
+        parent_process_id=os.getpid(),
+        process_group_id=os.getpgrp(),
+        session_id=os.getsid(0),
+        user_id=os.geteuid(),
+        birth_identity="failed-master",
+        executable_path=SSH_EXECUTABLE,
+    )
+    inspector = _Inspector(identity)
+    process = _FakeProcess(991, failure_stderr=raw)
+    process.returncode = 255
+
+    class FailedLauncher:
+        def spawn(
+            self,
+            argv: list[str],
+            *,
+            environment: dict[str, str],
+            control_path: Path,
+        ) -> OwnedSshMasterProcess:
+            del argv, environment, control_path
+            return process
+
+    def trust_run(
+        argv: list[str], environment: dict[str, str], timeout_seconds: float
+    ) -> subprocess.CompletedProcess[bytes]:
+        del environment, timeout_seconds
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            (
+                "hostname gpu.internal\n"
+                "port 22\n"
+                "canonicalizehostname false\n"
+                "hashknownhosts no\n"
+                f"userknownhostsfile {known_hosts}\n"
+                "globalknownhostsfile /etc/ssh/ssh_known_hosts\n"
+            ).encode(),
+            b"",
+        )
+
+    trust = SystemOpenSshHostTrust(
+        home=short_tmp_path,
+        inherited_environment={},
+        runner=trust_run,
+    )
+    session = SystemOpenSshSession(
+        _profile(),
+        connection_generation=7,
+        askpass_helper=_helper(short_tmp_path),
+        owns_askpass_helper=True,
+        home=str(short_tmp_path),
+        inherited_environment={},
+        runtime_parent=short_tmp_path,
+        inspector=inspector,
+        launcher=FailedLauncher(),
+        host_trust=trust,
+        startup_timeout_seconds=1.0,
+        cleanup_timeout_seconds=0.2,
+    )
+
+    with pytest.raises(SystemOpenSshSessionError) as exc_info:
+        session.start()
+
+    assert exc_info.value.code == "ssh_host_key_changed"
+    assert exc_info.value.host_key_review is not None
+    assert str(known_hosts) not in repr(exc_info.value)
+    assert raw.decode() not in str(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("state", "kind", "code"),
+    [
+        ("cancelled", "password", "ssh_prompt_cancelled"),
+        ("cancelled", "host_confirmation", "ssh_prompt_cancelled"),
+        ("rejected", "host_confirmation", "ssh_host_key_rejected"),
+        (
+            "completed",
+            "host_confirmation",
+            "ssh_first_host_accepted_reconnect_required",
+        ),
+    ],
+)
+def test_master_exit_maps_native_prompt_outcome_without_prompt_text(
+    short_tmp_path: Path,
+    state: str,
+    kind: str,
+    code: str,
+) -> None:
+    session, process, _inspector, _launcher, _runner = _session(short_tmp_path)
+    session._broker = SimpleNamespace(  # type: ignore[assignment]
+        prompt_observation=AskpassPromptObservation(
+            connection_generation=1,
+            kind=kind,
+            state=state,
+        )
+    )
+
+    error = session._master_exit_error(process, during_startup=True)
+
+    assert error.code == code
+    assert "password:" not in str(error).casefold()
+    session.askpass_helper.close()
+
+
+def test_connection_owner_retries_once_after_first_host_acceptance() -> None:
+    attempts: list[object] = []
+    snapshot = SystemOpenSshSessionSnapshot(
+        profile_id="profile-1",
+        ssh_host_alias="evolab",
+        connection_generation=8,
+        runtime_directory=Path("/tmp/owned-runtime"),
+        control_path=Path("/tmp/owned-runtime/m"),
+        owner_process_id=901,
+        owner_birth_identity="birth-901",
+        process_group_id=900,
+        session_id=800,
+        control_socket_device=1,
+        control_socket_inode=2,
+    )
+
+    class Attempt:
+        def __init__(self, fail: bool) -> None:
+            self.fail = fail
+            self.close_calls = 0
+
+        def start(self) -> SystemOpenSshSessionSnapshot:
+            if self.fail:
+                raise SystemOpenSshSessionError(
+                    "ssh_first_host_accepted_reconnect_required",
+                    "safe retry",
+                )
+            return snapshot
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+        def snapshot(self) -> SystemOpenSshSessionSnapshot:
+            return snapshot
+
+    def factory(_profile_value: SystemOpenSshAliasProfile, _generation: int):
+        attempt = Attempt(fail=not attempts)
+        attempts.append(attempt)
+        return attempt
+
+    owner = SystemOpenSshSessionOwner(factory)  # type: ignore[arg-type]
+    try:
+        assert owner.connect(_profile(), connection_generation=8) == snapshot
+        assert len(attempts) == 2
+        assert attempts[0].close_calls == 1  # type: ignore[attr-defined]
+    finally:
+        owner.close()

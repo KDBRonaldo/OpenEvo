@@ -24,7 +24,7 @@ import struct
 import sys
 import threading
 import time
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 _MAX_SOCKET_PATH_BYTES = 103
@@ -36,9 +36,10 @@ _CAPABILITY_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _SYSTEM_SSH_PATH = "/usr/bin/ssh"
 _PROMPT_KINDS = frozenset({"password", "passphrase", "host_confirmation"})
-_REQUEST_KEYS = frozenset(
+_AUTHORIZATION_REQUEST_KEYS = frozenset(
     {
         "schema_version",
+        "event",
         "capability",
         "connection_generation",
         "helper_pid",
@@ -49,6 +50,8 @@ _REQUEST_KEYS = frozenset(
         "prompt_bytes",
     }
 )
+_COMPLETION_REQUEST_KEYS = _AUTHORIZATION_REQUEST_KEYS | {"outcome"}
+_COMPLETION_OUTCOMES = frozenset({"accepted", "rejected", "cancelled"})
 _CAPABILITY_DOMAIN = b"openevo-system-ssh-askpass-capability-v1\0"
 _BROKER_BIND_WAIT_SECONDS = 2.0
 _BROKER_ACCEPT_INTERVAL_SECONDS = 0.1
@@ -123,9 +126,20 @@ class AskpassCapability:
 class _CapabilityRecord:
     generation: int
     nonce: bytearray = field(repr=False)
+    capability_digest: bytearray = field(repr=False)
     owner: ProcessIdentity | None = None
     consumed: bool = False
     cancelled: bool = False
+    prompt_binding: tuple[int | str, ...] | None = None
+    helper_identity: ProcessIdentity | None = None
+    completion_outcome: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AskpassPromptObservation:
+    connection_generation: int
+    kind: Literal["password", "passphrase", "host_confirmation"]
+    state: Literal["pending", "completed", "rejected", "cancelled"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +195,28 @@ class AskpassAuthorizationBroker:
     def cancelled(self) -> bool:
         with self._guard:
             return self._record is not None and self._record.cancelled
+
+    @property
+    def prompt_observation(self) -> AskpassPromptObservation | None:
+        with self._guard:
+            record = self._record
+            if record is None or record.prompt_binding is None:
+                return None
+            kind = record.prompt_binding[4]
+            assert isinstance(kind, str) and kind in _PROMPT_KINDS
+            if record.cancelled or record.completion_outcome == "cancelled":
+                state = "cancelled"
+            elif record.completion_outcome == "accepted":
+                state = "completed"
+            elif record.completion_outcome == "rejected":
+                state = "rejected"
+            else:
+                state = "pending"
+            return AskpassPromptObservation(
+                connection_generation=record.generation,
+                kind=kind,  # type: ignore[arg-type]
+                state=state,  # type: ignore[arg-type]
+            )
 
     def start(self) -> None:
         with self._guard:
@@ -243,6 +279,7 @@ class AskpassAuthorizationBroker:
             self._record = _CapabilityRecord(
                 generation=connection_generation,
                 nonce=nonce,
+                capability_digest=bytearray(hashlib.sha256(capability.encode("ascii")).digest()),
             )
             return AskpassCapability(
                 value=capability,
@@ -287,6 +324,7 @@ class AskpassAuthorizationBroker:
                 return
             record.cancelled = True
             _zero(record.nonce)
+            _zero(record.capability_digest)
             self._bound.notify_all()
 
     def authorize_payload(
@@ -295,7 +333,7 @@ class AskpassAuthorizationBroker:
         *,
         peer: UnixPeerAuthority,
     ) -> bool:
-        request = _validate_request(payload)
+        request = _validate_authorization_request(payload)
         if request is None or not isinstance(peer, UnixPeerAuthority):
             return False
         with self._bound:
@@ -321,12 +359,52 @@ class AskpassAuthorizationBroker:
                 )
             ):
                 return False
-            if not self._authorize_process_chain(request, peer, record.owner):
+            helper_identity = self._authorize_process_chain(request, peer, record.owner)
+            if helper_identity is None:
                 return False
             # Consume only after every independent authority check succeeds.
             record.consumed = True
+            record.prompt_binding = _prompt_binding(request)
+            record.helper_identity = helper_identity
             _zero(record.nonce)
             self._authorized_prompt_count += 1
+            return True
+
+    def complete_payload(
+        self,
+        payload: Mapping[str, object],
+        *,
+        peer: UnixPeerAuthority,
+    ) -> bool:
+        request = _validate_completion_request(payload)
+        if request is None or not isinstance(peer, UnixPeerAuthority):
+            return False
+        with self._bound:
+            record = self._record
+            if (
+                self._closed
+                or record is None
+                or record.owner is None
+                or record.cancelled
+                or not record.consumed
+                or record.prompt_binding is None
+                or record.helper_identity is None
+                or record.completion_outcome is not None
+                or request["connection_generation"] != record.generation
+                or request["owner_pid"] != record.owner.process_id
+                or _prompt_binding(request) != record.prompt_binding
+                or not hmac.compare_digest(
+                    hashlib.sha256(request["capability"].encode("ascii")).digest(),
+                    record.capability_digest,
+                )
+            ):
+                return False
+            helper_identity = self._authorize_process_chain(request, peer, record.owner)
+            if helper_identity != record.helper_identity:
+                return False
+            record.completion_outcome = request["outcome"]
+            _zero(record.capability_digest)
+            self._bound.notify_all()
             return True
 
     def verify_socket_binding(self) -> None:
@@ -352,6 +430,7 @@ class AskpassAuthorizationBroker:
             if record is not None:
                 record.cancelled = True
                 _zero(record.nonce)
+                _zero(record.capability_digest)
             listener, self._listener = self._listener, None
             thread = self._thread
             self._bound.notify_all()
@@ -395,7 +474,7 @@ class AskpassAuthorizationBroker:
         request: dict[str, int | str],
         peer: UnixPeerAuthority,
         owner: ProcessIdentity,
-    ) -> bool:
+    ) -> ProcessIdentity | None:
         helper_pid = request["helper_pid"]
         ssh_parent_pid = request["ssh_parent_pid"]
         if (
@@ -404,7 +483,7 @@ class AskpassAuthorizationBroker:
             or peer.process_id != helper_pid
             or peer.user_id != owner.user_id
         ):
-            return False
+            return None
         current_owner = self._inspector.inspect(owner.process_id)
         helper = self._inspector.inspect(helper_pid)
         ssh_parent = self._inspector.inspect(ssh_parent_pid)
@@ -416,7 +495,7 @@ class AskpassAuthorizationBroker:
             or ssh_parent is None
             or ssh_parent.executable_path != _SYSTEM_SSH_PATH
         ):
-            return False
+            return None
         current = ssh_parent
         observed: set[int] = set()
         for _ in range(_MAX_ANCESTORS):
@@ -426,14 +505,14 @@ class AskpassAuthorizationBroker:
                 or current.process_group_id != owner.process_group_id
                 or current.session_id != owner.session_id
             ):
-                return False
+                return None
             observed.add(current.process_id)
             if current.process_id == owner.process_id:
-                return current == owner
+                return helper if current == owner else None
             current = self._inspector.inspect(current.parent_process_id)
             if current is None:
-                return False
-        return False
+                return None
+        return None
 
     def _serve(self) -> None:
         while not self._stop.is_set():
@@ -454,7 +533,11 @@ class AskpassAuthorizationBroker:
                     peer = self._peer_authority(client)
                     payload = _read_request(client)
                     if payload is not None:
-                        authorized = self.authorize_payload(payload, peer=peer)
+                        event = payload.get("event")
+                        if event == "authorize":
+                            authorized = self.authorize_payload(payload, peer=peer)
+                        elif event == "complete":
+                            authorized = self.complete_payload(payload, peer=peer)
                 except (OSError, ValueError, AskpassBrokerError):
                     authorized = False
                 response = (
@@ -523,9 +606,41 @@ def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
-def _validate_request(payload: Mapping[str, object]) -> dict[str, int | str] | None:
-    if type(payload) is not dict or set(payload) != _REQUEST_KEYS:
+def _validate_authorization_request(
+    payload: Mapping[str, object],
+) -> dict[str, int | str] | None:
+    if (
+        type(payload) is not dict
+        or set(payload) != _AUTHORIZATION_REQUEST_KEYS
+        or payload.get("event") != "authorize"
+    ):
         return None
+    return _validate_prompt_request(payload, event="authorize")
+
+
+def _validate_completion_request(
+    payload: Mapping[str, object],
+) -> dict[str, int | str] | None:
+    if (
+        type(payload) is not dict
+        or set(payload) != _COMPLETION_REQUEST_KEYS
+        or payload.get("event") != "complete"
+        or type(payload.get("outcome")) is not str
+        or payload["outcome"] not in _COMPLETION_OUTCOMES
+    ):
+        return None
+    validated = _validate_prompt_request(payload, event="complete")
+    if validated is None:
+        return None
+    validated["outcome"] = payload["outcome"]
+    return validated
+
+
+def _validate_prompt_request(
+    payload: Mapping[str, object],
+    *,
+    event: str,
+) -> dict[str, int | str] | None:
     generation = payload["connection_generation"]
     helper_pid = payload["helper_pid"]
     ssh_parent_pid = payload["ssh_parent_pid"]
@@ -533,6 +648,7 @@ def _validate_request(payload: Mapping[str, object]) -> dict[str, int | str] | N
     prompt_bytes = payload["prompt_bytes"]
     if (
         payload["schema_version"] != 1
+        or payload["event"] != event
         or type(generation) is not int
         or not 1 <= generation <= _MAX_SAFE_GENERATION
         or type(helper_pid) is not int
@@ -553,6 +669,7 @@ def _validate_request(payload: Mapping[str, object]) -> dict[str, int | str] | N
         return None
     return {
         "schema_version": 1,
+        "event": event,
         "capability": payload["capability"],
         "connection_generation": generation,
         "helper_pid": helper_pid,
@@ -562,6 +679,18 @@ def _validate_request(payload: Mapping[str, object]) -> dict[str, int | str] | N
         "prompt_sha256": payload["prompt_sha256"],
         "prompt_bytes": prompt_bytes,
     }
+
+
+def _prompt_binding(request: Mapping[str, int | str]) -> tuple[int | str, ...]:
+    return (
+        request["connection_generation"],
+        request["helper_pid"],
+        request["ssh_parent_pid"],
+        request["owner_pid"],
+        request["prompt_kind"],
+        request["prompt_sha256"],
+        request["prompt_bytes"],
+    )
 
 
 def _validate_socket_path(value: Path | str) -> Path:
@@ -744,6 +873,7 @@ __all__ = (
     "AskpassAuthorizationBroker",
     "AskpassBrokerError",
     "AskpassCapability",
+    "AskpassPromptObservation",
     "ProcessIdentity",
     "ProcessInspector",
     "SystemProcessInspector",

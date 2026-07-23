@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Annotated, Callable
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import platform
 import re
@@ -31,7 +32,10 @@ from desktop.sidecar.native_workspace import (
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import NATIVE_SIDECAR_PROTOCOL
-from desktop.sidecar.system_ssh_session import AskpassHelperAuthority
+from desktop.sidecar.system_ssh_session import (
+    AskpassHelperAuthority,
+    SystemOpenSshHostTrust,
+)
 from desktop.sidecar.workspace_identity import (
     native_import_id_for_action,
     ownership_for_native_import,
@@ -415,6 +419,7 @@ def _create_app(
 
     state_root = resolve_desktop_state_root(desktop_config_root)
     askpass_helper: AskpassHelperAuthority | None = None
+    host_trust: SystemOpenSshHostTrust | None = None
     try:
         if build_channel == "release" and release_assets_root is None and core_assets_root is None:
             raise ValueError("release assets root must be provided by the native host")
@@ -438,6 +443,13 @@ def _create_app(
                 expected_sha256=packaged_askpass_helper_sha256,
                 expected_byte_size=packaged_askpass_helper_byte_size,
             )
+            home = os.environ.get("HOME")
+            if home is None:
+                raise ValueError("system OpenSSH HOME is unavailable")
+            host_trust = SystemOpenSshHostTrust(
+                home=home,
+                inherited_environment=os.environ,
+            )
         app = create_release_desktop_local_api_app(
             state_root=state_root,
             session_token=native_frame.session_token,
@@ -448,10 +460,13 @@ def _create_app(
             core_assets_root=core_assets_root,
             release_assets_root=release_assets_root,
             system_ssh_askpass_helper=askpass_helper,
+            system_ssh_host_trust=host_trust,
             startup_phase=record_startup_phase if build_channel == "release" else None,
             close_on_shutdown=build_channel != "release",
         )
     except Exception as exc:
+        if host_trust is not None:
+            host_trust.close()
         if askpass_helper is not None:
             askpass_helper.close()
         if build_channel == "release":

@@ -98,6 +98,7 @@ from openevo.deployment.system_executables import (
     OWNED_SUBPROCESS_BIRTH_ARGUMENT,
     RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
+    SSH_KEYGEN_EXECUTABLE,
     SshAgentProxy,
     SshAgentSocketSource,
     VerifiedSystemExecutable,
@@ -155,6 +156,10 @@ _SYSTEM_OPENSSH_MAX_SOCKET_BYTES = 103
 _SYSTEM_OPENSSH_MAX_HELPER_PATH_BYTES = 4_096
 _SYSTEM_OPENSSH_CAPABILITY_RE = re.compile(r"^[0-9a-f]{64}$")
 _SYSTEM_OPENSSH_LOCALE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
+_SYSTEM_KNOWN_HOSTS_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._%-]{0,252}$")
+_SYSTEM_KNOWN_HOSTS_NONDEFAULT_RE = re.compile(
+    r"^\[(?:[A-Za-z0-9][A-Za-z0-9._%-]{0,252}|[0-9A-Fa-f:.%]+)\]:[1-9][0-9]{0,4}$"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +247,30 @@ def build_system_openssh_probe_argv(
     """Build the post-selection, non-authoritative ``ssh -G`` probe."""
 
     return [SSH_EXECUTABLE, "-G", "--", profile.ssh_host_alias]
+
+
+def build_system_ssh_keygen_remove_argv(
+    *,
+    lookup_token: str,
+    known_hosts_file: Path | str,
+) -> list[str]:
+    """Build the one allowed changed-key trust-store mutation."""
+
+    if type(lookup_token) is not str or not _valid_system_known_hosts_lookup_token(lookup_token):
+        raise ValueError("system known-hosts lookup token is invalid")
+    path = os.fspath(known_hosts_file)
+    _validate_absolute_local_path(
+        path,
+        field_name="system known-hosts file",
+        max_bytes=4_096,
+    )
+    return [
+        SSH_KEYGEN_EXECUTABLE,
+        "-R",
+        lookup_token,
+        "-f",
+        path,
+    ]
 
 
 def build_system_openssh_master_argv(
@@ -499,6 +528,26 @@ def _validate_system_openssh_count(
 ) -> None:
     if type(value) is not int or not minimum <= value <= maximum:
         raise ValueError(f"{field_name} is invalid")
+
+
+def _valid_system_known_hosts_lookup_token(value: str) -> bool:
+    if (
+        not value
+        or value.startswith("-")
+        or "," in value
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        return False
+    if _SYSTEM_KNOWN_HOSTS_HOST_RE.fullmatch(value) is not None:
+        return True
+    if _SYSTEM_KNOWN_HOSTS_NONDEFAULT_RE.fullmatch(value) is not None:
+        port = int(value.rsplit(":", 1)[1])
+        return port <= 65_535
+    try:
+        return ipaddress.ip_address(value).version == 6
+    except ValueError:
+        return False
+
 
 _SUBPROCESS_BIRTH_LAUNCHER = """
 import os

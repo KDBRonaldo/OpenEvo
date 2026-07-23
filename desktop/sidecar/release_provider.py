@@ -82,7 +82,10 @@ from desktop.sidecar.ssh_config_catalog import (
     OpenSshCatalogScan,
     OpenSshHostCatalogLoader,
 )
-from desktop.sidecar.system_ssh_session import AskpassHelperAuthority
+from desktop.sidecar.system_ssh_session import (
+    AskpassHelperAuthority,
+    SystemOpenSshHostTrust,
+)
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
 from desktop.sidecar.workspace_identity import ownership_for_native_import
@@ -497,6 +500,7 @@ class DesktopReleaseProvider:
         execution_mode_capabilities: ExecutionModeCapabilitiesV1,
         remote_lifecycle: DesktopRemoteLifecycle,
         system_ssh_askpass_helper: AskpassHelperAuthority | None = None,
+        system_ssh_host_trust: SystemOpenSshHostTrust | None = None,
         core_runtime: DesktopCoreRuntimeOwnerV1 | None = None,
         core_bridge: DesktopCoreBridgeV1 | None = None,
         event_broker: DesktopEventBrokerV1 | None = None,
@@ -512,10 +516,17 @@ class DesktopReleaseProvider:
             system_ssh_askpass_helper, AskpassHelperAuthority
         ):
             raise TypeError("system SSH askpass helper authority is invalid")
+        if system_ssh_host_trust is not None and not isinstance(
+            system_ssh_host_trust, SystemOpenSshHostTrust
+        ):
+            raise TypeError("system SSH host trust authority is invalid")
+        if (system_ssh_askpass_helper is None) != (system_ssh_host_trust is None):
+            raise ValueError("system SSH helper and host trust authorities must be paired")
         self._store = store
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
         self._system_ssh_askpass_helper = system_ssh_askpass_helper
+        self._system_ssh_host_trust = system_ssh_host_trust
         self._core_runtime = core_runtime
         self._core_bridge = core_runtime.core_bridge if core_runtime is not None else core_bridge
         self._event_broker = (
@@ -632,6 +643,12 @@ class DesktopReleaseProvider:
         elif self._event_broker is not None:
             failure = _collect_cleanup_failure(self._event_broker.close, failure)
         failure = _collect_cleanup_failure(self._remote_lifecycle.close, failure)
+        host_trust = getattr(self, "_system_ssh_host_trust", None)
+        if host_trust is not None:
+            failure = _collect_cleanup_failure(
+                host_trust.close,
+                failure,
+            )
         askpass_helper = getattr(self, "_system_ssh_askpass_helper", None)
         if askpass_helper is not None:
             failure = _collect_cleanup_failure(
@@ -652,6 +669,12 @@ class DesktopReleaseProvider:
         """Return the sealed helper authority reserved for the v2 lifecycle."""
 
         return self._system_ssh_askpass_helper
+
+    @property
+    def system_ssh_host_trust(self) -> SystemOpenSshHostTrust | None:
+        """Return the user-trust mediator reserved for the v2 lifecycle."""
+
+        return self._system_ssh_host_trust
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)

@@ -69,6 +69,7 @@ def _request(
 ) -> dict[str, object]:
     return {
         "schema_version": 1,
+        "event": "authorize",
         "capability": capability,
         "connection_generation": generation,
         "helper_pid": helper_pid,
@@ -77,6 +78,18 @@ def _request(
         "prompt_kind": kind,
         "prompt_sha256": "a" * 64,
         "prompt_bytes": 17,
+    }
+
+
+def _completion(
+    authorization: dict[str, object],
+    *,
+    outcome: str,
+) -> dict[str, object]:
+    return {
+        **authorization,
+        "event": "complete",
+        "outcome": outcome,
     }
 
 
@@ -164,6 +177,60 @@ def test_direct_ssh_askpass_authorization_is_single_use(runtime_dir: Path) -> No
         assert first is True
         assert second is False
         assert broker.authorized_prompt_count == 1
+        assert broker.prompt_observation is not None
+        assert broker.prompt_observation.state == "pending"
+    finally:
+        broker.close()
+
+
+@pytest.mark.parametrize(
+    ("outcome", "state"),
+    [
+        ("accepted", "completed"),
+        ("rejected", "rejected"),
+        ("cancelled", "cancelled"),
+    ],
+)
+def test_prompt_completion_is_bound_to_the_authorized_helper_and_has_no_secret(
+    runtime_dir: Path,
+    outcome: str,
+    state: str,
+) -> None:
+    helper_pid = os.getpid()
+    owner = _identity(150, parent_id=50, executable="/usr/bin/ssh")
+    helper = _identity(helper_pid, parent_id=150, executable="/tmp/helper")
+    broker = AskpassAuthorizationBroker(
+        runtime_dir / "a",
+        helper_path=helper.executable_path,
+        inspector=_Inspector({150: owner, helper_pid: helper}),
+        hmac_key=b"o" * 32,
+    )
+    try:
+        broker.start()
+        capability = broker.issue_capability(connection_generation=10)
+        broker.bind_owner(capability, owner)
+        authorization = _request(
+            capability=capability.value,
+            generation=10,
+            helper_pid=helper_pid,
+            ssh_parent_pid=150,
+            owner_pid=150,
+            kind="host_confirmation",
+        )
+        peer = UnixPeerAuthority(process_id=helper_pid, user_id=os.geteuid())
+
+        assert broker.authorize_payload(authorization, peer=peer)
+        assert broker.complete_payload(
+            _completion(authorization, outcome=outcome),
+            peer=peer,
+        )
+        assert broker.prompt_observation is not None
+        assert broker.prompt_observation.kind == "host_confirmation"
+        assert broker.prompt_observation.state == state
+        assert not broker.complete_payload(
+            _completion(authorization, outcome=outcome),
+            peer=peer,
+        )
     finally:
         broker.close()
 
@@ -376,18 +443,21 @@ def test_socket_protocol_is_bounded_closed_and_never_returns_response_bytes(
         broker.start()
         capability = broker.issue_capability(connection_generation=6)
         broker.bind_owner(capability, owner)
-        response = _exchange(
+        request = _request(
+            capability=capability.value,
+            generation=6,
+            helper_pid=helper_pid,
+            ssh_parent_pid=700,
+            owner_pid=700,
+        )
+        response = _exchange(broker.socket_path, request)
+        completion = _exchange(
             broker.socket_path,
-            _request(
-                capability=capability.value,
-                generation=6,
-                helper_pid=helper_pid,
-                ssh_parent_pid=700,
-                owner_pid=700,
-            ),
+            _completion(request, outcome="cancelled"),
         )
 
         assert response == {"authorized": True, "schema_version": 1}
+        assert completion == {"authorized": True, "schema_version": 1}
         assert set(response) == {"authorized", "schema_version"}
     finally:
         broker.close()
