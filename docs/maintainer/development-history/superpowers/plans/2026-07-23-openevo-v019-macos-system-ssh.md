@@ -652,22 +652,22 @@ The exact broader gate is added in Task 18 after every slice is present.
 - Create: `tests/backend/test_science_successor_preparer_v2.py`
 - Modify: relevant Gateway/Rollout recovery tests
 
-- [ ] RED-test Task/Attempt progress, generation-bound run admission, verified
+- [x] RED-test Task/Attempt progress, generation-bound run admission, verified
   terminal execution receipt, cancellation race, infrastructure retry, crash
   recovery, and one authoritative Attempt only.
-- [ ] Compile the immutable v2 admission directly into the managed Codex
+- [x] Compile the immutable v2 admission directly into the managed Codex
   Subscription service graph. Do not create or mutate v1 project/run authority.
-- [ ] Before Gateway cleanup, publish a bounded no-follow workspace-result
+- [x] Before Gateway cleanup, publish a bounded no-follow workspace-result
   snapshot through an internal opaque, authenticated, one-owner handoff. Prove
   retry/restart cleanup and never expose a host path through public contracts,
   events, logs, or persisted task envelopes.
-- [ ] Build the production successor plan from the saved normalized project
+- [x] Build the production successor plan from the saved normalized project
   config and runner evidence, seal the transcript dataset, validate exact
   plan-bound method outputs, materialize the complete next-session context, and
   atomically commit the workspace/evolution/runtime successor.
-- [ ] Add a real two-session integration proving session N cannot consume its
+- [x] Add a real two-session integration proving session N cannot consume its
   own outputs and session N+1 receives the committed context and workspace.
-- [ ] Run focused Gateway/rollout/evolution/run-owner tests and protected-source
+- [x] Run focused Gateway/rollout/evolution/run-owner tests and protected-source
   guards; commit:
   `feat(core): execute v2 subscription tasks`
 

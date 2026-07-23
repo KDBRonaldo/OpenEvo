@@ -15,6 +15,10 @@ from typing import Any
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from openevo.backend.workspace_handoff_v2 import (
+    WORKSPACE_HANDOFF_ROOT_ENV,
+    WorkspaceHandoffStoreV2,
+)
 from openevo.config import GatewayNodeConfig, TopologyConfig
 from openevo.gateway.completion_writer import CompletionWriter
 from openevo.gateway.detection import APIType, detect, extract_model
@@ -152,6 +156,12 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
     builder_registry = default_builder_registry()
     evaluator_registry = default_evaluator_registry()
     event_bus = EventBus()
+    workspace_handoff_root = os.environ.get(WORKSPACE_HANDOFF_ROOT_ENV)
+    workspace_handoff_store = (
+        None
+        if workspace_handoff_root is None
+        else WorkspaceHandoffStoreV2(workspace_handoff_root)
+    )
     # Wrap session_registry methods to emit events on state changes.
     _wrap_registry_for_events(session_registry, event_bus)
     node_manager = GatewayNodeManager(
@@ -187,6 +197,8 @@ def _build_state(topology: TopologyConfig, node_id: str | None) -> GatewayState:
             _internal_identity.request_headers() if _internal_identity is not None else None
         ),
         credential_authority=_credential_authority,
+        workspace_handoff_store=workspace_handoff_store,
+        service_identity=_internal_identity,
     )
     return GatewayState(
         topology=topology,

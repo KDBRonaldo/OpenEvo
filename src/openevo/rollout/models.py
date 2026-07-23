@@ -12,8 +12,13 @@ from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from openevo.backend.workspace_handoff_v2 import (
+    WorkspaceHandoffBindingV2,
+    WorkspaceResultReceiptV2,
+)
+from openevo.backend.runtime_context_binding_v2 import RuntimeContextBindingV2
 from openevo.harness.models import AgentSpec
 from openevo.runtime.models import RuntimeSpec
 from openevo.trajectory.models import EvaluatorSpec, StrategySpec, Trajectory
@@ -74,6 +79,19 @@ class TaskRequest(BaseModel):
     evaluator: EvaluatorSpec | None = None
     callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+    workspace_handoff: WorkspaceHandoffBindingV2 | None = None
+    runtime_context_binding: RuntimeContextBindingV2 | None = None
+
+    @model_validator(mode="after")
+    def _one_workspace_owner(self) -> TaskRequest:
+        if self.workspace_handoff is not None:
+            if self.num_samples != 1:
+                raise ValueError("an opaque workspace handoff supports exactly one session")
+            if self.workspace_handoff.task_id != self.task_id:
+                raise ValueError("workspace handoff belongs to another rollout task")
+        if self.runtime_context_binding is not None and self.workspace_handoff is None:
+            raise ValueError("runtime context binding requires the same private workspace owner")
+        return self
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +149,19 @@ class SessionDispatchRequest(BaseModel):
     evaluator: EvaluatorSpec | None = None
     callback_url: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+    workspace_handoff: WorkspaceHandoffBindingV2 | None = None
+    runtime_context_binding: RuntimeContextBindingV2 | None = None
+
+    @model_validator(mode="after")
+    def _workspace_task(self) -> SessionDispatchRequest:
+        if (
+            self.workspace_handoff is not None
+            and self.workspace_handoff.task_id != self.task_id
+        ):
+            raise ValueError("workspace handoff belongs to another rollout task")
+        if self.runtime_context_binding is not None and self.workspace_handoff is None:
+            raise ValueError("runtime context binding requires the same private workspace owner")
+        return self
 
 
 class SessionDispatchResponse(BaseModel):
@@ -170,6 +201,16 @@ class SessionResult(BaseModel):
     node_id: str | None = None
     error: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
+    workspace_result: WorkspaceResultReceiptV2 | None = None
+
+    @model_validator(mode="after")
+    def _workspace_result_task(self) -> SessionResult:
+        if self.workspace_result is not None and (
+            self.workspace_result.task_id != self.task_id
+            or self.workspace_result.session_id != self.session_id
+        ):
+            raise ValueError("workspace result belongs to another rollout session")
+        return self
 
 
 class TaskResult(BaseModel):

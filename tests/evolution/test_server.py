@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import inspect
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 import httpx
@@ -11,6 +13,8 @@ import pytest
 from openevo.evolution.client import EvolutionClient
 from openevo.evolution.server import create_app
 from openevo.evolution.worker import EvolutionWorkerClient
+from openevo.internal_auth import InternalServiceIdentity
+from openevo.runtime.base import RUNTIME_READBACK_MAX_BYTES
 
 
 def test_health_reports_artifact_root(tmp_path):
@@ -24,6 +28,59 @@ def test_health_reports_artifact_root(tmp_path):
         "db": "ok",
         "artifact_root": str(tmp_path / "artifacts"),
     }
+
+
+def test_materialized_blob_transport_rejects_oversize_before_read(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    credential = "materialized-blob-transport-test-credential"
+    server_identity = InternalServiceIdentity(
+        service_id="evolution-backend",
+        generation_digest="1" * 64,
+        registry_digest="2" * 64,
+        framework_lock_digest="3" * 64,
+        credential=credential,
+    )
+    caller_identity = InternalServiceIdentity(
+        service_id="gateway",
+        generation_digest=server_identity.generation_digest,
+        registry_digest=server_identity.registry_digest,
+        framework_lock_digest=server_identity.framework_lock_digest,
+        credential=credential,
+    )
+    app = create_app(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+        internal_identity=server_identity,
+    )
+
+    class UnreadableStream:
+        def read(self, _size: int = -1) -> bytes:
+            raise AssertionError("oversized materialized blob must not be read")
+
+    @contextmanager
+    def open_oversized_blob(_context_id: str, _blob_id: str):
+        yield SimpleNamespace(
+            blob=SimpleNamespace(
+                size_bytes=RUNTIME_READBACK_MAX_BYTES + 1,
+                sha256="4" * 64,
+                media_type="application/octet-stream",
+            ),
+            stream=UnreadableStream(),
+        )
+
+    monkeypatch.setattr(app.state.store, "open_materialized_blob", open_oversized_blob)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get(
+            "/v1/internal/materialized-contexts/context-1/blobs/blob-1",
+            headers=caller_identity.request_headers(),
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == (
+        "materialized context blob exceeds the runtime transport budget"
+    )
 
 
 def test_post_event_ingests_once(tmp_path):

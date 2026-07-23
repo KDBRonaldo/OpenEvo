@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
+from datetime import datetime, timezone
 
 import httpx
 import pytest
 
 from openevo.harness.models import AgentSpec
+from openevo.backend.contracts.v2.models import (
+    WorkspaceArchiveDeclarationV2,
+    WorkspaceSnapshotRefV2,
+)
+from openevo.backend.workspace_handoff_v2 import WorkspaceHandoffBindingV2
 from openevo.rollout.balancer import NodeScheduler
 from openevo.rollout.models import (
     NodeRegistrationRequest,
@@ -62,6 +69,36 @@ async def test_run_batch_preserves_gateway_contract_and_cleans_up(monkeypatch) -
         refresh_runtime=True,
     )
     metadata = {"sample_index": 3, "tags": ["contract", "rollout"]}
+    empty_archive = WorkspaceArchiveDeclarationV2(
+        format="openevo_deterministic_tar_v1",
+        media_type="application/vnd.openevo.workspace-tar",
+        content_sha256=hashlib.sha256(bytes(1024)).hexdigest(),
+        byte_size=1024,
+        entry_count=0,
+        extracted_byte_size=0,
+    )
+    workspace_handoff = WorkspaceHandoffBindingV2(
+        handoff_id="workspace-handoff-contract",
+        task_id="task-contract",
+        attempt_id="attempt-contract",
+        task_admission_id="task-admission-contract",
+        admission_sha256="1" * 64,
+        project_id="project-contract",
+        input_workspace_snapshot=WorkspaceSnapshotRefV2(
+            workspace_snapshot_id="workspace-contract",
+            project_id="project-contract",
+            manifest_sha256="2" * 64,
+            entry_count=0,
+            byte_size=0,
+        ),
+        input_archive=empty_archive,
+        service_generation_sha256="3" * 64,
+        registry_sha256="4" * 64,
+        framework_lock_sha256="5" * 64,
+        created_at=datetime(2026, 7, 23, 4, tzinfo=timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z"),
+    )
     task_request = TaskRequest(
         task_id="task-contract",
         instruction="Solve the contract probe.",
@@ -71,6 +108,7 @@ async def test_run_batch_preserves_gateway_contract_and_cleans_up(monkeypatch) -
         builder=builder,
         evaluator=evaluator,
         metadata=metadata,
+        workspace_handoff=workspace_handoff,
     )
     session = SessionContext(
         session_id="session-contract",
@@ -157,6 +195,7 @@ async def test_run_batch_preserves_gateway_contract_and_cleans_up(monkeypatch) -
     assert received_dispatch.builder == builder
     assert received_dispatch.evaluator == evaluator
     assert received_dispatch.metadata == metadata
+    assert received_dispatch.workspace_handoff == workspace_handoff
 
     assert len(results) == 1
     assert isinstance(results[0], SessionResult)

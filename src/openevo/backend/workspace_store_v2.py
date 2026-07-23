@@ -806,6 +806,54 @@ class WorkspaceStoreV2:
             )
             return self.root / _SNAPSHOTS_NAME / snapshot.workspace_snapshot_id
 
+    def archive_declaration(
+        self,
+        snapshot: m.WorkspaceSnapshotRefV2,
+    ) -> m.WorkspaceArchiveDeclarationV2:
+        """Recover the exact private archive authority behind a snapshot ref."""
+
+        snapshot = _exact_model(m.WorkspaceSnapshotRefV2, snapshot)
+        with self._lock, self._reader() as connection:
+            row = connection.execute(
+                "SELECT snapshot_json, source_upload_id FROM snapshots "
+                "WHERE workspace_snapshot_id = ?",
+                (snapshot.workspace_snapshot_id,),
+            ).fetchone()
+            if row is None or _snapshot_from_bytes(bytes(row["snapshot_json"])) != snapshot:
+                raise WorkspaceNotFoundV2("workspace snapshot was not found")
+            source_upload_id = row["source_upload_id"]
+            if source_upload_id is None:
+                archive = _empty_archive_declaration()
+            else:
+                upload = connection.execute(
+                    "SELECT state, archive_json, workspace_snapshot_json FROM uploads "
+                    "WHERE upload_id = ?",
+                    (source_upload_id,),
+                ).fetchone()
+                if (
+                    upload is None
+                    or upload["state"] != "finalized"
+                    or upload["workspace_snapshot_json"] is None
+                    or _snapshot_from_bytes(bytes(upload["workspace_snapshot_json"]))
+                    != snapshot
+                ):
+                    raise WorkspaceIntegrityErrorV2(
+                        "workspace snapshot lost its archive authority"
+                    )
+                archive = _archive_from_bytes(bytes(upload["archive_json"]))
+            if _snapshot_for(snapshot.project_id, archive) != snapshot:
+                raise WorkspaceIntegrityErrorV2(
+                    "workspace archive declaration does not reproduce its snapshot"
+                )
+            self._verify_snapshot_filesystem(
+                connection,
+                snapshot,
+                source_upload_id=(
+                    None if source_upload_id is None else str(source_upload_id)
+                ),
+            )
+            return archive
+
     def _prepare_root(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         metadata = self.root.stat(follow_symlinks=False)

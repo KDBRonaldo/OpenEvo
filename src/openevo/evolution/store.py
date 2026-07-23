@@ -725,6 +725,65 @@ def _fetch_guarded_row(
     return row
 
 
+def _read_guarded_materialized_context_row(
+    conn: sqlite3.Connection,
+    context_id: str,
+) -> sqlite3.Row | None:
+    specs = (
+        _GuardedTextSpec("context_id", "context_id", 256),
+        _GuardedTextSpec("registry_digest", "registry_digest", 64),
+        _GuardedTextSpec("request_digest", "request_digest", 64),
+        _GuardedTextSpec(
+            "manifest_json",
+            "manifest_json",
+            MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+        ),
+    )
+    selections = [
+        "CASE WHEN typeof(context_id) = 'text' "
+        "AND length(CAST(context_id AS BLOB)) <= 256 "
+        "THEN context_id END AS __row_key"
+    ]
+    selections.extend(
+        f"CASE WHEN {spec.column} IS NULL THEN -1 "
+        f"ELSE length(CAST({spec.column} AS BLOB)) END AS __length_{index}"
+        for index, spec in enumerate(specs)
+    )
+    row = conn.execute(
+        f"SELECT {', '.join(selections)} FROM context_materializations "
+        "WHERE context_id = ?",
+        (context_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    if row["__row_key"] != context_id:
+        raise RevisionIntegrityError("materialized context row key is invalid")
+    lengths: list[int] = []
+    for index, spec in enumerate(specs):
+        length = row[f"__length_{index}"]
+        if type(length) is not int or length < 0 or length > spec.max_bytes:
+            raise RevisionIntegrityError(
+                "materialized context exceeds its guarded value byte limit"
+            )
+        lengths.append(length)
+    budget = _RecoveryBudget(
+        label="materialized context transport",
+        max_rows=1,
+        max_bytes=MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+        max_row_bytes=MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+    )
+    budget.consume_lengths(tuple(lengths))
+    return _fetch_guarded_row(
+        conn,
+        from_sql="context_materializations",
+        where_sql="context_id = ?",
+        key=context_id,
+        text_specs=specs,
+        lengths=tuple(lengths),
+        label="materialized context transport",
+    )
+
+
 def _read_guarded_store_identity_row(conn: sqlite3.Connection) -> sqlite3.Row:
     specs = (
         _GuardedTextSpec("store_id", "store_id", 64),
@@ -4207,6 +4266,40 @@ class EvolutionStore:
             return "committed"
         return "unknown"
 
+    def get_materialized_context(self, context_id: str) -> MaterializedContext:
+        """Read one canonical materialization without exposing its filesystem path."""
+
+        if (
+            not isinstance(context_id, str)
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", context_id)
+            is None
+        ):
+            raise ValueError("materialized context identity is invalid")
+        materializer = self._context_materializer
+        if materializer is None:
+            raise ValueError(
+                "materialized context access requires a verified executable registry"
+            )
+        if self._bound_store_id is None:
+            raise ValueError("evolution store identity has not been initialized")
+        with self._locked_context_materialization_root() as materialization_root_fd:
+            try:
+                with self.connect() as conn:
+                    self._verify_bound_store_identity(conn)
+                    row = _read_guarded_materialized_context_row(conn, context_id)
+                if row is None:
+                    raise ValueError("materialized context is not persisted")
+                manifest = self._materialized_context_from_row(row)
+                materializer.verify_persisted_materialization(
+                    manifest,
+                    materialization_root_descriptor=materialization_root_fd,
+                )
+                return manifest
+            finally:
+                self._verify_bound_materialization_root(materialization_root_fd)
+                with self.connect() as conn:
+                    self._verify_bound_store_identity(conn)
+
     @contextmanager
     def open_materialized_blob(
         self,
@@ -4223,11 +4316,7 @@ class EvolutionStore:
         with self._locked_context_materialization_root() as materialization_root_fd:
             with self.connect() as conn:
                 self._verify_bound_store_identity(conn)
-                row = conn.execute(
-                    "SELECT context_id, registry_digest, request_digest, manifest_json "
-                    "FROM context_materializations WHERE context_id = ?",
-                    (context_id,),
-                ).fetchone()
+                row = _read_guarded_materialized_context_row(conn, context_id)
             if row is None:
                 raise ValueError("materialized context is not persisted")
             manifest = self._materialized_context_from_row(row)

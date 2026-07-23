@@ -17,6 +17,7 @@ import shutil
 import stat
 import time
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Any, Awaitable, Callable, cast
@@ -24,6 +25,11 @@ from urllib.parse import unquote, urlparse
 
 import httpx
 
+from openevo.backend.workspace_handoff_v2 import (
+    WorkspaceHandoffErrorV2,
+    WorkspaceHandoffStoreV2,
+)
+from openevo.backend.runtime_context_binding_v2 import RuntimeContextBindingV2
 from openevo.config import EvolutionConfig
 from openevo.gateway.dispatcher import (
     DispatcherAdmissionLease,
@@ -57,6 +63,7 @@ from openevo.harness.capture import canonicalize_capture_mode, transcript_captur
 from openevo.harness.base import BaseHarness
 from openevo.harness.factory import create_harness
 from openevo.harness.models import AgentRunResult
+from openevo.internal_auth import InternalServiceIdentity
 from openevo.rollout.models import (
     NodeHeartbeatRequest,
     NodeRegistrationRequest,
@@ -68,6 +75,8 @@ from openevo.rollout.models import (
 from openevo.rollout.timer import StageTimer
 from openevo.runtime.base import (
     BaseRuntime,
+    RUNTIME_READBACK_MAX_BYTES,
+    RUNTIME_READBACK_MAX_FILES,
     RUNTIME_SESSION_DIR,
     RuntimeReadbackBudget,
     RuntimePathSecurityError,
@@ -117,6 +126,8 @@ from openevo.evolution.agent_system import (
     normalize_agent_system_target_path,
 )
 from openevo.evolution.client import EvolutionClient
+from openevo.evolution.context_materialization import MaterializedContext
+from openevo.evolution.framework import canonical_digest, canonical_json
 from openevo.evolution.framework.handlers import PayloadManifestEntry, payload_tree_digest
 from openevo.evolution.runtime_injection import (
     RuntimeInjectionPlan,
@@ -860,6 +871,310 @@ async def _stage_evolution_context_files(
         staged_tree_sha256=staged_tree_sha256,
         injection_plan=injection_plan,
     )
+
+
+async def _stage_materialized_runtime_context(
+    *,
+    runtime: BaseRuntime,
+    evolution_client: EvolutionClient,
+    binding: RuntimeContextBindingV2,
+    instruction: str,
+    target_dir: str,
+    base_model: str | None,
+) -> _EvolutionStagingResult:
+    """Fetch and stage one exact Core-materialized successor context."""
+
+    if type(binding) is not RuntimeContextBindingV2:
+        binding = RuntimeContextBindingV2.model_validate(binding.model_dump(mode="python"))
+    if (
+        binding.source != "materialized_successor"
+        or binding.materialized_context_id is None
+        or binding.materialized_context_manifest_sha256 is None
+        or binding.successor_transition_id is None
+        or binding.source_predecessor_project_head_id is None
+    ):
+        raise ValueError("runtime context binding is not a materialized successor")
+    if target_dir != _CANONICAL_EVOLUTION_TARGET_DIR:
+        raise ValueError("v2 runtime context requires the canonical evolution root")
+    if not isinstance(instruction, str) or not instruction:
+        raise ValueError("v2 runtime context requires a task instruction")
+
+    raw_context = await evolution_client.get_materialized_context(binding.materialized_context_id)
+    context = MaterializedContext.model_validate_json(
+        json.dumps(
+            raw_context,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    head = binding.project_head
+    if (
+        canonical_digest(context) != binding.materialized_context_manifest_sha256
+        or context.context_id != binding.materialized_context_id
+        or context.registry_digest != head.registry_sha256
+        or context.successor_transition_id != binding.successor_transition_id
+        or context.predecessor_project_head_id != binding.source_predecessor_project_head_id
+        or context.selection.artifact_ids != binding.selected_artifact_ids
+        or context.base_model != base_model
+        or head.runtime_context_snapshot.registry_sha256 != context.registry_digest
+        or head.runtime_context_snapshot.evolution_revision_id
+        != head.evolution_revision.evolution_revision_id
+    ):
+        raise ValueError("materialized context differs from the committed runtime authority")
+
+    effective_instruction = (
+        instruction
+        if not context.instruction
+        else f"{context.instruction}\n\nTask:\n{instruction}"
+    )
+    context_bytes = canonical_json(context).encode("utf-8")
+    adapter_bytes = canonical_json(context.adapter_merge_spec).encode("utf-8")
+    instruction_bytes = effective_instruction.encode("utf-8")
+    declared_runtime_bytes = (
+        len(context_bytes)
+        + len(adapter_bytes)
+        + len(instruction_bytes)
+        + sum(blob.size_bytes for blob in context.blobs)
+    )
+    if (
+        len(context.blobs) + 3 > RUNTIME_READBACK_MAX_FILES
+        or declared_runtime_bytes > RUNTIME_READBACK_MAX_BYTES
+    ):
+        raise ValueError("materialized context exceeds the runtime readback budget")
+
+    blob_payloads: dict[str, bytes] = {}
+    for blob in context.blobs:
+        payload = await evolution_client.get_materialized_blob(
+            context.context_id,
+            blob.blob_id,
+        )
+        if (
+            type(payload) is not bytes
+            or len(payload) != blob.size_bytes
+            or hashlib.sha256(payload).hexdigest() != blob.sha256
+        ):
+            raise ValueError("materialized context blob changed during transport")
+        blob_payloads[blob.blob_id] = payload
+
+    roots = {
+        "target_data": target_dir,
+        "harness_skills": f"{target_dir}/skills",
+        "harness_instruction": MANAGED_WORKSPACE,
+    }
+    env = _materialized_runtime_environment(context, roots=roots)
+    reserved_env = {
+        "OPENEVO_EVOLUTION_CONTEXT": f"{target_dir}/context.json",
+        "OPENEVO_ADAPTER_MERGE_SPEC": f"{target_dir}/adapters.json",
+    }
+    if set(env) & set(reserved_env):
+        raise ValueError("materialized context overrides a reserved runtime binding")
+    env = {**reserved_env, **env}
+
+    uploads: list[tuple[str, str, bytes, str | None]] = [
+        (
+            f"{target_dir}/context.json",
+            "evolution/context.json",
+            context_bytes,
+            None,
+        ),
+        (
+            f"{target_dir}/adapters.json",
+            "evolution/adapters.json",
+            adapter_bytes,
+            None,
+        ),
+        (
+            f"{target_dir}/instruction.txt",
+            "evolution/instruction.txt",
+            instruction_bytes,
+            None,
+        ),
+    ]
+    agent_system_targets: dict[str, bytes] = {}
+    runtime_paths: dict[str, list[str]] = {
+        artifact_id: [] for artifact_id in binding.selected_artifact_ids
+    }
+    occupied = {item[0] for item in uploads}
+    for blob in context.blobs:
+        scope = blob.destination_scope.value
+        root = roots.get(scope)
+        if root is None:
+            raise ValueError("materialized blob has an unsupported destination scope")
+        relative = _canonical_materialized_relative_path(blob.destination_relative_path)
+        remote_path = f"{root}/{relative}"
+        if remote_path in occupied:
+            raise ValueError("materialized context runtime destinations conflict")
+        occupied.add(remote_path)
+        if scope == "target_data":
+            receipt_path = f"evolution/{relative}"
+        elif scope == "harness_skills":
+            receipt_path = f"evolution/skills/{relative}"
+        else:
+            normalized = normalize_agent_system_target_path(relative)
+            if normalized != relative:
+                raise ValueError("materialized agent-system target is not canonical")
+            receipt_path = f"agent_system_targets/{relative}"
+            agent_system_targets[relative] = blob_payloads[blob.blob_id]
+        uploads.append(
+            (
+                remote_path,
+                receipt_path,
+                blob_payloads[blob.blob_id],
+                blob.blob_id,
+            )
+        )
+        for artifact_id in blob.source_artifact_ids:
+            if artifact_id not in runtime_paths:
+                raise ValueError("materialized blob references an uncommitted artifact")
+            runtime_paths[artifact_id].append(receipt_path)
+
+    entries = sorted(
+        (
+            {
+                "relative_path": receipt_path,
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            }
+            for _remote_path, receipt_path, payload, _blob_id in uploads
+        ),
+        key=lambda item: str(item["relative_path"]),
+    )
+    if len(entries) != len({str(item["relative_path"]) for item in entries}):
+        raise ValueError("materialized context receipt destinations conflict")
+    files_by_path = {str(item["relative_path"]): item for item in entries}
+    artifacts: list[dict[str, object]] = []
+    staged_artifacts: list[_StagedEvolutionArtifact] = []
+    target_by_artifact: dict[str, str] = {}
+    for projection in context.projections:
+        for artifact_id in projection.artifact_ids:
+            prior = target_by_artifact.setdefault(artifact_id, projection.target_id)
+            if prior != projection.target_id:
+                raise ValueError("materialized artifact appears in multiple targets")
+    for artifact_id in binding.selected_artifact_ids:
+        paths = sorted(set(runtime_paths[artifact_id]))
+        if not paths:
+            paths = ["evolution/adapters.json"]
+        selected_entries = [files_by_path[path] for path in paths]
+        runtime_tree_sha256 = _canonical_sha256({"files": selected_entries})
+        content_sha256 = _canonical_sha256({"artifact_id": artifact_id, "files": selected_entries})
+        artifact_type = target_by_artifact.get(artifact_id, "materialized_context")
+        artifacts.append(
+            {
+                "artifact_id": artifact_id,
+                "artifact_type": artifact_type,
+                "content_sha256": content_sha256,
+                "runtime_paths": paths,
+                "runtime_tree_sha256": runtime_tree_sha256,
+            }
+        )
+        staged_artifacts.append(
+            _StagedEvolutionArtifact(
+                artifact_id=artifact_id,
+                artifact_type=artifact_type,
+                content_sha256=content_sha256,
+                staged_sha256=runtime_tree_sha256,
+            )
+        )
+    runtime_tree_sha256 = _canonical_sha256({"files": entries})
+    authority: dict[str, object] = {
+        "schema_version": "4",
+        "context_id": context.context_id,
+        "context_manifest_sha256": binding.materialized_context_manifest_sha256,
+        "revision_id": head.evolution_revision.evolution_revision_id,
+        "runtime_context_snapshot_id": (head.runtime_context_snapshot.runtime_context_snapshot_id),
+        "project_head_id": head.project_head_id,
+        "instruction_sha256": hashlib.sha256(instruction_bytes).hexdigest(),
+        "runtime_tree_sha256": runtime_tree_sha256,
+        "files": entries,
+        "artifacts": artifacts,
+    }
+    plan = RuntimeInjectionPlan(
+        effective_instruction=effective_instruction,
+        canonical_files={
+            receipt_path: payload
+            for _remote_path, receipt_path, payload, _blob_id in uploads
+            if receipt_path.startswith("evolution/")
+        },
+        agent_system_targets=agent_system_targets,
+        skill_directories={},
+        authority=authority,
+    )
+    with TemporaryDirectory(prefix="openevo-materialized-context-") as temporary:
+        temporary_root = Path(temporary)
+        for index, (remote_path, _receipt_path, payload, _blob_id) in enumerate(uploads):
+            local_path = temporary_root / f"payload-{index:08d}"
+            local_path.write_bytes(payload)
+            await runtime.upload_file(str(local_path), remote_path)
+    return _EvolutionStagingResult(
+        env=env,
+        artifacts=tuple(staged_artifacts),
+        staged_tree_sha256=runtime_tree_sha256,
+        injection_plan=plan,
+    )
+
+
+def _canonical_materialized_relative_path(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("materialized destination path is invalid")
+    parsed = PurePosixPath(value)
+    if (
+        parsed.is_absolute()
+        or value != parsed.as_posix()
+        or not parsed.parts
+        or any(part in {"", ".", ".."} for part in parsed.parts)
+    ):
+        raise ValueError("materialized destination path is invalid")
+    return value
+
+
+def _materialized_runtime_environment(
+    context: MaterializedContext,
+    *,
+    roots: Mapping[str, str],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    allowed_roots = tuple(PurePosixPath(value) for value in roots.values())
+    for binding in context.environment:
+        kind = binding.value_kind.value
+        if kind == "json_paths":
+            try:
+                values = json.loads(binding.value)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("materialized runtime environment is invalid") from exc
+            if not isinstance(values, list) or not values:
+                raise ValueError("materialized runtime environment is invalid")
+        else:
+            values = [binding.value]
+        if not all(isinstance(value, str) for value in values):
+            raise ValueError("materialized runtime environment is invalid")
+        required_root = (
+            None
+            if binding.destination_scope is None
+            else PurePosixPath(roots[binding.destination_scope.value])
+        )
+        for value in values:
+            path = PurePosixPath(value)
+            if (
+                not path.is_absolute()
+                or ".." in path.parts
+                or not any(path == root or root in path.parents for root in allowed_roots)
+                or (
+                    required_root is not None
+                    and path != required_root
+                    and required_root not in path.parents
+                )
+            ):
+                raise ValueError("materialized runtime environment escapes fixed roots")
+        if kind == "scope_root" and (
+            required_root is None or values != [required_root.as_posix()]
+        ):
+            raise ValueError("materialized scope-root environment is invalid")
+        if binding.name in result:
+            raise ValueError("materialized runtime environment names conflict")
+        result[binding.name] = binding.value
+    return result
 
 
 def _selected_evolution_artifacts(
@@ -1635,6 +1950,8 @@ class GatewayNodeManager:
             HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
         ) = None,
         managed_image_authority_verifier: (Callable[[RuntimeSpec], Awaitable[None]] | None) = None,
+        workspace_handoff_store: WorkspaceHandoffStoreV2 | None = None,
+        service_identity: InternalServiceIdentity | None = None,
     ) -> None:
         self.node_id = node_id
         self.gateway_url = gateway_url.rstrip("/")
@@ -1662,6 +1979,8 @@ class GatewayNodeManager:
         self.evolution_client = evolution_client
         self._internal_headers = dict(internal_headers or {})
         self._credential_authority = credential_authority
+        self._workspace_handoff_store = workspace_handoff_store
+        self._service_identity = service_identity
         self._managed_image_authority_verifier = (
             managed_image_authority_verifier or verify_managed_runtime_image_admission
         )
@@ -1714,6 +2033,8 @@ class GatewayNodeManager:
         try:
             await self._close()
         finally:
+            if self._workspace_handoff_store is not None:
+                self._workspace_handoff_store.close()
             if self._docker_session_root is not None:
                 self._docker_session_root.close()
 
@@ -2078,6 +2399,25 @@ class GatewayNodeManager:
             runtime_spec = self._resolve_runtime_spec(request)
             self._validate_subscription_admission(request, runtime_spec, managed.session_dir)
             self._validate_runtime_admission(runtime_spec, managed)
+            if request.workspace_handoff is not None:
+                store = self._workspace_handoff_store
+                identity = self._service_identity
+                if store is None or identity is None:
+                    raise RuntimeError("opaque workspace handoff authority is unavailable")
+                await asyncio.to_thread(
+                    store.claim,
+                    request.workspace_handoff,
+                    session_id=request.session_id,
+                    generation_sha256=identity.generation_digest,
+                    registry_sha256=identity.registry_digest,
+                    framework_lock_sha256=identity.framework_lock_digest,
+                )
+                await asyncio.to_thread(
+                    store.materialize_input,
+                    request.workspace_handoff,
+                    session_id=request.session_id,
+                    destination_parent=managed.session_dir,
+                )
             if _is_codex_subscription_agent(request.agent) and (
                 managed.credential_mount is None or managed.credential_redactor is None
             ):
@@ -2641,6 +2981,8 @@ class GatewayNodeManager:
         harness: BaseHarness,
     ) -> _EvolutionInjection | dict[str, str]:
         request = managed.request
+        if request.runtime_context_binding is not None:
+            return await self._inject_committed_runtime_context(managed)
         if self.evolution is None or not self.evolution.enabled or self.evolution_client is None:
             return {}
         if managed.runtime is None:
@@ -2717,6 +3059,90 @@ class GatewayNodeManager:
                 level=logging.WARNING,
             )
             return {}
+
+    async def _inject_committed_runtime_context(
+        self,
+        managed: ManagedSession,
+    ) -> _EvolutionInjection | dict[str, str]:
+        request = managed.request
+        binding = request.runtime_context_binding
+        runtime = managed.runtime
+        identity = getattr(self, "_service_identity", None)
+        if binding is None or runtime is None or identity is None:
+            raise RuntimeError("v2 runtime context authority is unavailable")
+        head = binding.project_head
+        openevo = _existing_openevo_metadata(request.metadata)
+        if (
+            binding.service_generation_sha256 != identity.generation_digest
+            or binding.framework_lock_sha256 != identity.framework_lock_digest
+            or head.registry_sha256 != identity.registry_digest
+            or head.runtime_context_snapshot.registry_sha256 != identity.registry_digest
+            or openevo.get("project_id") != head.project_id
+            or openevo.get("project_head_id") != head.project_head_id
+            or openevo.get("evolution_revision_id")
+            != head.evolution_revision.evolution_revision_id
+            or openevo.get("runtime_context_snapshot_id")
+            != head.runtime_context_snapshot.runtime_context_snapshot_id
+        ):
+            raise RuntimeError("v2 runtime context dispatch differs from service authority")
+        evolution_metadata = {
+            **_existing_evolution_metadata(request.metadata),
+            "context_id": binding.materialized_context_id,
+            "context_injected": False,
+            "context_source": binding.source,
+            "runtime_context_snapshot_id": (
+                head.runtime_context_snapshot.runtime_context_snapshot_id
+            ),
+        }
+        if binding.source == "empty_genesis":
+            request.metadata["evolution"] = evolution_metadata
+            session_registry = getattr(self, "session_registry", None)
+            if session_registry is not None:
+                session_registry.update_metadata(
+                    request.session_id,
+                    {"evolution": evolution_metadata},
+                )
+            return {}
+        evolution = self.evolution
+        client = self.evolution_client
+        if evolution is None or not evolution.enabled or client is None:
+            raise RuntimeError("materialized context transport is unavailable")
+        model_ref = request.agent.model_name or self.model_served
+        if model_ref is None or (self.model_served is not None and self.model_served != model_ref):
+            raise RuntimeError("materialized context model authority changed")
+        staged = await self._await_with_budget(
+            _stage_materialized_runtime_context(
+                runtime=runtime,
+                evolution_client=client,
+                binding=binding,
+                instruction=request.instruction,
+                target_dir=evolution.context.target_dir,
+                base_model=model_ref,
+            ),
+            managed,
+        )
+        if staged.injection_plan is None:
+            raise RuntimeError("materialized context produced no injection authority")
+        request.instruction = staged.injection_plan.effective_instruction
+        adapter_payload = staged.injection_plan.canonical_files.get("evolution/adapters.json")
+        if not isinstance(adapter_payload, bytes):
+            raise RuntimeError("materialized adapter authority is unavailable")
+        adapter_merge_spec = json.loads(adapter_payload)
+        if not isinstance(adapter_merge_spec, dict):
+            raise RuntimeError("materialized adapter authority is invalid")
+        request.metadata["adapter_merge_spec"] = adapter_merge_spec
+        evolution_metadata["context_injected"] = True
+        request.metadata["evolution"] = evolution_metadata
+        session_registry = getattr(self, "session_registry", None)
+        if session_registry is not None:
+            session_registry.update_metadata(
+                request.session_id,
+                {
+                    "adapter_merge_spec": adapter_merge_spec,
+                    "evolution": evolution_metadata,
+                },
+            )
+        return _EvolutionInjection(env=dict(staged.env), staged=staged)
 
     def _publish_runtime_injection_receipt(
         self,
@@ -3378,6 +3804,25 @@ class GatewayNodeManager:
             managed.timer.mark("postrun", "finished")
             managed.timer.mark("return", "finished")
 
+        try:
+            result = await self._attach_workspace_result_after_runtime_absence(
+                managed,
+                result,
+            )
+        except WorkspaceHandoffErrorV2 as exc:
+            if request.workspace_handoff is not None:
+                self._log_credential_safe_exception(
+                    managed,
+                    "Workspace result publication retained cleanup ownership",
+                    exc,
+                )
+                managed.final_result = result
+                self._register_cleanup_retry(
+                    managed,
+                    finalize_subscription=True,
+                )
+                return
+
         delivered = await self._deliver_terminal_result(managed, result)
         if delivered:
             roots_removed = await self._remove_owned_roots(managed)
@@ -3387,6 +3832,28 @@ class GatewayNodeManager:
                 self._cleanup_retries.pop(request.session_id, None)
             else:
                 self._register_cleanup_retry(managed)
+
+    async def _attach_workspace_result_after_runtime_absence(
+        self,
+        managed: ManagedSession,
+        result: SessionResult,
+    ) -> SessionResult:
+        """Publish the accepted workspace before any terminal delivery or cleanup."""
+
+        binding = managed.request.workspace_handoff
+        if result.status is not SessionStatus.COMPLETED or binding is None:
+            return result
+        store = self._workspace_handoff_store
+        if store is None:
+            raise WorkspaceHandoffErrorV2("opaque workspace handoff authority is unavailable")
+        workspace_result = await asyncio.to_thread(
+            store.publish_result,
+            binding,
+            session_id=managed.request.session_id,
+            workspace_root=managed.session_dir / "workspace",
+            now=datetime.now(timezone.utc),
+        )
+        return result.model_copy(update={"workspace_result": workspace_result})
 
     async def _deliver_terminal_result(
         self,

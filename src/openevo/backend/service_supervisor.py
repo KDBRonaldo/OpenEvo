@@ -44,6 +44,7 @@ from openevo.backend.service_control import (
     ServiceRestartAttempt,
     ServiceRestartAttemptState,
 )
+from openevo.backend.workspace_handoff_v2 import WORKSPACE_HANDOFF_ROOT_ENV
 from openevo.backend.contracts.v1.models import (
     ApiErrorV1,
     ErrorCategory,
@@ -2230,6 +2231,8 @@ class CoreServiceSupervisor:
             self._max_restart_operations = max_restart_operations
             self._root.ensure_directory("child-cwd")
             self._child_cwd = self._root.path / "child-cwd"
+            self._root.ensure_directory("workspace-handoffs")
+            self._workspace_handoff_root = self._root.path / "workspace-handoffs"
             self._handles: dict[str, ProcessIdentity] = {}
             self._specs: dict[str, ServiceProcessSpec] = {}
             self._output_redactors: dict[
@@ -2619,6 +2622,13 @@ class CoreServiceSupervisor:
     def run_binding(self) -> ServiceRunBinding:
         with self._mutex:
             return self._run_binding_locked()
+
+    @property
+    def workspace_handoff_root(self) -> Path:
+        with self._mutex:
+            self._require_open()
+            self._root.verify()
+            return self._workspace_handoff_root
 
     def _run_binding_locked(self) -> ServiceRunBinding:
         self._require_open()
@@ -3105,7 +3115,13 @@ class CoreServiceSupervisor:
                 credential=credential,
             )
             argv_digest = _digest_json(list(argv))
-            env_digest = _digest_json(dict(sorted(base_env.items())))
+            service_env = dict(base_env)
+            if service_id == "gateway":
+                service_env[WORKSPACE_HANDOFF_ROOT_ENV] = os.fspath(
+                    self._workspace_handoff_root
+                )
+            service_env = dict(sorted(service_env.items()))
+            env_digest = _digest_json(service_env)
             identity_digest = _digest_json(
                 {
                     "argv_digest": argv_digest,
@@ -3130,7 +3146,7 @@ class CoreServiceSupervisor:
                     display_name=display_name,
                     component=component,
                     argv=argv,
-                    env=base_env,
+                    env=service_env,
                     argv_digest=argv_digest,
                     env_digest=env_digest,
                     identity_digest=identity_digest,

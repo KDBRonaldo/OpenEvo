@@ -1,5 +1,7 @@
 """Core Control API v1 closed contract models and schema source."""
 
+from typing import TYPE_CHECKING, Any
+
 from .app import (
     CoreControlApiProviderV1,
     CoreControlHTTPError,
@@ -27,7 +29,21 @@ from .snapshots import (
     events_schema_sha256,
     openapi_sha256,
 )
-from .provider import CoreControlProviderV1, create_core_control_app
+if TYPE_CHECKING:
+    from .provider import CoreControlProviderV1
+
+
+def __getattr__(name: str) -> Any:
+    """Load the business provider lazily to keep model/store imports acyclic."""
+
+    if name in {"CoreControlProviderV1", "create_core_control_app"}:
+        from .provider import CoreControlProviderV1, create_core_control_app
+
+        return {
+            "CoreControlProviderV1": CoreControlProviderV1,
+            "create_core_control_app": create_core_control_app,
+        }[name]
+    raise AttributeError(name)
 
 __all__ = [
     "ApiErrorV1",

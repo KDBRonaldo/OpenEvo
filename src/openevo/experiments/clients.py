@@ -27,6 +27,12 @@ class EvolutionClientProtocol(Protocol):
 
     def get_context_runtime_authority(self, context_id: str) -> dict[str, Any]: ...
 
+    def create_materialized_context(self, payload: dict[str, Any]) -> dict[str, Any]: ...
+
+    def get_materialized_context(self, context_id: str) -> dict[str, Any]: ...
+
+    def get_internal_job_result(self, job_id: str) -> dict[str, Any]: ...
+
     def update_artifact_promotion(
         self,
         artifact_id: str,
@@ -192,6 +198,28 @@ class EvolutionHttpClient:
         result = response.json()
         if not isinstance(result, dict):
             raise ValueError("context runtime authority was not a JSON object")
+        return result
+
+    def create_materialized_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        response = self._client.post(
+            f"{self.base_url}/v1/internal/materialized-contexts",
+            json=payload,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("materialized context response was not a JSON object")
+        return result
+
+    def get_materialized_context(self, context_id: str) -> dict[str, Any]:
+        encoded_context_id = quote(context_id, safe="")
+        response = self._client.get(
+            f"{self.base_url}/v1/internal/materialized-contexts/{encoded_context_id}"
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("materialized context response was not a JSON object")
         return result
 
     def get_internal_job_result(self, job_id: str) -> dict[str, Any]:

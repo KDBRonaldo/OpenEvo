@@ -227,6 +227,10 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
         assert client.get("/v1/health").status_code == 401
         assert client.get("/v1/internal/jobs/missing-job").status_code == 401
         assert client.get("/v1/internal/contexts/missing/runtime-authority").status_code == 401
+        assert (
+            client.get("/v1/internal/materialized-contexts/missing-context").status_code
+            == 401
+        )
         wrong = identity.request_headers()
         wrong["Authorization"] = "Bearer wrong-credential-value-that-is-long-enough"
         assert client.get("/v1/health", headers=wrong).status_code == 401
@@ -246,6 +250,20 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
             client.get(
                 "/v1/internal/contexts/missing/runtime-authority",
                 headers=identity.request_headers(),
+            ).status_code
+            == 403
+        )
+        assert (
+            client.get(
+                "/v1/internal/materialized-contexts/missing-context",
+                headers=_identity("gateway").request_headers(),
+            ).status_code
+            == 404
+        )
+        assert (
+            client.get(
+                "/v1/internal/materialized-contexts/missing-context",
+                headers=_identity("rollout").request_headers(),
             ).status_code
             == 403
         )

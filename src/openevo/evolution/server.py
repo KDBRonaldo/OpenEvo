@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 
 from openevo.evolution.models import (
     ArtifactPromotionUpdateRequest,
@@ -35,6 +36,8 @@ from openevo.evolution.models import (
     WorkerFailRequest,
     WorkerHeartbeatRequest,
 )
+from openevo.evolution.context_materialization import MaterializedContext
+from openevo.evolution.context_projection import ContextProjectionResolveRequest
 from openevo.evolution.planned_jobs import PlanBoundJobCreateRequest
 from openevo.evolution.store import EvolutionStore
 from openevo.evolution.framework.builtins import (
@@ -48,6 +51,7 @@ from openevo.internal_auth import (
     health_identity_payload,
     install_internal_auth,
 )
+from openevo.runtime.base import RUNTIME_READBACK_MAX_BYTES
 
 
 def _review_write_error(exc: ValueError) -> HTTPException:
@@ -207,6 +211,88 @@ def create_app(
             raise HTTPException(
                 status_code=404, detail="context runtime authority unavailable"
             ) from exc
+
+    def require_materialized_context_caller(request: Request) -> None:
+        if internal_identity is None:
+            raise HTTPException(
+                status_code=404,
+                detail="materialized context transport is disabled",
+            )
+        if request.headers.get(INTERNAL_SERVICE_HEADER) not in {
+            "core-control",
+            "gateway",
+        }:
+            raise HTTPException(
+                status_code=403,
+                detail="materialized context caller mismatch",
+            )
+
+    @app.post(
+        "/v1/internal/materialized-contexts",
+        response_model=MaterializedContext,
+    )
+    def create_materialized_context(
+        payload: ContextProjectionResolveRequest,
+        request: Request,
+    ) -> MaterializedContext:
+        require_materialized_context_caller(request)
+        if request.headers.get(INTERNAL_SERVICE_HEADER) != "core-control":
+            raise HTTPException(
+                status_code=403,
+                detail="only Core may create a materialized context",
+            )
+        try:
+            return store.resolve_materialized_context(payload)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/internal/materialized-contexts/{context_id}",
+        response_model=MaterializedContext,
+    )
+    def get_materialized_context(
+        context_id: str,
+        request: Request,
+    ) -> MaterializedContext:
+        require_materialized_context_caller(request)
+        try:
+            return store.get_materialized_context(context_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get(
+        "/v1/internal/materialized-contexts/{context_id}/blobs/{blob_id}",
+        response_class=Response,
+    )
+    def get_materialized_context_blob(
+        context_id: str,
+        blob_id: str,
+        request: Request,
+    ) -> Response:
+        require_materialized_context_caller(request)
+        try:
+            with store.open_materialized_blob(context_id, blob_id) as lease:
+                if lease.blob.size_bytes > RUNTIME_READBACK_MAX_BYTES:
+                    raise ValueError(
+                        "materialized context blob exceeds the runtime transport budget"
+                    )
+                payload = lease.stream.read(lease.blob.size_bytes + 1)
+                if (
+                    len(payload) != lease.blob.size_bytes
+                    or lease.stream.read(1)
+                    or hashlib.sha256(payload).hexdigest() != lease.blob.sha256
+                ):
+                    raise ValueError("materialized context blob changed during transport")
+                return Response(
+                    content=payload,
+                    media_type=lease.blob.media_type,
+                    headers={
+                        "Content-Length": str(lease.blob.size_bytes),
+                        "X-OpenEvo-Content-SHA256": lease.blob.sha256,
+                    },
+                )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/v1/datasets", response_model=DatasetCreateResponse)
     def create_dataset(request: DatasetCreateRequest) -> DatasetCreateResponse:

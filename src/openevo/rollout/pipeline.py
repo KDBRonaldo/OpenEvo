@@ -236,6 +236,8 @@ class Pipeline:
                 builder=session.request.builder,
                 evaluator=session.request.evaluator,
                 metadata=dict(session.request.metadata),
+                workspace_handoff=session.request.workspace_handoff,
+                runtime_context_binding=session.request.runtime_context_binding,
             )
             try:
                 response = await self._client.post(

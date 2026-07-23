@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import logging
 import math
 from pathlib import Path
 import secrets
@@ -25,6 +26,10 @@ from openevo.backend.contracts.v1.store import (
 from openevo.backend.run_control import CoreRunControlError, CoreTaskControlError
 from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.science_execution import compile_science_execution
+from openevo.backend.science_execution_v2 import (
+    ScienceAttemptCancelledV2,
+    ScienceAttemptExecutionV2Error,
+)
 from openevo.backend.science_successor import (
     AcceptedWorkspaceResultV2,
     ScienceMethodOutputV2,
@@ -87,6 +92,9 @@ from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 from openevo.rollout.models import canonicalize_task_request
 
 
+logger = logging.getLogger(__name__)
+
+
 _TERMINAL = frozenset({m.RunStatus.SUCCEEDED, m.RunStatus.FAILED, m.RunStatus.CANCELLED})
 _ACTIVE_FOR_ADMISSION = frozenset(
     {m.RunStatus.PREPARING, m.RunStatus.RUNNING, m.RunStatus.CANCELLING}
@@ -132,6 +140,8 @@ EvolutionFactory = Callable[[ServiceRunBinding], EvolutionClientProtocol]
 class ScienceSuccessorPreparerV2(Protocol):
     """Prepare all evidence before the Core owner atomically advances a head."""
 
+    def request_stop(self) -> None: ...
+
     def seal_dataset(
         self,
         context: ScienceSuccessorPreparationContextV2,
@@ -162,6 +172,18 @@ class ScienceSuccessorPreparerV2(Protocol):
     ) -> AcceptedWorkspaceResultV2: ...
 
 
+class ScienceAttemptRunnerV2(Protocol):
+    """Execute one already-started immutable v2 Attempt."""
+
+    def execute(
+        self,
+        *,
+        task: m2.TaskV2,
+        attempt: m2.AttemptRefV2,
+        cancellation: threading.Event,
+    ) -> object: ...
+
+
 class _RunCancelled(RuntimeError):
     pass
 
@@ -171,7 +193,7 @@ class _RunFinalizationConflict(ScienceRunConflict):
 
 
 class CoreScienceTaskOwnerV2:
-    """Own immutable v2 Task, admission, and Attempt identities only."""
+    """Own immutable v2 Task, Attempt execution, and successor publication."""
 
     def __init__(
         self,
@@ -179,11 +201,46 @@ class CoreScienceTaskOwnerV2:
         state_root: str | Path,
         clock: Callable[[], datetime] | None = None,
         successor_preparer: ScienceSuccessorPreparerV2 | None = None,
+        successor_preparer_factory: (
+            Callable[[ScienceTaskStoreV2], ScienceSuccessorPreparerV2] | None
+        ) = None,
+        attempt_executor_factory: (
+            Callable[[ScienceTaskStoreV2], ScienceAttemptRunnerV2] | None
+        ) = None,
     ) -> None:
+        if successor_preparer is not None and successor_preparer_factory is not None:
+            raise ValueError("v2 Task owner accepts one successor preparer authority")
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._ledger = ScienceTaskStoreV2(Path(state_root) / "science-tasks-v2")
-        self._successor_preparer = successor_preparer
+        self._successor_preparer = (
+            successor_preparer
+            if successor_preparer_factory is None
+            else successor_preparer_factory(self._ledger)
+        )
+        self._condition = threading.Condition()
+        self._lifecycle_lock = threading.RLock()
+        self._cancel_events: dict[str, threading.Event] = {}
+        self._closed = False
+        self._attempt_executor = (
+            None if attempt_executor_factory is None else attempt_executor_factory(self._ledger)
+        )
+        if self._attempt_executor is not None and not callable(
+            getattr(self._attempt_executor, "execute", None)
+        ):
+            self._ledger.close()
+            raise TypeError("v2 Task owner requires an Attempt executor")
+        self._ledger.recover_interrupted_attempts(now=self._clock())
         self._recover_interrupted_successor_transitions()
+        self._worker: threading.Thread | None = None
+        if self._attempt_executor is not None:
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name="openevo-science-task-owner-v2",
+                daemon=True,
+            )
+            self._worker.start()
+            with self._condition:
+                self._condition.notify_all()
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handlers: dict[str, Callable[[Mapping[str, object]], object]] = {
@@ -408,6 +465,11 @@ class CoreScienceTaskOwnerV2:
                 now=self._clock(),
             )
         except Exception as exc:
+            logger.error(
+                "v2 science successor transition %s failed during preparation [%s]",
+                transition_id,
+                type(exc).__name__,
+            )
             error = _successor_transition_api_error(
                 code="successor_transition_failed",
                 message="Core could not prepare and atomically commit the successor state.",
@@ -513,7 +575,76 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="getCoreTaskTimelineV2")
 
+    async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
+        """Authorize only service calls derived from an active v2 Attempt."""
+
+        try:
+            accepted = self._ledger.verify_attempt_run_admission(check)
+        except Exception as exc:
+            raise _admission_denied() from exc
+        if not accepted:
+            raise _admission_denied()
+
+    def cancel_attempt(
+        self,
+        task_id: str,
+        attempt_id: str,
+    ) -> m2.TaskV2:
+        """Durably request cancellation and wake the one owning executor."""
+
+        try:
+            with self._lifecycle_lock:
+                record = self._ledger.get_attempt_execution_optional(
+                    task_id,
+                    attempt_id,
+                )
+                if record is None:
+                    task = self._ledger.get_task(task_id)
+                    attempt = self._ledger.get_attempt(task_id, attempt_id)
+                    if attempt != task.attempts[-1]:
+                        raise ScienceTaskTerminalV2("only the latest v2 Attempt may be cancelled")
+                    record = self._ledger.begin_attempt_execution(
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        now=self._clock(),
+                    )
+                self._ledger.request_attempt_cancellation(
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    now=self._clock(),
+                )
+                cancellation = self._cancel_events.get(attempt_id)
+                if cancellation is None:
+                    self._ledger.finish_attempt_cancelled(
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        now=self._clock(),
+                    )
+                else:
+                    cancellation.set()
+            with self._condition:
+                self._condition.notify_all()
+            return self._ledger.get_task(task_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="cancelCoreTaskAttemptV2")
+
     def close(self) -> None:
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            for cancellation in self._cancel_events.values():
+                cancellation.set()
+        preparer_stop = getattr(self._successor_preparer, "request_stop", None)
+        if callable(preparer_stop):
+            preparer_stop()
+        with self._condition:
+            self._condition.notify_all()
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=30.0)
+            if worker.is_alive():
+                raise RuntimeError("v2 science Task owner did not stop before shutdown")
         self._ledger.close()
 
     def _submit_task(self, arguments: Mapping[str, object]) -> m2.TaskV2:
@@ -526,36 +657,30 @@ class CoreScienceTaskOwnerV2:
             ),
             now=self._clock(),
         )
+        with self._condition:
+            self._condition.notify_all()
         return task
 
     def _get_task(self, arguments: Mapping[str, object]) -> m2.TaskV2:
         _require_v2_argument_keys(arguments, {"task_id"})
-        return self._ledger.get_task(
-            _v2_string_argument(arguments["task_id"], label="task ID")
-        )
+        return self._ledger.get_task(_v2_string_argument(arguments["task_id"], label="task ID"))
 
     def _list_tasks(self, arguments: Mapping[str, object]) -> list[m2.TaskV2]:
         _require_v2_argument_keys(arguments, set(), optional={"project_id"})
         project_id = arguments.get("project_id")
         return self._ledger.list_tasks(
             project_id=(
-                None
-                if project_id is None
-                else _v2_string_argument(project_id, label="project ID")
+                None if project_id is None else _v2_string_argument(project_id, label="project ID")
             )
         )
 
-    def _get_admission(
-        self, arguments: Mapping[str, object]
-    ) -> m2.TaskAdmissionRefV2:
+    def _get_admission(self, arguments: Mapping[str, object]) -> m2.TaskAdmissionRefV2:
         _require_v2_argument_keys(arguments, {"task_id"})
         return self._ledger.get_admission(
             _v2_string_argument(arguments["task_id"], label="task ID")
         )
 
-    def _list_attempts(
-        self, arguments: Mapping[str, object]
-    ) -> list[m2.AttemptRefV2]:
+    def _list_attempts(self, arguments: Mapping[str, object]) -> list[m2.AttemptRefV2]:
         _require_v2_argument_keys(arguments, {"task_id"})
         return self._ledger.list_attempts(
             _v2_string_argument(arguments["task_id"], label="task ID")
@@ -575,6 +700,8 @@ class CoreScienceTaskOwnerV2:
             ),
             now=self._clock(),
         )
+        with self._condition:
+            self._condition.notify_all()
         return attempt
 
     def _get_attempt(self, arguments: Mapping[str, object]) -> m2.AttemptRefV2:
@@ -583,6 +710,124 @@ class CoreScienceTaskOwnerV2:
             _v2_string_argument(arguments["task_id"], label="task ID"),
             _v2_string_argument(arguments["attempt_id"], label="attempt ID"),
         )
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._lifecycle_lock:
+                if self._closed:
+                    return
+            try:
+                if self._process_one_captured_successor():
+                    continue
+                if self._process_one_unstarted_attempt():
+                    continue
+            except Exception as exc:
+                # A durable phase method records its own closed failure. Keep the
+                # owner alive so a different project can continue to make progress.
+                logger.error(
+                    "v2 science owner preserved a worker failure [%s]",
+                    type(exc).__name__,
+                )
+            with self._condition:
+                with self._lifecycle_lock:
+                    if self._closed:
+                        return
+                self._condition.wait(timeout=1.0)
+
+    def _process_one_captured_successor(self) -> bool:
+        if self._successor_preparer is None:
+            return False
+        for record in self._ledger.captured_attempt_executions():
+            attempt_id = record.attempt_id
+            task = self._ledger.get_task(record.task_id)
+            if (
+                task.state == "waiting_for_successor"
+                and task.authoritative_attempt_id == attempt_id
+                and task.successor_transition is None
+                and record.successor_plan is not None
+            ):
+                self.run_successor_transition(
+                    task.task_id,
+                    accepted_attempt_id=attempt_id,
+                    plan=record.successor_plan,
+                )
+                return True
+        return False
+
+    def _process_one_unstarted_attempt(self) -> bool:
+        executor = self._attempt_executor
+        if executor is None:
+            return False
+        pending = self._ledger.unstarted_attempts()
+        if not pending:
+            return False
+        task, attempt = pending[0]
+        cancellation = threading.Event()
+        try:
+            with self._lifecycle_lock:
+                if self._closed:
+                    return False
+                self._ledger.begin_attempt_execution(
+                    task_id=task.task_id,
+                    attempt_id=attempt.attempt_id,
+                    now=self._clock(),
+                )
+                self._cancel_events[attempt.attempt_id] = cancellation
+            executor.execute(
+                task=task,
+                attempt=attempt,
+                cancellation=cancellation,
+            )
+        except ScienceAttemptCancelledV2:
+            with self._lifecycle_lock:
+                if self._closed:
+                    self._finish_attempt_failed_if_owned(
+                        task,
+                        attempt,
+                        "daemon_shutdown_during_attempt",
+                    )
+                else:
+                    try:
+                        self._ledger.finish_attempt_cancelled(
+                            task_id=task.task_id,
+                            attempt_id=attempt.attempt_id,
+                            now=self._clock(),
+                        )
+                    except ScienceTaskTerminalV2:
+                        pass
+        except ScienceAttemptExecutionV2Error as exc:
+            self._finish_attempt_failed_if_owned(task, attempt, exc.code)
+        except Exception as exc:
+            logger.error(
+                "v2 science Attempt %s failed inside its executor [%s]",
+                attempt.attempt_id,
+                type(exc).__name__,
+            )
+            self._finish_attempt_failed_if_owned(
+                task,
+                attempt,
+                "attempt_execution_internal_error",
+            )
+        finally:
+            with self._lifecycle_lock:
+                self._cancel_events.pop(attempt.attempt_id, None)
+        return True
+
+    def _finish_attempt_failed_if_owned(
+        self,
+        task: m2.TaskV2,
+        attempt: m2.AttemptRefV2,
+        error_code: str,
+    ) -> None:
+        try:
+            self._ledger.finish_attempt_failed(
+                task_id=task.task_id,
+                attempt_id=attempt.attempt_id,
+                error_code=error_code,
+                now=self._clock(),
+            )
+        except ScienceTaskTerminalV2:
+            pass
 
 
 def _validate_sealed_successor_dataset(
@@ -595,8 +840,7 @@ def _validate_sealed_successor_dataset(
     dataset = SealedTranscriptDatasetV2.model_validate(value.model_dump(mode="python"))
     if (
         dataset.task_id != context.task.task_id
-        or dataset.task_admission_id
-        != context.task.admission.task_admission_id
+        or dataset.task_admission_id != context.task.admission.task_admission_id
         or dataset.accepted_attempt_id != context.accepted_attempt.attempt_id
     ):
         raise ValueError("sealed successor dataset has different Task ownership")
@@ -608,25 +852,18 @@ def _validate_successor_method_outputs(
     *,
     plan: ScienceSuccessorPlanV2,
 ) -> tuple[ScienceMethodOutputV2, ...]:
-    if type(value) is not tuple or any(
-        type(item) is not ScienceMethodOutputV2 for item in value
-    ):
+    if type(value) is not tuple or any(type(item) is not ScienceMethodOutputV2 for item in value):
         raise TypeError("successor method outputs have the wrong type")
     outputs = tuple(
-        ScienceMethodOutputV2.model_validate(item.model_dump(mode="python"))
-        for item in value
+        ScienceMethodOutputV2.model_validate(item.model_dump(mode="python")) for item in value
     )
     expected = tuple(
         (item.target_id, item.method_id, item.output_artifact_type)
         for item in plan.enabled_methods
     )
-    actual = tuple(
-        (item.target_id, item.method_id, item.artifact_type) for item in outputs
-    )
+    actual = tuple((item.target_id, item.method_id, item.artifact_type) for item in outputs)
     if actual != expected:
-        raise ValueError(
-            "successor method outputs do not exactly cover the enabled method plan"
-        )
+        raise ValueError("successor method outputs do not exactly cover the enabled method plan")
     if len({item.artifact_id for item in outputs}) != len(outputs):
         raise ValueError("successor method output artifact IDs must be unique")
     return outputs
@@ -641,9 +878,7 @@ def _validate_successor_outputs_receipt(
 ) -> ValidatedScienceOutputsV2:
     if type(value) is not ValidatedScienceOutputsV2:
         raise TypeError("validated successor outputs have the wrong type")
-    validated = ValidatedScienceOutputsV2.model_validate(
-        value.model_dump(mode="python")
-    )
+    validated = ValidatedScienceOutputsV2.model_validate(value.model_dump(mode="python"))
     if (
         validated.project_id != context.task.project_id
         or validated.successor_transition_id
@@ -665,9 +900,7 @@ def _validate_successor_materialization_receipt(
 ) -> SuccessorMaterializationV2:
     if type(value) is not SuccessorMaterializationV2:
         raise TypeError("successor materialization has the wrong type")
-    materialized = SuccessorMaterializationV2.model_validate(
-        value.model_dump(mode="python")
-    )
+    materialized = SuccessorMaterializationV2.model_validate(value.model_dump(mode="python"))
     runtime = materialized.runtime_context_snapshot
     evolution = validated.evolution_revision
     if (
@@ -691,9 +924,7 @@ def _validate_accepted_workspace_result(
 ) -> AcceptedWorkspaceResultV2:
     if type(value) is not AcceptedWorkspaceResultV2:
         raise TypeError("accepted workspace result has the wrong type")
-    workspace = AcceptedWorkspaceResultV2.model_validate(
-        value.model_dump(mode="python")
-    )
+    workspace = AcceptedWorkspaceResultV2.model_validate(value.model_dump(mode="python"))
     if (
         workspace.project_id != context.task.project_id
         or workspace.task_id != context.task.task_id
@@ -720,12 +951,8 @@ def _build_v2_successor_project_head(
         "predecessor_project_head_id": predecessor.project_head_id,
         "project_id": context.task.project_id,
         "registry_sha256": materialized.runtime_context_snapshot.registry_sha256,
-        "runtime_context_snapshot": materialized.runtime_context_snapshot.model_dump(
-            mode="json"
-        ),
-        "successor_transition_id": (
-            context.transition.transition.successor_transition_id
-        ),
+        "runtime_context_snapshot": materialized.runtime_context_snapshot.model_dump(mode="json"),
+        "successor_transition_id": (context.transition.transition.successor_transition_id),
         "workspace_snapshot": workspace.workspace_snapshot.model_dump(mode="json"),
     }
     payload = json.dumps(
@@ -737,7 +964,7 @@ def _build_v2_successor_project_head(
     ).encode("utf-8")
     manifest_sha256 = hashlib.sha256(payload).hexdigest()
     return m2.ProjectHeadRefV2(
-        project_head_id=f"project-head-{manifest_sha256[:32]}",
+        project_head_id=f"project-head-{manifest_sha256}",
         project_id=context.task.project_id,
         generation=predecessor.generation + 1,
         predecessor_project_head_id=predecessor.project_head_id,
@@ -764,9 +991,7 @@ def _build_atomic_successor_manifest(
     execution = successor.effective_execution_snapshot
     return AtomicSuccessorManifestV2(
         project_id=context.task.project_id,
-        successor_transition_id=(
-            context.transition.transition.successor_transition_id
-        ),
+        successor_transition_id=(context.transition.transition.successor_transition_id),
         task_id=context.task.task_id,
         task_admission_id=context.task.admission.task_admission_id,
         admission_sha256=context.task.admission.admission_sha256,
@@ -780,18 +1005,12 @@ def _build_atomic_successor_manifest(
         workspace_snapshot_id=workspace.workspace_snapshot.workspace_snapshot_id,
         workspace_manifest_sha256=workspace.workspace_snapshot.manifest_sha256,
         evolution_revision_id=validated.evolution_revision.evolution_revision_id,
-        evolution_revision_manifest_sha256=(
-            validated.evolution_revision.manifest_sha256
-        ),
+        evolution_revision_manifest_sha256=(validated.evolution_revision.manifest_sha256),
         runtime_context_snapshot_id=(
             materialized.runtime_context_snapshot.runtime_context_snapshot_id
         ),
-        runtime_context_manifest_sha256=(
-            materialized.runtime_context_snapshot.manifest_sha256
-        ),
-        effective_execution_snapshot_id=(
-            execution.effective_execution_snapshot_id
-        ),
+        runtime_context_manifest_sha256=(materialized.runtime_context_snapshot.manifest_sha256),
+        effective_execution_snapshot_id=(execution.effective_execution_snapshot_id),
         effective_execution_snapshot_sha256=execution.snapshot_sha256,
         registry_sha256=successor.registry_sha256,
         normalized_evolution_intent_sha256=(
@@ -801,10 +1020,8 @@ def _build_atomic_successor_manifest(
         dataset_artifact_id=dataset.artifact_id,
         dataset_manifest_sha256=dataset.manifest_sha256,
         materialized_context_id=materialized.materialized_context_id,
-        materialized_context_manifest_sha256=(
-            materialized.materialized_context_manifest_sha256
-        ),
-        method_artifact_ids=tuple(sorted(item.artifact_id for item in outputs)),
+        materialized_context_manifest_sha256=(materialized.materialized_context_manifest_sha256),
+        method_artifact_ids=tuple(item.artifact_id for item in outputs),
     )
 
 
@@ -1333,12 +1550,7 @@ class CoreScienceRunOwner:
                     cancellations = sorted(self._pending_cancellations)
                     pending = sorted(self._pending_finalizations)
                     queued = self._ledger.queued_run_ids()
-                    while (
-                        not self._closed
-                        and not cancellations
-                        and not pending
-                        and not queued
-                    ):
+                    while not self._closed and not cancellations and not pending and not queued:
                         self._condition.wait(timeout=1.0)
                         cancellations = sorted(self._pending_cancellations)
                         pending = sorted(self._pending_finalizations)
@@ -1595,10 +1807,7 @@ class CoreScienceRunOwner:
                 close = getattr(client, "close", None)
                 if callable(close):
                     close()
-            if (
-                result.get("task_id") != admission.task_id
-                or result.get("status") != "cancelled"
-            ):
+            if result.get("task_id") != admission.task_id or result.get("status") != "cancelled":
                 return False
             self._finish_cancelled(run_id)
             return True
@@ -3159,8 +3368,10 @@ def _require_v2_argument_keys(
         raise TypeError("v2 Task arguments must be a mapping")
     keys = set(arguments)
     allowed = required | (optional or set())
-    if keys - allowed or not required.issubset(keys) or any(
-        not isinstance(key, str) for key in keys
+    if (
+        keys - allowed
+        or not required.issubset(keys)
+        or any(not isinstance(key, str) for key in keys)
     ):
         raise ValueError("v2 Task arguments do not match the closed operation")
 

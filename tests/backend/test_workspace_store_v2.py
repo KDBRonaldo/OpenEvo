@@ -152,6 +152,7 @@ def test_scratch_snapshot_is_private_content_addressed_and_recoverable(
     assert snapshot.entry_count == 0
     assert snapshot.byte_size == 0
     assert store.ensure_empty_snapshot("project-1") == snapshot
+    assert store.archive_declaration(snapshot).entry_count == 0
     snapshot_path = store.snapshot_path(snapshot)
     assert snapshot_path.is_dir()
     assert list(snapshot_path.iterdir()) == []
@@ -193,6 +194,7 @@ def test_chunked_upload_finalizes_exact_archive_and_survives_restart(
     snapshot = finalized.workspace_snapshot
     assert snapshot.entry_count == entries
     assert snapshot.byte_size == extracted
+    assert store.archive_declaration(snapshot) == request.archive
     assert (store.snapshot_path(snapshot) / "src" / "AGENTS.md").read_bytes() == (
         b"OpenEvo v2 workspace\n"
     )
@@ -212,6 +214,7 @@ def test_chunked_upload_finalizes_exact_archive_and_survives_restart(
     restarted = WorkspaceStoreV2(root)
     try:
         assert restarted.get_upload("project-1", session.upload_id) == finalized
+        assert restarted.archive_declaration(snapshot) == request.archive
         assert (restarted.snapshot_path(snapshot) / "src" / "AGENTS.md").is_file()
     finally:
         restarted.close()

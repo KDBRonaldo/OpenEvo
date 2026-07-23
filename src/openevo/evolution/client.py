@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -37,6 +38,27 @@ class EvolutionClient:
         response = await self._client.post(f"{self.base_url}/v1/events", json=payload)
         response.raise_for_status()
         return response.json()
+
+    async def get_materialized_context(self, context_id: str) -> dict[str, Any]:
+        encoded_context_id = quote(context_id, safe="")
+        response = await self._client.get(
+            f"{self.base_url}/v1/internal/materialized-contexts/{encoded_context_id}"
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict):
+            raise ValueError("materialized context response was not a JSON object")
+        return result
+
+    async def get_materialized_blob(self, context_id: str, blob_id: str) -> bytes:
+        encoded_context_id = quote(context_id, safe="")
+        encoded_blob_id = quote(blob_id, safe="")
+        response = await self._client.get(
+            f"{self.base_url}/v1/internal/materialized-contexts/"
+            f"{encoded_context_id}/blobs/{encoded_blob_id}"
+        )
+        response.raise_for_status()
+        return response.content
 
     async def create_review_request(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = await self._client.post(f"{self.base_url}/v1/reviews", json=payload)

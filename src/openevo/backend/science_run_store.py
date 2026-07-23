@@ -23,11 +23,26 @@ from pydantic import BaseModel
 
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v2 import models as m2
+from openevo.backend.science_execution_v2 import (
+    MAX_CAPTURED_SESSION_RESULT_BYTES,
+    ScienceAttemptExecutionEvidenceV2,
+    ScienceAttemptExecutionReceiptV2,
+    ScienceAttemptExecutionRecordV2,
+    canonical_subscription_session_result,
+    science_attempt_execution_receipt_sha256,
+    science_session_result_bytes,
+    science_session_result_sha256,
+)
 from openevo.backend.science_successor import (
     ScienceSuccessorPlanV2,
     science_successor_plan_sha256,
 )
 from openevo.evolution.revisions import AtomicSuccessorCommitV2
+from openevo.internal_auth import (
+    GenerationBoundRunAdmissionCheck,
+    RunAdmissionOperation,
+)
+from openevo.rollout.models import SessionResult
 
 
 _T = TypeVar("_T", bound=BaseModel)
@@ -182,6 +197,39 @@ CREATE TABLE IF NOT EXISTS attempt_append_requests (
     FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
     FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id) ON DELETE RESTRICT
 ) STRICT;
+CREATE TABLE IF NOT EXISTS attempt_executions (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    receipt_sha256 TEXT,
+    session_result_sha256 TEXT,
+    session_result_json BLOB,
+    execution_json BLOB NOT NULL,
+    resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+    FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    CHECK (
+        (session_result_sha256 IS NULL AND session_result_json IS NULL)
+        OR (length(session_result_sha256) = 64 AND session_result_json IS NOT NULL)
+    )
+) STRICT;
+CREATE TABLE IF NOT EXISTS attempt_run_admissions (
+    attempt_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    rollout_task_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    generation_digest TEXT NOT NULL CHECK (length(generation_digest) = 64),
+    registry_digest TEXT NOT NULL CHECK (length(registry_digest) = 64),
+    framework_lock_digest TEXT NOT NULL CHECK (length(framework_lock_digest) = 64),
+    payload_sha256 TEXT NOT NULL CHECK (length(payload_sha256) = 64),
+    PRIMARY KEY(operation, rollout_task_id, session_id),
+    FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id) ON DELETE RESTRICT,
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS one_rollout_admission_per_attempt
+ON attempt_run_admissions(attempt_id)
+WHERE operation = 'rollout_task_submit';
 CREATE TABLE IF NOT EXISTS successor_transitions (
     successor_transition_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -219,6 +267,8 @@ _MAX_V2_PROJECT_HEADS = _MAX_V2_PROJECTS + _MAX_V2_TASKS
 _MAX_V2_EVENT_REPLAY = 10_000
 _MAX_V2_EVENT_ROWS = 100_000
 _MAX_V2_EVENTS_PER_TASK = 10_000
+_MAX_V2_RUN_ADMISSIONS = 100_000
+_MAX_V2_RUN_ADMISSIONS_PER_ATTEMPT = 4_096
 _V2_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
 
 
@@ -500,9 +550,7 @@ class ScienceRunStore:
                                     ).fetchone()[0]
                                 )
                                 if count >= _MAX_RUNS:
-                                    raise ScienceRunConflict(
-                                        "science run capacity is exhausted"
-                                    )
+                                    raise ScienceRunConflict("science run capacity is exhausted")
                                 connection.execute(
                                     "INSERT INTO pending_run_creates("
                                     "project_id, idempotency_key, run_id, request_digest, "
@@ -598,9 +646,7 @@ class ScienceRunStore:
                         ),
                     ).rowcount
                     if deleted != 1:
-                        raise ScienceRunStoreError(
-                            "science run create authority was not consumed"
-                        )
+                        raise ScienceRunStoreError("science run create authority was not consumed")
                     return run, False
             finally:
                 self._release_create_admission(admission)
@@ -1192,9 +1238,7 @@ class ScienceRunStore:
             raise ScienceRunStoreError("rollout task admission identity is ambiguous")
         return None if not rows else str(rows[0]["run_id"])
 
-    def rollout_task_admission(
-        self, run_id: str
-    ) -> RolloutTaskAdmissionAuthority | None:
+    def rollout_task_admission(self, run_id: str) -> RolloutTaskAdmissionAuthority | None:
         self.get_run(run_id)
         with self._lock, self._reader() as connection:
             rows = connection.execute(
@@ -1221,8 +1265,7 @@ class ScienceRunStore:
             )
         )
         if any(
-            len(value) != 64
-            or any(character not in "0123456789abcdef" for character in value)
+            len(value) != 64 or any(character not in "0123456789abcdef" for character in value)
             for value in values
         ):
             raise ScienceRunStoreError("rollout task admission digest is invalid")
@@ -1362,6 +1405,7 @@ class ScienceTaskStoreV2:
             raise ScienceTaskStoreV2Error("v2 science task database must not be a symlink")
         with self._reader() as connection:
             connection.executescript(_V2_SCHEMA)
+            _migrate_v2_attempt_execution_results(connection)
             connection.execute(
                 "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 2)"
             )
@@ -1414,20 +1458,15 @@ class ScienceTaskStoreV2:
                 return current
             if (
                 expected_project_head_id is None
-                or current.active_project_head.project_head_id
-                != expected_project_head_id
+                or current.active_project_head.project_head_id != expected_project_head_id
             ):
-                raise ScienceTaskPreconditionFailedV2(
-                    "v2 project admission authority changed"
-                )
+                raise ScienceTaskPreconditionFailedV2("v2 project admission authority changed")
             open_task = connection.execute(
                 "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
                 (authority.project_id,),
             ).fetchone()
             if open_task is not None:
-                raise ScienceTaskProjectInFlightV2(
-                    "project has an immutable v2 Task in flight"
-                )
+                raise ScienceTaskProjectInFlightV2("project has an immutable v2 Task in flight")
             connection.execute(
                 "UPDATE project_admission_authorities SET authority_json = ?, "
                 "resource_version = resource_version + 1 WHERE project_id = ?",
@@ -1443,14 +1482,11 @@ class ScienceTaskStoreV2:
         project_id = _v2_resource_id(project_id, label="project")
         with self._lock, self._reader() as connection:
             row = connection.execute(
-                "SELECT authority_json FROM project_admission_authorities "
-                "WHERE project_id = ?",
+                "SELECT authority_json FROM project_admission_authorities WHERE project_id = ?",
                 (project_id,),
             ).fetchone()
             if row is None:
-                raise ScienceTaskNotFoundV2(
-                    "v2 project admission authority was not found"
-                )
+                raise ScienceTaskNotFoundV2("v2 project admission authority was not found")
             authority = _v2_authority_from_bytes(bytes(row["authority_json"]))
             active = _load_v2_project_head(
                 connection,
@@ -1474,12 +1510,9 @@ class ScienceTaskStoreV2:
                 (project_id, _MAX_V2_TASKS + 2),
             ).fetchall()
             if len(rows) > _MAX_V2_TASKS + 1:
-                raise ScienceTaskStoreV2Error(
-                    "v2 project-head history exceeds its bound"
-                )
+                raise ScienceTaskStoreV2Error("v2 project-head history exceeds its bound")
             heads = [
-                _load_v2_project_head(connection, str(row["project_head_id"]))
-                for row in rows
+                _load_v2_project_head(connection, str(row["project_head_id"])) for row in rows
             ]
             _validate_v2_project_head_chain(heads)
             return heads
@@ -1508,10 +1541,7 @@ class ScienceTaskStoreV2:
         ).fetchall()
         if len(rows) > _MAX_V2_TASKS + 1:
             raise ScienceTaskStoreV2Error("v2 project-head history exceeds its bound")
-        heads = [
-            _load_v2_project_head(connection, str(row["project_head_id"]))
-            for row in rows
-        ]
+        heads = [_load_v2_project_head(connection, str(row["project_head_id"])) for row in rows]
         _validate_v2_project_head_chain(heads)
         return heads
 
@@ -1533,17 +1563,26 @@ class ScienceTaskStoreV2:
         timestamp = _v2_timestamp(now)
         with self._lock, self._transaction() as connection:
             task = _load_v2_task_closure(connection, task_id)
-            if (
-                task.state != "admitted"
-                or task.authoritative_attempt_id is not None
-                or task.successor_transition is not None
-            ):
-                raise ScienceTaskTerminalV2(
-                    "v2 Task already has authoritative result ownership"
-                )
-            attempts = {
-                attempt.attempt_id: attempt for attempt in task.attempts
-            }
+            direct_transition = (
+                task.state == "admitted"
+                and task.authoritative_attempt_id is None
+                and task.successor_transition is None
+            )
+            captured_execution = _load_v2_attempt_execution_optional(
+                connection,
+                accepted_attempt_id,
+            )
+            captured_transition = (
+                task.state == "waiting_for_successor"
+                and task.authoritative_attempt_id == accepted_attempt_id
+                and task.successor_transition is None
+                and captured_execution is not None
+                and captured_execution.state == "captured"
+                and captured_execution.successor_plan == plan
+            )
+            if not direct_transition and not captured_transition:
+                raise ScienceTaskTerminalV2("v2 Task already has authoritative result ownership")
+            attempts = {attempt.attempt_id: attempt for attempt in task.attempts}
             accepted_attempt = attempts.get(accepted_attempt_id)
             if accepted_attempt is None:
                 raise ScienceTaskPreconditionFailedV2(
@@ -1566,12 +1605,10 @@ class ScienceTaskStoreV2:
             authority = _load_v2_project_authority(connection, task.project_id)
             if (
                 authority.blockers
-                or authority.active_project_head
-                != task.admission.predecessor_project_head
+                or authority.active_project_head != task.admission.predecessor_project_head
             ):
                 raise ScienceTaskNotReadyV2(
-                    authority.blockers
-                    or (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                    authority.blockers or (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
                 )
             transition_id = f"successor-{secrets.token_hex(16)}"
             reference = m2.SuccessorTransitionRefV2(
@@ -1608,9 +1645,7 @@ class ScienceTaskStoreV2:
                 active_project_head=authority.active_project_head,
                 project_config_sha256=authority.project_config_sha256,
                 workspace_snapshot=authority.workspace_snapshot,
-                normalized_evolution_intent_sha256=(
-                    authority.normalized_evolution_intent_sha256
-                ),
+                normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
                 blockers=(ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,),
             )
             connection.execute(
@@ -1730,9 +1765,10 @@ class ScienceTaskStoreV2:
             label="successor transition",
         )
         dataset_id = _v2_resource_id(dataset_id, label="dataset")
-        if not isinstance(dataset_sha256, str) or re.fullmatch(
-            r"[0-9a-f]{64}", dataset_sha256, flags=re.ASCII
-        ) is None:
+        if (
+            not isinstance(dataset_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", dataset_sha256, flags=re.ASCII) is None
+        ):
             raise ValueError("v2 dataset digest is invalid")
         with self._lock, self._transaction() as connection:
             transition = _load_v2_successor_transition(
@@ -1741,11 +1777,7 @@ class ScienceTaskStoreV2:
             )
             admission = transition.transition.task_admission
             attempt = transition.transition.accepted_attempt
-            if (
-                transition.state != "sealing_dataset"
-                or admission is None
-                or attempt is None
-            ):
+            if transition.state != "sealing_dataset" or admission is None or attempt is None:
                 raise ScienceTaskPreconditionFailedV2(
                     "v2 dataset event does not bind the sealing transition"
                 )
@@ -1761,9 +1793,7 @@ class ScienceTaskStoreV2:
                     or event.dataset_id != dataset_id
                     or event.dataset_sha256 != dataset_sha256
                 ):
-                    raise ScienceTaskConflictV2(
-                        "v2 Task already binds another sealed dataset"
-                    )
+                    raise ScienceTaskConflictV2("v2 Task already binds another sealed dataset")
                 return event
             event = _append_v2_event(
                 connection,
@@ -1805,17 +1835,13 @@ class ScienceTaskStoreV2:
             if transition.state == "failed":
                 return transition
             if transition.state in {"committed", "cancelled", "superseded"}:
-                raise ScienceTaskTerminalV2(
-                    "terminal v2 successor transition cannot be failed"
-                )
+                raise ScienceTaskTerminalV2("terminal v2 successor transition cannot be failed")
             task = _load_v2_task_closure(
                 connection,
                 transition.transition.task_admission.task_id,  # type: ignore[union-attr]
             )
             if task.successor_transition != transition.transition:
-                raise ScienceTaskStoreV2Error(
-                    "v2 Task and successor transition ownership differ"
-                )
+                raise ScienceTaskStoreV2Error("v2 Task and successor transition ownership differ")
             updated_transition = _replace_v2_successor_transition(
                 transition,
                 state="failed",
@@ -1883,9 +1909,7 @@ class ScienceTaskStoreV2:
                 )
             reference = transition.transition
             if reference.task_admission is None or reference.accepted_attempt is None:
-                raise ScienceTaskStoreV2Error(
-                    "v2 run-result transition lost its Task ownership"
-                )
+                raise ScienceTaskStoreV2Error("v2 run-result transition lost its Task ownership")
             task = _load_v2_task_closure(
                 connection,
                 reference.task_admission.task_id,
@@ -1893,25 +1917,22 @@ class ScienceTaskStoreV2:
             authority = _load_v2_project_authority(connection, task.project_id)
             if (
                 task.state != "waiting_for_successor"
-                or task.authoritative_attempt_id
-                != reference.accepted_attempt.attempt_id
+                or task.authoritative_attempt_id != reference.accepted_attempt.attempt_id
                 or task.successor_transition != reference
                 or authority.active_project_head != reference.predecessor_project_head
-                or authority.blockers
-                != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                or authority.blockers != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
             ):
-                raise ScienceTaskPreconditionFailedV2(
-                    "v2 successor commit authority changed"
-                )
+                raise ScienceTaskPreconditionFailedV2("v2 successor commit authority changed")
             _validate_v2_successor_commit_closure(
                 task=task,
                 transition=transition,
                 successor=successor,
                 commit=commit,
             )
-            if int(
-                connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0]
-            ) >= _MAX_V2_PROJECT_HEADS:
+            if (
+                int(connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0])
+                >= _MAX_V2_PROJECT_HEADS
+            ):
                 raise ScienceTaskConflictV2("v2 project-head capacity is exhausted")
 
             _before_v2_successor_commit(
@@ -1955,9 +1976,7 @@ class ScienceTaskStoreV2:
                 active_project_head=successor,
                 project_config_sha256=authority.project_config_sha256,
                 workspace_snapshot=successor.workspace_snapshot,
-                normalized_evolution_intent_sha256=(
-                    authority.normalized_evolution_intent_sha256
-                ),
+                normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
                 blockers=(),
             )
             connection.execute(
@@ -2076,14 +2095,11 @@ class ScienceTaskStoreV2:
         task_id = _v2_resource_id(task_id, label="task")
         with self._lock, self._reader() as connection:
             row = connection.execute(
-                "SELECT successor_transition_id FROM successor_transitions "
-                "WHERE task_id = ?",
+                "SELECT successor_transition_id FROM successor_transitions WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if row is None:
-                raise ScienceTaskNotFoundV2(
-                    "v2 Task successor transition was not found"
-                )
+                raise ScienceTaskNotFoundV2("v2 Task successor transition was not found")
             return _load_v2_successor_transition(
                 connection,
                 str(row["successor_transition_id"]),
@@ -2117,14 +2133,80 @@ class ScienceTaskStoreV2:
                 AtomicSuccessorCommitV2,
                 bytes(row["commit_json"]),
             )
+            if row["manifest_sha256"] != commit.manifest_sha256 or transition.state != "committed":
+                raise ScienceTaskStoreV2Error("v2 successor commit row is inconsistent")
+            return commit
+
+    def successor_commit_for_project_head(
+        self,
+        project_head_id: str,
+    ) -> AtomicSuccessorCommitV2 | None:
+        """Return the exact atomic receipt that published a non-genesis head."""
+
+        project_head_id = _v2_resource_id(project_head_id, label="project head")
+        with self._lock, self._reader() as connection:
+            head = _load_v2_project_head(connection, project_head_id)
+            rows = connection.execute(
+                "SELECT successor_transition_id, manifest_sha256, commit_json "
+                "FROM successor_commits ORDER BY successor_transition_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 successor commit inventory exceeds its bound")
+            matches: list[AtomicSuccessorCommitV2] = []
+            for row in rows:
+                commit = _v2_model_from_bytes(
+                    AtomicSuccessorCommitV2,
+                    bytes(row["commit_json"]),
+                )
+                if row["manifest_sha256"] != commit.manifest_sha256:
+                    raise ScienceTaskStoreV2Error("v2 successor commit digest is inconsistent")
+                if commit.manifest.successor_project_head_id == project_head_id:
+                    matches.append(commit)
+            if not matches:
+                if head.generation != 0:
+                    raise ScienceTaskStoreV2Error(
+                        "non-genesis v2 project head has no atomic successor receipt"
+                    )
+                return None
+            if len(matches) != 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project head has multiple atomic successor receipts"
+                )
+            commit = matches[0]
             if (
-                row["manifest_sha256"] != commit.manifest_sha256
-                or transition.state != "committed"
+                commit.manifest.project_id != head.project_id
+                or commit.manifest.successor_generation != head.generation
+                or commit.manifest.successor_manifest_sha256 != head.manifest_sha256
             ):
                 raise ScienceTaskStoreV2Error(
-                    "v2 successor commit row is inconsistent"
+                    "v2 project head and atomic successor receipt differ"
                 )
             return commit
+
+    def prior_dataset_artifact_ids_for_head(
+        self,
+        project_head_id: str,
+    ) -> tuple[str, ...]:
+        """Recover canonical prior dataset identity from the immutable head chain."""
+
+        project_head_id = _v2_resource_id(project_head_id, label="project head")
+        dataset_ids: list[str] = []
+        seen_heads: set[str] = set()
+        current_id: str | None = project_head_id
+        while current_id is not None:
+            if current_id in seen_heads or len(seen_heads) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 project-head chain is cyclic")
+            seen_heads.add(current_id)
+            head = self.get_project_head(current_id)
+            commit = self.successor_commit_for_project_head(current_id)
+            if commit is not None:
+                dataset_ids.append(commit.manifest.dataset_artifact_id)
+            current_id = head.predecessor_project_head_id
+        values = tuple(sorted(dataset_ids))
+        if len(values) != len(set(values)):
+            raise ScienceTaskStoreV2Error("v2 project-head chain reuses a dataset artifact")
+        return values
 
     def nonterminal_successor_transition_ids(self) -> list[str]:
         terminal = ("committed", "failed", "cancelled", "superseded")
@@ -2165,14 +2247,11 @@ class ScienceTaskStoreV2:
                     existing["request_sha256"] != request_sha256
                     or bytes(existing["request_json"]) != request_json
                 ):
-                    raise ScienceTaskIdempotencyConflictV2(
-                        "v2 Task idempotency key was reused"
-                    )
+                    raise ScienceTaskIdempotencyConflictV2("v2 Task idempotency key was reused")
                 return _load_v2_task_closure(connection, str(existing["task_id"])), True
 
             authority_row = connection.execute(
-                "SELECT authority_json FROM project_admission_authorities "
-                "WHERE project_id = ?",
+                "SELECT authority_json FROM project_admission_authorities WHERE project_id = ?",
                 (request.project_id,),
             ).fetchone()
             if authority_row is None:
@@ -2183,13 +2262,14 @@ class ScienceTaskStoreV2:
             if authority.blockers:
                 raise ScienceTaskNotReadyV2(authority.blockers)
             _validate_v2_submission_authority(request, authority)
-            if connection.execute(
-                "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
-                (request.project_id,),
-            ).fetchone() is not None:
-                raise ScienceTaskProjectInFlightV2(
-                    "project has an immutable v2 Task in flight"
-                )
+            if (
+                connection.execute(
+                    "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
+                    (request.project_id,),
+                ).fetchone()
+                is not None
+            ):
+                raise ScienceTaskProjectInFlightV2("project has an immutable v2 Task in flight")
             if int(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]) >= (
                 _MAX_V2_TASKS
             ):
@@ -2277,9 +2357,7 @@ class ScienceTaskStoreV2:
                     replay["request_sha256"] != request_sha256
                     or bytes(replay["request_json"]) != request_json
                 ):
-                    raise ScienceTaskIdempotencyConflictV2(
-                        "v2 Attempt idempotency key was reused"
-                    )
+                    raise ScienceTaskIdempotencyConflictV2("v2 Attempt idempotency key was reused")
                 return _load_v2_attempt(
                     connection,
                     task_id=task_id,
@@ -2305,9 +2383,7 @@ class ScienceTaskStoreV2:
                 request.expected_previous_attempt_id != prior.attempt_id
                 or request.expected_next_ordinal != prior.ordinal + 1
             ):
-                raise ScienceTaskPreconditionFailedV2(
-                    "v2 Attempt append precondition changed"
-                )
+                raise ScienceTaskPreconditionFailedV2("v2 Attempt append precondition changed")
             attempt = m2.AttemptRefV2(
                 attempt_id=f"attempt-{secrets.token_hex(16)}",
                 ordinal=request.expected_next_ordinal,
@@ -2365,6 +2441,583 @@ class ScienceTaskStoreV2:
             )
             return attempt, False
 
+    def begin_attempt_execution(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        """Move the latest immutable Attempt into Daemon-owned preparation."""
+
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        timestamp = _v2_timestamp(now)
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            attempt = _load_v2_attempt(
+                connection,
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
+            existing = _load_v2_attempt_execution_optional(connection, attempt_id)
+            if existing is not None:
+                if existing.task_id != task_id:
+                    raise ScienceTaskStoreV2Error("v2 Attempt execution belongs to another Task")
+                if existing.state == "preparing":
+                    return existing
+                raise ScienceTaskTerminalV2("v2 Attempt execution preparation already advanced")
+            if (
+                task.state not in {"admitted", "failed", "cancelled"}
+                or task.authoritative_attempt_id is not None
+                or task.successor_transition is not None
+                or attempt != task.attempts[-1]
+            ):
+                raise ScienceTaskTerminalV2(
+                    "v2 Attempt cannot begin execution in the current Task state"
+                )
+            active = connection.execute(
+                "SELECT 1 FROM attempt_executions WHERE task_id = ? "
+                "AND state IN ('preparing', 'running', 'cancelling') LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if active is not None:
+                raise ScienceTaskConflictV2("v2 Task already has an active Attempt execution")
+            record = ScienceAttemptExecutionRecordV2(
+                task_id=task_id,
+                attempt_id=attempt_id,
+                state="preparing",
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            updated_task = _replace_v2_task(
+                task,
+                state="preparing",
+                updated_at=timestamp,
+            )
+            connection.execute(
+                "INSERT INTO attempt_executions(attempt_id, task_id, state, "
+                "receipt_sha256, session_result_sha256, session_result_json, "
+                "execution_json, resource_version) "
+                "VALUES (?, ?, ?, NULL, NULL, NULL, ?, 1)",
+                (attempt_id, task_id, record.state, _v2_model_bytes(record)),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(updated_task), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
+    def mark_attempt_running(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            if record.state == "running":
+                return record
+            if record.state != "preparing" or task.state != "preparing":
+                raise ScienceTaskTerminalV2("v2 Attempt cannot enter running state")
+            timestamp = _v2_timestamp(now)
+            updated_record = _replace_v2_execution_record(
+                record,
+                state="running",
+                updated_at=timestamp,
+            )
+            updated_task = _replace_v2_task(
+                task,
+                state="running",
+                updated_at=timestamp,
+            )
+            _update_v2_attempt_execution(connection, updated_record)
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(updated_task), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
+    def record_terminal_attempt(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        receipt: ScienceAttemptExecutionReceiptV2,
+        evidence: ScienceAttemptExecutionEvidenceV2,
+        successor_plan: ScienceSuccessorPlanV2,
+        terminal_result: SessionResult,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        """Atomically elect exactly one verified Attempt result as authoritative."""
+
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        receipt = _validate_v2_model(ScienceAttemptExecutionReceiptV2, receipt)
+        evidence = _validate_v2_model(ScienceAttemptExecutionEvidenceV2, evidence)
+        successor_plan = _validate_v2_model(
+            ScienceSuccessorPlanV2,
+            successor_plan,
+        )
+        terminal_result = canonical_subscription_session_result(terminal_result)
+        result_json = science_session_result_bytes(terminal_result)
+        result_sha256 = hashlib.sha256(result_json).hexdigest()
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            _validate_v2_terminal_execution_closure(
+                connection=connection,
+                task=task,
+                attempt_id=attempt_id,
+                receipt=receipt,
+                evidence=evidence,
+                successor_plan=successor_plan,
+                terminal_result=terminal_result,
+            )
+            if record.state == "captured":
+                if (
+                    record.receipt == receipt
+                    and record.evidence == evidence
+                    and record.successor_plan == successor_plan
+                    and _load_v2_captured_session_result(
+                        connection,
+                        attempt_id,
+                    )
+                    == terminal_result
+                ):
+                    return record
+                raise ScienceTaskConflictV2("v2 Attempt terminal evidence changed after capture")
+            if (
+                record.state not in {"preparing", "running"}
+                or task.state not in {"preparing", "running"}
+                or task.authoritative_attempt_id is not None
+                or task.successor_transition is not None
+            ):
+                raise ScienceTaskTerminalV2(
+                    "v2 Attempt terminal result lost authoritative ownership"
+                )
+            timestamp = _v2_timestamp(now)
+            captured = _replace_v2_execution_record(
+                record,
+                state="captured",
+                receipt=receipt,
+                evidence=evidence,
+                successor_plan=successor_plan,
+                error_code=None,
+                updated_at=timestamp,
+            )
+            authoritative = _replace_v2_task(
+                task,
+                authoritative_attempt_id=attempt_id,
+                state="waiting_for_successor",
+                updated_at=timestamp,
+            )
+            _update_v2_attempt_execution(connection, captured)
+            updated_result = connection.execute(
+                "UPDATE attempt_executions SET session_result_sha256 = ?, "
+                "session_result_json = ? WHERE attempt_id = ? AND task_id = ? "
+                "AND session_result_sha256 IS NULL AND session_result_json IS NULL",
+                (result_sha256, result_json, attempt_id, task_id),
+            ).rowcount
+            if updated_result != 1:
+                raise ScienceTaskStoreV2Error("v2 Attempt result persistence lost ownership")
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(authoritative), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
+    def get_captured_session_result(
+        self,
+        task_id: str,
+        attempt_id: str,
+    ) -> SessionResult:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._reader() as connection:
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            if record.task_id != task_id or record.state != "captured":
+                raise ScienceTaskTerminalV2("v2 Attempt has no authoritative captured result")
+            return _load_v2_captured_session_result(connection, attempt_id)
+
+    def request_attempt_cancellation(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            if record.state in {"cancelling", "cancelled"}:
+                return record
+            if (
+                record.state not in {"preparing", "running"}
+                or task.state not in {"preparing", "running"}
+                or task.authoritative_attempt_id is not None
+            ):
+                raise ScienceTaskTerminalV2("v2 Attempt cancellation lost authoritative ownership")
+            timestamp = _v2_timestamp(now)
+            cancelling = _replace_v2_execution_record(
+                record,
+                state="cancelling",
+                updated_at=timestamp,
+            )
+            cancelling_task = _replace_v2_task(
+                task,
+                state="cancelling",
+                updated_at=timestamp,
+            )
+            _update_v2_attempt_execution(connection, cancelling)
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(cancelling_task), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
+    def finish_attempt_cancelled(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            if record.state == "cancelled":
+                return record
+            if record.state != "cancelling" or task.state != "cancelling":
+                raise ScienceTaskTerminalV2("v2 Attempt cannot complete cancellation")
+            timestamp = _v2_timestamp(now)
+            cancelled = _replace_v2_execution_record(
+                record,
+                state="cancelled",
+                updated_at=timestamp,
+            )
+            cancelled_task = _replace_v2_task(
+                task,
+                state="cancelled",
+                updated_at=timestamp,
+            )
+            _update_v2_attempt_execution(connection, cancelled)
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(cancelled_task), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
+    def finish_attempt_failed(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        error_code: str,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        if (
+            not isinstance(error_code, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,127}", error_code, flags=re.ASCII) is None
+        ):
+            raise ValueError("v2 Attempt execution error code is invalid")
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            if record.state == "failed":
+                if record.error_code != error_code:
+                    raise ScienceTaskConflictV2(
+                        "v2 Attempt execution failure changed after persistence"
+                    )
+                return record
+            if (
+                record.state not in {"preparing", "running", "cancelling"}
+                or task.authoritative_attempt_id is not None
+                or task.successor_transition is not None
+            ):
+                raise ScienceTaskTerminalV2("v2 Attempt execution is already terminal")
+            timestamp = _v2_timestamp(now)
+            failed = _replace_v2_execution_record(
+                record,
+                state="failed",
+                error_code=error_code,
+                updated_at=timestamp,
+            )
+            failed_task = _replace_v2_task(
+                task,
+                state="failed",
+                updated_at=timestamp,
+            )
+            _update_v2_attempt_execution(connection, failed)
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(failed_task), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
+    def get_attempt_execution(
+        self,
+        task_id: str,
+        attempt_id: str,
+    ) -> ScienceAttemptExecutionRecordV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._reader() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            return record
+
+    def get_attempt_execution_optional(
+        self,
+        task_id: str,
+        attempt_id: str,
+    ) -> ScienceAttemptExecutionRecordV2 | None:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._reader() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            _load_v2_attempt(
+                connection,
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
+            record = _load_v2_attempt_execution_optional(connection, attempt_id)
+            if record is not None:
+                _validate_v2_execution_ownership(task, record)
+            return record
+
+    def captured_attempt_executions(self) -> list[ScienceAttemptExecutionRecordV2]:
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT attempt_id FROM attempt_executions WHERE state = 'captured' "
+                "ORDER BY attempt_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 captured Attempt inventory exceeds its bound")
+            return [_load_v2_attempt_execution(connection, str(row["attempt_id"])) for row in rows]
+
+    def captured_attempt_ids(self) -> list[str]:
+        return [record.attempt_id for record in self.captured_attempt_executions()]
+
+    def unstarted_attempts(self) -> list[tuple[m2.TaskV2, m2.AttemptRefV2]]:
+        """Return latest Attempts that have immutable admission but no execution."""
+
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT task_id FROM tasks WHERE closed = 0 ORDER BY task_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 unstarted Attempt inventory exceeds its bound")
+            pending: list[tuple[m2.TaskV2, m2.AttemptRefV2]] = []
+            for row in rows:
+                task = _load_v2_task_closure(connection, str(row["task_id"]))
+                if (
+                    task.state not in {"admitted", "failed", "cancelled"}
+                    or task.authoritative_attempt_id is not None
+                    or task.successor_transition is not None
+                ):
+                    continue
+                attempt = task.attempts[-1]
+                if (
+                    _load_v2_attempt_execution_optional(
+                        connection,
+                        attempt.attempt_id,
+                    )
+                    is None
+                ):
+                    pending.append((task, attempt))
+            return pending
+
+    def recover_interrupted_attempts(self, *, now: datetime) -> list[str]:
+        """Fail in-process executions closed; captured results remain resumable."""
+
+        timestamp = _v2_timestamp(now)
+        with self._lock, self._transaction() as connection:
+            rows = connection.execute(
+                "SELECT attempt_id FROM attempt_executions "
+                "WHERE state IN ('preparing', 'running', 'cancelling') "
+                "ORDER BY attempt_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 interrupted Attempt inventory exceeds its bound")
+            recovered: list[str] = []
+            for row in rows:
+                attempt_id = str(row["attempt_id"])
+                record = _load_v2_attempt_execution(connection, attempt_id)
+                task = _load_v2_task_closure(connection, record.task_id)
+                _validate_v2_execution_ownership(task, record)
+                if task.authoritative_attempt_id is not None:
+                    raise ScienceTaskStoreV2Error(
+                        "interrupted v2 Attempt unexpectedly owns a result"
+                    )
+                failed = _replace_v2_execution_record(
+                    record,
+                    state="failed",
+                    error_code="daemon_restarted_during_attempt",
+                    updated_at=timestamp,
+                )
+                failed_task = _replace_v2_task(
+                    task,
+                    state="failed",
+                    updated_at=timestamp,
+                )
+                _update_v2_attempt_execution(connection, failed)
+                connection.execute(
+                    "UPDATE tasks SET task_json = ?, "
+                    "resource_version = resource_version + 1 WHERE task_id = ?",
+                    (_v2_model_bytes(failed_task), task.task_id),
+                )
+                recovered.append(attempt_id)
+            return recovered
+
+    def register_attempt_run_admission(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        check: GenerationBoundRunAdmissionCheck,
+        allow_create: bool,
+    ) -> bool:
+        """Pre-register the exact rollout payload for one active Attempt."""
+
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        if type(check) is not GenerationBoundRunAdmissionCheck:
+            raise TypeError("v2 run admission check has the wrong type")
+        if type(allow_create) is not bool:
+            raise TypeError("v2 run admission create flag must be exact bool")
+        if check.task_id is None:
+            raise ValueError("v2 run admission requires a rollout Task identity")
+        normalized_session = check.session_id or ""
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            record = _load_v2_attempt_execution(connection, attempt_id)
+            _validate_v2_execution_ownership(task, record)
+            row = _v2_run_admission_row(connection, check)
+            if row is not None:
+                if record.state not in {
+                    "preparing",
+                    "running",
+                    "cancelling",
+                } or task.state not in {"preparing", "running", "cancelling"}:
+                    return False
+                if _v2_run_admission_matches(row, check) and (
+                    row["task_id"] == task_id and row["attempt_id"] == attempt_id
+                ):
+                    return True
+                raise ScienceTaskConflictV2(
+                    "v2 run admission identity was reused with different authority"
+                )
+            if not allow_create:
+                raise ScienceTaskConflictV2("v2 run admission is not pre-authorized")
+            if (
+                check.operation is not RunAdmissionOperation.ROLLOUT_TASK_SUBMIT
+                or normalized_session
+                or record.state not in {"preparing", "running"}
+                or task.state not in {"preparing", "running"}
+                or check.registry_digest != task.admission.registry_sha256
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 rollout admission does not bind an active Attempt"
+                )
+            _insert_v2_run_admission(
+                connection,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                check=check,
+            )
+            return True
+
+    def verify_attempt_run_admission(
+        self,
+        check: GenerationBoundRunAdmissionCheck,
+    ) -> bool:
+        """Verify, and for a gateway child operation durably derive, authority."""
+
+        if type(check) is not GenerationBoundRunAdmissionCheck:
+            raise TypeError("v2 run admission check has the wrong type")
+        if check.task_id is None:
+            return False
+        with self._lock, self._transaction() as connection:
+            row = _v2_run_admission_row(connection, check)
+            if row is not None:
+                record = _load_v2_attempt_execution(
+                    connection,
+                    str(row["attempt_id"]),
+                )
+                task = _load_v2_task_closure(connection, str(row["task_id"]))
+                _validate_v2_execution_ownership(task, record)
+                return (
+                    record.state in {"preparing", "running", "cancelling"}
+                    and task.state in {"preparing", "running", "cancelling"}
+                    and _v2_run_admission_matches(row, check)
+                )
+            if check.operation is RunAdmissionOperation.ROLLOUT_TASK_SUBMIT:
+                return False
+            if check.session_id is None:
+                return False
+            rollout = connection.execute(
+                "SELECT * FROM attempt_run_admissions WHERE operation = ? "
+                "AND rollout_task_id = ? AND session_id = '' LIMIT 2",
+                (RunAdmissionOperation.ROLLOUT_TASK_SUBMIT.value, check.task_id),
+            ).fetchall()
+            if len(rollout) != 1:
+                return False
+            parent = rollout[0]
+            if any(
+                parent[column] != value
+                for column, value in (
+                    ("generation_digest", check.generation_digest),
+                    ("registry_digest", check.registry_digest),
+                    ("framework_lock_digest", check.framework_lock_digest),
+                )
+            ):
+                return False
+            record = _load_v2_attempt_execution(
+                connection,
+                str(parent["attempt_id"]),
+            )
+            task = _load_v2_task_closure(connection, str(parent["task_id"]))
+            _validate_v2_execution_ownership(task, record)
+            if record.state not in {"preparing", "running", "cancelling"} or task.state not in {
+                "preparing",
+                "running",
+                "cancelling",
+            }:
+                return False
+            _insert_v2_run_admission(
+                connection,
+                task_id=task.task_id,
+                attempt_id=record.attempt_id,
+                check=check,
+            )
+            return True
+
     def close_task(
         self,
         task_id: str,
@@ -2376,9 +3029,10 @@ class ScienceTaskStoreV2:
     ) -> m2.TaskV2:
         task_id = _v2_resource_id(task_id, label="task")
         request = _validate_v2_model(m2.TaskActionRequestV2, request)
-        if expected_etag is not None and re.fullmatch(
-            r'"[0-9a-f]{64}"', expected_etag, flags=re.ASCII
-        ) is None:
+        if (
+            expected_etag is not None
+            and re.fullmatch(r'"[0-9a-f]{64}"', expected_etag, flags=re.ASCII) is None
+        ):
             raise ValueError("v2 Task expected ETag is invalid")
         if type(allow_closed_recovery) is not bool:
             raise TypeError("v2 Task close recovery flag must be exact bool")
@@ -2428,15 +3082,12 @@ class ScienceTaskStoreV2:
                 ).fetchall()
             else:
                 rows = connection.execute(
-                    "SELECT task_id FROM tasks WHERE project_id = ? "
-                    "ORDER BY task_id LIMIT ?",
+                    "SELECT task_id FROM tasks WHERE project_id = ? ORDER BY task_id LIMIT ?",
                     (project_id, _MAX_V2_TASKS + 1),
                 ).fetchall()
             if len(rows) > _MAX_V2_TASKS:
                 raise ScienceTaskStoreV2Error("v2 Task inventory exceeds its bound")
-            return [
-                _load_v2_task_closure(connection, str(row["task_id"])) for row in rows
-            ]
+            return [_load_v2_task_closure(connection, str(row["task_id"])) for row in rows]
 
     def get_admission(self, task_id: str) -> m2.TaskAdmissionRefV2:
         return self.get_task(task_id).admission
@@ -2470,9 +3121,7 @@ class ScienceTaskStoreV2:
             maximum = bounds["maximum"]
             if minimum is None or maximum is None:
                 if after_event_id is not None:
-                    raise ScienceEventCursorExpiredV2(
-                        "v2 event replay cursor is not retained"
-                    )
+                    raise ScienceEventCursorExpiredV2("v2 event replay cursor is not retained")
                 return []
             replay_floor = max(
                 int(minimum),
@@ -2485,14 +3134,10 @@ class ScienceTaskStoreV2:
                     (after_event_id,),
                 ).fetchone()
                 if cursor is None:
-                    raise ScienceEventCursorExpiredV2(
-                        "v2 event replay cursor is not retained"
-                    )
+                    raise ScienceEventCursorExpiredV2("v2 event replay cursor is not retained")
                 after_sequence = int(cursor["sequence"])
                 if after_sequence < replay_floor:
-                    raise ScienceEventCursorExpiredV2(
-                        "v2 event replay cursor is not retained"
-                    )
+                    raise ScienceEventCursorExpiredV2("v2 event replay cursor is not retained")
             rows = connection.execute(
                 "SELECT task_id, event_json FROM events WHERE sequence > ? ORDER BY sequence "
                 "LIMIT ?",
@@ -2500,10 +3145,7 @@ class ScienceTaskStoreV2:
             ).fetchall()
             if len(rows) > _MAX_V2_EVENT_REPLAY:
                 raise ScienceTaskStoreV2Error("v2 event replay exceeds its bound")
-            events = [
-                _load_and_validate_v2_event(connection, row)
-                for row in rows
-            ]
+            events = [_load_and_validate_v2_event(connection, row) for row in rows]
             for task_id in sorted(
                 {str(row["task_id"]) for row in rows if row["task_id"] is not None}
             ):
@@ -2531,9 +3173,7 @@ class ScienceTaskStoreV2:
             or metadata.st_uid != os.geteuid()
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
-            raise ScienceTaskStoreV2Error(
-                "v2 science task root must be a private owned directory"
-            )
+            raise ScienceTaskStoreV2Error("v2 science task root must be a private owned directory")
 
     def _verify_database(self) -> None:
         metadata = self.database.stat(follow_symlinks=False)
@@ -2543,9 +3183,7 @@ class ScienceTaskStoreV2:
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
-            raise ScienceTaskStoreV2Error(
-                "v2 science task database is not a private regular file"
-            )
+            raise ScienceTaskStoreV2Error("v2 science task database is not a private regular file")
         with self._reader() as connection:
             row = connection.execute(
                 "SELECT schema_version FROM metadata WHERE singleton = 1"
@@ -2567,9 +3205,7 @@ class ScienceTaskStoreV2:
                 (_MAX_V2_PROJECT_HEADS + 1,),
             ).fetchall()
             if len(head_inventory) > _MAX_V2_PROJECT_HEADS:
-                raise ScienceTaskStoreV2Error(
-                    "v2 project-head inventory exceeds its bound"
-                )
+                raise ScienceTaskStoreV2Error("v2 project-head inventory exceeds its bound")
             authority_projects = {str(item["project_id"]) for item in authorities}
             head_projects = {str(item["project_id"]) for item in head_inventory}
             if head_projects != authority_projects:
@@ -2577,9 +3213,7 @@ class ScienceTaskStoreV2:
                     "v2 project-head inventory has no exact project authority"
                 )
             for authority_row in authorities:
-                authority = _v2_authority_from_bytes(
-                    bytes(authority_row["authority_json"])
-                )
+                authority = _v2_authority_from_bytes(bytes(authority_row["authority_json"]))
                 if (
                     authority.project_id != authority_row["project_id"]
                     or _load_v2_project_head(
@@ -2597,9 +3231,7 @@ class ScienceTaskStoreV2:
                     (authority.project_id, _MAX_V2_TASKS + 2),
                 ).fetchall()
                 if len(head_rows) > _MAX_V2_TASKS + 1:
-                    raise ScienceTaskStoreV2Error(
-                        "v2 project-head history exceeds its bound"
-                    )
+                    raise ScienceTaskStoreV2Error("v2 project-head history exceeds its bound")
                 heads = [
                     _load_v2_project_head(connection, str(item["project_head_id"]))
                     for item in head_rows
@@ -2617,6 +3249,55 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskStoreV2Error("v2 Task inventory exceeds its bound")
             for task_row in tasks:
                 _load_v2_task_closure(connection, str(task_row["task_id"]))
+            execution_rows = connection.execute(
+                "SELECT attempt_id FROM attempt_executions ORDER BY attempt_id LIMIT ?",
+                (_MAX_V2_TASKS * 100 + 1,),
+            ).fetchall()
+            if len(execution_rows) > _MAX_V2_TASKS * 100:
+                raise ScienceTaskStoreV2Error("v2 Attempt execution inventory exceeds its bound")
+            active_by_task: dict[str, str] = {}
+            for execution_row in execution_rows:
+                record = _load_v2_attempt_execution(
+                    connection,
+                    str(execution_row["attempt_id"]),
+                )
+                task = _load_v2_task_closure(connection, record.task_id)
+                _validate_v2_execution_ownership(task, record)
+                if record.state == "captured":
+                    if (
+                        record.receipt is None
+                        or record.evidence is None
+                        or record.successor_plan is None
+                    ):
+                        raise ScienceTaskStoreV2Error(
+                            "captured v2 Attempt has incomplete terminal evidence"
+                        )
+                    _validate_v2_terminal_execution_closure(
+                        connection=connection,
+                        task=task,
+                        attempt_id=record.attempt_id,
+                        receipt=record.receipt,
+                        evidence=record.evidence,
+                        successor_plan=record.successor_plan,
+                        terminal_result=_load_v2_captured_session_result(
+                            connection,
+                            record.attempt_id,
+                        ),
+                    )
+                if record.state in {"preparing", "running", "cancelling"}:
+                    if record.task_id in active_by_task:
+                        raise ScienceTaskStoreV2Error(
+                            "v2 Task has multiple active Attempt executions"
+                        )
+                    active_by_task[record.task_id] = record.attempt_id
+                    if (
+                        task.attempts[-1].attempt_id != record.attempt_id
+                        or task.state != record.state
+                    ):
+                        raise ScienceTaskStoreV2Error(
+                            "active v2 Attempt execution and Task state differ"
+                        )
+            _verify_v2_run_admission_inventory(connection)
             transition_rows = connection.execute(
                 "SELECT successor_transition_id FROM successor_transitions "
                 "ORDER BY successor_transition_id LIMIT ?",
@@ -2646,10 +3327,7 @@ class ScienceTaskStoreV2:
                     m2.AttemptAppendRequestV2,
                     request_json,
                 )
-                if (
-                    hashlib.sha256(request_json).hexdigest()
-                    != append_row["request_sha256"]
-                ):
+                if hashlib.sha256(request_json).hexdigest() != append_row["request_sha256"]:
                     raise ScienceTaskStoreV2Error(
                         "v2 Attempt append request digest is inconsistent"
                     )
@@ -2690,14 +3368,9 @@ class ScienceTaskStoreV2:
                     or event.event_type != event_row["event_type"]
                     or event.project_id != event_row["project_id"]
                     or _v2_model_bytes(event) != bytes(event_row["event_json"])
-                    or (
-                        previous_sequence is not None
-                        and sequence != previous_sequence + 1
-                    )
+                    or (previous_sequence is not None and sequence != previous_sequence + 1)
                 ):
-                    raise ScienceTaskStoreV2Error(
-                        "persisted v2 event journal is inconsistent"
-                    )
+                    raise ScienceTaskStoreV2Error("persisted v2 event journal is inconsistent")
                 task_id = event_row["task_id"]
                 if task_id is not None:
                     task = _load_v2_task_closure(connection, str(task_id))
@@ -2751,6 +3424,21 @@ class ScienceTaskStoreV2:
         return connection
 
 
+def _migrate_v2_attempt_execution_results(connection: sqlite3.Connection) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(attempt_executions)").fetchall()
+    }
+    expected = {"session_result_sha256", "session_result_json"}
+    missing = expected.difference(columns)
+    if not missing:
+        return
+    if missing != expected:
+        raise ScienceTaskStoreV2Error("v2 Attempt result schema is only partially present")
+    connection.execute("ALTER TABLE attempt_executions ADD COLUMN session_result_sha256 TEXT")
+    connection.execute("ALTER TABLE attempt_executions ADD COLUMN session_result_json BLOB")
+
+
 def _backfill_v2_project_heads(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         "SELECT authority_json FROM project_admission_authorities ORDER BY project_id"
@@ -2788,8 +3476,7 @@ def _store_v2_project_head(
         if (
             existing["project_id"] != head.project_id
             or int(existing["generation"]) != head.generation
-            or existing["predecessor_project_head_id"]
-            != head.predecessor_project_head_id
+            or existing["predecessor_project_head_id"] != head.predecessor_project_head_id
             or existing["manifest_sha256"] != head.manifest_sha256
             or bytes(existing["head_json"]) != payload
         ):
@@ -2806,9 +3493,7 @@ def _store_v2_project_head(
         (head.project_id, head.generation),
     ).fetchone()
     if same_generation is not None:
-        raise ScienceTaskConflictV2(
-            "v2 project already has a different head at this generation"
-        )
+        raise ScienceTaskConflictV2("v2 project already has a different head at this generation")
     if head.generation == 0:
         if head.predecessor_project_head_id is not None:
             raise ScienceTaskStoreV2Error("v2 genesis project head has a predecessor")
@@ -2823,9 +3508,7 @@ def _store_v2_project_head(
             predecessor.project_id != head.project_id
             or head.generation != predecessor.generation + 1
         ):
-            raise ScienceTaskStoreV2Error(
-                "v2 project-head predecessor is not adjacent"
-            )
+            raise ScienceTaskStoreV2Error("v2 project-head predecessor is not adjacent")
     connection.execute(
         "INSERT INTO project_heads(project_head_id, project_id, generation, "
         "predecessor_project_head_id, manifest_sha256, head_json) "
@@ -2870,9 +3553,7 @@ def _validate_v2_project_head_chain(heads: Sequence[m2.ProjectHeadRefV2]) -> Non
             raise ScienceTaskStoreV2Error("v2 project-head generations are not contiguous")
         if index == 0:
             if head.predecessor_project_head_id is not None:
-                raise ScienceTaskStoreV2Error(
-                    "v2 project-head history does not begin at genesis"
-                )
+                raise ScienceTaskStoreV2Error("v2 project-head history does not begin at genesis")
         elif head.predecessor_project_head_id != heads[index - 1].project_head_id:
             raise ScienceTaskStoreV2Error("v2 project-head chain is not adjacent")
 
@@ -2913,18 +3594,10 @@ def _load_v2_successor_transition(
         or reference.plan_sha256 != row["plan_sha256"]
         or science_successor_plan_sha256(plan) != row["plan_sha256"]
     ):
-        raise ScienceTaskStoreV2Error(
-            "persisted v2 successor transition row is inconsistent"
-        )
+        raise ScienceTaskStoreV2Error("persisted v2 successor transition row is inconsistent")
     task = _load_v2_task_closure(connection, str(row["task_id"]))
-    if (
-        task.successor_transition != reference
-        or task.authoritative_attempt_id
-        != (
-            None
-            if reference.accepted_attempt is None
-            else reference.accepted_attempt.attempt_id
-        )
+    if task.successor_transition != reference or task.authoritative_attempt_id != (
+        None if reference.accepted_attempt is None else reference.accepted_attempt.attempt_id
     ):
         raise ScienceTaskStoreV2Error(
             "persisted v2 successor transition ownership is inconsistent"
@@ -2936,17 +3609,13 @@ def _load_v2_successor_transition(
     ).fetchone()
     if transition.state == "committed":
         if commit_row is None or reference.successor_project_head is None:
-            raise ScienceTaskStoreV2Error(
-                "committed v2 successor transition is incomplete"
-            )
+            raise ScienceTaskStoreV2Error("committed v2 successor transition is incomplete")
         commit = _v2_model_from_bytes(
             AtomicSuccessorCommitV2,
             bytes(commit_row["commit_json"]),
         )
         if commit.manifest_sha256 != commit_row["manifest_sha256"]:
-            raise ScienceTaskStoreV2Error(
-                "persisted v2 successor commit digest is inconsistent"
-            )
+            raise ScienceTaskStoreV2Error("persisted v2 successor commit digest is inconsistent")
         _validate_v2_successor_commit_closure(
             task=task,
             transition=transition,
@@ -2954,9 +3623,7 @@ def _load_v2_successor_transition(
             commit=commit,
         )
     elif commit_row is not None or reference.successor_project_head is not None:
-        raise ScienceTaskStoreV2Error(
-            "noncommitted v2 successor transition exposes a successor"
-        )
+        raise ScienceTaskStoreV2Error("noncommitted v2 successor transition exposes a successor")
     return transition
 
 
@@ -2987,12 +3654,9 @@ def _validate_v2_successor_commit_closure(
         or manifest.successor_project_head_id != successor.project_head_id
         or manifest.successor_generation != successor.generation
         or manifest.successor_manifest_sha256 != successor.manifest_sha256
-        or manifest.workspace_snapshot_id
-        != successor.workspace_snapshot.workspace_snapshot_id
-        or manifest.workspace_manifest_sha256
-        != successor.workspace_snapshot.manifest_sha256
-        or manifest.evolution_revision_id
-        != successor.evolution_revision.evolution_revision_id
+        or manifest.workspace_snapshot_id != successor.workspace_snapshot.workspace_snapshot_id
+        or manifest.workspace_manifest_sha256 != successor.workspace_snapshot.manifest_sha256
+        or manifest.evolution_revision_id != successor.evolution_revision.evolution_revision_id
         or manifest.evolution_revision_manifest_sha256
         != successor.evolution_revision.manifest_sha256
         or manifest.runtime_context_snapshot_id
@@ -3008,8 +3672,7 @@ def _validate_v2_successor_commit_closure(
         != admission.normalized_evolution_intent_sha256
         or successor.predecessor_project_head_id != predecessor.project_head_id
         or successor.generation != reference.expected_successor_generation
-        or successor.effective_execution_snapshot
-        != predecessor.effective_execution_snapshot
+        or successor.effective_execution_snapshot != predecessor.effective_execution_snapshot
     ):
         raise ScienceTaskPreconditionFailedV2(
             "atomic v2 successor receipt does not match its authoritative closure"
@@ -3030,9 +3693,7 @@ def _validate_v2_project_authority(
         workspace_snapshot=m2.WorkspaceSnapshotRefV2.model_validate(
             authority.workspace_snapshot.model_dump(mode="python")
         ),
-        normalized_evolution_intent_sha256=(
-            authority.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
         blockers=authority.blockers,
     )
 
@@ -3042,9 +3703,7 @@ def _v2_authority_bytes(authority: ScienceProjectAdmissionAuthorityV2) -> bytes:
         {
             "active_project_head": authority.active_project_head.model_dump(mode="json"),
             "blockers": [blocker.value for blocker in authority.blockers],
-            "normalized_evolution_intent_sha256": (
-                authority.normalized_evolution_intent_sha256
-            ),
+            "normalized_evolution_intent_sha256": (authority.normalized_evolution_intent_sha256),
             "project_config_sha256": authority.project_config_sha256,
             "project_id": authority.project_id,
             "workspace_snapshot": authority.workspace_snapshot.model_dump(mode="json"),
@@ -3078,16 +3737,12 @@ def _v2_authority_from_bytes(payload: bytes | str) -> ScienceProjectAdmissionAut
             raise ValueError("authority blockers are invalid")
         authority = ScienceProjectAdmissionAuthorityV2(
             project_id=value["project_id"],
-            active_project_head=m2.ProjectHeadRefV2.model_validate(
-                value["active_project_head"]
-            ),
+            active_project_head=m2.ProjectHeadRefV2.model_validate(value["active_project_head"]),
             project_config_sha256=value["project_config_sha256"],
             workspace_snapshot=m2.WorkspaceSnapshotRefV2.model_validate(
                 value["workspace_snapshot"]
             ),
-            normalized_evolution_intent_sha256=value[
-                "normalized_evolution_intent_sha256"
-            ],
+            normalized_evolution_intent_sha256=value["normalized_evolution_intent_sha256"],
             blockers=tuple(ScienceProjectReadinessBlockerV2(item) for item in blockers),
         )
     except Exception as exc:
@@ -3095,9 +3750,7 @@ def _v2_authority_from_bytes(payload: bytes | str) -> ScienceProjectAdmissionAut
             "persisted v2 project admission authority is invalid"
         ) from exc
     if _v2_authority_bytes(authority) != raw:
-        raise ScienceTaskStoreV2Error(
-            "persisted v2 project admission authority is not canonical"
-        )
+        raise ScienceTaskStoreV2Error("persisted v2 project admission authority is not canonical")
     return authority
 
 
@@ -3148,9 +3801,7 @@ def _append_v2_event(
     if _V2_EVENT_MODELS.get(event_type) is not model_type:
         raise ScienceTaskStoreV2Error("v2 event model does not match its type")
     next_sequence = int(
-        connection.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events"
-        ).fetchone()[0]
+        connection.execute("SELECT COALESCE(MAX(sequence), 0) + 1 FROM events").fetchone()[0]
     )
     if next_sequence > m2.MAX_JAVASCRIPT_SAFE_INTEGER:
         raise ScienceTaskConflictV2("v2 event sequence capacity is exhausted")
@@ -3168,7 +3819,7 @@ def _append_v2_event(
     try:
         provisional = model_type.model_validate(
             {
-                "event_id": f'event-{"0" * 64}',
+                "event_id": f"event-{'0' * 64}",
                 **event_payload,
             }
         )
@@ -3240,14 +3891,10 @@ def _validate_v2_event_authority(
         raise ScienceTaskStoreV2Error("persisted v2 event belongs to another project")
     if isinstance(event, m2.TaskAdmittedEventV2):
         valid = (
-            event.admission == task.admission
-            and event.occurred_at == task.admission.admitted_at
+            event.admission == task.admission and event.occurred_at == task.admission.admitted_at
         )
     elif isinstance(event, m2.AttemptAppendedEventV2):
-        valid = (
-            event.attempt in task.attempts
-            and event.occurred_at == event.attempt.created_at
-        )
+        valid = event.attempt in task.attempts and event.occurred_at == event.attempt.created_at
     elif isinstance(event, m2.DatasetSealedEventV2):
         valid = (
             event.task_id == task.task_id
@@ -3256,8 +3903,7 @@ def _validate_v2_event_authority(
         )
         if valid and task.successor_transition is not None:
             commit_row = connection.execute(
-                "SELECT commit_json FROM successor_commits "
-                "WHERE successor_transition_id = ?",
+                "SELECT commit_json FROM successor_commits WHERE successor_transition_id = ?",
                 (task.successor_transition.successor_transition_id,),
             ).fetchone()
             if commit_row is not None:
@@ -3267,8 +3913,7 @@ def _validate_v2_event_authority(
                 )
                 valid = (
                     commit.manifest.dataset_id == event.dataset_id
-                    and commit.manifest.dataset_manifest_sha256
-                    == event.dataset_sha256
+                    and commit.manifest.dataset_manifest_sha256 == event.dataset_sha256
                 )
     elif isinstance(event, m2.TransitionChangedEventV2):
         current = _load_v2_successor_transition(
@@ -3309,9 +3954,7 @@ def _validate_v2_event_authority(
     else:  # pragma: no cover - closed event union guards this branch
         valid = False
     if not valid:
-        raise ScienceTaskStoreV2Error(
-            "persisted v2 event does not match authoritative Task state"
-        )
+        raise ScienceTaskStoreV2Error("persisted v2 event does not match authoritative Task state")
 
 
 def _load_and_validate_v2_task_event_history(
@@ -3320,8 +3963,7 @@ def _load_and_validate_v2_task_event_history(
 ) -> list[m2.EventEnvelopeV2]:
     task = _load_v2_task_closure(connection, task_id)
     rows = connection.execute(
-        "SELECT task_id, event_json FROM events WHERE task_id = ? ORDER BY sequence "
-        "LIMIT ?",
+        "SELECT task_id, event_json FROM events WHERE task_id = ? ORDER BY sequence LIMIT ?",
         (task_id, _MAX_V2_EVENTS_PER_TASK + 1),
     ).fetchall()
     if len(rows) > _MAX_V2_EVENTS_PER_TASK:
@@ -3487,12 +4129,10 @@ def _validate_v2_submission_authority(
     if (
         request.project_id != authority.project_id
         or request.expected_project_admission_etag != authority.project_etag
-        or request.expected_project_head_id
-        != authority.active_project_head.project_head_id
+        or request.expected_project_head_id != authority.active_project_head.project_head_id
         or request.expected_project_head_manifest_sha256
         != authority.active_project_head.manifest_sha256
-        or request.expected_project_config_sha256
-        != authority.project_config_sha256
+        or request.expected_project_config_sha256 != authority.project_config_sha256
     ):
         raise ScienceTaskStaleSubmissionV2(
             "v2 Task submission no longer matches project admission authority"
@@ -3522,9 +4162,7 @@ def _new_v2_task(
             workspace_snapshot=authority.workspace_snapshot,
             project_config_sha256=authority.project_config_sha256,
         ),
-        normalized_evolution_intent_sha256=(
-            authority.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
         registry_sha256=authority.active_project_head.registry_sha256,
         admission_sha256="0" * 64,
         admitted_at=timestamp,
@@ -3578,9 +4216,7 @@ def _task_envelope_sha256(
                 "project_id": project_id,
                 "schema_version": "2",
                 "workspace_snapshot": workspace_snapshot.model_dump(mode="json"),
-                "predecessor_project_head": predecessor_project_head.model_dump(
-                    mode="json"
-                ),
+                "predecessor_project_head": predecessor_project_head.model_dump(mode="json"),
             }
         )
     ).hexdigest()
@@ -3622,9 +4258,7 @@ def _replace_v2_task(task: m2.TaskV2, **changes: object) -> m2.TaskV2:
         **data,
         etag=f'"{"0" * 64}"',
     )
-    etag_payload = _v2_json_bytes(
-        provisional.model_dump(mode="json", exclude={"etag"})
-    )
+    etag_payload = _v2_json_bytes(provisional.model_dump(mode="json", exclude={"etag"}))
     data["etag"] = f'"{hashlib.sha256(etag_payload).hexdigest()}"'
     return m2.TaskV2.model_validate(data)
 
@@ -3675,23 +4309,18 @@ def _load_v2_task_closure(
         active_project_head=admission.predecessor_project_head,
         project_config_sha256=admission.project_config_sha256,
         workspace_snapshot=admission.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            admission.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(admission.normalized_evolution_intent_sha256),
     )
     if (
         admission != task.admission
         or admission_row["task_id"] != task.task_id
         or admission_row["admission_sha256"] != admission.admission_sha256
         or m2.task_admission_sha256_for(admission) != admission.admission_sha256
-        or request.expected_project_admission_etag
-        != admitted_authority.project_etag
-        or request.expected_project_head_id
-        != admission.predecessor_project_head.project_head_id
+        or request.expected_project_admission_etag != admitted_authority.project_etag
+        or request.expected_project_head_id != admission.predecessor_project_head.project_head_id
         or request.expected_project_head_manifest_sha256
         != admission.predecessor_project_head.manifest_sha256
-        or request.expected_project_config_sha256
-        != admission.project_config_sha256
+        or request.expected_project_config_sha256 != admission.project_config_sha256
         or admission.task_envelope_sha256
         != _task_envelope_sha256(
             project_id=admission.project_id,
@@ -3699,12 +4328,9 @@ def _load_v2_task_closure(
             workspace_snapshot=admission.workspace_snapshot,
             project_config_sha256=admission.project_config_sha256,
         )
-        or admission.registry_sha256
-        != admission.predecessor_project_head.registry_sha256
+        or admission.registry_sha256 != admission.predecessor_project_head.registry_sha256
     ):
-        raise ScienceTaskStoreV2Error(
-            "persisted v2 Task admission closure is inconsistent"
-        )
+        raise ScienceTaskStoreV2Error("persisted v2 Task admission closure is inconsistent")
 
     attempt_rows = connection.execute(
         "SELECT attempt_id, ordinal, attempt_json FROM attempts WHERE task_id = ? "
@@ -3714,8 +4340,7 @@ def _load_v2_task_closure(
     if len(attempt_rows) > 100:
         raise ScienceTaskStoreV2Error("persisted v2 Attempt inventory exceeds its bound")
     attempts = [
-        _v2_model_from_bytes(m2.AttemptRefV2, bytes(item["attempt_json"]))
-        for item in attempt_rows
+        _v2_model_from_bytes(m2.AttemptRefV2, bytes(item["attempt_json"])) for item in attempt_rows
     ]
     if attempts != task.attempts or any(
         item["attempt_id"] != attempt.attempt_id or item["ordinal"] != attempt.ordinal
@@ -3728,9 +4353,7 @@ def _load_v2_task_closure(
     ).fetchall()
     if task.successor_transition is None:
         if transition_rows:
-            raise ScienceTaskStoreV2Error(
-                "persisted v2 Task omits its successor transition"
-            )
+            raise ScienceTaskStoreV2Error("persisted v2 Task omits its successor transition")
     else:
         if len(transition_rows) != 1:
             raise ScienceTaskStoreV2Error(
@@ -3750,17 +4373,12 @@ def _load_v2_task_closure(
         }
         if (
             transition.transition != task.successor_transition
-            or (
-                task.state == "waiting_for_successor"
-                and transition.state not in nonterminal
-            )
+            or (task.state == "waiting_for_successor" and transition.state not in nonterminal)
             or (task.state == "failed" and transition.state != "failed")
             or (task.state == "completed" and transition.state != "committed")
             or task.state not in {"waiting_for_successor", "failed", "completed"}
         ):
-            raise ScienceTaskStoreV2Error(
-                "persisted v2 Task successor state is inconsistent"
-            )
+            raise ScienceTaskStoreV2Error("persisted v2 Task successor state is inconsistent")
     return task
 
 
@@ -3771,8 +4389,7 @@ def _load_v2_attempt(
     attempt_id: str,
 ) -> m2.AttemptRefV2:
     row = connection.execute(
-        "SELECT ordinal, attempt_json FROM attempts "
-        "WHERE task_id = ? AND attempt_id = ?",
+        "SELECT ordinal, attempt_json FROM attempts WHERE task_id = ? AND attempt_id = ?",
         (task_id, attempt_id),
     ).fetchone()
     if row is None:
@@ -3785,6 +4402,416 @@ def _load_v2_attempt(
     ):
         raise ScienceTaskStoreV2Error("persisted v2 Attempt row is inconsistent")
     return attempt
+
+
+def _replace_v2_execution_record(
+    record: ScienceAttemptExecutionRecordV2,
+    **changes: object,
+) -> ScienceAttemptExecutionRecordV2:
+    data = record.model_dump(mode="python")
+    data.update(changes)
+    return ScienceAttemptExecutionRecordV2.model_validate(data)
+
+
+def _load_v2_attempt_execution_optional(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+) -> ScienceAttemptExecutionRecordV2 | None:
+    row = connection.execute(
+        "SELECT task_id, state, receipt_sha256, session_result_sha256, "
+        "length(CAST(session_result_json AS BLOB)) AS session_result_byte_size, "
+        "execution_json "
+        "FROM attempt_executions WHERE attempt_id = ?",
+        (attempt_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    record = _v2_model_from_bytes(
+        ScienceAttemptExecutionRecordV2,
+        bytes(row["execution_json"]),
+    )
+    expected_receipt_sha256 = None if record.receipt is None else record.receipt.receipt_sha256
+    if (
+        record.attempt_id != attempt_id
+        or record.task_id != row["task_id"]
+        or record.state != row["state"]
+        or row["receipt_sha256"] != expected_receipt_sha256
+        or (
+            record.receipt is not None
+            and science_attempt_execution_receipt_sha256(record.receipt)
+            != record.receipt.receipt_sha256
+        )
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 Attempt execution row is inconsistent")
+    has_result = row["session_result_sha256"] is not None
+    has_result_bytes = row["session_result_byte_size"] is not None
+    if has_result != has_result_bytes or (record.state == "captured") != has_result:
+        raise ScienceTaskStoreV2Error("persisted v2 Attempt result authority is inconsistent")
+    if has_result:
+        captured_result = _load_v2_captured_session_result(connection, attempt_id)
+        if (
+            record.receipt is None
+            or record.evidence is None
+            or science_session_result_sha256(captured_result)
+            != record.receipt.session_result_sha256
+            or record.evidence.session_result_sha256 != record.receipt.session_result_sha256
+        ):
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 Attempt result differs from its terminal receipt"
+            )
+    attempt = _load_v2_attempt(
+        connection,
+        task_id=record.task_id,
+        attempt_id=record.attempt_id,
+    )
+    if attempt.attempt_id != record.attempt_id:
+        raise ScienceTaskStoreV2Error("persisted v2 Attempt execution lost its Attempt")
+    return record
+
+
+def _load_v2_captured_session_result(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+) -> SessionResult:
+    row = connection.execute(
+        "SELECT session_result_sha256, "
+        "length(CAST(session_result_json AS BLOB)) AS byte_size, "
+        "CASE WHEN length(CAST(session_result_json AS BLOB)) <= ? "
+        "THEN session_result_json ELSE NULL END AS guarded_json "
+        "FROM attempt_executions WHERE attempt_id = ?",
+        (MAX_CAPTURED_SESSION_RESULT_BYTES, attempt_id),
+    ).fetchone()
+    if row is None or row["session_result_sha256"] is None or row["byte_size"] is None:
+        raise ScienceTaskStoreV2Error("captured v2 Attempt result is missing")
+    byte_size = int(row["byte_size"])
+    if byte_size < 1 or byte_size > MAX_CAPTURED_SESSION_RESULT_BYTES:
+        raise ScienceTaskStoreV2Error("captured v2 Attempt result exceeds its byte budget")
+    guarded = row["guarded_json"]
+    if guarded is None:
+        raise ScienceTaskStoreV2Error("captured v2 Attempt result was not read safely")
+    payload = bytes(guarded)
+    if (
+        len(payload) != byte_size
+        or hashlib.sha256(payload).hexdigest() != row["session_result_sha256"]
+    ):
+        raise ScienceTaskStoreV2Error("captured v2 Attempt result digest is inconsistent")
+    try:
+        result = SessionResult.model_validate_json(payload)
+        result = canonical_subscription_session_result(result)
+    except (TypeError, ValueError) as exc:
+        raise ScienceTaskStoreV2Error("captured v2 Attempt result is invalid") from exc
+    if science_session_result_bytes(result) != payload:
+        raise ScienceTaskStoreV2Error("captured v2 Attempt result is not canonical")
+    return result
+
+
+def _load_v2_attempt_execution(
+    connection: sqlite3.Connection,
+    attempt_id: str,
+) -> ScienceAttemptExecutionRecordV2:
+    record = _load_v2_attempt_execution_optional(connection, attempt_id)
+    if record is None:
+        raise ScienceAttemptNotFoundV2("v2 Attempt execution was not found")
+    return record
+
+
+def _update_v2_attempt_execution(
+    connection: sqlite3.Connection,
+    record: ScienceAttemptExecutionRecordV2,
+) -> None:
+    receipt_sha256 = None if record.receipt is None else record.receipt.receipt_sha256
+    updated = connection.execute(
+        "UPDATE attempt_executions SET state = ?, receipt_sha256 = ?, "
+        "execution_json = ?, resource_version = resource_version + 1 "
+        "WHERE attempt_id = ? AND task_id = ?",
+        (
+            record.state,
+            receipt_sha256,
+            _v2_model_bytes(record),
+            record.attempt_id,
+            record.task_id,
+        ),
+    ).rowcount
+    if updated != 1:
+        raise ScienceTaskStoreV2Error("v2 Attempt execution update lost ownership")
+
+
+def _validate_v2_execution_ownership(
+    task: m2.TaskV2,
+    record: ScienceAttemptExecutionRecordV2,
+) -> None:
+    if record.task_id != task.task_id or all(
+        item.attempt_id != record.attempt_id for item in task.attempts
+    ):
+        raise ScienceTaskStoreV2Error("v2 Attempt execution does not belong to the immutable Task")
+    if record.state == "captured":
+        if task.authoritative_attempt_id != record.attempt_id or task.state not in {
+            "waiting_for_successor",
+            "completed",
+            "failed",
+        }:
+            raise ScienceTaskStoreV2Error(
+                "captured v2 Attempt does not own the authoritative Task result"
+            )
+    elif task.authoritative_attempt_id == record.attempt_id:
+        raise ScienceTaskStoreV2Error("non-captured v2 Attempt unexpectedly owns the Task result")
+
+
+def _validate_v2_terminal_execution_closure(
+    *,
+    connection: sqlite3.Connection,
+    task: m2.TaskV2,
+    attempt_id: str,
+    receipt: ScienceAttemptExecutionReceiptV2,
+    evidence: ScienceAttemptExecutionEvidenceV2,
+    successor_plan: ScienceSuccessorPlanV2,
+    terminal_result: SessionResult,
+) -> None:
+    admission = task.admission
+    predecessor = admission.predecessor_project_head
+    attempt = next(
+        (item for item in task.attempts if item.attempt_id == attempt_id),
+        None,
+    )
+    if attempt is None:
+        raise ScienceTaskPreconditionFailedV2(
+            "terminal execution Attempt does not belong to the immutable Task"
+        )
+    rollout_rows = connection.execute(
+        "SELECT attempt_id, task_id, rollout_task_id, session_id, "
+        "generation_digest, registry_digest, framework_lock_digest, payload_sha256 "
+        "FROM attempt_run_admissions WHERE attempt_id = ? AND operation = ? LIMIT 2",
+        (attempt_id, RunAdmissionOperation.ROLLOUT_TASK_SUBMIT.value),
+    ).fetchall()
+    if len(rollout_rows) != 1:
+        raise ScienceTaskPreconditionFailedV2(
+            "terminal execution has no exact pre-registered rollout authority"
+        )
+    rollout = rollout_rows[0]
+    workspace_result = terminal_result.workspace_result
+    if (
+        rollout["attempt_id"] != attempt_id
+        or rollout["task_id"] != task.task_id
+        or rollout["rollout_task_id"] != receipt.rollout_task_id
+        or rollout["session_id"] != ""
+        or rollout["generation_digest"] != receipt.service_generation_sha256
+        or rollout["registry_digest"] != receipt.registry_sha256
+        or rollout["framework_lock_digest"] != receipt.framework_lock_sha256
+        or rollout["payload_sha256"] != receipt.rollout_payload_sha256
+        or receipt.task_id != task.task_id
+        or receipt.attempt_id != attempt.attempt_id
+        or receipt.task_admission_id != admission.task_admission_id
+        or receipt.admission_sha256 != admission.admission_sha256
+        or receipt.project_id != task.project_id
+        or receipt.predecessor_project_head_id != predecessor.project_head_id
+        or receipt.predecessor_project_head_manifest_sha256 != predecessor.manifest_sha256
+        or receipt.workspace_snapshot_id != admission.workspace_snapshot.workspace_snapshot_id
+        or receipt.workspace_manifest_sha256 != admission.workspace_snapshot.manifest_sha256
+        or receipt.evolution_revision_id != predecessor.evolution_revision.evolution_revision_id
+        or receipt.evolution_revision_manifest_sha256
+        != predecessor.evolution_revision.manifest_sha256
+        or receipt.runtime_context_snapshot_id
+        != predecessor.runtime_context_snapshot.runtime_context_snapshot_id
+        or receipt.runtime_context_manifest_sha256
+        != predecessor.runtime_context_snapshot.manifest_sha256
+        or receipt.effective_execution_snapshot_id
+        != predecessor.effective_execution_snapshot.effective_execution_snapshot_id
+        or receipt.effective_execution_snapshot_sha256
+        != predecessor.effective_execution_snapshot.snapshot_sha256
+        or receipt.registry_sha256 != admission.registry_sha256
+        or receipt.capture_mode != predecessor.effective_execution_snapshot.capture_mode
+        or receipt.token_level_metrics_available
+        != predecessor.effective_execution_snapshot.token_level_metrics_available
+        or evidence.task_id != task.task_id
+        or evidence.attempt_id != attempt.attempt_id
+        or evidence.rollout_task_id != receipt.rollout_task_id
+        or evidence.session_id != receipt.session_id
+        or evidence.session_result_sha256 != receipt.session_result_sha256
+        or evidence.workspace_handoff_id != receipt.workspace_handoff_id
+        or evidence.workspace_result_manifest_sha256 != receipt.workspace_result_manifest_sha256
+        or evidence.capture_mode != receipt.capture_mode
+        or evidence.token_level_metrics_available != receipt.token_level_metrics_available
+        or evidence.session_status != receipt.terminal_status
+        or terminal_result.task_id != receipt.rollout_task_id
+        or terminal_result.session_id != receipt.session_id
+        or science_session_result_sha256(terminal_result) != receipt.session_result_sha256
+        or workspace_result is None
+        or workspace_result.handoff_id != receipt.workspace_handoff_id
+        or workspace_result.result_manifest_sha256 != receipt.workspace_result_manifest_sha256
+        or workspace_result.attempt_id != attempt.attempt_id
+        or workspace_result.task_admission_id != admission.task_admission_id
+        or workspace_result.admission_sha256 != admission.admission_sha256
+        or workspace_result.project_id != task.project_id
+        or workspace_result.input_workspace_snapshot_id
+        != admission.workspace_snapshot.workspace_snapshot_id
+        or workspace_result.input_workspace_manifest_sha256
+        != admission.workspace_snapshot.manifest_sha256
+        or workspace_result.service_generation_sha256 != receipt.service_generation_sha256
+        or workspace_result.registry_sha256 != receipt.registry_sha256
+        or workspace_result.framework_lock_sha256 != receipt.framework_lock_sha256
+        or terminal_result.metadata.get("policy_version") != evidence.policy_version
+        or evidence.transcript_record_count != len(terminal_result.trajectory.traces)
+        or evidence.workspace_archive_sha256 != workspace_result.output_archive.content_sha256
+        or evidence.workspace_archive_byte_size != workspace_result.output_archive.byte_size
+        or evidence.workspace_entry_count != workspace_result.output_archive.entry_count
+        or evidence.workspace_extracted_byte_size
+        != workspace_result.output_archive.extracted_byte_size
+        or successor_plan.project_id != task.project_id
+        or successor_plan.task_id != task.task_id
+        or successor_plan.task_admission_id != admission.task_admission_id
+        or successor_plan.admission_sha256 != admission.admission_sha256
+        or successor_plan.accepted_attempt_id != attempt.attempt_id
+        or successor_plan.predecessor_project_head_id != predecessor.project_head_id
+        or successor_plan.normalized_evolution_intent_sha256
+        != admission.normalized_evolution_intent_sha256
+    ):
+        raise ScienceTaskPreconditionFailedV2(
+            "terminal execution evidence does not match immutable v2 admission"
+        )
+
+
+def _v2_run_admission_row(
+    connection: sqlite3.Connection,
+    check: GenerationBoundRunAdmissionCheck,
+) -> sqlite3.Row | None:
+    assert check.task_id is not None
+    return connection.execute(
+        "SELECT attempt_id, task_id, generation_digest, registry_digest, "
+        "framework_lock_digest, payload_sha256 FROM attempt_run_admissions "
+        "WHERE operation = ? AND rollout_task_id = ? AND session_id = ?",
+        (check.operation.value, check.task_id, check.session_id or ""),
+    ).fetchone()
+
+
+def _v2_run_admission_matches(
+    row: sqlite3.Row,
+    check: GenerationBoundRunAdmissionCheck,
+) -> bool:
+    return all(
+        row[column] == value
+        for column, value in (
+            ("generation_digest", check.generation_digest),
+            ("registry_digest", check.registry_digest),
+            ("framework_lock_digest", check.framework_lock_digest),
+            ("payload_sha256", check.payload_sha256),
+        )
+    )
+
+
+def _insert_v2_run_admission(
+    connection: sqlite3.Connection,
+    *,
+    task_id: str,
+    attempt_id: str,
+    check: GenerationBoundRunAdmissionCheck,
+) -> None:
+    if check.task_id is None:
+        raise ValueError("v2 run admission requires a rollout Task identity")
+    per_attempt = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM attempt_run_admissions WHERE attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()[0]
+    )
+    total = int(connection.execute("SELECT COUNT(*) FROM attempt_run_admissions").fetchone()[0])
+    if per_attempt >= _MAX_V2_RUN_ADMISSIONS_PER_ATTEMPT or total >= _MAX_V2_RUN_ADMISSIONS:
+        raise ScienceTaskConflictV2("v2 run admission capacity is exhausted")
+    try:
+        connection.execute(
+            "INSERT INTO attempt_run_admissions(attempt_id, task_id, operation, "
+            "rollout_task_id, session_id, generation_digest, registry_digest, "
+            "framework_lock_digest, payload_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                attempt_id,
+                task_id,
+                check.operation.value,
+                check.task_id,
+                check.session_id or "",
+                check.generation_digest,
+                check.registry_digest,
+                check.framework_lock_digest,
+                check.payload_sha256,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ScienceTaskConflictV2("v2 run admission conflicts with existing authority") from exc
+
+
+def _verify_v2_run_admission_inventory(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT attempt_id, task_id, operation, rollout_task_id, session_id, "
+        "generation_digest, registry_digest, framework_lock_digest, payload_sha256 "
+        "FROM attempt_run_admissions ORDER BY operation, rollout_task_id, session_id "
+        "LIMIT ?",
+        (_MAX_V2_RUN_ADMISSIONS + 1,),
+    ).fetchall()
+    if len(rows) > _MAX_V2_RUN_ADMISSIONS:
+        raise ScienceTaskStoreV2Error("v2 run admission inventory exceeds its bound")
+    parents: dict[str, sqlite3.Row] = {}
+    counts: dict[str, int] = {}
+    for row in rows:
+        try:
+            operation = RunAdmissionOperation(str(row["operation"]))
+        except ValueError as exc:
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 run admission operation is invalid"
+            ) from exc
+        attempt_id = str(row["attempt_id"])
+        task_id = str(row["task_id"])
+        rollout_task_id = str(row["rollout_task_id"])
+        session_id = str(row["session_id"])
+        record = _load_v2_attempt_execution(connection, attempt_id)
+        task = _load_v2_task_closure(connection, task_id)
+        _validate_v2_execution_ownership(task, record)
+        if record.task_id != task_id:
+            raise ScienceTaskStoreV2Error("persisted v2 run admission crosses Task ownership")
+        counts[attempt_id] = counts.get(attempt_id, 0) + 1
+        if counts[attempt_id] > _MAX_V2_RUN_ADMISSIONS_PER_ATTEMPT:
+            raise ScienceTaskStoreV2Error(
+                "v2 per-Attempt run admission inventory exceeds its bound"
+            )
+        for column in (
+            "generation_digest",
+            "registry_digest",
+            "framework_lock_digest",
+            "payload_sha256",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(row[column]), flags=re.ASCII) is None:
+                raise ScienceTaskStoreV2Error("persisted v2 run admission digest is invalid")
+        if row["registry_digest"] != task.admission.registry_sha256:
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 run admission registry differs from admission"
+            )
+        if operation is RunAdmissionOperation.ROLLOUT_TASK_SUBMIT:
+            if session_id or rollout_task_id in parents:
+                raise ScienceTaskStoreV2Error(
+                    "persisted v2 rollout admission identity is ambiguous"
+                )
+            parents[rollout_task_id] = row
+        elif not session_id:
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 gateway admission lacks a session identity"
+            )
+
+    for row in rows:
+        operation = RunAdmissionOperation(str(row["operation"]))
+        if operation is RunAdmissionOperation.ROLLOUT_TASK_SUBMIT:
+            continue
+        parent = parents.get(str(row["rollout_task_id"]))
+        if parent is None or any(
+            row[column] != parent[column]
+            for column in (
+                "attempt_id",
+                "task_id",
+                "generation_digest",
+                "registry_digest",
+                "framework_lock_digest",
+            )
+        ):
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 gateway admission has no exact rollout parent"
+            )
 
 
 def page_items(
