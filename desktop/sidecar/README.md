@@ -4,6 +4,25 @@ The sidecar owns Desktop-local security boundaries that must not be exposed to
 the React renderer. Local HTTP routes and the native host are separate adapters;
 they are not implemented in every private sidecar service module.
 
+## OpenSSH host catalog
+
+Local API v2 exposes a path-free catalog of literal aliases from the user's
+default OpenSSH configuration. `ssh_config_catalog.py` performs only bounded
+lexical reads of `Host` and statically resolvable `Include` directives. It does
+not invoke `ssh -G`, `Match exec`, `ProxyCommand`, a shell, or any other external
+program. Wildcard, negated, conditional, malformed, unreadable, cyclic, and
+over-budget entries produce closed warning codes; a bounded literal alias can
+still be entered manually.
+
+The loader has immutable limits for file count, aggregate and per-file bytes,
+include depth and patterns, glob matches, line bytes, and unique aliases. Its
+result contains aliases, source kind, and aggregate warnings only—never config
+text or source paths. The v2 catalog provider assigns a semantic generation,
+keeps that generation stable when a rescan is unchanged, and binds every rescan
+to both the expected generation and an idempotency key. This catalog is a UI
+hint: the selected exact alias is later passed to system OpenSSH, which remains
+the connection and configuration authority.
+
 ## Release execution modes
 
 The exact sidecar release composition publishes the required

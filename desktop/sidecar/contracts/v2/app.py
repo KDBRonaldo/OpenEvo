@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-from typing import Annotated
+from collections.abc import Iterable, Iterator, Mapping
+from functools import wraps
+from typing import Annotated, Protocol
 
-from fastapi import APIRouter, FastAPI, Header, Query, Security
+from fastapi import APIRouter, FastAPI, Header, Query, Request, Security
 from fastapi.openapi.utils import get_openapi
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from pydantic import StringConstraints
+
+from desktop.sidecar.ssh_catalog_errors import (
+    SshCatalogActionCapacityError,
+    SshCatalogGenerationChangedError,
+    SshCatalogIdempotencyConflictError,
+)
 
 from . import models as m
 
@@ -96,7 +105,71 @@ def _contract_only() -> JSONResponse:
     return JSONResponse(status_code=501, content=payload.model_dump(mode="json"))
 
 
-def create_desktop_local_v2_contract_app() -> FastAPI:
+class DesktopLocalApiProviderV2(Protocol):
+    """Execution provider bound to canonical Desktop Local API v2 routes."""
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
+
+
+def _iter_api_routes(routes: Iterable[object]) -> Iterator[APIRoute]:
+    visited_routers: set[int] = set()
+
+    def visit(items: Iterable[object]) -> Iterator[APIRoute]:
+        for route in items:
+            if isinstance(route, APIRoute):
+                yield route
+                continue
+            original_router = getattr(route, "original_router", None)
+            if not isinstance(original_router, APIRouter):
+                continue
+            identity = id(original_router)
+            if identity in visited_routers:
+                continue
+            visited_routers.add(identity)
+            yield from visit(original_router.routes)
+
+    yield from visit(routes)
+
+
+def _bind_provider(app: FastAPI, provider: DesktopLocalApiProviderV2) -> None:
+    for route in _iter_api_routes(app.routes):
+        if route.operation_id is None:
+            continue
+        operation_id = route.operation_id
+        original_endpoint = route.endpoint
+
+        @wraps(original_endpoint)
+        async def invoke_provider(
+            _operation_id: str = operation_id,
+            **arguments: object,
+        ) -> object:
+            return provider.invoke(_operation_id, arguments)
+
+        route.endpoint = invoke_provider
+        route.dependant.call = invoke_provider
+
+
+def _catalog_error(
+    *,
+    status_code: int,
+    code: str,
+    summary: str,
+    retryable: bool,
+    action: m.DesktopActionV2,
+) -> JSONResponse:
+    error = m.DesktopErrorV2(
+        code=code,
+        summary=summary,
+        retryable=retryable,
+        action=action,
+        affected_resource_id=None,
+    )
+    return JSONResponse(status_code=status_code, content=error.model_dump(mode="json"))
+
+
+def create_desktop_local_v2_contract_app(
+    provider: DesktopLocalApiProviderV2 | None = None,
+) -> FastAPI:
     """Build the Local API v2 schema source with no business implementation."""
 
     app = FastAPI(
@@ -637,6 +710,51 @@ def create_desktop_local_v2_contract_app() -> FastAPI:
 
     app.include_router(router)
 
+    @app.exception_handler(SshCatalogGenerationChangedError)
+    async def catalog_generation_changed(
+        request: Request,
+        exc: SshCatalogGenerationChangedError,
+    ) -> JSONResponse:
+        del request, exc
+        return _catalog_error(
+            status_code=412,
+            code="ssh_catalog_generation_changed",
+            summary="The configured SSH host catalog changed; reload it before rescanning.",
+            retryable=True,
+            action="rescan",
+        )
+
+    @app.exception_handler(SshCatalogIdempotencyConflictError)
+    async def catalog_idempotency_conflict(
+        request: Request,
+        exc: SshCatalogIdempotencyConflictError,
+    ) -> JSONResponse:
+        del request, exc
+        return _catalog_error(
+            status_code=409,
+            code="ssh_catalog_idempotency_conflict",
+            summary="The SSH catalog action key was already used for another request.",
+            retryable=False,
+            action="none",
+        )
+
+    @app.exception_handler(SshCatalogActionCapacityError)
+    async def catalog_action_capacity(
+        request: Request,
+        exc: SshCatalogActionCapacityError,
+    ) -> JSONResponse:
+        del request, exc
+        return _catalog_error(
+            status_code=503,
+            code="ssh_catalog_action_capacity_exhausted",
+            summary="The bounded SSH catalog action ledger is full.",
+            retryable=False,
+            action="reconnect",
+        )
+
+    if provider is not None:
+        _bind_provider(app, provider)
+
     def contract_openapi() -> dict[str, object]:
         if app.openapi_schema is not None:
             return app.openapi_schema
@@ -673,6 +791,7 @@ desktop_local_v2_contract_app = create_desktop_local_v2_contract_app()
 
 
 __all__ = [
+    "DesktopLocalApiProviderV2",
     "desktop_local_v2_contract_app",
     "create_desktop_local_v2_contract_app",
 ]

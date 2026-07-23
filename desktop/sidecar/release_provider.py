@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import hmac
+import json
 import logging
 import re
 import sqlite3
@@ -43,6 +44,11 @@ from desktop.sidecar.contracts.v1.models import (
     VersionV1,
     WorkspaceImportRefV1,
 )
+from desktop.sidecar.contracts.v2.models import (
+    MAX_JAVASCRIPT_SAFE_INTEGER,
+    SshHostCatalogRescanV2,
+    SshHostCatalogV2,
+)
 from desktop.sidecar.core_bridge_v1 import (
     CoreActivationV1,
     DesktopCoreBridgeErrorV1,
@@ -66,6 +72,15 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteCredentialUnavailableError,
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
+)
+from desktop.sidecar.ssh_catalog_errors import (
+    SshCatalogActionCapacityError,
+    SshCatalogGenerationChangedError,
+    SshCatalogIdempotencyConflictError,
+)
+from desktop.sidecar.ssh_config_catalog import (
+    OpenSshCatalogScan,
+    OpenSshHostCatalogLoader,
 )
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
@@ -164,6 +179,120 @@ class _ConnectionOutcome:
 
 
 ConnectionAction = Callable[[RemoteProfileV1], _ConnectionOutcome]
+
+
+@dataclass(frozen=True)
+class _CatalogActionReplayV2:
+    request_sha256: str
+    response: SshHostCatalogV2
+
+
+class ConfiguredSshHostCatalogProviderV2:
+    """Bounded provider slice for authenticated Local API v2 catalog routes."""
+
+    def __init__(
+        self,
+        loader: OpenSshHostCatalogLoader,
+        *,
+        clock: Callable[[], datetime] | None = None,
+        max_idempotency_actions: int = 1_024,
+    ) -> None:
+        if type(max_idempotency_actions) is not int or max_idempotency_actions < 1:
+            raise ValueError("catalog idempotency capacity must be a positive integer")
+        self._loader = loader
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._max_idempotency_actions = max_idempotency_actions
+        self._lock = Lock()
+        self._replays: dict[str, _CatalogActionReplayV2] = {}
+        initial = self._loader.scan()
+        self._semantic_sha256 = initial.semantic_sha256
+        self._catalog = self._snapshot(initial, generation=1)
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        if operation_id == "listConfiguredSshHostsV2":
+            return self.list_catalog()
+        if operation_id == "rescanConfiguredSshHostsV2":
+            request = arguments.get("request")
+            resource_generation = arguments.get("resource_generation")
+            idempotency_key = arguments.get("idempotency_key")
+            if not isinstance(request, SshHostCatalogRescanV2):
+                raise TypeError("catalog rescan request has an invalid type")
+            if type(resource_generation) is not int:
+                raise TypeError("catalog resource generation has an invalid type")
+            if type(idempotency_key) is not str:
+                raise TypeError("catalog idempotency key has an invalid type")
+            return self.rescan(
+                request,
+                resource_generation=resource_generation,
+                idempotency_key=idempotency_key,
+            )
+        raise ProviderCapabilityUnavailableError(operation_id)
+
+    def list_catalog(self) -> SshHostCatalogV2:
+        with self._lock:
+            return self._catalog
+
+    def rescan(
+        self,
+        request: SshHostCatalogRescanV2,
+        *,
+        resource_generation: int,
+        idempotency_key: str,
+    ) -> SshHostCatalogV2:
+        request_sha256 = self._request_sha256(request, resource_generation)
+        with self._lock:
+            replay = self._replays.get(idempotency_key)
+            if replay is not None:
+                if replay.request_sha256 != request_sha256:
+                    raise SshCatalogIdempotencyConflictError
+                return replay.response
+            if resource_generation != self._catalog.catalog_generation:
+                raise SshCatalogGenerationChangedError
+            if len(self._replays) >= self._max_idempotency_actions:
+                raise SshCatalogActionCapacityError
+
+            scan = self._loader.scan()
+            generation = self._catalog.catalog_generation
+            if scan.semantic_sha256 != self._semantic_sha256:
+                if generation >= MAX_JAVASCRIPT_SAFE_INTEGER:
+                    raise SshCatalogActionCapacityError
+                generation += 1
+            response = self._snapshot(scan, generation=generation)
+            self._semantic_sha256 = scan.semantic_sha256
+            self._catalog = response
+            self._replays[idempotency_key] = _CatalogActionReplayV2(
+                request_sha256=request_sha256,
+                response=response,
+            )
+            return response
+
+    def _snapshot(self, scan: OpenSshCatalogScan, *, generation: int) -> SshHostCatalogV2:
+        return SshHostCatalogV2(
+            catalog_generation=generation,
+            hosts=list(scan.hosts),
+            warnings=list(scan.warnings),
+            scanned_at=self._timestamp(),
+        )
+
+    def _timestamp(self) -> str:
+        moment = self._clock()
+        if not isinstance(moment, datetime) or moment.tzinfo is None:
+            raise ValueError("catalog clock must return a timezone-aware datetime")
+        return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _request_sha256(request: SshHostCatalogRescanV2, generation: int) -> str:
+        encoded = json.dumps(
+            {
+                "request": request.model_dump(mode="json"),
+                "resource_generation": generation,
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("ascii")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 def _collect_cleanup_failure(
@@ -2671,6 +2800,7 @@ class DesktopReleaseProvider:
 
 __all__ = (
     "ActiveProjectMismatchError",
+    "ConfiguredSshHostCatalogProviderV2",
     "DesktopReleaseProvider",
     "EvolutionConfigurationPendingError",
     "ExecutionModeReleaseUnavailableError",
