@@ -1,5 +1,8 @@
 {
   "bundle": {
+    "macOS": {
+      "hardenedRuntime": false
+    },
     "resources": {
       "release-resources/openevo-release-assets": "openevo-release-assets"
     }

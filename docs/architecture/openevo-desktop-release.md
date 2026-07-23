@@ -66,6 +66,21 @@ The repository currently provides:
   then atomically replaces the Tauri target and fsyncs the binary directory. A
   failure before replacement preserves the previous target and leaves only a
   non-authoritative staging file for inspection.
+- unsigned macOS Preview signing uses one closed policy. PyInstaller's default
+  ad-hoc hardened-runtime signature is not a valid composition for its onefile
+  extraction on macOS Tahoe when neither the outer executable nor the extracted
+  Python framework has a shared Team identifier: library validation rejects the
+  framework before the sidecar can publish Local API readiness. On macOS the
+  sidecar builder therefore replaces only the generated outer sidecar signature
+  with plain ad-hoc signing before archive verification and publication. The
+  Tauri release overlay sets `hardenedRuntime=false`. Neither layer grants
+  `com.apple.security.cs.disable-library-validation` or any other entitlement.
+  The mounted-DMG and detached-copy gates use exact `/usr/bin/codesign`
+  inspection to require `Signature=adhoc`, no Team identifier, the sole
+  `adhoc` CodeDirectory flag, no runtime version, and no entitlements for the
+  app, native executable, and bundled sidecar. A future Developer ID profile
+  must sign the PyInstaller composition at build time and define a separate
+  reviewed policy; it must not inherit this unsigned normalization implicitly.
 - source-level frontend, sidecar, Rust, and package-inventory tests;
 - Linux and macOS CI jobs that build the actual PyInstaller externalBin and
   exercise it through the production Rust native-launch path;
@@ -931,10 +946,12 @@ the final release inventory; the canonical inventory replaces the wheel and
 descriptor with the exact Daemon Bundle and release manifest.
 
 The dependency/security summaries and Core descriptor use version 2. The
-release candidate manifest uses version 6 and distinguishes
+release candidate manifest uses version 8 and distinguishes
 `developer_id_signed=false`, `app_bundle_signature="adhoc"`,
 `notarized=false`, and `quarantine_removal_tested=true`; it also records the
-exact Rust toolchain. Packaged Playwright report/evidence uses version 2 and
+closed `macos_code_signing` policy (`identity="adhoc"`, hardened runtime off,
+and disable-library-validation off) and the exact Rust toolchain. Packaged
+Playwright report/evidence uses version 2 and
 declares `simulator=false`, `provider_kind="desktop_sidecar"`, and
 `composition="packaged_web"`. Native smoke evidence uses version 3 to bind its
 launch origin, exact source-DMG SHA256, and both packaged binary SHA256 values.

@@ -503,11 +503,16 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         == []
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 7
+    assert payload["schema_version"] == 8
     assert payload["release"] == {
         "app_bundle_signature": "adhoc",
         "channel": "unsigned-preview",
         "developer_id_signed": False,
+        "macos_code_signing": {
+            "disable_library_validation": False,
+            "hardened_runtime": False,
+            "identity": "adhoc",
+        },
         "notarized": False,
         "quarantine_removal_tested": True,
     }
@@ -592,6 +597,39 @@ def test_candidate_manifest_rejects_ambiguous_or_false_signature_claims(
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     payload["release"][field] = value
+    _write_json(manifest, payload)
+
+    errors = candidate.validate_candidate_manifest(manifest)
+
+    assert errors
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("identity", "developer_id"),
+        ("hardened_runtime", True),
+        ("disable_library_validation", True),
+        ("unexpected", False),
+    ],
+)
+def test_candidate_manifest_rejects_macos_signing_policy_changes(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload["release"]["macos_code_signing"][field] = value
     _write_json(manifest, payload)
 
     errors = candidate.validate_candidate_manifest(manifest)

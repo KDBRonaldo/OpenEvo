@@ -70,9 +70,21 @@ def _candidate(source: str) -> dict[str, object]:
         ("app_bundle_smoke", "app-bundle-smoke.json", len(app_smoke)),
     ]
     return {
-        "schema_version": 7,
+        "schema_version": 8,
         "source_commit": source,
         "version": "0.1.4",
+        "release": {
+            "app_bundle_signature": "adhoc",
+            "channel": "unsigned-preview",
+            "developer_id_signed": False,
+            "macos_code_signing": {
+                "disable_library_validation": False,
+                "hardened_runtime": False,
+                "identity": "adhoc",
+            },
+            "notarized": False,
+            "quarantine_removal_tested": True,
+        },
         "files": [
             {
                 "role": role,
@@ -405,6 +417,22 @@ def test_exact_candidate_two_session_evidence_passes(tmp_path: Path) -> None:
     )
 
     assert validated["outcome"] == "passed"
+
+
+def test_candidate_unsigned_macos_policy_change_fails_closed(tmp_path: Path) -> None:
+    module = _load_validator()
+    source = "b" * 40
+    candidate_payload = _candidate(source)
+    candidate_payload["release"]["macos_code_signing"]["hardened_runtime"] = True
+    candidate = tmp_path / "release-candidate.json"
+    candidate_digest = _write(module, candidate, candidate_payload)
+
+    with pytest.raises(module.EvidenceError, match="signing policy"):
+        module._read_candidate_manifest(
+            candidate,
+            expected_sha256=candidate_digest,
+            expected_source_commit=source,
+        )
 
 
 def test_minimal_verdict_claim_fails_closed(tmp_path: Path) -> None:

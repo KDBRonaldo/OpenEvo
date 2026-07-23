@@ -351,8 +351,11 @@ post-candidate policy relaxation.
 
 The current rehearsal's dependency and security summaries and Core descriptor
 use schema version 2 for those closed contracts. The release candidate manifest
-uses version 6, with explicit Developer ID, ad-hoc bundle signature,
-notarization, quarantine-removal, and Rust-toolchain fields. Candidate
+uses version 8, with explicit Developer ID, ad-hoc bundle signature,
+notarization, quarantine-removal, Rust-toolchain, and closed unsigned macOS
+code-signing-policy fields. For the unsigned Preview, the policy requires plain
+ad-hoc signing with hardened runtime disabled and rejects the
+disable-library-validation entitlement. Candidate
 Playwright evidence uses version 2. Native smoke evidence uses version 3 so
 every report declares its
 `mounted_dmg` or `detached_copy`

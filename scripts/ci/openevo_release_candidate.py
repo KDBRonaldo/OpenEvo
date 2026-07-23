@@ -18,7 +18,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 MANIFEST_NAME = "release-candidate.json"
-RELEASE_CANDIDATE_SCHEMA_VERSION = 7
+RELEASE_CANDIDATE_SCHEMA_VERSION = 8
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
@@ -308,6 +308,14 @@ def _managed_runtime_manifest() -> dict[str, object]:
             "runtime_alias": MANAGED_RUNTIME_ALIAS,
         },
         "release": source["release"],
+    }
+
+
+def _macos_signing_policy() -> dict[str, object]:
+    return {
+        "identity": "adhoc",
+        "hardened_runtime": False,
+        "disable_library_validation": False,
     }
 
 
@@ -1693,6 +1701,7 @@ def create_candidate_manifest(
             "app_bundle_signature": "adhoc",
             "channel": "unsigned-preview",
             "developer_id_signed": False,
+            "macos_code_signing": _macos_signing_policy(),
             "notarized": False,
             "quarantine_removal_tested": True,
         },
@@ -1751,6 +1760,7 @@ def _validate_candidate_manifest(
         "app_bundle_signature": "adhoc",
         "channel": "unsigned-preview",
         "developer_id_signed": False,
+        "macos_code_signing": _macos_signing_policy(),
         "notarized": False,
         "quarantine_removal_tested": True,
     }:

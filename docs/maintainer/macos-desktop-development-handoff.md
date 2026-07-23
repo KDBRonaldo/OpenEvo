@@ -308,6 +308,39 @@ The evidence supports these conclusions:
 Do not describe this as a user-specific setup problem. Multiple users have seen
 the same startup failure, and the product must diagnose and handle it.
 
+### 5.1 Confirmed macOS Tahoe root cause
+
+The retained `0.1.8` installation has now been reproduced on the target macOS
+Tahoe `26.5.2` host. Both the Tauri app and bundled PyInstaller sidecar are
+ad-hoc signed with the hardened-runtime CodeDirectory flag and have no Team
+identifier. PyInstaller extracts a separately signed Python framework before
+the guarded Python entrypoint. Tahoe's library validation rejects that framework
+because the unsigned outer executable and nested library have no shared Team
+identity, so the sidecar exits `255` before it can emit a recognized startup
+marker. This explains why renderer, provider SQLite, SSH, Daemon bootstrap, and
+Codex never start in the reported incident.
+
+A controlled copy of the exact `0.1.8` sidecar was re-signed ad hoc without the
+hardened-runtime flag and passed the FD-handoff packaged-sidecar smoke. That is
+diagnostic evidence, not permission to mutate the installed `0.1.8` app.
+
+The `0.1.9` unsigned Preview repair is therefore closed and narrow:
+
+- re-sign the generated macOS sidecar as plain ad hoc before validating and
+  publishing the external binary;
+- set the Tauri release bundle's hardened runtime to false;
+- add no entitlements, especially not
+  `com.apple.security.cs.disable-library-validation`;
+- verify the final mounted and copied apps, their native executables, and their
+  bundled sidecars with exact `/usr/bin/codesign` policy checks before launch;
+  and
+- bind that policy in release-candidate manifest schema version 8.
+
+Developer ID signing remains future work. When introduced, the nested
+PyInstaller composition must be signed coherently at build time under a
+separately reviewed policy; broad library-validation bypass is not an accepted
+repair.
+
 ## 6. Highest-Value First Investigation
 
 The real Mac is now the primary reproduction host. Do not start by dispatching

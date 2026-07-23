@@ -312,6 +312,41 @@ def _desktop_package_metadata_paths() -> tuple[Path, ...]:
     return tuple(path for path in candidates if path.exists())
 
 
+def validate_unsigned_macos_release_policy(repo_root: Path = REPO_ROOT) -> list[str]:
+    config_paths = (
+        repo_root / "desktop/src-tauri/tauri.conf.json",
+        repo_root / "desktop/src-tauri/tauri.release.conf.json",
+    )
+    configs: list[dict[str, object]] = []
+    for path in config_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return [f"Unsigned macOS release configuration is unreadable: {path.name}."]
+        if not isinstance(payload, dict):
+            return [f"Unsigned macOS release configuration is invalid: {path.name}."]
+        configs.append(payload)
+
+    macos_values: list[dict[str, object]] = []
+    for path, config in zip(config_paths, configs, strict=True):
+        bundle = config.get("bundle")
+        macos = bundle.get("macOS") if isinstance(bundle, dict) else None
+        if not isinstance(macos, dict):
+            return [f"Unsigned macOS release policy is missing from {path.name}."]
+        macos_values.append(macos)
+    base_macos, release_macos = macos_values
+    merged_macos = {**base_macos, **release_macos}
+
+    errors: list[str] = []
+    if base_macos.get("signingIdentity") != "-":
+        errors.append("Unsigned macOS release must use the ad-hoc signing identity.")
+    if release_macos.get("hardenedRuntime") is not False:
+        errors.append("Unsigned macOS release must explicitly disable hardened runtime.")
+    if "entitlements" in merged_macos:
+        errors.append("Unsigned macOS release must not configure entitlements.")
+    return errors
+
+
 def validate_release_artifacts(
     artifact_paths: list[Path],
     *,
@@ -526,6 +561,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     all_errors: list[str] = []
     all_errors.extend(validate_local_versions(expected_version))
+    all_errors.extend(validate_unsigned_macos_release_policy())
     if args.artifact is not None:
         all_errors.extend(
             validate_release_artifacts(args.artifact, expected_version=expected_version)

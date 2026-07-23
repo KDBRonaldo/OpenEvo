@@ -17,7 +17,7 @@ from typing import Mapping
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-RELEASE_CANDIDATE_SCHEMA_VERSION = 7
+RELEASE_CANDIDATE_SCHEMA_VERSION = 8
 MAX_EVIDENCE_BYTES = 128 * 1024
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -140,6 +140,31 @@ def _read_candidate_manifest(
         or not manifest["version"]
     ):
         raise EvidenceError("candidate manifest identity is invalid")
+    release = _exact_mapping(
+        manifest.get("release"),
+        "candidate release",
+        {
+            "app_bundle_signature",
+            "channel",
+            "developer_id_signed",
+            "macos_code_signing",
+            "notarized",
+            "quarantine_removal_tested",
+        },
+    )
+    if release != {
+        "app_bundle_signature": "adhoc",
+        "channel": "unsigned-preview",
+        "developer_id_signed": False,
+        "macos_code_signing": {
+            "disable_library_validation": False,
+            "hardened_runtime": False,
+            "identity": "adhoc",
+        },
+        "notarized": False,
+        "quarantine_removal_tested": True,
+    }:
+        raise EvidenceError("candidate macOS signing policy is invalid")
     files = manifest.get("files")
     if not isinstance(files, list) or not files:
         raise EvidenceError("candidate manifest file inventory is missing")

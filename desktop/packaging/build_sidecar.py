@@ -67,6 +67,9 @@ PRODUCT_WEB_MANIFEST = ".openevo-product-web.json"
 SIDECAR_BUILD_METADATA_RELATIVE_PATH = Path("desktop/packaging/sidecar-build-metadata.json")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
+_MACOS_CODESIGN_FLAGS_PATTERN = re.compile(r"\bflags=0x[0-9a-fA-F]+\(([^)]*)\)")
+_MAX_MACOS_CODESIGN_OUTPUT_BYTES = 64 * 1024
+_FORBIDDEN_MACOS_ENTITLEMENT = "com.apple.security.cs.disable-library-validation"
 
 
 def _validate_core_inventory(names: set[str], *, container: str) -> None:
@@ -199,6 +202,92 @@ def _validate_product_web_build(desktop_root: Path) -> str:
 def _build_product_web(desktop_root: Path) -> str:
     subprocess.run(["npm", "run", "build:openevo"], check=True, cwd=desktop_root)
     return _validate_product_web_build(desktop_root)
+
+
+def _run_macos_codesign(arguments: list[str], *, stage: str) -> str:
+    result = subprocess.run(
+        ["/usr/bin/codesign", *arguments],
+        check=False,
+        capture_output=True,
+    )
+    output = result.stdout + result.stderr
+    if len(output) > _MAX_MACOS_CODESIGN_OUTPUT_BYTES:
+        raise RuntimeError(f"macOS sidecar code signing {stage} output is oversized")
+    if result.returncode != 0:
+        raise RuntimeError(f"macOS sidecar code signing {stage} failed")
+    try:
+        return output.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"macOS sidecar code signing {stage} output is not UTF-8") from exc
+
+
+def _normalize_unsigned_macos_sidecar_signature(executable: Path) -> None:
+    """Replace PyInstaller's hardened ad-hoc signature with the Preview policy."""
+    parent = os.stat(executable.parent, follow_symlinks=False)
+    before = os.stat(executable, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.geteuid()
+        or parent.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        or not stat.S_ISREG(before.st_mode)
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("macOS sidecar code signing input is not a private regular file")
+    _run_macos_codesign(
+        [
+            "--force",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            str(executable),
+        ],
+        stage="normalization",
+    )
+    after = os.stat(executable, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(after.st_mode)
+        or after.st_uid != before.st_uid
+        or after.st_nlink != 1
+        or after.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise RuntimeError("macOS sidecar code signing output is not a private regular file")
+
+    description = _run_macos_codesign(
+        ["-d", "--verbose=4", str(executable)],
+        stage="description",
+    )
+    lines = tuple(line.strip() for line in description.splitlines() if line.strip())
+    flag_lines = tuple(line for line in lines if line.startswith("CodeDirectory "))
+    if "Signature=adhoc" not in lines or "TeamIdentifier=not set" not in lines:
+        raise RuntimeError("macOS sidecar is not ad-hoc signed without a Team identifier")
+    if len(flag_lines) != 1:
+        raise RuntimeError("macOS sidecar has no unique CodeDirectory flags")
+    match = _MACOS_CODESIGN_FLAGS_PATTERN.search(flag_lines[0])
+    if match is None:
+        raise RuntimeError("macOS sidecar CodeDirectory flags are malformed")
+    flags = frozenset(value.strip() for value in match.group(1).split(",") if value.strip())
+    if flags != {"adhoc"}:
+        if "runtime" in flags or any(line.startswith("Runtime Version=") for line in lines):
+            raise RuntimeError("macOS sidecar unexpectedly enables hardened runtime")
+        raise RuntimeError("macOS sidecar CodeDirectory flags are not closed ad-hoc policy")
+    if any(line.startswith("Runtime Version=") for line in lines):
+        raise RuntimeError("macOS sidecar unexpectedly enables hardened runtime")
+
+    entitlements = _run_macos_codesign(
+        ["-d", "--entitlements", "-", str(executable)],
+        stage="entitlements",
+    )
+    if _FORBIDDEN_MACOS_ENTITLEMENT in entitlements:
+        raise RuntimeError("macOS sidecar enables the forbidden library validation entitlement")
+    unexpected_entitlements = tuple(
+        line.strip()
+        for line in entitlements.splitlines()
+        if line.strip() and not line.startswith("Executable=")
+    )
+    if unexpected_entitlements:
+        raise RuntimeError("macOS sidecar has unexpected entitlements")
 
 
 NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
@@ -2596,6 +2685,8 @@ def build_sidecar(
         built = dist_dir / f"{SIDECAR_NAME}{_platform_extension()}"
         if not built.is_file():
             raise RuntimeError(f"PyInstaller did not produce expected sidecar: {built}")
+        if sys.platform == "darwin":
+            _normalize_unsigned_macos_sidecar_signature(built)
         _validate_fd_bound_bootloader(built)
         _validate_sidecar_excludes_remote_release_assets(built)
         _validate_embedded_product_web(built, desktop_root, product_web_digest)

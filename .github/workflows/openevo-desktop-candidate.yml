@@ -520,6 +520,10 @@ jobs:
             2> "$RUNNER_TEMP/openevo-candidate-codesign.txt"
           grep -F "Signature=adhoc" \
             "$RUNNER_TEMP/openevo-candidate-codesign.txt"
+          # Verify unsigned Desktop code-signing policy before executing the mounted app.
+          uv run python scripts/ci/verify_openevo_desktop_codesign.py \
+            --app "$mounted_app" \
+            --evidence-out "$RUNNER_TEMP/openevo-mounted-codesign.json"
           uv run python scripts/ci/openevo_desktop_daemon_resource.py verify-app \
             --app "$mounted_app" \
             --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \
@@ -548,6 +552,11 @@ jobs:
             exit 1
           fi
           codesign --verify --deep --strict --verbose=2 "$copied_app"
+          uv run python scripts/ci/verify_openevo_desktop_codesign.py \
+            --app "$copied_app" \
+            --evidence-out "$RUNNER_TEMP/openevo-copied-codesign.json"
+          cmp "$RUNNER_TEMP/openevo-mounted-codesign.json" \
+            "$RUNNER_TEMP/openevo-copied-codesign.json"
           uv run python scripts/ci/openevo_desktop_daemon_resource.py verify-app \
             --app "$copied_app" \
             --bundle "$OPENEVO_DAEMON_INPUTS/daemon/openevo-daemon-linux-x86_64" \

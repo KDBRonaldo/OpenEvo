@@ -817,6 +817,11 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         lambda *_: pyinstaller_root,
     )
     monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
+    monkeypatch.setattr(
+        builder,
+        "_normalize_unsigned_macos_sidecar_signature",
+        lambda _: None,
+    )
     monkeypatch.setattr(builder, "_validate_managed_runtime_archive", lambda _: None)
     monkeypatch.setattr(builder, "_validate_daemon_manifest_core", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(builder.subprocess, "run", fake_run)
@@ -872,6 +877,104 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         assert (wheel_output / "framework-lock.json").is_file()
     assert (stale_stage / "stale.whl").read_text(encoding="utf-8") == "stale"
     assert (generic_build / "user-output.txt").read_text(encoding="utf-8") == "keep"
+
+
+def test_unsigned_macos_sidecar_is_resigned_without_hardened_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "openevo-desktop-sidecar"
+    executable.write_bytes(b"sidecar")
+    calls: list[list[str]] = []
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=b"",
+                stderr=(
+                    b"CodeDirectory v=20400 flags=0x2(adhoc) hashes=1+2 location=embedded\n"
+                    b"Signature=adhoc\n"
+                    b"TeamIdentifier=not set\n"
+                ),
+            ),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=b"",
+                stderr=b"Executable=/private/example/openevo-desktop-sidecar\n",
+            ),
+        ]
+    )
+
+    def fake_run(command, *, check, capture_output):
+        assert check is False
+        assert capture_output is True
+        calls.append(command)
+        if len(calls) == 1:
+            replacement = executable.with_name("codesign-replacement")
+            replacement.write_bytes(b"resigned-sidecar")
+            replacement.chmod(0o755)
+            os.replace(replacement, executable)
+        return next(responses)
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    builder._normalize_unsigned_macos_sidecar_signature(executable)
+
+    assert calls == [
+        [
+            "/usr/bin/codesign",
+            "--force",
+            "--sign",
+            "-",
+            "--timestamp=none",
+            str(executable),
+        ],
+        ["/usr/bin/codesign", "-d", "--verbose=4", str(executable)],
+        [
+            "/usr/bin/codesign",
+            "-d",
+            "--entitlements",
+            "-",
+            str(executable),
+        ],
+    ]
+
+
+def test_unsigned_macos_sidecar_rejects_hardened_runtime_after_resigning(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "openevo-desktop-sidecar"
+    executable.write_bytes(b"sidecar")
+    responses = iter(
+        [
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=b"",
+                stderr=(
+                    b"CodeDirectory v=20500 flags=0x10002(adhoc,runtime) hashes=1+2\n"
+                    b"Signature=adhoc\n"
+                    b"TeamIdentifier=not set\n"
+                    b"Runtime Version=12.1.0\n"
+                ),
+            ),
+        ]
+    )
+    monkeypatch.setattr(
+        builder.subprocess,
+        "run",
+        lambda *_args, **_kwargs: next(responses),
+    )
+
+    with pytest.raises(RuntimeError, match="hardened runtime"):
+        builder._normalize_unsigned_macos_sidecar_signature(executable)
 
 
 def test_imported_core_pair_cannot_be_combined_with_export_directory(
@@ -1311,6 +1414,11 @@ def test_temporary_directory_cleanup_failure_keeps_complete_published_pair(
     monkeypatch.setattr(builder, "_build_product_web", lambda _: "0" * 64)
     monkeypatch.setattr(builder, "_prepare_fd_bound_pyinstaller", lambda *args: Path(args[1]))
     monkeypatch.setattr(builder.subprocess, "run", fake_pyinstaller)
+    monkeypatch.setattr(
+        builder,
+        "_normalize_unsigned_macos_sidecar_signature",
+        lambda _: None,
+    )
     monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
     monkeypatch.setattr(
         builder, "_validate_sidecar_excludes_remote_release_assets", lambda *_: None

@@ -140,6 +140,16 @@ def _load_bundle_smoke_module():
     return module
 
 
+def _load_codesign_verifier_module():
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/verify_openevo_desktop_codesign.py"
+    spec = importlib.util.spec_from_file_location("verify_openevo_desktop_codesign", path)
+    assert spec is not None
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
+
+
 def _load_remote_capability_smoke_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_remote_capabilities.py"
     spec = importlib.util.spec_from_file_location("smoke_openevo_remote_capabilities", path)
@@ -3644,6 +3654,142 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "cargo build --locked --release" in workflow
     assert "release binary contains the debug source launcher fallback" in workflow
     assert "release binary contains debug sidecar override code" in workflow
+
+
+def test_unsigned_macos_release_disables_incompatible_hardened_runtime() -> None:
+    release_config = json.loads(
+        Path("desktop/src-tauri/tauri.release.conf.json").read_text(encoding="utf-8")
+    )
+    base_config = json.loads(
+        Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8")
+    )
+    candidate = _load_release_candidate_module()
+    checker = _load_module()
+    workflow = Path(".github/workflows/openevo-desktop-candidate.yml").read_text(
+        encoding="utf-8"
+    )
+
+    assert base_config["bundle"]["macOS"]["signingIdentity"] == "-"
+    assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
+    assert "entitlements" not in base_config["bundle"]["macOS"]
+    assert "entitlements" not in release_config["bundle"]["macOS"]
+    assert candidate._macos_signing_policy() == {
+        "identity": "adhoc",
+        "hardened_runtime": False,
+        "disable_library_validation": False,
+    }
+    assert checker.validate_unsigned_macos_release_policy() == []
+    assert "Verify unsigned Desktop code-signing policy" in workflow
+    assert "verify_openevo_desktop_codesign.py" in workflow
+
+
+@pytest.mark.parametrize(
+    ("base_macos", "release_macos"),
+    [
+        ({"signingIdentity": "-"}, {"hardenedRuntime": True}),
+        (
+            {
+                "entitlements": "unsafe.plist",
+                "signingIdentity": "-",
+            },
+            {"hardenedRuntime": False},
+        ),
+        (
+            {"signingIdentity": "-"},
+            {
+                "entitlements": "unsafe.plist",
+                "hardenedRuntime": False,
+            },
+        ),
+    ],
+)
+def test_release_checker_rejects_unsigned_macos_runtime_or_entitlements(
+    tmp_path: Path,
+    base_macos: dict[str, object],
+    release_macos: dict[str, object],
+) -> None:
+    checker = _load_module()
+    tauri_root = tmp_path / "desktop/src-tauri"
+    tauri_root.mkdir(parents=True)
+    (tauri_root / "tauri.conf.json").write_text(
+        json.dumps({"bundle": {"macOS": base_macos}}),
+        encoding="utf-8",
+    )
+    (tauri_root / "tauri.release.conf.json").write_text(
+        json.dumps({"bundle": {"macOS": release_macos}}),
+        encoding="utf-8",
+    )
+
+    assert checker.validate_unsigned_macos_release_policy(tmp_path)
+
+
+def test_unsigned_macos_codesign_policy_accepts_only_plain_adhoc() -> None:
+    verifier = _load_codesign_verifier_module()
+    valid = "\n".join(
+        [
+            "Identifier=openevo-desktop-sidecar",
+            "Format=Mach-O thin (arm64)",
+            "CodeDirectory v=20400 size=100 flags=0x2(adhoc) hashes=1+2 location=embedded",
+            "Signature=adhoc",
+            "TeamIdentifier=not set",
+        ]
+    )
+
+    assert verifier.validate_codesign_description(valid, component="sidecar") == {
+        "component": "sidecar",
+        "hardened_runtime": False,
+        "identity": "adhoc",
+        "team_identifier": None,
+    }
+    verifier.validate_entitlements_output(
+        "Executable=/private/example/openevo-desktop-sidecar\n",
+        component="sidecar",
+    )
+
+
+@pytest.mark.parametrize(
+    ("description", "error"),
+    [
+        (
+            "CodeDirectory v=20500 flags=0x10002(adhoc,runtime)\n"
+            "Signature=adhoc\nTeamIdentifier=not set\nRuntime Version=12.1.0\n",
+            "hardened runtime",
+        ),
+        (
+            "CodeDirectory v=20400 flags=0x0(none)\n"
+            "Signature=Developer ID Application\nTeamIdentifier=TEAM123\n",
+            "ad-hoc",
+        ),
+        (
+            "CodeDirectory v=20400 flags=0x2(adhoc)\n"
+            "Signature=adhoc\nTeamIdentifier=TEAM123\n",
+            "Team identifier",
+        ),
+        (
+            "CodeDirectory v=20400 flags=0x12(adhoc,kill)\n"
+            "Signature=adhoc\nTeamIdentifier=not set\n",
+            "closed ad-hoc",
+        ),
+    ],
+)
+def test_unsigned_macos_codesign_policy_rejects_wrong_identity_or_runtime(
+    description: str,
+    error: str,
+) -> None:
+    verifier = _load_codesign_verifier_module()
+
+    with pytest.raises(verifier.CodeSignPolicyError, match=error):
+        verifier.validate_codesign_description(description, component="sidecar")
+
+
+def test_unsigned_macos_codesign_policy_rejects_library_validation_entitlement() -> None:
+    verifier = _load_codesign_verifier_module()
+
+    with pytest.raises(verifier.CodeSignPolicyError, match="entitlement"):
+        verifier.validate_entitlements_output(
+            "<key>com.apple.security.cs.disable-library-validation</key>\n<true/>",
+            component="sidecar",
+        )
 
 
 def test_sidecar_bootloader_separates_verified_archive_fd_from_macos_exec_path(
