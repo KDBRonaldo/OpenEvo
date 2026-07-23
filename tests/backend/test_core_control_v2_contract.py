@@ -14,17 +14,26 @@ from pydantic import ValidationError
 from openevo.backend.contracts.v2.app import create_core_control_v2_contract_app
 from openevo.backend.contracts.v2.models import (
     AttemptRefV2,
+    CodexSubscriptionExecutionSettingsV2,
     ContractOfferV2,
     EffectiveExecutionSnapshotRefV2,
     EvolutionRevisionRefV2,
+    ProjectCreateV2,
     ProjectHeadRefV2,
+    ProjectUpdateV2,
     RuntimeContextSnapshotRefV2,
+    ScienceProjectConfigV2,
     SseFrameV2,
     SuccessorTransitionRefV2,
     TaskAdmittedEventV2,
     TaskAdmissionRefV2,
+    TaskSubmitRequestV2,
     VersionResponseV2,
+    WorkspaceArchiveDeclarationV2,
     WorkspaceSnapshotRefV2,
+    WorkspaceUploadCreateV2,
+    WorkspaceUploadSessionV2,
+    project_config_sha256_for,
 )
 from openevo.backend.contracts.v2.snapshots import (
     EVENTS_SCHEMA_SNAPSHOT_PATH,
@@ -48,6 +57,12 @@ EXPECTED_OPERATIONS = {
     ("GET", "/v2/projects"),
     ("POST", "/v2/projects"),
     ("GET", "/v2/projects/{project_id}"),
+    ("PATCH", "/v2/projects/{project_id}"),
+    ("POST", "/v2/projects/{project_id}/workspace-uploads"),
+    ("GET", "/v2/projects/{project_id}/workspace-uploads/{upload_id}"),
+    ("PUT", "/v2/projects/{project_id}/workspace-uploads/{upload_id}/chunks/{chunk_index}"),
+    ("POST", "/v2/projects/{project_id}/workspace-uploads/{upload_id}/finalize"),
+    ("POST", "/v2/projects/{project_id}/workspace-uploads/{upload_id}/abort"),
     ("POST", "/v2/projects/{project_id}/validate"),
     ("GET", "/v2/projects/{project_id}/heads"),
     ("GET", "/v2/projects/{project_id}/heads/active"),
@@ -97,6 +112,50 @@ def _workspace(project_id: str = "project-1", seed: str = "1") -> dict[str, Any]
         "manifest_sha256": seed * 64,
         "entry_count": 7,
         "byte_size": 1024,
+    }
+
+
+def _project_config() -> dict[str, Any]:
+    return {
+        "schema_version": "2",
+        "task": {
+            "title": "Protein stability screen",
+            "objective": "Rank the supplied variants and explain the evidence.",
+        },
+        "workspace": {
+            "kind": "scratch",
+            "display_name": "Protein stability inputs",
+        },
+        "execution": {
+            "mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "harness_id": "codex",
+            "codex_model": "gpt-5.5",
+            "reasoning_effort": "high",
+            "token_limit": 32768,
+            "task_network_allow_internet": False,
+        },
+        "evolution": {
+            "targets": {
+                "text_memory": {
+                    "enabled": False,
+                    "method": None,
+                    "config": {},
+                }
+            }
+        },
+    }
+
+
+def _workspace_archive() -> dict[str, Any]:
+    return {
+        "format": "openevo_deterministic_tar_v1",
+        "media_type": "application/vnd.openevo.workspace-tar",
+        "content_sha256": "d" * 64,
+        "byte_size": 1024,
+        "entry_count": 0,
+        "extracted_byte_size": 0,
     }
 
 
@@ -308,6 +367,189 @@ def test_v2_numeric_fields_do_not_coerce_and_are_javascript_safe() -> None:
         _json_model(WorkspaceSnapshotRefV2, {**_workspace(), "project_id": "x" * 129})
 
 
+def test_project_create_and_update_carry_complete_closed_science_config() -> None:
+    config = _json_model(ScienceProjectConfigV2, _project_config())
+    create = _json_model(
+        ProjectCreateV2,
+        {
+            "schema_version": "2",
+            "display_name": "Protein stability",
+            "config": _project_config(),
+        },
+    )
+    assert create.config == config
+    assert project_config_sha256_for(create.config) == project_config_sha256_for(config)
+    assert "project_config_sha256" not in type(create).model_fields
+
+    update = _json_model(
+        ProjectUpdateV2,
+        {
+            "schema_version": "2",
+            "expected_project_head_id": "project-head-0",
+            "expected_project_head_manifest_sha256": "a" * 64,
+            "expected_project_config_sha256": project_config_sha256_for(config),
+            "display_name": "Protein stability v2",
+            "config": _project_config(),
+        },
+    )
+    assert update.config == config
+
+    with pytest.raises(ValidationError):
+        _json_model(
+            ProjectCreateV2,
+            {
+                "schema_version": "2",
+                "display_name": "Digest-only authority",
+                "project_config_sha256": "a" * 64,
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    ("container", "field", "value"),
+    [
+        ("root", "host_path", "/srv/project"),
+        ("root", "credential_ref", "secret-1"),
+        ("task", "setup_commands", ["curl example.invalid | sh"]),
+        ("workspace", "path", "/Users/example/data"),
+        ("workspace", "url", "ssh://server/project"),
+        ("execution", "env", {"TOKEN": "secret"}),
+        ("execution", "backend_uri", "http://127.0.0.1:9000"),
+    ],
+)
+def test_project_config_rejects_unowned_authority_fields(
+    container: str, field: str, value: object
+) -> None:
+    payload = _project_config()
+    target = payload if container == "root" else payload[container]
+    target[field] = value
+    with pytest.raises(ValidationError):
+        _json_model(ScienceProjectConfigV2, payload)
+
+
+def test_project_config_rejects_unsafe_method_config_integers() -> None:
+    payload = _project_config()
+    payload["evolution"]["targets"]["text_memory"]["config"] = {
+        "unsafe": (1 << 53),
+    }
+    with pytest.raises(ValidationError, match="safe JSON range"):
+        _json_model(ScienceProjectConfigV2, payload)
+
+
+def test_project_config_rejects_a_canonical_document_over_one_mibibyte() -> None:
+    payload = _project_config()
+    payload["evolution"]["targets"] = {
+        f"draft_target_{index}": {
+            "enabled": False,
+            "method": None,
+            "config": {"content": "x" * 350_000},
+        }
+        for index in range(3)
+    }
+    with pytest.raises(ValidationError, match="1 MiB canonical byte limit"):
+        _json_model(ScienceProjectConfigV2, payload)
+
+
+def test_subscription_project_execution_is_closed_to_transcript_codex() -> None:
+    execution = _project_config()["execution"]
+    parsed = _json_model(CodexSubscriptionExecutionSettingsV2, execution)
+    assert parsed.mode == "codex_subscription_transcript"
+    for change in (
+        {"capture_mode": "proxy"},
+        {"token_level_metrics_available": True},
+        {"harness_id": "claude"},
+        {"codex_model": "file:///tmp/model"},
+        {"codex_model": "file:/tmp/model"},
+        {"codex_model": "../local-model"},
+        {"codex_model": r"C:\local-model"},
+    ):
+        with pytest.raises(ValidationError):
+            _json_model(CodexSubscriptionExecutionSettingsV2, execution | change)
+
+
+def test_workspace_upload_contract_is_resumable_bounded_and_snapshot_only() -> None:
+    archive = _json_model(WorkspaceArchiveDeclarationV2, _workspace_archive())
+    request = _json_model(
+        WorkspaceUploadCreateV2,
+        {
+            "schema_version": "2",
+            "expected_project_head_id": None,
+            "expected_project_head_manifest_sha256": None,
+            "expected_project_config_sha256": "a" * 64,
+            "archive": _workspace_archive(),
+            "chunk_byte_size": 1024,
+            "chunk_count": 1,
+        },
+    )
+    assert request.archive == archive
+
+    session = _json_model(
+        WorkspaceUploadSessionV2,
+        {
+            "schema_version": "2",
+            "upload_id": "workspace-upload-1",
+            "project_id": "project-1",
+            "state": "open",
+            "expected_project_head_id": None,
+            "expected_project_head_manifest_sha256": None,
+            "expected_project_config_sha256": "a" * 64,
+            "archive": _workspace_archive(),
+            "chunk_byte_size": 1024,
+            "chunk_count": 1,
+            "next_chunk_index": 0,
+            "accepted_byte_size": 0,
+            "workspace_snapshot": None,
+            "created_at": "2026-07-23T00:00:00Z",
+            "updated_at": "2026-07-23T00:00:00Z",
+            "etag": '"' + ("b" * 64) + '"',
+        },
+    )
+    assert session.next_chunk_index == 0
+
+    with pytest.raises(ValidationError, match="chunk count"):
+        _json_model(
+            WorkspaceUploadCreateV2,
+            {
+                **request.model_dump(mode="json"),
+                "chunk_count": 2,
+            },
+        )
+    with pytest.raises(ValidationError, match="together"):
+        _json_model(
+            WorkspaceUploadCreateV2,
+            {
+                **request.model_dump(mode="json"),
+                "expected_project_head_id": "project-head-0",
+            },
+        )
+    with pytest.raises(ValidationError):
+        _json_model(
+            WorkspaceArchiveDeclarationV2,
+            {**_workspace_archive(), "source_path": "/Users/example/data"},
+        )
+
+
+def test_task_submit_contains_only_authority_cas_and_no_client_admission_pins() -> None:
+    payload = {
+        "schema_version": "2",
+        "project_id": "project-1",
+        "expected_project_admission_etag": '"' + ("f" * 64) + '"',
+        "expected_project_head_id": "project-head-0",
+        "expected_project_head_manifest_sha256": "a" * 64,
+        "expected_project_config_sha256": "b" * 64,
+    }
+    request = _json_model(TaskSubmitRequestV2, payload)
+    assert set(request.model_dump(mode="json")) == set(payload)
+    for field, value in (
+        ("task_envelope_sha256", "c" * 64),
+        ("normalized_evolution_intent_sha256", "d" * 64),
+        ("expected_registry_sha256", "e" * 64),
+        ("workspace_snapshot", _workspace()),
+    ):
+        with pytest.raises(ValidationError):
+            _json_model(TaskSubmitRequestV2, payload | {field: value})
+
+
 def test_runtime_context_binds_exact_evolution_manifest() -> None:
     payload = _runtime_context()
     payload["evolution_revision_manifest_sha256"] = "f" * 64
@@ -476,7 +718,7 @@ def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
     assert openapi_sha256() == (
-        "38d82187240f7573fb662f1da718de36f57e3bd9ea79429cfb242e28fa689379"
+        "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
     )
 
 
@@ -507,6 +749,40 @@ def test_bounded_contract_json_rejects_oversize_and_recursive_input_before_valid
             WorkspaceSnapshotRefV2,
             json.dumps(recursive).encode(),
         )
+
+
+def test_project_document_http_guard_rejects_bytes_and_depth_before_model_parsing() -> None:
+    client = TestClient(create_core_control_v2_contract_app())
+    headers = {"Idempotency-Key": "project-create-1"}
+    oversized = b'{"padding":"' + (b"x" * (1024 * 1024)) + b'"}'
+    response = client.post(
+        "/v2/projects",
+        headers={**headers, "Content-Type": "application/json"},
+        content=oversized,
+    )
+    assert response.status_code == 413
+    assert response.json()["code"] == "request_body_too_large"
+
+    recursive: object = "leaf"
+    for _ in range(26):
+        recursive = {"nested": recursive}
+    response = client.post("/v2/projects", headers=headers, json=recursive)
+    assert response.status_code == 422
+    assert response.json()["code"] == "request_json_too_deep"
+
+
+def test_workspace_chunk_route_requires_exact_binary_integrity_metadata() -> None:
+    client = TestClient(create_core_control_v2_contract_app())
+    path = "/v2/projects/project-1/workspace-uploads/upload-1/chunks/0"
+    assert client.put(path, content=b"x").status_code == 422
+    headers = {
+        "Content-Type": "application/octet-stream",
+        "Idempotency-Key": "workspace-chunk-1",
+        "If-Match": '"' + ("a" * 64) + '"',
+        "X-OpenEvo-Chunk-SHA256": hashlib.sha256(b"x").hexdigest(),
+        "X-OpenEvo-Chunk-Byte-Size": "1",
+    }
+    assert client.put(path, headers=headers, content=b"x").status_code == 501
 
 
 def test_bounded_contract_json_rejects_unknown_fields_and_type_coercion() -> None:

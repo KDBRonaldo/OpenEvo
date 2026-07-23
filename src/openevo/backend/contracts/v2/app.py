@@ -8,7 +8,7 @@ import re
 import secrets
 from typing import Annotated, Literal, Protocol
 
-from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Security
+from fastapi import APIRouter, Body, Depends, FastAPI, Header, Path, Query, Request, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
@@ -26,8 +26,11 @@ _PROJECT_VALIDATION_PATH = re.compile(
     r"^/v2/projects/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/validate$",
     re.ASCII,
 )
+_PROJECT_UPDATE_PATH = re.compile(
+    r"^/v2/projects/[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    re.ASCII,
+)
 _MAX_PROJECT_VALIDATION_BYTES = 1024 * 1024
-_MAX_PROJECT_VALIDATION_JSON_DEPTH = 24
 _bearer = HTTPBearer(
     auto_error=False,
     scheme_name="CoreBearerAuthV2",
@@ -98,14 +101,14 @@ class CoreControlHTTPErrorV2(Exception):
         self.headers = dict(headers or {})
 
 
-class _ProjectValidationBodyGuardV2:
-    """Bound project validation before Starlette decodes JSON or Pydantic runs."""
+class _ProjectDocumentBodyGuardV2:
+    """Bound project JSON before Starlette decodes it or Pydantic runs."""
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if not _is_project_validation_request(scope):
+        if not _is_bounded_project_json_request(scope):
             await self.app(scope, receive, send)
             return
 
@@ -117,7 +120,7 @@ class _ProjectValidationBodyGuardV2:
             await _body_guard_error(
                 413,
                 code="request_body_too_large",
-                message="The project validation request exceeds the byte limit.",
+                message="The project request exceeds the byte limit.",
             )(scope, receive, send)
             return
 
@@ -131,18 +134,18 @@ class _ProjectValidationBodyGuardV2:
                 await _body_guard_error(
                     413,
                     code="request_body_too_large",
-                    message="The project validation request exceeds the byte limit.",
+                    message="The project request exceeds the byte limit.",
                 )(scope, receive, send)
                 return
             body.extend(chunk)
             if not message.get("more_body", False):
                 break
 
-        if _json_nesting_exceeds(body, _MAX_PROJECT_VALIDATION_JSON_DEPTH):
+        if _json_nesting_exceeds(body, m.MAX_PROJECT_CONFIG_JSON_DEPTH):
             await _body_guard_error(
                 422,
                 code="request_json_too_deep",
-                message="The project validation request exceeds the nesting limit.",
+                message="The project request exceeds the nesting limit.",
             )(scope, receive, send)
             return
 
@@ -185,12 +188,18 @@ def _body_guard_error(
     )
 
 
-def _is_project_validation_request(scope: Scope) -> bool:
+def _is_bounded_project_json_request(scope: Scope) -> bool:
+    if scope["type"] != "http":
+        return False
+    method = scope.get("method")
+    path = str(scope.get("path", ""))
     return (
-        scope["type"] == "http"
-        and scope.get("method") == "POST"
-        and _PROJECT_VALIDATION_PATH.fullmatch(str(scope.get("path", "")))
-        is not None
+        (method == "POST" and path == "/v2/projects")
+        or (method == "PATCH" and _PROJECT_UPDATE_PATH.fullmatch(path) is not None)
+        or (
+            method == "POST"
+            and _PROJECT_VALIDATION_PATH.fullmatch(path) is not None
+        )
     )
 
 
@@ -329,6 +338,15 @@ LastEventId = Annotated[
     str | None,
     Header(alias="Last-Event-ID", min_length=1, max_length=128),
 ]
+ChunkIndex = Annotated[int, Path(ge=0, le=m.MAX_WORKSPACE_CHUNKS - 1)]
+ChunkSha256 = Annotated[
+    str,
+    Header(alias="X-OpenEvo-Chunk-SHA256", pattern=r"^[0-9a-f]{64}$"),
+]
+ChunkByteSize = Annotated[
+    int,
+    Header(alias="X-OpenEvo-Chunk-Byte-Size", ge=1, le=m.MAX_WORKSPACE_CHUNK_BYTES),
+]
 
 
 def create_core_control_v2_contract_app(
@@ -348,7 +366,7 @@ def create_core_control_v2_contract_app(
         redoc_url=None,
         openapi_url=None,
     )
-    app.add_middleware(_ProjectValidationBodyGuardV2)
+    app.add_middleware(_ProjectDocumentBodyGuardV2)
 
     @app.get(
         "/version",
@@ -435,6 +453,109 @@ def create_core_control_v2_contract_app(
         tags=["projects"],
     )
     async def get_project(project_id: ResourceId) -> Response:
+        return _not_implemented()
+
+    @router.patch(
+        "/projects/{project_id}",
+        operation_id="updateCoreProjectV2",
+        response_model=m.ProjectV2,
+        responses=_ERROR_RESPONSES,
+        tags=["projects"],
+    )
+    async def update_project(
+        project_id: ResourceId,
+        request: m.ProjectUpdateV2,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.post(
+        "/projects/{project_id}/workspace-uploads",
+        operation_id="createCoreWorkspaceUploadV2",
+        response_model=m.WorkspaceUploadSessionV2,
+        status_code=201,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def create_workspace_upload(
+        project_id: ResourceId,
+        request: m.WorkspaceUploadCreateV2,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/projects/{project_id}/workspace-uploads/{upload_id}",
+        operation_id="getCoreWorkspaceUploadV2",
+        response_model=m.WorkspaceUploadSessionV2,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def get_workspace_upload(
+        project_id: ResourceId,
+        upload_id: ResourceId,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.put(
+        "/projects/{project_id}/workspace-uploads/{upload_id}/chunks/{chunk_index}",
+        operation_id="putCoreWorkspaceUploadChunkV2",
+        response_model=m.WorkspaceUploadSessionV2,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def put_workspace_upload_chunk(
+        project_id: ResourceId,
+        upload_id: ResourceId,
+        chunk_index: ChunkIndex,
+        chunk: Annotated[
+            bytes,
+            Body(
+                min_length=1,
+                max_length=m.MAX_WORKSPACE_CHUNK_BYTES,
+                media_type="application/octet-stream",
+            ),
+        ],
+        chunk_sha256: ChunkSha256,
+        chunk_byte_size: ChunkByteSize,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.post(
+        "/projects/{project_id}/workspace-uploads/{upload_id}/finalize",
+        operation_id="finalizeCoreWorkspaceUploadV2",
+        response_model=m.WorkspaceUploadSessionV2,
+        status_code=201,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def finalize_workspace_upload(
+        project_id: ResourceId,
+        upload_id: ResourceId,
+        request: m.WorkspaceUploadFinalizeV2,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _not_implemented()
+
+    @router.post(
+        "/projects/{project_id}/workspace-uploads/{upload_id}/abort",
+        operation_id="abortCoreWorkspaceUploadV2",
+        response_model=m.WorkspaceUploadSessionV2,
+        responses=_ERROR_RESPONSES,
+        tags=["workspace"],
+    )
+    async def abort_workspace_upload(
+        project_id: ResourceId,
+        upload_id: ResourceId,
+        request: m.WorkspaceUploadAbortV2,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
         return _not_implemented()
 
     @router.post(

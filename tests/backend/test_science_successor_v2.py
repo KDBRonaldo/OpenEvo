@@ -14,10 +14,12 @@ from openevo.backend.contracts.v2.models import (
     EvolutionRevisionRefV2,
     ProjectHeadRefV2,
     RuntimeContextSnapshotRefV2,
+    ScienceProjectConfigV2,
     TaskSubmitRequestV2,
     TaskV2,
     TransitionChangedEventV2,
     WorkspaceSnapshotRefV2,
+    project_config_sha256_for,
 )
 from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.science_execution import (
@@ -45,6 +47,32 @@ from openevo.evolution.framework.handlers import (
     payload_tree_digest,
 )
 from openevo.evolution.runtime_injection import build_runtime_injection_plan
+
+
+def _project_config() -> ScienceProjectConfigV2:
+    return ScienceProjectConfigV2.model_validate(
+        {
+            "task": {
+                "title": "Successor task",
+                "objective": "Produce a verified successor.",
+            },
+            "workspace": {
+                "kind": "scratch",
+                "display_name": "Successor workspace",
+            },
+            "execution": {
+                "mode": "codex_subscription_transcript",
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+                "harness_id": "codex",
+                "codex_model": "gpt-5.5",
+                "reasoning_effort": "high",
+                "token_limit": 32768,
+                "task_network_allow_internet": False,
+            },
+            "evolution": {"targets": {}},
+        }
+    )
 
 
 class _Clock:
@@ -118,7 +146,7 @@ def _authority(head: ProjectHeadRefV2 | None = None) -> ScienceProjectAdmissionA
     return ScienceProjectAdmissionAuthorityV2(
         project_id=head.project_id,
         active_project_head=head,
-        project_config_sha256="6" * 64,
+        project_config_sha256=project_config_sha256_for(_project_config()),
         workspace_snapshot=_workspace(head.project_id, "7"),
         normalized_evolution_intent_sha256="8" * 64,
     )
@@ -127,17 +155,12 @@ def _authority(head: ProjectHeadRefV2 | None = None) -> ScienceProjectAdmissionA
 def _request(authority: ScienceProjectAdmissionAuthorityV2) -> TaskSubmitRequestV2:
     return TaskSubmitRequestV2(
         project_id=authority.project_id,
+        expected_project_admission_etag=authority.project_etag,
         expected_project_head_id=authority.active_project_head.project_head_id,
         expected_project_head_manifest_sha256=(
             authority.active_project_head.manifest_sha256
         ),
-        project_config_sha256=authority.project_config_sha256,
-        task_envelope_sha256="9" * 64,
-        workspace_snapshot=authority.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            authority.normalized_evolution_intent_sha256
-        ),
-        expected_registry_sha256=authority.active_project_head.registry_sha256,
+        expected_project_config_sha256=authority.project_config_sha256,
     )
 
 

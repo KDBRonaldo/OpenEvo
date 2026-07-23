@@ -6,7 +6,7 @@ from collections.abc import Iterable, Iterator, Mapping
 from functools import wraps
 from typing import Annotated, Protocol
 
-from fastapi import APIRouter, FastAPI, Header, Query, Request, Security
+from fastapi import APIRouter, FastAPI, Header, HTTPException, Query, Request, Security
 from fastapi.openapi.utils import get_openapi
 from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response
@@ -34,8 +34,15 @@ _desktop_session = APIKeyHeader(
     name=DESKTOP_SESSION_HEADER,
     scheme_name="DesktopSessionV2",
     description="Ephemeral Desktop session credential issued by the native host.",
-    auto_error=True,
+    auto_error=False,
 )
+
+
+async def _require_desktop_session(
+    session: Annotated[str | None, Security(_desktop_session)],
+) -> None:
+    if session is None:
+        raise HTTPException(status_code=401, detail="Desktop session is required.")
 
 ResourceId = Annotated[
     str,
@@ -209,7 +216,7 @@ def create_desktop_local_v2_contract_app(
 
     router = APIRouter(
         prefix="/desktop/v2",
-        dependencies=[Security(_desktop_session)],
+        dependencies=[Security(_require_desktop_session)],
         responses=_ERROR_RESPONSES,
     )
 

@@ -21,6 +21,7 @@ from desktop.sidecar.contracts.v2.canonical import (
 )
 from desktop.sidecar.contracts.v2.models import (
     AttemptRefV2,
+    CoreTaskSubmitRequestV2,
     DesktopArtifactV2,
     DesktopDiagnosticV2,
     DesktopErrorV2,
@@ -32,7 +33,10 @@ from desktop.sidecar.contracts.v2.models import (
     EffectiveExecutionSnapshotRefV2,
     EvolutionRevisionRefV2,
     LegacyExplicitProfileV2,
+    ProjectCapabilityProjectionV2,
+    ProjectCreateV2,
     ProjectHeadRefV2,
+    ProjectPatchV2,
     RemoteWorkspaceProfileV2,
     RuntimeContextSnapshotRefV2,
     SshHostCatalogV2,
@@ -43,6 +47,7 @@ from desktop.sidecar.contracts.v2.models import (
     SystemOpenSshProfileCreateV2,
     TaskAdmissionRefV2,
     WorkspaceSnapshotRefV2,
+    evolution_capabilities_sha256_for,
 )
 
 
@@ -143,6 +148,47 @@ def _profile() -> dict[str, Any]:
         "created_at": "2026-07-23T00:00:00Z",
         "updated_at": "2026-07-23T00:00:01Z",
         "etag": '"' + ("d" * 64) + '"',
+    }
+
+
+def _science_config() -> dict[str, Any]:
+    return {
+        "schema_version": "2",
+        "task": {
+            "title": "Protein stability screen",
+            "objective": "Rank the supplied variants and explain the evidence.",
+        },
+        "workspace": {
+            "kind": "scratch",
+            "display_name": "Protein stability inputs",
+        },
+        "execution": {
+            "mode": "codex_subscription_transcript",
+            "capture_mode": "transcript",
+            "token_level_metrics_available": False,
+            "harness_id": "codex",
+            "codex_model": "gpt-5.5",
+            "reasoning_effort": "high",
+            "token_limit": 32768,
+            "task_network_allow_internet": False,
+        },
+        "evolution": {"targets": {}},
+    }
+
+
+def _capabilities() -> dict[str, Any]:
+    return {
+        "schema_version": "1",
+        "core_version": "0.1.9",
+        "registry_digest": "c" * 64,
+        "evaluated_profile": {
+            "execution_mode": "subscription",
+            "capture_mode": "transcript",
+            "harness_id": "codex",
+            "harness_capabilities": [],
+            "runtime_capabilities": [],
+        },
+        "targets": [],
     }
 
 
@@ -360,6 +406,85 @@ def test_local_contract_projects_all_distinct_core_v2_authorities() -> None:
         assert schema["additionalProperties"] is False
 
 
+def test_desktop_project_mutations_forward_complete_config_not_digest_only() -> None:
+    create_payload = {
+        "schema_version": "2",
+        "profile_id": "profile-1",
+        "profile_connection_generation": 3,
+        "display_name": "Protein stability",
+        "config": _science_config(),
+    }
+    create = _json_model(ProjectCreateV2, create_payload)
+    assert create.config.task.title == "Protein stability screen"
+    assert "project_config_sha256" not in type(create).model_fields
+
+    patch_payload = {
+        "schema_version": "2",
+        "expected_project_head_id": "project-head-0",
+        "expected_project_head_manifest_sha256": "a" * 64,
+        "expected_project_config_sha256": "b" * 64,
+        "display_name": "Protein stability v2",
+        "config": _science_config(),
+    }
+    assert _json_model(ProjectPatchV2, patch_payload).config == create.config
+
+    with pytest.raises(ValidationError):
+        _json_model(
+            ProjectCreateV2,
+            {
+                **create_payload,
+                "config": None,
+                "project_config_sha256": "b" * 64,
+            },
+        )
+
+
+def test_desktop_capability_projection_contains_the_complete_remote_envelope() -> None:
+    capabilities = _capabilities()
+    digest = evolution_capabilities_sha256_for(capabilities)
+    payload = {
+        "schema_version": "2",
+        "project_id": "project-1",
+        "execution_mode": "codex_subscription_transcript",
+        "registry_sha256": "c" * 64,
+        "capabilities_sha256": digest,
+        "capabilities": capabilities,
+        "fetched_at": "2026-07-23T00:00:00Z",
+    }
+    projection = _json_model(ProjectCapabilityProjectionV2, payload)
+    assert projection.capabilities.model_dump(mode="json") == capabilities
+    assert "target_ids" not in type(projection).model_fields
+
+    with pytest.raises(ValidationError, match="digest"):
+        _json_model(
+            ProjectCapabilityProjectionV2,
+            {**payload, "capabilities_sha256": "f" * 64},
+        )
+    with pytest.raises(ValidationError, match="registry"):
+        _json_model(
+            ProjectCapabilityProjectionV2,
+            {**payload, "registry_sha256": "f" * 64},
+        )
+
+
+def test_desktop_task_submit_forwards_only_project_authority_cas() -> None:
+    payload = {
+        "schema_version": "2",
+        "project_id": "project-1",
+        "expected_project_admission_etag": '"' + ("f" * 64) + '"',
+        "expected_project_head_id": "project-head-0",
+        "expected_project_head_manifest_sha256": "a" * 64,
+        "expected_project_config_sha256": "b" * 64,
+    }
+    request = _json_model(CoreTaskSubmitRequestV2, payload)
+    assert set(request.model_dump(mode="json")) == set(payload)
+    with pytest.raises(ValidationError):
+        _json_model(
+            CoreTaskSubmitRequestV2,
+            {**payload, "workspace_snapshot": {"host_path": "/srv/project"}},
+        )
+
+
 def test_desktop_v2_schema_has_no_forbidden_renderer_authority_fields() -> None:
     schema = desktop_openapi_document()
     forbidden_exact = {
@@ -442,7 +567,7 @@ def test_desktop_v2_snapshots_are_exact_and_frozen() -> None:
     assert hashlib.sha256(openapi).hexdigest() == DESKTOP_OPENAPI_SHA256
     assert hashlib.sha256(events).hexdigest() == DESKTOP_EVENTS_SCHEMA_SHA256
     assert DESKTOP_OPENAPI_SHA256 == (
-        "124ead258cb861f47052c57d90732e44fd5844159b49934d03eb887e9705bb64"
+        "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
     )
     assert DESKTOP_EVENTS_SCHEMA_SHA256 == (
         "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"

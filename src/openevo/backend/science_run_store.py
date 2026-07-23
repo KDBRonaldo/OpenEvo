@@ -343,6 +343,10 @@ class ScienceProjectAdmissionAuthorityV2:
         ):
             raise ValueError("v2 project readiness blockers must be sorted and unique")
 
+    @property
+    def project_etag(self) -> str:
+        return _v2_authority_etag(self)
+
 
 @dataclass(frozen=True, slots=True)
 class ScienceRunCreateAdmission:
@@ -3048,6 +3052,10 @@ def _v2_authority_bytes(authority: ScienceProjectAdmissionAuthorityV2) -> bytes:
     )
 
 
+def _v2_authority_etag(authority: ScienceProjectAdmissionAuthorityV2) -> str:
+    return f'"{hashlib.sha256(_v2_authority_bytes(authority)).hexdigest()}"'
+
+
 def _v2_authority_from_bytes(payload: bytes | str) -> ScienceProjectAdmissionAuthorityV2:
     raw = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
     if len(raw) > _MAX_DOCUMENT_BYTES:
@@ -3478,16 +3486,13 @@ def _validate_v2_submission_authority(
 ) -> None:
     if (
         request.project_id != authority.project_id
+        or request.expected_project_admission_etag != authority.project_etag
         or request.expected_project_head_id
         != authority.active_project_head.project_head_id
         or request.expected_project_head_manifest_sha256
         != authority.active_project_head.manifest_sha256
-        or request.project_config_sha256 != authority.project_config_sha256
-        or request.workspace_snapshot != authority.workspace_snapshot
-        or request.normalized_evolution_intent_sha256
-        != authority.normalized_evolution_intent_sha256
-        or request.expected_registry_sha256
-        != authority.active_project_head.registry_sha256
+        or request.expected_project_config_sha256
+        != authority.project_config_sha256
     ):
         raise ScienceTaskStaleSubmissionV2(
             "v2 Task submission no longer matches project admission authority"
@@ -3510,12 +3515,17 @@ def _new_v2_task(
         project_id=request.project_id,
         predecessor_project_head=authority.active_project_head,
         workspace_snapshot=authority.workspace_snapshot,
-        project_config_sha256=request.project_config_sha256,
-        task_envelope_sha256=request.task_envelope_sha256,
-        normalized_evolution_intent_sha256=(
-            request.normalized_evolution_intent_sha256
+        project_config_sha256=authority.project_config_sha256,
+        task_envelope_sha256=_task_envelope_sha256(
+            project_id=authority.project_id,
+            predecessor_project_head=authority.active_project_head,
+            workspace_snapshot=authority.workspace_snapshot,
+            project_config_sha256=authority.project_config_sha256,
         ),
-        registry_sha256=request.expected_registry_sha256,
+        normalized_evolution_intent_sha256=(
+            authority.normalized_evolution_intent_sha256
+        ),
+        registry_sha256=authority.active_project_head.registry_sha256,
         admission_sha256="0" * 64,
         admitted_at=timestamp,
     )
@@ -3550,6 +3560,30 @@ def _new_v2_task(
             etag=f'"{"0" * 64}"',
         )
     )
+
+
+def _task_envelope_sha256(
+    *,
+    project_id: str,
+    predecessor_project_head: m2.ProjectHeadRefV2,
+    workspace_snapshot: m2.WorkspaceSnapshotRefV2,
+    project_config_sha256: str,
+) -> str:
+    """Derive the closed task-envelope identity from Daemon-owned authority."""
+
+    return hashlib.sha256(
+        _v2_json_bytes(
+            {
+                "project_config_sha256": project_config_sha256,
+                "project_id": project_id,
+                "schema_version": "2",
+                "workspace_snapshot": workspace_snapshot.model_dump(mode="json"),
+                "predecessor_project_head": predecessor_project_head.model_dump(
+                    mode="json"
+                ),
+            }
+        )
+    ).hexdigest()
 
 
 def _v2_timestamp(value: datetime) -> str:
@@ -3636,21 +3670,37 @@ def _load_v2_task_closure(
         m2.TaskAdmissionRefV2,
         bytes(admission_row["admission_json"]),
     )
+    admitted_authority = ScienceProjectAdmissionAuthorityV2(
+        project_id=admission.project_id,
+        active_project_head=admission.predecessor_project_head,
+        project_config_sha256=admission.project_config_sha256,
+        workspace_snapshot=admission.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            admission.normalized_evolution_intent_sha256
+        ),
+    )
     if (
         admission != task.admission
         or admission_row["task_id"] != task.task_id
         or admission_row["admission_sha256"] != admission.admission_sha256
         or m2.task_admission_sha256_for(admission) != admission.admission_sha256
+        or request.expected_project_admission_etag
+        != admitted_authority.project_etag
         or request.expected_project_head_id
         != admission.predecessor_project_head.project_head_id
         or request.expected_project_head_manifest_sha256
         != admission.predecessor_project_head.manifest_sha256
-        or request.project_config_sha256 != admission.project_config_sha256
-        or request.task_envelope_sha256 != admission.task_envelope_sha256
-        or request.workspace_snapshot != admission.workspace_snapshot
-        or request.normalized_evolution_intent_sha256
-        != admission.normalized_evolution_intent_sha256
-        or request.expected_registry_sha256 != admission.registry_sha256
+        or request.expected_project_config_sha256
+        != admission.project_config_sha256
+        or admission.task_envelope_sha256
+        != _task_envelope_sha256(
+            project_id=admission.project_id,
+            predecessor_project_head=admission.predecessor_project_head,
+            workspace_snapshot=admission.workspace_snapshot,
+            project_config_sha256=admission.project_config_sha256,
+        )
+        or admission.registry_sha256
+        != admission.predecessor_project_head.registry_sha256
     ):
         raise ScienceTaskStoreV2Error(
             "persisted v2 Task admission closure is inconsistent"

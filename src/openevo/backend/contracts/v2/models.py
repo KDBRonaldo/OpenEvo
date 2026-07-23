@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import (
@@ -11,15 +12,22 @@ from pydantic import (
     ConfigDict,
     Field,
     StringConstraints,
+    field_validator,
     model_validator,
 )
 
+from openevo.codex_models import validate_codex_model_ref
 from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
+from openevo.evolution.framework.plan import ProjectEvolutionTargetMap
 
 
 MAX_JAVASCRIPT_SAFE_INTEGER = (1 << 53) - 1
 MAX_SNAPSHOT_ENTRIES = 100_000
 MAX_SNAPSHOT_BYTES = 16 * 1024 * 1024 * 1024
+MAX_PROJECT_CONFIG_BYTES = 1024 * 1024
+MAX_PROJECT_CONFIG_JSON_DEPTH = 24
+MAX_WORKSPACE_CHUNK_BYTES = 8 * 1024 * 1024
+MAX_WORKSPACE_CHUNKS = 65_536
 
 
 class ContractModel(BaseModel):
@@ -419,10 +427,214 @@ class SystemStatusV2(ContractModel):
     checked_at: UtcTimestamp
 
 
+class ScienceTaskConfigV2(ContractModel):
+    """Ordinary-user task text saved as Daemon-owned project authority."""
+
+    title: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    objective: Annotated[str, StringConstraints(min_length=1, max_length=65_536)]
+
+
+class ScienceWorkspaceSourceV2(ContractModel):
+    """Workspace intent without a local path, URI, or caller-created snapshot."""
+
+    kind: Literal["scratch", "native_folder_snapshot"]
+    display_name: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+
+
+class CodexSubscriptionExecutionSettingsV2(ContractModel):
+    """Closed desired settings for the v0.1.9 Subscription vertical."""
+
+    mode: Literal["codex_subscription_transcript"]
+    capture_mode: Literal["transcript"]
+    token_level_metrics_available: Literal[False]
+    harness_id: Literal["codex"]
+    codex_model: Annotated[str, StringConstraints(min_length=1, max_length=256)]
+    reasoning_effort: Literal["low", "medium", "high", "xhigh"] | None
+    token_limit: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    task_network_allow_internet: bool
+
+    @field_validator("codex_model")
+    @classmethod
+    def _valid_codex_model(cls, value: str) -> str:
+        model = validate_codex_model_ref(value, field_name="execution.codex_model")
+        if (
+            "://" in model
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", model) is not None
+            or model.startswith(("/", "\\", ".", "~"))
+            or "\\" in model
+            or any(part in {".", ".."} for part in model.split("/"))
+        ):
+            raise ValueError("execution.codex_model must not be a path or URI")
+        return model
+
+
+class ScienceEvolutionConfigV2(ContractModel):
+    targets: ProjectEvolutionTargetMap
+
+
+class ScienceProjectConfigV2(ContractModel):
+    """Complete canonical Science configuration persisted behind its digest."""
+
+    schema_version: Literal["2"] = "2"
+    task: ScienceTaskConfigV2
+    workspace: ScienceWorkspaceSourceV2
+    execution: CodexSubscriptionExecutionSettingsV2
+    evolution: ScienceEvolutionConfigV2
+
+    @model_validator(mode="after")
+    def _bounded_canonical_document(self) -> ScienceProjectConfigV2:
+        if len(_canonical_json_bytes(self)) > MAX_PROJECT_CONFIG_BYTES:
+            raise ValueError("project config exceeds the 1 MiB canonical byte limit")
+        return self
+
+
+def _canonical_json_bytes(value: BaseModel) -> bytes:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def project_config_sha256_for(config: ScienceProjectConfigV2) -> str:
+    """Digest the exact closed project config after strict normalization."""
+
+    if type(config) is not ScienceProjectConfigV2:
+        raise TypeError("project config digest requires ScienceProjectConfigV2")
+    return hashlib.sha256(_canonical_json_bytes(config)).hexdigest()
+
+
 class ProjectCreateV2(ContractModel):
     schema_version: Literal["2"] = "2"
     display_name: Annotated[str, StringConstraints(min_length=1, max_length=128)]
-    project_config_sha256: Sha256Digest
+    config: ScienceProjectConfigV2
+
+
+class ProjectUpdateV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    expected_project_head_id: OpaqueId | None
+    expected_project_head_manifest_sha256: Sha256Digest | None
+    expected_project_config_sha256: Sha256Digest
+    display_name: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    config: ScienceProjectConfigV2
+
+    @model_validator(mode="after")
+    def _head_cas_is_complete(self) -> ProjectUpdateV2:
+        if (self.expected_project_head_id is None) != (
+            self.expected_project_head_manifest_sha256 is None
+        ):
+            raise ValueError("expected project head ID and manifest must be present together")
+        return self
+
+
+class WorkspaceArchiveDeclarationV2(ContractModel):
+    format: Literal["openevo_deterministic_tar_v1"]
+    media_type: Literal["application/vnd.openevo.workspace-tar"]
+    content_sha256: Sha256Digest
+    byte_size: int = Field(ge=1024, le=MAX_SNAPSHOT_BYTES)
+    entry_count: int = Field(ge=0, le=MAX_SNAPSHOT_ENTRIES)
+    extracted_byte_size: int = Field(ge=0, le=MAX_SNAPSHOT_BYTES)
+
+    @model_validator(mode="after")
+    def _valid_archive_bounds(self) -> WorkspaceArchiveDeclarationV2:
+        if self.byte_size % 512 != 0:
+            raise ValueError("workspace archive byte size must be a multiple of 512")
+        if self.entry_count == 0 and self.extracted_byte_size != 0:
+            raise ValueError("an empty archive cannot declare extracted bytes")
+        minimum_body_bytes = ((self.extracted_byte_size + 511) // 512) * 512
+        minimum_archive_bytes = (self.entry_count + 2) * 512 + minimum_body_bytes
+        if self.byte_size < minimum_archive_bytes:
+            raise ValueError("workspace archive is too small for its declared contents")
+        if self.entry_count == 0 and self.byte_size != 1024:
+            raise ValueError("an empty deterministic archive is exactly 1024 bytes")
+        return self
+
+
+class WorkspaceUploadCreateV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    expected_project_head_id: OpaqueId | None
+    expected_project_head_manifest_sha256: Sha256Digest | None
+    expected_project_config_sha256: Sha256Digest
+    archive: WorkspaceArchiveDeclarationV2
+    chunk_byte_size: int = Field(ge=1024, le=MAX_WORKSPACE_CHUNK_BYTES)
+    chunk_count: int = Field(ge=1, le=MAX_WORKSPACE_CHUNKS)
+
+    @model_validator(mode="after")
+    def _valid_upload_shape(self) -> WorkspaceUploadCreateV2:
+        if (self.expected_project_head_id is None) != (
+            self.expected_project_head_manifest_sha256 is None
+        ):
+            raise ValueError("expected project head ID and manifest must be present together")
+        expected_chunks = (
+            self.archive.byte_size + self.chunk_byte_size - 1
+        ) // self.chunk_byte_size
+        if self.chunk_count != expected_chunks:
+            raise ValueError("workspace upload chunk count does not match its byte sizes")
+        return self
+
+
+class WorkspaceUploadSessionV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    upload_id: OpaqueId
+    project_id: OpaqueId
+    state: Literal["open", "finalizing", "finalized", "aborted"]
+    expected_project_head_id: OpaqueId | None
+    expected_project_head_manifest_sha256: Sha256Digest | None
+    expected_project_config_sha256: Sha256Digest
+    archive: WorkspaceArchiveDeclarationV2
+    chunk_byte_size: int = Field(ge=1024, le=MAX_WORKSPACE_CHUNK_BYTES)
+    chunk_count: int = Field(ge=1, le=MAX_WORKSPACE_CHUNKS)
+    next_chunk_index: int = Field(ge=0, le=MAX_WORKSPACE_CHUNKS)
+    accepted_byte_size: int = Field(ge=0, le=MAX_SNAPSHOT_BYTES)
+    workspace_snapshot: WorkspaceSnapshotRefV2 | None
+    created_at: UtcTimestamp
+    updated_at: UtcTimestamp
+    etag: StrongETag
+
+    @model_validator(mode="after")
+    def _valid_session_shape(self) -> WorkspaceUploadSessionV2:
+        if (self.expected_project_head_id is None) != (
+            self.expected_project_head_manifest_sha256 is None
+        ):
+            raise ValueError("expected project head ID and manifest must be present together")
+        expected_chunks = (
+            self.archive.byte_size + self.chunk_byte_size - 1
+        ) // self.chunk_byte_size
+        if self.chunk_count != expected_chunks:
+            raise ValueError("workspace upload chunk count does not match its byte sizes")
+        if self.next_chunk_index > self.chunk_count:
+            raise ValueError("next chunk index exceeds the declared chunk count")
+        expected_bytes = min(
+            self.next_chunk_index * self.chunk_byte_size,
+            self.archive.byte_size,
+        )
+        if self.accepted_byte_size != expected_bytes:
+            raise ValueError("accepted byte size does not match the next chunk index")
+        if self.state in {"finalizing", "finalized"} and (
+            self.next_chunk_index != self.chunk_count
+            or self.accepted_byte_size != self.archive.byte_size
+        ):
+            raise ValueError("finalizing uploads must contain every declared byte")
+        if (self.state == "finalized") != (self.workspace_snapshot is not None):
+            raise ValueError("only a finalized upload exposes a workspace snapshot")
+        if (
+            self.workspace_snapshot is not None
+            and self.workspace_snapshot.project_id != self.project_id
+        ):
+            raise ValueError("workspace snapshot belongs to another project")
+        return self
+
+
+class WorkspaceUploadFinalizeV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    expected_content_sha256: Sha256Digest
+
+
+class WorkspaceUploadAbortV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    reason: Literal["user_cancelled", "superseded", "project_deleted"]
 
 
 CapabilitiesResponseV2 = EvolutionCapabilitiesV1
@@ -432,7 +644,7 @@ class ProjectValidationRequestV2(ContractModel):
     schema_version: Literal["2"] = "2"
     expected_project_head_id: OpaqueId
     expected_project_head_manifest_sha256: Sha256Digest
-    project_config_sha256: Sha256Digest
+    expected_project_config_sha256: Sha256Digest
     expected_registry_sha256: Sha256Digest
 
 
@@ -457,8 +669,10 @@ class ProjectV2(ContractModel):
     schema_version: Literal["2"] = "2"
     project_id: OpaqueId
     display_name: Annotated[str, StringConstraints(min_length=1, max_length=128)]
+    config: ScienceProjectConfigV2
     project_config_sha256: Sha256Digest
     active_project_head: ProjectHeadRefV2 | None
+    admission_etag: StrongETag | None
     state: Literal["ready", "transitioning", "not_ready", "needs_attention"]
     created_at: UtcTimestamp
     updated_at: UtcTimestamp
@@ -466,11 +680,15 @@ class ProjectV2(ContractModel):
 
     @model_validator(mode="after")
     def _head_belongs_to_project(self) -> ProjectV2:
+        if self.project_config_sha256 != project_config_sha256_for(self.config):
+            raise ValueError("project config digest does not match canonical config bytes")
         if (
             self.active_project_head is not None
             and self.active_project_head.project_id != self.project_id
         ):
             raise ValueError("active project head belongs to another project")
+        if (self.active_project_head is None) != (self.admission_etag is None):
+            raise ValueError("an active project head and admission ETag must appear together")
         return self
 
 
@@ -525,19 +743,10 @@ class SuccessorTransitionPageV2(CursorPageV2):
 class TaskSubmitRequestV2(ContractModel):
     schema_version: Literal["2"] = "2"
     project_id: OpaqueId
+    expected_project_admission_etag: StrongETag
     expected_project_head_id: OpaqueId
     expected_project_head_manifest_sha256: Sha256Digest
-    project_config_sha256: Sha256Digest
-    task_envelope_sha256: Sha256Digest
-    workspace_snapshot: WorkspaceSnapshotRefV2
-    normalized_evolution_intent_sha256: Sha256Digest
-    expected_registry_sha256: Sha256Digest
-
-    @model_validator(mode="after")
-    def _workspace_belongs_to_project(self) -> TaskSubmitRequestV2:
-        if self.workspace_snapshot.project_id != self.project_id:
-            raise ValueError("workspace snapshot belongs to another project")
-        return self
+    expected_project_config_sha256: Sha256Digest
 
 
 TaskStateV2: TypeAlias = Literal[
@@ -879,6 +1088,7 @@ __all__ = [
     "AttemptRefV2",
     "CacheCleanupRequestV2",
     "CapabilitiesResponseV2",
+    "CodexSubscriptionExecutionSettingsV2",
     "ContractModel",
     "ContractOfferV2",
     "ContractOnlyResponseV2",
@@ -894,11 +1104,16 @@ __all__ = [
     "ProjectHeadPageV2",
     "ProjectHeadRefV2",
     "ProjectPageV2",
+    "ProjectUpdateV2",
     "ProjectValidationCheckV2",
     "ProjectValidationRequestV2",
     "ProjectValidationResponseV2",
     "ProjectV2",
     "RuntimeContextSnapshotRefV2",
+    "ScienceEvolutionConfigV2",
+    "ScienceProjectConfigV2",
+    "ScienceTaskConfigV2",
+    "ScienceWorkspaceSourceV2",
     "ServicePageV2",
     "ServiceV2",
     "SseFrameV2",
@@ -915,5 +1130,11 @@ __all__ = [
     "TimelinePageV2",
     "VersionResponseV2",
     "WorkspaceSnapshotRefV2",
+    "WorkspaceArchiveDeclarationV2",
+    "WorkspaceUploadAbortV2",
+    "WorkspaceUploadCreateV2",
+    "WorkspaceUploadFinalizeV2",
+    "WorkspaceUploadSessionV2",
+    "project_config_sha256_for",
     "task_admission_sha256_for",
 ]

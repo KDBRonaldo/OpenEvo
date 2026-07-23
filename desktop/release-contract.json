@@ -21,13 +21,13 @@
       "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
     ],
     "accepted_core_openapi_digests": [
-      "38d82187240f7573fb662f1da718de36f57e3bd9ea79429cfb242e28fa689379"
+      "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
     ],
     "accepted_desktop_event_schema_digests": [
       "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
     ],
     "accepted_desktop_openapi_digests": [
-      "124ead258cb861f47052c57d90732e44fd5844159b49934d03eb887e9705bb64"
+      "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
     ],
     "allow_direct_core_url": false,
     "allow_legacy_route_fallback": false,

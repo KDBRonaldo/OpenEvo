@@ -29,12 +29,13 @@ from .snapshots import canonical_contract_bytes, parse_contract_json_bytes
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1)
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS projects (
     project_id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
     project_config_sha256 TEXT NOT NULL CHECK (length(project_config_sha256) = 64),
+    project_config_json BLOB NOT NULL,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     resource_version INTEGER NOT NULL CHECK (resource_version >= 1)
@@ -90,6 +91,7 @@ class OperationNotFoundV2(CoreControlStoreV2Error):
 class ProjectRecordV2:
     project_id: str
     display_name: str
+    config: m.ScienceProjectConfigV2
     project_config_sha256: str
     created_at: str
     updated_at: str
@@ -116,7 +118,7 @@ class CoreControlStoreV2:
         with self._reader() as connection:
             connection.executescript(_SCHEMA)
             connection.execute(
-                "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 1)"
+                "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 2)"
             )
             connection.commit()
         os.chmod(self.database, 0o600)
@@ -158,13 +160,17 @@ class CoreControlStoreV2:
             ):
                 raise ProjectConflictV2("v2 project catalog capacity is exhausted")
             project_id = f"project-{secrets.token_hex(16)}"
+            config_json = canonical_contract_bytes(request.config)
+            project_config_sha256 = m.project_config_sha256_for(request.config)
             connection.execute(
                 "INSERT INTO projects(project_id, display_name, project_config_sha256, "
-                "created_at, updated_at, resource_version) VALUES (?, ?, ?, ?, ?, 1)",
+                "project_config_json, created_at, updated_at, resource_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1)",
                 (
                     project_id,
                     request.display_name,
-                    request.project_config_sha256,
+                    project_config_sha256,
+                    config_json,
                     timestamp,
                     timestamp,
                 ),
@@ -181,17 +187,20 @@ class CoreControlStoreV2:
         *,
         project_id: str,
         display_name: str,
-        project_config_sha256: str,
+        config: m.ScienceProjectConfigV2,
         now: datetime,
     ) -> ProjectRecordV2:
         project_id = _resource_id(project_id, label="project")
         if not isinstance(display_name, str) or not 1 <= len(display_name) <= 128:
             raise ValueError("v2 project display name is invalid")
-        project_config_sha256 = _sha256(project_config_sha256, label="project config")
+        config = _exact_model(m.ScienceProjectConfigV2, config)
+        config_json = canonical_contract_bytes(config)
+        project_config_sha256 = m.project_config_sha256_for(config)
         timestamp = _timestamp(now)
         with self._lock, self._transaction() as connection:
             row = connection.execute(
-                "SELECT display_name, project_config_sha256 FROM projects "
+                "SELECT display_name, project_config_sha256, project_config_json "
+                "FROM projects "
                 "WHERE project_id = ?",
                 (project_id,),
             ).fetchone()
@@ -202,18 +211,22 @@ class CoreControlStoreV2:
                     raise ProjectConflictV2("v2 project catalog capacity is exhausted")
                 connection.execute(
                     "INSERT INTO projects(project_id, display_name, "
-                    "project_config_sha256, created_at, updated_at, resource_version) "
-                    "VALUES (?, ?, ?, ?, ?, 1)",
+                    "project_config_sha256, project_config_json, created_at, updated_at, "
+                    "resource_version) VALUES (?, ?, ?, ?, ?, ?, 1)",
                     (
                         project_id,
                         display_name,
                         project_config_sha256,
+                        config_json,
                         timestamp,
                         timestamp,
                     ),
                 )
             else:
-                if row["project_config_sha256"] != project_config_sha256:
+                if (
+                    row["project_config_sha256"] != project_config_sha256
+                    or bytes(row["project_config_json"]) != config_json
+                ):
                     raise ProjectConflictV2(
                         "v2 project catalog disagrees with admission authority"
                     )
@@ -376,7 +389,7 @@ class CoreControlStoreV2:
             identity = connection.execute(
                 "SELECT schema_version FROM metadata WHERE singleton = 1"
             ).fetchone()
-            if identity is None or int(identity["schema_version"]) != 1:
+            if identity is None or int(identity["schema_version"]) != 2:
                 raise CoreControlStoreV2Error("v2 catalog schema identity is invalid")
             rows = connection.execute(
                 "SELECT project_id FROM projects ORDER BY project_id LIMIT ?",
@@ -397,7 +410,13 @@ class CoreControlStoreV2:
             for row in requests:
                 request_json = bytes(row["request_json"])
                 try:
-                    parse_contract_json_bytes(m.ProjectCreateV2, request_json)
+                    parse_contract_json_bytes(
+                        m.ProjectCreateV2,
+                        request_json,
+                        max_depth=m.MAX_PROJECT_CONFIG_JSON_DEPTH,
+                        max_nodes=m.MAX_PROJECT_CONFIG_BYTES,
+                        max_collection_items=m.MAX_PROJECT_CONFIG_BYTES,
+                    )
                 except (TypeError, ValueError) as exc:
                     raise CoreControlStoreV2Error(
                         "persisted v2 project request is invalid"
@@ -501,16 +520,25 @@ def _load_project(
     connection: sqlite3.Connection, project_id: str
 ) -> ProjectRecordV2:
     row = connection.execute(
-        "SELECT project_id, display_name, project_config_sha256, created_at, "
-        "updated_at, resource_version FROM projects WHERE project_id = ?",
+        "SELECT project_id, display_name, project_config_sha256, project_config_json, "
+        "created_at, updated_at, resource_version FROM projects WHERE project_id = ?",
         (project_id,),
     ).fetchone()
     if row is None:
         raise ProjectNotFoundV2("v2 project was not found")
     try:
+        config_json = bytes(row["project_config_json"])
+        config = parse_contract_json_bytes(
+            m.ScienceProjectConfigV2,
+            config_json,
+            max_depth=m.MAX_PROJECT_CONFIG_JSON_DEPTH,
+            max_nodes=m.MAX_PROJECT_CONFIG_BYTES,
+            max_collection_items=m.MAX_PROJECT_CONFIG_BYTES,
+        )
         loaded = ProjectRecordV2(
             project_id=_resource_id(str(row["project_id"]), label="project"),
             display_name=str(row["display_name"]),
+            config=config,
             project_config_sha256=_sha256(
                 str(row["project_config_sha256"]), label="project config"
             ),
@@ -520,7 +548,13 @@ def _load_project(
         )
     except (TypeError, ValueError) as exc:
         raise CoreControlStoreV2Error("persisted v2 project is invalid") from exc
-    if not 1 <= len(loaded.display_name) <= 128 or loaded.resource_version < 1:
+    if (
+        not 1 <= len(loaded.display_name) <= 128
+        or loaded.resource_version < 1
+        or canonical_contract_bytes(loaded.config) != config_json
+        or m.project_config_sha256_for(loaded.config)
+        != loaded.project_config_sha256
+    ):
         raise CoreControlStoreV2Error("persisted v2 project is invalid")
     return loaded
 
@@ -646,6 +680,7 @@ def project_etag_payload(
     record: ProjectRecordV2,
     *,
     active_project_head: m.ProjectHeadRefV2 | None,
+    admission_etag: str | None,
     state: str,
 ) -> str:
     """Return a stable strong ETag for the public joined project representation."""
@@ -659,6 +694,7 @@ def project_etag_payload(
             if active_project_head is None
             else active_project_head.model_dump(mode="json")
         ),
+        "admission_etag": admission_etag,
         "state": state,
         "created_at": record.created_at,
         "updated_at": record.updated_at,

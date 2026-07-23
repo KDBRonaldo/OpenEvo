@@ -449,14 +449,24 @@ class ProjectCreateV2(StrictModel):
         ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER
     )
     display_name: DisplayName
-    project_config_sha256: Digest
+    config: core.ScienceProjectConfigV2
 
 
 class ProjectPatchV2(StrictModel):
     schema_version: Literal["2"] = "2"
-    expected_project_head_id: OpaqueId
+    expected_project_head_id: OpaqueId | None
+    expected_project_head_manifest_sha256: Digest | None
+    expected_project_config_sha256: Digest
     display_name: DisplayName
-    project_config_sha256: Digest
+    config: core.ScienceProjectConfigV2
+
+    @model_validator(mode="after")
+    def _head_cas_is_complete(self) -> ProjectPatchV2:
+        if (self.expected_project_head_id is None) != (
+            self.expected_project_head_manifest_sha256 is None
+        ):
+            raise ValueError("expected project head ID and manifest must be present together")
+        return self
 
 
 class ProjectActionV2(StrictModel):
@@ -471,20 +481,52 @@ class ProjectCapabilityProjectionV2(StrictModel):
     execution_mode: Literal["codex_subscription_transcript", "self_deployed"]
     registry_sha256: Digest
     capabilities_sha256: Digest
-    target_ids: list[OpaqueId] = Field(max_length=128)
+    capabilities: core.CapabilitiesResponseV2
     fetched_at: UtcTimestamp
 
     @model_validator(mode="after")
-    def _targets_unique(self) -> ProjectCapabilityProjectionV2:
-        if len(self.target_ids) != len(set(self.target_ids)):
-            raise ValueError("capability target IDs must be unique")
+    def _bind_complete_remote_envelope(self) -> ProjectCapabilityProjectionV2:
+        if self.registry_sha256 != self.capabilities.registry_digest:
+            raise ValueError("capability registry digest differs from the remote envelope")
+        if self.capabilities_sha256 != evolution_capabilities_sha256_for(
+            self.capabilities
+        ):
+            raise ValueError("capability digest differs from the remote envelope")
+        expected_framework_mode = (
+            "subscription"
+            if self.execution_mode == "codex_subscription_transcript"
+            else "self_deployed"
+        )
+        if self.capabilities.evaluated_profile.execution_mode != expected_framework_mode:
+            raise ValueError("capability execution mode differs from the remote envelope")
         return self
+
+
+def evolution_capabilities_sha256_for(
+    capabilities: core.CapabilitiesResponseV2 | dict[str, object],
+) -> str:
+    """Hash the complete validated capability envelope forwarded by the sidecar."""
+
+    parsed = (
+        capabilities
+        if isinstance(capabilities, core.CapabilitiesResponseV2)
+        else core.CapabilitiesResponseV2.model_validate(capabilities)
+    )
+    encoded = json.dumps(
+        parsed.model_dump(mode="json"),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class ProjectValidationRequestV2(StrictModel):
     schema_version: Literal["2"] = "2"
     expected_project_head_id: OpaqueId
-    project_config_sha256: Digest
+    expected_project_head_manifest_sha256: Digest
+    expected_project_config_sha256: Digest
     capability_registry_sha256: Digest
 
 
@@ -700,4 +742,5 @@ __all__ = [
     "TransitionActionV2",
     "TransitionReplaceV2",
     "WorkspaceSnapshotRefV2",
+    "evolution_capabilities_sha256_for",
 ]

@@ -71,7 +71,17 @@ _PROJECT_OPERATIONS = frozenset(
         "getCoreProjectV2",
         "listCoreProjectHeadsV2",
         "listCoreProjectsV2",
+        "updateCoreProjectV2",
         "validateCoreProjectV2",
+    }
+)
+_WORKSPACE_OPERATIONS = frozenset(
+    {
+        "abortCoreWorkspaceUploadV2",
+        "createCoreWorkspaceUploadV2",
+        "finalizeCoreWorkspaceUploadV2",
+        "getCoreWorkspaceUploadV2",
+        "putCoreWorkspaceUploadChunkV2",
     }
 )
 _TRANSITION_OPERATIONS = frozenset(
@@ -249,6 +259,8 @@ class CoreControlProviderV2:
                 "deleteCoreDiagnosticV2",
                 "cleanupCoreCachesV2",
                 "validateCoreProjectV2",
+                "updateCoreProjectV2",
+                *_WORKSPACE_OPERATIONS,
             }
         )
 
@@ -265,6 +277,7 @@ class CoreControlProviderV2:
         self,
         *,
         display_name: str,
+        config: m.ScienceProjectConfigV2,
         authority: ScienceProjectAdmissionAuthorityV2,
         expected_project_head_id: str | None = None,
     ) -> m.ProjectV2:
@@ -272,6 +285,8 @@ class CoreControlProviderV2:
         head = authority.active_project_head
         if (
             authority.project_id != head.project_id
+            or authority.project_config_sha256
+            != m.project_config_sha256_for(config)
             or head.registry_sha256 != self._registry_sha256
             or head.runtime_context_snapshot.runtime_contract_sha256
             != self._runtime_contract_sha256
@@ -282,7 +297,7 @@ class CoreControlProviderV2:
         self.store.upsert_authoritative_project(
             project_id=authority.project_id,
             display_name=display_name,
-            project_config_sha256=authority.project_config_sha256,
+            config=config,
             now=self._clock(),
         )
         self._task_owner.publish_project_admission_authority(
@@ -469,6 +484,7 @@ class CoreControlProviderV2:
 
     def _project_model(self, record: ProjectRecordV2) -> m.ProjectV2:
         active: m.ProjectHeadRefV2 | None = None
+        admission_etag: str | None = None
         state: Literal["ready", "transitioning", "not_ready", "needs_attention"]
         try:
             authority = self._task_owner.project_admission_authority(record.project_id)
@@ -482,6 +498,7 @@ class CoreControlProviderV2:
                     "project catalog and admission authority digests differ"
                 )
             active = authority.active_project_head
+            admission_etag = authority.project_etag
             negotiated_digest_drift = (
                 active.registry_sha256 != self._registry_sha256
                 or active.runtime_context_snapshot.runtime_contract_sha256
@@ -505,13 +522,16 @@ class CoreControlProviderV2:
         etag = project_etag_payload(
             record,
             active_project_head=active,
+            admission_etag=admission_etag,
             state=state,
         )
         return m.ProjectV2(
             project_id=record.project_id,
             display_name=record.display_name,
+            config=record.config,
             project_config_sha256=record.project_config_sha256,
             active_project_head=active,
+            admission_etag=admission_etag,
             state=state,
             created_at=record.created_at,
             updated_at=record.updated_at,
@@ -887,7 +907,7 @@ class CoreControlProviderV2:
             "contract",
             "internal",
         ] = "system"
-        if operation_id in _PROJECT_OPERATIONS:
+        if operation_id in _PROJECT_OPERATIONS or operation_id in _WORKSPACE_OPERATIONS:
             category = "project"
         elif operation_id in _TRANSITION_OPERATIONS:
             category = "transition"

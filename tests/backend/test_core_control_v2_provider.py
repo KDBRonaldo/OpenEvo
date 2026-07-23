@@ -30,8 +30,10 @@ from openevo.backend.contracts.v2.models import (
     ProjectCreateV2,
     ProjectHeadRefV2,
     RuntimeContextSnapshotRefV2,
+    ScienceProjectConfigV2,
     TaskSubmitRequestV2,
     WorkspaceSnapshotRefV2,
+    project_config_sha256_for,
 )
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
 from openevo.backend.science_run_store import ScienceProjectAdmissionAuthorityV2
@@ -41,12 +43,39 @@ from tests.backend.test_science_successor_v2 import (
     _authority as _successor_authority,
     _head as _successor_head,
     _plan as _successor_plan,
+    _project_config as _successor_project_config,
     _request as _successor_request,
 )
 
 
 _TOKEN = "core-v2-test-bearer"
 _RUNTIME_CONTRACT_SHA256 = "d" * 64
+
+
+def _project_config() -> ScienceProjectConfigV2:
+    return ScienceProjectConfigV2.model_validate(
+        {
+            "task": {
+                "title": "Provider task",
+                "objective": "Exercise the v2 provider authority.",
+            },
+            "workspace": {
+                "kind": "scratch",
+                "display_name": "Provider workspace",
+            },
+            "execution": {
+                "mode": "codex_subscription_transcript",
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+                "harness_id": "codex",
+                "codex_model": "gpt-5.5",
+                "reasoning_effort": "high",
+                "token_limit": 32768,
+                "task_network_allow_internet": False,
+            },
+            "evolution": {"targets": {}},
+        }
+    )
 
 
 class _Clock:
@@ -120,7 +149,7 @@ def _authority(*, registry_sha256: str = "a" * 64) -> ScienceProjectAdmissionAut
     return ScienceProjectAdmissionAuthorityV2(
         project_id=head.project_id,
         active_project_head=head,
-        project_config_sha256="6" * 64,
+        project_config_sha256=project_config_sha256_for(_project_config()),
         workspace_snapshot=_workspace(head.project_id, "7"),
         normalized_evolution_intent_sha256="8" * 64,
     )
@@ -130,7 +159,7 @@ def _authority_with_head(head: ProjectHeadRefV2) -> ScienceProjectAdmissionAutho
     return ScienceProjectAdmissionAuthorityV2(
         project_id=head.project_id,
         active_project_head=head,
-        project_config_sha256="6" * 64,
+        project_config_sha256=project_config_sha256_for(_project_config()),
         workspace_snapshot=_workspace(head.project_id, "7"),
         normalized_evolution_intent_sha256="8" * 64,
     )
@@ -139,17 +168,12 @@ def _authority_with_head(head: ProjectHeadRefV2) -> ScienceProjectAdmissionAutho
 def _request(authority: ScienceProjectAdmissionAuthorityV2) -> TaskSubmitRequestV2:
     return TaskSubmitRequestV2(
         project_id=authority.project_id,
+        expected_project_admission_etag=authority.project_etag,
         expected_project_head_id=authority.active_project_head.project_head_id,
         expected_project_head_manifest_sha256=(
             authority.active_project_head.manifest_sha256
         ),
-        project_config_sha256=authority.project_config_sha256,
-        task_envelope_sha256="9" * 64,
-        workspace_snapshot=authority.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            authority.normalized_evolution_intent_sha256
-        ),
-        expected_registry_sha256=authority.active_project_head.registry_sha256,
+        expected_project_config_sha256=authority.project_config_sha256,
     )
 
 
@@ -179,6 +203,7 @@ class _Runtime:
         )
         self.provider.publish_project_admission_authority(
             display_name="Provider project",
+            config=_project_config(),
             authority=self.authority,
         )
         self.app = create_core_control_v2_contract_app(self.provider)
@@ -576,7 +601,7 @@ def test_project_create_idempotency_etag_and_cursor_are_closed(
     request = {
         "schema_version": "2",
         "display_name": "Draft project",
-        "project_config_sha256": "c" * 64,
+        "config": _project_config().model_dump(mode="json"),
     }
     created = runtime.client.post(
         "/v2/projects",
@@ -586,6 +611,11 @@ def test_project_create_idempotency_etag_and_cursor_are_closed(
     assert created.status_code == 201
     assert created.json()["state"] == "not_ready"
     assert created.json()["active_project_head"] is None
+    assert created.json()["admission_etag"] is None
+    assert created.json()["config"] == request["config"]
+    assert created.json()["project_config_sha256"] == project_config_sha256_for(
+        _project_config()
+    )
     assert created.headers["etag"] == created.json()["etag"]
 
     replay = runtime.client.post(
@@ -621,6 +651,40 @@ def test_project_create_idempotency_etag_and_cursor_are_closed(
     )
     assert wrong_query.status_code == 400
     assert wrong_query.json()["code"] == "cursor_invalid"
+
+
+def test_project_resource_etag_binds_the_complete_admission_authority(
+    runtime: _Runtime,
+) -> None:
+    before = runtime.client.get("/v2/projects/project-1", headers=runtime.headers)
+    assert before.status_code == 200
+
+    updated_authority = ScienceProjectAdmissionAuthorityV2(
+        project_id=runtime.authority.project_id,
+        active_project_head=runtime.authority.active_project_head,
+        project_config_sha256=runtime.authority.project_config_sha256,
+        workspace_snapshot=_workspace(runtime.authority.project_id, "9"),
+        normalized_evolution_intent_sha256=(
+            runtime.authority.normalized_evolution_intent_sha256
+        ),
+    )
+    runtime.provider.publish_project_admission_authority(
+        display_name="Provider project",
+        config=_project_config(),
+        authority=updated_authority,
+        expected_project_head_id=(
+            runtime.authority.active_project_head.project_head_id
+        ),
+    )
+
+    after = runtime.client.get("/v2/projects/project-1", headers=runtime.headers)
+    assert after.status_code == 200
+    assert after.json()["active_project_head"] == before.json()["active_project_head"]
+    assert after.json()["project_config_sha256"] == before.json()[
+        "project_config_sha256"
+    ]
+    assert after.json()["admission_etag"] != before.json()["admission_etag"]
+    assert after.headers["etag"] != before.headers["etag"]
 
 
 def test_provider_exposes_only_authoritative_services_and_fails_closed_elsewhere(
@@ -679,7 +743,7 @@ def test_provider_exposes_only_authoritative_services_and_fails_closed_elsewhere
             "schema_version": "2",
             "expected_project_head_id": "project-head-0",
             "expected_project_head_manifest_sha256": "5" * 64,
-            "project_config_sha256": runtime.authority.project_config_sha256,
+            "expected_project_config_sha256": runtime.authority.project_config_sha256,
             "expected_registry_sha256": runtime.registry.snapshot.registry_digest,
         },
     )
@@ -752,6 +816,7 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
     )
     provider.publish_project_admission_authority(
         display_name="Successor project",
+        config=_successor_project_config(),
         authority=authority,
     )
     client = TestClient(create_core_control_v2_contract_app(provider))
@@ -887,6 +952,7 @@ def test_provider_rejects_registry_drift_and_schema_snapshot_drift(
         with pytest.raises(ValueError, match="negotiated Core digests"):
             provider.publish_project_admission_authority(
                 display_name="Drifted project",
+                config=_project_config(),
                 authority=_authority(registry_sha256="f" * 64),
             )
         assert owner.ownership_counts() == (0, 0, 0)
@@ -939,7 +1005,7 @@ def test_persisted_project_digest_drift_blocks_new_task_admission(
     store.upsert_authoritative_project(
         project_id=authority.project_id,
         display_name="Drifted project",
-        project_config_sha256=authority.project_config_sha256,
+        config=_project_config(),
         now=clock(),
     )
     provider = CoreControlProviderV2(
@@ -979,7 +1045,7 @@ def test_project_create_request_remains_valid_after_catalog_display_update(
     store = CoreControlStoreV2(root)
     request = ProjectCreateV2(
         display_name="Original name",
-        project_config_sha256="c" * 64,
+        config=_project_config(),
     )
     record, replayed = store.create_project(
         request,
@@ -990,7 +1056,7 @@ def test_project_create_request_remains_valid_after_catalog_display_update(
     store.upsert_authoritative_project(
         project_id=record.project_id,
         display_name="Updated name",
-        project_config_sha256=record.project_config_sha256,
+        config=record.config,
         now=datetime(2026, 7, 23, 0, 0, 1, tzinfo=timezone.utc),
     )
     store.close()
@@ -1006,6 +1072,70 @@ def test_project_create_request_remains_valid_after_catalog_display_update(
         assert recovered.display_name == "Updated name"
     finally:
         restarted.close()
+
+
+def test_v2_catalog_recovers_a_project_config_at_the_declared_depth_limit(
+    tmp_path: Path,
+) -> None:
+    nested: object = "leaf"
+    for _ in range(14):
+        nested = {"nested": nested}
+    payload = _project_config().model_dump(mode="json")
+    payload["evolution"]["targets"] = {
+        "text_memory": {
+            "enabled": False,
+            "method": None,
+            "config": {"deep": nested},
+        }
+    }
+    config = ScienceProjectConfigV2.model_validate(payload)
+    root = tmp_path / "catalog"
+    store = CoreControlStoreV2(root)
+    record, replayed = store.create_project(
+        ProjectCreateV2(display_name="Deep config", config=config),
+        idempotency_key="deep-project-config",
+        now=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    assert replayed is False
+    assert record.config == config
+    store.close()
+
+    restarted = CoreControlStoreV2(root)
+    try:
+        assert restarted.get_project(record.project_id).config == config
+    finally:
+        restarted.close()
+
+
+@pytest.mark.parametrize("corruption", ["bytes", "digest"])
+def test_v2_catalog_startup_rejects_corrupt_project_config(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    root = tmp_path / "catalog"
+    store = CoreControlStoreV2(root)
+    record, _ = store.create_project(
+        ProjectCreateV2(display_name="Corruption target", config=_project_config()),
+        idempotency_key="corruption-target",
+        now=datetime(2026, 7, 23, tzinfo=timezone.utc),
+    )
+    database = store.database
+    store.close()
+    with sqlite3.connect(database) as connection:
+        if corruption == "bytes":
+            connection.execute(
+                "UPDATE projects SET project_config_json = ? WHERE project_id = ?",
+                (b"{}\n", record.project_id),
+            )
+        else:
+            connection.execute(
+                "UPDATE projects SET project_config_sha256 = ? WHERE project_id = ?",
+                ("f" * 64, record.project_id),
+            )
+        connection.commit()
+
+    with pytest.raises(CoreControlStoreV2Error, match="persisted v2 project"):
+        CoreControlStoreV2(root)
 
 
 def test_v2_catalog_startup_rejects_near_match_schema(tmp_path: Path) -> None:

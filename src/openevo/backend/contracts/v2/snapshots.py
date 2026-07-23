@@ -63,11 +63,22 @@ def _reject_json_constant(value: str) -> None:
 def parse_contract_json_bytes(
     model: type[_ContractT],
     payload: bytes,
+    *,
+    max_depth: int = MAX_CONTRACT_JSON_DEPTH,
+    max_nodes: int = MAX_CONTRACT_JSON_NODES,
+    max_collection_items: int = MAX_CONTRACT_JSON_COLLECTION_ITEMS,
 ) -> _ContractT:
     """Budget raw JSON before validating one strict closed contract model."""
 
     if type(payload) is not bytes:
         raise TypeError("contract JSON payload must be exact bytes")
+    for label, value in (
+        ("depth", max_depth),
+        ("node", max_nodes),
+        ("collection item", max_collection_items),
+    ):
+        if type(value) is not int or value < 1:
+            raise ValueError(f"contract JSON {label} limit must be a positive integer")
     if len(payload) > MAX_CONTRACT_JSON_BYTES:
         raise ValueError("contract JSON exceeds the byte limit")
     try:
@@ -86,9 +97,9 @@ def parse_contract_json_bytes(
     while stack:
         value, depth = stack.pop()
         node_count += 1
-        if node_count > MAX_CONTRACT_JSON_NODES:
+        if node_count > max_nodes:
             raise ValueError("contract JSON exceeds the node limit")
-        if depth > MAX_CONTRACT_JSON_DEPTH:
+        if depth > max_depth:
             raise ValueError("contract JSON exceeds the depth limit")
         if isinstance(value, dict):
             collection_items += len(value)
@@ -96,7 +107,7 @@ def parse_contract_json_bytes(
         elif isinstance(value, list):
             collection_items += len(value)
             stack.extend((child, depth + 1) for child in value)
-        if collection_items > MAX_CONTRACT_JSON_COLLECTION_ITEMS:
+        if collection_items > max_collection_items:
             raise ValueError("contract JSON exceeds the collection item limit")
     return model.model_validate(decoded)
 

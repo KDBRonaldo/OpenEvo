@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import hashlib
+import json
 from pathlib import Path
 import sqlite3
 import threading
@@ -118,17 +120,12 @@ def _request(
 ) -> TaskSubmitRequestV2:
     payload = {
         "project_id": authority.project_id,
+        "expected_project_admission_etag": authority.project_etag,
         "expected_project_head_id": authority.active_project_head.project_head_id,
         "expected_project_head_manifest_sha256": (
             authority.active_project_head.manifest_sha256
         ),
-        "project_config_sha256": authority.project_config_sha256,
-        "task_envelope_sha256": "c" * 64,
-        "workspace_snapshot": authority.workspace_snapshot,
-        "normalized_evolution_intent_sha256": (
-            authority.normalized_evolution_intent_sha256
-        ),
-        "expected_registry_sha256": authority.active_project_head.registry_sha256,
+        "expected_project_config_sha256": authority.project_config_sha256,
     }
     payload.update(changes)
     return TaskSubmitRequestV2.model_validate(payload)
@@ -172,12 +169,13 @@ def test_unresolved_project_state_creates_no_task_admission_or_attempt(
 @pytest.mark.parametrize(
     ("change", "expected_code"),
     [
+        (
+            {"expected_project_admission_etag": '"' + ("f" * 64) + '"'},
+            "task_submission_stale",
+        ),
         ({"expected_project_head_id": "project-head-stale"}, "task_submission_stale"),
         ({"expected_project_head_manifest_sha256": "f" * 64}, "task_submission_stale"),
-        ({"project_config_sha256": "f" * 64}, "task_submission_stale"),
-        ({"workspace_snapshot": _workspace(seed="f")}, "task_submission_stale"),
-        ({"normalized_evolution_intent_sha256": "f" * 64}, "task_submission_stale"),
-        ({"expected_registry_sha256": "f" * 64}, "task_submission_stale"),
+        ({"expected_project_config_sha256": "f" * 64}, "task_submission_stale"),
     ],
 )
 def test_stale_submission_creates_no_partial_ownership(
@@ -233,13 +231,16 @@ def test_submission_atomically_pins_the_complete_project_head_and_first_attempt(
             == authority.active_project_head.effective_execution_snapshot
         )
         assert task.admission.workspace_snapshot == authority.workspace_snapshot
-        assert task.admission.project_config_sha256 == request.project_config_sha256
-        assert task.admission.task_envelope_sha256 == request.task_envelope_sha256
+        assert task.admission.project_config_sha256 == authority.project_config_sha256
+        assert len(task.admission.task_envelope_sha256) == 64
         assert (
             task.admission.normalized_evolution_intent_sha256
-            == request.normalized_evolution_intent_sha256
+            == authority.normalized_evolution_intent_sha256
         )
-        assert task.admission.registry_sha256 == request.expected_registry_sha256
+        assert (
+            task.admission.registry_sha256
+            == authority.active_project_head.registry_sha256
+        )
         assert task.admission.admission_sha256 == task_admission_sha256_for(
             task.admission
         )
@@ -279,7 +280,7 @@ def test_conflicting_submission_idempotency_and_project_concurrency_fail_closed(
                 "submitCoreTaskV2",
                 {
                     "request": request.model_copy(
-                        update={"task_envelope_sha256": "d" * 64}
+                        update={"expected_project_config_sha256": "d" * 64}
                     ),
                     "idempotency_key": "submit-one",
                 },
@@ -511,6 +512,43 @@ def test_v2_event_journal_survives_restart_and_tamper_fails_closed(
         )
         connection.commit()
     with pytest.raises(ScienceTaskStoreV2Error, match="event journal"):
+        _owner(tmp_path)
+
+
+def test_v2_task_recovery_rejects_a_rewritten_admission_authority_etag(
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(authority)
+    task = owner.invoke(
+        "submitCoreTaskV2",
+        {"request": _request(authority), "idempotency_key": "etag-tamper"},
+    )
+    owner.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        request_json = connection.execute(
+            "SELECT request_json FROM tasks WHERE task_id = ?",
+            (task.task_id,),
+        ).fetchone()[0]
+        payload = json.loads(bytes(request_json))
+        payload["expected_project_admission_etag"] = '"' + ("f" * 64) + '"'
+        rewritten = json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        connection.execute(
+            "UPDATE tasks SET request_json = ?, request_sha256 = ? WHERE task_id = ?",
+            (rewritten, hashlib.sha256(rewritten).hexdigest(), task.task_id),
+        )
+        connection.commit()
+
+    with pytest.raises(ScienceTaskStoreV2Error, match="admission closure"):
         _owner(tmp_path)
 
 
