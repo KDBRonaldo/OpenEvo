@@ -56,6 +56,7 @@ from openevo.deployment.profile import (
     ProxySettings,
     RemoteProfileConfig,
     SSHAuthConfig,
+    SystemOpenSshAliasProfile,
     load_remote_profile_config,
 )
 from openevo.deployment.planner import (
@@ -78,7 +79,17 @@ from openevo.deployment.services import (
     restart_remote_service,
     stop_remote_service,
 )
-from openevo.deployment.ssh import SshRemoteExecutorTransport
+from openevo.deployment.ssh import (
+    SshRemoteExecutorTransport,
+    SystemOpenSshAskpassEnvironment,
+    build_system_openssh_command_argv,
+    build_system_openssh_control_argv,
+    build_system_openssh_core_tunnel_argv,
+    build_system_openssh_environment,
+    build_system_openssh_master_argv,
+    build_system_openssh_probe_argv,
+    build_system_openssh_upload_argv,
+)
 from openevo.deployment.workspace import (
     WorkspacePreparationAction,
     WorkspacePreparationPlan,
@@ -130,6 +141,8 @@ __all__ = [
     "SidecarExecutionReport",
     "SidecarSciencePlan",
     "SshRemoteExecutorTransport",
+    "SystemOpenSshAliasProfile",
+    "SystemOpenSshAskpassEnvironment",
     "WorkspacePreparationAction",
     "WorkspacePreparationPlan",
     "WorkspaceActionExecution",
@@ -137,6 +150,13 @@ __all__ = [
     "WorkspaceExecutionReport",
     "build_remote_services_plan",
     "build_sidecar_science_plan",
+    "build_system_openssh_command_argv",
+    "build_system_openssh_control_argv",
+    "build_system_openssh_core_tunnel_argv",
+    "build_system_openssh_environment",
+    "build_system_openssh_master_argv",
+    "build_system_openssh_probe_argv",
+    "build_system_openssh_upload_argv",
     "execute_sidecar_plan",
     "execute_remote_services_plan",
     "execute_workspace_plan",

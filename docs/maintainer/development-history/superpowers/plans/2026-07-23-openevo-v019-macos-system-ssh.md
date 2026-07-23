@@ -349,8 +349,9 @@ The exact broader gate is added in Task 18 after every slice is present.
   inherited `SSH_AUTH_SOCK`, askpass variables, and deterministic system path;
   reject arbitrary inherited secrets.
 - [ ] Add controlled OpenSSH experiments/tests for user-config forwards and
-  `ClearAllForwardings` plus the intentional Core `-L`; freeze the safe option
-  ordering from observed supported-client behavior.
+  `ClearAllForwardings`; prove that it also erases command-line `-L`, then
+  freeze the safe owned-master `-W` Core channel from observed supported-client
+  behavior.
 - [ ] Implement alias-native profile/transport types without deleting the v1
   explicit transport yet. Make the new v2 provider select only the new type.
 - [ ] Preserve redaction and bounded timeout/error mapping.

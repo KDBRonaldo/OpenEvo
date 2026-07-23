@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Literal
 
 import yaml
@@ -12,6 +13,8 @@ DesktopExecutionMode = Literal[
     "codex_subscription_transcript",
     "self-deployed",
 ]
+_SYSTEM_OPENSSH_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+_OPAQUE_PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class _StrictFrozenModel(BaseModel):
@@ -155,6 +158,29 @@ class RemoteProfileConfig(_StrictFrozenModel):
             return None
         if not value.startswith("/"):
             raise ValueError("workspace_root must be an absolute remote path")
+        return value
+
+
+class SystemOpenSshAliasProfile(_StrictFrozenModel):
+    """V2 connection authority containing only one literal OpenSSH alias."""
+
+    schema_version: Literal[2] = 2
+    profile_id: str
+    connection_authority: Literal["system_openssh"] = "system_openssh"
+    ssh_host_alias: str
+
+    @field_validator("profile_id")
+    @classmethod
+    def _validate_profile_id(cls, value: str) -> str:
+        if _OPAQUE_PROFILE_ID_RE.fullmatch(value) is None:
+            raise ValueError("profile_id must be a bounded opaque identifier")
+        return value
+
+    @field_validator("ssh_host_alias")
+    @classmethod
+    def _validate_alias(cls, value: str) -> str:
+        if _SYSTEM_OPENSSH_ALIAS_RE.fullmatch(value) is None:
+            raise ValueError("ssh_host_alias must be a bounded literal alias")
         return value
 
 

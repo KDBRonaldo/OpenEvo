@@ -286,9 +286,13 @@ policy except for the separately reviewed first-host interaction described
 below.
 
 The exact interaction between `ClearAllForwardings` and OpenEvo's intentional
-`-L` tunnel is proven against the supported macOS OpenSSH before implementation
-is accepted. The command and tunnel option sets are separate closed builders,
-not string concatenation.
+Core channel is proven against the supported macOS OpenSSH before implementation
+is accepted. That experiment confirms that `ClearAllForwardings=yes` also erases
+an explicit command-line `-L`, independent of option order. The Core builder
+therefore uses the owned master's `-W` stdio channel, which keeps the exact Core
+forward while still clearing every configured local, remote, and dynamic
+forward. The command and tunnel option sets are separate closed builders, not
+string concatenation.
 
 ### 3.3 Owned multiplexed session
 

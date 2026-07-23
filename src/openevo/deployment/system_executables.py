@@ -19,13 +19,25 @@ from typing import TypeVar
 
 
 SSH_EXECUTABLE = "/usr/bin/ssh"
+SSH_KEYGEN_EXECUTABLE = "/usr/bin/ssh-keygen"
 SSH_KEYSCAN_EXECUTABLE = "/usr/bin/ssh-keyscan"
 RSYNC_EXECUTABLE = "/usr/bin/rsync"
 OWNED_SUBPROCESS_BIRTH_ARGUMENT = "--openevo-owned-subprocess-birth-v1"
+MACOS_SYSTEM_COMMAND_PATH = ":".join(
+    (
+        "/usr/local/bin",
+        "/System/Cryptexes/App/usr/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+    )
+)
 
 _ALLOWED_EXECUTABLES = frozenset(
     {
         SSH_EXECUTABLE,
+        SSH_KEYGEN_EXECUTABLE,
         SSH_KEYSCAN_EXECUTABLE,
         RSYNC_EXECUTABLE,
     }

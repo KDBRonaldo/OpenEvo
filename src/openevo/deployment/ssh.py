@@ -19,7 +19,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, BinaryIO, NoReturn, Protocol
@@ -92,8 +92,9 @@ from openevo.deployment.managed_runtime_assets import (
     snapshot_managed_runtime_archive,
 )
 from openevo.deployment.preflight import RemoteCommandResult
-from openevo.deployment.profile import RemoteProfileConfig
+from openevo.deployment.profile import RemoteProfileConfig, SystemOpenSshAliasProfile
 from openevo.deployment.system_executables import (
+    MACOS_SYSTEM_COMMAND_PATH,
     OWNED_SUBPROCESS_BIRTH_ARGUMENT,
     RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
@@ -138,6 +139,366 @@ _ORPHANED_CORE_TUNNELS: dict[int, "_CoreTunnelEndpoint"] = {}
 _ORPHANED_TRUST_LEASES: dict[int, AbstractContextManager[Path]] = {}
 _ORPHANED_SUBPROCESS_GUARD = threading.Lock()
 _ORPHANED_SUBPROCESSES: dict[int, "_OwnedSubprocessAuthority"] = {}
+
+_SYSTEM_OPENSSH_CONTROL_OPERATIONS = frozenset({"check", "exit", "stop"})
+_SYSTEM_OPENSSH_LOCALE_KEYS = (
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+)
+_SYSTEM_OPENSSH_MAX_ENV_VALUE_BYTES = 4_096
+_SYSTEM_OPENSSH_MAX_CONTROL_PATH_BYTES = 103
+_SYSTEM_OPENSSH_MAX_COMMAND_BYTES = 1 << 20
+_SYSTEM_OPENSSH_MAX_HOME_BYTES = 4_096
+_SYSTEM_OPENSSH_MAX_SOCKET_BYTES = 103
+_SYSTEM_OPENSSH_MAX_HELPER_PATH_BYTES = 4_096
+_SYSTEM_OPENSSH_CAPABILITY_RE = re.compile(r"^[0-9a-f]{64}$")
+_SYSTEM_OPENSSH_LOCALE_RE = re.compile(r"^[A-Za-z0-9_.@-]{1,128}$")
+
+
+@dataclass(frozen=True, slots=True)
+class SystemOpenSshAskpassEnvironment:
+    """Non-secret authority values passed to the sealed native askpass helper."""
+
+    helper_path: str = field(repr=False)
+    broker_socket: str = field(repr=False)
+    capability: str = field(repr=False)
+    connection_generation: int
+
+    def __post_init__(self) -> None:
+        _validate_absolute_local_path(
+            self.helper_path,
+            field_name="askpass helper path",
+            max_bytes=_SYSTEM_OPENSSH_MAX_HELPER_PATH_BYTES,
+        )
+        _validate_absolute_local_path(
+            self.broker_socket,
+            field_name="askpass broker socket",
+            max_bytes=_SYSTEM_OPENSSH_MAX_SOCKET_BYTES,
+        )
+        if _SYSTEM_OPENSSH_CAPABILITY_RE.fullmatch(self.capability) is None:
+            raise ValueError("askpass capability must be 32 bytes of lowercase hex")
+        if (
+            type(self.connection_generation) is not int
+            or not 1 <= self.connection_generation <= (1 << 53) - 1
+        ):
+            raise ValueError("askpass connection generation is invalid")
+
+
+def build_system_openssh_environment(
+    *,
+    home: str,
+    inherited: Mapping[str, str],
+    askpass: SystemOpenSshAskpassEnvironment | None = None,
+) -> dict[str, str]:
+    """Build the complete closed environment for a system OpenSSH child."""
+
+    _validate_absolute_local_path(
+        home,
+        field_name="OpenSSH HOME",
+        max_bytes=_SYSTEM_OPENSSH_MAX_HOME_BYTES,
+    )
+    environment = {
+        "HOME": home,
+        "PATH": MACOS_SYSTEM_COMMAND_PATH,
+    }
+    for key in _SYSTEM_OPENSSH_LOCALE_KEYS:
+        value = inherited.get(key)
+        if value is None:
+            continue
+        if type(value) is not str or _SYSTEM_OPENSSH_LOCALE_RE.fullmatch(value) is None:
+            raise ValueError("inherited OpenSSH locale is invalid")
+        environment[key] = value
+    agent_socket = inherited.get("SSH_AUTH_SOCK")
+    if agent_socket is not None:
+        if type(agent_socket) is not str:
+            raise ValueError("inherited SSH agent socket is invalid")
+        _validate_absolute_local_path(
+            agent_socket,
+            field_name="inherited SSH agent socket",
+            max_bytes=_SYSTEM_OPENSSH_MAX_ENV_VALUE_BYTES,
+        )
+        environment["SSH_AUTH_SOCK"] = agent_socket
+    if askpass is not None:
+        environment.update(
+            {
+                "SSH_ASKPASS": askpass.helper_path,
+                "SSH_ASKPASS_REQUIRE": "force",
+                "DISPLAY": "openevo-ssh-askpass",
+                "OPENEVO_SSH_ASKPASS_SOCKET": askpass.broker_socket,
+                "OPENEVO_SSH_ASKPASS_CAPABILITY": askpass.capability,
+                "OPENEVO_SSH_CONNECTION_GENERATION": str(
+                    askpass.connection_generation
+                ),
+            }
+        )
+    return environment
+
+
+def build_system_openssh_probe_argv(
+    profile: SystemOpenSshAliasProfile,
+) -> list[str]:
+    """Build the post-selection, non-authoritative ``ssh -G`` probe."""
+
+    return [SSH_EXECUTABLE, "-G", "--", profile.ssh_host_alias]
+
+
+def build_system_openssh_master_argv(
+    profile: SystemOpenSshAliasProfile,
+    *,
+    control_path: Path | str,
+    connect_timeout_seconds: int = 15,
+    keepalive_interval_seconds: int = 15,
+    keepalive_count: int = 2,
+) -> list[str]:
+    """Build one non-persistent OpenEvo-owned interactive SSH master."""
+
+    socket_path = _validate_system_openssh_control_path(control_path)
+    _validate_system_openssh_count(
+        connect_timeout_seconds,
+        field_name="OpenSSH connect timeout",
+        minimum=1,
+        maximum=60,
+    )
+    _validate_system_openssh_count(
+        keepalive_interval_seconds,
+        field_name="OpenSSH keepalive interval",
+        minimum=1,
+        maximum=300,
+    )
+    _validate_system_openssh_count(
+        keepalive_count,
+        field_name="OpenSSH keepalive count",
+        minimum=1,
+        maximum=10,
+    )
+    return [
+        SSH_EXECUTABLE,
+        "-M",
+        "-S",
+        socket_path,
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        f"ConnectTimeout={connect_timeout_seconds}",
+        "-o",
+        f"ServerAliveInterval={keepalive_interval_seconds}",
+        "-o",
+        f"ServerAliveCountMax={keepalive_count}",
+        "-N",
+        "-T",
+        "--",
+        profile.ssh_host_alias,
+    ]
+
+
+def build_system_openssh_command_argv(
+    profile: SystemOpenSshAliasProfile,
+    *,
+    control_path: Path | str,
+    remote_command: str,
+) -> list[str]:
+    """Build a command intended to reuse exactly one owned master socket."""
+
+    if (
+        type(remote_command) is not str
+        or not remote_command
+        or "\x00" in remote_command
+        or len(remote_command.encode("utf-8")) > _SYSTEM_OPENSSH_MAX_COMMAND_BYTES
+    ):
+        raise ValueError("system OpenSSH remote command is invalid")
+    return [
+        *_system_openssh_follower_argv(control_path),
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "RemoteCommand=none",
+        "-T",
+        "--",
+        profile.ssh_host_alias,
+        remote_command,
+    ]
+
+
+def build_system_openssh_upload_argv(
+    profile: SystemOpenSshAliasProfile,
+    *,
+    control_path: Path | str,
+    local_path: Path | str,
+    remote_path: str,
+    delete: bool = False,
+) -> list[str]:
+    """Build a bounded rsync upload through the exact owned SSH socket."""
+
+    if type(delete) is not bool:
+        raise ValueError("rsync delete flag must be boolean")
+    local = Path(local_path)
+    if not local.is_absolute() or not local.is_dir():
+        raise ValueError("rsync local path must be an existing absolute directory")
+    _validate_remote_absolute_path(remote_path, "remote_path")
+    remote_shell = [
+        *_system_openssh_follower_argv(control_path),
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "RemoteCommand=none",
+        "-T",
+        "--",
+    ]
+    argv = [RSYNC_EXECUTABLE, "--archive"]
+    if delete:
+        argv.append("--delete")
+    argv.extend(
+        [
+            "-e",
+            shlex.join(remote_shell),
+            _with_trailing_slash(str(local)),
+            f"{profile.ssh_host_alias}:{_with_trailing_slash(remote_path)}",
+        ]
+    )
+    return argv
+
+
+def build_system_openssh_control_argv(
+    profile: SystemOpenSshAliasProfile,
+    *,
+    control_path: Path | str,
+    operation: str,
+) -> list[str]:
+    """Build a closed master control request that cannot open a session."""
+
+    if operation not in _SYSTEM_OPENSSH_CONTROL_OPERATIONS:
+        raise ValueError("unsupported system OpenSSH control operation")
+    return [
+        *_system_openssh_follower_argv(control_path),
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-O",
+        operation,
+        "--",
+        profile.ssh_host_alias,
+    ]
+
+
+def build_system_openssh_core_tunnel_argv(
+    profile: SystemOpenSshAliasProfile,
+    *,
+    control_path: Path | str,
+    remote_port: int,
+) -> list[str]:
+    """Build a stdio Core tunnel through the exact owned master.
+
+    Supported macOS OpenSSH clears an explicit ``-L`` together with configured
+    forwards when ``ClearAllForwardings=yes``.  ``-W`` is therefore the only
+    closed builder that both suppresses user forwards and retains the one
+    intentional Core channel.
+    """
+
+    _validate_system_openssh_count(
+        remote_port,
+        field_name="remote Core port",
+        minimum=1,
+        maximum=65_535,
+    )
+    return [
+        *_system_openssh_follower_argv(control_path),
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-W",
+        f"127.0.0.1:{remote_port}",
+        "-T",
+        "--",
+        profile.ssh_host_alias,
+    ]
+
+
+def _system_openssh_follower_argv(control_path: Path | str) -> list[str]:
+    return [
+        SSH_EXECUTABLE,
+        "-S",
+        _validate_system_openssh_control_path(control_path),
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPersist=no",
+    ]
+
+
+def _validate_system_openssh_control_path(path: Path | str) -> str:
+    value = os.fspath(path)
+    _validate_absolute_local_path(
+        value,
+        field_name="OpenSSH control path",
+        max_bytes=_SYSTEM_OPENSSH_MAX_CONTROL_PATH_BYTES,
+    )
+    return value
+
+
+def _validate_absolute_local_path(
+    value: str,
+    *,
+    field_name: str,
+    max_bytes: int,
+) -> None:
+    if type(value) is not str:
+        raise ValueError(f"{field_name} must be text")
+    encoded = os.fsencode(value)
+    candidate = Path(value)
+    if (
+        not candidate.is_absolute()
+        or not encoded
+        or len(encoded) > max_bytes
+        or b"\x00" in encoded
+        or any(part in {"", ".", ".."} for part in candidate.parts[1:])
+        or any(ord(character) < 32 or ord(character) == 127 for character in value)
+    ):
+        raise ValueError(f"{field_name} is invalid")
+
+
+def _validate_system_openssh_count(
+    value: int,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> None:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(f"{field_name} is invalid")
 
 _SUBPROCESS_BIRTH_LAUNCHER = """
 import os

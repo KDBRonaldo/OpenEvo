@@ -93,7 +93,10 @@ and known-host policy.
 OpenEvo may set only reviewed process/session safety options: its own
 multiplexing socket, no ambient master adoption, no local command, no
 unrequested TTY or remote command, no unowned forwarding, exact intentional
-Core forwarding, keepalive/deadline, and bounded cleanup. It must not use
+Core forwarding through the owned master's stdio `-W` channel,
+keepalive/deadline, and bounded cleanup. `ClearAllForwardings=yes` is not
+combined with `-L`: supported macOS OpenSSH clears that explicit forward too.
+It must not use
 `-F /dev/null`, flatten connection values, select authentication, or replace
 known-host files.
 
