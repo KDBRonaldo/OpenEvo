@@ -237,14 +237,14 @@ registry scope. The stronger hostile-install bootstrap threat model is tracked
 in GitHub issue #193 and is not a claim of this unsigned packaging-only
 candidate.
 
-On macOS, the native host copies the verified sidecar into an owner-only private
-directory and executes the named private copy while retaining its verified file
-descriptor. The directory's full execution-time identity is captured only after
-that named executable is published and revalidated. `pre_exec` compares that
-current snapshot against both the held directory descriptor and pathname; the
-long-lived creation identity remains a device/inode anchor. This preserves the
-anti-swap check without comparing a populated directory to its stale empty-state
-metadata.
+On macOS, the native host directly executes the verified
+`Contents/MacOS/openevo-desktop-sidecar` bundle member. It retains the verified
+file descriptor and the relevant bundle-directory descriptors, then compares
+the executable path, device, inode, size, mode, owner, link count, timestamps,
+and digest before and after spawn. The PyInstaller archive is opened through
+retained FD 4 via `/dev/fd/4`; unlike the `0.1.7` implementation, no private
+macOS copy is created. Linux retains its separate private anonymous-copy and
+`/proc/self/fd/4` execution design.
 
 If the packaged sidecar exits before readiness, inspect only the bounded
 `OPENEVO_STARTUP_V1` stage/code emitted by the bootloader or Python entry
