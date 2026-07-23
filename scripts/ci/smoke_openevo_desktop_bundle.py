@@ -29,6 +29,13 @@ from smoke_openevo_desktop_sidecar import (  # noqa: E402
     SmokeFailure,
     _STARTUP_DIAGNOSTIC_CODES,
 )
+from smoke_openevo_desktop_launchservices import (  # noqa: E402
+    _closed_desktop_log_v1_event,
+    _closed_desktop_log_v2_event,
+    _startup_log_checkpoint,
+    _startup_log_events,
+    _valid_desktop_log_sequence,
+)
 
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
@@ -51,6 +58,9 @@ NATIVE_STARTUP_FAILURE_MARKER_PREFIX = b"OPENEVO_DESKTOP_STARTUP_FAILURE_"
 NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
 NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
+MACOS_DESKTOP_LOG_RELATIVE = Path(
+    "Library/Application Support/org.openevo.desktop/logs-v1"
+)
 PROBE_REAP_TIMEOUT_SECONDS = 2.0
 PROBE_DESCENDANT_SNAPSHOT_TIMEOUT_SECONDS = 0.5
 DARWIN_PROCESS_PATH_MAX_BYTES = 4096
@@ -138,6 +148,10 @@ _ALLOWED_NATIVE_STARTUP_FAILURES = frozenset(
 ) | {
     ("embedded_python_loader", "python_shared_library_validation_failed"),
 }
+
+
+class StartupDiagnosticsPending(SmokeFailure):
+    """The current startup attempt has not completed its diagnostic envelope."""
 
 
 class NativeSidecarProcessMarker(NamedTuple):
@@ -743,6 +757,85 @@ def _startup_failure_suffix(failure: tuple[str, str] | None) -> str:
     return f"; startup_stage={stage}; startup_code={code}"
 
 
+def _validate_startup_diagnostic_events(
+    events: tuple[dict[str, object], ...],
+    *,
+    checkpoint: int,
+) -> dict[str, object]:
+    if type(checkpoint) is not int or checkpoint < 0 or len(events) > 16_384:
+        raise SmokeFailure("Startup diagnostic checkpoint is invalid")
+    if any(
+        type(event) is not dict
+        or not (
+            _closed_desktop_log_v1_event(event)
+            or _closed_desktop_log_v2_event(event)
+        )
+        for event in events
+    ):
+        raise SmokeFailure("Startup diagnostic event envelope is invalid")
+    if not _valid_desktop_log_sequence(list(events)):
+        raise SmokeFailure("Startup diagnostic event sequence is invalid")
+    current = [event for event in events if int(event["sequence"]) > checkpoint]
+    if not current:
+        raise StartupDiagnosticsPending("Startup diagnostic envelope is not available yet")
+    if any(
+        event.get("schema_version") != "2" or not _closed_desktop_log_v2_event(event)
+        for event in current
+    ):
+        raise SmokeFailure("Current startup diagnostics do not use the closed v2 envelope")
+
+    stage_events = [event for event in current if event["event"] == "startup_stage"]
+    if not stage_events:
+        raise StartupDiagnosticsPending("Startup diagnostic stages are not available yet")
+    latest_ordinal = max(int(event["attempt_ordinal"]) for event in stage_events)
+    attempt = [
+        event
+        for event in stage_events
+        if int(event["attempt_ordinal"]) == latest_ordinal
+    ]
+    attempt_ids = {str(event["attempt_id"]) for event in attempt}
+    if len(attempt_ids) != 1:
+        raise SmokeFailure("Startup diagnostic attempt identity is inconsistent")
+    attempt.sort(key=lambda event: int(event["attempt_sequence"]))
+    failures = [event for event in attempt if event["result"] == "failed"]
+    if failures:
+        raise SmokeFailure("Native host recorded a failed startup attempt")
+    completed = [event for event in attempt if event["result"] == "completed"]
+    if not completed or completed[-1]["stage"] != "renderer_ready":
+        raise StartupDiagnosticsPending("Startup diagnostic envelope is not complete yet")
+    renderer_ready = completed[-1]
+    source_commit = renderer_ready["source_commit"]
+    if type(source_commit) is not str or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None:
+        raise SmokeFailure("Startup diagnostic release identity is incomplete")
+    return {
+        "schema_version": "2",
+        "attempt_id": next(iter(attempt_ids)),
+        "attempt_ordinal": latest_ordinal,
+        "last_completed_stage": str(renderer_ready["stage"]),
+        "first_failed_stage": None,
+        "duration_bucket": str(renderer_ready["duration_bucket"]),
+        "product_version": str(renderer_ready["product_version"]),
+        "source_commit": source_commit,
+    }
+
+
+def _wait_for_startup_diagnostic_envelope(
+    log_root: Path,
+    *,
+    checkpoint: int,
+    deadline: float,
+) -> dict[str, object]:
+    while time.monotonic() < deadline:
+        try:
+            return _validate_startup_diagnostic_events(
+                _startup_log_events(log_root),
+                checkpoint=checkpoint,
+            )
+        except StartupDiagnosticsPending:
+            time.sleep(0.01)
+    raise SmokeFailure("Timed out waiting for the closed v2 startup diagnostic envelope")
+
+
 def _darwin_process_birth_identity(pid: int) -> str | None:
     if sys.platform != "darwin":
         return None
@@ -1141,6 +1234,10 @@ def smoke_bundle(
             home.mkdir(mode=0o700)
         else:
             home = _validate_existing_home(existing_home)
+        startup_log_root = home / MACOS_DESKTOP_LOG_RELATIVE
+        startup_checkpoint = (
+            _startup_log_checkpoint(startup_log_root) if sys.platform == "darwin" else 0
+        )
         environment = os.environ.copy()
         environment.update(
             {
@@ -1206,6 +1303,11 @@ def smoke_bundle(
                         process_groups.update(observed_groups)
                         if evidence is not None:
                             _validate_renderer_completion_stages(observed_renderer_stages)
+                            _wait_for_startup_diagnostic_envelope(
+                                startup_log_root,
+                                checkpoint=startup_checkpoint,
+                                deadline=deadline,
+                            )
                             break
                         readiness_stage = _advance_readiness_stage(
                             readiness_stage,

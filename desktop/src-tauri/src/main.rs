@@ -26,7 +26,10 @@ use tempfile::TempDir;
 
 mod desktop_log;
 
-use desktop_log::{DesktopLogLevel, DesktopLogSource, DesktopLogStore, DesktopLogTailV1};
+use desktop_log::{
+    DesktopDiagnosticLogV2, DesktopEnvironmentSummaryV2, DesktopLogLevel, DesktopLogSource,
+    DesktopLogStore, DesktopLogTailV1, DesktopStartupResult, DesktopStartupStage,
+};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
@@ -183,11 +186,11 @@ struct DesktopDiagnosticsActionV1 {
 }
 
 #[derive(Serialize)]
-struct DesktopDiagnosticsExportV1 {
+struct DesktopDiagnosticsExportV2 {
     schema_version: &'static str,
     product: &'static str,
     product_version: &'static str,
-    logs: DesktopLogTailV1,
+    logs: DesktopDiagnosticLogV2,
 }
 
 impl NativeHostError {
@@ -381,11 +384,11 @@ impl StartupDiagnosticSink {
             }
             *last = Some(diagnostic);
         }
-        self.desktop_logs.record(
+        self.desktop_logs.record_startup_stage(
             DesktopLogSource::Startup,
-            DesktopLogLevel::Error,
-            "sidecar_startup_diagnostic",
-            Some(&format!("{}_{}", diagnostic.stage, diagnostic.code)),
+            startup_stage_for_diagnostic(diagnostic),
+            DesktopStartupResult::Failed,
+            Some(diagnostic.code),
             None,
             None,
             diagnostic.errno,
@@ -1161,6 +1164,58 @@ fn startup_diagnostic_pair(stage: &[u8], code: &[u8]) -> Option<(&'static str, &
         })
 }
 
+fn startup_stage_for_diagnostic(diagnostic: StartupDiagnostic) -> DesktopStartupStage {
+    if diagnostic.stage.starts_with("bootloader_") {
+        return DesktopStartupStage::Bootloader;
+    }
+    if diagnostic.stage == "embedded_python_loader" {
+        return DesktopStartupStage::EmbeddedPython;
+    }
+    if diagnostic.stage == "python_launcher" {
+        if matches!(
+            diagnostic.code,
+            "provider_store_failed" | "credential_reset_failed" | "workspace_store_failed"
+        ) {
+            return DesktopStartupStage::StateStore;
+        }
+        if matches!(
+            diagnostic.code,
+            "listener_failed"
+                | "server_failed"
+                | "server_import_failed"
+                | "contract_app_failed"
+                | "release_routes_failed"
+                | "static_app_failed"
+                | "native_routes_failed"
+        ) {
+            return DesktopStartupStage::LocalApi;
+        }
+    }
+    DesktopStartupStage::SidecarEntry
+}
+
+fn startup_stage_for_native_error(error: &NativeHostError) -> DesktopStartupStage {
+    if error.code.contains("bundled_sidecar")
+        || error.code.contains("packaged_sidecar")
+        || error.code.contains("private_sidecar")
+    {
+        DesktopStartupStage::BundleVerification
+    } else if error.code.contains("spawn") {
+        DesktopStartupStage::SidecarSpawn
+    } else if matches!(
+        error.code.as_str(),
+        "sidecar_exited_during_startup"
+            | "sidecar_startup_timeout"
+            | "sidecar_health_unavailable"
+            | "sidecar_contract_incompatible"
+            | "sidecar_session_unavailable"
+    ) {
+        DesktopStartupStage::LocalApi
+    } else {
+        DesktopStartupStage::DescriptorHandoff
+    }
+}
+
 struct AllocatedSidecarListener {
     listener: TcpListener,
     port: u16,
@@ -1333,6 +1388,13 @@ struct NegotiatedContractV1 {
     openapi_sha256: String,
     provider_kind: String,
     feature_flags: Vec<FeatureFlagV1>,
+}
+
+#[derive(Debug)]
+struct ValidatedSidecarContractV1 {
+    negotiated: NegotiatedContractV1,
+    build_version: String,
+    source_commit: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -3822,7 +3884,31 @@ fn check_sidecar_health_with_challenge_for_instance(
     mac.verify_slice(&proof).map_err(|_| sidecar_health_error())
 }
 
+#[cfg(test)]
 fn check_sidecar_contract(port: u16) -> HostResult<NegotiatedContractV1> {
+    Ok(check_sidecar_contract_with_identity(port)?.negotiated)
+}
+
+fn check_sidecar_contract_with_identity(port: u16) -> HostResult<ValidatedSidecarContractV1> {
+    let version = read_validated_sidecar_version(port)?;
+    let legacy = loopback_http_get(port, LEGACY_DESKTOP_SHELL_ROUTE, None)
+        .map_err(|_| sidecar_contract_incompatible_error())?;
+    if legacy.status != 404 {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    Ok(ValidatedSidecarContractV1 {
+        negotiated: NegotiatedContractV1 {
+            major: 1,
+            openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
+            provider_kind: "desktop_sidecar".to_string(),
+            feature_flags: version.feature_flags,
+        },
+        build_version: version.build_version,
+        source_commit: version.source_commit,
+    })
+}
+
+fn read_validated_sidecar_version(port: u16) -> HostResult<VersionInfoV1> {
     let response = loopback_http_get(port, "/version", None)
         .map_err(|_| sidecar_contract_incompatible_error())?;
     if response.status != 200 {
@@ -3841,28 +3927,30 @@ fn check_sidecar_contract(port: u16) -> HostResult<NegotiatedContractV1> {
         || version.supported_majors.is_empty()
         || version.supported_majors.iter().any(|major| *major != 1)
         || version.openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256
-        || version.build_version.is_empty()
-        || version.build_version.len() > 512
-        || version.build_version.contains('\0')
+        || version.build_version != env!("CARGO_PKG_VERSION")
         || !(7..=40).contains(&version.source_commit.len())
         || !version.source_commit.bytes().all(is_lower_hex)
+        || version.source_commit.bytes().all(|byte| byte == b'0')
         || version.build_channel != "release"
         || version.provider_kind != "desktop_sidecar"
         || duplicate_features
     {
         return Err(sidecar_contract_incompatible_error());
     }
-    let legacy = loopback_http_get(port, LEGACY_DESKTOP_SHELL_ROUTE, None)
-        .map_err(|_| sidecar_contract_incompatible_error())?;
-    if legacy.status != 404 {
+    Ok(version)
+}
+
+fn retain_sidecar_release_identity(
+    state: &DesktopHostState,
+    contract: &ValidatedSidecarContractV1,
+) -> HostResult<()> {
+    if !state
+        .desktop_logs
+        .update_release_identity(&contract.build_version, &contract.source_commit)
+    {
         return Err(sidecar_contract_incompatible_error());
     }
-    Ok(NegotiatedContractV1 {
-        major: 1,
-        openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
-        provider_kind: "desktop_sidecar".to_string(),
-        feature_flags: version.feature_flags,
-    })
+    Ok(())
 }
 
 fn check_sidecar_session_binding(port: u16, session_token: &str) -> HostResult<()> {
@@ -4191,7 +4279,7 @@ fn wait_for_sidecar_ready(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
-) -> HostResult<NegotiatedContractV1> {
+) -> HostResult<ValidatedSidecarContractV1> {
     wait_for_sidecar_ready_with_inspection(port, credential, timeout, is_cancelled, || {
         OsProcessControl
             .leader_exit_disposition(child)
@@ -4206,7 +4294,7 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     startup_epoch: u64,
-) -> HostResult<NegotiatedContractV1> {
+) -> HostResult<ValidatedSidecarContractV1> {
     wait_for_sidecar_ready_with_inspection(
         port,
         credential,
@@ -4257,7 +4345,7 @@ fn wait_for_sidecar_ready_with_inspection(
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
     mut child_exit_disposition: impl FnMut() -> HostResult<Option<StartupExitDisposition>>,
-) -> HostResult<NegotiatedContractV1> {
+) -> HostResult<ValidatedSidecarContractV1> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_cancelled() {
@@ -4271,7 +4359,7 @@ fn wait_for_sidecar_ready_with_inspection(
             .with_startup_exit_disposition(disposition));
         }
         if check_sidecar_health(port, credential).is_ok() {
-            let contract = check_sidecar_contract(port)?;
+            let contract = check_sidecar_contract_with_identity(port)?;
             let session_token = EncodedSecret::new(&credential.session_token);
             check_sidecar_session_binding(port, session_token.expose())?;
             return Ok(contract);
@@ -5463,14 +5551,24 @@ fn start_sidecar_inner_with<C: ProcessControl>(
                         &managed.instance_id,
                         &bootstrap.readiness_credential.0,
                     )?;
-                    let negotiated = check_sidecar_contract(port)?;
-                    if negotiated != bootstrap.negotiated_contract {
+                    let contract = check_sidecar_contract_with_identity(port)?;
+                    if contract.negotiated != bootstrap.negotiated_contract {
                         return Err(sidecar_contract_incompatible_error());
                     }
+                    retain_sidecar_release_identity(state, &contract)?;
                     let session_token = EncodedSecret::new(&bootstrap.session_credential.0);
                     check_sidecar_session_binding(port, session_token.expose())
                 })();
                 if validation.is_ok() {
+                    state.desktop_logs.record_startup_stage(
+                        DesktopLogSource::Native,
+                        DesktopStartupStage::LocalApi,
+                        DesktopStartupResult::Completed,
+                        Some("existing_session_verified"),
+                        None,
+                        None,
+                        None,
+                    );
                     return managed.bootstrap_context();
                 }
                 managed.mark_cleanup_pending();
@@ -5499,6 +5597,15 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     if let Some(executable) = launch.verified_executable.as_ref() {
         executable.validate()?;
     }
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Native,
+        DesktopStartupStage::BundleVerification,
+        DesktopStartupResult::Completed,
+        Some("bundle_verified"),
+        None,
+        None,
+        None,
+    );
     let mut credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
     let parent_liveness_writer = prepared.take_parent_liveness_writer()?;
@@ -5542,6 +5649,15 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     }) {
         return Err(fail_state_owned_startup(state, control, error));
     }
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Native,
+        DesktopStartupStage::SidecarSpawn,
+        DesktopStartupResult::Completed,
+        Some("process_spawned"),
+        None,
+        None,
+        None,
+    );
     if let Err(error) = finalize_state_owned_private_executable(state) {
         return Err(fail_state_owned_startup(state, control, error));
     }
@@ -5551,7 +5667,16 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     if let Err(error) = write_state_owned_credential(state, &credential) {
         return Err(fail_state_owned_startup(state, control, error));
     }
-    let negotiated_contract = match wait_for_state_owned_sidecar_ready(
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Native,
+        DesktopStartupStage::DescriptorHandoff,
+        DesktopStartupResult::Completed,
+        Some("handoff_completed"),
+        None,
+        None,
+        None,
+    );
+    let validated_contract = match wait_for_state_owned_sidecar_ready(
         state,
         control,
         port,
@@ -5562,6 +5687,18 @@ fn start_sidecar_inner_with<C: ProcessControl>(
         Ok(contract) => contract,
         Err(error) => return Err(fail_state_owned_startup(state, control, error)),
     };
+    if let Err(error) = retain_sidecar_release_identity(state, &validated_contract) {
+        return Err(fail_state_owned_startup(state, control, error));
+    }
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Native,
+        DesktopStartupStage::LocalApi,
+        DesktopStartupResult::Completed,
+        Some("readiness_verified"),
+        None,
+        None,
+        None,
+    );
     let bootstrap = SidecarBootstrapState {
         session_credential: credential.take_session_credential(),
         readiness_credential: ReadinessCredential(std::mem::replace(
@@ -5569,7 +5706,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
             [0_u8; READINESS_KEY_BYTES],
         )),
         handoff_credential: credential.take_handoff_credential(),
-        negotiated_contract,
+        negotiated_contract: validated_contract.negotiated,
     };
     match publish_sidecar_gated(state, startup_epoch, bootstrap) {
         Ok(context) => Ok(context),
@@ -6335,12 +6472,188 @@ fn write_run_retry_recovery(
     )
 }
 
+fn closed_environment_value(value: &str) -> String {
+    let value = value.trim();
+    if !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        value.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn desktop_environment_summary_from(
+    executable: Option<&Path>,
+    os_family: &str,
+    os_version: &str,
+    os_build: &str,
+    architecture: &str,
+    quarantine: &str,
+) -> DesktopEnvironmentSummaryV2 {
+    let translocated = executable.is_some_and(|path| {
+        path.as_os_str()
+            .as_bytes()
+            .windows(b"/AppTranslocation/".len())
+            .any(|window| window == b"/AppTranslocation/")
+    });
+    let app_location = if translocated {
+        "translocated"
+    } else if executable.is_some_and(|path| {
+        path.components()
+            .any(|component| component.as_os_str() == "Applications")
+    }) {
+        "applications"
+    } else if executable.is_some_and(|path| path.starts_with("/Volumes")) {
+        "mounted_dmg"
+    } else if executable.is_some() {
+        "other"
+    } else {
+        "unknown"
+    };
+    DesktopEnvironmentSummaryV2 {
+        schema_version: "2".to_string(),
+        os_family: match os_family {
+            "macos" | "linux" => os_family,
+            _ => "unknown",
+        }
+        .to_string(),
+        os_version: closed_environment_value(os_version),
+        os_build: closed_environment_value(os_build),
+        architecture: match architecture {
+            "arm64" | "x86_64" => architecture,
+            _ => "unknown",
+        }
+        .to_string(),
+        app_location: app_location.to_string(),
+        quarantine: match quarantine {
+            "present" | "absent" => quarantine,
+            _ => "unknown",
+        }
+        .to_string(),
+        translocation: if translocated { "present" } else { "absent" }.to_string(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_environment_value(name: &'static str) -> String {
+    let name = CString::new(name).expect("sysctl name has no NUL");
+    let mut size = 0_usize;
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || !(2..=65).contains(&size)
+    {
+        return "unknown".to_string();
+    }
+    let mut value = vec![0_u8; size];
+    if unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size > value.len()
+    {
+        return "unknown".to_string();
+    }
+    value.truncate(size);
+    while value.last() == Some(&0) {
+        value.pop();
+    }
+    std::str::from_utf8(&value)
+        .map(closed_environment_value)
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_app_quarantine(executable: Option<&Path>) -> &'static str {
+    let app = executable.and_then(|path| {
+        path.ancestors().find(|ancestor| {
+            ancestor
+                .extension()
+                .is_some_and(|extension| extension == "app")
+        })
+    });
+    let Some(app) = app else {
+        return "unknown";
+    };
+    let Ok(path) = CString::new(app.as_os_str().as_bytes()) else {
+        return "unknown";
+    };
+    let attribute = c"com.apple.quarantine";
+    let result = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            attribute.as_ptr(),
+            std::ptr::null_mut(),
+            0,
+            0,
+            libc::XATTR_NOFOLLOW,
+        )
+    };
+    if result >= 0 {
+        "present"
+    } else if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOATTR) {
+        "absent"
+    } else {
+        "unknown"
+    }
+}
+
+fn desktop_environment_summary() -> DesktopEnvironmentSummaryV2 {
+    let executable = std::env::current_exe().ok();
+    #[cfg(target_os = "macos")]
+    let (os_family, os_version, os_build, quarantine) = (
+        "macos",
+        macos_environment_value("kern.osproductversion"),
+        macos_environment_value("kern.osversion"),
+        macos_app_quarantine(executable.as_deref()),
+    );
+    #[cfg(target_os = "linux")]
+    let (os_family, os_version, os_build, quarantine) = (
+        "linux",
+        "unknown".to_string(),
+        "unknown".to_string(),
+        "unknown",
+    );
+    let architecture = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => "unknown",
+    };
+    desktop_environment_summary_from(
+        executable.as_deref(),
+        os_family,
+        &os_version,
+        &os_build,
+        architecture,
+        quarantine,
+    )
+}
+
 fn initialize_desktop_logs(app: &tauri::AppHandle, state: &DesktopHostState) {
+    let _ = state
+        .desktop_logs
+        .set_environment(desktop_environment_summary());
     let persistent = app
         .path()
         .app_data_dir()
         .ok()
         .is_some_and(|root| state.desktop_logs.bind_app_data_root(&root));
+    state.desktop_logs.begin_startup_attempt();
     state.desktop_logs.record(
         DesktopLogSource::Native,
         if persistent {
@@ -6349,6 +6662,19 @@ fn initialize_desktop_logs(app: &tauri::AppHandle, state: &DesktopHostState) {
             DesktopLogLevel::Warning
         },
         "application_started",
+        Some(if persistent {
+            "persistent_log_ready"
+        } else {
+            "memory_log_only"
+        }),
+        None,
+        None,
+        None,
+    );
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Native,
+        DesktopStartupStage::NativeApplication,
+        DesktopStartupResult::Completed,
         Some(if persistent {
             "persistent_log_ready"
         } else {
@@ -6473,7 +6799,10 @@ async fn export_desktop_diagnostics(
     })
 }
 
-fn write_desktop_diagnostics_export(path: &Path, logs: &DesktopLogTailV1) -> std::io::Result<()> {
+fn write_desktop_diagnostics_export(
+    path: &Path,
+    logs: &DesktopDiagnosticLogV2,
+) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -6495,8 +6824,8 @@ fn write_desktop_diagnostics_export(path: &Path, logs: &DesktopLogTailV1) -> std
         .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(parent)?;
-    let document = DesktopDiagnosticsExportV1 {
-        schema_version: "1",
+    let document = DesktopDiagnosticsExportV2 {
+        schema_version: "2",
         product: "OpenEvo Desktop",
         product_version: env!("CARGO_PKG_VERSION"),
         logs: logs.clone(),
@@ -6521,6 +6850,16 @@ async fn start_sidecar(
 ) -> HostResult<DesktopBootstrapContextV1> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
+        state.desktop_logs.ensure_startup_attempt();
+        state.desktop_logs.record_startup_stage(
+            DesktopLogSource::Native,
+            DesktopStartupStage::BundleVerification,
+            DesktopStartupResult::Started,
+            Some("verification_started"),
+            None,
+            None,
+            None,
+        );
         emit_renderer_stage("sidecar_start_requested");
         state.desktop_logs.record(
             DesktopLogSource::Native,
@@ -6533,6 +6872,19 @@ async fn start_sidecar(
         );
         let bundled_path = bundled_sidecar_path();
         let result = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref());
+        if let Err(error) = result.as_ref() {
+            if !state.desktop_logs.current_attempt_failed() {
+                state.desktop_logs.record_startup_stage(
+                    DesktopLogSource::Native,
+                    startup_stage_for_native_error(error),
+                    DesktopStartupResult::Failed,
+                    Some(error.code.as_str()),
+                    None,
+                    None,
+                    None,
+                );
+            }
+        }
         state.desktop_logs.record(
             DesktopLogSource::Native,
             if result.is_ok() {
@@ -6598,16 +6950,33 @@ fn renderer_bootstrap_stage(
     state: tauri::State<'_, DesktopHostState>,
     stage: RendererBootstrapStageV1,
 ) {
-    state.desktop_logs.record(
+    record_renderer_bootstrap_stage(&state, stage);
+    emit_renderer_stage(stage.as_str());
+}
+
+fn record_renderer_bootstrap_stage(state: &DesktopHostState, stage: RendererBootstrapStageV1) {
+    let failed = matches!(
+        stage,
+        RendererBootstrapStageV1::BootstrapContextFailed
+            | RendererBootstrapStageV1::LocalApiVersionFailed
+            | RendererBootstrapStageV1::RetryRecoveryFailed
+            | RendererBootstrapStageV1::ProviderAdapterFailed
+            | RendererBootstrapStageV1::ProviderCreateFailed
+            | RendererBootstrapStageV1::InitialSnapshotFailed
+    );
+    state.desktop_logs.record_startup_stage(
         DesktopLogSource::Renderer,
-        DesktopLogLevel::Info,
-        "renderer_stage",
+        DesktopStartupStage::RendererBootstrap,
+        if failed {
+            DesktopStartupResult::Failed
+        } else {
+            DesktopStartupResult::Completed
+        },
         Some(stage.as_str()),
         None,
         None,
         None,
     );
-    emit_renderer_stage(stage.as_str());
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -6616,16 +6985,44 @@ fn renderer_ready(
     state: tauri::State<'_, DesktopHostState>,
     openapi_sha256: String,
 ) -> HostResult<()> {
+    state.desktop_logs.ensure_startup_attempt();
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Renderer,
+        DesktopStartupStage::RendererReady,
+        DesktopStartupResult::Started,
+        Some("ready_requested"),
+        None,
+        None,
+        None,
+    );
     emit_renderer_stage("ready_requested");
     let size = match window.inner_size() {
         Ok(size) => size,
         Err(_) => {
             emit_renderer_stage("window_identity_invalid");
+            state.desktop_logs.record_startup_stage(
+                DesktopLogSource::Renderer,
+                DesktopStartupStage::RendererReady,
+                DesktopStartupResult::Failed,
+                Some("renderer_window_unavailable"),
+                None,
+                None,
+                None,
+            );
             return Err(renderer_window_error());
         }
     };
     if let Err(error) = validate_renderer_window_ready(window.label(), size.width, size.height) {
         emit_renderer_stage("window_identity_invalid");
+        state.desktop_logs.record_startup_stage(
+            DesktopLogSource::Renderer,
+            DesktopStartupStage::RendererReady,
+            DesktopStartupResult::Failed,
+            Some(error.code.as_str()),
+            None,
+            None,
+            None,
+        );
         return Err(error);
     }
     emit_renderer_stage("window_identity_valid");
@@ -6641,6 +7038,24 @@ fn renderer_ready(
     if result.is_err() {
         emit_renderer_stage("ready_validation_failed");
     }
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Renderer,
+        DesktopStartupStage::RendererReady,
+        if result.is_ok() {
+            DesktopStartupResult::Completed
+        } else {
+            DesktopStartupResult::Failed
+        },
+        Some(
+            result
+                .as_ref()
+                .err()
+                .map_or("ready", |error| error.code.as_str()),
+        ),
+        None,
+        None,
+        None,
+    );
     result
 }
 
@@ -9166,6 +9581,8 @@ mod tests {
     fn contract_handshake_rejects_digest_provider_and_legacy_route_inventory_mismatches() {
         for version in [
             valid_version_response_with("openapi_sha256", serde_json::json!("0".repeat(64))),
+            valid_version_response_with("build_version", serde_json::json!("0.0.0")),
+            valid_version_response_with("source_commit", serde_json::json!("0".repeat(40))),
             valid_version_response_with("provider_kind", serde_json::json!("contract_simulator")),
             valid_version_response_with("unexpected", serde_json::json!(true)),
             valid_version_response_with(
@@ -9793,8 +10210,18 @@ mapping process and mapped file (non-platform) have different Team IDs\n";
                 errno: None,
             })
         );
-        let encoded = serde_json::to_string(&state.desktop_logs.tail(Some(10))).unwrap();
-        assert!(encoded.contains("embedded_python_loader_python_shared_library_validation_failed"));
+        let export = state.desktop_logs.export_snapshot();
+        let failure = export
+            .entries
+            .iter()
+            .find(|entry| entry.result.as_deref() == Some("failed"))
+            .expect("classified loader failure was not retained");
+        assert_eq!(failure.stage.as_deref(), Some("embedded_python"));
+        assert_eq!(
+            failure.code.as_deref(),
+            Some("python_shared_library_validation_failed")
+        );
+        let encoded = serde_json::to_string(&export).unwrap();
         assert!(!encoded.contains("/private/"));
         assert!(!encoded.contains("token"));
         assert!(!encoded.contains("https://"));
@@ -9814,6 +10241,116 @@ mapping process and mapped file have different Team IDs";
         let mut oversized = valid.to_vec();
         oversized.resize(SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES + 1, b'x');
         assert_eq!(classify_stock_loader_line(&oversized), None);
+    }
+
+    #[test]
+    fn startup_failure_injections_map_to_distinct_v2_stages() {
+        let cases = [
+            (
+                StartupDiagnostic {
+                    stage: "bootloader_archive",
+                    code: "archive_open_failed",
+                    errno: None,
+                },
+                DesktopStartupStage::Bootloader,
+            ),
+            (
+                StartupDiagnostic {
+                    stage: "python_import",
+                    code: "launcher_import_failed",
+                    errno: None,
+                },
+                DesktopStartupStage::SidecarEntry,
+            ),
+            (
+                StartupDiagnostic {
+                    stage: "python_launcher",
+                    code: "provider_store_failed",
+                    errno: None,
+                },
+                DesktopStartupStage::StateStore,
+            ),
+            (
+                StartupDiagnostic {
+                    stage: "python_launcher",
+                    code: "listener_failed",
+                    errno: None,
+                },
+                DesktopStartupStage::LocalApi,
+            ),
+            (
+                StartupDiagnostic {
+                    stage: "embedded_python_loader",
+                    code: "python_shared_library_validation_failed",
+                    errno: None,
+                },
+                DesktopStartupStage::EmbeddedPython,
+            ),
+        ];
+
+        for (diagnostic, expected) in cases {
+            assert_eq!(startup_stage_for_diagnostic(diagnostic), expected);
+        }
+    }
+
+    #[test]
+    fn renderer_bootstrap_failure_closes_the_current_attempt() {
+        let state = DesktopHostState::default();
+        state.desktop_logs.begin_startup_attempt();
+
+        record_renderer_bootstrap_stage(&state, RendererBootstrapStageV1::ProviderCreateFailed);
+
+        let export = state.desktop_logs.export_snapshot();
+        assert_eq!(export.attempts.len(), 1);
+        assert_eq!(
+            export.attempts[0].first_failed_stage.as_deref(),
+            Some("renderer_bootstrap")
+        );
+        assert_eq!(export.attempts[0].outcome, "failed");
+        assert_eq!(
+            export.entries[0].code.as_deref(),
+            Some("provider_create_failed")
+        );
+    }
+
+    #[test]
+    fn environment_summary_is_closed_and_does_not_retain_executable_path() {
+        let environment = desktop_environment_summary_from(
+            Some(Path::new(
+                "/private/var/folders/secret/AppTranslocation/token/OpenEvo Desktop.app/Contents/MacOS/openevo-desktop",
+            )),
+            "macos",
+            "26.5.2",
+            "25F84",
+            "arm64",
+            "present",
+        );
+        let encoded = serde_json::to_string(&environment).unwrap();
+
+        assert_eq!(environment.os_family, "macos");
+        assert_eq!(environment.app_location, "translocated");
+        assert_eq!(environment.translocation, "present");
+        assert_eq!(environment.quarantine, "present");
+        assert!(!encoded.contains("/private/"));
+        assert!(!encoded.contains("token"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_macos_environment_probes_are_bounded_and_do_not_spawn_tools() {
+        let root = tempfile::tempdir().unwrap();
+        let app = root.path().join("OpenEvo Desktop.app");
+        fs::create_dir(&app).unwrap();
+        let executable = app.join("Contents/MacOS/openevo-desktop");
+
+        let product = macos_environment_value("kern.osproductversion");
+        let build = macos_environment_value("kern.osversion");
+
+        assert_ne!(product, "unknown");
+        assert_ne!(build, "unknown");
+        assert_eq!(closed_environment_value(&product), product);
+        assert_eq!(closed_environment_value(&build), build);
+        assert_eq!(macos_app_quarantine(Some(&executable)), "absent");
     }
 
     #[test]
@@ -10099,7 +10636,7 @@ https://user:password@example.invalid/private\n"[..],
         write_desktop_diagnostics_export(&export, &snapshot).unwrap();
         let document: serde_json::Value =
             serde_json::from_slice(&fs::read(export).unwrap()).unwrap();
-        assert_eq!(document["schema_version"], "1");
+        assert_eq!(document["schema_version"], "2");
         assert_eq!(document["product"], "OpenEvo Desktop");
         assert!(document["logs"]["entries"]
             .as_array()
@@ -11290,7 +11827,7 @@ https://user:password@example.invalid/private\n"[..],
             "preferred_major": 1,
             "supported_majors": [1],
             "openapi_sha256": DESKTOP_LOCAL_API_OPENAPI_SHA256,
-            "build_version": "0.1.0",
+            "build_version": env!("CARGO_PKG_VERSION"),
             "source_commit": "0123456789abcdef0123456789abcdef01234567",
             "build_channel": "release",
             "provider_kind": "desktop_sidecar",

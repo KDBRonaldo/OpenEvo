@@ -230,6 +230,33 @@ def _project(profile_id: str, *, name: str = "Protein design") -> dict[str, obje
     }
 
 
+def test_release_app_marks_state_store_before_provider_store_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    phases: list[str] = []
+    canary = RuntimeError("Traceback /Users/private token=secret")
+
+    def fail_provider_store(*_args: object, **_kwargs: object):
+        raise canary
+
+    monkeypatch.setattr(release_app_module, "DesktopProviderStore", fail_provider_store)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        create_release_desktop_local_api_app(
+            state_root=tmp_path / "state",
+            session_token=SESSION_TOKEN,
+            instance_id=INSTANCE_ID,
+            readiness_key=READINESS_KEY,
+            source_commit=SOURCE_COMMIT,
+            build_channel="release",
+            startup_phase=phases.append,
+        )
+
+    assert exc_info.value is canary
+    assert phases == ["provider_store"]
+
+
 def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Path) -> None:
     app = _app(tmp_path / "state")
 

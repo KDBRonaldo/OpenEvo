@@ -34,8 +34,8 @@ PROC_PIDPATHINFO_MAXSIZE = 4_096
 DESKTOP_LOG_DIRECTORY = Path.home() / "Library/Application Support/org.openevo.desktop/logs-v1"
 DESKTOP_LOG_MAX_FILE_BYTES = 2 * 1024 * 1024
 DESKTOP_LOG_MAX_FILES = 8
-DESKTOP_LOG_MAX_LINE_BYTES = 1024
-_DESKTOP_LOG_EVENT_KEYS = {
+DESKTOP_LOG_MAX_LINE_BYTES = 2048
+_DESKTOP_LOG_V1_EVENT_KEYS = {
     "code",
     "errno",
     "event",
@@ -46,6 +46,69 @@ _DESKTOP_LOG_EVENT_KEYS = {
     "sequence",
     "signal",
     "source",
+}
+_DESKTOP_LOG_V2_EVENT_KEYS = {
+    "attempt_id",
+    "attempt_ordinal",
+    "attempt_sequence",
+    "code",
+    "component",
+    "duration_bucket",
+    "errno",
+    "event",
+    "exit_code",
+    "level",
+    "occurred_at",
+    "product_version",
+    "result",
+    "schema_version",
+    "sequence",
+    "signal",
+    "source_commit",
+    "stage",
+}
+_DESKTOP_LOG_COMPONENTS = {"native", "startup", "sidecar", "renderer"}
+_DESKTOP_LOG_LEVELS = {"info", "warning", "error"}
+_DESKTOP_LOG_EVENTS = {
+    "application_started",
+    "startup_stage",
+    "app_translocation_detected",
+    "sidecar_start_requested",
+    "sidecar_start_succeeded",
+    "sidecar_start_failed",
+    "sidecar_startup_diagnostic",
+    "sidecar_exited_before_ready",
+    "sidecar_pre_python_exit",
+    "sidecar_unstructured_output_discarded",
+    "sidecar_stop_requested",
+    "sidecar_stop_succeeded",
+    "sidecar_stop_failed",
+    "sidecar_runtime_exited",
+    "renderer_stage",
+    "log_directory_revealed",
+    "diagnostics_exported",
+}
+_DESKTOP_STARTUP_STAGES = {
+    "native_application",
+    "bundle_verification",
+    "sidecar_spawn",
+    "descriptor_handoff",
+    "bootloader",
+    "embedded_python",
+    "sidecar_entry",
+    "state_store",
+    "local_api",
+    "renderer_bootstrap",
+    "renderer_ready",
+}
+_DESKTOP_STARTUP_RESULTS = {"started", "completed", "failed"}
+_DESKTOP_DURATION_BUCKETS = {
+    "under_10ms",
+    "under_100ms",
+    "under_1s",
+    "under_10s",
+    "under_60s",
+    "at_least_60s",
 }
 _LOADER_FAILURE_EVENT_CODE = (
     "embedded_python_loader_python_shared_library_validation_failed"
@@ -89,6 +152,153 @@ _PS_ROW = re.compile(
 )
 _LOOPBACK_LISTENER = re.compile(r"^(?:127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$")
 _VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[.+-][A-Za-z0-9._-]+)?$")
+_DESKTOP_LOG_TIMESTAMP = re.compile(
+    r"^[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])"
+    r"T(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\.[0-9]{3}Z$"
+)
+_DESKTOP_LOG_CODE = re.compile(r"^[a-z0-9_/-]{1,96}$")
+_DESKTOP_LOG_PRODUCT_VERSION = re.compile(
+    r"^(?:legacy|[0-9]+\.[0-9]+\.[0-9]+(?:[.+-][A-Za-z0-9._+-]+)?)$"
+)
+_DESKTOP_LOG_ATTEMPT_ID = re.compile(r"^[0-9a-f]{32}$")
+_DESKTOP_LOG_SOURCE_COMMIT = re.compile(r"^[0-9a-f]{7,40}$")
+
+
+def _nullable_nonnegative_integer(value: object) -> bool:
+    return value is None or (type(value) is int and value >= 0)
+
+
+def _closed_desktop_log_v1_event(event: dict[str, object]) -> bool:
+    return (
+        set(event) == _DESKTOP_LOG_V1_EVENT_KEYS
+        and event.get("schema_version") == "1"
+        and type(event.get("sequence")) is int
+        and int(event["sequence"]) > 0
+        and type(event.get("occurred_at")) is str
+        and _DESKTOP_LOG_TIMESTAMP.fullmatch(str(event["occurred_at"])) is not None
+        and event.get("source") in _DESKTOP_LOG_COMPONENTS
+        and event.get("level") in _DESKTOP_LOG_LEVELS
+        and event.get("event") in _DESKTOP_LOG_EVENTS - {"startup_stage"}
+        and (
+            event.get("code") is None
+            or (
+                type(event.get("code")) is str
+                and _DESKTOP_LOG_CODE.fullmatch(str(event["code"])) is not None
+            )
+        )
+        and _nullable_nonnegative_integer(event.get("exit_code"))
+        and _nullable_nonnegative_integer(event.get("signal"))
+        and _nullable_nonnegative_integer(event.get("errno"))
+    )
+
+
+def _closed_desktop_log_v2_event(event: dict[str, object]) -> bool:
+    if (
+        set(event) != _DESKTOP_LOG_V2_EVENT_KEYS
+        or event.get("schema_version") != "2"
+        or type(event.get("sequence")) is not int
+        or int(event["sequence"]) <= 0
+        or type(event.get("occurred_at")) is not str
+        or _DESKTOP_LOG_TIMESTAMP.fullmatch(str(event["occurred_at"])) is None
+        or event.get("component") not in _DESKTOP_LOG_COMPONENTS
+        or event.get("level") not in _DESKTOP_LOG_LEVELS
+        or event.get("event") not in _DESKTOP_LOG_EVENTS
+        or event.get("event") in {"sidecar_startup_diagnostic", "renderer_stage"}
+        or (
+            event.get("code") is not None
+            and (
+                type(event.get("code")) is not str
+                or _DESKTOP_LOG_CODE.fullmatch(str(event["code"])) is None
+            )
+        )
+        or type(event.get("product_version")) is not str
+        or _DESKTOP_LOG_PRODUCT_VERSION.fullmatch(str(event["product_version"])) is None
+        or (
+            event.get("source_commit") is not None
+            and (
+                type(event.get("source_commit")) is not str
+                or _DESKTOP_LOG_SOURCE_COMMIT.fullmatch(str(event["source_commit"])) is None
+                or set(str(event["source_commit"])) == {"0"}
+            )
+        )
+        or not _nullable_nonnegative_integer(event.get("exit_code"))
+        or not _nullable_nonnegative_integer(event.get("signal"))
+        or not _nullable_nonnegative_integer(event.get("errno"))
+    ):
+        return False
+    attempt = (
+        event.get("attempt_id"),
+        event.get("attempt_ordinal"),
+        event.get("attempt_sequence"),
+    )
+    attempt_valid = attempt == (None, None, None) or (
+        type(attempt[0]) is str
+        and _DESKTOP_LOG_ATTEMPT_ID.fullmatch(attempt[0]) is not None
+        and type(attempt[1]) is int
+        and attempt[1] > 0
+        and type(attempt[2]) is int
+        and attempt[2] > 0
+    )
+    if not attempt_valid:
+        return False
+    if event["event"] == "startup_stage":
+        return (
+            attempt[0] is not None
+            and event.get("stage") in _DESKTOP_STARTUP_STAGES
+            and event.get("result") in _DESKTOP_STARTUP_RESULTS
+            and event.get("duration_bucket") in _DESKTOP_DURATION_BUCKETS
+            and (
+                (event["result"] == "failed" and event["level"] == "error")
+                or (event["result"] != "failed" and event["level"] == "info")
+            )
+        )
+    return (
+        event.get("stage") is None
+        and event.get("result") is None
+        and event.get("duration_bucket") is None
+    )
+
+
+def _valid_desktop_log_sequence(events: list[dict[str, object]]) -> bool:
+    if any(
+        int(previous["sequence"]) >= int(current["sequence"])
+        for previous, current in zip(events, events[1:])
+    ):
+        return False
+    attempts: dict[str, tuple[int, int, str, str | None]] = {}
+    ordinals: dict[int, str] = {}
+    for event in events:
+        if event["schema_version"] != "2" or event["attempt_id"] is None:
+            continue
+        attempt_id = str(event["attempt_id"])
+        ordinal = int(event["attempt_ordinal"])
+        attempt_sequence = int(event["attempt_sequence"])
+        product_version = str(event["product_version"])
+        source_commit = event["source_commit"]
+        bound_id = ordinals.setdefault(ordinal, attempt_id)
+        if bound_id != attempt_id:
+            return False
+        previous = attempts.get(attempt_id)
+        if previous is not None:
+            previous_ordinal, previous_sequence, previous_version, previous_commit = previous
+            if (
+                previous_ordinal != ordinal
+                or previous_sequence >= attempt_sequence
+                or previous_version != product_version
+                or (
+                    previous_commit is not None
+                    and previous_commit != source_commit
+                )
+            ):
+                return False
+            source_commit = previous_commit if source_commit is None else source_commit
+        attempts[attempt_id] = (
+            ordinal,
+            attempt_sequence,
+            product_version,
+            None if source_commit is None else str(source_commit),
+        )
+    return True
 
 
 def _startup_log_events(log_root: Path) -> tuple[dict[str, object], ...]:
@@ -154,21 +364,17 @@ def _startup_log_events(log_root: Path) -> tuple[dict[str, object], ...]:
                 event = json.loads(line.decode("utf-8", errors="strict"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 return ()
-            if type(event) is not dict or set(event) != _DESKTOP_LOG_EVENT_KEYS:
+            if type(event) is not dict:
                 return ()
-            sequence = event.get("sequence")
-            if (
-                event.get("schema_version") != "1"
-                or type(sequence) is not int
-                or sequence <= 0
-                or type(event.get("event")) is not str
-                or type(event.get("source")) is not str
-                or type(event.get("level")) is not str
-                or not (event.get("code") is None or type(event.get("code")) is str)
+            if not (
+                _closed_desktop_log_v1_event(event)
+                or _closed_desktop_log_v2_event(event)
             ):
                 return ()
             events.append(event)
     events.sort(key=lambda event: int(event["sequence"]))
+    if not _valid_desktop_log_sequence(events):
+        return ()
     return tuple(events)
 
 
@@ -183,15 +389,28 @@ def _startup_failure_since(
     log_root: Path,
     checkpoint: int,
 ) -> tuple[str, str] | None:
-    matches = [
-        event
-        for event in _startup_log_events(log_root)
-        if int(event["sequence"]) > checkpoint
-        and event["source"] == "startup"
-        and event["level"] == "error"
-        and event["event"] == "sidecar_startup_diagnostic"
-        and event["code"] == _LOADER_FAILURE_EVENT_CODE
-    ]
+    matches = []
+    for event in _startup_log_events(log_root):
+        if int(event["sequence"]) <= checkpoint:
+            continue
+        if event["schema_version"] == "1":
+            matched = (
+                event["source"] == "startup"
+                and event["level"] == "error"
+                and event["event"] == "sidecar_startup_diagnostic"
+                and event["code"] == _LOADER_FAILURE_EVENT_CODE
+            )
+        else:
+            matched = (
+                event["component"] == "startup"
+                and event["level"] == "error"
+                and event["event"] == "startup_stage"
+                and event["stage"] == "embedded_python"
+                and event["result"] == "failed"
+                and event["code"] == _LOADER_FAILURE[1]
+            )
+        if matched:
+            matches.append(event)
     return _LOADER_FAILURE if matches else None
 
 

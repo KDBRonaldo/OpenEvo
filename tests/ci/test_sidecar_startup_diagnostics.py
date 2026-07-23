@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 import re
@@ -249,6 +250,90 @@ def test_bundle_smoke_rejects_non_contract_startup_failure_marker(marker: bytes)
 
     with pytest.raises(bundle.SmokeFailure, match="marker is malformed"):
         bundle._parse_native_host_observation(marker)
+
+
+def test_bundle_smoke_requires_a_successful_v2_startup_attempt_without_canaries() -> None:
+    bundle = _load_module(
+        "openevo_bundle_smoke_v2_startup_envelope_test",
+        "scripts/ci/smoke_openevo_desktop_bundle.py",
+    )
+    attempt_id = "a" * 32
+
+    def stage(sequence: int, attempt_sequence: int, name: str, result: str) -> dict[str, object]:
+        return {
+            "schema_version": "2",
+            "sequence": sequence,
+            "occurred_at": f"2026-07-23T01:02:03.{sequence:03d}Z",
+            "attempt_id": attempt_id,
+            "attempt_ordinal": 4,
+            "attempt_sequence": attempt_sequence,
+            "component": "renderer" if name.startswith("renderer_") else "native",
+            "level": "error" if result == "failed" else "info",
+            "event": "startup_stage",
+            "stage": name,
+            "result": result,
+            "code": "ready" if name == "renderer_ready" else "stage_complete",
+            "duration_bucket": "under_1s",
+            "product_version": "0.1.9",
+            "source_commit": "b" * 40,
+            "exit_code": None,
+            "signal": None,
+            "errno": None,
+        }
+
+    summary = bundle._validate_startup_diagnostic_events(
+        (
+            stage(7, 1, "native_application", "completed"),
+            stage(8, 2, "local_api", "completed"),
+            stage(9, 3, "renderer_bootstrap", "completed"),
+            stage(10, 4, "renderer_ready", "completed"),
+        ),
+        checkpoint=6,
+    )
+
+    assert summary == {
+        "schema_version": "2",
+        "attempt_id": attempt_id,
+        "attempt_ordinal": 4,
+        "last_completed_stage": "renderer_ready",
+        "first_failed_stage": None,
+        "duration_bucket": "under_1s",
+        "product_version": "0.1.9",
+        "source_commit": "b" * 40,
+    }
+    encoded = json.dumps(summary, sort_keys=True)
+    assert "/Users/" not in encoded
+    assert "token" not in encoded
+
+
+def test_bundle_smoke_rejects_a_failed_v2_startup_attempt() -> None:
+    bundle = _load_module(
+        "openevo_bundle_smoke_failed_v2_startup_envelope_test",
+        "scripts/ci/smoke_openevo_desktop_bundle.py",
+    )
+    event = {
+        "schema_version": "2",
+        "sequence": 7,
+        "occurred_at": "2026-07-23T01:02:03.007Z",
+        "attempt_id": "a" * 32,
+        "attempt_ordinal": 4,
+        "attempt_sequence": 1,
+        "component": "startup",
+        "level": "error",
+        "event": "startup_stage",
+        "stage": "state_store",
+        "result": "failed",
+        "code": "provider_store_failed",
+        "duration_bucket": "under_1s",
+        "product_version": "0.1.9",
+        "source_commit": None,
+        "exit_code": None,
+        "signal": None,
+        "errno": None,
+    }
+
+    with pytest.raises(bundle.SmokeFailure, match="failed startup attempt"):
+        bundle._validate_startup_diagnostic_events((event,), checkpoint=6)
 
 
 def test_smoke_failure_exposes_only_bounded_allowlisted_startup_lines(tmp_path: Path) -> None:

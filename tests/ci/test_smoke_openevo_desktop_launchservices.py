@@ -158,7 +158,7 @@ def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) ->
     events = [
         {
             "schema_version": "1",
-            "sequence": 7,
+            "sequence": 6,
             "occurred_at": "2026-07-23T01:02:03.004Z",
             "source": "startup",
             "level": "error",
@@ -169,13 +169,41 @@ def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) ->
             "errno": None,
         },
         {
-            "schema_version": "1",
-            "sequence": 8,
+            "schema_version": "2",
+            "sequence": 7,
             "occurred_at": "2026-07-23T01:02:03.005Z",
-            "source": "sidecar",
+            "attempt_id": "a" * 32,
+            "attempt_ordinal": 2,
+            "attempt_sequence": 4,
+            "component": "startup",
+            "level": "error",
+            "event": "startup_stage",
+            "stage": "embedded_python",
+            "result": "failed",
+            "code": "python_shared_library_validation_failed",
+            "duration_bucket": "under_1s",
+            "product_version": "0.1.9",
+            "source_commit": None,
+            "exit_code": None,
+            "signal": None,
+            "errno": None,
+        },
+        {
+            "schema_version": "2",
+            "sequence": 8,
+            "occurred_at": "2026-07-23T01:02:03.006Z",
+            "attempt_id": "a" * 32,
+            "attempt_ordinal": 2,
+            "attempt_sequence": 5,
+            "component": "sidecar",
             "level": "warning",
             "event": "sidecar_unstructured_output_discarded",
+            "stage": None,
+            "result": None,
             "code": "unknown_2_sha256_" + "a" * 64,
+            "duration_bucket": None,
+            "product_version": "0.1.9",
+            "source_commit": "b" * 40,
             "exit_code": None,
             "signal": None,
             "errno": None,
@@ -193,6 +221,39 @@ def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) ->
         "python_shared_library_validation_failed",
     )
     assert smoke._startup_failure_since(log_root, 7) is None
+
+
+def test_launchservices_rejects_open_v2_startup_envelopes(tmp_path: Path) -> None:
+    smoke = _load_module()
+    log_root = tmp_path / "logs-v1"
+    log_root.mkdir(mode=0o700)
+    log_file = log_root / "desktop.jsonl"
+    event = {
+        "schema_version": "2",
+        "sequence": 7,
+        "occurred_at": "2026-07-23T01:02:03.005Z",
+        "attempt_id": "a" * 32,
+        "attempt_ordinal": 2,
+        "attempt_sequence": 4,
+        "component": "startup",
+        "level": "error",
+        "event": "startup_stage",
+        "stage": "embedded_python",
+        "result": "failed",
+        "code": "python_shared_library_validation_failed",
+        "duration_bucket": "under_1s",
+        "product_version": "0.1.9",
+        "source_commit": None,
+        "exit_code": None,
+        "signal": None,
+        "errno": None,
+        "raw_path": "/Users/private/token=secret",
+    }
+    log_file.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    log_file.chmod(0o600)
+
+    assert smoke._startup_log_events(log_root) == ()
+    assert smoke._startup_failure_since(log_root, 0) is None
 
 
 def test_smoke_times_out_when_no_owned_sidecar_appears(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
