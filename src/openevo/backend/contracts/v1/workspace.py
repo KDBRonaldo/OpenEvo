@@ -20,6 +20,7 @@ _OCTAL_7 = re.compile(rb"^[0-7]{7}\0$")
 _OCTAL_11 = re.compile(rb"^[0-7]{11}\0$")
 _CHECKSUM = re.compile(rb"^[0-7]{6}\0 $")
 _RENAME_NOREPLACE = 1
+_RENAME_EXCL = 0x00000004
 
 
 class WorkspaceArchiveError(ValueError):
@@ -80,6 +81,15 @@ def verify_and_materialize_workspace(
         )
         published = True
         os.fsync(workspace_root_fd)
+        _require_entry_binding(
+            workspace_root_fd,
+            snapshot_name,
+            temporary_identity,
+        )
+        if not _same_identity(os.fstat(temporary_fd), temporary_identity):
+            raise WorkspaceArchiveError(
+                "published workspace snapshot binding changed"
+            )
     except Exception:
         if published:
             _remove_tree_at(
@@ -798,26 +808,36 @@ def _quarantine_entry_noreplace(parent_fd: int, name: str) -> str:
 
 
 def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
-    if sys.platform != "linux":
-        raise OSError(errno.ENOSYS, "safe no-replace rename requires Linux renameat2")
     libc = ctypes.CDLL(None, use_errno=True)
-    renameat2 = getattr(libc, "renameat2", None)
-    if renameat2 is None:
-        raise OSError(errno.ENOSYS, "safe no-replace rename requires renameat2")
-    renameat2.argtypes = (
+    if sys.platform == "linux":
+        rename = getattr(libc, "renameat2", None)
+        flag = _RENAME_NOREPLACE
+        requirement = "renameat2"
+    elif sys.platform == "darwin":
+        rename = getattr(libc, "renameatx_np", None)
+        flag = _RENAME_EXCL
+        requirement = "renameatx_np"
+    else:
+        raise OSError(
+            errno.ENOSYS,
+            "safe no-replace rename requires renameat2 or renameatx_np",
+        )
+    if rename is None:
+        raise OSError(errno.ENOSYS, f"safe no-replace rename requires {requirement}")
+    rename.argtypes = (
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_int,
         ctypes.c_char_p,
         ctypes.c_uint,
     )
-    renameat2.restype = ctypes.c_int
-    result = renameat2(
+    rename.restype = ctypes.c_int
+    result = rename(
         directory_fd,
         os.fsencode(source),
         directory_fd,
         os.fsencode(destination),
-        _RENAME_NOREPLACE,
+        flag,
     )
     if result != 0:
         error = ctypes.get_errno()

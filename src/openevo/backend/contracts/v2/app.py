@@ -38,6 +38,32 @@ _bearer = HTTPBearer(
 )
 
 
+def _freeze_workspace_chunk_openapi_schema(schema: dict[str, object]) -> None:
+    """Keep the checked-in binary-body spelling stable across schema generators."""
+
+    try:
+        chunk_schema = schema["paths"][  # type: ignore[index]
+            "/v2/projects/{project_id}/workspace-uploads/{upload_id}/chunks/{chunk_index}"
+        ]["put"]["requestBody"]["content"]["application/octet-stream"]["schema"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("workspace chunk OpenAPI schema is unavailable") from exc
+    if not isinstance(chunk_schema, dict):
+        raise RuntimeError("workspace chunk OpenAPI schema is malformed")
+    if (
+        chunk_schema.get("type") != "string"
+        or chunk_schema.get("minLength") != 1
+        or chunk_schema.get("maxLength") != m.MAX_WORKSPACE_CHUNK_BYTES
+        or chunk_schema.get("title") != "Chunk"
+        or not (
+            chunk_schema.get("format") == "binary"
+            or chunk_schema.get("contentMediaType") == "application/octet-stream"
+        )
+    ):
+        raise RuntimeError("workspace chunk OpenAPI schema changed unexpectedly")
+    chunk_schema.pop("contentMediaType", None)
+    chunk_schema["format"] = "binary"
+
+
 async def _declare_bearer_security(
     _credentials: Annotated[
         HTTPAuthorizationCredentials | None,
@@ -1094,6 +1120,7 @@ def create_core_control_v2_contract_app(
             description=app.description,
             routes=app.routes,
         )
+        _freeze_workspace_chunk_openapi_schema(schema)
         schema["x-openevo-contract-only"] = True
         schema["x-openevo-business-provider"] = False
         for discovery_path in ("/version", "/health"):

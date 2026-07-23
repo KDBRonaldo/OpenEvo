@@ -20,10 +20,24 @@ from typing import Literal
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from openevo.backend.run_control import CoreTaskControlError
+from openevo.backend.project_authority_v2 import (
+    ProjectAuthorityConflictV2,
+    ProjectAuthorityInvalidV2,
+    ProjectAuthorityV2,
+    ProjectAuthorityV2Error,
+)
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
 from openevo.backend.science_run_store import (
     ScienceProjectAdmissionAuthorityV2,
     page_items,
+)
+from openevo.backend.workspace_store_v2 import (
+    WorkspaceConflictV2,
+    WorkspaceIdempotencyConflictV2,
+    WorkspaceIntegrityErrorV2,
+    WorkspaceNotFoundV2,
+    WorkspacePreconditionFailedV2,
+    WorkspaceStoreV2Error,
 )
 from openevo.evolution.framework.builtins import (
     VerifiedExecutableRegistry,
@@ -50,6 +64,7 @@ from .store import (
     ProjectConflictV2,
     ProjectIdempotencyConflictV2,
     ProjectNotFoundV2,
+    ProjectPreconditionFailedV2,
     ProjectRecordV2,
     operation_etag_for,
     project_etag_payload,
@@ -118,6 +133,7 @@ class CoreControlProviderV2:
         *,
         task_owner: CoreScienceTaskOwnerV2,
         executable_registry: VerifiedExecutableRegistry,
+        project_authority: ProjectAuthorityV2 | None = None,
         bearer_token: str,
         release_version: str,
         source_commit: str,
@@ -136,6 +152,9 @@ class CoreControlProviderV2:
         self.store = store
         self._task_owner = task_owner
         self._registry = require_verified_executable_registry(executable_registry)
+        if project_authority is not None and type(project_authority) is not ProjectAuthorityV2:
+            raise TypeError("Core v2 project authority has the wrong type")
+        self._project_authority = project_authority
         self._authorization = b"Bearer " + token_bytes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
@@ -159,6 +178,11 @@ class CoreControlProviderV2:
                 *(
                     ["atomic_successor_v2"]
                     if task_owner.successor_available
+                    else []
+                ),
+                *(
+                    ["project_genesis_v2", "workspace_snapshots_v2"]
+                    if project_authority is not None
                     else []
                 ),
             ]
@@ -241,6 +265,18 @@ class CoreControlProviderV2:
             "getCoreOperationV2": self._get_operation,
             "streamCoreEventsV2": self._events,
         }
+        if project_authority is not None:
+            self._handlers.update(
+                {
+                    "abortCoreWorkspaceUploadV2": self._abort_workspace_upload,
+                    "createCoreWorkspaceUploadV2": self._create_workspace_upload,
+                    "finalizeCoreWorkspaceUploadV2": self._finalize_workspace_upload,
+                    "getCoreWorkspaceUploadV2": self._get_workspace_upload,
+                    "putCoreWorkspaceUploadChunkV2": self._put_workspace_chunk,
+                    "updateCoreProjectV2": self._update_project,
+                    "validateCoreProjectV2": self._validate_project,
+                }
+            )
         self._all_operation_ids = frozenset(
             {
                 *self._handlers,
@@ -326,6 +362,87 @@ class CoreControlProviderV2:
             raise
         except CoreTaskControlError as exc:
             raise _task_owner_http_error(exc, operation_id=operation_id) from exc
+        except WorkspaceIdempotencyConflictV2 as exc:
+            raise _http_error(
+                409,
+                code="workspace_idempotency_key_reused",
+                message="The workspace idempotency key was reused for another request.",
+                category="project",
+                retryable=False,
+                repair_action="user_action_required",
+            ) from exc
+        except WorkspacePreconditionFailedV2 as exc:
+            raise _http_error(
+                412,
+                code="workspace_authority_changed",
+                message="The workspace upload authority changed before this action.",
+                category="project",
+                retryable=True,
+                repair_action="retry",
+            ) from exc
+        except WorkspaceNotFoundV2 as exc:
+            raise _http_error(
+                404,
+                code="workspace_upload_not_found",
+                message="The requested workspace upload was not found.",
+                category="project",
+                retryable=False,
+                repair_action="user_action_required",
+            ) from exc
+        except WorkspaceConflictV2 as exc:
+            raise _http_error(
+                409,
+                code="workspace_conflict",
+                message="The workspace mutation conflicts with durable Core state.",
+                category="project",
+                retryable=False,
+                repair_action="repair",
+            ) from exc
+        except WorkspaceIntegrityErrorV2 as exc:
+            raise _http_error(
+                422,
+                code="workspace_archive_invalid",
+                message="The workspace archive failed closed validation.",
+                category="contract",
+                retryable=False,
+                repair_action="reconfigure",
+            ) from exc
+        except WorkspaceStoreV2Error as exc:
+            raise _http_error(
+                503,
+                code="workspace_authority_unavailable",
+                message="The durable workspace authority is unavailable.",
+                category="system",
+                retryable=True,
+                repair_action="retry",
+            ) from exc
+        except ProjectAuthorityInvalidV2 as exc:
+            raise _http_error(
+                409,
+                code="evolution_project_invalid",
+                message="The saved project evolution configuration is invalid.",
+                category="project",
+                retryable=False,
+                repair_action="reconfigure",
+            ) from exc
+        except ProjectAuthorityConflictV2 as exc:
+            raise _http_error(
+                412,
+                code="project_authority_changed",
+                message="The project authority changed before this action.",
+                category="project",
+                retryable=True,
+                repair_action="retry",
+            ) from exc
+        except ProjectAuthorityV2Error as exc:
+            raise _http_error(
+                503,
+                code="project_authority_unavailable",
+                message="The durable project authority is unavailable.",
+                category="system",
+                retryable=True,
+                repair_action="retry",
+            ) from exc
         except ProjectIdempotencyConflictV2 as exc:
             raise _http_error(
                 409,
@@ -334,6 +451,15 @@ class CoreControlProviderV2:
                 category="project",
                 retryable=False,
                 repair_action="user_action_required",
+            ) from exc
+        except ProjectPreconditionFailedV2 as exc:
+            raise _http_error(
+                412,
+                code="project_authority_changed",
+                message="The project authority changed before this mutation.",
+                category="project",
+                retryable=True,
+                repair_action="retry",
             ) from exc
         except OperationNotFoundV2 as exc:
             raise _http_error(
@@ -394,6 +520,8 @@ class CoreControlProviderV2:
                 return
             self._closed = True
         try:
+            if self._project_authority is not None:
+                self._project_authority.close()
             self._task_owner.close()
         finally:
             self.store.close()
@@ -441,11 +569,15 @@ class CoreControlProviderV2:
     def _create_project(self, arguments: Mapping[str, object]) -> object:
         _keys(arguments, "request", "idempotency_key")
         request = _model(m.ProjectCreateV2, arguments["request"])
+        if self._project_authority is not None:
+            self._project_authority.validate_config(request.config)
         record, _replayed = self.store.create_project(
             request,
             idempotency_key=_string(arguments["idempotency_key"]),
             now=self._clock(),
         )
+        if self._project_authority is not None:
+            self._project_authority.ensure_project(record)
         project = self._project_model(record)
         return JSONResponse(
             status_code=201,
@@ -483,6 +615,8 @@ class CoreControlProviderV2:
         )
 
     def _project_model(self, record: ProjectRecordV2) -> m.ProjectV2:
+        if self._project_authority is not None:
+            self._project_authority.ensure_project(record)
         active: m.ProjectHeadRefV2 | None = None
         admission_etag: str | None = None
         state: Literal["ready", "transitioning", "not_ready", "needs_attention"]
@@ -519,6 +653,10 @@ class CoreControlProviderV2:
                     == "failed"
                 ):
                     state = "needs_attention"
+        if self._project_authority is not None:
+            readiness = self._project_authority.readiness(record)
+            if not readiness.ready and state == "ready":
+                state = "not_ready"
         etag = project_etag_payload(
             record,
             active_project_head=active,
@@ -537,6 +675,200 @@ class CoreControlProviderV2:
             updated_at=record.updated_at,
             etag=etag,
         )
+
+    def _update_project(self, arguments: Mapping[str, object]) -> object:
+        _keys(
+            arguments,
+            "project_id",
+            "request",
+            "if_match",
+            "idempotency_key",
+        )
+        authority = self._require_project_authority()
+        project_id = _string(arguments["project_id"])
+        request = _model(m.ProjectUpdateV2, arguments["request"])
+        authority.validate_config(request.config)
+        current_record = self.store.get_project(project_id)
+        current = self._project_model(current_record)
+        head = current.active_project_head
+        if (
+            request.expected_project_head_id
+            != (None if head is None else head.project_head_id)
+            or request.expected_project_head_manifest_sha256
+            != (None if head is None else head.manifest_sha256)
+        ):
+            raise ProjectAuthorityConflictV2("project head changed")
+        if request.config != current_record.config:
+            raise _http_error(
+                409,
+                code="project_update_requires_successor",
+                message=(
+                    "Changing a pinned project configuration requires an atomic "
+                    "successor transition."
+                ),
+                category="project",
+                retryable=False,
+                repair_action="repair",
+            )
+        updated, _replayed = self.store.update_project(
+            project_id,
+            request,
+            if_match=_string(arguments["if_match"]),
+            current_etag=current.etag,
+            idempotency_key=_string(arguments["idempotency_key"]),
+            now=self._clock(),
+        )
+        project = self._project_model(updated)
+        return JSONResponse(
+            content=project.model_dump(mode="json"),
+            headers={"ETag": project.etag},
+        )
+
+    def _create_workspace_upload(self, arguments: Mapping[str, object]) -> object:
+        _keys(
+            arguments,
+            "project_id",
+            "request",
+            "if_match",
+            "idempotency_key",
+        )
+        authority = self._require_project_authority()
+        record = self.store.get_project(_string(arguments["project_id"]))
+        self._require_project_etag(record, _string(arguments["if_match"]))
+        session, _replayed = authority.create_workspace_upload(
+            record,
+            _model(m.WorkspaceUploadCreateV2, arguments["request"]),
+            idempotency_key=_string(arguments["idempotency_key"]),
+            now=self._clock(),
+        )
+        return session
+
+    def _get_workspace_upload(self, arguments: Mapping[str, object]) -> object:
+        _keys(arguments, "project_id", "upload_id")
+        authority = self._require_project_authority()
+        record = self.store.get_project(_string(arguments["project_id"]))
+        session = authority.get_workspace_upload(
+            record,
+            _string(arguments["upload_id"]),
+        )
+        return JSONResponse(
+            content=session.model_dump(mode="json"),
+            headers={"ETag": session.etag},
+        )
+
+    def _put_workspace_chunk(self, arguments: Mapping[str, object]) -> object:
+        _keys(
+            arguments,
+            "project_id",
+            "upload_id",
+            "chunk_index",
+            "chunk",
+            "chunk_sha256",
+            "chunk_byte_size",
+            "if_match",
+            "idempotency_key",
+        )
+        authority = self._require_project_authority()
+        record = self.store.get_project(_string(arguments["project_id"]))
+        chunk = arguments["chunk"]
+        if type(chunk) is not bytes:
+            raise TypeError("workspace chunk must be exact bytes")
+        session, _replayed = authority.put_workspace_chunk(
+            record,
+            _string(arguments["upload_id"]),
+            chunk_index=arguments["chunk_index"],  # type: ignore[arg-type]
+            chunk=chunk,
+            chunk_sha256=_string(arguments["chunk_sha256"]),
+            chunk_byte_size=arguments["chunk_byte_size"],  # type: ignore[arg-type]
+            if_match=_string(arguments["if_match"]),
+            idempotency_key=_string(arguments["idempotency_key"]),
+            now=self._clock(),
+        )
+        return JSONResponse(
+            content=session.model_dump(mode="json"),
+            headers={"ETag": session.etag},
+        )
+
+    def _finalize_workspace_upload(self, arguments: Mapping[str, object]) -> object:
+        _keys(
+            arguments,
+            "project_id",
+            "upload_id",
+            "request",
+            "if_match",
+            "idempotency_key",
+        )
+        authority = self._require_project_authority()
+        record = self.store.get_project(_string(arguments["project_id"]))
+        session, _replayed = authority.finalize_workspace_upload(
+            record,
+            _string(arguments["upload_id"]),
+            _model(m.WorkspaceUploadFinalizeV2, arguments["request"]),
+            if_match=_string(arguments["if_match"]),
+            idempotency_key=_string(arguments["idempotency_key"]),
+            now=self._clock(),
+        )
+        return session
+
+    def _abort_workspace_upload(self, arguments: Mapping[str, object]) -> object:
+        _keys(
+            arguments,
+            "project_id",
+            "upload_id",
+            "request",
+            "if_match",
+            "idempotency_key",
+        )
+        authority = self._require_project_authority()
+        record = self.store.get_project(_string(arguments["project_id"]))
+        session, _replayed = authority.abort_workspace_upload(
+            record,
+            _string(arguments["upload_id"]),
+            _model(m.WorkspaceUploadAbortV2, arguments["request"]),
+            if_match=_string(arguments["if_match"]),
+            idempotency_key=_string(arguments["idempotency_key"]),
+            now=self._clock(),
+        )
+        return JSONResponse(
+            content=session.model_dump(mode="json"),
+            headers={"ETag": session.etag},
+        )
+
+    def _validate_project(self, arguments: Mapping[str, object]) -> object:
+        _keys(arguments, "project_id", "request", "idempotency_key")
+        authority = self._require_project_authority()
+        project_id = _string(arguments["project_id"])
+        idempotency_key = _string(arguments["idempotency_key"])
+        request = _model(m.ProjectValidationRequestV2, arguments["request"])
+        replay = self.store.begin_project_validation(
+            project_id,
+            request,
+            idempotency_key=idempotency_key,
+        )
+        if replay is not None:
+            return replay
+        record = self.store.get_project(project_id)
+        response = authority.validate_project(
+            record,
+            request,
+            now=self._clock(),
+        )
+        return self.store.commit_project_validation(
+            project_id,
+            request,
+            response,
+            idempotency_key=idempotency_key,
+        )
+
+    def _require_project_authority(self) -> ProjectAuthorityV2:
+        if self._project_authority is None:
+            raise ProjectAuthorityV2Error("project authority is not configured")
+        return self._project_authority
+
+    def _require_project_etag(self, record: ProjectRecordV2, expected: str) -> None:
+        project = self._project_model(record)
+        if project.etag != expected:
+            raise ProjectAuthorityConflictV2("project resource ETag changed")
 
     def _list_project_heads(self, arguments: Mapping[str, object]) -> m.ProjectHeadPageV2:
         _keys(arguments, "project_id", "limit", "after", "direction")
