@@ -208,6 +208,39 @@ Artifact, history, timeline, context, and event payloads use these exact types.
 They never infer one identity from another or call an Evolution Revision a
 Project Head.
 
+## Executable Project And Workspace Authority
+
+Core stores the canonical bytes behind every digest it publishes. Project
+create/update therefore accepts one closed Science project document rather
+than only a caller-computed digest. The release document contains the task
+title/objective, `codex_subscription_transcript` settings, workspace-source
+kind, and `evolution.targets.<target_id> = {enabled, method, config}`. Core
+computes `project_config_sha256` after strict validation against the active
+verified registry.
+
+Native workspace data is staged through Core-owned v2 upload resources:
+
+```text
+POST /v2/projects/{project_id}/workspace-uploads
+PUT  /v2/projects/{project_id}/workspace-uploads/{upload_id}/chunks/{index}
+POST /v2/projects/{project_id}/workspace-uploads/{upload_id}/finalize
+POST /v2/projects/{project_id}/workspace-uploads/{upload_id}/abort
+```
+
+The archive protocol is bounded, digest-verified, resumable, no-follow, and
+publishes an immutable Workspace Snapshot only after complete validation. No
+request or response exposes a host path. Scratch projects receive a real empty
+snapshot owned by the same store.
+
+Task submission contains expected project/head/config identities, not
+caller-authored task-envelope, normalized-intent, registry, or workspace
+digests. The Daemon derives and seals those values from its saved project,
+staged workspace, current head, verified registry, and verified effective
+execution snapshot in the admission transaction. Full method schemas,
+defaults, support axes, and accepted/resolver selections are forwarded from
+the Daemon capability envelope; a target-ID-only summary is not sufficient for
+renderer configuration.
+
 ## Readiness, Admission, And Retry
 
 Unsaved work is a Desktop draft. While workspace publication, settings
@@ -234,6 +267,16 @@ The Subscription production issuer seals transcript capture with
 runtime, task-network policy, and no serving endpoint. Ordinary callers cannot
 construct a verified execution snapshot. Self-Deployed remains unavailable
 until its deployment/serving issuer is verified.
+
+An admitted Attempt is executed by the Daemon's production run owner through
+the generation-bound managed service graph. Its terminal receipt binds the
+actual service generation, runtime, harness, capture, model, task-network,
+workspace-input and runtime-context identities to the immutable admission.
+Only that verified receipt can make an Attempt authoritative and start the
+successor transition. The Gateway exports a bounded, digest-verified workspace
+result through an internal opaque handoff before session cleanup; Core adopts
+it into the project workspace store without putting a host path in public or
+persisted contract data.
 
 ## Atomic Successor
 

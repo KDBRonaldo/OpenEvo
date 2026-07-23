@@ -574,6 +574,128 @@ The exact broader gate is added in Task 18 after every slice is present.
 - [ ] Run provider/contract tests and commit:
   `feat(core): serve authoritative control API v2`
 
+### Task 18A: Close the executable project, workspace, and admission contract
+
+**Files:**
+
+- Modify: `src/openevo/backend/contracts/v2/models.py`
+- Modify: `src/openevo/backend/contracts/v2/app.py`
+- Modify: `src/openevo/backend/contracts/v2/openapi.json`
+- Modify: `desktop/sidecar/contracts/v2/models.py`
+- Modify: `desktop/sidecar/contracts/v2/app.py`
+- Modify: both v2 Local API snapshots
+- Modify: `tests/backend/test_core_control_v2_contract.py`
+- Modify: `tests/openevo/sidecar/test_desktop_contract_v2.py`
+
+- [ ] Write RED tests proving project create/update carries complete closed
+  canonical Science configuration and Core, rather than Desktop, computes its
+  digest. Reject digest-only authority, env, setup commands, host paths, URIs,
+  credentials, unknown fields, unsafe integers, and oversized config.
+- [ ] Add bounded resumable Core workspace-upload create/chunk/finalize/abort
+  resources. Requests and responses expose only opaque identities, digests,
+  sizes, counts, indexes, and state.
+- [ ] Replace caller-authored task-envelope/workspace/normalized-intent digests
+  with expected project/head/config CAS fields; require Core to derive every
+  immutable admission input from saved authority.
+- [ ] Project capability projection must carry the complete verified remote
+  envelope needed for generic method configuration, not only target IDs and a
+  digest.
+- [ ] Regenerate both exact OpenAPI snapshots and update release digests only
+  through deterministic generators.
+- [ ] Run Core/Desktop contract tests and commit:
+  `feat(contract): close executable v2 science requests`
+
+### Task 18B: Own project configuration, workspace snapshots, and genesis
+
+**Files:**
+
+- Create: `src/openevo/backend/project_authority_v2.py`
+- Create: `src/openevo/backend/workspace_store_v2.py`
+- Modify: `src/openevo/backend/contracts/v2/store.py`
+- Modify: `src/openevo/backend/contracts/v2/provider.py`
+- Modify: `src/openevo/backend/science_run_store.py`
+- Create: `tests/backend/test_project_authority_v2.py`
+- Create: `tests/backend/test_workspace_store_v2.py`
+- Modify: `tests/backend/test_core_control_v2_provider.py`
+
+- [ ] RED-test private roots, exact schema/marker identity, no-follow archive
+  extraction, cumulative budgets, duplicate/hardlink/symlink/special-file
+  rejection, chunk retry, crash recovery, and final no-replace publication.
+- [ ] Persist exact canonical project config bytes and authoritative desired
+  settings. Create a real empty workspace snapshot for scratch or adopt one
+  finalized upload; never accept a caller-created snapshot reference.
+- [ ] Resolve verified Subscription service readiness and issue the production
+  effective-execution snapshot before genesis. Build and atomically publish the
+  empty Evolution Revision, verified Runtime Context Snapshot, and generation
+  zero Project Head.
+- [ ] Implement capability-backed project validation and task-request
+  derivation. Validation and admission use the same frozen registry/compiler
+  path and serialized-byte limits.
+- [ ] Test settings/registry/runtime drift as typed not-ready with no Task or
+  partial head, restart recovery, and exact idempotency/ETag behavior.
+- [ ] Run focused and affected store/evolution tests and commit:
+  `feat(core): own v2 project genesis and workspaces`
+
+### Task 18C: Execute real Subscription attempts and successors
+
+**Files:**
+
+- Create: `src/openevo/backend/science_execution_v2.py`
+- Create: `src/openevo/backend/science_successor_preparer_v2.py`
+- Modify: `src/openevo/backend/science_run_owner.py`
+- Modify: `src/openevo/backend/science_run_store.py`
+- Modify: `src/openevo/backend/service_supervisor.py`
+- Modify: `src/openevo/gateway/node.py`
+- Modify: `src/openevo/gateway/server.py`
+- Modify: `src/openevo/rollout/models.py`
+- Create: `tests/backend/test_science_execution_v2.py`
+- Create: `tests/backend/test_science_successor_preparer_v2.py`
+- Modify: relevant Gateway/Rollout recovery tests
+
+- [ ] RED-test Task/Attempt progress, generation-bound run admission, verified
+  terminal execution receipt, cancellation race, infrastructure retry, crash
+  recovery, and one authoritative Attempt only.
+- [ ] Compile the immutable v2 admission directly into the managed Codex
+  Subscription service graph. Do not create or mutate v1 project/run authority.
+- [ ] Before Gateway cleanup, publish a bounded no-follow workspace-result
+  snapshot through an internal opaque, authenticated, one-owner handoff. Prove
+  retry/restart cleanup and never expose a host path through public contracts,
+  events, logs, or persisted task envelopes.
+- [ ] Build the production successor plan from the saved normalized project
+  config and runner evidence, seal the transcript dataset, validate exact
+  plan-bound method outputs, materialize the complete next-session context, and
+  atomically commit the workspace/evolution/runtime successor.
+- [ ] Add a real two-session integration proving session N cannot consume its
+  own outputs and session N+1 receives the committed context and workspace.
+- [ ] Run focused Gateway/rollout/evolution/run-owner tests and protected-source
+  guards; commit:
+  `feat(core): execute v2 subscription tasks`
+
+### Task 18D: Make the release Daemon a real v2 composition
+
+**Files:**
+
+- Modify: `src/openevo/backend/launcher.py`
+- Modify: `src/openevo/backend/service.py`
+- Modify: `src/openevo/backend/contracts/v1/provider.py`
+- Create: `tests/backend/test_daemon_v2_composition.py`
+- Modify: Daemon bundle and release-contract checks under `tests/ci/`
+
+- [ ] RED-test the packaged launcher through the inherited release socket and
+  prove `/version`, authenticated `/v2/*`, provider kind, feature set, schema
+  digests, registry/runtime identity, project genesis, Task execution, events,
+  reconnect, and shutdown against production owners.
+- [ ] Bind the launcher to the v2 provider, project/workspace authority,
+  production executor/preparer, service supervisor, and private run-admission
+  endpoint. The ready payload and authenticated status proof bind the v2 build.
+- [ ] If v1 is mounted, expose only an explicitly negotiated read-only migration
+  surface. No v1 mutation owner, shared business URL, or fallback is available
+  in the 0.1.9 release composition.
+- [ ] Advertise `atomic_successor_v2` and other mutation features only when the
+  concrete production owners are present and startup recovery is complete.
+- [ ] Run launcher/bundle/service/provider tests and commit:
+  `feat(daemon): launch the production v2 authority`
+
 ---
 
 ## Phase E: Sidecar v2 state, tunnel, and migration

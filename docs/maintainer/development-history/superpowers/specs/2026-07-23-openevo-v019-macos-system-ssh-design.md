@@ -408,6 +408,22 @@ instead of aliases.
 
 ### 5.3 Admission and successor behavior
 
+A digest-only request is not executable authority. Project create/update carries
+the complete closed ordinary-user Science configuration, including task text,
+Subscription execution settings, workspace-source kind, and the generic
+evolution target map. Core validates and persists its canonical bytes and
+computes the public digest itself. Desktop never asks Core to trust a digest for
+configuration bytes Core has not received.
+
+Workspace content crosses the tunnel only through bounded, resumable Core v2
+upload resources. Requests and renderer projections contain opaque upload and
+snapshot identities, digests, counts, and byte sizes, never a Mac or Linux host
+path. Scratch creation and finalized uploads produce a Core-owned immutable
+Workspace Snapshot. Task submission carries expected project/head identities;
+Core derives the closed task envelope, normalized evolution intent, and exact
+workspace input from its saved project and staged-workspace authority. A client
+cannot manufacture those admission digests or submit an unowned snapshot.
+
 A saved task remains a Desktop draft while a successor transition, settings
 transition, runtime-context rebind, or workspace publication is unresolved.
 Submission returns typed not-ready and creates no Task, admission, or attempt.
@@ -427,6 +443,11 @@ V2 exposes compare-and-set/idempotent close, transition retry, replacement
 plan, abandon, and historical restore actions with replayable events. The
 0.1.9 renderer may expose only the subset needed for Subscription recovery, but
 the provider models and state transitions remain complete and closed.
+
+The production Daemon composition must bind these routes to a real project
+owner, workspace owner, Subscription attempt executor, and successor preparer.
+The schema-only app, a test preparer, a provider returning 503 for task
+execution, or the historical v1 launcher is not a releasable v2 Daemon.
 
 ### 5.4 Production execution snapshot issuer
 
