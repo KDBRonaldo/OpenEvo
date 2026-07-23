@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import sqlite3
 import threading
 
 import pytest
@@ -25,9 +26,11 @@ from openevo.backend.run_control import (
     CoreTaskControlError,
 )
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
+import openevo.backend.science_run_store as task_store_module
 from openevo.backend.science_run_store import (
     ScienceProjectAdmissionAuthorityV2,
     ScienceProjectReadinessBlockerV2,
+    ScienceTaskStoreV2Error,
 )
 
 
@@ -476,5 +479,77 @@ def test_v2_task_owner_never_dispatches_a_frozen_v1_run_operation(
             owner.invoke("createCoreRunV1", {})
         assert unavailable.value.code == "task_operation_unavailable"
         assert owner.ownership_counts() == (0, 0, 0)
+    finally:
+        owner.close()
+
+
+def test_v2_event_journal_survives_restart_and_tamper_fails_closed(
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(authority)
+    task = owner.invoke(
+        "submitCoreTaskV2",
+        {"request": _request(authority), "idempotency_key": "event-journal"},
+    )
+    event = owner.list_task_events(task.task_id)[0]
+    assert event.event_type == "task_admitted"
+    assert event.event_id.startswith("event-")
+    assert len(event.event_id) == len("event-") + 64
+    owner.close()
+
+    restarted = _owner(tmp_path)
+    assert restarted.list_events()[0] == event
+    restarted.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE events SET event_type = 'attempt_appended' WHERE event_id = ?",
+            (event.event_id,),
+        )
+        connection.commit()
+    with pytest.raises(ScienceTaskStoreV2Error, match="event journal"):
+        _owner(tmp_path)
+
+
+def test_v2_task_timeline_outlives_the_bounded_sse_replay_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(task_store_module, "_MAX_V2_EVENT_REPLAY", 3)
+    authority = _authority()
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(authority)
+    try:
+        first = owner.invoke(
+            "submitCoreTaskV2",
+            {"request": _request(authority), "idempotency_key": "timeline-first"},
+        )
+        first_timeline = owner.list_task_events(first.task_id)
+        assert [event.event_type for event in first_timeline] == [
+            "task_admitted",
+            "attempt_appended",
+        ]
+        owner.close_task(
+            first.task_id,
+            TaskActionRequestV2(
+                task_admission_id=first.admission.task_admission_id,
+                admission_sha256=first.admission.admission_sha256,
+            ),
+        )
+        second = owner.invoke(
+            "submitCoreTaskV2",
+            {"request": _request(authority), "idempotency_key": "timeline-second"},
+        )
+
+        assert len(owner.list_events()) == 3
+        assert owner.list_task_events(first.task_id) == first_timeline
+        assert len(owner.list_task_events(second.task_id)) == 2
+        with pytest.raises(CoreTaskControlError) as expired:
+            owner.list_events(after_event_id=first_timeline[0].event_id)
+        assert expired.value.code == "event_cursor_expired"
+        assert expired.value.http_status == 410
     finally:
         owner.close()

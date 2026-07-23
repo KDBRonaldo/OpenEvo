@@ -44,9 +44,11 @@ EXPECTED_OPERATIONS = {
     ("GET", "/version"),
     ("GET", "/health"),
     ("GET", "/v2/system/status"),
+    ("GET", "/v2/capabilities"),
     ("GET", "/v2/projects"),
     ("POST", "/v2/projects"),
     ("GET", "/v2/projects/{project_id}"),
+    ("POST", "/v2/projects/{project_id}/validate"),
     ("GET", "/v2/projects/{project_id}/heads"),
     ("GET", "/v2/projects/{project_id}/heads/active"),
     ("GET", "/v2/project-heads/{project_head_id}"),
@@ -474,7 +476,7 @@ def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
     assert openapi_sha256() == (
-        "2ceda6959407c471b9ae83d168db70075f13c4eb0d36786cd431ec6b330f95b5"
+        "38d82187240f7573fb662f1da718de36f57e3bd9ea79429cfb242e28fa689379"
     )
 
 

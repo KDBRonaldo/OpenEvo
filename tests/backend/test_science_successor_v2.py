@@ -16,6 +16,7 @@ from openevo.backend.contracts.v2.models import (
     RuntimeContextSnapshotRefV2,
     TaskSubmitRequestV2,
     TaskV2,
+    TransitionChangedEventV2,
     WorkspaceSnapshotRefV2,
 )
 from openevo.backend.run_control import CoreTaskControlError
@@ -68,7 +69,12 @@ def _workspace(project_id: str, seed: str) -> WorkspaceSnapshotRefV2:
     )
 
 
-def _head(project_id: str = "project-1") -> ProjectHeadRefV2:
+def _head(
+    project_id: str = "project-1",
+    *,
+    registry_sha256: str = "a" * 64,
+    runtime_contract_sha256: str = "b" * 64,
+) -> ProjectHeadRefV2:
     evolution = EvolutionRevisionRefV2(
         evolution_revision_id="evolution-0",
         project_id=project_id,
@@ -80,8 +86,8 @@ def _head(project_id: str = "project-1") -> ProjectHeadRefV2:
         project_id=project_id,
         evolution_revision_id=evolution.evolution_revision_id,
         evolution_revision_manifest_sha256=evolution.manifest_sha256,
-        registry_sha256="a" * 64,
-        runtime_contract_sha256="b" * 64,
+        registry_sha256=registry_sha256,
+        runtime_contract_sha256=runtime_contract_sha256,
         manifest_sha256="3" * 64,
     )
     execution = EffectiveExecutionSnapshotRefV2(
@@ -263,7 +269,10 @@ class _Preparer(ScienceSuccessorPreparerV2):
                 evolution_revision_id=evolution.evolution_revision_id,
                 evolution_revision_manifest_sha256=evolution.manifest_sha256,
                 registry_sha256=context.task.admission.registry_sha256,
-                runtime_contract_sha256="f" * 64,
+                runtime_contract_sha256=(
+                    context.task.admission.predecessor_project_head
+                    .runtime_context_snapshot.runtime_contract_sha256
+                ),
                 manifest_sha256="1" * 64,
             ),
         )
@@ -391,6 +400,9 @@ def test_preparation_failure_keeps_predecessor_active_and_next_task_not_ready(
         assert transition.state == "failed"
         assert transition.error is not None
         assert transition.transition.successor_project_head is None
+        final_event = owner.list_task_events(task.task_id)[-1]
+        assert final_event.event_type == "transition_changed"
+        assert final_event.state == "failed"
         assert owner.active_project_head(task.project_id) == predecessor.active_project_head
         assert owner.list_project_heads(task.project_id) == [
             predecessor.active_project_head
@@ -537,6 +549,48 @@ def test_restart_fails_closed_on_tampered_atomic_successor_receipt(
         connection.commit()
 
     with pytest.raises(ScienceTaskStoreV2Error, match="persisted v2 document"):
+        _owner(tmp_path, _Preparer())
+
+
+def test_restart_fails_closed_on_rewritten_successor_event_history(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path, _Preparer())
+    _predecessor, task = _admit(owner)
+    owner.run_successor_transition(
+        task.task_id,
+        accepted_attempt_id=task.attempts[0].attempt_id,
+        plan=_plan(task),
+    )
+    owner.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT sequence, event_json FROM events "
+            "WHERE task_id = ? AND event_type = 'transition_changed' "
+            "ORDER BY sequence LIMIT 1",
+            (task.task_id,),
+        ).fetchone()
+        assert row is not None
+        event = TransitionChangedEventV2.model_validate_json(bytes(row[1]))
+        rewritten = event.model_copy(
+            update={"state": "committing", "progress_completed": 5}
+        )
+        rewritten = rewritten.model_copy(
+            update={"event_id": task_store_module._v2_event_id(rewritten)}
+        )
+        connection.execute(
+            "UPDATE events SET event_id = ?, event_json = ? WHERE sequence = ?",
+            (
+                rewritten.event_id,
+                task_store_module._v2_model_bytes(rewritten),
+                row[0],
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(ScienceTaskStoreV2Error, match="event history"):
         _owner(tmp_path, _Preparer())
 
 

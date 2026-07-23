@@ -974,6 +974,97 @@ def test_status_proof_requires_authenticated_verified_identity(
     assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
 
 
+def test_status_proof_accepts_exact_v2_daemon_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[str] = []
+    feature_flags = ["immutable_task_admission"]
+    version = {
+        "schema_version": "2",
+        "api_name": "openevo-core-control-api",
+        "preferred_major": 2,
+        "supported_majors": [1, 2],
+        "mutation_major": 2,
+        "mutation_compatible": True,
+        "provider_kind": "openevo_daemon",
+        "build_channel": "release",
+        "source_commit": SOURCE_COMMIT,
+        "release_version": "0.1.9",
+        "build_id": "6" * 64,
+        "feature_flags": feature_flags,
+        "feature_set_sha256": hashlib.sha256(
+            json.dumps(feature_flags, separators=(",", ":")).encode("ascii")
+        ).hexdigest(),
+        "registry_sha256": RELEASE_A.registry_digest,
+        "runtime_contract_sha256": "7" * 64,
+        "contracts": [
+            {
+                "api_major": 1,
+                "access": "read_only_migration",
+                "mutation_compatible": False,
+                "openapi_sha256": "1" * 64,
+                "event_schema_sha256": "2" * 64,
+            },
+            {
+                "api_major": 2,
+                "access": "mutation",
+                "mutation_compatible": True,
+                "openapi_sha256": "3" * 64,
+                "event_schema_sha256": "4" * 64,
+            },
+        ],
+    }
+    status = {
+        "schema_version": "2",
+        "status": "ready",
+        "source_commit": SOURCE_COMMIT,
+        "release_version": "0.1.9",
+        "registry_sha256": RELEASE_A.registry_digest,
+        "checked_at": "2026-07-23T03:00:00.000000Z",
+    }
+
+    def fetch(_host: str, _port: int, path: str, **_kwargs: object) -> object:
+        requests.append(path)
+        return version if path == "/version" else status
+
+    monkeypatch.setattr(service, "_fetch_json", fetch)
+    proof = service._authenticated_status_proof(
+        port=8765,
+        bearer="B" * 64,
+        release=RELEASE_A,
+        generation="3" * 32,
+        deadline=time.monotonic() + 1,
+    )
+
+    assert len(proof) == 64
+    assert requests == ["/version", "/v2/system/status"]
+
+    version["feature_flags"] = ["event_replay_v2", "verified_registry"]
+    version["feature_set_sha256"] = hashlib.sha256(
+        json.dumps(version["feature_flags"], separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    version["build_id"] = "8" * 64
+    changed_feature_proof = service._authenticated_status_proof(
+        port=8765,
+        bearer="B" * 64,
+        release=RELEASE_A,
+        generation="3" * 32,
+        deadline=time.monotonic() + 1,
+    )
+    assert changed_feature_proof != proof
+
+    version["mutation_compatible"] = False
+    with pytest.raises(CoreServiceError) as exc_info:
+        service._authenticated_status_proof(
+            port=8765,
+            bearer="B" * 64,
+            release=RELEASE_A,
+            generation="3" * 32,
+            deadline=time.monotonic() + 1,
+        )
+    assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
+
+
 @pytest.mark.parametrize(
     ("status", "payload"),
     [

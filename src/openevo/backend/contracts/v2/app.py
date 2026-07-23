@@ -1,19 +1,33 @@
-"""Canonical schema-only FastAPI application for Core Control API v2."""
+"""Canonical FastAPI routes and optional Core Control API v2 provider binding."""
 
 from __future__ import annotations
 
-from typing import Annotated, Literal
+from collections.abc import Iterable, Iterator, Mapping
+from functools import wraps
+import re
+import secrets
+from typing import Annotated, Literal, Protocol
 
-from fastapi import APIRouter, Depends, FastAPI, Header, Query, Security
+from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request, Security
+from fastapi.exceptions import RequestValidationError
 from fastapi.openapi.utils import get_openapi
+from fastapi.routing import APIRoute
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import StringConstraints
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import models as m
 
 
 _CONTRACT_ONLY_MESSAGE = "This app defines the Core Control API v2 contract and has no provider."
+_VERSIONED_PATH = re.compile(r"^/v([0-9]+)(?:/|$)")
+_PROJECT_VALIDATION_PATH = re.compile(
+    r"^/v2/projects/[A-Za-z0-9][A-Za-z0-9._-]{0,127}/validate$",
+    re.ASCII,
+)
+_MAX_PROJECT_VALIDATION_BYTES = 1024 * 1024
+_MAX_PROJECT_VALIDATION_JSON_DEPTH = 24
 _bearer = HTTPBearer(
     auto_error=False,
     scheme_name="CoreBearerAuthV2",
@@ -28,6 +42,232 @@ async def _declare_bearer_security(
     ],
 ) -> None:
     """Declare the v2 security scheme without implementing a provider."""
+
+
+class CoreControlApiProviderV2(Protocol):
+    """Business provider dispatched through the frozen v2 operation IDs."""
+
+    def authenticate(self, authorization_values: tuple[bytes, ...]) -> bool: ...
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
+
+    async def invoke_async(
+        self, operation_id: str, arguments: Mapping[str, object]
+    ) -> object: ...
+
+
+class CoreControlHTTPErrorV2(Exception):
+    """Typed provider error rendered as the frozen :class:`ApiErrorV2` shape."""
+
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        code: str,
+        message: str,
+        category: Literal[
+            "system",
+            "project",
+            "task",
+            "transition",
+            "artifact",
+            "service",
+            "authentication",
+            "contract",
+            "internal",
+        ],
+        retryable: bool,
+        repair_action: Literal[
+            "retry", "repair", "reconfigure", "user_action_required", "unsupported"
+        ],
+        next_action: str,
+        headers: Mapping[str, str] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.error = m.ApiErrorV2(
+            request_id=f"request-{secrets.token_hex(16)}",
+            code=code,
+            http_status=status_code,
+            message=message,
+            category=category,
+            retryable=retryable,
+            repair_action=repair_action,
+            next_action=next_action,
+        )
+        self.headers = dict(headers or {})
+
+
+class _ProjectValidationBodyGuardV2:
+    """Bound project validation before Starlette decodes JSON or Pydantic runs."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if not _is_project_validation_request(scope):
+            await self.app(scope, receive, send)
+            return
+
+        declared_length = _content_length(scope)
+        if (
+            declared_length is not None
+            and declared_length > _MAX_PROJECT_VALIDATION_BYTES
+        ):
+            await _body_guard_error(
+                413,
+                code="request_body_too_large",
+                message="The project validation request exceeds the byte limit.",
+            )(scope, receive, send)
+            return
+
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message["type"] == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            if len(body) + len(chunk) > _MAX_PROJECT_VALIDATION_BYTES:
+                await _body_guard_error(
+                    413,
+                    code="request_body_too_large",
+                    message="The project validation request exceeds the byte limit.",
+                )(scope, receive, send)
+                return
+            body.extend(chunk)
+            if not message.get("more_body", False):
+                break
+
+        if _json_nesting_exceeds(body, _MAX_PROJECT_VALIDATION_JSON_DEPTH):
+            await _body_guard_error(
+                422,
+                code="request_json_too_deep",
+                message="The project validation request exceeds the nesting limit.",
+            )(scope, receive, send)
+            return
+
+        replayed = False
+
+        async def replay_receive() -> Message:
+            nonlocal replayed
+            if replayed:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            replayed = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay_receive, send)
+
+
+def _provider_error_response(exc: CoreControlHTTPErrorV2) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=exc.error.model_dump(mode="json"),
+        headers=exc.headers,
+    )
+
+
+def _body_guard_error(
+    status_code: int,
+    *,
+    code: str,
+    message: str,
+) -> JSONResponse:
+    return _provider_error_response(
+        CoreControlHTTPErrorV2(
+            status_code,
+            code=code,
+            message=message,
+            category="contract",
+            retryable=False,
+            repair_action="reconfigure",
+            next_action="Reduce or correct the request body before retrying.",
+        )
+    )
+
+
+def _is_project_validation_request(scope: Scope) -> bool:
+    return (
+        scope["type"] == "http"
+        and scope.get("method") == "POST"
+        and _PROJECT_VALIDATION_PATH.fullmatch(str(scope.get("path", "")))
+        is not None
+    )
+
+
+def _content_length(scope: Scope) -> int | None:
+    values = [
+        value
+        for name, value in scope.get("headers", ())
+        if name.lower() == b"content-length"
+    ]
+    if len(values) != 1:
+        return None
+    try:
+        value = int(values[0])
+    except ValueError:
+        return None
+    return value if value >= 0 else None
+
+
+def _json_nesting_exceeds(body: bytes | bytearray, maximum: int) -> bool:
+    depth = 0
+    in_string = False
+    escaped = False
+    for value in body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif value == ord("\\"):
+                escaped = True
+            elif value == ord('"'):
+                in_string = False
+            continue
+        if value == ord('"'):
+            in_string = True
+        elif value in (ord("{"), ord("[")):
+            depth += 1
+            if depth > maximum:
+                return True
+        elif value in (ord("}"), ord("]")):
+            depth = max(depth - 1, 0)
+    return False
+
+
+def _iter_api_routes(routes: Iterable[object]) -> Iterator[APIRoute]:
+    visited_routers: set[int] = set()
+
+    def visit(items: Iterable[object]) -> Iterator[APIRoute]:
+        for route in items:
+            if isinstance(route, APIRoute):
+                yield route
+                continue
+            original_router = getattr(route, "original_router", None)
+            if not isinstance(original_router, APIRouter):
+                continue
+            identity = id(original_router)
+            if identity in visited_routers:
+                continue
+            visited_routers.add(identity)
+            yield from visit(original_router.routes)
+
+    yield from visit(routes)
+
+
+def _bind_provider(app: FastAPI, provider: CoreControlApiProviderV2) -> None:
+    for route in _iter_api_routes(app.routes):
+        if route.operation_id is None:
+            continue
+        operation_id = route.operation_id
+        original_endpoint = route.endpoint
+
+        @wraps(original_endpoint)
+        async def invoke_provider(
+            _operation_id: str = operation_id, **arguments: object
+        ) -> object:
+            return await provider.invoke_async(_operation_id, arguments)
+
+        route.endpoint = invoke_provider
+        route.dependant.call = invoke_provider
 
 
 def _not_implemented() -> JSONResponse:
@@ -45,6 +285,7 @@ _ERROR_RESPONSES = {
     409: {"model": m.ApiErrorV2, "description": "Resource or idempotency conflict."},
     410: {"model": m.ApiErrorV2, "description": "Cursor or event replay expired."},
     412: {"model": m.ApiErrorV2, "description": "Expected authority identity changed."},
+    413: {"model": m.ApiErrorV2, "description": "Request body exceeds its byte limit."},
     422: {"model": m.ApiErrorV2, "description": "Closed contract validation failed."},
     426: {"model": m.ApiErrorV2, "description": "Contract version unsupported."},
     500: {"model": m.ApiErrorV2, "description": "Core internal error."},
@@ -90,8 +331,10 @@ LastEventId = Annotated[
 ]
 
 
-def create_core_control_v2_contract_app() -> FastAPI:
-    """Create the v2 schema source; every endpoint intentionally returns 501."""
+def create_core_control_v2_contract_app(
+    provider: CoreControlApiProviderV2 | None = None,
+) -> FastAPI:
+    """Create the canonical app, optionally bound to a real business provider."""
 
     app = FastAPI(
         title="OpenEvo Core Control API v2 Contract (Schema Only)",
@@ -105,6 +348,7 @@ def create_core_control_v2_contract_app() -> FastAPI:
         redoc_url=None,
         openapi_url=None,
     )
+    app.add_middleware(_ProjectValidationBodyGuardV2)
 
     @app.get(
         "/version",
@@ -139,6 +383,20 @@ def create_core_control_v2_contract_app() -> FastAPI:
         tags=["system"],
     )
     async def system_status() -> Response:
+        return _not_implemented()
+
+    @router.get(
+        "/capabilities",
+        operation_id="getCoreCapabilitiesV2",
+        response_model=m.CapabilitiesResponseV2,
+        responses=_ERROR_RESPONSES,
+        tags=["capabilities"],
+    )
+    async def capabilities(
+        execution_mode: Annotated[
+            Literal["codex_subscription_transcript", "self_deployed"], Query()
+        ],
+    ) -> Response:
         return _not_implemented()
 
     @router.get(
@@ -177,6 +435,20 @@ def create_core_control_v2_contract_app() -> FastAPI:
         tags=["projects"],
     )
     async def get_project(project_id: ResourceId) -> Response:
+        return _not_implemented()
+
+    @router.post(
+        "/projects/{project_id}/validate",
+        operation_id="validateCoreProjectV2",
+        response_model=m.ProjectValidationResponseV2,
+        responses=_ERROR_RESPONSES,
+        tags=["projects"],
+    )
+    async def validate_project(
+        project_id: ResourceId,
+        request: m.ProjectValidationRequestV2,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
         return _not_implemented()
 
     @router.get(
@@ -606,6 +878,91 @@ def create_core_control_v2_contract_app() -> FastAPI:
 
     app.include_router(router)
 
+    if provider is not None:
+        app.state.core_control_v2_provider = provider
+
+        @app.middleware("http")
+        async def enforce_provider_boundary(request: Request, call_next):
+            version_match = _VERSIONED_PATH.match(request.url.path)
+            if version_match is not None:
+                authorization_values = tuple(
+                    value
+                    for name, value in request.scope.get("headers", ())
+                    if name.lower() == b"authorization"
+                )
+                if not provider.authenticate(authorization_values):
+                    return _provider_error_response(
+                        CoreControlHTTPErrorV2(
+                            401,
+                            code="core_bearer_invalid",
+                            message="The Core bearer credential is missing or invalid.",
+                            category="authentication",
+                            retryable=False,
+                            repair_action="user_action_required",
+                            next_action=(
+                                "Reconnect with the bearer issued for this Core instance."
+                            ),
+                            headers={"WWW-Authenticate": "Bearer"},
+                        )
+                    )
+                if version_match.group(1) != "2":
+                    return _provider_error_response(
+                        CoreControlHTTPErrorV2(
+                            426,
+                            code="contract_version_unsupported",
+                            message=(
+                                "The requested Core Control API major version is unsupported."
+                            ),
+                            category="contract",
+                            retryable=False,
+                            repair_action="user_action_required",
+                            next_action="Negotiate a supported major through GET /version.",
+                        )
+                    )
+            return await call_next(request)
+
+        @app.exception_handler(CoreControlHTTPErrorV2)
+        async def provider_http_error(
+            _request: Request, exc: CoreControlHTTPErrorV2
+        ) -> JSONResponse:
+            return _provider_error_response(exc)
+
+        @app.exception_handler(RequestValidationError)
+        async def provider_validation_error(
+            _request: Request, _exc: RequestValidationError
+        ) -> JSONResponse:
+            return _provider_error_response(
+                CoreControlHTTPErrorV2(
+                    422,
+                    code="request_validation_error",
+                    message=(
+                        "The request does not satisfy the closed Core Control API v2 contract."
+                    ),
+                    category="contract",
+                    retryable=False,
+                    repair_action="reconfigure",
+                    next_action="Correct the request fields and retry.",
+                )
+            )
+
+        @app.exception_handler(Exception)
+        async def provider_internal_error(
+            _request: Request, _exc: Exception
+        ) -> JSONResponse:
+            return _provider_error_response(
+                CoreControlHTTPErrorV2(
+                    500,
+                    code="core_control_internal_error",
+                    message="Core Control could not complete the request.",
+                    category="internal",
+                    retryable=True,
+                    repair_action="retry",
+                    next_action="Inspect Core diagnostics before retrying.",
+                )
+            )
+
+        _bind_provider(app, provider)
+
     def contract_openapi() -> dict[str, object]:
         if app.openapi_schema is not None:
             return app.openapi_schema
@@ -642,6 +999,8 @@ core_control_v2_contract_app = create_core_control_v2_contract_app()
 
 
 __all__ = [
+    "CoreControlApiProviderV2",
+    "CoreControlHTTPErrorV2",
     "core_control_v2_contract_app",
     "create_core_control_v2_contract_app",
 ]

@@ -199,6 +199,16 @@ CREATE TABLE IF NOT EXISTS successor_commits (
     FOREIGN KEY(successor_transition_id)
         REFERENCES successor_transitions(successor_transition_id) ON DELETE RESTRICT
 ) STRICT;
+CREATE TABLE IF NOT EXISTS events (
+    sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
+    event_id TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    task_id TEXT,
+    event_json BLOB NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+) STRICT;
+CREATE INDEX IF NOT EXISTS events_task_sequence_idx ON events(task_id, sequence);
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_task_per_project
 ON tasks(project_id)
 WHERE closed = 0;
@@ -206,6 +216,9 @@ WHERE closed = 0;
 _MAX_V2_TASKS = 10_000
 _MAX_V2_PROJECTS = 10_000
 _MAX_V2_PROJECT_HEADS = _MAX_V2_PROJECTS + _MAX_V2_TASKS
+_MAX_V2_EVENT_REPLAY = 10_000
+_MAX_V2_EVENT_ROWS = 100_000
+_MAX_V2_EVENTS_PER_TASK = 10_000
 _V2_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
 
 
@@ -275,7 +288,15 @@ class ScienceTaskPreconditionFailedV2(ScienceTaskConflictV2):
     pass
 
 
+class ScienceTaskETagChangedV2(ScienceTaskPreconditionFailedV2):
+    pass
+
+
 class ScienceTaskTerminalV2(ScienceTaskConflictV2):
+    pass
+
+
+class ScienceEventCursorExpiredV2(ScienceTaskStoreV2Error):
     pass
 
 
@@ -1459,6 +1480,37 @@ class ScienceTaskStoreV2:
             _validate_v2_project_head_chain(heads)
             return heads
 
+    def get_project_head(self, project_head_id: str) -> m2.ProjectHeadRefV2:
+        project_head_id = _v2_resource_id(project_head_id, label="project head")
+        with self._lock, self._reader() as connection:
+            head = _load_v2_project_head(connection, project_head_id)
+            authority = _load_v2_project_authority(connection, head.project_id)
+            heads = self._project_heads_in_connection(connection, head.project_id)
+            if not heads or heads[-1] != authority.active_project_head:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project-head history does not bind active authority"
+                )
+            return head
+
+    def _project_heads_in_connection(
+        self,
+        connection: sqlite3.Connection,
+        project_id: str,
+    ) -> list[m2.ProjectHeadRefV2]:
+        rows = connection.execute(
+            "SELECT project_head_id FROM project_heads WHERE project_id = ? "
+            "ORDER BY generation LIMIT ?",
+            (project_id, _MAX_V2_TASKS + 2),
+        ).fetchall()
+        if len(rows) > _MAX_V2_TASKS + 1:
+            raise ScienceTaskStoreV2Error("v2 project-head history exceeds its bound")
+        heads = [
+            _load_v2_project_head(connection, str(row["project_head_id"]))
+            for row in rows
+        ]
+        _validate_v2_project_head_chain(heads)
+        return heads
+
     def start_successor_transition(
         self,
         *,
@@ -1581,6 +1633,20 @@ class ScienceTaskStoreV2:
                 "resource_version = resource_version + 1 WHERE project_id = ?",
                 (_v2_authority_bytes(blocked_authority), task.project_id),
             )
+            _append_v2_event(
+                connection,
+                model_type=m2.TransitionChangedEventV2,
+                event_type="transition_changed",
+                project_id=task.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "transition": reference,
+                    "state": transition.state,
+                    "progress_completed": transition.progress_completed,
+                    "progress_total": transition.progress_total,
+                },
+            )
             return _load_v2_successor_transition(connection, transition_id)
 
     def advance_successor_transition(
@@ -1627,10 +1693,92 @@ class ScienceTaskStoreV2:
                 "WHERE successor_transition_id = ?",
                 (_v2_model_bytes(updated), successor_transition_id),
             )
+            admission = updated.transition.task_admission
+            _append_v2_event(
+                connection,
+                model_type=m2.TransitionChangedEventV2,
+                event_type="transition_changed",
+                project_id=updated.transition.project_id,
+                task_id=None if admission is None else admission.task_id,
+                occurred_at=updated.updated_at,
+                payload={
+                    "transition": updated.transition,
+                    "state": updated.state,
+                    "progress_completed": updated.progress_completed,
+                    "progress_total": updated.progress_total,
+                },
+            )
             return _load_v2_successor_transition(
                 connection,
                 successor_transition_id,
             )
+
+    def record_dataset_sealed(
+        self,
+        successor_transition_id: str,
+        *,
+        dataset_id: str,
+        dataset_sha256: str,
+        now: datetime,
+    ) -> m2.DatasetSealedEventV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        dataset_id = _v2_resource_id(dataset_id, label="dataset")
+        if not isinstance(dataset_sha256, str) or re.fullmatch(
+            r"[0-9a-f]{64}", dataset_sha256, flags=re.ASCII
+        ) is None:
+            raise ValueError("v2 dataset digest is invalid")
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            admission = transition.transition.task_admission
+            attempt = transition.transition.accepted_attempt
+            if (
+                transition.state != "sealing_dataset"
+                or admission is None
+                or attempt is None
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 dataset event does not bind the sealing transition"
+                )
+            prior = connection.execute(
+                "SELECT event_json FROM events WHERE event_type = 'dataset_sealed' "
+                "AND task_id = ?",
+                (admission.task_id,),
+            ).fetchone()
+            if prior is not None:
+                event = _load_v2_event_bytes(bytes(prior["event_json"]))
+                if (
+                    not isinstance(event, m2.DatasetSealedEventV2)
+                    or event.dataset_id != dataset_id
+                    or event.dataset_sha256 != dataset_sha256
+                ):
+                    raise ScienceTaskConflictV2(
+                        "v2 Task already binds another sealed dataset"
+                    )
+                return event
+            event = _append_v2_event(
+                connection,
+                model_type=m2.DatasetSealedEventV2,
+                event_type="dataset_sealed",
+                project_id=transition.transition.project_id,
+                task_id=admission.task_id,
+                occurred_at=_v2_timestamp(now),
+                payload={
+                    "task_id": admission.task_id,
+                    "task_admission_id": admission.task_admission_id,
+                    "attempt_id": attempt.attempt_id,
+                    "dataset_id": dataset_id,
+                    "dataset_sha256": dataset_sha256,
+                },
+            )
+            if not isinstance(event, m2.DatasetSealedEventV2):
+                raise ScienceTaskStoreV2Error("v2 dataset event has the wrong type")
+            return event
 
     def fail_successor_transition(
         self,
@@ -1685,6 +1833,20 @@ class ScienceTaskStoreV2:
                 "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
                 "WHERE task_id = ?",
                 (_v2_model_bytes(updated_task), task.task_id),
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.TransitionChangedEventV2,
+                event_type="transition_changed",
+                project_id=updated_transition.transition.project_id,
+                task_id=task.task_id,
+                occurred_at=updated_transition.updated_at,
+                payload={
+                    "transition": updated_transition.transition,
+                    "state": updated_transition.state,
+                    "progress_completed": updated_transition.progress_completed,
+                    "progress_total": updated_transition.progress_total,
+                },
             )
             return _load_v2_successor_transition(
                 connection,
@@ -1810,6 +1972,56 @@ class ScienceTaskStoreV2:
                 "resource_version = resource_version + 1 WHERE project_id = ?",
                 (_v2_authority_bytes(next_authority), authority.project_id),
             )
+            _append_v2_event(
+                connection,
+                model_type=m2.EvolutionRevisionCommittedEventV2,
+                event_type="evolution_revision_committed",
+                project_id=successor.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "successor_transition_id": successor_transition_id,
+                    "evolution_revision": successor.evolution_revision,
+                },
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.RuntimeContextCommittedEventV2,
+                event_type="runtime_context_committed",
+                project_id=successor.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "successor_transition_id": successor_transition_id,
+                    "runtime_context_snapshot": successor.runtime_context_snapshot,
+                },
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.ProjectHeadActivatedEventV2,
+                event_type="project_head_activated",
+                project_id=successor.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "successor_transition_id": successor_transition_id,
+                    "project_head": successor,
+                },
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.TransitionChangedEventV2,
+                event_type="transition_changed",
+                project_id=successor.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "transition": committed_reference,
+                    "state": committed_transition.state,
+                    "progress_completed": committed_transition.progress_completed,
+                    "progress_total": committed_transition.progress_total,
+                },
+            )
             return _load_v2_successor_transition(
                 connection,
                 successor_transition_id,
@@ -1828,6 +2040,30 @@ class ScienceTaskStoreV2:
                 connection,
                 successor_transition_id,
             )
+
+    def list_successor_transitions(
+        self,
+        project_id: str,
+    ) -> list[m2.SuccessorTransitionV2]:
+        project_id = _v2_resource_id(project_id, label="project")
+        with self._lock, self._reader() as connection:
+            _load_v2_project_authority(connection, project_id)
+            rows = connection.execute(
+                "SELECT successor_transition_id FROM successor_transitions "
+                "WHERE project_id = ? ORDER BY successor_transition_id LIMIT ?",
+                (project_id, _MAX_V2_TASKS + 1),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor transition inventory exceeds its bound"
+                )
+            return [
+                _load_v2_successor_transition(
+                    connection,
+                    str(row["successor_transition_id"]),
+                )
+                for row in rows
+            ]
 
     def get_successor_transition_for_task(
         self,
@@ -1993,6 +2229,24 @@ class ScienceTaskStoreV2:
                     _v2_model_bytes(first_attempt),
                 ),
             )
+            _append_v2_event(
+                connection,
+                model_type=m2.TaskAdmittedEventV2,
+                event_type="task_admitted",
+                project_id=task.project_id,
+                task_id=task.task_id,
+                occurred_at=task.created_at,
+                payload={"admission": admission},
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.AttemptAppendedEventV2,
+                event_type="attempt_appended",
+                project_id=first_attempt.project_id,
+                task_id=first_attempt.task_id,
+                occurred_at=first_attempt.created_at,
+                payload={"attempt": first_attempt},
+            )
             return _load_v2_task_closure(connection, task.task_id), False
 
     def append_attempt(
@@ -2096,6 +2350,15 @@ class ScienceTaskStoreV2:
             recovered = _load_v2_task_closure(connection, task.task_id)
             if recovered.attempts[-1] != attempt:
                 raise ScienceTaskStoreV2Error("v2 Attempt append readback is inconsistent")
+            _append_v2_event(
+                connection,
+                model_type=m2.AttemptAppendedEventV2,
+                event_type="attempt_appended",
+                project_id=attempt.project_id,
+                task_id=attempt.task_id,
+                occurred_at=attempt.created_at,
+                payload={"attempt": attempt},
+            )
             return attempt, False
 
     def close_task(
@@ -2104,9 +2367,17 @@ class ScienceTaskStoreV2:
         request: m2.TaskActionRequestV2,
         *,
         now: datetime,
+        expected_etag: str | None = None,
+        allow_closed_recovery: bool = False,
     ) -> m2.TaskV2:
         task_id = _v2_resource_id(task_id, label="task")
         request = _validate_v2_model(m2.TaskActionRequestV2, request)
+        if expected_etag is not None and re.fullmatch(
+            r'"[0-9a-f]{64}"', expected_etag, flags=re.ASCII
+        ) is None:
+            raise ValueError("v2 Task expected ETag is invalid")
+        if type(allow_closed_recovery) is not bool:
+            raise TypeError("v2 Task close recovery flag must be exact bool")
         with self._lock, self._transaction() as connection:
             task = _load_v2_task_closure(connection, task_id)
             if (
@@ -2116,6 +2387,9 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskPreconditionFailedV2(
                     "v2 Task close does not bind the immutable admission"
                 )
+            if expected_etag is not None and task.etag != expected_etag:
+                if not (allow_closed_recovery and task.state == "closed"):
+                    raise ScienceTaskETagChangedV2("v2 Task ETag changed")
             if task.state == "closed":
                 return task
             if task.authoritative_attempt_id is not None or task.successor_transition is not None:
@@ -2176,6 +2450,67 @@ class ScienceTaskStoreV2:
                 task_id=task_id,
                 attempt_id=attempt_id,
             )
+
+    def list_events(
+        self,
+        *,
+        after_event_id: str | None = None,
+    ) -> list[m2.EventEnvelopeV2]:
+        if after_event_id is not None:
+            after_event_id = _v2_resource_id(after_event_id, label="event")
+        with self._lock, self._reader() as connection:
+            bounds = connection.execute(
+                "SELECT MIN(sequence) AS minimum, MAX(sequence) AS maximum FROM events"
+            ).fetchone()
+            minimum = bounds["minimum"]
+            maximum = bounds["maximum"]
+            if minimum is None or maximum is None:
+                if after_event_id is not None:
+                    raise ScienceEventCursorExpiredV2(
+                        "v2 event replay cursor is not retained"
+                    )
+                return []
+            replay_floor = max(
+                int(minimum),
+                int(maximum) - _MAX_V2_EVENT_REPLAY + 1,
+            )
+            after_sequence = replay_floor - 1
+            if after_event_id is not None:
+                cursor = connection.execute(
+                    "SELECT sequence FROM events WHERE event_id = ?",
+                    (after_event_id,),
+                ).fetchone()
+                if cursor is None:
+                    raise ScienceEventCursorExpiredV2(
+                        "v2 event replay cursor is not retained"
+                    )
+                after_sequence = int(cursor["sequence"])
+                if after_sequence < replay_floor:
+                    raise ScienceEventCursorExpiredV2(
+                        "v2 event replay cursor is not retained"
+                    )
+            rows = connection.execute(
+                "SELECT task_id, event_json FROM events WHERE sequence > ? ORDER BY sequence "
+                "LIMIT ?",
+                (after_sequence, _MAX_V2_EVENT_REPLAY + 1),
+            ).fetchall()
+            if len(rows) > _MAX_V2_EVENT_REPLAY:
+                raise ScienceTaskStoreV2Error("v2 event replay exceeds its bound")
+            events = [
+                _load_and_validate_v2_event(connection, row)
+                for row in rows
+            ]
+            for task_id in sorted(
+                {str(row["task_id"]) for row in rows if row["task_id"] is not None}
+            ):
+                _load_and_validate_v2_task_event_history(connection, task_id)
+            return events
+
+    def list_task_events(self, task_id: str) -> list[m2.EventEnvelopeV2]:
+        task_id = _v2_resource_id(task_id, label="task")
+        with self._lock, self._reader() as connection:
+            _load_v2_task_closure(connection, task_id)
+            return _load_and_validate_v2_task_event_history(connection, task_id)
 
     def ownership_counts(self) -> tuple[int, int, int]:
         with self._lock, self._reader() as connection:
@@ -2333,6 +2668,50 @@ class ScienceTaskStoreV2:
                     raise ScienceTaskStoreV2Error(
                         "v2 Attempt append request authority is inconsistent"
                     )
+            event_rows = connection.execute(
+                "SELECT sequence, event_id, event_type, project_id, task_id, "
+                "event_json FROM events ORDER BY sequence LIMIT ?",
+                (_MAX_V2_EVENT_ROWS + 1,),
+            ).fetchall()
+            if len(event_rows) > _MAX_V2_EVENT_ROWS:
+                raise ScienceTaskStoreV2Error("v2 event journal exceeds its bound")
+            previous_sequence: int | None = None
+            for event_row in event_rows:
+                event = _load_v2_event_bytes(bytes(event_row["event_json"]))
+                sequence = int(event_row["sequence"])
+                if (
+                    event.sequence != sequence
+                    or event.event_id != event_row["event_id"]
+                    or event.event_id != _v2_event_id(event)
+                    or event.event_type != event_row["event_type"]
+                    or event.project_id != event_row["project_id"]
+                    or _v2_model_bytes(event) != bytes(event_row["event_json"])
+                    or (
+                        previous_sequence is not None
+                        and sequence != previous_sequence + 1
+                    )
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "persisted v2 event journal is inconsistent"
+                    )
+                task_id = event_row["task_id"]
+                if task_id is not None:
+                    task = _load_v2_task_closure(connection, str(task_id))
+                    if task.project_id != event.project_id:
+                        raise ScienceTaskStoreV2Error(
+                            "persisted v2 event belongs to another project"
+                        )
+                _validate_v2_event_authority(
+                    connection,
+                    event,
+                    None if task_id is None else str(task_id),
+                )
+                previous_sequence = sequence
+            for task_row in tasks:
+                _load_and_validate_v2_task_event_history(
+                    connection,
+                    str(task_row["task_id"]),
+                )
 
     @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
@@ -2735,6 +3114,329 @@ def _v2_model_from_bytes(model_type: type[_T], payload: bytes | str) -> _T:
     if _v2_model_bytes(model) != raw:
         raise ScienceTaskStoreV2Error("persisted v2 document is not canonical")
     return model
+
+
+_V2_EVENT_MODELS: dict[str, type[BaseModel]] = {
+    "task_admitted": m2.TaskAdmittedEventV2,
+    "attempt_appended": m2.AttemptAppendedEventV2,
+    "dataset_sealed": m2.DatasetSealedEventV2,
+    "transition_changed": m2.TransitionChangedEventV2,
+    "evolution_revision_committed": m2.EvolutionRevisionCommittedEventV2,
+    "runtime_context_committed": m2.RuntimeContextCommittedEventV2,
+    "project_head_activated": m2.ProjectHeadActivatedEventV2,
+}
+
+
+def _append_v2_event(
+    connection: sqlite3.Connection,
+    *,
+    model_type: type[BaseModel],
+    event_type: str,
+    project_id: str,
+    task_id: str | None,
+    occurred_at: str,
+    payload: Mapping[str, object],
+) -> m2.EventEnvelopeV2:
+    if _V2_EVENT_MODELS.get(event_type) is not model_type:
+        raise ScienceTaskStoreV2Error("v2 event model does not match its type")
+    next_sequence = int(
+        connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM events"
+        ).fetchone()[0]
+    )
+    if next_sequence > m2.MAX_JAVASCRIPT_SAFE_INTEGER:
+        raise ScienceTaskConflictV2("v2 event sequence capacity is exhausted")
+    event_count = int(connection.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+    if event_count >= _MAX_V2_EVENT_ROWS:
+        raise ScienceTaskConflictV2("v2 event journal capacity is exhausted")
+    event_payload = {
+        "schema_version": "2",
+        "sequence": next_sequence,
+        "occurred_at": occurred_at,
+        "project_id": project_id,
+        "event_type": event_type,
+        **dict(payload),
+    }
+    try:
+        provisional = model_type.model_validate(
+            {
+                "event_id": f'event-{"0" * 64}',
+                **event_payload,
+            }
+        )
+        event_id = _v2_event_id(provisional)
+        event = model_type.model_validate(
+            {
+                "event_id": event_id,
+                **event_payload,
+            }
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScienceTaskStoreV2Error("v2 event payload is invalid") from exc
+    connection.execute(
+        "INSERT INTO events(sequence, event_id, event_type, project_id, task_id, "
+        "event_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            next_sequence,
+            event_id,
+            event_type,
+            project_id,
+            task_id,
+            _v2_model_bytes(event),
+        ),
+    )
+    return event  # type: ignore[return-value]
+
+
+def _load_v2_event_bytes(payload: bytes | str) -> m2.EventEnvelopeV2:
+    raw_bytes = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    try:
+        raw = json.loads(raw_bytes.decode("utf-8", errors="strict"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ScienceTaskStoreV2Error("persisted v2 event is invalid") from exc
+    if not isinstance(raw, dict):
+        raise ScienceTaskStoreV2Error("persisted v2 event is invalid")
+    event_type = raw.get("event_type")
+    model_type = _V2_EVENT_MODELS.get(event_type) if isinstance(event_type, str) else None
+    if model_type is None:
+        raise ScienceTaskStoreV2Error("persisted v2 event type is invalid")
+    event = _v2_model_from_bytes(model_type, raw_bytes)
+    if event.event_id != _v2_event_id(event):
+        raise ScienceTaskStoreV2Error("persisted v2 event ID is inconsistent")
+    return event  # type: ignore[return-value]
+
+
+def _load_and_validate_v2_event(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+) -> m2.EventEnvelopeV2:
+    event = _load_v2_event_bytes(bytes(row["event_json"]))
+    task_id = row["task_id"]
+    _validate_v2_event_authority(
+        connection,
+        event,
+        None if task_id is None else str(task_id),
+    )
+    return event
+
+
+def _validate_v2_event_authority(
+    connection: sqlite3.Connection,
+    event: m2.EventEnvelopeV2,
+    task_id: str | None,
+) -> None:
+    if task_id is None:
+        raise ScienceTaskStoreV2Error("persisted v2 event has no Task authority")
+    task = _load_v2_task_closure(connection, task_id)
+    if task.project_id != event.project_id:
+        raise ScienceTaskStoreV2Error("persisted v2 event belongs to another project")
+    if isinstance(event, m2.TaskAdmittedEventV2):
+        valid = (
+            event.admission == task.admission
+            and event.occurred_at == task.admission.admitted_at
+        )
+    elif isinstance(event, m2.AttemptAppendedEventV2):
+        valid = (
+            event.attempt in task.attempts
+            and event.occurred_at == event.attempt.created_at
+        )
+    elif isinstance(event, m2.DatasetSealedEventV2):
+        valid = (
+            event.task_id == task.task_id
+            and event.task_admission_id == task.admission.task_admission_id
+            and any(attempt.attempt_id == event.attempt_id for attempt in task.attempts)
+        )
+        if valid and task.successor_transition is not None:
+            commit_row = connection.execute(
+                "SELECT commit_json FROM successor_commits "
+                "WHERE successor_transition_id = ?",
+                (task.successor_transition.successor_transition_id,),
+            ).fetchone()
+            if commit_row is not None:
+                commit = _v2_model_from_bytes(
+                    AtomicSuccessorCommitV2,
+                    bytes(commit_row["commit_json"]),
+                )
+                valid = (
+                    commit.manifest.dataset_id == event.dataset_id
+                    and commit.manifest.dataset_manifest_sha256
+                    == event.dataset_sha256
+                )
+    elif isinstance(event, m2.TransitionChangedEventV2):
+        current = _load_v2_successor_transition(
+            connection,
+            event.transition.successor_transition_id,
+        )
+        historical_reference = current.transition.model_copy(
+            update={"successor_project_head": None}
+        )
+        valid = (
+            current.transition.task_admission is not None
+            and current.transition.task_admission.task_id == task.task_id
+            and event.transition in (current.transition, historical_reference)
+        )
+    elif isinstance(event, m2.EvolutionRevisionCommittedEventV2):
+        transition = _load_v2_successor_transition(
+            connection,
+            event.successor_transition_id,
+        )
+        successor = transition.transition.successor_project_head
+        valid = successor is not None and event.evolution_revision == successor.evolution_revision
+    elif isinstance(event, m2.RuntimeContextCommittedEventV2):
+        transition = _load_v2_successor_transition(
+            connection,
+            event.successor_transition_id,
+        )
+        successor = transition.transition.successor_project_head
+        valid = (
+            successor is not None
+            and event.runtime_context_snapshot == successor.runtime_context_snapshot
+        )
+    elif isinstance(event, m2.ProjectHeadActivatedEventV2):
+        transition = _load_v2_successor_transition(
+            connection,
+            event.successor_transition_id,
+        )
+        valid = event.project_head == transition.transition.successor_project_head
+    else:  # pragma: no cover - closed event union guards this branch
+        valid = False
+    if not valid:
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 event does not match authoritative Task state"
+        )
+
+
+def _load_and_validate_v2_task_event_history(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> list[m2.EventEnvelopeV2]:
+    task = _load_v2_task_closure(connection, task_id)
+    rows = connection.execute(
+        "SELECT task_id, event_json FROM events WHERE task_id = ? ORDER BY sequence "
+        "LIMIT ?",
+        (task_id, _MAX_V2_EVENTS_PER_TASK + 1),
+    ).fetchall()
+    if len(rows) > _MAX_V2_EVENTS_PER_TASK:
+        raise ScienceTaskStoreV2Error("v2 task timeline exceeds its bound")
+    events = [_load_and_validate_v2_event(connection, row) for row in rows]
+
+    def invalid() -> None:
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 event history does not match the Task lifecycle"
+        )
+
+    expected_initial = 1 + len(task.attempts)
+    if len(events) < expected_initial:
+        invalid()
+    admitted = events[0]
+    if not isinstance(admitted, m2.TaskAdmittedEventV2):
+        invalid()
+    for offset, attempt in enumerate(task.attempts, start=1):
+        event = events[offset]
+        if not isinstance(event, m2.AttemptAppendedEventV2) or event.attempt != attempt:
+            invalid()
+
+    remaining = events[expected_initial:]
+    if task.successor_transition is None:
+        if remaining:
+            invalid()
+        return events
+
+    transition = _load_v2_successor_transition(
+        connection,
+        task.successor_transition.successor_transition_id,
+    )
+    if not remaining or not isinstance(remaining[0], m2.TransitionChangedEventV2):
+        invalid()
+    pending = remaining[0]
+    if (
+        pending.state != "pending"
+        or pending.progress_completed != 0
+        or pending.progress_total != 6
+    ):
+        invalid()
+
+    phases = (
+        "pending",
+        "sealing_dataset",
+        "running_methods",
+        "validating",
+        "materializing",
+        "committing",
+        "committed",
+    )
+    phase_index = 0
+    dataset_seen = False
+    commit_stage = 0
+    failed_seen = False
+    for offset, event in enumerate(remaining[1:], start=1):
+        if failed_seen:
+            invalid()
+        if isinstance(event, m2.TransitionChangedEventV2):
+            if event.state == "failed":
+                if (
+                    offset != len(remaining) - 1
+                    or transition.state != "failed"
+                    or event.progress_completed != phase_index
+                    or event.progress_total != 6
+                ):
+                    invalid()
+                failed_seen = True
+                continue
+            if phase_index + 1 >= len(phases) or event.state != phases[phase_index + 1]:
+                invalid()
+            if event.state == "running_methods" and not dataset_seen:
+                invalid()
+            if event.state == "committed" and commit_stage != 3:
+                invalid()
+            phase_index += 1
+            if event.progress_completed != phase_index or event.progress_total != 6:
+                invalid()
+            continue
+        if isinstance(event, m2.DatasetSealedEventV2):
+            if phase_index != 1 or dataset_seen or commit_stage != 0:
+                invalid()
+            dataset_seen = True
+            continue
+        if isinstance(event, m2.EvolutionRevisionCommittedEventV2):
+            if phase_index != 5 or commit_stage != 0:
+                invalid()
+            commit_stage = 1
+            continue
+        if isinstance(event, m2.RuntimeContextCommittedEventV2):
+            if phase_index != 5 or commit_stage != 1:
+                invalid()
+            commit_stage = 2
+            continue
+        if isinstance(event, m2.ProjectHeadActivatedEventV2):
+            if phase_index != 5 or commit_stage != 2:
+                invalid()
+            commit_stage = 3
+            continue
+        invalid()
+
+    if failed_seen:
+        if transition.progress_completed != phase_index or commit_stage != 0:
+            invalid()
+    elif (
+        transition.state != phases[phase_index]
+        or transition.progress_completed != phase_index
+        or transition.progress_total != 6
+    ):
+        invalid()
+    if phase_index >= 2 and not dataset_seen:
+        invalid()
+    if phase_index == 6:
+        if commit_stage != 3:
+            invalid()
+    elif commit_stage != 0:
+        invalid()
+    return events
+
+
+def _v2_event_id(event: BaseModel) -> str:
+    payload = event.model_dump(mode="json", exclude={"event_id"})
+    return f"event-{hashlib.sha256(_v2_json_bytes(payload)).hexdigest()}"
 
 
 def _v2_json_bytes(value: object) -> bytes:
@@ -3299,6 +4001,7 @@ __all__ = [
     "ScienceRunStore",
     "ScienceRunStoreError",
     "ScienceTaskConflictV2",
+    "ScienceTaskETagChangedV2",
     "ScienceTaskIdempotencyConflictV2",
     "ScienceTaskNotFoundV2",
     "ScienceTaskNotReadyV2",

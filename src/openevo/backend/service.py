@@ -23,7 +23,9 @@ import threading
 import time
 from typing import Any, Callable, Protocol, Sequence
 
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
+
+from openevo.backend.contracts.v2 import models as core_v2_models
 
 from openevo.backend.runtime_identity import (
     CoreReleaseIdentity,
@@ -1509,47 +1511,114 @@ def authenticate_core_service_endpoint(
         expected_headers=expected_headers,
         endpoint=endpoint,
     )
+    is_v2 = isinstance(version, dict) and (
+        version.get("preferred_major") == 2
+        or version.get("provider_kind") == "openevo_daemon"
+    )
+    status_path = "/v2/system/status" if is_v2 else "/v1/status"
     status = _fetch_json(
         host,
         port,
-        "/v1/status",
+        status_path,
         bearer=bearer,
         deadline=deadline,
         expected_headers=expected_headers,
         endpoint=endpoint,
     )
-    if (
-        not isinstance(version, dict)
-        or version.get("provider_kind") != "openevo_core"
-        or version.get("build_channel") != "release"
-        or version.get("source_commit") != source_commit
-        or not isinstance(version.get("openapi_sha256"), str)
-        or re.fullmatch(r"[0-9a-f]{64}", version["openapi_sha256"]) is None
-        or not isinstance(version.get("build_version"), str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version["build_version"]) is None
-        or not isinstance(status, dict)
-        or status.get("registry_status") != "verified"
-        or status.get("registry_digest") != registry_digest
-    ):
-        raise CoreServiceError(
-            CoreServiceErrorCode.STATUS_INVALID,
-            "Core service identity proof did not match the verified release.",
-            retryable=False,
+    if is_v2:
+        try:
+            version_v2 = core_v2_models.VersionResponseV2.model_validate(version)
+            status_v2 = core_v2_models.SystemStatusV2.model_validate(status)
+        except ValidationError as exc:
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATUS_INVALID,
+                "Core service identity proof did not match the verified release.",
+                retryable=False,
+            ) from exc
+        if (
+            version_v2.provider_kind != "openevo_daemon"
+            or version_v2.build_channel != "release"
+            or version_v2.source_commit != source_commit
+            or version_v2.registry_sha256 != registry_digest
+            or not version_v2.mutation_compatible
+            or status_v2.status != "ready"
+            or status_v2.release_version != version_v2.release_version
+            or status_v2.source_commit != source_commit
+            or status_v2.registry_sha256 != registry_digest
+        ):
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATUS_INVALID,
+                "Core service identity proof did not match the verified release.",
+                retryable=False,
+            )
+        mutation_offer = next(
+            (
+                offer
+                for offer in version_v2.contracts
+                if offer.api_major == version_v2.mutation_major
+            ),
+            None,
         )
-    material = canonical_json_bytes(
-        {
-            "schema_version": 1,
-            "generation": generation,
-            "release_identity": release_identity,
-            "openapi_sha256": version.get("openapi_sha256"),
-            "build_version": version.get("build_version"),
-            "source_commit": version.get("source_commit"),
-            "provider_kind": version.get("provider_kind"),
-            "build_channel": version.get("build_channel"),
-            "registry_status": status.get("registry_status"),
-            "registry_digest": status.get("registry_digest"),
-        }
-    )
+        if mutation_offer is None:
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATUS_INVALID,
+                "Core service identity proof did not match the verified release.",
+                retryable=False,
+            )
+        material = canonical_json_bytes(
+            {
+                "schema_version": 2,
+                "generation": generation,
+                "release_identity": release_identity,
+                "api_major": version_v2.mutation_major,
+                "openapi_sha256": mutation_offer.openapi_sha256,
+                "event_schema_sha256": mutation_offer.event_schema_sha256,
+                "release_version": version_v2.release_version,
+                "build_id": version_v2.build_id,
+                "source_commit": version_v2.source_commit,
+                "provider_kind": version_v2.provider_kind,
+                "build_channel": version_v2.build_channel,
+                "feature_set_sha256": version_v2.feature_set_sha256,
+                "registry_sha256": version_v2.registry_sha256,
+                "runtime_contract_sha256": version_v2.runtime_contract_sha256,
+            }
+        )
+    else:
+        if (
+            not isinstance(version, dict)
+            or version.get("provider_kind") != "openevo_core"
+            or version.get("build_channel") != "release"
+            or version.get("source_commit") != source_commit
+            or not isinstance(version.get("openapi_sha256"), str)
+            or re.fullmatch(r"[0-9a-f]{64}", version["openapi_sha256"]) is None
+            or not isinstance(version.get("build_version"), str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version["build_version"]
+            )
+            is None
+            or not isinstance(status, dict)
+            or status.get("registry_status") != "verified"
+            or status.get("registry_digest") != registry_digest
+        ):
+            raise CoreServiceError(
+                CoreServiceErrorCode.STATUS_INVALID,
+                "Core service identity proof did not match the verified release.",
+                retryable=False,
+            )
+        material = canonical_json_bytes(
+            {
+                "schema_version": 1,
+                "generation": generation,
+                "release_identity": release_identity,
+                "openapi_sha256": version.get("openapi_sha256"),
+                "build_version": version.get("build_version"),
+                "source_commit": version.get("source_commit"),
+                "provider_kind": version.get("provider_kind"),
+                "build_channel": version.get("build_channel"),
+                "registry_status": status.get("registry_status"),
+                "registry_digest": status.get("registry_digest"),
+            }
+        )
     return hmac.new(bearer.encode("ascii"), material, hashlib.sha256).hexdigest()
 
 

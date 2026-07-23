@@ -37,6 +37,7 @@ from openevo.backend.science_successor import (
 from openevo.backend.science_run_store import (
     ProjectInFlightCoordinator,
     ScienceAttemptNotFoundV2,
+    ScienceEventCursorExpiredV2,
     ScienceProjectInFlight,
     ScienceRunConflict,
     ScienceRunIdempotencyConflict,
@@ -46,6 +47,7 @@ from openevo.backend.science_run_store import (
     ScienceRunStoreError,
     ScienceProjectAdmissionAuthorityV2,
     ScienceTaskConflictV2,
+    ScienceTaskETagChangedV2,
     ScienceTaskIdempotencyConflictV2,
     ScienceTaskNotFoundV2,
     ScienceTaskNotReadyV2,
@@ -208,6 +210,10 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id=operation_id)
 
+    @property
+    def successor_available(self) -> bool:
+        return self._successor_preparer is not None
+
     def publish_project_admission_authority(
         self,
         authority: ScienceProjectAdmissionAuthorityV2,
@@ -249,6 +255,12 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="listCoreProjectHeadsV2")
 
+    def get_project_head(self, project_head_id: str) -> m2.ProjectHeadRefV2:
+        try:
+            return self._ledger.get_project_head(project_head_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreProjectHeadV2")
+
     def get_successor_transition(
         self,
         successor_transition_id: str,
@@ -257,6 +269,15 @@ class CoreScienceTaskOwnerV2:
             return self._ledger.get_successor_transition(successor_transition_id)
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="getCoreSuccessorTransitionV2")
+
+    def list_successor_transitions(
+        self,
+        project_id: str,
+    ) -> list[m2.SuccessorTransitionV2]:
+        try:
+            return self._ledger.list_successor_transitions(project_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="listCoreSuccessorTransitionsV2")
 
     def get_successor_transition_for_task(
         self,
@@ -311,6 +332,12 @@ class CoreScienceTaskOwnerV2:
             dataset = _validate_sealed_successor_dataset(
                 preparer.seal_dataset(context),
                 context=context,
+            )
+            self._ledger.record_dataset_sealed(
+                transition_id,
+                dataset_id=dataset.dataset_id,
+                dataset_sha256=dataset.manifest_sha256,
+                now=self._clock(),
             )
 
             context = self._advance_successor_phase(
@@ -449,9 +476,18 @@ class CoreScienceTaskOwnerV2:
         self,
         task_id: str,
         request: m2.TaskActionRequestV2,
+        *,
+        expected_etag: str | None = None,
+        allow_closed_recovery: bool = False,
     ) -> m2.TaskV2:
         try:
-            return self._ledger.close_task(task_id, request, now=self._clock())
+            return self._ledger.close_task(
+                task_id,
+                request,
+                now=self._clock(),
+                expected_etag=expected_etag,
+                allow_closed_recovery=allow_closed_recovery,
+            )
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="closeCoreTaskV2")
 
@@ -460,6 +496,22 @@ class CoreScienceTaskOwnerV2:
             return self._ledger.ownership_counts()
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="inspectCoreTaskOwnershipV2")
+
+    def list_events(
+        self,
+        *,
+        after_event_id: str | None = None,
+    ) -> list[m2.EventEnvelopeV2]:
+        try:
+            return self._ledger.list_events(after_event_id=after_event_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="streamCoreEventsV2")
+
+    def list_task_events(self, task_id: str) -> list[m2.EventEnvelopeV2]:
+        try:
+            return self._ledger.list_task_events(task_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreTaskTimelineV2")
 
     def close(self) -> None:
         self._ledger.close()
@@ -2998,6 +3050,13 @@ def _owner_error(code: str, message: str, status: int, retryable: bool) -> CoreR
 
 
 def _raise_v2_owner_error(exc: Exception, *, operation_id: str) -> None:
+    if isinstance(exc, ScienceEventCursorExpiredV2):
+        raise CoreTaskControlError(
+            "event_cursor_expired",
+            "The requested v2 event replay cursor is no longer retained.",
+            http_status=410,
+            retryable=False,
+        ) from exc
     if isinstance(exc, ScienceTaskNotReadyV2):
         raise CoreTaskControlError(
             "project_not_ready",
@@ -3024,6 +3083,13 @@ def _raise_v2_owner_error(exc: Exception, *, operation_id: str) -> None:
             "task_project_in_flight",
             "The project already has an immutable Task in flight.",
             http_status=409,
+            retryable=True,
+        ) from exc
+    if isinstance(exc, ScienceTaskETagChangedV2):
+        raise CoreTaskControlError(
+            "task_etag_changed",
+            "The Task ETag changed before the requested mutation.",
+            http_status=412,
             retryable=True,
         ) from exc
     if isinstance(exc, ScienceTaskPreconditionFailedV2):

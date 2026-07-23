@@ -14,6 +14,8 @@ from pydantic import (
     model_validator,
 )
 
+from openevo.evolution.framework.capabilities import EvolutionCapabilitiesV1
+
 
 MAX_JAVASCRIPT_SAFE_INTEGER = (1 << 53) - 1
 MAX_SNAPSHOT_ENTRIES = 100_000
@@ -421,6 +423,34 @@ class ProjectCreateV2(ContractModel):
     schema_version: Literal["2"] = "2"
     display_name: Annotated[str, StringConstraints(min_length=1, max_length=128)]
     project_config_sha256: Sha256Digest
+
+
+CapabilitiesResponseV2 = EvolutionCapabilitiesV1
+
+
+class ProjectValidationRequestV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    expected_project_head_id: OpaqueId
+    expected_project_head_manifest_sha256: Sha256Digest
+    project_config_sha256: Sha256Digest
+    expected_registry_sha256: Sha256Digest
+
+
+class ProjectValidationCheckV2(ContractModel):
+    check_id: OpaqueId
+    status: Literal["passed", "failed", "unavailable"]
+    message: Description
+    target_id: OpaqueId | None = None
+    method_id: OpaqueId | None = None
+
+
+class ProjectValidationResponseV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    project_id: OpaqueId
+    valid: bool
+    registry_sha256: Sha256Digest
+    checks: list[ProjectValidationCheckV2] = Field(max_length=256)
+    validated_at: UtcTimestamp
 
 
 class ProjectV2(ContractModel):
@@ -848,6 +878,7 @@ __all__ = [
     "AttemptPageV2",
     "AttemptRefV2",
     "CacheCleanupRequestV2",
+    "CapabilitiesResponseV2",
     "ContractModel",
     "ContractOfferV2",
     "ContractOnlyResponseV2",
@@ -863,6 +894,9 @@ __all__ = [
     "ProjectHeadPageV2",
     "ProjectHeadRefV2",
     "ProjectPageV2",
+    "ProjectValidationCheckV2",
+    "ProjectValidationRequestV2",
+    "ProjectValidationResponseV2",
     "ProjectV2",
     "RuntimeContextSnapshotRefV2",
     "ServicePageV2",
