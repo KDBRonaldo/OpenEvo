@@ -23,6 +23,32 @@ to both the expected generation and an idempotency key. This catalog is a UI
 hint: the selected exact alias is later passed to system OpenSSH, which remains
 the connection and configuration authority.
 
+## V2 provider state and Preview import
+
+The Desktop v2 local-state composition owns a separate owner-private
+`provider-v2/` namespace beneath the existing Desktop state root. Its SQLite
+schema and migration history have frozen startup fingerprints and use
+rollback-journal transactions. Every operation revalidates the held root, lock,
+database inode, size budgets, and the canonical closed documents it reads. A
+committed mutation and its idempotency response are one transaction, so a retry
+after process loss returns the original profile or draft without duplicating it.
+
+The retained v1 `provider.sqlite3` is opened only through a shared owner lock and
+SQLite read-only/query-only mode after exact root, file, schema, and inode
+validation. Import reads lengths before bounded cells and applies one aggregate
+budget. Valid explicit profiles become non-connectable `legacy_explicit`
+records containing only a display name and opaque digests. Host, user, port,
+authentication, proxy, cached revision, and remote authority are never copied.
+Corrupt or oversized profile rows become generic quarantined records; invalid
+project rows are skipped. Both cases produce bounded typed diagnostics, and an
+unsafe or unavailable legacy store does not prevent unrelated fresh v2 state
+from starting.
+
+Legacy draft documents stay process-local migration input. Copying one requires
+the user-selected system-OpenSSH profile and a complete `ScienceProjectConfigV2`
+that passes strict validation. The v2 store persists only that canonical config
+and its digest, never a cached v1 remote state or generic revision.
+
 ## Release execution modes
 
 The exact sidecar release composition publishes the required

@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 import hashlib
 import json
 import logging
@@ -36,7 +37,12 @@ from desktop.sidecar.core_bridge_v1 import (
     DesktopCoreBridgeV1,
 )
 from desktop.sidecar.event_broker_v1 import DesktopEventBrokerError, DesktopEventBrokerV1
+from desktop.sidecar.legacy_v1_import import (
+    LegacyV1ImportReport,
+    import_legacy_v1_state,
+)
 from desktop.sidecar.provider_store import DesktopProviderStore, ProviderStoreError
+from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
 from desktop.sidecar.remote_lifecycle import DesktopRemoteLifecycle
 from desktop.sidecar.workspace_identity import ownership_for_native_import
 from desktop.sidecar.workspace_imports import (
@@ -68,6 +74,7 @@ _MAX_DAEMON_MANIFEST_BYTES = 1024 * 1024
 _RELAY_MIN_BACKOFF_SECONDS = 0.1
 _RELAY_MAX_BACKOFF_SECONDS = 2.0
 _RELEASE_ACTIVATION_TIMEOUT_SECONDS = 900.0
+_V2_PROVIDER_STATE_DIRECTORY = "provider-v2"
 
 
 class ReleaseRuntimeConfigurationError(RuntimeError):
@@ -221,6 +228,62 @@ class CoreRuntimeSessionBinding:
 
     project: local_v1.ProjectV1
     generation: int
+
+
+@dataclass(slots=True)
+class ReleaseLocalStateV2:
+    """Own the isolated v2 provider store and its read-only v1 import report."""
+
+    provider_store: DesktopProviderStoreV2
+    legacy_import: LegacyV1ImportReport
+    _closed: bool = False
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.provider_store.close()
+        self._closed = True
+
+
+def create_release_local_state_v2(
+    state_root: Path | str,
+    *,
+    clock: Callable[[], datetime] | None = None,
+) -> ReleaseLocalStateV2:
+    """Create fresh v2 authority without mutating retained v1 state."""
+
+    root = Path(os.path.abspath(os.fspath(Path(state_root).expanduser())))
+    try:
+        metadata = os.lstat(root)
+    except FileNotFoundError:
+        root.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.mkdir(root, 0o700)
+        except FileExistsError:
+            metadata = os.lstat(root)
+        else:
+            os.chmod(root, 0o700, follow_symlinks=False)
+            metadata = os.lstat(root)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+        or (hasattr(os, "getuid") and metadata.st_uid != os.getuid())
+    ):
+        raise ReleaseRuntimeConfigurationError("Desktop v2 state root is not owner-private")
+    provider = DesktopProviderStoreV2(
+        root / _V2_PROVIDER_STATE_DIRECTORY,
+        clock=clock,
+    )
+    try:
+        imported = import_legacy_v1_state(provider, root)
+        return ReleaseLocalStateV2(
+            provider_store=provider,
+            legacy_import=imported,
+        )
+    except BaseException:
+        provider.close()
+        raise
 
 
 class ProviderWorkspaceArchiveSourceV1:
@@ -1232,7 +1295,9 @@ __all__ = (
     "CoreRuntimeSessionBinding",
     "DesktopReleaseCoreRuntimeV1",
     "ProviderWorkspaceArchiveSourceV1",
+    "ReleaseLocalStateV2",
     "ReleaseRuntimeConfigurationError",
     "create_release_core_runtime",
+    "create_release_local_state_v2",
     "load_core_bootstrap_config",
 )

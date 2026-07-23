@@ -710,15 +710,15 @@ The exact broader gate is added in Task 18 after every slice is present.
 - Create: `tests/openevo/sidecar/test_legacy_v1_import.py`
 - Modify: `desktop/sidecar/release_runtime.py`
 
-- [ ] Write RED tests for a new private state namespace/schema fingerprint,
+- [x] Write RED tests for a new private state namespace/schema fingerprint,
   atomic DDL/migration, crash recovery, budgets, inode/path replacement,
   retained v1 state, corrupt/oversized v1 rows, and unrelated startup.
-- [ ] Import v1 profiles as non-connectable `legacy_explicit` records only.
+- [x] Import v1 profiles as non-connectable `legacy_explicit` records only.
   Require explicit alias rebind for a new v2 profile.
-- [ ] Copy draft intent only after v2 validation; never adopt cached v1 remote
+- [x] Copy draft intent only after v2 validation; never adopt cached v1 remote
   authority or generic revision data.
-- [ ] Implement exact retry/idempotency/ETag semantics and startup recovery.
-- [ ] Run focused store tests and commit:
+- [x] Implement exact retry/idempotency/ETag semantics and startup recovery.
+- [x] Run focused store tests and commit:
   `feat(sidecar): migrate Preview state into v2 safely`
 
 ### Task 20: Implement strict Core v2 client and durable bridge
