@@ -21,6 +21,7 @@ from .snapshots import (
     deterministic_sha256,
     events_schema_sha256,
     openapi_sha256,
+    parse_contract_json_bytes,
 )
 
 __all__ = [
@@ -43,4 +44,5 @@ __all__ = [
     "deterministic_sha256",
     "events_schema_sha256",
     "openapi_sha256",
+    "parse_contract_json_bytes",
 ]

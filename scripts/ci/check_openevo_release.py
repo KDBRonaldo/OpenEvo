@@ -304,6 +304,47 @@ def validate_local_versions(expected_version: str) -> list[str]:
     return errors
 
 
+def validate_v019_contract_manifest(
+    repo_root: Path = REPO_ROOT,
+    *,
+    expected_version: str,
+) -> list[str]:
+    """Require exact Core v2 mutation authority for the 0.1.9 release."""
+
+    if expected_version != "0.1.9":
+        return []
+
+    manifest_path = repo_root / "desktop/release-contract.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return ["The 0.1.9 release contract manifest is missing or unreadable."]
+    if not isinstance(payload, dict):
+        return ["The 0.1.9 release contract manifest must be a JSON object."]
+
+    if str(SRC_ROOT) not in sys.path:
+        sys.path.insert(0, str(SRC_ROOT))
+    from openevo.backend.contracts.v2.snapshots import (
+        events_schema_sha256,
+        openapi_sha256,
+    )
+
+    errors: list[str] = []
+    if payload.get("schema_version") != "2":
+        errors.append("The 0.1.9 release contract manifest must use schema_version 2.")
+    if payload.get("core_control_mutation_major") != 2:
+        errors.append("The 0.1.9 release must require Core Control API v2 for mutation.")
+    if payload.get("accepted_core_openapi_digests") != [openapi_sha256()]:
+        errors.append(
+            "The 0.1.9 release manifest must pin the exact generated Core v2 OpenAPI digest."
+        )
+    if payload.get("accepted_core_event_schema_digests") != [events_schema_sha256()]:
+        errors.append(
+            "The 0.1.9 release manifest must pin the exact generated Core v2 event schema digest."
+        )
+    return errors
+
+
 def _desktop_package_metadata_paths() -> tuple[Path, ...]:
     candidates = (
         REPO_ROOT / "desktop" / "package.json",
@@ -561,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     all_errors: list[str] = []
     all_errors.extend(validate_local_versions(expected_version))
+    all_errors.extend(validate_v019_contract_manifest(expected_version=expected_version))
     all_errors.extend(validate_unsigned_macos_release_policy())
     if args.artifact is not None:
         all_errors.extend(

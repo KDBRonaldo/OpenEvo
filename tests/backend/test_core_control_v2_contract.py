@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import importlib.util
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -15,13 +18,23 @@ from openevo.backend.contracts.v2.models import (
     EvolutionRevisionRefV2,
     ProjectHeadRefV2,
     RuntimeContextSnapshotRefV2,
+    SseFrameV2,
     SuccessorTransitionRefV2,
+    TaskAdmittedEventV2,
     TaskAdmissionRefV2,
     WorkspaceSnapshotRefV2,
 )
 from openevo.backend.contracts.v2.snapshots import (
+    EVENTS_SCHEMA_SNAPSHOT_PATH,
+    OPENAPI_SNAPSHOT_PATH,
+    build_events_schema_document,
+    build_openapi_document,
     canonical_contract_bytes,
     canonical_contract_sha256,
+    canonical_json_bytes,
+    events_schema_sha256,
+    openapi_sha256,
+    parse_contract_json_bytes,
 )
 
 
@@ -434,3 +447,175 @@ def test_v2_contract_app_declares_authority_routes_and_is_contract_only() -> Non
         "code": "contract_only_not_implemented",
         "message": "This app defines the Core Control API v2 contract and has no provider.",
     }
+
+
+def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
+    rebuilt = canonical_json_bytes(build_openapi_document())
+    assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
+    assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
+    assert openapi_sha256() == (
+        "4cf68e882557a706bf962a42eb9a380aa03aaf05f546a714f49cc2dc3162ef92"
+    )
+
+
+def test_v2_event_schema_snapshot_is_exactly_rebuildable() -> None:
+    rebuilt = canonical_json_bytes(build_events_schema_document())
+    assert EVENTS_SCHEMA_SNAPSHOT_PATH.read_bytes() == rebuilt
+    assert hashlib.sha256(rebuilt).hexdigest() == events_schema_sha256()
+    assert events_schema_sha256() == (
+        "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+    )
+
+
+def test_bounded_contract_json_rejects_oversize_and_recursive_input_before_validation() -> None:
+    valid = json.dumps(_workspace(), separators=(",", ":")).encode()
+    assert parse_contract_json_bytes(WorkspaceSnapshotRefV2, valid).entry_count == 7
+
+    with pytest.raises(ValueError, match="byte limit"):
+        parse_contract_json_bytes(
+            WorkspaceSnapshotRefV2,
+            b'{"padding":"' + (b"x" * (1024 * 1024)) + b'"}',
+        )
+
+    recursive: object = "leaf"
+    for _ in range(18):
+        recursive = {"nested": recursive}
+    with pytest.raises(ValueError, match="depth limit"):
+        parse_contract_json_bytes(
+            WorkspaceSnapshotRefV2,
+            json.dumps(recursive).encode(),
+        )
+
+
+def test_bounded_contract_json_rejects_unknown_fields_and_type_coercion() -> None:
+    unknown = {**_workspace(), "metadata": {"host_path": "/private/tmp"}}
+    with pytest.raises(ValidationError):
+        parse_contract_json_bytes(
+            WorkspaceSnapshotRefV2,
+            json.dumps(unknown).encode(),
+        )
+    with pytest.raises(ValidationError):
+        parse_contract_json_bytes(
+            WorkspaceSnapshotRefV2,
+            json.dumps({**_workspace(), "entry_count": "7"}).encode(),
+        )
+
+
+def test_v2_event_identity_is_closed_and_cannot_drift() -> None:
+    admission = _admission()
+    event = {
+        "schema_version": "2",
+        "event_id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-23T00:00:02Z",
+        "project_id": "project-1",
+        "event_type": "task_admitted",
+        "admission": admission,
+    }
+    frame = {
+        "id": "event-1",
+        "event": "task_admitted",
+        "data": event,
+        "retry": 1000,
+    }
+    assert _json_model(SseFrameV2, frame).data.event_id == "event-1"
+
+    with pytest.raises(ValidationError, match="event project"):
+        _json_model(
+            TaskAdmittedEventV2,
+            {**event, "project_id": "project-2"},
+        )
+    with pytest.raises(ValidationError, match="SSE frame ID"):
+        _json_model(SseFrameV2, {**frame, "id": "event-2"})
+    with pytest.raises(ValidationError):
+        _json_model(SseFrameV2, {**frame, "id": "file://event"})
+
+
+def test_v2_http_cursor_idempotency_and_etag_boundaries_fail_closed() -> None:
+    client = TestClient(create_core_control_v2_contract_app())
+
+    assert client.get("/v2/projects?after=").status_code == 422
+    assert client.post("/v2/tasks", json={}).status_code == 422
+    assert (
+        client.post(
+            "/v2/tasks/task-1/close",
+            headers={
+                "Idempotency-Key": "retry-1",
+                "If-Match": "not-an-etag",
+            },
+            json={
+                "schema_version": "2",
+                "task_admission_id": "admission-1",
+                "admission_sha256": "a" * 64,
+            },
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            "/v2/tasks/task-1/close",
+            headers={
+                "Idempotency-Key": "x" * 257,
+                "If-Match": f'"{"a" * 64}"',
+            },
+            json={
+                "schema_version": "2",
+                "task_admission_id": "admission-1",
+                "admission_sha256": "a" * 64,
+            },
+        ).status_code
+        == 422
+    )
+
+
+def _load_release_checker() -> Any:
+    path = Path(__file__).resolve().parents[2] / "scripts/ci/check_openevo_release.py"
+    spec = importlib.util.spec_from_file_location("check_openevo_release_v2_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _v019_release_contract() -> dict[str, Any]:
+    return {
+        "schema_version": "2",
+        "core_control_mutation_major": 2,
+        "accepted_core_openapi_digests": [openapi_sha256()],
+        "accepted_core_event_schema_digests": [events_schema_sha256()],
+    }
+
+
+def test_v019_release_manifest_requires_exact_core_v2_schema_digests(
+    tmp_path: Path,
+) -> None:
+    checker = _load_release_checker()
+    desktop = tmp_path / "desktop"
+    desktop.mkdir()
+    manifest = desktop / "release-contract.json"
+    manifest.write_text(json.dumps(_v019_release_contract()), encoding="utf-8")
+
+    assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9") == []
+
+    payload = _v019_release_contract()
+    payload["accepted_core_openapi_digests"] = ["f" * 64]
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+    assert "exact generated Core v2 OpenAPI digest" in " ".join(
+        checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9")
+    )
+
+
+def test_v019_release_manifest_forbids_v1_mutation_authority(tmp_path: Path) -> None:
+    checker = _load_release_checker()
+    desktop = tmp_path / "desktop"
+    desktop.mkdir()
+    manifest = desktop / "release-contract.json"
+    payload = _v019_release_contract()
+    payload["core_control_mutation_major"] = 1
+    manifest.write_text(json.dumps(payload), encoding="utf-8")
+
+    errors = checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9")
+    assert any("must require Core Control API v2 for mutation" in error for error in errors)
+
+    # The guard is dormant for the retained 0.1.8 release identity until Task 25.
+    assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.8") == []

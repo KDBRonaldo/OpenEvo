@@ -528,10 +528,22 @@ class TaskAdmittedEventV2(EventBaseV2):
     event_type: Literal["task_admitted"]
     admission: TaskAdmissionRefV2
 
+    @model_validator(mode="after")
+    def _bind_project(self) -> TaskAdmittedEventV2:
+        if self.admission.project_id != self.project_id:
+            raise ValueError("event project differs from its task admission")
+        return self
+
 
 class AttemptAppendedEventV2(EventBaseV2):
     event_type: Literal["attempt_appended"]
     attempt: AttemptRefV2
+
+    @model_validator(mode="after")
+    def _bind_project(self) -> AttemptAppendedEventV2:
+        if self.attempt.project_id != self.project_id:
+            raise ValueError("event project differs from its attempt")
+        return self
 
 
 class DatasetSealedEventV2(EventBaseV2):
@@ -550,11 +562,25 @@ class TransitionChangedEventV2(EventBaseV2):
     progress_completed: int = Field(ge=0, le=10_000)
     progress_total: int = Field(ge=0, le=10_000)
 
+    @model_validator(mode="after")
+    def _bind_project(self) -> TransitionChangedEventV2:
+        if self.transition.project_id != self.project_id:
+            raise ValueError("event project differs from its transition")
+        if self.progress_completed > self.progress_total:
+            raise ValueError("transition progress exceeds total")
+        return self
+
 
 class EvolutionRevisionCommittedEventV2(EventBaseV2):
     event_type: Literal["evolution_revision_committed"]
     successor_transition_id: OpaqueId
     evolution_revision: EvolutionRevisionRefV2
+
+    @model_validator(mode="after")
+    def _bind_project(self) -> EvolutionRevisionCommittedEventV2:
+        if self.evolution_revision.project_id != self.project_id:
+            raise ValueError("event project differs from its evolution revision")
+        return self
 
 
 class RuntimeContextCommittedEventV2(EventBaseV2):
@@ -562,11 +588,23 @@ class RuntimeContextCommittedEventV2(EventBaseV2):
     successor_transition_id: OpaqueId
     runtime_context_snapshot: RuntimeContextSnapshotRefV2
 
+    @model_validator(mode="after")
+    def _bind_project(self) -> RuntimeContextCommittedEventV2:
+        if self.runtime_context_snapshot.project_id != self.project_id:
+            raise ValueError("event project differs from its runtime context")
+        return self
+
 
 class ProjectHeadActivatedEventV2(EventBaseV2):
     event_type: Literal["project_head_activated"]
     successor_transition_id: OpaqueId
     project_head: ProjectHeadRefV2
+
+    @model_validator(mode="after")
+    def _bind_project(self) -> ProjectHeadActivatedEventV2:
+        if self.project_head.project_id != self.project_id:
+            raise ValueError("event project differs from its project head")
+        return self
 
 
 EventEnvelopeV2: TypeAlias = Annotated[

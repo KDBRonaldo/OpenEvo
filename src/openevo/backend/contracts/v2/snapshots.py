@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from .app import create_core_control_v2_contract_app
 from .models import ContractModel, SseFrameV2
@@ -14,6 +14,11 @@ from .models import ContractModel, SseFrameV2
 CONTRACT_DIRECTORY = Path(__file__).resolve().parent
 OPENAPI_SNAPSHOT_PATH = CONTRACT_DIRECTORY / "openapi.json"
 EVENTS_SCHEMA_SNAPSHOT_PATH = CONTRACT_DIRECTORY / "events.schema.json"
+MAX_CONTRACT_JSON_BYTES = 1024 * 1024
+MAX_CONTRACT_JSON_DEPTH = 16
+MAX_CONTRACT_JSON_NODES = 8192
+MAX_CONTRACT_JSON_COLLECTION_ITEMS = 4096
+_ContractT = TypeVar("_ContractT", bound=ContractModel)
 
 
 def canonical_json_bytes(document: object) -> bytes:
@@ -51,6 +56,51 @@ def canonical_contract_sha256(contract: ContractModel) -> str:
     return hashlib.sha256(canonical_contract_bytes(contract)).hexdigest()
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"unsupported JSON constant: {value}")
+
+
+def parse_contract_json_bytes(
+    model: type[_ContractT],
+    payload: bytes,
+) -> _ContractT:
+    """Budget raw JSON before validating one strict closed contract model."""
+
+    if type(payload) is not bytes:
+        raise TypeError("contract JSON payload must be exact bytes")
+    if len(payload) > MAX_CONTRACT_JSON_BYTES:
+        raise ValueError("contract JSON exceeds the byte limit")
+    try:
+        decoded = json.loads(
+            payload.decode("utf-8", errors="strict"),
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("contract JSON is not valid UTF-8 JSON") from exc
+    if not isinstance(decoded, dict):
+        raise ValueError("contract JSON must contain one object")
+
+    stack: list[tuple[object, int]] = [(decoded, 1)]
+    node_count = 0
+    collection_items = 0
+    while stack:
+        value, depth = stack.pop()
+        node_count += 1
+        if node_count > MAX_CONTRACT_JSON_NODES:
+            raise ValueError("contract JSON exceeds the node limit")
+        if depth > MAX_CONTRACT_JSON_DEPTH:
+            raise ValueError("contract JSON exceeds the depth limit")
+        if isinstance(value, dict):
+            collection_items += len(value)
+            stack.extend((child, depth + 1) for child in value.values())
+        elif isinstance(value, list):
+            collection_items += len(value)
+            stack.extend((child, depth + 1) for child in value)
+        if collection_items > MAX_CONTRACT_JSON_COLLECTION_ITEMS:
+            raise ValueError("contract JSON exceeds the collection item limit")
+    return model.model_validate(decoded)
+
+
 def build_openapi_document() -> dict[str, Any]:
     """Build the Core Control API v2 OpenAPI document from model source."""
 
@@ -80,8 +130,18 @@ def events_schema_sha256() -> str:
     return deterministic_sha256(build_events_schema_document())
 
 
+def write_contract_snapshots() -> None:
+    """Mechanically regenerate both checked-in v2 schema snapshots."""
+
+    OPENAPI_SNAPSHOT_PATH.write_bytes(canonical_json_bytes(build_openapi_document()))
+    EVENTS_SCHEMA_SNAPSHOT_PATH.write_bytes(
+        canonical_json_bytes(build_events_schema_document())
+    )
+
+
 __all__ = [
     "EVENTS_SCHEMA_SNAPSHOT_PATH",
+    "MAX_CONTRACT_JSON_BYTES",
     "OPENAPI_SNAPSHOT_PATH",
     "build_events_schema_document",
     "build_openapi_document",
@@ -91,4 +151,6 @@ __all__ = [
     "deterministic_sha256",
     "events_schema_sha256",
     "openapi_sha256",
+    "parse_contract_json_bytes",
+    "write_contract_snapshots",
 ]
