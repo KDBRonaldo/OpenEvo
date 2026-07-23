@@ -4,10 +4,22 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
-from typing import Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from openevo.backend.runtime_identity import (
+    RuntimeIdentityError,
+    require_managed_subscription_runtime_identity,
+)
+from openevo.backend.subscription_snapshot_issuer import (
+    SubscriptionSnapshotIssueError,
+    _issue_subscription_snapshot,
+)
+from openevo.evolution.framework import MAX_JAVASCRIPT_SAFE_INTEGER
+from openevo.evolution.revisions import VerifiedExecutionSnapshot
 
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
@@ -15,6 +27,9 @@ from openevo.internal_auth import (
     RunAdmissionError,
     RunAdmissionOperation,
 )
+
+if TYPE_CHECKING:
+    from openevo.backend.service_supervisor import ServiceRunBinding
 
 
 _PATH = "/internal/v1/run-admissions/verify"
@@ -30,6 +45,154 @@ _FIELDS = frozenset(
         "task_id",
     }
 )
+
+
+class EffectiveExecutionSettings(BaseModel):
+    """Closed desired settings resolved into one verified effective snapshot."""
+
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        validate_default=True,
+    )
+
+    execution_mode: Literal[
+        "codex_subscription_transcript",
+        "self_deployed",
+    ]
+    capture_mode: Literal["transcript", "proxy", "token_level"]
+    harness_id: str
+    model_ref: str
+    token_limit: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    task_network_allow_internet: bool
+
+    @field_validator("harness_id", "model_ref")
+    @classmethod
+    def _bounded_identity_text(cls, value: str) -> str:
+        if (
+            not value
+            or len(value) > 4096
+            or value != value.strip()
+            or any(ord(character) < 32 or ord(character) == 127 for character in value)
+            or any(0xD800 <= ord(character) <= 0xDFFF for character in value)
+        ):
+            raise ValueError("execution setting identity text is invalid")
+        return value
+
+
+class EffectiveExecutionSnapshotUnavailable(RuntimeError):
+    """Typed fail-closed result for an execution profile that cannot be sealed."""
+
+    def __init__(self, code: str, *, retryable: bool) -> None:
+        messages = {
+            "managed_runtime_identity_unavailable": (
+                "The verified managed Subscription runtime identity is unavailable."
+            ),
+            "managed_runtime_model_mismatch": (
+                "The verified managed runtime does not match the desired Subscription model."
+            ),
+            "self_deployed_execution_unavailable": (
+                "Self-Deployed execution is unavailable until its verified issuer is ready."
+            ),
+            "subscription_capture_invalid": (
+                "Codex Subscription execution requires transcript capture."
+            ),
+            "subscription_harness_invalid": (
+                "The effective Subscription harness must be Codex."
+            ),
+            "subscription_model_invalid": (
+                "The desired Subscription model identity is invalid."
+            ),
+            "task_network_policy_invalid": (
+                "The effective task-network policy is invalid."
+            ),
+            "subscription_snapshot_invalid": (
+                "The effective Subscription snapshot could not be sealed."
+            ),
+        }
+        if code not in messages:
+            raise ValueError("effective execution unavailable code is invalid")
+        super().__init__(messages[code])
+        self.code = code
+        self.retryable = retryable
+
+
+def resolve_genesis_execution_snapshot(
+    *,
+    settings: EffectiveExecutionSettings,
+    service_binding: ServiceRunBinding | None,
+) -> VerifiedExecutionSnapshot:
+    """Resolve the verified effective execution used by a Subscription genesis."""
+
+    return _resolve_effective_execution_snapshot(
+        settings=settings,
+        service_binding=service_binding,
+    )
+
+
+def resolve_settings_transition_execution_snapshot(
+    *,
+    settings: EffectiveExecutionSettings,
+    service_binding: ServiceRunBinding | None,
+) -> VerifiedExecutionSnapshot:
+    """Resolve the verified effective execution for a settings-only successor."""
+
+    return _resolve_effective_execution_snapshot(
+        settings=settings,
+        service_binding=service_binding,
+    )
+
+
+def _resolve_effective_execution_snapshot(
+    *,
+    settings: EffectiveExecutionSettings,
+    service_binding: ServiceRunBinding | None,
+) -> VerifiedExecutionSnapshot:
+    if type(settings) is not EffectiveExecutionSettings:
+        raise TypeError("effective execution settings must be a closed settings object")
+    settings = EffectiveExecutionSettings.model_validate(settings.model_dump(mode="python"))
+    if settings.execution_mode == "self_deployed":
+        raise EffectiveExecutionSnapshotUnavailable(
+            "self_deployed_execution_unavailable",
+            retryable=False,
+        )
+    if settings.capture_mode != "transcript":
+        raise EffectiveExecutionSnapshotUnavailable(
+            "subscription_capture_invalid",
+            retryable=False,
+        )
+    if settings.harness_id != "codex":
+        raise EffectiveExecutionSnapshotUnavailable(
+            "subscription_harness_invalid",
+            retryable=False,
+        )
+    try:
+        runtime = require_managed_subscription_runtime_identity(service_binding)
+    except RuntimeIdentityError as exc:
+        raise EffectiveExecutionSnapshotUnavailable(
+            "managed_runtime_identity_unavailable",
+            retryable=True,
+        ) from exc
+    try:
+        return _issue_subscription_snapshot(
+            runtime=runtime,
+            capture_mode=settings.capture_mode,
+            harness_id=settings.harness_id,
+            model_ref=settings.model_ref,
+            token_limit=settings.token_limit,
+            task_network_allow_internet=settings.task_network_allow_internet,
+        )
+    except SubscriptionSnapshotIssueError as exc:
+        retryable = exc.code in {
+            "managed_runtime_identity_unavailable",
+            "managed_runtime_model_mismatch",
+            "subscription_snapshot_invalid",
+        }
+        raise EffectiveExecutionSnapshotUnavailable(
+            exc.code,
+            retryable=retryable,
+        ) from exc
 
 
 class RunServiceAuthenticator(Protocol):
@@ -102,4 +265,11 @@ def _error(status_code: int, code: str, retryable: bool) -> JSONResponse:
     )
 
 
-__all__ = ["RunServiceAuthenticator", "install_core_run_admission_endpoint"]
+__all__ = [
+    "EffectiveExecutionSettings",
+    "EffectiveExecutionSnapshotUnavailable",
+    "RunServiceAuthenticator",
+    "install_core_run_admission_endpoint",
+    "resolve_genesis_execution_snapshot",
+    "resolve_settings_transition_execution_snapshot",
+]

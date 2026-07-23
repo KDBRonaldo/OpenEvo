@@ -27,6 +27,7 @@ from openevo.evolution.revisions import (
     ExecutionRuntimeIdentity,
     ExecutionServingIdentity,
     ExecutionSnapshotV1,
+    ExecutionTaskNetworkPolicy,
     ModelIdentitySource,
     RevisionCapacityError,
     RevisionConflictError,
@@ -43,6 +44,7 @@ from openevo.evolution.revisions import (
     bind_task_admission,
     content_addressed_snapshot_ref,
     execution_snapshot_id_for_snapshot,
+    execution_task_network_policy_digest,
     revision_id_for_manifest,
 )
 from openevo.evolution.store import EvolutionStore
@@ -79,9 +81,11 @@ def _execution_snapshot(
     model_revision: str = "model-commit-0123456789abcdef",
     token_limit: int = 32_768,
 ) -> ExecutionSnapshotV1:
+    network_policy_id = "openevo.task-network.v1"
     return ExecutionSnapshotV1(
         execution_mode="subscription" if subscription else "self_deployed",
         capture_mode="transcript" if subscription else "token_level",
+        token_level_metrics_available=not subscription,
         model=ExecutionModelIdentity(
             source=(
                 ModelIdentitySource.SUBSCRIPTION
@@ -95,12 +99,28 @@ def _execution_snapshot(
         runtime=ExecutionRuntimeIdentity(
             kind="subscription_client" if subscription else "container",
             harness_id="codex",
+            harness_version="0.144.1" if subscription else "test-harness-v1",
+            image_digest="c" * 64,
+            policy_id=(
+                "openevo.codex-subscription-credential-isolation.v1"
+                if subscription
+                else "openevo.self-deployed-test-policy.v1"
+            ),
+            policy_digest="d" * 64,
             snapshot=_ref("runtime", "subscription" if subscription else "science-image"),
         ),
         serving=ExecutionServingIdentity(
             kind="subscription" if subscription else "managed_deployment",
             deployment_id="codex-subscription" if subscription else "vllm-primary",
             snapshot=_ref("deployment", "subscription" if subscription else "vllm-primary"),
+        ),
+        task_network=ExecutionTaskNetworkPolicy(
+            policy_id=network_policy_id,
+            allow_internet=True,
+            policy_digest=execution_task_network_policy_digest(
+                policy_id=network_policy_id,
+                allow_internet=True,
+            ),
         ),
     )
 
@@ -258,6 +278,23 @@ def test_token_limit_is_identity_data_not_a_secret_heuristic() -> None:
         ExecutionSnapshotV1.model_validate(
             first.model_dump(mode="json") | {"GITHUB_PAT": "must-not-enter-contract"}
         )
+
+
+def test_execution_snapshot_independently_validates_metrics_network_and_no_endpoint() -> None:
+    subscription = _execution_snapshot(subscription=True).model_dump(mode="json")
+    subscription["token_level_metrics_available"] = True
+    with pytest.raises(ValidationError, match="token-level metrics"):
+        ExecutionSnapshotV1.model_validate(subscription)
+
+    network = _execution_snapshot().task_network.model_dump(mode="json")
+    network["policy_digest"] = "a" * 64
+    with pytest.raises(ValidationError, match="policy digest is inconsistent"):
+        ExecutionTaskNetworkPolicy.model_validate(network)
+
+    serving = _execution_snapshot(subscription=True).serving.model_dump(mode="json")
+    serving["endpoint"] = "https://example.invalid/v1"
+    with pytest.raises(ValidationError):
+        ExecutionServingIdentity.model_validate(serving)
 
 
 @pytest.mark.parametrize("invalid", [True, "0", 0.0])

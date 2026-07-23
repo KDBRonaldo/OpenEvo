@@ -78,6 +78,7 @@ def _binding(
     )
     return ServiceRunBinding(
         execution_mode=execution_mode,
+        codex_model="gpt-5.5",
         runtime_image="openevo/science-runtime:0.1.1",
         runtime_image_immutable_reference=(
             MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest

@@ -193,9 +193,16 @@ class ExecutionModelIdentity(_Contract):
 class ExecutionRuntimeIdentity(_Contract):
     kind: RuntimeKind
     harness_id: str
+    harness_version: str
+    image_digest: str
+    policy_id: str
+    policy_digest: str
     snapshot: ContentAddressedSnapshotRef
 
     _harness = field_validator("harness_id")(_stable_id)
+    _identity_text_fields = field_validator("harness_version")(_identity_text)
+    _policy = field_validator("policy_id")(_stable_id)
+    _digests = field_validator("image_digest", "policy_digest")(_digest)
 
     @model_validator(mode="after")
     def _runtime_snapshot_kind(self) -> ExecutionRuntimeIdentity:
@@ -208,6 +215,7 @@ class ExecutionServingIdentity(_Contract):
     kind: ServingKind
     deployment_id: str
     snapshot: ContentAddressedSnapshotRef
+    endpoint: None = None
 
     _deployment = field_validator("deployment_id")(_stable_id)
 
@@ -218,15 +226,56 @@ class ExecutionServingIdentity(_Contract):
         return self
 
 
+def execution_task_network_policy_digest(
+    *,
+    policy_id: str,
+    allow_internet: bool,
+) -> str:
+    """Return the canonical identity of one closed effective task-network policy."""
+
+    _stable_id(policy_id)
+    if type(allow_internet) is not bool:
+        raise ValueError("task-network allow_internet must be a boolean")
+    return canonical_digest(
+        {
+            "task_network_policy_contract_version": "1",
+            "policy_id": policy_id,
+            "allow_internet": allow_internet,
+        }
+    )
+
+
+class ExecutionTaskNetworkPolicy(_Contract):
+    task_network_policy_contract_version: Literal["1"] = "1"
+    policy_id: str
+    allow_internet: bool
+    policy_digest: str
+
+    _policy = field_validator("policy_id")(_stable_id)
+    _digest = field_validator("policy_digest")(_digest)
+
+    @model_validator(mode="after")
+    def _identity_matches_policy(self) -> ExecutionTaskNetworkPolicy:
+        expected = execution_task_network_policy_digest(
+            policy_id=self.policy_id,
+            allow_internet=self.allow_internet,
+        )
+        if self.policy_digest != expected:
+            raise ValueError("task-network policy digest is inconsistent")
+        return self
+
+
 class ExecutionSnapshotV1(_Contract):
     """Closed typed facts whose persistence requires a verified producer seal."""
 
     execution_snapshot_contract_version: Literal["1"] = "1"
     execution_mode: ExecutionMode
     capture_mode: CaptureMode
+    token_level_metrics_available: bool
     model: ExecutionModelIdentity
     runtime: ExecutionRuntimeIdentity
     serving: ExecutionServingIdentity
+    task_network: ExecutionTaskNetworkPolicy
 
     @model_validator(mode="after")
     def _mode_specific_shape(self) -> ExecutionSnapshotV1:
@@ -234,6 +283,8 @@ class ExecutionSnapshotV1(_Contract):
         if subscription:
             if self.capture_mode is not CaptureMode.TRANSCRIPT:
                 raise ValueError("subscription execution requires transcript capture")
+            if self.token_level_metrics_available:
+                raise ValueError("subscription execution cannot expose token-level metrics")
             if self.model.source is not ModelIdentitySource.SUBSCRIPTION:
                 raise ValueError("subscription execution requires a subscription model")
             if self.runtime.kind != "subscription_client":
@@ -247,6 +298,11 @@ class ExecutionSnapshotV1(_Contract):
                 raise ValueError("self-deployed execution cannot use a subscription client")
             if self.serving.kind != "managed_deployment":
                 raise ValueError("self-deployed execution requires managed serving")
+        if (
+            self.capture_mode is CaptureMode.TRANSCRIPT
+            and self.token_level_metrics_available
+        ):
+            raise ValueError("transcript capture cannot expose token-level metrics")
         if len(canonical_json(self).encode("utf-8")) > MAX_EXECUTION_SNAPSHOT_BYTES:
             raise ValueError("execution snapshot exceeds the byte limit")
         return self
@@ -680,6 +736,7 @@ __all__ = [
     "ExecutionServingIdentity",
     "ExecutionSnapshotRecord",
     "ExecutionSnapshotV1",
+    "ExecutionTaskNetworkPolicy",
     "MAX_EXECUTION_SNAPSHOT_BYTES",
     "MAX_REVISION_ADAPTERS",
     "MAX_REVISION_MANIFEST_BYTES",
@@ -704,6 +761,7 @@ __all__ = [
     "bind_task_admission",
     "content_addressed_snapshot_ref",
     "execution_snapshot_id_for_snapshot",
+    "execution_task_network_policy_digest",
     "require_verified_execution_snapshot",
     "revision_id_for_manifest",
 ]

@@ -12,6 +12,16 @@ import secrets
 import stat
 from typing import Any, Mapping
 
+from openevo.codex_models import codex_cli_model_name, validate_codex_model_ref
+from openevo.runtime.codex_isolation import (
+    CODEX_SUBSCRIPTION_POLICY_ID,
+    CODEX_SUBSCRIPTION_POLICY_SHA256,
+)
+from openevo.runtime.managed import (
+    MANAGED_CODEX_VERSION,
+    require_immutable_managed_runtime_image,
+)
+
 
 _BEARER_PATTERN = re.compile(r"[A-Za-z0-9_-]{64}\Z")
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
@@ -40,6 +50,91 @@ class CoreReleaseIdentity:
             raise ValueError("framework lock digest is invalid")
         if re.fullmatch(r"[0-9a-f]{40}", self.source_commit) is None:
             raise ValueError("source commit is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedSubscriptionRuntimeIdentity:
+    """Closed non-secret projection of one verified Subscription run binding."""
+
+    harness_id: str
+    harness_version: str
+    codex_model: str
+    image_digest: str
+    runtime_identity_digest: str
+    runtime_policy_id: str
+    runtime_policy_digest: str
+
+    def __post_init__(self) -> None:
+        if self.harness_id != "codex":
+            raise ValueError("managed subscription harness identity is invalid")
+        if self.harness_version != MANAGED_CODEX_VERSION:
+            raise ValueError("managed subscription harness version is invalid")
+        validated_model = validate_codex_model_ref(
+            self.codex_model,
+            field_name="managed subscription Codex model",
+        )
+        if codex_cli_model_name(validated_model) != self.codex_model:
+            raise ValueError("managed subscription Codex model is not canonical")
+        for value, label in (
+            (self.image_digest, "managed subscription image digest"),
+            (self.runtime_identity_digest, "managed subscription runtime digest"),
+            (self.runtime_policy_digest, "managed subscription policy digest"),
+        ):
+            if _DIGEST_PATTERN.fullmatch(value) is None:
+                raise ValueError(f"{label} is invalid")
+        if self.runtime_policy_id != CODEX_SUBSCRIPTION_POLICY_ID:
+            raise ValueError("managed subscription runtime policy ID is invalid")
+        if self.runtime_policy_digest != CODEX_SUBSCRIPTION_POLICY_SHA256:
+            raise ValueError("managed subscription runtime policy digest is invalid")
+
+
+def require_managed_subscription_runtime_identity(
+    service_binding: object,
+) -> ManagedSubscriptionRuntimeIdentity:
+    """Project trusted service evidence into the closed effective-runtime identity."""
+
+    # Imported lazily so the host identity primitives remain independent of the
+    # supervisor's process-lifecycle module at import time.
+    from openevo.backend.service_supervisor import (
+        ServiceExecutionMode,
+        ServiceRunBinding,
+    )
+
+    if type(service_binding) is not ServiceRunBinding:
+        raise RuntimeIdentityError("Managed Subscription runtime identity is unavailable")
+    try:
+        service_binding.__post_init__()
+        if (
+            service_binding.execution_mode
+            is not ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        ):
+            raise ValueError("run binding is not the Subscription profile")
+        release = require_immutable_managed_runtime_image(
+            profile="managed_science",
+            image=service_binding.runtime_image_immutable_reference,
+        )
+        if release.image != service_binding.runtime_image:
+            raise ValueError("managed image alias differs from its immutable release")
+        model = validate_codex_model_ref(
+            service_binding.codex_model,
+            field_name="managed Subscription Codex model",
+        )
+        model = codex_cli_model_name(model)
+        identity = ManagedSubscriptionRuntimeIdentity(
+            harness_id="codex",
+            harness_version=MANAGED_CODEX_VERSION,
+            codex_model=model,
+            image_digest=release.trusted_digest.removeprefix("sha256:"),
+            runtime_identity_digest=service_binding.runtime_identity_digest,
+            runtime_policy_id=CODEX_SUBSCRIPTION_POLICY_ID,
+            runtime_policy_digest=CODEX_SUBSCRIPTION_POLICY_SHA256,
+        )
+        identity.__post_init__()
+        return identity
+    except (TypeError, ValueError) as exc:
+        raise RuntimeIdentityError(
+            "Managed Subscription runtime identity is unavailable"
+        ) from exc
 
 
 class HostServiceRoot:
@@ -518,12 +613,14 @@ def _unlink_at_if_regular(directory_fd: int, name: str) -> None:
 __all__ = [
     "CoreReleaseIdentity",
     "HostServiceRoot",
+    "ManagedSubscriptionRuntimeIdentity",
     "RuntimeIdentityError",
     "canonical_json_bytes",
     "compute_release_identity",
     "default_core_service_root",
     "load_bounded_json",
     "load_or_create_core_bearer_token",
+    "require_managed_subscription_runtime_identity",
     "require_host_global_service_root",
     "rotate_core_bearer_token",
 ]

@@ -1200,6 +1200,7 @@ class ServiceRunBinding:
     """Ephemeral trusted connection from the run owner to one service generation."""
 
     execution_mode: ServiceExecutionMode
+    codex_model: str
     runtime_image: str
     runtime_image_immutable_reference: str
     runtime_identity_digest: str
@@ -1216,13 +1217,33 @@ class ServiceRunBinding:
             raise ValueError("service run binding execution mode is invalid")
         if self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values()):
             raise ValueError("service run binding image is not Core-managed")
+        model = validate_codex_model_ref(
+            self.codex_model,
+            field_name="service run binding Codex model",
+        )
+        if model != self.codex_model:
+            raise ValueError("service run binding Codex model is not canonical")
         release = require_immutable_managed_runtime_image(
             profile="managed_science",
             image=self.runtime_image_immutable_reference,
         )
         if release.image != self.runtime_image:
             raise ValueError("service run binding immutable image does not match its alias")
-        _require_digest(self.runtime_identity_digest, "runtime_identity_digest")
+        for value, label in (
+            (self.runtime_identity_digest, "runtime_identity_digest"),
+            (self.generation_digest, "generation_digest"),
+            (self.registry_digest, "registry_digest"),
+            (self.framework_lock_digest, "framework_lock_digest"),
+        ):
+            _require_digest(value, label)
+        if (
+            type(self._identity) is not InternalServiceIdentity
+            or self._identity.service_id != "core-control"
+            or self._identity.generation_digest != self.generation_digest
+            or self._identity.registry_digest != self.registry_digest
+            or self._identity.framework_lock_digest != self.framework_lock_digest
+        ):
+            raise ValueError("service run binding internal identity is inconsistent")
 
     def request_headers(self) -> dict[str, str]:
         return self._identity.request_headers()
@@ -2633,6 +2654,7 @@ class CoreServiceSupervisor:
         )
         return ServiceRunBinding(
             execution_mode=snapshot.execution_mode,
+            codex_model=runtime_request.codex_model,
             runtime_image=runtime_request.runtime_image,
             runtime_image_immutable_reference=immutable_runtime_image,
             runtime_identity_digest=runtime_identity,
