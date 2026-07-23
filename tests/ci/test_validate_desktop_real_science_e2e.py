@@ -70,7 +70,7 @@ def _candidate(source: str) -> dict[str, object]:
         ("app_bundle_smoke", "app-bundle-smoke.json", len(app_smoke)),
     ]
     return {
-        "schema_version": 8,
+        "schema_version": 9,
         "source_commit": source,
         "version": "0.1.4",
         "release": {

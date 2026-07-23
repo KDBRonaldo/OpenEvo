@@ -10,8 +10,11 @@ import importlib.util
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import secrets
 import stat
+import struct
+import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import ModuleType
@@ -33,8 +36,12 @@ CORE_DIRECTORY = Path("core")
 DAEMON_DIRECTORY = Path("daemon")
 RUNTIME_DIRECTORY = Path("runtime")
 MACOS_RESOURCE_ROOT = Path("Contents/Resources") / RELEASE_ASSETS_DIRECTORY
+MACOS_ASKPASS_HELPER_PATH = Path("Contents/MacOS/openevo-ssh-askpass")
+MAX_ASKPASS_HELPER_BYTES = 16 * 1024 * 1024
 SOURCE_COMMIT_LENGTH = 40
 _SHA256_HEX = frozenset("0123456789abcdef")
+_MACOS_CODESIGN_FLAGS_PATTERN = re.compile(r"\bflags=0x[0-9a-fA-F]+\(([^)]*)\)")
+_MAX_CODESIGN_OUTPUT_BYTES = 64 * 1024
 
 
 class ResourceCompositionError(RuntimeError):
@@ -521,6 +528,110 @@ def _validate_packaged_runtime_loader(resource_root: Path, *, source_commit: str
         raise ResourceCompositionError("Packaged Desktop runtime assets are incomplete")
 
 
+def _thin_mach_o_architecture(payload: bytes) -> str:
+    if len(payload) < 32 or payload[:4] != b"\xcf\xfa\xed\xfe":
+        raise ResourceCompositionError(
+            "Packaged SSH askpass helper is not a thin 64-bit Mach-O executable"
+        )
+    cpu_type = struct.unpack_from("<i", payload, 4)[0]
+    try:
+        return {0x0100_000C: "arm64", 0x0100_0007: "x86_64"}[cpu_type]
+    except KeyError as exc:
+        raise ResourceCompositionError(
+            "Packaged SSH askpass helper architecture is unsupported"
+        ) from exc
+
+
+def _codesign_output(arguments: list[str]) -> str:
+    result = subprocess.run(
+        ["/usr/bin/codesign", *arguments],
+        check=False,
+        capture_output=True,
+    )
+    output = result.stdout + result.stderr
+    if result.returncode != 0 or len(output) > _MAX_CODESIGN_OUTPUT_BYTES:
+        raise ResourceCompositionError("Packaged SSH askpass helper signature is invalid")
+    try:
+        return output.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ResourceCompositionError(
+            "Packaged SSH askpass helper signature evidence is invalid"
+        ) from exc
+
+
+def _verify_macos_adhoc_signature(executable: Path) -> str:
+    _codesign_output(["--verify", "--strict", str(executable)])
+    description = _codesign_output(["-d", "--verbose=4", str(executable)])
+    lines = tuple(line.strip() for line in description.splitlines() if line.strip())
+    flag_lines = tuple(line for line in lines if line.startswith("CodeDirectory "))
+    if (
+        "Signature=adhoc" not in lines
+        or "TeamIdentifier=not set" not in lines
+        or len(flag_lines) != 1
+    ):
+        raise ResourceCompositionError("Packaged SSH askpass helper is not ad-hoc signed")
+    match = _MACOS_CODESIGN_FLAGS_PATTERN.search(flag_lines[0])
+    flags = (
+        frozenset(value.strip() for value in match.group(1).split(",") if value.strip())
+        if match is not None
+        else frozenset()
+    )
+    if flags != {"adhoc"} or any(line.startswith("Runtime Version=") for line in lines):
+        raise ResourceCompositionError(
+            "Packaged SSH askpass helper signature policy is not closed"
+        )
+    return "adhoc"
+
+
+def _inspect_packaged_askpass_helper(app: Path) -> dict[str, object]:
+    helper = app / MACOS_ASKPASS_HELPER_PATH
+    macos_root = helper.parent
+    _reject_symlink_components(macos_root)
+    try:
+        with os.scandir(macos_root) as entries:
+            helper_names = sorted(
+                entry.name
+                for entry in entries
+                if entry.name.startswith("openevo-ssh-askpass")
+            )
+    except OSError as exc:
+        raise ResourceCompositionError("Packaged SSH askpass helper inventory is unavailable") from exc
+    if helper_names != [helper.name]:
+        raise ResourceCompositionError("App bundle does not contain the exact SSH askpass helper")
+
+    try:
+        before = os.stat(helper, follow_symlinks=False)
+    except OSError as exc:
+        raise ResourceCompositionError("Packaged SSH askpass helper is unavailable") from exc
+    payload = _read_controlled_file(helper, executable=True)
+    if stat.S_IMODE(before.st_mode) != 0o755:
+        raise ResourceCompositionError("Packaged SSH askpass helper mode must be exactly 0755")
+    if not 0 < len(payload) <= MAX_ASKPASS_HELPER_BYTES:
+        raise ResourceCompositionError("Packaged SSH askpass helper exceeds its byte limit")
+    architecture = _thin_mach_o_architecture(payload)
+    signature = _verify_macos_adhoc_signature(helper)
+    try:
+        after = os.stat(helper, follow_symlinks=False)
+    except OSError as exc:
+        raise ResourceCompositionError(
+            "Packaged SSH askpass helper changed during verification"
+        ) from exc
+    if (
+        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+        != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+        or stat.S_IMODE(after.st_mode) != 0o755
+    ):
+        raise ResourceCompositionError("Packaged SSH askpass helper changed during verification")
+    return {
+        "architecture": architecture,
+        "byte_size": len(payload),
+        "mode": "0755",
+        "relative_path": MACOS_ASKPASS_HELPER_PATH.as_posix(),
+        "sha256": _sha256_bytes(payload),
+        "signature": signature,
+    }
+
+
 def verify_app_resource(
     *,
     app: Path,
@@ -565,6 +676,7 @@ def verify_app_resource(
             "Packaged release asset manifest differs from verified inputs"
         )
     _validate_packaged_runtime_loader(resource_root, source_commit=source_commit)
+    askpass_helper = _inspect_packaged_askpass_helper(app)
     evidence = {
         "launch_origin": launch_origin,
         "release_assets": {
@@ -575,7 +687,8 @@ def verify_app_resource(
                 "sha256": _sha256_bytes(packaged_manifest),
             },
         },
-        "schema_version": 2,
+        "schema_version": 3,
+        "ssh_askpass_helper": askpass_helper,
         "source_dmg": {
             "filename": source_dmg.name,
             "sha256": _sha256_bytes(_read_controlled_file(source_dmg)),

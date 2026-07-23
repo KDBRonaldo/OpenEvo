@@ -386,7 +386,9 @@ jobs:
             --release-build
           echo "OPENEVO_CANDIDATE_CORE=$OPENEVO_DAEMON_INPUTS/core" >> "$GITHUB_ENV"
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-${OPENEVO_RUST_TARGET}"
+          askpass="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-ssh-askpass-${OPENEVO_RUST_TARGET}"
           test -x "$sidecar"
+          test -x "$askpass"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
 
       - name: Clean-install and verify final Core wheel, lock, and registry

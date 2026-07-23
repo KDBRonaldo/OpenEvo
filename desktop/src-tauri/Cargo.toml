@@ -2,6 +2,15 @@
 name = "openevo-desktop"
 version = "0.1.8"
 edition = "2021"
+default-run = "openevo-desktop"
+
+[[bin]]
+name = "openevo-desktop"
+path = "src/main.rs"
+
+[[bin]]
+name = "openevo-ssh-askpass"
+path = "src/bin/openevo-ssh-askpass.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

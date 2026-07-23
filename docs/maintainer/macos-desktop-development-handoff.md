@@ -343,7 +343,9 @@ The `0.1.9` unsigned Preview repair is therefore closed and narrow:
 - verify the final mounted and copied apps, their native executables, and their
   bundled sidecars with exact `/usr/bin/codesign` policy checks before launch;
   and
-- bind that policy in release-candidate manifest schema version 8.
+- bind that policy plus the separately bundled SSH askpass helper's exact
+  architecture, mode, digest, and plain ad-hoc signature in release-candidate
+  manifest schema version 9.
 
 Developer ID signing remains future work. When introduced, the nested
 PyInstaller composition must be signed coherently at build time under a

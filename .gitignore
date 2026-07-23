@@ -143,5 +143,6 @@ desktop/packaging/sidecar-build/
 desktop/packaging/sidecar-dist/
 desktop/packaging/core-wheel-dist/
 desktop/src-tauri/binaries/openevo-desktop-sidecar-*
+desktop/src-tauri/binaries/openevo-ssh-askpass-*
 desktop/src-tauri/gen/
 desktop/src-tauri/target/

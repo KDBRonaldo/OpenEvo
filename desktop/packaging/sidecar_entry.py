@@ -8,7 +8,7 @@ import re
 import sys
 
 BUILD_METADATA_RELATIVE_PATH = Path("desktop/packaging/sidecar-build-metadata.json")
-BUILD_METADATA_MAX_BYTES = 1024
+BUILD_METADATA_MAX_BYTES = 2048
 NATIVE_EXECUTABLE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"
 NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
 NATIVE_EXECUTABLE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
@@ -47,8 +47,20 @@ _PYTHON_STARTUP_DIAGNOSTICS = frozenset(
 
 
 @dataclass(frozen=True)
+class _PackagedAskpassHelper:
+    architecture: str
+    byte_size: int
+    filename: str
+    mode: str
+    sha256: str
+    signature: str
+    target_triple: str
+
+
+@dataclass(frozen=True)
 class _PackagedBuildMetadata:
     source_commit: str
+    ssh_askpass_helper: _PackagedAskpassHelper
 
 
 def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -73,17 +85,65 @@ def _load_packaged_build_metadata() -> _PackagedBuildMetadata:
         )
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("invalid packaged sidecar build metadata") from exc
-    if type(value) is not dict or set(value) != {"schema_version", "source_commit"}:
+    if type(value) is not dict or set(value) != {
+        "schema_version",
+        "source_commit",
+        "ssh_askpass_helper",
+    }:
         raise ValueError("invalid packaged sidecar build metadata")
     source_commit = value["source_commit"]
+    helper = value["ssh_askpass_helper"]
     if (
-        value["schema_version"] != "1"
+        value["schema_version"] != "2"
         or type(source_commit) is not str
         or re.fullmatch(r"[0-9a-f]{7,40}", source_commit) is None
         or set(source_commit) == {"0"}
+        or type(helper) is not dict
+        or set(helper)
+        != {
+            "architecture",
+            "byte_size",
+            "filename",
+            "mode",
+            "sha256",
+            "signature",
+            "target_triple",
+        }
     ):
         raise ValueError("invalid packaged sidecar build metadata")
-    return _PackagedBuildMetadata(source_commit=source_commit)
+    architecture = helper["architecture"]
+    byte_size = helper["byte_size"]
+    target_triple = helper["target_triple"]
+    if (
+        helper["filename"] != "openevo-ssh-askpass"
+        or type(byte_size) is not int
+        or not 0 < byte_size <= 16 * 1024 * 1024
+        or type(helper["sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", helper["sha256"]) is None
+        or set(helper["sha256"]) == {"0"}
+        or helper["mode"] != "0755"
+        or type(architecture) is not str
+        or architecture not in {"arm64", "x86_64"}
+        or type(target_triple) is not str
+    ):
+        raise ValueError("invalid packaged sidecar build metadata")
+    platform_identity = (architecture, target_triple, helper["signature"])
+    if (
+        sys.platform == "darwin"
+        and platform_identity
+        not in {
+            ("arm64", "aarch64-apple-darwin", "adhoc"),
+            ("x86_64", "x86_64-apple-darwin", "adhoc"),
+        }
+    ) or (
+        sys.platform == "linux"
+        and platform_identity != ("x86_64", "x86_64-unknown-linux-gnu", "none")
+    ) or sys.platform not in {"darwin", "linux"}:
+        raise ValueError("invalid packaged sidecar build metadata")
+    return _PackagedBuildMetadata(
+        source_commit=source_commit,
+        ssh_askpass_helper=_PackagedAskpassHelper(**helper),
+    )
 
 
 def _emit_startup_diagnostic(stage: str, code: str) -> None:

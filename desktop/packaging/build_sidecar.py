@@ -37,6 +37,7 @@ from openevo.runtime.managed import (
 )
 
 SIDECAR_NAME = "openevo-desktop-sidecar"
+ASKPASS_NAME = "openevo-ssh-askpass"
 CORE_WHEEL_ARCHIVE_ROOT = Path("openevo/wheels")
 MANAGED_RUNTIME_ARCHIVE_ROOT = Path("openevo/runtime-assets")
 DAEMON_ARCHIVE_ROOT = Path("openevo/daemon")
@@ -52,6 +53,7 @@ REMOTE_RELEASE_ARCHIVE_ROOTS = (
 # assets must stay in the DMG resource directory. This leaves substantial headroom
 # for dependency updates while catching accidental re-embedding of the runtime.
 MAX_SIDECAR_BINARY_BYTES = 128 * 1024 * 1024
+MAX_ASKPASS_BINARY_BYTES = 16 * 1024 * 1024
 FORBIDDEN_LEGACY_CORE_MODULE_FILES = frozenset(
     {
         "openevo/evolution/terminal_bench_bridge.py",
@@ -254,6 +256,16 @@ def _normalize_unsigned_macos_sidecar_signature(executable: Path) -> None:
     ):
         raise RuntimeError("macOS sidecar code signing output is not a private regular file")
 
+    _verify_macos_adhoc_signature(executable)
+
+
+def _verify_macos_adhoc_signature(executable: Path) -> str:
+    """Verify the closed unsigned Preview signature policy for a native binary."""
+
+    _run_macos_codesign(
+        ["--verify", "--strict", str(executable)],
+        stage="verification",
+    )
     description = _run_macos_codesign(
         ["-d", "--verbose=4", str(executable)],
         stage="description",
@@ -288,6 +300,7 @@ def _normalize_unsigned_macos_sidecar_signature(executable: Path) -> None:
     )
     if unexpected_entitlements:
         raise RuntimeError("macOS sidecar has unexpected entitlements")
+    return "adhoc"
 
 
 NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
@@ -770,12 +783,57 @@ _BUILD_SOURCE_COMMIT = _trusted_source_commit(_repo_root())
 _BUILD_SOURCE_DATE_EPOCH = _trusted_source_date_epoch(_repo_root())
 
 
-def _write_sidecar_build_metadata(path: Path, *, source_commit: str) -> None:
+def _validate_askpass_build_identity(value: object) -> dict[str, object]:
+    if type(value) is not dict or set(value) != {
+        "architecture",
+        "byte_size",
+        "filename",
+        "mode",
+        "sha256",
+        "signature",
+        "target_triple",
+    }:
+        raise RuntimeError("Desktop askpass helper build identity is not closed")
+    byte_size = value.get("byte_size")
+    sha256 = value.get("sha256")
+    target_triple = value.get("target_triple")
+    if (
+        value.get("filename") != ASKPASS_NAME
+        or type(byte_size) is not int
+        or not 0 < byte_size <= MAX_ASKPASS_BINARY_BYTES
+        or type(sha256) is not str
+        or _SHA256_PATTERN.fullmatch(sha256) is None
+        or set(sha256) == {"0"}
+        or value.get("mode") != "0755"
+        or value.get("architecture") not in {"arm64", "x86_64"}
+        or type(target_triple) is not str
+        or (value.get("architecture"), target_triple, value.get("signature"))
+        not in {
+            ("arm64", "aarch64-apple-darwin", "adhoc"),
+            ("x86_64", "x86_64-apple-darwin", "adhoc"),
+            ("x86_64", "x86_64-unknown-linux-gnu", "none"),
+        }
+    ):
+        raise RuntimeError("Desktop askpass helper build identity is invalid")
+    return dict(value)
+
+
+def _write_sidecar_build_metadata(
+    path: Path,
+    *,
+    source_commit: str,
+    askpass_helper: dict[str, object],
+) -> None:
     if _SOURCE_COMMIT_PATTERN.fullmatch(source_commit) is None or set(source_commit) == {"0"}:
         raise RuntimeError("Desktop sidecar source commit is invalid")
+    helper_identity = _validate_askpass_build_identity(askpass_helper)
     path.write_text(
         json.dumps(
-            {"schema_version": "1", "source_commit": source_commit},
+            {
+                "schema_version": "2",
+                "source_commit": source_commit,
+                "ssh_askpass_helper": helper_identity,
+            },
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -808,6 +866,40 @@ def _target_triple() -> str:
         if line.startswith("host:"):
             return line.split(":", 1)[1].strip()
     raise RuntimeError("failed to determine Rust host target triple")
+
+
+def _build_native_askpass_helper(
+    tauri_root: Path,
+    *,
+    cargo_target: Path,
+    target_triple: str,
+) -> Path:
+    environment = os.environ.copy()
+    environment["CARGO_TARGET_DIR"] = str(cargo_target)
+    # The helper is itself one of Tauri's required external binaries. Compile
+    # that single bin with a closed bootstrap override, then publish it before
+    # the real Tauri app build evaluates the full externalBin inventory.
+    environment["TAURI_CONFIG"] = json.dumps(
+        {"bundle": {"externalBin": []}},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    command = [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "--bin",
+        ASKPASS_NAME,
+        "--target",
+        target_triple,
+    ]
+    subprocess.run(command, check=True, cwd=tauri_root, env=environment)
+    built = cargo_target / target_triple / "release" / f"{ASKPASS_NAME}{_platform_extension()}"
+    if not built.is_file() or built.is_symlink():
+        raise RuntimeError("Cargo did not produce the native askpass helper")
+    built.chmod(0o755)
+    return built
 
 
 def _platform_extension() -> str:
@@ -1279,6 +1371,111 @@ def _sha256_fd(file_fd: int) -> tuple[int, str]:
     return byte_size, digest.hexdigest()
 
 
+def _thin_mach_o_architecture(header: bytes) -> str:
+    if len(header) < 32 or header[:4] != b"\xcf\xfa\xed\xfe":
+        raise RuntimeError("Desktop askpass helper is not a thin 64-bit Mach-O executable")
+    cpu_type = struct.unpack_from("<i", header, 4)[0]
+    try:
+        return {
+            0x0100_000C: "arm64",
+            0x0100_0007: "x86_64",
+        }[cpu_type]
+    except KeyError as exc:
+        raise RuntimeError("Desktop askpass helper architecture is unsupported") from exc
+
+
+def _elf_architecture(header: bytes) -> str:
+    if (
+        len(header) < 20
+        or header[:4] != b"\x7fELF"
+        or header[4] != 2
+        or header[5] != 1
+        or struct.unpack_from("<H", header, 18)[0] != 62
+    ):
+        raise RuntimeError("Desktop askpass helper is not an x86_64 ELF64 executable")
+    return "x86_64"
+
+
+def _validate_native_askpass_helper(
+    executable: Path,
+    *,
+    target_triple: str,
+) -> dict[str, object]:
+    target_policy = {
+        "aarch64-apple-darwin": ("arm64", "mach_o", "adhoc"),
+        "x86_64-apple-darwin": ("x86_64", "mach_o", "adhoc"),
+        "x86_64-unknown-linux-gnu": ("x86_64", "elf", "none"),
+    }.get(target_triple)
+    if target_policy is None:
+        raise RuntimeError("Desktop askpass helper target triple is unsupported")
+    expected_architecture, binary_format, expected_signature = target_policy
+    if executable.name != ASKPASS_NAME:
+        raise RuntimeError("Desktop askpass helper filename is invalid")
+
+    file_fd = -1
+    try:
+        file_fd = os.open(executable, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        before = os.fstat(file_fd)
+        pathname = os.stat(executable, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+            or (before.st_dev, before.st_ino) != (pathname.st_dev, pathname.st_ino)
+        ):
+            raise RuntimeError("Desktop askpass helper is not a private regular file")
+        if stat.S_IMODE(before.st_mode) != 0o755:
+            raise RuntimeError("Desktop askpass helper mode must be exactly 0755")
+        if before.st_size <= 0 or before.st_size > MAX_ASKPASS_BINARY_BYTES:
+            raise RuntimeError("Desktop askpass helper exceeds its binary byte limit")
+
+        header = os.read(file_fd, 32)
+        architecture = (
+            _thin_mach_o_architecture(header)
+            if binary_format == "mach_o"
+            else _elf_architecture(header)
+        )
+        if architecture != expected_architecture:
+            raise RuntimeError("Desktop askpass helper architecture differs from its target")
+        byte_size, digest = _sha256_fd(file_fd)
+        if byte_size != before.st_size:
+            raise RuntimeError("Desktop askpass helper changed while hashing")
+
+        signature = (
+            _verify_macos_adhoc_signature(executable)
+            if expected_signature == "adhoc"
+            else expected_signature
+        )
+        after = os.fstat(file_fd)
+        current_path = os.stat(executable, follow_symlinks=False)
+        current_size, current_digest = _sha256_fd(file_fd)
+        if (
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
+            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            or (current_path.st_dev, current_path.st_ino) != (before.st_dev, before.st_ino)
+            or stat.S_IMODE(current_path.st_mode) != 0o755
+            or current_size != byte_size
+            or current_digest != digest
+        ):
+            raise RuntimeError("Desktop askpass helper changed during verification")
+        return _validate_askpass_build_identity(
+            {
+                "architecture": architecture,
+                "byte_size": byte_size,
+                "filename": ASKPASS_NAME,
+                "mode": "0755",
+                "sha256": digest,
+                "signature": signature,
+                "target_triple": target_triple,
+            }
+        )
+    except OSError as exc:
+        raise RuntimeError("Desktop askpass helper is not a private regular file") from exc
+    finally:
+        if file_fd >= 0:
+            os.close(file_fd)
+
+
 def _paths_overlap(left: Path, right: Path) -> bool:
     return left == right or left.is_relative_to(right) or right.is_relative_to(left)
 
@@ -1723,7 +1920,12 @@ def _publish_core_release_inputs_once(
         os.close(parent_fd)
 
 
-def _publish_sidecar_binary(built: Path, target: Path) -> None:
+def _publish_sidecar_binary(
+    built: Path,
+    target: Path,
+    *,
+    subject: str = "Desktop sidecar",
+) -> None:
     """Atomically replace the Tauri external binary with verified build bytes."""
     if target.name in {"", ".", ".."} or target.parent == target:
         raise RuntimeError("Desktop sidecar target path is invalid")
@@ -1743,10 +1945,10 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             or (source_descriptor.st_dev, source_descriptor.st_ino)
             != (source_path_descriptor.st_dev, source_path_descriptor.st_ino)
         ):
-            raise RuntimeError("PyInstaller sidecar output is not a private regular file")
+            raise RuntimeError(f"{subject} output is not a private regular file")
         byte_size, digest = _sha256_fd(source_fd)
         if byte_size != source_descriptor.st_size:
-            raise RuntimeError("PyInstaller sidecar output changed while hashing")
+            raise RuntimeError(f"{subject} output changed while hashing")
 
         directory_fd = os.open(
             target.parent,
@@ -1758,7 +1960,7 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             or directory_descriptor.st_uid != os.geteuid()
             or directory_descriptor.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
         ):
-            raise RuntimeError("Desktop sidecar binary directory is not trusted")
+            raise RuntimeError(f"{subject} binary directory is not trusted")
 
         staging_fd = os.open(
             staging_name,
@@ -1772,7 +1974,7 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             while remaining:
                 written = os.write(staging_fd, remaining)
                 if written <= 0:
-                    raise RuntimeError("Desktop sidecar copy stalled")
+                    raise RuntimeError(f"{subject} copy stalled")
                 remaining = remaining[written:]
         os.lseek(source_fd, 0, os.SEEK_SET)
         os.fchmod(staging_fd, 0o755)
@@ -1790,7 +1992,7 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             or current_size != byte_size
             or current_digest != digest
         ):
-            raise RuntimeError("PyInstaller sidecar output changed while copying")
+            raise RuntimeError(f"{subject} output changed while copying")
 
         staged = os.fstat(staging_fd)
         staged_path = os.stat(staging_name, dir_fd=directory_fd, follow_symlinks=False)
@@ -1804,7 +2006,7 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             or staged_digest != digest
             or (staged_path.st_dev, staged_path.st_ino) != (staged.st_dev, staged.st_ino)
         ):
-            raise RuntimeError("Desktop sidecar staging file failed verification")
+            raise RuntimeError(f"{subject} staging file failed verification")
 
         try:
             os.replace(
@@ -1815,7 +2017,7 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             )
         except OSError as exc:
             raise RuntimeError(
-                "Desktop sidecar could not be published atomically; "
+                f"{subject} could not be published atomically; "
                 f"the non-authoritative staging file was preserved as {staging_name}"
             ) from exc
         os.fsync(directory_fd)
@@ -1828,7 +2030,7 @@ def _publish_sidecar_binary(built: Path, target: Path) -> None:
             or final_size != byte_size
             or final_digest != digest
         ):
-            raise RuntimeError("Published Desktop sidecar failed final verification")
+            raise RuntimeError(f"Published {subject} failed final verification")
     finally:
         if staging_fd >= 0:
             os.close(staging_fd)
@@ -2590,7 +2792,9 @@ def build_sidecar(
             shutil.rmtree(dist_dir, ignore_errors=True)
             shutil.rmtree(build_dir, ignore_errors=True)
         binary_dir.mkdir(parents=True, exist_ok=True)
-        target = binary_dir / f"{SIDECAR_NAME}-{_target_triple()}{_platform_extension()}"
+        target_triple = _target_triple()
+        target = binary_dir / f"{SIDECAR_NAME}-{target_triple}{_platform_extension()}"
+        askpass_target = binary_dir / f"{ASKPASS_NAME}-{target_triple}{_platform_extension()}"
         if provided_core_wheel is None or provided_core_lock is None:
             core_wheel = _build_core_wheel(repo, temporary_root / "core")
             core_framework_lock = _write_core_framework_lock(
@@ -2614,6 +2818,17 @@ def build_sidecar(
                 framework_lock=core_release_lock,
                 version=core_version,
             )
+        askpass_built = _build_native_askpass_helper(
+            tauri_root,
+            cargo_target=temporary_root / "cargo-target",
+            target_triple=target_triple,
+        )
+        if sys.platform == "darwin":
+            _normalize_unsigned_macos_sidecar_signature(askpass_built)
+        askpass_identity = _validate_native_askpass_helper(
+            askpass_built,
+            target_triple=target_triple,
+        )
         product_web_digest = _build_product_web(desktop_root)
         pyinstaller_root = _prepare_fd_bound_pyinstaller(
             repo,
@@ -2623,6 +2838,7 @@ def build_sidecar(
         _write_sidecar_build_metadata(
             build_metadata,
             source_commit=_BUILD_SOURCE_COMMIT,
+            askpass_helper=askpass_identity,
         )
 
         command = [
@@ -2701,6 +2917,11 @@ def build_sidecar(
                 core_framework_lock,
             )
 
+        _publish_sidecar_binary(
+            askpass_built,
+            askpass_target,
+            subject="Desktop askpass helper",
+        )
         _publish_sidecar_binary(built, target)
         return target
 

@@ -101,8 +101,11 @@ jobs:
         run: |
           npm run build:sidecar
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          askpass="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-ssh-askpass-$(rustc --print host-tuple)"
           test -x "$sidecar"
+          test -x "$askpass"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
+          echo "OPENEVO_PACKAGED_ASKPASS_PATH=$askpass" >> "$GITHUB_ENV"
 
       - name: Exercise packaged fixed-executable birth dispatch
         run: |
@@ -175,6 +178,9 @@ jobs:
         run: |
           if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
             rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          if [ -n "${OPENEVO_PACKAGED_ASKPASS_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_ASKPASS_PATH"
           fi
           rm -rf desktop/packaging/sidecar-build desktop/packaging/sidecar-dist
 
@@ -259,8 +265,11 @@ jobs:
           npm run build:openevo
           npm run build:sidecar
           sidecar="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-desktop-sidecar-$(rustc --print host-tuple)"
+          askpass="$GITHUB_WORKSPACE/desktop/src-tauri/binaries/openevo-ssh-askpass-$(rustc --print host-tuple)"
           test -x "$sidecar"
+          test -x "$askpass"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
+          echo "OPENEVO_PACKAGED_ASKPASS_PATH=$askpass" >> "$GITHUB_ENV"
 
       - name: Test macOS release-mode Tauri host
         working-directory: desktop/src-tauri
@@ -288,5 +297,8 @@ jobs:
         run: |
           if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
             rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          if [ -n "${OPENEVO_PACKAGED_ASKPASS_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_ASKPASS_PATH"
           fi
           rm -rf desktop/packaging/sidecar-build desktop/packaging/sidecar-dist

@@ -164,6 +164,40 @@ def _write_product_web(root: Path, *, javascript: str = "product workspace") -> 
     )
 
 
+def _write_thin_mach_o(path: Path, *, architecture: str = "arm64") -> None:
+    cpu_type = {
+        "arm64": 0x0100_000C,
+        "x86_64": 0x0100_0007,
+    }[architecture]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        struct.pack(
+            "<IiiIIIII",
+            0xFEED_FACF,
+            cpu_type,
+            0,
+            2,
+            0,
+            0,
+            0,
+            0,
+        )
+        + b"native askpass helper"
+    )
+    path.chmod(0o755)
+
+
+def _write_x86_64_elf(path: Path) -> None:
+    header = bytearray(64)
+    header[:4] = b"\x7fELF"
+    header[4] = 2
+    header[5] = 1
+    struct.pack_into("<H", header, 18, 62)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(header) + b"native askpass helper")
+    path.chmod(0o755)
+
+
 def test_validate_core_wheel_rejects_project_identity_mismatch(tmp_path: Path) -> None:
     builder = _load_builder()
     wheel = tmp_path / "openevo-9.9.9-py3-none-any.whl"
@@ -782,6 +816,27 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
             assert not (source / "src/openevo/openevo.egg-info").exists()
             output_dir = Path(command[command.index("--outdir") + 1])
             _write_core_wheel(output_dir / "openevo-0.1.0-py3-none-any.whl")
+        elif command[:2] == ["cargo", "build"]:
+            env = kwargs.pop("env")
+            assert not kwargs
+            commands.append("cargo")
+            assert Path(cwd) == repo / "desktop/src-tauri"
+            assert command == [
+                "cargo",
+                "build",
+                "--locked",
+                "--release",
+                "--bin",
+                builder.ASKPASS_NAME,
+                "--target",
+                "aarch64-apple-darwin",
+            ]
+            helper = (
+                Path(env["CARGO_TARGET_DIR"])
+                / "aarch64-apple-darwin/release"
+                / builder.ASKPASS_NAME
+            )
+            _write_thin_mach_o(helper)
         elif command[2] == "PyInstaller":
             env = kwargs.pop("env")
             assert not kwargs
@@ -802,6 +857,14 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
                 command[index : index + 2] == ["--collect-data", "openevo"]
                 for index in range(len(command) - 1)
             )
+            metadata_source = next(
+                Path(source)
+                for source, destination in (value.rsplit(os.pathsep, 1) for value in add_data)
+                if destination == builder.SIDECAR_BUILD_METADATA_RELATIVE_PATH.parent.as_posix()
+            )
+            metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
+            assert metadata["schema_version"] == "2"
+            assert metadata["ssh_askpass_helper"]["filename"] == builder.ASKPASS_NAME
             dist_dir = Path(command[command.index("--distpath") + 1])
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / builder.SIDECAR_NAME).write_bytes(b"packaged-sidecar")
@@ -810,7 +873,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(builder, "_repo_root", lambda: repo)
-    monkeypatch.setattr(builder, "_target_triple", lambda: "test-target")
+    monkeypatch.setattr(builder, "_target_triple", lambda: "aarch64-apple-darwin")
     monkeypatch.setattr(
         builder,
         "_prepare_fd_bound_pyinstaller",
@@ -822,6 +885,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         "_normalize_unsigned_macos_sidecar_signature",
         lambda _: None,
     )
+    monkeypatch.setattr(builder, "_verify_macos_adhoc_signature", lambda _: "adhoc")
     monkeypatch.setattr(builder, "_validate_managed_runtime_archive", lambda _: None)
     monkeypatch.setattr(builder, "_validate_daemon_manifest_core", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(builder.subprocess, "run", fake_run)
@@ -860,13 +924,22 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
     )
 
     assert commands == (
-        ["product-web", "PyInstaller"]
+        ["cargo", "product-web", "PyInstaller"]
         if release_build
-        else ["build", "product-web", "PyInstaller"]
+        else ["build", "cargo", "product-web", "PyInstaller"]
     )
-    assert target == (repo / "desktop/src-tauri/binaries" / "openevo-desktop-sidecar-test-target")
+    assert target == (
+        repo
+        / "desktop/src-tauri/binaries"
+        / "openevo-desktop-sidecar-aarch64-apple-darwin"
+    )
     assert target.read_bytes() == b"packaged-sidecar"
     assert target.stat().st_mode & 0o777 == 0o755
+    published_helper = (
+        repo / "desktop/src-tauri/binaries/openevo-ssh-askpass-aarch64-apple-darwin"
+    )
+    assert published_helper.is_file()
+    assert published_helper.stat().st_mode & 0o777 == 0o755
     if release_build:
         assert not wheel_output.exists()
     else:
@@ -889,6 +962,7 @@ def test_unsigned_macos_sidecar_is_resigned_without_hardened_runtime(
     calls: list[list[str]] = []
     responses = iter(
         [
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
             subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
             subprocess.CompletedProcess(
                 [],
@@ -933,6 +1007,7 @@ def test_unsigned_macos_sidecar_is_resigned_without_hardened_runtime(
             "--timestamp=none",
             str(executable),
         ],
+        ["/usr/bin/codesign", "--verify", "--strict", str(executable)],
         ["/usr/bin/codesign", "-d", "--verbose=4", str(executable)],
         [
             "/usr/bin/codesign",
@@ -944,6 +1019,192 @@ def test_unsigned_macos_sidecar_is_resigned_without_hardened_runtime(
     ]
 
 
+def test_native_askpass_helper_has_closed_target_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    helper = tmp_path / builder.ASKPASS_NAME
+    _write_thin_mach_o(helper)
+    signatures: list[Path] = []
+    monkeypatch.setattr(
+        builder,
+        "_verify_macos_adhoc_signature",
+        lambda path: signatures.append(path) or "adhoc",
+    )
+
+    identity = builder._validate_native_askpass_helper(
+        helper,
+        target_triple="aarch64-apple-darwin",
+    )
+
+    assert identity == {
+        "architecture": "arm64",
+        "byte_size": helper.stat().st_size,
+        "filename": builder.ASKPASS_NAME,
+        "mode": "0755",
+        "sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+        "signature": "adhoc",
+        "target_triple": "aarch64-apple-darwin",
+    }
+    assert signatures == [helper]
+
+
+def test_native_askpass_helper_rejects_wrong_architecture_mode_symlink_and_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    helper = tmp_path / builder.ASKPASS_NAME
+    _write_thin_mach_o(helper, architecture="x86_64")
+    monkeypatch.setattr(builder, "_verify_macos_adhoc_signature", lambda _path: "adhoc")
+
+    with pytest.raises(RuntimeError, match="architecture"):
+        builder._validate_native_askpass_helper(
+            helper,
+            target_triple="aarch64-apple-darwin",
+        )
+    _write_thin_mach_o(helper)
+    helper.chmod(0o775)
+    with pytest.raises(RuntimeError, match="mode"):
+        builder._validate_native_askpass_helper(
+            helper,
+            target_triple="aarch64-apple-darwin",
+        )
+
+    helper.unlink()
+    real = tmp_path / "real-helper"
+    _write_thin_mach_o(real)
+    helper.symlink_to(real)
+    with pytest.raises(RuntimeError, match="regular file"):
+        builder._validate_native_askpass_helper(
+            helper,
+            target_triple="aarch64-apple-darwin",
+        )
+
+    helper.unlink()
+    _write_thin_mach_o(helper)
+
+    def replace_during_signature(path: Path) -> str:
+        path.unlink()
+        _write_thin_mach_o(path)
+        return "adhoc"
+
+    monkeypatch.setattr(builder, "_verify_macos_adhoc_signature", replace_during_signature)
+    with pytest.raises(RuntimeError, match="changed during verification"):
+        builder._validate_native_askpass_helper(
+            helper,
+            target_triple="aarch64-apple-darwin",
+        )
+
+
+def test_native_askpass_helper_has_closed_linux_ci_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    helper = tmp_path / builder.ASKPASS_NAME
+    _write_x86_64_elf(helper)
+    monkeypatch.setattr(
+        builder,
+        "_verify_macos_adhoc_signature",
+        lambda _path: (_ for _ in ()).throw(AssertionError("codesign must not run")),
+    )
+
+    identity = builder._validate_native_askpass_helper(
+        helper,
+        target_triple="x86_64-unknown-linux-gnu",
+    )
+
+    assert identity["architecture"] == "x86_64"
+    assert identity["signature"] == "none"
+    assert identity["target_triple"] == "x86_64-unknown-linux-gnu"
+
+
+def test_native_askpass_helper_build_uses_locked_targeted_cargo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    tauri_root = tmp_path / "desktop/src-tauri"
+    tauri_root.mkdir(parents=True)
+    cargo_target = tmp_path / "cargo-target"
+    observed: list[tuple[list[str], Path, dict[str, str]]] = []
+
+    def fake_run(command, *, check, cwd, env):
+        observed.append((command, Path(cwd), env))
+        built = cargo_target / "aarch64-apple-darwin/release" / builder.ASKPASS_NAME
+        _write_thin_mach_o(built)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    built = builder._build_native_askpass_helper(
+        tauri_root,
+        cargo_target=cargo_target,
+        target_triple="aarch64-apple-darwin",
+    )
+
+    assert built == cargo_target / "aarch64-apple-darwin/release" / builder.ASKPASS_NAME
+    assert observed[0][0] == [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "--bin",
+        builder.ASKPASS_NAME,
+        "--target",
+        "aarch64-apple-darwin",
+    ]
+    assert observed[0][1] == tauri_root
+    assert observed[0][2]["CARGO_TARGET_DIR"] == str(cargo_target)
+    assert json.loads(observed[0][2]["TAURI_CONFIG"]) == {"bundle": {"externalBin": []}}
+
+
+def test_sidecar_build_metadata_binds_exact_native_askpass_helper(tmp_path: Path) -> None:
+    builder = _load_builder()
+    path = tmp_path / "sidecar-build-metadata.json"
+    identity = {
+        "architecture": "arm64",
+        "byte_size": 42,
+        "filename": builder.ASKPASS_NAME,
+        "mode": "0755",
+        "sha256": "a" * 64,
+        "signature": "adhoc",
+        "target_triple": "aarch64-apple-darwin",
+    }
+
+    builder._write_sidecar_build_metadata(
+        path,
+        source_commit="b" * 40,
+        askpass_helper=identity,
+    )
+
+    assert json.loads(path.read_text(encoding="utf-8")) == {
+        "schema_version": "2",
+        "source_commit": "b" * 40,
+        "ssh_askpass_helper": identity,
+    }
+
+
+def test_tauri_bundles_exact_native_askpass_external_binary() -> None:
+    config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
+    build_script = Path("desktop/src-tauri/build.rs").read_text(encoding="utf-8")
+    helper = Path("desktop/src-tauri/src/askpass.rs").read_text(encoding="utf-8")
+
+    assert config["bundle"]["externalBin"] == [
+        "binaries/openevo-desktop-sidecar",
+        "binaries/openevo-ssh-askpass",
+    ]
+    assert 'name = "openevo-ssh-askpass"' in cargo
+    assert "cargo:rerun-if-changed=src/askpass.rs" in build_script
+    assert "cargo:rerun-if-changed=src/bin/openevo-ssh-askpass.rs" in build_script
+    assert "NSSecureTextField" in helper
+    assert "osascript" not in helper
+    assert 'Command::new("sh")' not in helper
+
+
 def test_unsigned_macos_sidecar_rejects_hardened_runtime_after_resigning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -953,6 +1214,7 @@ def test_unsigned_macos_sidecar_rejects_hardened_runtime_after_resigning(
     executable.write_bytes(b"sidecar")
     responses = iter(
         [
+            subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
             subprocess.CompletedProcess([], 0, stdout=b"", stderr=b""),
             subprocess.CompletedProcess(
                 [],
@@ -1407,10 +1669,21 @@ def test_temporary_directory_cleanup_failure_keeps_complete_published_pair(
         (dist / builder.SIDECAR_NAME).write_bytes(b"sidecar")
         return subprocess.CompletedProcess(command, 0)
 
+    def fake_askpass(
+        _tauri_root: Path,
+        *,
+        cargo_target: Path,
+        target_triple: str,
+    ) -> Path:
+        helper = cargo_target / target_triple / "release" / builder.ASKPASS_NAME
+        _write_thin_mach_o(helper)
+        return helper
+
     monkeypatch.setattr(builder, "TemporaryDirectory", FailingTemporaryDirectory)
     monkeypatch.setattr(builder, "_repo_root", lambda: repo)
-    monkeypatch.setattr(builder, "_target_triple", lambda: "test-target")
+    monkeypatch.setattr(builder, "_target_triple", lambda: "aarch64-apple-darwin")
     monkeypatch.setattr(builder, "_build_core_wheel", fake_core_wheel)
+    monkeypatch.setattr(builder, "_build_native_askpass_helper", fake_askpass)
     monkeypatch.setattr(builder, "_build_product_web", lambda _: "0" * 64)
     monkeypatch.setattr(builder, "_prepare_fd_bound_pyinstaller", lambda *args: Path(args[1]))
     monkeypatch.setattr(builder.subprocess, "run", fake_pyinstaller)
@@ -1419,6 +1692,7 @@ def test_temporary_directory_cleanup_failure_keeps_complete_published_pair(
         "_normalize_unsigned_macos_sidecar_signature",
         lambda _: None,
     )
+    monkeypatch.setattr(builder, "_verify_macos_adhoc_signature", lambda _: "adhoc")
     monkeypatch.setattr(builder, "_validate_fd_bound_bootloader", lambda _: None)
     monkeypatch.setattr(
         builder, "_validate_sidecar_excludes_remote_release_assets", lambda *_: None

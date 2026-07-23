@@ -1454,10 +1454,39 @@ def test_packaged_sidecar_build_metadata_returns_baked_commit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    helper_identity = (
+        {
+            "architecture": "arm64",
+            "byte_size": 42,
+            "filename": "openevo-ssh-askpass",
+            "mode": "0755",
+            "sha256": "a" * 64,
+            "signature": "adhoc",
+            "target_triple": "aarch64-apple-darwin",
+        }
+        if sys.platform == "darwin"
+        else {
+            "architecture": "x86_64",
+            "byte_size": 42,
+            "filename": "openevo-ssh-askpass",
+            "mode": "0755",
+            "sha256": "a" * 64,
+            "signature": "none",
+            "target_triple": "x86_64-unknown-linux-gnu",
+        }
+    )
     path = tmp_path / sidecar_entry.BUILD_METADATA_RELATIVE_PATH
     path.parent.mkdir(parents=True)
     path.write_text(
-        '{"schema_version":"1","source_commit":"89baeb26"}\n',
+        json.dumps(
+            {
+                "schema_version": "2",
+                "source_commit": "89baeb26",
+                "ssh_askpass_helper": helper_identity,
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(sidecar_entry.sys, "_MEIPASS", str(tmp_path), raising=False)
@@ -1465,3 +1494,48 @@ def test_packaged_sidecar_build_metadata_returns_baked_commit(
     metadata = sidecar_entry._load_packaged_build_metadata()
 
     assert metadata.source_commit == "89baeb26"
+    assert metadata.ssh_askpass_helper.sha256 == "a" * 64
+
+
+def test_packaged_sidecar_build_metadata_rejects_other_platform_helper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    other_platform = (
+        {
+            "architecture": "x86_64",
+            "signature": "none",
+            "target_triple": "x86_64-unknown-linux-gnu",
+        }
+        if sys.platform == "darwin"
+        else {
+            "architecture": "arm64",
+            "signature": "adhoc",
+            "target_triple": "aarch64-apple-darwin",
+        }
+    )
+    helper = {
+        **other_platform,
+        "byte_size": 42,
+        "filename": "openevo-ssh-askpass",
+        "mode": "0755",
+        "sha256": "a" * 64,
+    }
+    path = tmp_path / sidecar_entry.BUILD_METADATA_RELATIVE_PATH
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "2",
+                "source_commit": "89baeb26",
+                "ssh_askpass_helper": helper,
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sidecar_entry.sys, "_MEIPASS", str(tmp_path), raising=False)
+
+    with pytest.raises(ValueError, match="invalid packaged sidecar build metadata"):
+        sidecar_entry._load_packaged_build_metadata()

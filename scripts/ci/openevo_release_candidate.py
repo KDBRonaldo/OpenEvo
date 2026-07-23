@@ -18,7 +18,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 MANIFEST_NAME = "release-candidate.json"
-RELEASE_CANDIDATE_SCHEMA_VERSION = 8
+RELEASE_CANDIDATE_SCHEMA_VERSION = 9
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
@@ -1073,16 +1073,18 @@ def _validate_daemon_resource_evidence(
     bundle_entry: dict[str, object],
     manifest_entry: dict[str, object],
     source_commit: str,
-) -> None:
+    architecture: str,
+) -> dict[str, object]:
     evidence = _load_json(path)
     if type(evidence) is not dict or set(evidence) != {
         "launch_origin",
         "release_assets",
         "schema_version",
+        "ssh_askpass_helper",
         "source_dmg",
     }:
         raise CandidateError(f"{path.name} does not use the closed release asset resource schema")
-    if evidence.get("schema_version") != 2 or evidence.get("launch_origin") != launch_origin:
+    if evidence.get("schema_version") != 3 or evidence.get("launch_origin") != launch_origin:
         raise CandidateError(f"{path.name} release asset resource origin is invalid")
     if evidence.get("source_dmg") != {
         "filename": dmg_path.name,
@@ -1138,6 +1140,30 @@ def _validate_daemon_resource_evidence(
         raise CandidateError(
             f"{path.name} does not bind the exact packaged release asset manifest"
         )
+    helper = evidence.get("ssh_askpass_helper")
+    if (
+        type(helper) is not dict
+        or set(helper)
+        != {
+            "architecture",
+            "byte_size",
+            "mode",
+            "relative_path",
+            "sha256",
+            "signature",
+        }
+        or helper.get("architecture") != ARCHITECTURE_SLICES.get(architecture)
+        or type(helper.get("byte_size")) is not int
+        or not 0 < helper["byte_size"] <= 16 * 1024 * 1024
+        or helper.get("mode") != "0755"
+        or helper.get("relative_path") != "Contents/MacOS/openevo-ssh-askpass"
+        or type(helper.get("sha256")) is not str
+        or DIGEST_PATTERN.fullmatch(helper["sha256"]) is None
+        or set(helper["sha256"]) == {"0"}
+        or helper.get("signature") != "adhoc"
+    ):
+        raise CandidateError(f"{path.name} SSH askpass helper inventory is invalid")
+    return dict(helper)
 
 
 def _validate_mach_o_observation(payload: object, *, subject: str) -> list[str]:
@@ -1617,7 +1643,7 @@ def create_candidate_manifest(
         dmg_path=paths["desktop_dmg"],
         version=version,
     )
-    _validate_daemon_resource_evidence(
+    mounted_askpass_helper = _validate_daemon_resource_evidence(
         paths["daemon_mounted_resource"],
         launch_origin="mounted_dmg",
         dmg_path=paths["desktop_dmg"],
@@ -1626,8 +1652,9 @@ def create_candidate_manifest(
         bundle_entry=_file_entry("daemon_bundle", paths["daemon_bundle"]),
         manifest_entry=_file_entry("daemon_manifest", paths["daemon_manifest"]),
         source_commit=source_commit,
+        architecture=architecture,
     )
-    _validate_daemon_resource_evidence(
+    copied_askpass_helper = _validate_daemon_resource_evidence(
         paths["daemon_copy_resource"],
         launch_origin="detached_copy",
         dmg_path=paths["desktop_dmg"],
@@ -1636,7 +1663,10 @@ def create_candidate_manifest(
         bundle_entry=_file_entry("daemon_bundle", paths["daemon_bundle"]),
         manifest_entry=_file_entry("daemon_manifest", paths["daemon_manifest"]),
         source_commit=source_commit,
+        architecture=architecture,
     )
+    if copied_askpass_helper != mounted_askpass_helper:
+        raise CandidateError("mounted and copied SSH askpass helper identities differ")
     if _load_json(paths["managed_runtime_source"]) != _managed_runtime_source_evidence():
         raise CandidateError("managed runtime source evidence is invalid")
     _validate_playwright_candidate_evidence(
@@ -1695,6 +1725,7 @@ def create_candidate_manifest(
             "native_architectures": native_architectures,
             "rust_target": rust_target,
             "rust_toolchain": RUST_TOOLCHAIN_VERSION,
+            "ssh_askpass_helper": mounted_askpass_helper,
         },
         "managed_runtime": _managed_runtime_manifest(),
         "release": {
@@ -1773,6 +1804,7 @@ def _validate_candidate_manifest(
         "native_architectures",
         "rust_target",
         "rust_toolchain",
+        "ssh_askpass_helper",
     }:
         raise CandidateError("candidate macOS identity is invalid")
     architecture = macos.get("architecture")
@@ -1791,6 +1823,9 @@ def _validate_candidate_manifest(
         "bundled_external_bin": [expected_slice],
     }:
         raise CandidateError("candidate manifest does not bind the packaged Mach-O slices")
+    askpass_helper = macos.get("ssh_askpass_helper")
+    if type(askpass_helper) is not dict:
+        raise CandidateError("candidate manifest does not bind the SSH askpass helper")
     if managed_runtime != _managed_runtime_manifest():
         raise CandidateError("candidate managed runtime identity is invalid")
     if type(files) is not list or len(files) != len(FINAL_ROLES):
@@ -1905,7 +1940,7 @@ def _validate_candidate_manifest(
     )
     if observed_native_architectures != native_architectures:
         raise CandidateError("candidate manifest Mach-O slices do not match native evidence")
-    _validate_daemon_resource_evidence(
+    mounted_askpass_helper = _validate_daemon_resource_evidence(
         root / str(by_role["daemon_mounted_resource"]["filename"]),
         launch_origin="mounted_dmg",
         dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
@@ -1914,8 +1949,9 @@ def _validate_candidate_manifest(
         bundle_entry=by_role["daemon_bundle"],
         manifest_entry=by_role["daemon_manifest"],
         source_commit=str(manifest["source_commit"]),
+        architecture=architecture,
     )
-    _validate_daemon_resource_evidence(
+    copied_askpass_helper = _validate_daemon_resource_evidence(
         root / str(by_role["daemon_copy_resource"]["filename"]),
         launch_origin="detached_copy",
         dmg_path=root / str(by_role["desktop_dmg"]["filename"]),
@@ -1924,7 +1960,13 @@ def _validate_candidate_manifest(
         bundle_entry=by_role["daemon_bundle"],
         manifest_entry=by_role["daemon_manifest"],
         source_commit=str(manifest["source_commit"]),
+        architecture=architecture,
     )
+    if (
+        copied_askpass_helper != mounted_askpass_helper
+        or askpass_helper != mounted_askpass_helper
+    ):
+        raise CandidateError("candidate SSH askpass helper identities differ")
     if (
         _load_json(root / str(by_role["managed_runtime_source"]["filename"]))
         != _managed_runtime_source_evidence()

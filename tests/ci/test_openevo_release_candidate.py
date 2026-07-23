@@ -503,7 +503,15 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         == []
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 8
+    assert payload["schema_version"] == 9
+    assert payload["macos"]["ssh_askpass_helper"] == {
+        "architecture": "arm64",
+        "byte_size": 51,
+        "mode": "0755",
+        "relative_path": "Contents/MacOS/openevo-ssh-askpass",
+        "sha256": "e" * 64,
+        "signature": "adhoc",
+    }
     assert payload["release"] == {
         "app_bundle_signature": "adhoc",
         "channel": "unsigned-preview",
@@ -525,6 +533,14 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         },
         "rust_target": "aarch64-apple-darwin",
         "rust_toolchain": "1.95.0",
+        "ssh_askpass_helper": {
+            "architecture": "arm64",
+            "byte_size": 51,
+            "mode": "0755",
+            "relative_path": "Contents/MacOS/openevo-ssh-askpass",
+            "sha256": "e" * 64,
+            "signature": "adhoc",
+        },
     }
     by_role = {entry["role"]: entry for entry in payload["files"]}
     assert by_role["desktop_dmg"]["filename"] == paths["dmg"].name
@@ -668,6 +684,39 @@ def test_candidate_manifest_rejects_unverified_daemon_dmg_evidence(tmp_path: Pat
     _write_json(evidence_path, evidence)
 
     with pytest.raises(candidate.CandidateError, match="exact packaged release assets"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+
+def test_candidate_manifest_rejects_invalid_or_mismatched_askpass_inventory(
+    tmp_path: Path,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    copied = tmp_path / candidate.DAEMON_COPY_EVIDENCE_NAME
+    evidence = json.loads(copied.read_text(encoding="utf-8"))
+    evidence["ssh_askpass_helper"]["sha256"] = "f" * 64
+    _write_json(copied, evidence)
+
+    with pytest.raises(candidate.CandidateError, match="askpass helper.*differ"):
+        candidate.create_candidate_manifest(
+            tmp_path,
+            source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+            version="0.1.0",
+            architecture="aarch64",
+            rust_target="aarch64-apple-darwin",
+            registry_digest="a" * 64,
+        )
+
+    evidence["ssh_askpass_helper"]["sha256"] = "not-a-digest"
+    _write_json(copied, evidence)
+    with pytest.raises(candidate.CandidateError, match="askpass helper inventory"):
         candidate.create_candidate_manifest(
             tmp_path,
             source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
@@ -1826,7 +1875,15 @@ def _write_candidate_inputs(
                 "sha256": hashlib.sha256(release_manifest).hexdigest(),
             },
         },
-        "schema_version": 2,
+        "schema_version": 3,
+        "ssh_askpass_helper": {
+            "architecture": "arm64",
+            "byte_size": 51,
+            "mode": "0755",
+            "relative_path": "Contents/MacOS/openevo-ssh-askpass",
+            "sha256": "e" * 64,
+            "signature": "adhoc",
+        },
         "source_dmg": {"filename": dmg.name, "sha256": _sha256(dmg)},
     }
     _write_json(root / "daemon-mounted-resource.json", daemon_resource)

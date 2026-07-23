@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import struct
 import subprocess
 import sys
 from types import ModuleType
@@ -37,6 +38,16 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(
         json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8"
     )
+
+
+def _write_thin_mach_o(path: Path, *, architecture: str = "arm64") -> None:
+    cpu_type = {"arm64": 0x0100_000C, "x86_64": 0x0100_0007}[architecture]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(
+        struct.pack("<IiiIIIII", 0xFEED_FACF, cpu_type, 0, 2, 0, 0, 0, 0)
+        + b"native askpass helper"
+    )
+    path.chmod(0o755)
 
 
 def _release_inputs(
@@ -201,6 +212,8 @@ def test_verify_app_resource_binds_all_release_assets_for_both_origins(
     resource_parent = app / module.MACOS_RESOURCE_ROOT.parent
     resource_parent.mkdir(parents=True)
     shutil.copytree(staged, resource_parent / module.RELEASE_ASSETS_DIRECTORY)
+    helper = app / module.MACOS_ASKPASS_HELPER_PATH
+    _write_thin_mach_o(helper)
     dmg = tmp_path / "OpenEvo-Desktop-0.1.0-aarch64.dmg"
     dmg.write_bytes(b"candidate dmg")
     dmg.chmod(0o600)
@@ -210,6 +223,7 @@ def test_verify_app_resource_binds_all_release_assets_for_both_origins(
         "_validate_packaged_runtime_loader",
         lambda root, *, source_commit: runtime_loads.append((root, source_commit)),
     )
+    monkeypatch.setattr(module, "_verify_macos_adhoc_signature", lambda _path: "adhoc")
 
     for origin, evidence in (
         ("mounted_dmg", tmp_path / "mounted.json"),
@@ -228,8 +242,16 @@ def test_verify_app_resource_binds_all_release_assets_for_both_origins(
             evidence_out=evidence,
         )
         payload = json.loads(evidence.read_text(encoding="utf-8"))
-        assert payload["schema_version"] == 2
+        assert payload["schema_version"] == 3
         assert payload["launch_origin"] == origin
+        assert payload["ssh_askpass_helper"] == {
+            "architecture": "arm64",
+            "byte_size": helper.stat().st_size,
+            "mode": "0755",
+            "relative_path": module.MACOS_ASKPASS_HELPER_PATH.as_posix(),
+            "sha256": _sha256(helper),
+            "signature": "adhoc",
+        }
         assert payload["release_assets"]["manifest"]["relative_path"] == (
             "Contents/Resources/openevo-release-assets/release-assets.json"
         )
@@ -259,6 +281,61 @@ def test_verify_app_resource_binds_all_release_assets_for_both_origins(
             launch_origin="mounted_dmg",
             evidence_out=tmp_path / "tampered.json",
         )
+
+
+def test_verify_app_resource_rejects_askpass_symlink_wrong_mode_and_replacement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    inputs = _release_inputs(module, tmp_path / "inputs", monkeypatch)
+    staged = tmp_path / module.RELEASE_ASSETS_DIRECTORY
+    _stage(module, inputs, staged)
+    app = tmp_path / "OpenEvo Desktop.app"
+    resources = app / module.MACOS_RESOURCE_ROOT.parent
+    resources.mkdir(parents=True)
+    shutil.copytree(staged, resources / module.RELEASE_ASSETS_DIRECTORY)
+    helper = app / module.MACOS_ASKPASS_HELPER_PATH
+    real = tmp_path / "real-helper"
+    _write_thin_mach_o(real)
+    helper.parent.mkdir(parents=True)
+    helper.symlink_to(real)
+    dmg = tmp_path / "OpenEvo-Desktop.dmg"
+    dmg.write_bytes(b"candidate")
+    dmg.chmod(0o600)
+    monkeypatch.setattr(module, "_validate_packaged_runtime_loader", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(module, "_verify_macos_adhoc_signature", lambda _path: "adhoc")
+
+    arguments = {
+        "app": app,
+        "bundle": inputs["bundle"],
+        "manifest": inputs["manifest"],
+        "wheel": inputs["wheel"],
+        "framework_lock": inputs["framework_lock"],
+        "managed_runtime_archive": inputs["runtime"],
+        "source_commit": SOURCE_COMMIT,
+        "source_dmg": dmg,
+        "launch_origin": "mounted_dmg",
+        "evidence_out": tmp_path / "evidence.json",
+    }
+    with pytest.raises(module.ResourceCompositionError, match="symlink|trusted"):
+        module.verify_app_resource(**arguments)
+
+    helper.unlink()
+    _write_thin_mach_o(helper)
+    helper.chmod(0o700)
+    with pytest.raises(module.ResourceCompositionError, match="mode"):
+        module.verify_app_resource(**arguments)
+
+    helper.chmod(0o755)
+
+    def replace_during_signature(path: Path) -> str:
+        path.unlink()
+        _write_thin_mach_o(path)
+        return "adhoc"
+
+    monkeypatch.setattr(module, "_verify_macos_adhoc_signature", replace_during_signature)
+    with pytest.raises(module.ResourceCompositionError, match="changed during verification"):
+        module.verify_app_resource(**arguments)
 
 
 def test_packaged_runtime_loader_adds_repo_root_for_direct_script_execution(
@@ -353,6 +430,8 @@ def test_release_workflow_stages_one_release_asset_tree_without_sidecar_embeddin
         "npm run tauri:build"
     )
     assert macos_job.count("openevo_desktop_daemon_resource.py verify-app") == 2
+    assert "openevo-ssh-askpass-${OPENEVO_RUST_TARGET}" in macos_job
+    assert 'test -x "$askpass"' in macos_job
     assert "_validate_embedded_managed_runtime_archive" not in macos_job
     assert release_config["bundle"]["resources"] == {
         "release-resources/openevo-release-assets": "openevo-release-assets"

@@ -25,7 +25,10 @@
     "active": true,
     "targets": ["dmg"],
     "icon": ["icons/icon.icns"],
-    "externalBin": ["binaries/openevo-desktop-sidecar"],
+    "externalBin": [
+      "binaries/openevo-desktop-sidecar",
+      "binaries/openevo-ssh-askpass"
+    ],
     "macOS": {
       "minimumSystemVersion": "12.0",
       "infoPlist": "Info.plist",

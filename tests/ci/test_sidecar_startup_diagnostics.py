@@ -679,7 +679,18 @@ def test_python_startup_redacts_launcher_system_exit(
     monkeypatch.setattr(
         entry,
         "_load_packaged_build_metadata",
-        lambda: entry._PackagedBuildMetadata(source_commit="abcdef1"),
+        lambda: entry._PackagedBuildMetadata(
+            source_commit="abcdef1",
+            ssh_askpass_helper=entry._PackagedAskpassHelper(
+                architecture="arm64",
+                byte_size=42,
+                filename="openevo-ssh-askpass",
+                mode="0755",
+                sha256="a" * 64,
+                signature="adhoc",
+                target_triple="aarch64-apple-darwin",
+            ),
+        ),
     )
     monkeypatch.setattr(
         launcher,
@@ -712,7 +723,18 @@ def test_python_startup_preserves_typed_redacted_launcher_failure(
     monkeypatch.setattr(
         entry,
         "_load_packaged_build_metadata",
-        lambda: entry._PackagedBuildMetadata(source_commit="abcdef1"),
+        lambda: entry._PackagedBuildMetadata(
+            source_commit="abcdef1",
+            ssh_askpass_helper=entry._PackagedAskpassHelper(
+                architecture="arm64",
+                byte_size=42,
+                filename="openevo-ssh-askpass",
+                mode="0755",
+                sha256="a" * 64,
+                signature="adhoc",
+                target_triple="aarch64-apple-darwin",
+            ),
+        ),
     )
     canary = "Traceback /Users/private token=secret"
 

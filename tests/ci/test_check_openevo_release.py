@@ -3498,9 +3498,12 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     cargo_bin_targets = [
         target for target in cargo_package["targets"] if target["kind"] == ["bin"]
     ]
-    assert len(cargo_bin_targets) == 1
-    cargo_main_binary = cargo_bin_targets[0]["name"]
-    assert cargo_package["default_run"] in (None, cargo_main_binary)
+    assert {target["name"] for target in cargo_bin_targets} == {
+        "openevo-desktop",
+        "openevo-ssh-askpass",
+    }
+    cargo_main_binary = "openevo-desktop"
+    assert cargo_package["default_run"] == cargo_main_binary
     effective_tauri_binary = config.get("mainBinaryName") or cargo_main_binary
     assert effective_tauri_binary == candidate_tool.TAURI_EXECUTABLE_NAME == "openevo-desktop"
     assert cargo_config["package"]["name"] == "openevo-desktop"
@@ -3523,7 +3526,10 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert config["build"]["frontendDist"] == "../dist"
     assert config["bundle"]["active"] is True
     assert config["bundle"]["targets"] == ["dmg"]
-    assert config["bundle"]["externalBin"] == ["binaries/openevo-desktop-sidecar"]
+    assert config["bundle"]["externalBin"] == [
+        "binaries/openevo-desktop-sidecar",
+        "binaries/openevo-ssh-askpass",
+    ]
     assert config["bundle"]["macOS"]["minimumSystemVersion"] == "12.0"
     assert config["bundle"]["macOS"]["infoPlist"] == "Info.plist"
     assert config["bundle"]["macOS"]["signingIdentity"] == "-"
@@ -3541,6 +3547,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert sidecar_builder.is_file()
     assert sidecar_entry.is_file()
     assert "desktop/src-tauri/binaries/openevo-desktop-sidecar-*" in gitignore
+    assert "desktop/src-tauri/binaries/openevo-ssh-askpass-*" in gitignore
     sidecar_builder_text = sidecar_builder.read_text(encoding="utf-8")
     sidecar_entry_text = sidecar_entry.read_text(encoding="utf-8")
     assert "PyInstaller" in sidecar_builder_text
@@ -3645,12 +3652,16 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert workflow.index("npm run build:sidecar") < workflow.index(
         "tests::packaged_external_bin_native_launch_smoke"
     )
+    assert workflow.count("openevo-ssh-askpass-$(rustc --print host-tuple)") == 2
+    assert workflow.count('test -x "$askpass"') == 2
+    assert workflow.count("OPENEVO_PACKAGED_ASKPASS_PATH=$askpass") == 2
     assert "macOS FD-bound packaged sidecar launch smoke" in workflow
     assert (
         "tests::macos_release_spawns_verified_bundle_path_without_private_copy" in workflow
     )
     assert "if: always()" in workflow
     assert 'rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"' in workflow
+    assert workflow.count('rm -f "$OPENEVO_PACKAGED_ASKPASS_PATH"') == 2
     assert "cargo build --locked --release" in workflow
     assert "release binary contains the debug source launcher fallback" in workflow
     assert "release binary contains debug sidecar override code" in workflow

@@ -17,7 +17,7 @@ from typing import Mapping
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-RELEASE_CANDIDATE_SCHEMA_VERSION = 8
+RELEASE_CANDIDATE_SCHEMA_VERSION = 9
 MAX_EVIDENCE_BYTES = 128 * 1024
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
