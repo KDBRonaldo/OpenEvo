@@ -56,13 +56,15 @@ G7-G12 remain open.
 
 Current priority is:
 
-1. assign the clean-host workstream owner and complete a G3-shaped rehearsal,
+1. repair the 0.1.8 Tahoe packaged-sidecar startup failure and complete the
+   system-OpenSSH configured-host path for 0.1.9;
+2. assign the clean-host workstream owner and complete a G3-shaped rehearsal,
    including mediated Subscription authentication and the direct/proxy matrix;
-2. complete and independently review the durable System recovery owner;
-3. cut product authority over to the next negotiated API contract major before
+3. complete and independently review the durable System recovery owner;
+4. complete v2 authority cutover across Core, sidecar, and Desktop before
    extending deep Task, Files, or History state;
-4. complete the Desktop System, Files, History, diagnostics, and recovery views;
-5. close Self-Deployed, atomic cross-session evolution, benchmark, security,
+5. complete the Desktop System, Files, History, diagnostics, and recovery views;
+6. close Self-Deployed, atomic cross-session evolution, benchmark, security,
    lifecycle, and release-evidence gates.
 
 This order changes implementation scheduling only. It does not reduce any
@@ -90,6 +92,12 @@ the next negotiated API contract major must:
   replacement-plan, abandon, and historical-restore actions;
 - migrate run, artifact, history, event, sidecar, and Desktop schemas together,
   with no context-dependent reinterpretation of the generic v1 revision type.
+
+The 0.1.9 remote-workspace change is part of that complete v2 authority cutover.
+Its local profile stores a literal system OpenSSH alias rather than a flattened
+host/user/port or an OpenEvo credential/trust record. `/usr/bin/ssh <alias>`
+remains authoritative for resolution, route, identities, prompts, and known-host
+policy. A profile-only v2 facade over v1 run/revision semantics is forbidden.
 
 Core also still contains Terminal-Bench-named parametric training projections.
 They must move to benchmark-owned automation or a benchmark-owned verified

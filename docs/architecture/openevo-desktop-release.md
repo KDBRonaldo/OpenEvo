@@ -821,21 +821,47 @@ nonterminal reservations, writing
 their cancelled operation and idempotency response together. SSH success alone
 reports `core_not_started`, not an online Core.
 
-The exhibition candidate does not ship a native SSH credential broker. Desktop
-release profile creation and patch accept only `ssh_agent`; historical
-`native_password` and `native_private_key` values remain parseable as reserved
-contract values but cannot connect; the user must explicitly save the profile as
-SSH agent before it can connect.
+### 0.1.9 system OpenSSH composition
+
+The 0.1.9 release profile stores a literal configured alias and uses
+`/usr/bin/ssh <alias>` as the final authority for resolution, user, port,
+identity files, agent and Keychain behavior, authentication prompts,
+ProxyJump/ProxyCommand, and known-host policy. The renderer selects a bounded
+catalog hint or types a literal alias; it never submits host/user/port/key data
+or receives the effective command/config paths.
+
+The sidecar owns one private OpenSSH master and the Core tunnel generation. A
+separately inventoried native askpass helper mediates first-host confirmation,
+encrypted-key passphrases, and passwords. Secret responses flow only to the
+owning OpenSSH process and are never returned to the sidecar or renderer,
+persisted by OpenEvo, or logged. Changed keys fail closed and require explicit
+review; OpenEvo invokes `ssh-keygen` repair only after proving one unambiguous
+ordinary user known-host file.
+
+OpenEvo applies only reviewed process/multiplexing/forward/TTY/deadline safety
+options. It does not use `-F /dev/null`, flatten user configuration, select an
+auth method, relay an isolated replacement agent, or own a second known-host
+store. After compatible Core v2 negotiation, SSH remains only the private
+tunnel and manifest-bound maintenance path; every business operation uses the
+active project tunnel.
+
+### Frozen 0.1.8 SSH composition
+
+The 0.1.8 exhibition candidate did not ship a native SSH credential broker.
+Desktop release profile creation and patch accepted only `ssh_agent`;
+historical `native_password` and `native_private_key` values remained parseable
+as reserved contract values but could not connect; the user had to explicitly
+save the profile as SSH agent before it could connect.
 Startup clears historical credential-slot status. There is no Tauri password
 prompt, private-key picker, Keychain registry, sidecar credential vault, askpass
 helper, `ssh-agent` child, `ssh-add` child, or native credential handoff route in
-the packaged composition. Linux and macOS therefore share the same fail-closed
+that packaged composition. Linux and macOS therefore shared the same fail-closed
 boundary. Authenticated proxy slots and the self-deployed Hugging Face token slot
-are likewise reserved and unavailable; HTTP(S) proxy URLs without user-info
-remain supported.
+were likewise reserved and unavailable; HTTP(S) proxy URLs without user-info
+remained supported.
 
-Release SSH, ssh-keyscan, and rsync calls use platform-fixed allowlisted absolute
-binaries. The Desktop sidecar deployment transport verifies root ownership,
+The 0.1.8 SSH, ssh-keyscan, and rsync calls used platform-fixed allowlisted
+absolute binaries. The Desktop sidecar deployment transport verifies root ownership,
 regular-file type, executable mode, link count one, non-group/world-writable
 ancestors and file metadata. Linux launches through the held executable FD. On
 macOS, the top-level SSH/rsync birth child compares that FD with the fixed system

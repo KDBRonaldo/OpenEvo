@@ -282,15 +282,17 @@ The Tauri native host owns:
 
 - lifecycle and authentication of the Desktop sidecar;
 - the renderer's private Desktop session;
-- macOS Keychain access;
+- the sealed native askpass helper and its secure macOS prompt surface;
+- macOS Keychain access for non-SSH product secrets that are explicitly retained;
 - native file and directory selection;
 - local notifications;
 - safe opening and saving of user-selected local files.
 
 The Desktop sidecar owns:
 
-- non-secret server profiles and local task-text or project-form drafts;
-- SSH authentication orchestration and host-key verification;
+- non-secret system-OpenSSH alias profiles and local task-text or project-form
+  drafts;
+- system OpenSSH process, prompt-authorization, and host-key review orchestration;
 - Daemon bundle transfer and bootstrap;
 - private SSH tunnel establishment and recovery;
 - typed projection and forwarding between the renderer and the Daemon.
@@ -302,7 +304,9 @@ sidecar process handles.
 
 The packaged application MUST include everything required by its local
 components. It MUST NOT depend on a system Python, Node, Rust toolchain,
-development server, source checkout, or globally installed command.
+development server, source checkout, or globally installed application command.
+The declared macOS platform `/usr/bin/ssh` and its reviewed system helpers are
+operating-system services, not bundled OpenEvo product dependencies.
 
 Native-host, sidecar, and renderer communication MUST use private authenticated
 sessions over IPC or an equivalent private channel. A release build MUST NOT
@@ -312,9 +316,9 @@ expose an unauthenticated localhost API.
 
 Desktop MAY persist:
 
-- server addresses and user-facing labels;
-- accepted SSH host-key records;
-- references to Keychain credentials;
+- literal OpenSSH aliases and user-facing labels;
+- bounded non-authoritative display snapshots of a selected alias;
+- references to non-SSH Keychain credentials;
 - UI preferences;
 - non-secret task-text and project-form drafts keyed by server and project;
 - the last acknowledged event cursor for each active connection;
@@ -329,17 +333,20 @@ state, not sidecar drafts. They are content-addressed, recoverable after
 Desktop restart, and removed only through an explicit discard, project delete,
 or bounded orphan-cleanup operation.
 
-SSH passwords, private-key passphrases, proxy credentials, and Hugging Face
-tokens stored on the Mac MUST use Keychain. Plaintext project configuration
-contains references, not secret values.
+System OpenSSH configuration, identity selection, agent/Keychain behavior, and
+known-host state remain user-owned. OpenEvo MUST NOT copy them into a second
+credential or trust database. SSH prompt responses MUST NOT be persisted by OpenEvo.
+Proxy credentials and Hugging Face tokens retained on the Mac MUST use
+Keychain. Plaintext project configuration contains references, not secret
+values.
 
 ### 7.3 First Run And Server Setup
 
 The first-run flow MUST remain inside Desktop:
 
 ```text
-server address, SSH identity, and optional remote network settings
--> host-key confirmation
+configured OpenSSH host alias and optional remote network settings
+-> system OpenSSH authentication and host-key interaction
 -> remote preflight
 -> Daemon installation or attachment
 -> first project
@@ -381,14 +388,26 @@ Starting from a demonstration, adding a server always creates a new
 remote-workspace profile; successful creation makes that profile selectable for
 connection and project creation without editing or hiding an existing profile.
 
-Supported SSH authentication methods are:
+The default connection is equivalent to `/usr/bin/ssh <alias>`. The selected
+literal alias is persisted, and system OpenSSH is the final connection authority
+for host resolution, user, port, identity files, agent and Keychain integration,
+password or passphrase prompts, ProxyJump, ProxyCommand, and known-host policy.
+Desktop discovers bounded literal `Host` aliases only as selection hints; it
+does not flatten effective configuration
+into host/user/port/key fields. Agent, private-key/passphrase, and password
+authentication are supported when the user's OpenSSH configuration and server
+permit them.
 
-- SSH agent;
-- private key with an optional Keychain-backed passphrase;
-- password with a Keychain-backed credential.
+OpenEvo MAY add only reviewed session-safety options needed to own its process,
+multiplexing socket, forwarding, TTY, and deadlines. It MUST NOT use
+`-F /dev/null`, select an authentication method, override identity or route
+configuration, or replace user known-host policy with an OpenEvo store.
 
 A changed host key MUST block connection until the user explicitly reviews and
-accepts the new identity. Desktop MUST NOT silently replace a pinned host key.
+accepts the new identity. Desktop MUST NOT silently replace a user trust record.
+Automated repair is permitted only when Desktop proves one ordinary writable
+`UserKnownHostsFile` and no command-based or ambiguous trust source; otherwise
+it returns a typed in-app administrator action.
 
 Remote network settings include:
 
@@ -1470,7 +1489,8 @@ not executable release evidence.
 
 ### 13.1 Connection And Process Isolation
 
-- Desktop verifies and pins SSH host identity.
+- System OpenSSH verifies SSH host identity; Desktop mediates explicit review
+  without creating a second trust store.
 - The Daemon API binds only to remote loopback.
 - Desktop reaches it only through an authenticated private tunnel.
 - Daemon bearer material is private, permission-restricted, and rotated on a
@@ -1496,13 +1516,15 @@ effective policy; an active task cannot change it.
 
 ### 13.2 Secrets
 
-Secrets include SSH credentials, proxy credentials, Hugging Face tokens,
-Codex authentication, authorization headers, and Desktop-Daemon session
+Secrets include transient SSH prompt responses, proxy credentials, Hugging Face
+tokens, Codex authentication, authorization headers, and Desktop-Daemon session
 material.
 
 Secret values are:
 
-- stored in Keychain on the Mac when retained locally;
+- stored in Keychain on the Mac when retained locally by OpenEvo, except that
+  SSH prompt responses are never retained by OpenEvo and remain under system
+  OpenSSH agent/Keychain policy;
 - stored in permission-restricted remote secret state only when required;
 - accepted through write-only API fields;
 - excluded from project configuration returned to the renderer;
@@ -1867,8 +1889,10 @@ Pass criteria:
 - the required `cn-mainland-restricted-v1` row proves direct-route denial and
   successful proxied Codex preparation, login, execution, and applicable
   release-managed downloads;
-- retained local credentials use Keychain references, and secret canaries are
-  absent from renderer state, project configuration, logs, and diagnostics.
+- OpenEvo retains no SSH prompt response; any user-selected OpenSSH
+  agent/Keychain retention remains system-owned. Other retained local secrets
+  use Keychain references, and secret canaries are absent from renderer state,
+  project configuration, logs, and diagnostics.
 
 Evidence: preflight report, installation operation history, service health,
 authentication/bootstrap matrix, task/run record, transcript-capture

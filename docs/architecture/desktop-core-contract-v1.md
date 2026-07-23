@@ -1,12 +1,17 @@
 # Desktop/Daemon Implementation Contract v1
 
-Status: non-normative implementation snapshot for the current v1 APIs
+Status: frozen historical contract for the 0.1.8 Preview
 
 The canonical product target and release acceptance are defined only by
 `docs/maintainer/productization/spec.md`. This document refines the currently
-implemented Desktop/Daemon API slice. Statements that a capability is absent,
-hidden, or unavailable describe a current implementation gap; they do not
-remove or narrow a requirement in the canonical specification.
+implemented 0.1.8 Desktop/Daemon API slice. Statements that a capability is
+absent, hidden, or unavailable describe a current implementation gap; they do
+not remove or narrow a requirement in the canonical specification.
+
+OpenEvo 0.1.9 does not mutate the meaning of this contract. V1 profile and
+generic revision data may be read only as bounded migration input. The release
+renderer and all new mutations use the negotiated v2 contract in
+`docs/architecture/desktop-core-contract-v2.md`; there is no v1 route fallback.
 
 Issue #163 tracks the exhibition-oriented implementation slice. The checked-in
 OpenAPI documents and conformance tests fix its exact JSON schemas.

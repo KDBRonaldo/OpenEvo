@@ -3747,6 +3747,49 @@ def test_disabled_release_artifact_workflow_does_not_upload_checksums_or_notes()
     assert "release-artifacts/openevo-desktop-dmg/*" not in text
 
 
+def test_v019_docs_define_system_openssh_and_v2_authority() -> None:
+    agents = Path("AGENTS.md").read_text(encoding="utf-8")
+    product_spec = Path("docs/maintainer/productization/spec.md").read_text(
+        encoding="utf-8"
+    )
+    implementation_plan = Path(
+        "docs/maintainer/productization/implementation-plan.md"
+    ).read_text(encoding="utf-8")
+    v1_contract = Path("docs/architecture/desktop-core-contract-v1.md").read_text(
+        encoding="utf-8"
+    )
+    v2_contract = Path("docs/architecture/desktop-core-contract-v2.md").read_text(
+        encoding="utf-8"
+    )
+    release = Path("docs/architecture/openevo-desktop-release.md").read_text(
+        encoding="utf-8"
+    )
+    ssh_foundation = Path(
+        "docs/architecture/openevo-desktop-ssh-transport-foundation.md"
+    ).read_text(encoding="utf-8")
+    handoff = Path("docs/maintainer/macos-desktop-development-handoff.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "`/desktop/v2/*`" in agents
+    assert "`/v2/*`" in agents
+    assert "`/usr/bin/ssh <alias>`" in product_spec
+    assert "system OpenSSH is the final connection authority" in product_spec
+    assert "SSH prompt responses MUST NOT be persisted by OpenEvo" in product_spec
+    assert "private key with an optional Keychain-backed passphrase" not in product_spec
+    assert "complete v2 authority cutover" in implementation_plan
+    assert "Status: frozen historical contract for the 0.1.8 Preview" in v1_contract
+    assert "# OpenEvo Desktop And Core Contract v2" in v2_contract
+    assert "Project Head" in v2_contract
+    assert "Evolution Revision" in v2_contract
+    assert "Runtime Context Snapshot" in v2_contract
+    assert "Effective Execution Snapshot" in v2_contract
+    assert "system OpenSSH" in release
+    assert "must not use `-F /dev/null`" in ssh_foundation
+    assert "select the `evolab` alias" in handoff
+    assert "Server address" not in handoff
+
+
 def test_desktop_science_release_doc_matches_remote_lifecycle_state() -> None:
     doc = Path("docs/architecture/openevo-desktop-science-foundation.md")
 

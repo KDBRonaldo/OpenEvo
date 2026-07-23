@@ -74,10 +74,14 @@ Use that command for developer-only diagnostics and for confirming that the Mac
 can reach the test host. It is not an instruction for ordinary users to operate
 the Daemon manually.
 
-The current Desktop SSH transport deliberately invokes OpenSSH with
-`-F /dev/null` and explicit trust/authentication options. It therefore does not
-load `Host evolab` from `~/.ssh/config`. Before creating the Desktop remote
-workspace, inspect the alias locally without printing identity-file contents:
+The 0.1.8 Desktop transport deliberately invokes OpenSSH with `-F /dev/null`
+and explicit trust/authentication options, so it cannot load `Host evolab` from
+the user's configuration. That historical behavior is not an acceptance
+workaround. The 0.1.9 path must present the configured-host catalog and let the
+user select the `evolab` alias directly.
+
+For developer-only diagnosis, inspect the alias without printing identity-file
+contents:
 
 ```bash
 ssh -G evolab | awk '
@@ -87,28 +91,17 @@ ssh -G evolab | awk '
 ssh-add -l
 ```
 
-Create the Desktop workspace with:
+Create the Desktop workspace with a local display name and the `evolab` catalog
+entry. Do not transcribe the resolved hostname, user, port, identity path,
+ProxyJump, or ProxyCommand into Desktop. The real `/usr/bin/ssh evolab`
+invocation remains authoritative for all of those values and for the user's
+agent/Keychain and known-host policy.
 
-- **Workspace name**: a local display name such as `OpenEvo development server`;
-- **Server address**: the concrete `hostname` reported by `ssh -G`, not the
-  `evolab` alias unless that name is also independently DNS-resolvable;
-- **Port** and **User name**: the concrete values reported by `ssh -G`;
-- **Authentication**: SSH agent; and
-- **Network proxy**: empty unless this server's outbound network needs an
-  explicit HTTP/HTTPS proxy.
-
-The identity used by `evolab` must be loaded into the Mac's current SSH agent.
-Desktop never reads a private-key file from the renderer and never copies a key
-to the server. If `ssh -G evolab` reports an active `proxyjump` or
-`proxycommand`, the current explicit-host Desktop transport cannot reproduce
-that route. Do not silently treat the alias as supported: either provide a
-direct endpoint for this acceptance host or implement and review a typed
-jump-host contract before claiming support.
-
-When Desktop first probes the concrete endpoint, compare its displayed host-key
-fingerprint with the existing trusted `evolab` host identity through a separate
-trusted channel. Do not approve a changed key merely because `ssh evolab`
-previously worked.
+Desktop mediates any first-host, encrypted-key passphrase, or password prompt
+through the sealed native askpass surface. It does not copy a key, password, or
+passphrase into renderer, Local API, argv, logs, diagnostics, or OpenEvo state.
+A changed key remains a separate blocking review and must not be approved merely
+because `ssh evolab` previously worked.
 
 As of this handoff, the remote container has the required first-release profile:
 
@@ -148,7 +141,7 @@ state is valuable upgrade and reconnect coverage.
 
 For the end-to-end acceptance:
 
-1. start from the installed Mac app and add the explicit remote profile above;
+1. start from the installed Mac app and add the configured `evolab` workspace;
 2. save, connect, verify the host key, and let Desktop install or upgrade the
    Daemon;
 3. create a Subscription project and independently select the evolution targets

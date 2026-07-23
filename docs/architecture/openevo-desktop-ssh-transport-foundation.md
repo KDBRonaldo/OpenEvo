@@ -20,6 +20,38 @@ remote daemon, manage Docker Compose, manage vLLM, or perform Desktop UI
 orchestration. Remote dependency installation is limited to the bootstrap
 layer's user-site Python package checks.
 
+## 0.1.9 System OpenSSH Replacement
+
+The foundation below is frozen 0.1.8 history. The 0.1.9 release replaces its
+explicit host/user/port, private known-host store, isolated agent relay, and
+authentication selector with the contract in
+`desktop-core-contract-v2.md`.
+
+The new connectable profile contains only a user-facing name and a literal
+OpenSSH alias. The actual connection is `/usr/bin/ssh <alias>`. System OpenSSH
+is authoritative for HostName, User, Port, Include, Match, IdentityFile, agent
+and Keychain integration, password/passphrase prompts, ProxyJump, ProxyCommand,
+canonicalization, and known-host policy.
+
+The 0.1.9 transport must not use `-F /dev/null`, `-p`, `-l`, `-i`,
+`IdentityFile=none`, `IdentitiesOnly`, or an OpenEvo `UserKnownHostsFile`. It may
+override only reviewed process ownership, private multiplexing, unrequested
+forward/command/TTY suppression, intentional Core tunnel forwarding,
+keepalive, and deadlines. The separately inventoried native askpass helper
+returns secret input directly to the owning OpenSSH process; OpenEvo does not
+persist that input or receive it through React/Local API.
+
+A bounded lexical parser lists literal configured hosts as hints but never
+executes config commands. Selection persists the alias, not flattened
+effective values. First-host and changed-key behavior uses the user's OpenSSH
+trust policy, with explicit changed-key review and only provably unambiguous
+`ssh-keygen` repair.
+
+## Frozen 0.1.8 Foundation
+
+The remaining sections document the explicit transport retained only for v1
+tests and read-only migration context. They are not a 0.1.9 release fallback.
+
 ## Transport Contract
 
 Desktop chooses between dry-run and SSH transports through the sidecar API. The
