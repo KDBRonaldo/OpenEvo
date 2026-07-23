@@ -31,8 +31,17 @@ from pydantic import ValidationError
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from openevo_startup_diagnostics import (  # noqa: E402
+    STARTUP_OUTPUT_LINE_MAX_BYTES,
+    classify_stock_loader_line,
+    unknown_output_fingerprint,
+)
 
 from desktop.sidecar.contracts.v1 import DesktopStateV1, VersionV1  # noqa: E402
 from openevo.deployment.ssh import (  # noqa: E402
@@ -873,23 +882,50 @@ def _read_startup_diagnostics(process_output) -> tuple[str, ...]:
         if not chunk:
             break
         payload.extend(chunk)
+    scan_exhausted = len(payload) > STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES
     bounded = payload[:STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES]
-    final_newline = bounded.rfind(b"\n")
-    if final_newline < 0:
-        return ()
-
+    if scan_exhausted:
+        final_newline = bounded.rfind(b"\n")
+        complete = bounded[: final_newline + 1] if final_newline >= 0 else b""
+        lines = complete.split(b"\n")
+    else:
+        lines = bounded.split(b"\n")
     diagnostics: list[str] = []
-    for line in bounded[:final_newline].split(b"\n"):
+    unknown_lines: list[bytes] = []
+    for raw_line in lines:
+        if not raw_line:
+            continue
+        line = bytes(raw_line)
         match = _STARTUP_DIAGNOSTIC_PATTERN.fullmatch(line)
-        if match is None:
+        if match is not None:
+            stage = match.group(1).decode("ascii")
+            code = match.group(2).decode("ascii")
+            if code in _STARTUP_DIAGNOSTIC_CODES.get(stage, ()):
+                if len(diagnostics) < STARTUP_DIAGNOSTIC_MAX_LINES:
+                    diagnostics.append(line.decode("ascii"))
+                continue
+        classification = classify_stock_loader_line(line)
+        if classification is not None:
+            if len(diagnostics) < STARTUP_DIAGNOSTIC_MAX_LINES:
+                diagnostics.append(
+                    "OPENEVO_STARTUP_CLASSIFIED_V1 "
+                    f"stage={classification.stage} code={classification.code}"
+                )
             continue
-        stage = match.group(1).decode("ascii")
-        code = match.group(2).decode("ascii")
-        if code not in _STARTUP_DIAGNOSTIC_CODES.get(stage, ()):
-            continue
-        diagnostics.append(line.decode("ascii"))
+        unknown_lines.append(line[:STARTUP_OUTPUT_LINE_MAX_BYTES])
+    if scan_exhausted:
+        unknown_lines.append(b"scan_exhausted")
+    summary = unknown_output_fingerprint(unknown_lines)
+    if summary is not None:
+        count, fingerprint = summary
+        unknown_diagnostic = (
+            "OPENEVO_STARTUP_UNKNOWN_V1 category=unclassified "
+            f"count={count} fingerprint=sha256:{fingerprint}"
+        )
         if len(diagnostics) == STARTUP_DIAGNOSTIC_MAX_LINES:
-            break
+            diagnostics[-1] = unknown_diagnostic
+        else:
+            diagnostics.append(unknown_diagnostic)
     return tuple(diagnostics)
 
 

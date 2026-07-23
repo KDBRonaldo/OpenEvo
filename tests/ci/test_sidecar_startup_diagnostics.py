@@ -15,6 +15,16 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _stock_loader_failure(*, team_phrase: str = "different Team IDs") -> bytes:
+    return (
+        "[PYI-43120:ERROR] Failed to load Python shared library "
+        "'/private/var/folders/secret/_MEI123/Python': "
+        "dlopen(https://user:token@example.invalid/private): code signature in "
+        "<Python.framework token=super-secret> not valid for use in process: "
+        f"mapping process and mapped file (non-platform) have {team_phrase}"
+    ).encode("utf-8")
+
+
 def _load_module(name: str, relative_path: str):
     path = REPOSITORY_ROOT / relative_path
     spec = importlib.util.spec_from_file_location(name, path)
@@ -112,6 +122,135 @@ def test_startup_producers_exactly_match_smoke_allowlist() -> None:
     }
 
 
+def test_stock_loader_failure_maps_to_closed_diagnostic_without_canaries(
+    tmp_path: Path,
+) -> None:
+    classifier = _load_module(
+        "openevo_stock_startup_classifier_test",
+        "scripts/ci/openevo_startup_diagnostics.py",
+    )
+    smoke = _load_module(
+        "openevo_sidecar_smoke_stock_loader_test",
+        "scripts/ci/smoke_openevo_desktop_sidecar.py",
+    )
+    raw = _stock_loader_failure()
+
+    assert classifier.classify_stock_loader_line(raw) == (
+        "embedded_python_loader",
+        "python_shared_library_validation_failed",
+    )
+    process_log = tmp_path / "process.log"
+    process_log.write_bytes(raw + b"\n")
+    with process_log.open("rb") as stream:
+        failure = smoke._render_process_failure(255, stream)
+
+    assert failure == (
+        "sidecar exited before serving /health (exit 255).\n"
+        "startup diagnostics:\n"
+        "OPENEVO_STARTUP_CLASSIFIED_V1 stage=embedded_python_loader "
+        "code=python_shared_library_validation_failed"
+    )
+    assert "/private/" not in failure
+    assert "token" not in failure
+    assert "https://" not in failure
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        _stock_loader_failure(team_phrase="the same Team IDs"),
+        _stock_loader_failure().replace(b"[PYI-43120:ERROR]", b"[PYI-X:ERROR]"),
+        _stock_loader_failure().replace(b"Failed to load", b"Could not load"),
+        _stock_loader_failure().replace(b"code signature in", b"signature in"),
+    ],
+)
+def test_stock_loader_classifier_rejects_near_matches(line: bytes) -> None:
+    classifier = _load_module(
+        "openevo_stock_startup_classifier_near_match_test",
+        "scripts/ci/openevo_startup_diagnostics.py",
+    )
+
+    assert classifier.classify_stock_loader_line(line) is None
+
+
+def test_stock_loader_classifier_rejects_over_budget_line() -> None:
+    classifier = _load_module(
+        "openevo_stock_startup_classifier_budget_test",
+        "scripts/ci/openevo_startup_diagnostics.py",
+    )
+    payload = _stock_loader_failure() + b"X" * classifier.STARTUP_OUTPUT_LINE_MAX_BYTES
+
+    assert classifier.classify_stock_loader_line(payload) is None
+
+
+def test_unknown_startup_output_keeps_only_count_category_and_fingerprint(
+    tmp_path: Path,
+) -> None:
+    smoke = _load_module(
+        "openevo_sidecar_smoke_unknown_summary_test",
+        "scripts/ci/smoke_openevo_desktop_sidecar.py",
+    )
+    process_log = tmp_path / "process.log"
+    process_log.write_bytes(
+        b"Traceback /Users/private token=super-secret\n"
+        b"https://user:password@example.invalid/private\n"
+    )
+
+    with process_log.open("rb") as stream:
+        failure = smoke._render_process_failure(255, stream)
+
+    assert re.search(
+        r"OPENEVO_STARTUP_UNKNOWN_V1 category=unclassified count=2 "
+        r"fingerprint=sha256:[0-9a-f]{64}$",
+        failure,
+    )
+    assert "/Users/" not in failure
+    assert "token" not in failure
+    assert "https://" not in failure
+
+
+def test_bundle_smoke_accepts_only_closed_native_startup_failure_marker() -> None:
+    bundle = _load_module(
+        "openevo_bundle_smoke_startup_classifier_test",
+        "scripts/ci/smoke_openevo_desktop_bundle.py",
+    )
+    payload = (
+        b"raw /Users/private token=secret\n"
+        b"OPENEVO_DESKTOP_STARTUP_FAILURE_V1 stage=embedded_python_loader "
+        b"code=python_shared_library_validation_failed\n"
+    )
+
+    observation = bundle._parse_native_host_observation(payload)
+
+    assert observation.startup_failure == (
+        "embedded_python_loader",
+        "python_shared_library_validation_failed",
+    )
+    assert "/Users/" not in repr(observation)
+    assert "token" not in repr(observation)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        b"OPENEVO_DESKTOP_STARTUP_FAILURE_V1 stage=embedded_python_loader "
+        b"code=unknown_failure\n",
+        b"OPENEVO_DESKTOP_STARTUP_FAILURE_V1 stage=embedded_python_loader "
+        b"code=python_shared_library_validation_failed raw=/Users/private\n",
+        b"OPENEVO_DESKTOP_STARTUP_FAILURE_V2 stage=embedded_python_loader "
+        b"code=python_shared_library_validation_failed\n",
+    ],
+)
+def test_bundle_smoke_rejects_non_contract_startup_failure_marker(marker: bytes) -> None:
+    bundle = _load_module(
+        "openevo_bundle_smoke_invalid_startup_classifier_test",
+        "scripts/ci/smoke_openevo_desktop_bundle.py",
+    )
+
+    with pytest.raises(bundle.SmokeFailure, match="marker is malformed"):
+        bundle._parse_native_host_observation(marker)
+
+
 def test_smoke_failure_exposes_only_bounded_allowlisted_startup_lines(tmp_path: Path) -> None:
     smoke = _load_module(
         "openevo_sidecar_smoke_startup_test",
@@ -137,11 +276,16 @@ def test_smoke_failure_exposes_only_bounded_allowlisted_startup_lines(tmp_path: 
     with process_log.open("rb") as stream:
         failure = smoke._render_process_failure(255, stream)
 
-    assert failure == (
+    assert failure.startswith(
         "sidecar exited before serving /health (exit 255).\n"
         "startup diagnostics:\n"
         "OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed\n"
-        "OPENEVO_STARTUP_V1 stage=python_metadata code=load_failed errno=13"
+        "OPENEVO_STARTUP_V1 stage=python_metadata code=load_failed errno=13\n"
+    )
+    assert re.search(
+        r"OPENEVO_STARTUP_UNKNOWN_V1 category=unclassified count=7 "
+        r"fingerprint=sha256:[0-9a-f]{64}$",
+        failure,
     )
     assert len(failure.encode()) < 1024
     assert not any(canary in failure for canary in canaries)
@@ -160,6 +304,25 @@ def test_smoke_failure_caps_valid_diagnostic_lines(tmp_path: Path) -> None:
         failure = smoke._render_process_failure(255, stream)
 
     assert failure.count("OPENEVO_STARTUP_V1") == smoke.STARTUP_DIAGNOSTIC_MAX_LINES
+
+
+def test_smoke_failure_reserves_bounded_output_for_unknown_summary(tmp_path: Path) -> None:
+    smoke = _load_module(
+        "openevo_sidecar_smoke_unknown_line_cap_test",
+        "scripts/ci/smoke_openevo_desktop_sidecar.py",
+    )
+    valid = b"OPENEVO_STARTUP_V1 stage=python_launcher code=execution_failed\n"
+    process_log = tmp_path / "process.log"
+    process_log.write_bytes(valid * smoke.STARTUP_DIAGNOSTIC_MAX_LINES + b"secret output\n")
+
+    with process_log.open("rb") as stream:
+        diagnostics = smoke._read_startup_diagnostics(stream)
+
+    assert len(diagnostics) == smoke.STARTUP_DIAGNOSTIC_MAX_LINES
+    assert diagnostics[-1].startswith(
+        "OPENEVO_STARTUP_UNKNOWN_V1 category=unclassified count=1 "
+    )
+    assert "secret output" not in "\n".join(diagnostics)
 
 
 @pytest.mark.parametrize(
@@ -183,7 +346,11 @@ def test_smoke_failure_rejects_non_contract_diagnostics(tmp_path: Path, line: by
     with process_log.open("rb") as stream:
         failure = smoke._render_process_failure(255, stream)
 
-    assert failure.endswith("no valid OPENEVO_STARTUP_V1 diagnostic was emitted")
+    assert re.search(
+        r"OPENEVO_STARTUP_UNKNOWN_V1 category=unclassified count=1 "
+        r"fingerprint=sha256:[0-9a-f]{64}$",
+        failure,
+    )
     assert "archive_open_failed" not in failure
 
 

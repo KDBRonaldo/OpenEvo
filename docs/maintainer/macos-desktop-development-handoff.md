@@ -324,6 +324,15 @@ A controlled copy of the exact `0.1.8` sidecar was re-signed ad hoc without the
 hardened-runtime flag and passed the FD-handoff packaged-sidecar smoke. That is
 diagnostic evidence, not permission to mutate the installed `0.1.8` app.
 
+The `0.1.9` bounded stock-output classifier also recognizes the exact retained
+Tahoe/PyInstaller failure as
+`embedded_python_loader/python_shared_library_validation_failed`. Running the
+new direct-sidecar smoke against the unchanged installed `0.1.8` sidecar
+produced that closed classification and exposed none of the raw path, URL, or
+credential canaries used by the regression tests. Native bundle and
+LaunchServices smokes consume only the corresponding closed native/log event;
+unknown output retains only category, count, and a one-way fingerprint.
+
 The `0.1.9` unsigned Preview repair is therefore closed and narrow:
 
 - re-sign the generated macOS sidecar as plain ad hoc before validating and

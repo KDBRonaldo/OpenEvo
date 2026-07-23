@@ -27,6 +27,7 @@ if str(SCRIPT_DIR) not in sys.path:
 from smoke_openevo_desktop_sidecar import (  # noqa: E402
     EXPECTED_DESKTOP_OPENAPI_SHA256,
     SmokeFailure,
+    _STARTUP_DIAGNOSTIC_CODES,
 )
 
 
@@ -46,6 +47,7 @@ MACH_O_ARCHITECTURES = {"arm64", "x86_64"}
 NATIVE_PROCESS_MARKER_PREFIX = b"OPENEVO_DESKTOP_SIDECAR_PROCESS_"
 NATIVE_RENDERER_MARKER_PREFIX = b"OPENEVO_DESKTOP_RENDERER_READY_"
 NATIVE_RENDERER_STAGE_MARKER_PREFIX = b"OPENEVO_DESKTOP_RENDERER_STAGE_"
+NATIVE_STARTUP_FAILURE_MARKER_PREFIX = b"OPENEVO_DESKTOP_STARTUP_FAILURE_"
 NATIVE_HOST_LOG_MAX_BYTES = 64 * 1024
 NATIVE_HOST_LOG_MAX_LINES = 512
 NATIVE_GROUP_MAX_PROCESSES = 16
@@ -125,6 +127,17 @@ _NATIVE_RENDERER_MARKER_PATTERN = re.compile(
 _NATIVE_RENDERER_STAGE_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_RENDERER_STAGE_V1 ([a-z_]{1,64})"
 )
+_NATIVE_STARTUP_FAILURE_MARKER_PATTERN = re.compile(
+    rb"OPENEVO_DESKTOP_STARTUP_FAILURE_V1 "
+    rb"stage=([a-z][a-z0-9_]{0,63}) code=([a-z][a-z0-9_]{0,63})"
+)
+_ALLOWED_NATIVE_STARTUP_FAILURES = frozenset(
+    (stage, code)
+    for stage, codes in _STARTUP_DIAGNOSTIC_CODES.items()
+    for code in codes
+) | {
+    ("embedded_python_loader", "python_shared_library_validation_failed"),
+}
 
 
 class NativeSidecarProcessMarker(NamedTuple):
@@ -143,6 +156,7 @@ class NativeHostObservation(NamedTuple):
     renderer_ready: bool
     process_groups: frozenset[int]
     renderer_stages: frozenset[str] = frozenset()
+    startup_failure: tuple[str, str] | None = None
 
 
 class NativeFileDescriptorObservation(NamedTuple):
@@ -613,7 +627,19 @@ def _parse_native_host_observation(
     renderer_ready = False
     process_groups: set[int] = set()
     renderer_stages: set[str] = set()
+    startup_failure: tuple[str, str] | None = None
     for line in lines:
+        if line.startswith(NATIVE_STARTUP_FAILURE_MARKER_PREFIX):
+            matched = _NATIVE_STARTUP_FAILURE_MARKER_PATTERN.fullmatch(line)
+            failure = (
+                (matched.group(1).decode("ascii"), matched.group(2).decode("ascii"))
+                if matched is not None
+                else None
+            )
+            if failure not in _ALLOWED_NATIVE_STARTUP_FAILURES:
+                raise SmokeFailure("Native host startup failure marker is malformed")
+            startup_failure = failure
+            continue
         if line.startswith(NATIVE_RENDERER_STAGE_MARKER_PREFIX):
             matched = _NATIVE_RENDERER_STAGE_MARKER_PATTERN.fullmatch(line)
             stage = matched.group(1).decode("ascii") if matched is not None else None
@@ -679,6 +705,7 @@ def _parse_native_host_observation(
         renderer_ready=renderer_ready,
         process_groups=frozenset(process_groups),
         renderer_stages=frozenset(renderer_stages),
+        startup_failure=startup_failure,
     )
 
 
@@ -707,6 +734,13 @@ def _drain_native_host_stderr(
             raise SmokeFailure("Native host smoke diagnostics exceeded the byte limit")
         buffer.extend(chunk)
     return _parse_native_host_observation(bytes(buffer), observed_process_groups)
+
+
+def _startup_failure_suffix(failure: tuple[str, str] | None) -> str:
+    if failure is None:
+        return ""
+    stage, code = failure
+    return f"; startup_stage={stage}; startup_code={code}"
 
 
 def _darwin_process_birth_identity(pid: int) -> str | None:
@@ -1144,6 +1178,7 @@ def smoke_bundle(
         readiness_stage = "native_marker_absent"
         observed_readiness_stages = {readiness_stage}
         observed_renderer_stages: set[str] = set()
+        observed_startup_failure: tuple[str, str] | None = None
         deadline = time.monotonic() + timeout_seconds
         captured_error: BaseException | None = None
         try:
@@ -1154,6 +1189,8 @@ def smoke_bundle(
                     process_groups,
                 )
                 observed_renderer_stages.update(native_observation.renderer_stages)
+                if native_observation.startup_failure is not None:
+                    observed_startup_failure = native_observation.startup_failure
                 if sys.platform == "darwin":
                     if process.poll() is None:
                         evidence, observed_groups, candidate_stage = _macos_native_evidence(
@@ -1187,6 +1224,7 @@ def smoke_bundle(
                 if process.poll() is not None:
                     raise SmokeFailure(
                         "OpenEvo Desktop native executable exited before smoke evidence was ready"
+                        + _startup_failure_suffix(observed_startup_failure)
                     )
                 time.sleep(0.1)
             if evidence is None:
@@ -1194,7 +1232,8 @@ def smoke_bundle(
                     "Timed out waiting for OpenEvo Desktop app smoke evidence "
                     f"(stage={readiness_stage}; observed_stages="
                     f"{','.join(sorted(observed_readiness_stages))}; renderer_stages="
-                    f"{','.join(sorted(observed_renderer_stages)) or 'none'})"
+                    f"{','.join(sorted(observed_renderer_stages)) or 'none'}"
+                    f"{_startup_failure_suffix(observed_startup_failure)})"
                 )
         except BaseException as exc:
             captured_error = exc

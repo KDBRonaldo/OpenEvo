@@ -150,6 +150,51 @@ def test_validate_version_rejects_malformed_release_provider() -> None:
         smoke.validate_version(payload, "0.1.7")
 
 
+def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) -> None:
+    smoke = _load_module()
+    log_root = tmp_path / "logs-v1"
+    log_root.mkdir(mode=0o700)
+    log_file = log_root / "desktop.jsonl"
+    events = [
+        {
+            "schema_version": "1",
+            "sequence": 7,
+            "occurred_at": "2026-07-23T01:02:03.004Z",
+            "source": "startup",
+            "level": "error",
+            "event": "sidecar_startup_diagnostic",
+            "code": "embedded_python_loader_python_shared_library_validation_failed",
+            "exit_code": None,
+            "signal": None,
+            "errno": None,
+        },
+        {
+            "schema_version": "1",
+            "sequence": 8,
+            "occurred_at": "2026-07-23T01:02:03.005Z",
+            "source": "sidecar",
+            "level": "warning",
+            "event": "sidecar_unstructured_output_discarded",
+            "code": "unknown_2_sha256_" + "a" * 64,
+            "exit_code": None,
+            "signal": None,
+            "errno": None,
+        },
+    ]
+    log_file.write_text(
+        "".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events),
+        encoding="utf-8",
+    )
+    log_file.chmod(0o600)
+
+    assert smoke._startup_log_checkpoint(log_root) == 8
+    assert smoke._startup_failure_since(log_root, 6) == (
+        "embedded_python_loader",
+        "python_shared_library_validation_failed",
+    )
+    assert smoke._startup_failure_since(log_root, 7) is None
+
+
 def test_smoke_times_out_when_no_owned_sidecar_appears(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     smoke = _load_module()
     app, executable = _app_bundle(tmp_path)

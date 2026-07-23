@@ -11,7 +11,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -124,7 +124,11 @@ const NATIVE_INSTANCE_FRAME_MAX_BYTES: usize = 512;
 const SIDECAR_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const SIDECAR_STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES: usize = 32 * 1024;
 const SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES: usize = 160;
+const SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES: usize = 2048;
 const SIDECAR_STARTUP_DIAGNOSTIC_DRAIN_SETTLE_TIMEOUT: Duration = Duration::from_millis(250);
+const DESKTOP_STARTUP_FAILURE_MARKER: &str = "OPENEVO_DESKTOP_STARTUP_FAILURE_V1";
+const STARTUP_CLASSIFIER_POLICY_JSON: &str =
+    include_str!("../../startup-output-classifiers-v1.json");
 const NATIVE_HOST_ERROR_MESSAGE_MAX_BYTES: usize = 767;
 const SIDECAR_HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SIDECAR_HEALTH_CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
@@ -248,6 +252,94 @@ struct StartupDiagnostic {
     errno: Option<u64>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartupClassifierPolicy {
+    classifiers: Vec<StartupClassifierEntry>,
+    max_line_bytes: usize,
+    pyinstaller_error_prefix: String,
+    pyinstaller_error_separator: String,
+    pyinstaller_pid_max_digits: usize,
+    schema_version: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartupClassifierEntry {
+    code: String,
+    required_fragments: Vec<String>,
+    stage: String,
+}
+
+fn valid_classifier_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.as_bytes()[0].is_ascii_lowercase()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn startup_classifier_policy() -> Option<&'static StartupClassifierPolicy> {
+    static POLICY: OnceLock<Option<StartupClassifierPolicy>> = OnceLock::new();
+    POLICY
+        .get_or_init(|| {
+            let policy: StartupClassifierPolicy =
+                serde_json::from_str(STARTUP_CLASSIFIER_POLICY_JSON).ok()?;
+            let classifier = policy.classifiers.first()?;
+            if policy.schema_version != "1"
+                || policy.max_line_bytes != SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES
+                || policy.pyinstaller_error_prefix != "[PYI-"
+                || policy.pyinstaller_error_separator != ":ERROR] "
+                || policy.pyinstaller_pid_max_digits != 10
+                || policy.classifiers.len() != 1
+                || classifier.required_fragments.len() != 4
+                || !valid_classifier_name(&classifier.stage)
+                || !valid_classifier_name(&classifier.code)
+                || classifier
+                    .required_fragments
+                    .iter()
+                    .any(|fragment| fragment.is_empty() || !fragment.is_ascii())
+            {
+                return None;
+            }
+            Some(policy)
+        })
+        .as_ref()
+}
+
+fn classify_stock_loader_line(line: &[u8]) -> Option<StartupDiagnostic> {
+    if line.is_empty() || line.len() > SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES {
+        return None;
+    }
+    let policy = startup_classifier_policy()?;
+    let body = line.strip_prefix(policy.pyinstaller_error_prefix.as_bytes())?;
+    let separator_index = body
+        .windows(policy.pyinstaller_error_separator.len())
+        .position(|window| window == policy.pyinstaller_error_separator.as_bytes())?;
+    let pid = &body[..separator_index];
+    if pid.is_empty()
+        || pid.len() > policy.pyinstaller_pid_max_digits
+        || pid[0] == b'0'
+        || !pid.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    let mut remainder = &body[separator_index + policy.pyinstaller_error_separator.len()..];
+    let classifier = policy.classifiers.first()?;
+    for fragment in &classifier.required_fragments {
+        let index = remainder
+            .windows(fragment.len())
+            .position(|window| window == fragment.as_bytes())?;
+        remainder = &remainder[index + fragment.len()..];
+    }
+    Some(StartupDiagnostic {
+        stage: classifier.stage.as_str(),
+        code: classifier.code.as_str(),
+        errno: None,
+    })
+}
+
 struct StartupDiagnosticSink {
     last: Mutex<Option<StartupDiagnostic>>,
     exit_disposition: Mutex<Option<StartupExitDisposition>>,
@@ -298,6 +390,10 @@ impl StartupDiagnosticSink {
             None,
             diagnostic.errno,
         );
+        eprintln!(
+            "{DESKTOP_STARTUP_FAILURE_MARKER} stage={} code={}",
+            diagnostic.stage, diagnostic.code
+        );
     }
 
     fn record_exit(&self, disposition: StartupExitDisposition) {
@@ -319,15 +415,21 @@ impl StartupDiagnosticSink {
         );
     }
 
-    fn record_unstructured_output(&self, generation: u64, count: u32) {
+    fn record_unstructured_output(&self, generation: u64, count: u32, fingerprint: [u8; 32]) {
         if count == 0 || self.generation.load(Ordering::Acquire) != generation {
             return;
+        }
+        let mut code = format!("unknown_{count}_sha256_");
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in fingerprint {
+            code.push(HEX[(byte >> 4) as usize] as char);
+            code.push(HEX[(byte & 0x0f) as usize] as char);
         }
         self.desktop_logs.record(
             DesktopLogSource::Sidecar,
             DesktopLogLevel::Warning,
             "sidecar_unstructured_output_discarded",
-            Some("bounded_output_discarded"),
+            Some(&code),
             None,
             None,
             None,
@@ -868,10 +970,11 @@ fn drain_startup_diagnostics(
 struct StartupDiagnosticScanner {
     scanned: usize,
     scan_exhausted: bool,
-    line: [u8; SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES],
+    line: [u8; SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES],
     line_len: usize,
     line_overflowed: bool,
     discarded_lines: u32,
+    unknown_fingerprint: Sha256,
 }
 
 impl StartupDiagnosticScanner {
@@ -879,10 +982,11 @@ impl StartupDiagnosticScanner {
         Self {
             scanned: 0,
             scan_exhausted: false,
-            line: [0; SIDECAR_STARTUP_DIAGNOSTIC_MARKER_MAX_BYTES],
+            line: [0; SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES],
             line_len: 0,
             line_overflowed: false,
             discarded_lines: 0,
+            unknown_fingerprint: Sha256::new(),
         }
     }
 
@@ -911,21 +1015,33 @@ impl StartupDiagnosticScanner {
             self.record_line(diagnostics, generation);
         }
         if self.scan_exhausted {
-            self.discarded_lines = self.discarded_lines.saturating_add(1);
+            self.record_unknown_line(b"scan_exhausted");
         }
-        diagnostics.record_unstructured_output(generation, self.discarded_lines);
+        let fingerprint: [u8; 32] = self.unknown_fingerprint.clone().finalize().into();
+        diagnostics.record_unstructured_output(generation, self.discarded_lines, fingerprint);
     }
 
     fn record_line(&mut self, diagnostics: &StartupDiagnosticSink, generation: u64) {
         if self.line_overflowed {
-            self.discarded_lines = self.discarded_lines.saturating_add(1);
+            let line = self.line;
+            self.record_unknown_line(&line);
             return;
         }
         if let Some(diagnostic) = parse_startup_diagnostic(&self.line[..self.line_len]) {
             diagnostics.record(generation, diagnostic);
+        } else if let Some(diagnostic) = classify_stock_loader_line(&self.line[..self.line_len]) {
+            diagnostics.record(generation, diagnostic);
         } else if self.line_len > 0 {
-            self.discarded_lines = self.discarded_lines.saturating_add(1);
+            let line = self.line[..self.line_len].to_vec();
+            self.record_unknown_line(&line);
         }
+    }
+
+    fn record_unknown_line(&mut self, line: &[u8]) {
+        self.discarded_lines = self.discarded_lines.saturating_add(1);
+        self.unknown_fingerprint
+            .update((line.len() as u64).to_be_bytes());
+        self.unknown_fingerprint.update(line);
     }
 }
 
@@ -9654,6 +9770,78 @@ OPENEVO_STARTUP_V1 stage=python_launcher code=server_failed errno=13\n"[..],
         );
         assert!(!error.message.contains("secret"));
         assert!(!error.message.contains("token"));
+    }
+
+    #[test]
+    fn stock_python_loader_failure_is_classified_without_retaining_raw_output() {
+        let state = DesktopHostState::default();
+        let diagnostics = &state.startup_diagnostics;
+        let generation = diagnostics.begin();
+        let raw = b"[PYI-43120:ERROR] Failed to load Python shared library \
+'/private/var/folders/secret/_MEI123/Python': \
+dlopen(https://user:token@example.invalid/private): code signature in \
+<Python.framework token=super-secret> not valid for use in process: \
+mapping process and mapped file (non-platform) have different Team IDs\n";
+
+        drain_startup_diagnostics(&raw[..], diagnostics, generation);
+
+        assert_eq!(
+            diagnostics.last(),
+            Some(StartupDiagnostic {
+                stage: "embedded_python_loader",
+                code: "python_shared_library_validation_failed",
+                errno: None,
+            })
+        );
+        let encoded = serde_json::to_string(&state.desktop_logs.tail(Some(10))).unwrap();
+        assert!(encoded.contains("embedded_python_loader_python_shared_library_validation_failed"));
+        assert!(!encoded.contains("/private/"));
+        assert!(!encoded.contains("token"));
+        assert!(!encoded.contains("https://"));
+    }
+
+    #[test]
+    fn stock_python_loader_classifier_rejects_near_match_and_over_budget() {
+        let near_match = b"[PYI-43120:ERROR] Failed to load Python shared library \
+'/private/Python': code signature in <Python.framework> not valid: \
+mapping process and mapped file have the same Team IDs";
+        assert_eq!(classify_stock_loader_line(near_match), None);
+
+        let valid = b"[PYI-43120:ERROR] Failed to load Python shared library \
+'/private/Python': code signature in <Python.framework> not valid: \
+mapping process and mapped file have different Team IDs";
+        assert!(classify_stock_loader_line(valid).is_some());
+        let mut oversized = valid.to_vec();
+        oversized.resize(SIDECAR_STARTUP_OUTPUT_LINE_MAX_BYTES + 1, b'x');
+        assert_eq!(classify_stock_loader_line(&oversized), None);
+    }
+
+    #[test]
+    fn unknown_startup_output_keeps_only_bounded_summary() {
+        let state = DesktopHostState::default();
+        let diagnostics = &state.startup_diagnostics;
+        let generation = diagnostics.begin();
+        drain_startup_diagnostics(
+            &b"Traceback /Users/private token=super-secret\n\
+https://user:password@example.invalid/private\n"[..],
+            diagnostics,
+            generation,
+        );
+
+        let event = state
+            .desktop_logs
+            .tail(Some(10))
+            .entries
+            .into_iter()
+            .find(|entry| entry.event == "sidecar_unstructured_output_discarded")
+            .expect("unknown output summary was not retained");
+        let code = event.code.expect("unknown output summary has no code");
+        assert!(code.starts_with("unknown_2_sha256_"));
+        assert_eq!(code.len(), "unknown_2_sha256_".len() + 64);
+        assert!(code["unknown_2_sha256_".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()));
+        assert!(!code.contains("secret"));
     }
 
     #[test]

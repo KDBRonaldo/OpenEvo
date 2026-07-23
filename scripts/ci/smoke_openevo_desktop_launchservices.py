@@ -31,6 +31,29 @@ COMMAND_TIMEOUT_SECONDS = 5.0
 HTTP_RESPONSE_MAX_BYTES = 16 * 1024
 PROCESS_ROW_LIMIT = 16_384
 PROC_PIDPATHINFO_MAXSIZE = 4_096
+DESKTOP_LOG_DIRECTORY = Path.home() / "Library/Application Support/org.openevo.desktop/logs-v1"
+DESKTOP_LOG_MAX_FILE_BYTES = 2 * 1024 * 1024
+DESKTOP_LOG_MAX_FILES = 8
+DESKTOP_LOG_MAX_LINE_BYTES = 1024
+_DESKTOP_LOG_EVENT_KEYS = {
+    "code",
+    "errno",
+    "event",
+    "exit_code",
+    "level",
+    "occurred_at",
+    "schema_version",
+    "sequence",
+    "signal",
+    "source",
+}
+_LOADER_FAILURE_EVENT_CODE = (
+    "embedded_python_loader_python_shared_library_validation_failed"
+)
+_LOADER_FAILURE = (
+    "embedded_python_loader",
+    "python_shared_library_validation_failed",
+)
 
 
 class SmokeFailure(RuntimeError):
@@ -66,6 +89,110 @@ _PS_ROW = re.compile(
 )
 _LOOPBACK_LISTENER = re.compile(r"^(?:127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$")
 _VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[.+-][A-Za-z0-9._-]+)?$")
+
+
+def _startup_log_events(log_root: Path) -> tuple[dict[str, object], ...]:
+    try:
+        root = log_root.lstat()
+        if (
+            log_root.is_symlink()
+            or not log_root.is_dir()
+            or root.st_uid != os.geteuid()
+            or root.st_mode & 0o777 != 0o700
+        ):
+            return ()
+    except OSError:
+        return ()
+    names = [f"desktop.{index}.jsonl" for index in range(7, 0, -1)]
+    names.append("desktop.jsonl")
+    events: list[dict[str, object]] = []
+    for name in names[:DESKTOP_LOG_MAX_FILES]:
+        path = log_root / name
+        try:
+            metadata = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return ()
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or metadata.st_mode & 0o777 != 0o600
+            or metadata.st_size > DESKTOP_LOG_MAX_FILE_BYTES
+        ):
+            return ()
+        try:
+            with path.open("rb") as stream:
+                opened = os.fstat(stream.fileno())
+                if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                    metadata.st_dev,
+                    metadata.st_ino,
+                    metadata.st_size,
+                ):
+                    return ()
+                payload = stream.read(DESKTOP_LOG_MAX_FILE_BYTES + 1)
+                final = os.fstat(stream.fileno())
+        except OSError:
+            return ()
+        if (
+            len(payload) > DESKTOP_LOG_MAX_FILE_BYTES
+            or (final.st_dev, final.st_ino, final.st_size)
+            != (metadata.st_dev, metadata.st_ino, metadata.st_size)
+        ):
+            return ()
+        if payload and not payload.endswith(b"\n"):
+            boundary = payload.rfind(b"\n")
+            payload = payload[: boundary + 1] if boundary >= 0 else b""
+        for line in payload.splitlines():
+            if not line:
+                continue
+            if len(line) > DESKTOP_LOG_MAX_LINE_BYTES:
+                return ()
+            try:
+                event = json.loads(line.decode("utf-8", errors="strict"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                return ()
+            if type(event) is not dict or set(event) != _DESKTOP_LOG_EVENT_KEYS:
+                return ()
+            sequence = event.get("sequence")
+            if (
+                event.get("schema_version") != "1"
+                or type(sequence) is not int
+                or sequence <= 0
+                or type(event.get("event")) is not str
+                or type(event.get("source")) is not str
+                or type(event.get("level")) is not str
+                or not (event.get("code") is None or type(event.get("code")) is str)
+            ):
+                return ()
+            events.append(event)
+    events.sort(key=lambda event: int(event["sequence"]))
+    return tuple(events)
+
+
+def _startup_log_checkpoint(log_root: Path) -> int:
+    return max(
+        (int(event["sequence"]) for event in _startup_log_events(log_root)),
+        default=0,
+    )
+
+
+def _startup_failure_since(
+    log_root: Path,
+    checkpoint: int,
+) -> tuple[str, str] | None:
+    matches = [
+        event
+        for event in _startup_log_events(log_root)
+        if int(event["sequence"]) > checkpoint
+        and event["source"] == "startup"
+        and event["level"] == "error"
+        and event["event"] == "sidecar_startup_diagnostic"
+        and event["code"] == _LOADER_FAILURE_EVENT_CODE
+    ]
+    return _LOADER_FAILURE if matches else None
 
 
 def parse_ps_rows(payload: str) -> list[ProcessRow]:
@@ -271,6 +398,12 @@ class DarwinSystem:
         result = self.command(["/usr/bin/open", "-n", str(app)], timeout=COMMAND_TIMEOUT_SECONDS)
         if result.returncode != 0:
             raise SmokeFailure("LaunchServices could not launch OpenEvo Desktop")
+
+    def startup_log_checkpoint(self) -> int:
+        return _startup_log_checkpoint(DESKTOP_LOG_DIRECTORY)
+
+    def startup_failure_since(self, checkpoint: int) -> tuple[str, str] | None:
+        return _startup_failure_since(DESKTOP_LOG_DIRECTORY, checkpoint)
 
     def http_version(self, port: int, timeout: float) -> bytes:
         url = f"http://127.0.0.1:{port}/version"
@@ -485,6 +618,31 @@ def _write_evidence(path: Path, payload: dict[str, object]) -> None:
     path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _system_startup_checkpoint(system: object) -> int | None:
+    checkpoint = getattr(system, "startup_log_checkpoint", None)
+    if not callable(checkpoint):
+        return None
+    try:
+        value = checkpoint()
+    except (OSError, ValueError):
+        return None
+    return value if type(value) is int and value >= 0 else None
+
+
+def _system_startup_failure(
+    system: object,
+    checkpoint: int | None,
+) -> tuple[str, str] | None:
+    read_failure = getattr(system, "startup_failure_since", None)
+    if checkpoint is None or not callable(read_failure):
+        return None
+    try:
+        failure = read_failure(checkpoint)
+    except (OSError, ValueError):
+        return None
+    return failure if failure == _LOADER_FAILURE else None
+
+
 def smoke_launchservices(
     app: Path,
     *,
@@ -513,6 +671,7 @@ def smoke_launchservices(
     if _app_roots(tools, tools.snapshot(), executable):
         raise SmokeFailure("an instance of this exact app bundle is already active")
 
+    startup_checkpoint = _system_startup_checkpoint(tools)
     tools.remove_quarantine(app)
     tools.launch(app)
     deadline = time.monotonic() + timeout_seconds
@@ -556,11 +715,18 @@ def smoke_launchservices(
                 break
             time.sleep(0.1)
         if not ready:
+            startup_failure = _system_startup_failure(tools, startup_checkpoint)
+            startup_detail = (
+                f"; startup_stage={startup_failure[0]}; startup_code={startup_failure[1]}"
+                if startup_failure is not None
+                else ""
+            )
             raise SmokeFailure(
                 "timed out waiting for an owned sidecar loopback listener "
                 f"(app_process_observed={str(app_observed).lower()}; "
                 f"sidecar_process_observed={str(sidecar_observed).lower()}; "
-                f"listener_observed={str(listener_observed).lower()})"
+                f"listener_observed={str(listener_observed).lower()}"
+                f"{startup_detail})"
             )
     except BaseException as exc:
         captured = exc

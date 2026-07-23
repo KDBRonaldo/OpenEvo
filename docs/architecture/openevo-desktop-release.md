@@ -405,6 +405,20 @@ bridge/runtime, Local API provider/routes, and static app. It converts only the
 last phase, including native routing and native-frame/listener/server startup,
 into an allowlisted `python_launcher/*_failed` code. Exception types, messages,
 chained causes, and runtime values are not part of the contract.
+
+Failures emitted by stock PyInstaller code before an OpenEvo marker exists use
+the checked-in `desktop/startup-output-classifiers-v1.json` policy. Native and
+release-smoke scanners accept only bounded lines and the exact ordered
+PyInstaller signature for the macOS embedded-Python library-validation failure;
+they project it to
+`embedded_python_loader/python_shared_library_validation_failed`. Raw stock
+output is discarded. Other non-empty output is represented only by the fixed
+`unclassified` category, a bounded line count, and a SHA-256 fingerprint over
+length-delimited bounded bytes. The native host persists the same closed
+classification and emits a local native marker so direct-bundle and
+LaunchServices smokes can report the stage and code without recovering stderr.
+Unknown output never becomes a new stage or code merely from its fingerprint.
+
 Provider and listener cleanup is attempted on every server exit. A cleanup
 failure without an earlier server failure becomes the fixed, redacted
 `python_launcher/shutdown_failed` diagnostic; cleanup errors never replace an
