@@ -25,6 +25,7 @@ from openevo.backend.service import (
     CoreServiceError,
     CoreServiceErrorCode,
     CoreServicePredecessor,
+    V2_DAEMON_LIFECYCLE_COMPATIBILITY,
     ensure_core_service,
     inspect_core_service,
     observe_core_service_predecessor,
@@ -63,7 +64,7 @@ _CORE_METADATA_KEYS = {
 _FILE_METADATA_KEYS = {"filename", "sha256"}
 _PLATFORM_METADATA_KEYS = {"architecture", "system"}
 _PYTHON_METADATA_KEYS = {"implementation", "version"}
-_LIFECYCLE_COMPATIBILITY = 8
+_LIFECYCLE_COMPATIBILITY = V2_DAEMON_LIFECYCLE_COMPATIBILITY
 
 
 class DaemonBundleError(RuntimeError):

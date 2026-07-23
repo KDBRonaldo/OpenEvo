@@ -49,9 +49,13 @@
     "required_core_feature_flags": [
       "atomic_successor_v2",
       "event_replay_v2",
+      "project_genesis_v2",
       "project_heads_v2",
       "task_admission_v2",
-      "verified_registry"
+      "task_execution_v2",
+      "verified_capabilities",
+      "verified_registry",
+      "workspace_snapshots_v2"
     ],
     "required_desktop_feature_flags": [
       "core_control_v2",

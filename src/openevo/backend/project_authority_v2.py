@@ -268,8 +268,7 @@ class ProjectAuthorityV2:
             )
             if authority_record.publication_state == "published":
                 authority = _science_authority(authority_record)
-                self._require_published_authority(authority)
-                return authority
+                return self._require_published_authority(authority)
             if authority_record.publication_state == "prepared":
                 authority = _science_authority(authority_record)
                 published = self._published_authority_or_none(project.project_id)
@@ -568,6 +567,10 @@ class ProjectAuthorityV2:
             else _load_authority_record(document, expected_project=project)
         )
         head = None if authority_record is None else authority_record.active_project_head
+        if authority_record is not None and authority_record.publication_state == "published":
+            published = self._published_authority_or_none(project.project_id)
+            if published is not None:
+                head = published.active_project_head
         if (
             head is None
             or request.expected_project_head_id != head.project_head_id
@@ -640,17 +643,27 @@ class ProjectAuthorityV2:
                     "The managed Subscription runtime is verified and ready.",
                 )
             )
-        effective_matches = (
-            authority_record is not None
-            and authority_record.publication_state == "published"
-            and authority_record.execution_snapshot == verified.snapshot
-            and authority_record.execution_snapshot_producer_id == verified.producer_id
+        published = (
+            None
+            if authority_record is None
+            or authority_record.publication_state != "published"
+            else self._published_authority_or_none(project.project_id)
+        )
+        expected_execution = _effective_execution_ref(
+            project_id=project.project_id,
+            execution_snapshot=verified.snapshot,
+            execution_snapshot_producer_id=verified.producer_id,
+        )
+        effective_matches = bool(
+            published is not None
+            and authority_record is not None
             and authority_record.framework_lock_sha256
             == binding.framework_lock_digest
-            and authority_record.active_project_head is not None
-            and authority_record.active_project_head.registry_sha256
+            and published.active_project_head.effective_execution_snapshot
+            == expected_execution
+            and published.active_project_head.registry_sha256
             == self._registry_sha256
-            and authority_record.active_project_head.runtime_context_snapshot
+            and published.active_project_head.runtime_context_snapshot
             .runtime_contract_sha256
             == self._runtime_contract_sha256
         )
@@ -667,13 +680,13 @@ class ProjectAuthorityV2:
                 )
             )
         workspace_matches = False
-        if authority_record is not None and authority_record.workspace_snapshot is not None:
+        if published is not None:
             try:
                 stored = self._workspaces.get_snapshot(
-                    authority_record.workspace_snapshot.workspace_snapshot_id
+                    published.workspace_snapshot.workspace_snapshot_id
                 )
-                self._workspaces.snapshot_path(authority_record.workspace_snapshot)
-                workspace_matches = stored == authority_record.workspace_snapshot
+                self._workspaces.snapshot_path(published.workspace_snapshot)
+                workspace_matches = stored == published.workspace_snapshot
             except (WorkspaceIntegrityErrorV2, WorkspaceNotFoundV2):
                 workspace_matches = False
         if include_passed or not workspace_matches:
@@ -689,9 +702,16 @@ class ProjectAuthorityV2:
                 )
             )
         science_matches = False
-        if authority_record is not None and authority_record.publication_state == "published":
+        if (
+            authority_record is not None
+            and authority_record.publication_state == "published"
+            and published is not None
+        ):
             expected = _science_authority(authority_record)
-            science_matches = self._published_authority_or_none(project.project_id) == expected
+            try:
+                science_matches = self._require_published_authority(expected) == published
+            except ProjectAuthorityConflictV2:
+                science_matches = False
         ready = effective_matches and workspace_matches and science_matches
         return checks, ready
 
@@ -746,12 +766,27 @@ class ProjectAuthorityV2:
     def _require_published_authority(
         self,
         expected: ScienceProjectAdmissionAuthorityV2,
-    ) -> None:
+    ) -> ScienceProjectAdmissionAuthorityV2:
         actual = self._published_authority_or_none(expected.project_id)
-        if actual != expected:
+        if actual is None:
             raise ProjectAuthorityConflictV2(
                 "published project authority differs from the catalog"
             )
+        heads = self._tasks.list_project_heads(expected.project_id)
+        if (
+            actual.project_id != expected.project_id
+            or actual.project_config_sha256 != expected.project_config_sha256
+            or actual.normalized_evolution_intent_sha256
+            != expected.normalized_evolution_intent_sha256
+            or not heads
+            or heads[0] != expected.active_project_head
+            or heads[-1] != actual.active_project_head
+            or actual.workspace_snapshot != actual.active_project_head.workspace_snapshot
+        ):
+            raise ProjectAuthorityConflictV2(
+                "published project authority differs from the catalog"
+            )
+        return actual
 
     def _mark_published(
         self,
@@ -813,15 +848,10 @@ def _build_genesis_head(
     registry_sha256: str,
     runtime_contract_sha256: str,
 ) -> m.ProjectHeadRefV2:
-    execution_sha256 = canonical_digest(execution_snapshot)
-    execution = m.EffectiveExecutionSnapshotRefV2(
-        effective_execution_snapshot_id=f"exec-{execution_sha256}",
+    execution = _effective_execution_ref(
         project_id=project_id,
-        execution_mode="codex_subscription_transcript",
-        capture_mode="transcript",
-        token_level_metrics_available=False,
-        producer_id=execution_snapshot_producer_id,
-        snapshot_sha256=execution_sha256,
+        execution_snapshot=execution_snapshot,
+        execution_snapshot_producer_id=execution_snapshot_producer_id,
     )
     evolution_manifest = {
         "artifact_ids": [],
@@ -878,6 +908,24 @@ def _build_genesis_head(
         manifest_sha256=head_sha256,
     )
     return head
+
+
+def _effective_execution_ref(
+    *,
+    project_id: str,
+    execution_snapshot: ExecutionSnapshotV1,
+    execution_snapshot_producer_id: str,
+) -> m.EffectiveExecutionSnapshotRefV2:
+    execution_sha256 = canonical_digest(execution_snapshot)
+    return m.EffectiveExecutionSnapshotRefV2(
+        effective_execution_snapshot_id=f"exec-{execution_sha256}",
+        project_id=project_id,
+        execution_mode="codex_subscription_transcript",
+        capture_mode="transcript",
+        token_level_metrics_available=False,
+        producer_id=execution_snapshot_producer_id,
+        snapshot_sha256=execution_sha256,
+    )
 
 
 def _science_authority(

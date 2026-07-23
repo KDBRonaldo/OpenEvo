@@ -16,8 +16,13 @@ from openevo.codex_models import codex_cli_model_name, validate_codex_model_ref
 from openevo.runtime.codex_isolation import (
     CODEX_SUBSCRIPTION_POLICY_ID,
     CODEX_SUBSCRIPTION_POLICY_SHA256,
+    codex_subscription_contract,
 )
+from openevo.runtime.base import RUNTIME_SESSION_DIR
 from openevo.runtime.managed import (
+    MANAGED_HOME,
+    MANAGED_RUNTIME_RELEASES,
+    MANAGED_WORKSPACE,
     MANAGED_CODEX_VERSION,
     require_immutable_managed_runtime_image,
 )
@@ -375,6 +380,41 @@ def compute_release_identity(
     )
 
 
+def release_runtime_contract_sha256() -> str:
+    """Identify the complete v0.1.9 managed runtime/context ABI.
+
+    The registry digest separately binds executable evolution handlers.  This
+    digest binds the stable runtime destinations and managed Subscription
+    execution contract that consume their materialized output.
+    """
+
+    evolution_root = f"{RUNTIME_SESSION_DIR}/evolution"
+    material = canonical_json_bytes(
+        {
+            "schema_version": 1,
+            "contract_id": "openevo.runtime-context.v2",
+            "runtime_session_dir": RUNTIME_SESSION_DIR,
+            "managed_home": MANAGED_HOME,
+            "managed_workspace": MANAGED_WORKSPACE,
+            "runtime_destinations": {
+                "target_data": evolution_root,
+                "harness_skills": f"{evolution_root}/skills",
+            },
+            "runtime_environment": {
+                "OPENEVO_ADAPTER_MERGE_SPEC": f"{evolution_root}/adapters.json",
+                "OPENEVO_AGENT_SYSTEM_FILE": f"{evolution_root}/agent_system.md",
+                "OPENEVO_MEMORY_FILE": f"{evolution_root}/memory.md",
+                "OPENEVO_SKILLS_DIR": f"{evolution_root}/skills",
+            },
+            "managed_science_image": (
+                MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference
+            ),
+            "codex_subscription": codex_subscription_contract(),
+        }
+    )
+    return hashlib.sha256(b"openevo-runtime-contract-v1\0" + material).hexdigest()
+
+
 def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
     return json.dumps(
         value,
@@ -622,5 +662,6 @@ __all__ = [
     "load_or_create_core_bearer_token",
     "require_managed_subscription_runtime_identity",
     "require_host_global_service_root",
+    "release_runtime_contract_sha256",
     "rotate_core_bearer_token",
 ]

@@ -681,19 +681,19 @@ The exact broader gate is added in Task 18 after every slice is present.
 - Create: `tests/backend/test_daemon_v2_composition.py`
 - Modify: Daemon bundle and release-contract checks under `tests/ci/`
 
-- [ ] RED-test the packaged launcher through the inherited release socket and
+- [x] RED-test the packaged launcher through the inherited release socket and
   prove `/version`, authenticated `/v2/*`, provider kind, feature set, schema
   digests, registry/runtime identity, project genesis, Task execution, events,
   reconnect, and shutdown against production owners.
-- [ ] Bind the launcher to the v2 provider, project/workspace authority,
+- [x] Bind the launcher to the v2 provider, project/workspace authority,
   production executor/preparer, service supervisor, and private run-admission
   endpoint. The ready payload and authenticated status proof bind the v2 build.
-- [ ] If v1 is mounted, expose only an explicitly negotiated read-only migration
+- [x] If v1 is mounted, expose only an explicitly negotiated read-only migration
   surface. No v1 mutation owner, shared business URL, or fallback is available
   in the 0.1.9 release composition.
-- [ ] Advertise `atomic_successor_v2` and other mutation features only when the
+- [x] Advertise `atomic_successor_v2` and other mutation features only when the
   concrete production owners are present and startup recovery is complete.
-- [ ] Run launcher/bundle/service/provider tests and commit:
+- [x] Run launcher/bundle/service/provider tests and commit:
   `feat(daemon): launch the production v2 authority`
 
 ---

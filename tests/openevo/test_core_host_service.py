@@ -17,9 +17,19 @@ from types import SimpleNamespace
 
 import pytest
 
+from openevo import __version__
 from openevo.backend import launcher
 from openevo.backend import service
-from openevo.backend.runtime_identity import CoreReleaseIdentity, HostServiceRoot
+from openevo.backend.contracts.v2.provider import RELEASE_DAEMON_FEATURE_FLAGS_V2
+from openevo.backend.contracts.v2.snapshots import (
+    events_schema_sha256,
+    openapi_sha256,
+)
+from openevo.backend.runtime_identity import (
+    CoreReleaseIdentity,
+    HostServiceRoot,
+    release_runtime_contract_sha256,
+)
 from openevo.backend.service import (
     CoreDaemonBundleIdentity,
     CoreServiceError,
@@ -83,6 +93,11 @@ DAEMON_V8 = CoreDaemonBundleIdentity(
     bundle_sha256="d" * 64,
     canonical_manifest_sha256="3" * 64,
     lifecycle_compatibility=8,
+)
+DAEMON_V9 = CoreDaemonBundleIdentity(
+    bundle_sha256="e" * 64,
+    canonical_manifest_sha256="4" * 64,
+    lifecycle_compatibility=9,
 )
 
 
@@ -152,16 +167,26 @@ class FakeChild:
         ready_fd = pass_fds[1]
         generation = argv[argv.index("--generation") + 1]
         release_identity = argv[argv.index("--expected-release-identity") + 1]
+        source_commit = argv[argv.index("--source-commit") + 1]
         registry_digest = "b" * 64 if release_identity == "a" * 64 else "e" * 64
         os.write(
             ready_fd,
             (
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "generation": generation,
                         "release_identity": release_identity,
+                        "api_major": 2,
+                        "openapi_sha256": openapi_sha256(),
+                        "event_schema_sha256": events_schema_sha256(),
+                        "release_version": __version__,
+                        "build_id": "6" * 64,
+                        "source_commit": source_commit,
+                        "provider_kind": "openevo_daemon",
+                        "feature_set_sha256": (service._production_v2_feature_set_sha256()),
                         "registry_digest": registry_digest,
+                        "runtime_contract_sha256": release_runtime_contract_sha256(),
                     },
                     separators=(",", ":"),
                     sort_keys=True,
@@ -1063,6 +1088,120 @@ def test_status_proof_accepts_exact_v2_daemon_identity(
             deadline=time.monotonic() + 1,
         )
     assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
+
+
+def test_release_status_proof_requires_the_complete_production_v2_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    features = list(RELEASE_DAEMON_FEATURE_FLAGS_V2)
+    version = {
+        "schema_version": "2",
+        "api_name": "openevo-core-control-api",
+        "preferred_major": 2,
+        "supported_majors": [2],
+        "mutation_major": 2,
+        "mutation_compatible": True,
+        "provider_kind": "openevo_daemon",
+        "build_channel": "release",
+        "source_commit": SOURCE_COMMIT,
+        "release_version": __version__,
+        "build_id": "6" * 64,
+        "feature_flags": features,
+        "feature_set_sha256": hashlib.sha256(
+            json.dumps(features, separators=(",", ":")).encode("ascii")
+        ).hexdigest(),
+        "registry_sha256": RELEASE_A.registry_digest,
+        "runtime_contract_sha256": release_runtime_contract_sha256(),
+        "contracts": [
+            {
+                "api_major": 2,
+                "access": "mutation",
+                "mutation_compatible": True,
+                "openapi_sha256": openapi_sha256(),
+                "event_schema_sha256": events_schema_sha256(),
+            }
+        ],
+    }
+    status = {
+        "schema_version": "2",
+        "status": "ready",
+        "source_commit": SOURCE_COMMIT,
+        "release_version": __version__,
+        "registry_sha256": RELEASE_A.registry_digest,
+        "checked_at": "2026-07-23T03:00:00.000000Z",
+    }
+
+    def fetch(_host: str, _port: int, path: str, **_kwargs: object) -> object:
+        return version if path == "/version" else status
+
+    monkeypatch.setattr(service, "_fetch_json", fetch)
+    proof = service._authenticated_status_proof(
+        port=8765,
+        bearer="B" * 64,
+        release=RELEASE_A,
+        generation="3" * 32,
+        deadline=time.monotonic() + 1,
+        require_production_v2=True,
+    )
+    assert len(proof) == 64
+
+    version["runtime_contract_sha256"] = "7" * 64
+    with pytest.raises(CoreServiceError) as exc_info:
+        service._authenticated_status_proof(
+            port=8765,
+            bearer="B" * 64,
+            release=RELEASE_A,
+            generation="3" * 32,
+            deadline=time.monotonic() + 1,
+            require_production_v2=True,
+        )
+    assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
+
+
+def test_release_launcher_ready_payload_binds_v2_contract_and_runtime() -> None:
+    assert service._identity_requires_production_v2(DAEMON_V8) is False
+    assert service._identity_requires_production_v2(DAEMON_V9) is True
+    payload = {
+        "schema_version": 2,
+        "generation": "3" * 32,
+        "release_identity": RELEASE_A.digest,
+        "api_major": 2,
+        "openapi_sha256": openapi_sha256(),
+        "event_schema_sha256": events_schema_sha256(),
+        "release_version": __version__,
+        "build_id": "6" * 64,
+        "source_commit": SOURCE_COMMIT,
+        "provider_kind": "openevo_daemon",
+        "feature_set_sha256": service._production_v2_feature_set_sha256(),
+        "registry_digest": RELEASE_A.registry_digest,
+        "runtime_contract_sha256": release_runtime_contract_sha256(),
+    }
+    assert service._launcher_ready_matches(
+        payload,
+        release=RELEASE_A,
+        generation="3" * 32,
+        require_production_v2=True,
+    )
+
+    drifted = {**payload, "openapi_sha256": "0" * 64}
+    assert not service._launcher_ready_matches(
+        drifted,
+        release=RELEASE_A,
+        generation="3" * 32,
+        require_production_v2=True,
+    )
+    legacy = {
+        "schema_version": 1,
+        "generation": "3" * 32,
+        "release_identity": RELEASE_A.digest,
+        "registry_digest": RELEASE_A.registry_digest,
+    }
+    assert not service._launcher_ready_matches(
+        legacy,
+        release=RELEASE_A,
+        generation="3" * 32,
+        require_production_v2=True,
+    )
 
 
 @pytest.mark.parametrize(

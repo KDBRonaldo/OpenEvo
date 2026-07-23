@@ -2,27 +2,43 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
 import socket
+import sys
+import threading
 
 from openevo import __version__
-from openevo.backend.contracts.v1.provider import create_core_control_app
+from openevo.backend.contracts.v2 import models as core_v2_models
+from openevo.backend.contracts.v2.app import create_core_control_v2_contract_app
+from openevo.backend.contracts.v2.provider import CoreControlProviderV2
+from openevo.backend.contracts.v2.store import CoreControlStoreV2
+from openevo.backend.project_authority_v2 import ProjectAuthorityV2
+from openevo.backend.run_admission import install_core_run_admission_endpoint
 from openevo.backend.runtime_identity import (
     HostServiceRoot,
     canonical_json_bytes,
     compute_release_identity,
     load_or_create_core_bearer_token,
+    release_runtime_contract_sha256,
     require_host_global_service_root,
 )
-from openevo.backend.science_run_owner import CoreScienceRunOwner
+from openevo.backend.science_execution_v2 import ScienceAttemptExecutorV2
+from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
+from openevo.backend.science_successor_preparer_v2 import (
+    ProductionScienceSuccessorPreparerV2,
+)
 from openevo.backend.service import claim_core_service_spawn
 from openevo.backend.service_supervisor import CoreServiceSupervisor, ServiceLaunchMode
+from openevo.backend.workspace_handoff_v2 import WorkspaceHandoffStoreV2
+from openevo.backend.workspace_store_v2 import WorkspaceStoreV2
 from openevo.evolution.framework import (
     EvolutionExecutionProfile,
     load_verified_framework_registry,
 )
+from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.harness.capture import transcript_capture_enabled
 from openevo.runtime.managed import require_managed_runtime_binding
 
@@ -61,6 +77,196 @@ def main(argv: list[str] | None = None) -> int:
     raise ValueError(args.command)
 
 
+@dataclass(slots=True)
+class _ReleaseDaemonV2Composition:
+    app: object
+    provider: CoreControlProviderV2
+    catalog: CoreControlStoreV2
+    workspaces: WorkspaceStoreV2
+    workspace_handoffs: WorkspaceHandoffStoreV2
+    task_owner: CoreScienceTaskOwnerV2
+    project_authority: ProjectAuthorityV2
+    attempt_executor: ScienceAttemptExecutorV2
+    successor_preparer: ProductionScienceSuccessorPreparerV2
+    service_supervisor: object
+    _lock: threading.RLock = field(default_factory=threading.RLock)
+    _provider_closed: bool = False
+    _handoffs_closed: bool = False
+    _supervisor_closed: bool = False
+
+    def close(self) -> None:
+        with self._lock:
+            if not self._provider_closed:
+                self.provider.close()
+                self._provider_closed = True
+            if not self._handoffs_closed:
+                self.workspace_handoffs.close()
+                self._handoffs_closed = True
+            if not self._supervisor_closed:
+                self.service_supervisor.close()
+                self._supervisor_closed = True
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self.close)
+
+
+def _build_release_daemon_v2_composition(
+    *,
+    state_root: str | Path,
+    bearer_token: str,
+    source_commit: str,
+    executable_registry: VerifiedExecutableRegistry,
+    service_supervisor: object,
+    runtime_contract_sha256: str,
+) -> _ReleaseDaemonV2Composition:
+    """Build the only mutation authority shipped by the release Daemon."""
+
+    root = Path(state_root).expanduser().absolute()
+    catalog: CoreControlStoreV2 | None = None
+    workspaces: WorkspaceStoreV2 | None = None
+    handoffs: WorkspaceHandoffStoreV2 | None = None
+    task_owner: CoreScienceTaskOwnerV2 | None = None
+    project_authority: ProjectAuthorityV2 | None = None
+    provider: CoreControlProviderV2 | None = None
+    executor_holder: dict[str, ScienceAttemptExecutorV2] = {}
+    preparer_holder: dict[str, ProductionScienceSuccessorPreparerV2] = {}
+    try:
+        catalog = CoreControlStoreV2(root / "core-control-v2")
+        workspaces = WorkspaceStoreV2(root / "workspaces-v2")
+        handoff_root = getattr(service_supervisor, "workspace_handoff_root")
+        handoffs = WorkspaceHandoffStoreV2(handoff_root)
+
+        def build_executor(ledger) -> ScienceAttemptExecutorV2:
+            executor = ScienceAttemptExecutorV2(
+                catalog=catalog,
+                workspaces=workspaces,
+                workspace_handoffs=handoffs,
+                ledger=ledger,
+                services=service_supervisor,
+                executable_registry=executable_registry,
+                prior_dataset_artifact_ids=(
+                    lambda head: ledger.prior_dataset_artifact_ids_for_head(head.project_head_id)
+                ),
+            )
+            executor_holder["value"] = executor
+            return executor
+
+        def build_preparer(ledger) -> ProductionScienceSuccessorPreparerV2:
+            preparer = ProductionScienceSuccessorPreparerV2(
+                catalog=catalog,
+                ledger=ledger,
+                workspaces=workspaces,
+                workspace_handoffs=handoffs,
+                services=service_supervisor,
+                executable_registry=executable_registry,
+            )
+            preparer_holder["value"] = preparer
+            return preparer
+
+        task_owner = CoreScienceTaskOwnerV2(
+            state_root=root,
+            attempt_executor_factory=build_executor,
+            successor_preparer_factory=build_preparer,
+        )
+        if not task_owner.production_ready:
+            raise RuntimeError("release v2 Task owner did not complete recovery")
+        project_authority = ProjectAuthorityV2(
+            catalog_store=catalog,
+            workspace_store=workspaces,
+            task_owner=task_owner,
+            executable_registry=executable_registry,
+            service_binding_provider=service_supervisor,
+            runtime_contract_sha256=runtime_contract_sha256,
+        )
+        provider = CoreControlProviderV2(
+            catalog,
+            task_owner=task_owner,
+            executable_registry=executable_registry,
+            project_authority=project_authority,
+            bearer_token=bearer_token,
+            release_version=__version__,
+            source_commit=source_commit,
+            build_channel="release",
+            runtime_contract_sha256=runtime_contract_sha256,
+        )
+        app = create_core_control_v2_contract_app(provider)
+        install_core_run_admission_endpoint(app, service_supervisor, task_owner)
+        composition = _ReleaseDaemonV2Composition(
+            app=app,
+            provider=provider,
+            catalog=catalog,
+            workspaces=workspaces,
+            workspace_handoffs=handoffs,
+            task_owner=task_owner,
+            project_authority=project_authority,
+            attempt_executor=executor_holder["value"],
+            successor_preparer=preparer_holder["value"],
+            service_supervisor=service_supervisor,
+        )
+        app.state.core_control_provider = provider
+        app.state.release_daemon_v2_composition = composition
+        app.router.add_event_handler("shutdown", composition.aclose)
+        return composition
+    except BaseException:
+        if provider is not None:
+            try:
+                provider.close()
+            except BaseException:
+                pass
+        else:
+            if task_owner is not None:
+                try:
+                    task_owner.close()
+                except BaseException:
+                    pass
+            if project_authority is not None:
+                try:
+                    project_authority.close()
+                except BaseException:
+                    pass
+            elif workspaces is not None:
+                workspaces.close()
+            if catalog is not None:
+                catalog.close()
+        if handoffs is not None:
+            handoffs.close()
+        try:
+            service_supervisor.close()
+        except BaseException:
+            pass
+        raise
+
+
+def _release_daemon_v2_ready_payload(
+    provider: CoreControlProviderV2,
+    *,
+    generation: str,
+    release_identity: str,
+) -> dict[str, object]:
+    version = provider.invoke("discoverCoreContractVersionV2", {})
+    if type(version) is not core_v2_models.VersionResponseV2:
+        raise RuntimeError("release v2 discovery authority is unavailable")
+    offers = [offer for offer in version.contracts if offer.api_major == 2]
+    if len(offers) != 1 or version.mutation_major != 2:
+        raise RuntimeError("release v2 mutation contract is unavailable")
+    offer = offers[0]
+    return {
+        "schema_version": 2,
+        "generation": generation,
+        "release_identity": release_identity,
+        "api_major": 2,
+        "openapi_sha256": offer.openapi_sha256,
+        "event_schema_sha256": offer.event_schema_sha256,
+        "release_version": version.release_version,
+        "build_id": version.build_id,
+        "source_commit": version.source_commit,
+        "provider_kind": version.provider_kind,
+        "feature_set_sha256": version.feature_set_sha256,
+        "registry_digest": version.registry_sha256,
+        "runtime_contract_sha256": version.runtime_contract_sha256,
+    }
+
+
 def _serve_core_control(args: argparse.Namespace) -> int:
     descriptors = {args.socket_fd, args.ready_fd, args.spawn_lock_fd}
     if min(descriptors) < 3 or len(descriptors) != 3:
@@ -73,7 +279,7 @@ def _serve_core_control(args: argparse.Namespace) -> int:
         inherited_socket.family != socket.AF_INET
         or host != "127.0.0.1"
         or not 0 < port <= 65535
-        or inherited_socket.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1
+        or not _is_inherited_listener(inherited_socket)
     ):
         inherited_socket.close()
         raise RuntimeError("Core supervisor socket is not a listening IPv4 loopback socket")
@@ -104,25 +310,15 @@ def _serve_core_control(args: argparse.Namespace) -> int:
             f"http://127.0.0.1:{port}/internal/v1/run-admissions/verify"
         ),
     )
-    try:
-        app = create_core_control_app(
-            state_root=state_root,
-            bearer_token=bearer_token,
-            source_commit=args.source_commit,
-            build_channel="release",
-            enable_maintenance_owner=True,
-            evolution_registry=registry,
-            service_supervisor=service_supervisor,
-            run_control_factory=lambda store: CoreScienceRunOwner(
-                state_root=state_root,
-                project_store=store,
-                service_supervisor=service_supervisor,
-                executable_registry=registry,
-            ),
-        )
-    except BaseException:
-        service_supervisor.close()
-        raise
+    composition = _build_release_daemon_v2_composition(
+        state_root=state_root,
+        bearer_token=bearer_token,
+        source_commit=args.source_commit,
+        executable_registry=registry,
+        service_supervisor=service_supervisor,
+        runtime_contract_sha256=release_runtime_contract_sha256(),
+    )
+    app = composition.app
     _bind_host_service_identity(
         app,
         generation=args.generation,
@@ -134,16 +330,32 @@ def _serve_core_control(args: argparse.Namespace) -> int:
                 app,
                 inherited_socket=inherited_socket,
                 ready_fd=args.ready_fd,
-                ready_payload={
-                    "schema_version": 1,
-                    "generation": args.generation,
-                    "release_identity": release.digest,
-                    "registry_digest": release.registry_digest,
-                },
+                ready_payload=_release_daemon_v2_ready_payload(
+                    composition.provider,
+                    generation=args.generation,
+                    release_identity=release.digest,
+                ),
             )
         )
     finally:
-        inherited_socket.close()
+        try:
+            composition.close()
+        finally:
+            inherited_socket.close()
+
+
+def _is_inherited_listener(value: socket.socket) -> bool:
+    if value.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM:
+        return False
+    try:
+        return value.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) == 1
+    except OSError as exc:
+        # Darwin declares SO_ACCEPTCONN but returns ENOPROTOOPT when it is read.
+        # The release Daemon runs only on Linux; this branch keeps Mac-side
+        # packaging tests non-mutating while preserving the Linux listen proof.
+        if sys.platform == "darwin" and exc.errno in {42, 102}:
+            return True
+        raise
 
 
 def _bind_host_service_identity(

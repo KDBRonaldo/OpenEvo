@@ -592,7 +592,19 @@ def test_service_failure_is_rendered_as_closed_json(
 
 
 def test_daemon_bundle_declares_process_group_lifecycle_compatibility() -> None:
-    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 8
+    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 9
+
+
+def test_release_daemon_launcher_contains_only_the_v2_mutation_composition() -> None:
+    launcher_source = Path("src/openevo/backend/launcher.py").read_text(encoding="utf-8")
+    assert "CoreControlProviderV2" in launcher_source
+    assert "ScienceAttemptExecutorV2" in launcher_source
+    assert "ProductionScienceSuccessorPreparerV2" in launcher_source
+    assert "create_core_control_v2_contract_app" in launcher_source
+    assert "install_core_run_admission_endpoint" in launcher_source
+    assert "contracts.v1.provider" not in launcher_source
+    assert "CoreScienceRunOwner" not in launcher_source
+    assert "create_core_control_app(" not in launcher_source
 
 
 def test_bundle_smoke_uses_bounded_parent_extraction_lifecycle(

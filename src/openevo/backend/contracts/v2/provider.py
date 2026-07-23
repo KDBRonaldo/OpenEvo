@@ -78,6 +78,17 @@ _BASE_FEATURE_FLAGS = [
     "verified_capabilities",
     "verified_registry",
 ]
+RELEASE_DAEMON_FEATURE_FLAGS_V2 = tuple(
+    sorted(
+        [
+            *_BASE_FEATURE_FLAGS,
+            "atomic_successor_v2",
+            "project_genesis_v2",
+            "task_execution_v2",
+            "workspace_snapshots_v2",
+        ]
+    )
+)
 _PROJECT_OPERATIONS = frozenset(
     {
         "createCoreProjectV2",
@@ -141,6 +152,8 @@ class CoreControlProviderV2:
         runtime_contract_sha256: str,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
+        if type(task_owner) is not CoreScienceTaskOwnerV2:
+            raise TypeError("Core v2 provider requires the exact v2 Task owner")
         try:
             token_bytes = bearer_token.encode("ascii")
         except UnicodeEncodeError as exc:
@@ -171,13 +184,24 @@ class CoreControlProviderV2:
             label="runtime contract",
         )
         _require_exact_schema_snapshots()
+        if build_channel == "release" and (
+            project_authority is None or not task_owner.production_ready
+        ):
+            raise ValueError(
+                "release Core v2 requires recovered production project and Task owners"
+            )
         self._started_at = _timestamp(self._clock())
         feature_flags = sorted(
             [
                 *_BASE_FEATURE_FLAGS,
                 *(
                     ["atomic_successor_v2"]
-                    if task_owner.successor_available
+                    if task_owner.production_ready
+                    else []
+                ),
+                *(
+                    ["task_execution_v2"]
+                    if task_owner.execution_available
                     else []
                 ),
                 *(
@@ -518,13 +542,11 @@ class CoreControlProviderV2:
         with self._lock:
             if self._closed:
                 return
-            self._closed = True
-        try:
+            self._task_owner.close()
             if self._project_authority is not None:
                 self._project_authority.close()
-            self._task_owner.close()
-        finally:
             self.store.close()
+            self._closed = True
 
     async def aclose(self) -> None:
         await asyncio.to_thread(self.close)
@@ -1445,4 +1467,4 @@ def _require_exact_schema_snapshots() -> None:
             raise RuntimeError(f"Core v2 {label} snapshot does not match provider code")
 
 
-__all__ = ["CoreControlProviderV2"]
+__all__ = ["CoreControlProviderV2", "RELEASE_DAEMON_FEATURE_FLAGS_V2"]

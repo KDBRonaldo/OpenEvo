@@ -315,24 +315,23 @@ def test_supervised_launcher_builds_release_core_control_app(
     registry = object()
     app = object()
     service_supervisor = object()
-    run_owner = object()
+    provider = object()
     calls: dict[str, object] = {}
 
     monkeypatch.setattr(launcher, "require_host_global_service_root", lambda path: path)
     monkeypatch.setattr(launcher, "load_verified_framework_registry", lambda path: registry)
     monkeypatch.setattr(launcher, "compute_release_identity", lambda **kwargs: release)
+    monkeypatch.setattr(
+        launcher,
+        "load_or_create_core_bearer_token",
+        lambda _root: "launcher-test-bearer-" + "x" * 43,
+    )
 
     def build_service_supervisor(**kwargs: object) -> object:
         calls["service_supervisor"] = kwargs
         return service_supervisor
 
     monkeypatch.setattr(launcher, "CoreServiceSupervisor", build_service_supervisor)
-
-    def build_run_owner(**kwargs: object) -> object:
-        calls["run_owner"] = kwargs
-        return run_owner
-
-    monkeypatch.setattr(launcher, "CoreScienceRunOwner", build_run_owner)
 
     def claim_spawn(**kwargs: object) -> None:
         calls["claim"] = kwargs
@@ -345,9 +344,37 @@ def test_supervised_launcher_builds_release_core_control_app(
         lambda *args, **kwargs: calls.setdefault("identity", (args, kwargs)),
     )
 
-    def create_app(**kwargs: object) -> object:
-        calls["create"] = kwargs
-        return app
+    class Composition:
+        def __init__(self) -> None:
+            self.app = app
+            self.provider = provider
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    composition = Composition()
+
+    def build_composition(**kwargs: object) -> Composition:
+        calls["composition"] = kwargs
+        return composition
+
+    def ready_payload(
+        received_provider: object,
+        *,
+        generation: str,
+        release_identity: str,
+    ) -> dict[str, object]:
+        calls["ready"] = {
+            "provider": received_provider,
+            "generation": generation,
+            "release_identity": release_identity,
+        }
+        return {
+            "schema_version": 2,
+            "generation": generation,
+            "release_identity": release_identity,
+        }
 
     async def run_server(
         received_app: object,
@@ -364,7 +391,8 @@ def test_supervised_launcher_builds_release_core_control_app(
         os.close(ready_fd)
         return 0
 
-    monkeypatch.setattr(launcher, "create_core_control_app", create_app)
+    monkeypatch.setattr(launcher, "_build_release_daemon_v2_composition", build_composition)
+    monkeypatch.setattr(launcher, "_release_daemon_v2_ready_payload", ready_payload)
     monkeypatch.setattr(launcher, "_run_supervised_server", run_server)
     listener = socket.socket()
     listener.bind(("127.0.0.1", 0))
@@ -387,20 +415,14 @@ def test_supervised_launcher_builds_release_core_control_app(
     finally:
         os.close(read_fd)
     assert result == 0
-    create = calls["create"]
-    assert create["state_root"] == service_root / "state"
-    assert create["build_channel"] == "release"
-    assert create["enable_maintenance_owner"] is True
-    assert create["source_commit"] == release.source_commit
-    assert create["evolution_registry"] is registry
-    assert create["service_supervisor"] is service_supervisor
-    project_store = object()
-    assert create["run_control_factory"](project_store) is run_owner
-    assert calls["run_owner"] == {
+    create = calls["composition"]
+    assert create == {
         "state_root": service_root / "state",
-        "project_store": project_store,
-        "service_supervisor": service_supervisor,
+        "bearer_token": create["bearer_token"],
+        "source_commit": release.source_commit,
         "executable_registry": registry,
+        "service_supervisor": service_supervisor,
+        "runtime_contract_sha256": launcher.release_runtime_contract_sha256(),
     }
     assert len(create["bearer_token"]) == 64
     server = calls["server"]
@@ -417,3 +439,9 @@ def test_supervised_launcher_builds_release_core_control_app(
     assert server["app"] is app
     assert server["socket"][0] == "127.0.0.1"
     assert server["ready_payload"]["release_identity"] == release.digest
+    assert calls["ready"] == {
+        "provider": provider,
+        "generation": "d" * 32,
+        "release_identity": release.digest,
+    }
+    assert composition.closed is True

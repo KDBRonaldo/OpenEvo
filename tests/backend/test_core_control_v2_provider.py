@@ -270,6 +270,16 @@ def test_provider_build_identity_binds_the_negotiated_feature_set(
 ) -> None:
     registry = verified_builtin_registry(tmp_path / "registry")
 
+    class _IdleAttemptExecutor:
+        def execute(
+            self,
+            *,
+            task: object,
+            attempt: object,
+            cancellation: threading.Event,
+        ) -> object:
+            raise AssertionError("the feature-set test must not execute an Attempt")
+
     def provider_at(path: str, *, successor: bool) -> CoreControlProviderV2:
         return CoreControlProviderV2(
             CoreControlStoreV2(tmp_path / path / "catalog"),
@@ -277,6 +287,9 @@ def test_provider_build_identity_binds_the_negotiated_feature_set(
                 state_root=tmp_path / path,
                 clock=_Clock(),
                 successor_preparer=_SuccessorPreparer() if successor else None,
+                attempt_executor_factory=(
+                    (lambda _ledger: _IdleAttemptExecutor()) if successor else None
+                ),
             ),
             executable_registry=registry,
             bearer_token=_TOKEN,
@@ -822,7 +835,7 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
     client = TestClient(create_core_control_v2_contract_app(provider))
     headers = {"Authorization": f"Bearer {_TOKEN}"}
     try:
-        assert "atomic_successor_v2" in client.get("/version").json()[
+        assert "atomic_successor_v2" not in client.get("/version").json()[
             "feature_flags"
         ]
         admitted = client.post(

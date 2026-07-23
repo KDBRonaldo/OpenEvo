@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from openevo.backend.contracts.v2.app import create_core_control_v2_contract_app
+from openevo.backend.contracts.v2.provider import RELEASE_DAEMON_FEATURE_FLAGS_V2
 from openevo.backend.contracts.v2.models import (
     AttemptRefV2,
     CodexSubscriptionExecutionSettingsV2,
@@ -883,9 +884,27 @@ def _v019_release_contract() -> dict[str, Any]:
             "core_control_mutation_major": 2,
             "accepted_core_openapi_digests": [openapi_sha256()],
             "accepted_core_event_schema_digests": [events_schema_sha256()],
+            "required_core_feature_flags": list(RELEASE_DAEMON_FEATURE_FLAGS_V2),
             "allow_legacy_route_fallback": False,
         },
     }
+
+
+def _write_v019_launcher_fixture(root: Path) -> None:
+    launcher = root / "src/openevo/backend/launcher.py"
+    launcher.parent.mkdir(parents=True)
+    launcher.write_text(
+        "\n".join(
+            [
+                "CoreControlProviderV2",
+                "ScienceAttemptExecutorV2",
+                "ProductionScienceSuccessorPreparerV2",
+                "create_core_control_v2_contract_app",
+                "install_core_run_admission_endpoint",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
 
 def test_v019_release_manifest_requires_exact_core_v2_schema_digests(
@@ -896,6 +915,7 @@ def test_v019_release_manifest_requires_exact_core_v2_schema_digests(
     desktop.mkdir()
     manifest = desktop / "release-contract.json"
     manifest.write_text(json.dumps(_v019_release_contract()), encoding="utf-8")
+    _write_v019_launcher_fixture(tmp_path)
 
     assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9") == []
 

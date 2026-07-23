@@ -25,7 +25,13 @@ from typing import Any, Callable, Protocol, Sequence
 
 from pydantic import SecretStr, ValidationError
 
+from openevo import __version__
 from openevo.backend.contracts.v2 import models as core_v2_models
+from openevo.backend.contracts.v2.provider import RELEASE_DAEMON_FEATURE_FLAGS_V2
+from openevo.backend.contracts.v2.snapshots import (
+    events_schema_sha256 as core_v2_events_schema_sha256,
+    openapi_sha256 as core_v2_openapi_sha256,
+)
 
 from openevo.backend.runtime_identity import (
     CoreReleaseIdentity,
@@ -36,6 +42,7 @@ from openevo.backend.runtime_identity import (
     default_core_service_root,
     load_bounded_json,
     load_or_create_core_bearer_token,
+    release_runtime_contract_sha256,
     require_host_global_service_root,
     rotate_core_bearer_token,
 )
@@ -58,6 +65,7 @@ _SPAWN_LOCK_NAME = "spawn.lock"
 _SERVICE_GENERATION_HEADER = "X-OpenEvo-Core-Generation"
 _RELEASE_IDENTITY_HEADER = "X-OpenEvo-Core-Release-Identity"
 _PROCESS_GROUP_LIFECYCLE_COMPATIBILITY = 3
+V2_DAEMON_LIFECYCLE_COMPATIBILITY = 9
 _ONEFILE_LAUNCHER_CLEANUP_SECONDS = 10.0
 _ORPHANED_SERVICE_CHILDREN_GUARD = threading.Lock()
 _ORPHANED_SERVICE_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
@@ -728,6 +736,7 @@ def observe_core_service_predecessor(
                     release=_release_from_ledger(ledger),
                     generation=ledger["generation"],
                     deadline=deadline,
+                    require_production_v2=_ledger_requires_production_v2(ledger),
                 )
                 _verify_ready_ledger(root, ledger, proof)
                 return _predecessor_from_ledger(ledger)
@@ -769,6 +778,7 @@ def inspect_core_service(
             release=release,
             generation=ledger["generation"],
             deadline=time.monotonic() + 5.0,
+            require_production_v2=_ledger_requires_production_v2(ledger),
         )
         return _attachment_from_ledger(
             ledger,
@@ -1142,6 +1152,7 @@ def _ensure_locked(
                         release=release,
                         generation=ledger["generation"],
                         deadline=deadline,
+                        require_production_v2=_ledger_requires_production_v2(ledger),
                     )
                     _verify_ready_ledger(root, ledger, proof)
                     root.unlink_regular(_PENDING_NAME)
@@ -1295,12 +1306,13 @@ def _ensure_locked(
         finally:
             os.close(ready_read)
             ready_read = -1
-        if ready != {
-            "schema_version": 1,
-            "generation": generation,
-            "release_identity": release.digest,
-            "registry_digest": release.registry_digest,
-        }:
+        require_production_v2 = _identity_requires_production_v2(daemon_bundle_identity)
+        if not _launcher_ready_matches(
+            ready,
+            release=release,
+            generation=generation,
+            require_production_v2=require_production_v2,
+        ):
             raise CoreServiceError(
                 CoreServiceErrorCode.START_FAILED,
                 "Core service returned an invalid readiness proof.",
@@ -1334,6 +1346,7 @@ def _ensure_locked(
             release=release,
             generation=generation,
             deadline=deadline,
+            require_production_v2=require_production_v2,
         )
         ready_ledger: dict[str, object] = {
             "schema_version": 1 if daemon_bundle_identity is None else 2,
@@ -1460,6 +1473,7 @@ def _authenticated_status_proof(
     generation: str,
     deadline: float,
     host: str = "127.0.0.1",
+    require_production_v2: bool = False,
 ) -> str:
     return authenticate_core_service_endpoint(
         host=host,
@@ -1470,7 +1484,109 @@ def _authenticated_status_proof(
         source_commit=release.source_commit,
         generation=generation,
         deadline=deadline,
+        require_production_v2=require_production_v2,
     )
+
+
+def _identity_requires_production_v2(
+    identity: CoreDaemonBundleIdentity | None,
+) -> bool:
+    return (
+        identity is not None
+        and identity.lifecycle_compatibility >= V2_DAEMON_LIFECYCLE_COMPATIBILITY
+    )
+
+
+def _ledger_requires_production_v2(ledger: dict[str, Any]) -> bool:
+    return bool(
+        _is_exact_daemon_ledger(ledger)
+        and ledger["lifecycle_compatibility"] >= V2_DAEMON_LIFECYCLE_COMPATIBILITY
+    )
+
+
+def _production_v2_feature_set_sha256() -> str:
+    payload = json.dumps(
+        list(RELEASE_DAEMON_FEATURE_FLAGS_V2),
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _is_exact_production_v2_discovery(
+    version: core_v2_models.VersionResponseV2,
+) -> bool:
+    if (
+        version.preferred_major != 2
+        or version.supported_majors != [2]
+        or version.mutation_major != 2
+        or version.release_version != __version__
+        or tuple(version.feature_flags) != RELEASE_DAEMON_FEATURE_FLAGS_V2
+        or version.feature_set_sha256 != _production_v2_feature_set_sha256()
+        or version.runtime_contract_sha256 != release_runtime_contract_sha256()
+        or len(version.contracts) != 1
+    ):
+        return False
+    offer = version.contracts[0]
+    return (
+        offer.api_major == 2
+        and offer.access == "mutation"
+        and offer.mutation_compatible is True
+        and offer.openapi_sha256 == core_v2_openapi_sha256()
+        and offer.event_schema_sha256 == core_v2_events_schema_sha256()
+    )
+
+
+def _launcher_ready_matches(
+    value: object,
+    *,
+    release: CoreReleaseIdentity,
+    generation: str,
+    require_production_v2: bool,
+) -> bool:
+    if not isinstance(value, dict):
+        return False
+    v2_keys = {
+        "api_major",
+        "build_id",
+        "event_schema_sha256",
+        "feature_set_sha256",
+        "generation",
+        "openapi_sha256",
+        "provider_kind",
+        "registry_digest",
+        "release_identity",
+        "release_version",
+        "runtime_contract_sha256",
+        "schema_version",
+        "source_commit",
+    }
+    if set(value) == v2_keys:
+        return bool(
+            value.get("schema_version") == 2
+            and value.get("generation") == generation
+            and value.get("release_identity") == release.digest
+            and value.get("api_major") == 2
+            and value.get("openapi_sha256") == core_v2_openapi_sha256()
+            and value.get("event_schema_sha256") == core_v2_events_schema_sha256()
+            and value.get("release_version") == __version__
+            and isinstance(value.get("build_id"), str)
+            and re.fullmatch(r"[0-9a-f]{64}", value["build_id"]) is not None
+            and value.get("source_commit") == release.source_commit
+            and value.get("provider_kind") == "openevo_daemon"
+            and value.get("feature_set_sha256") == _production_v2_feature_set_sha256()
+            and value.get("registry_digest") == release.registry_digest
+            and value.get("runtime_contract_sha256") == release_runtime_contract_sha256()
+        )
+    if require_production_v2:
+        return False
+    return value == {
+        "schema_version": 1,
+        "generation": generation,
+        "release_identity": release.digest,
+        "registry_digest": release.registry_digest,
+    }
 
 
 def authenticate_core_service_endpoint(
@@ -1484,6 +1600,7 @@ def authenticate_core_service_endpoint(
     generation: str,
     deadline: float,
     endpoint: CoreServiceEndpoint | None = None,
+    require_production_v2: bool = False,
 ) -> str:
     if (
         ((endpoint is None) != (host == "127.0.0.1" and type(port) is int and 1 <= port <= 65535))
@@ -1492,6 +1609,7 @@ def authenticate_core_service_endpoint(
         or re.fullmatch(r"[0-9a-f]{64}", registry_digest) is None
         or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
         or re.fullmatch(r"[0-9a-f]{32}", generation) is None
+        or not isinstance(require_production_v2, bool)
     ):
         raise CoreServiceError(
             CoreServiceErrorCode.STATUS_INVALID,
@@ -1515,6 +1633,12 @@ def authenticate_core_service_endpoint(
         version.get("preferred_major") == 2
         or version.get("provider_kind") == "openevo_daemon"
     )
+    if require_production_v2 and not is_v2:
+        raise CoreServiceError(
+            CoreServiceErrorCode.STATUS_INVALID,
+            "Core service identity proof did not match the verified release.",
+            retryable=False,
+        )
     status_path = "/v2/system/status" if is_v2 else "/v1/status"
     status = _fetch_json(
         host,
@@ -1545,6 +1669,7 @@ def authenticate_core_service_endpoint(
             or status_v2.release_version != version_v2.release_version
             or status_v2.source_commit != source_commit
             or status_v2.registry_sha256 != registry_digest
+            or (require_production_v2 and not _is_exact_production_v2_discovery(version_v2))
         ):
             raise CoreServiceError(
                 CoreServiceErrorCode.STATUS_INVALID,
@@ -2772,6 +2897,7 @@ __all__ = [
     "LinuxProcessController",
     "LockIdentity",
     "ProcessIdentity",
+    "V2_DAEMON_LIFECYCLE_COMPATIBILITY",
     "ensure_core_service",
     "inspect_core_service",
     "observe_core_service_predecessor",

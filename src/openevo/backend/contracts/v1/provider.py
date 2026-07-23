@@ -10,6 +10,7 @@ import difflib
 import hashlib
 import hmac
 from pathlib import Path, PurePosixPath
+import re
 import threading
 import time
 from typing import TYPE_CHECKING, Any, NoReturn, cast
@@ -2130,6 +2131,15 @@ def _modified_document_hunks(
     return hunks
 
 
+def _release_version_requires_v2(value: str) -> bool:
+    if not isinstance(value, str):
+        return False
+    matched = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:$|[^0-9])", value)
+    if matched is None:
+        return False
+    return tuple(int(part) for part in matched.groups()) >= (0, 1, 9)
+
+
 def create_core_control_app(
     *,
     state_root: str | Path,
@@ -2153,6 +2163,13 @@ def create_core_control_app(
     resolved_build_channel = (
         m.BuildChannel(build_channel) if isinstance(build_channel, str) else build_channel
     )
+    if (
+        resolved_build_channel is m.BuildChannel.RELEASE
+        and _release_version_requires_v2(build_version)
+    ):
+        raise RuntimeError(
+            "OpenEvo 0.1.9 and later release mutation requires Core Control API v2"
+        )
     store = CoreControlStoreV1(
         state_root,
         event_replay_limit=event_replay_limit,

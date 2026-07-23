@@ -328,6 +328,9 @@ def validate_v019_contract_manifest(
         events_schema_sha256,
         openapi_sha256,
     )
+    from openevo.backend.contracts.v2.provider import (
+        RELEASE_DAEMON_FEATURE_FLAGS_V2,
+    )
 
     policy = payload.get("v019")
     if not isinstance(policy, dict):
@@ -346,8 +349,35 @@ def validate_v019_contract_manifest(
         errors.append(
             "The 0.1.9 release manifest must pin the exact generated Core v2 event schema digest."
         )
+    if policy.get("required_core_feature_flags") != list(RELEASE_DAEMON_FEATURE_FLAGS_V2):
+        errors.append(
+            "The 0.1.9 release manifest must require the complete production Daemon v2 feature set."
+        )
     if policy.get("allow_legacy_route_fallback") is not False:
         errors.append("The 0.1.9 release manifest must forbid legacy route fallback.")
+    launcher_path = repo_root / "src/openevo/backend/launcher.py"
+    try:
+        launcher = launcher_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        errors.append("The 0.1.9 release Daemon launcher is unreadable.")
+    else:
+        required_composition = (
+            "CoreControlProviderV2",
+            "ScienceAttemptExecutorV2",
+            "ProductionScienceSuccessorPreparerV2",
+            "create_core_control_v2_contract_app",
+            "install_core_run_admission_endpoint",
+        )
+        if any(value not in launcher for value in required_composition):
+            errors.append("The 0.1.9 release Daemon launcher is missing its production v2 owners.")
+        if (
+            "contracts.v1.provider" in launcher
+            or "CoreScienceRunOwner" in launcher
+            or "create_core_control_app(" in launcher
+        ):
+            errors.append(
+                "The 0.1.9 release Daemon launcher retains a legacy mutation composition."
+            )
     return errors
 
 

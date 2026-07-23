@@ -221,6 +221,8 @@ class CoreScienceTaskOwnerV2:
         self._lifecycle_lock = threading.RLock()
         self._cancel_events: dict[str, threading.Event] = {}
         self._closed = False
+        self._close_complete = False
+        self._recovery_complete = False
         self._attempt_executor = (
             None if attempt_executor_factory is None else attempt_executor_factory(self._ledger)
         )
@@ -231,6 +233,7 @@ class CoreScienceTaskOwnerV2:
             raise TypeError("v2 Task owner requires an Attempt executor")
         self._ledger.recover_interrupted_attempts(now=self._clock())
         self._recover_interrupted_successor_transitions()
+        self._recovery_complete = True
         self._worker: threading.Thread | None = None
         if self._attempt_executor is not None:
             self._worker = threading.Thread(
@@ -270,6 +273,18 @@ class CoreScienceTaskOwnerV2:
     @property
     def successor_available(self) -> bool:
         return self._successor_preparer is not None
+
+    @property
+    def execution_available(self) -> bool:
+        return self._attempt_executor is not None
+
+    @property
+    def production_ready(self) -> bool:
+        return (
+            self._recovery_complete
+            and self._attempt_executor is not None
+            and self._successor_preparer is not None
+        )
 
     def publish_project_admission_authority(
         self,
@@ -630,22 +645,27 @@ class CoreScienceTaskOwnerV2:
 
     def close(self) -> None:
         with self._lifecycle_lock:
-            if self._closed:
+            if self._close_complete:
                 return
-            self._closed = True
-            for cancellation in self._cancel_events.values():
-                cancellation.set()
-        preparer_stop = getattr(self._successor_preparer, "request_stop", None)
-        if callable(preparer_stop):
-            preparer_stop()
-        with self._condition:
-            self._condition.notify_all()
+            first_close = not self._closed
+            if first_close:
+                self._closed = True
+                for cancellation in self._cancel_events.values():
+                    cancellation.set()
+        if first_close:
+            preparer_stop = getattr(self._successor_preparer, "request_stop", None)
+            if callable(preparer_stop):
+                preparer_stop()
+            with self._condition:
+                self._condition.notify_all()
         worker = self._worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=30.0)
             if worker.is_alive():
                 raise RuntimeError("v2 science Task owner did not stop before shutdown")
         self._ledger.close()
+        with self._lifecycle_lock:
+            self._close_complete = True
 
     def _submit_task(self, arguments: Mapping[str, object]) -> m2.TaskV2:
         _require_v2_argument_keys(arguments, {"request", "idempotency_key"})

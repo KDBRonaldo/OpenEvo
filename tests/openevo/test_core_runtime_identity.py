@@ -16,8 +16,15 @@ from openevo.backend.runtime_identity import (
     default_core_service_root,
     load_bounded_json,
     load_or_create_core_bearer_token,
+    release_runtime_contract_sha256,
     require_host_global_service_root,
 )
+
+
+def test_release_runtime_contract_identity_is_frozen() -> None:
+    assert release_runtime_contract_sha256() == (
+        "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+    )
 
 
 def test_concurrent_host_root_creation_converges(tmp_path: Path) -> None:

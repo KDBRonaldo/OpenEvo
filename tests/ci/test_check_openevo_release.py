@@ -3958,6 +3958,9 @@ def test_v019_release_manifest_pins_v2_mutation_and_forbids_fallbacks() -> None:
         DESKTOP_EVENTS_SCHEMA_SHA256,
         DESKTOP_OPENAPI_SHA256,
     )
+    from openevo.backend.contracts.v2.provider import (
+        RELEASE_DAEMON_FEATURE_FLAGS_V2,
+    )
     from openevo.backend.contracts.v2.snapshots import (
         events_schema_sha256,
         openapi_sha256,
@@ -3975,6 +3978,9 @@ def test_v019_release_manifest_pins_v2_mutation_and_forbids_fallbacks() -> None:
     ]
     assert policy["accepted_core_openapi_digests"] == [openapi_sha256()]
     assert policy["accepted_core_event_schema_digests"] == [events_schema_sha256()]
+    assert policy["required_core_feature_flags"] == list(
+        RELEASE_DAEMON_FEATURE_FLAGS_V2
+    )
     assert policy["core_transport"] == "active_project_ssh_tunnel"
     assert policy["allow_direct_core_url"] is False
     assert policy["allow_legacy_route_fallback"] is False
