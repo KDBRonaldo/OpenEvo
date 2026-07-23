@@ -88,6 +88,32 @@ become a zombie before observer installation, proving that Darwin's kqueue plus
 non-reaping `ps` snapshot closes the registration gap. These rules model the
 production ownership lifecycle without weakening its fail-closed checks.
 
+The v0.1.9 system-OpenSSH gate is
+`scripts/ci/run_desktop_system_ssh_integration.py --require-complete`. It is a
+required macOS candidate step and fails when the Apple `sshd`, SSH tools, C
+compiler, loopback fixture, askpass broker, or any asserted workflow is
+unavailable. The gate creates an owner-private fixture beneath the current
+account's canonical home and runs the production alias-only master, command,
+rsync, control, and `-W` tunnel builders through exact `/usr/bin/ssh` and
+`/usr/bin/rsync`. It covers a controlled agent, `IdentityFile`, encrypted-key
+askpass, a real password prompt (successful authentication only when the host
+account supports the generated fixture value), ProxyJump, ProxyCommand,
+first-host accept/cancel, strict first-use refusal, changed and repeatedly
+changed keys, master reuse, ambient-agent/master isolation, cancellation, and
+complete process/socket cleanup. The emitted evidence is a closed boolean
+summary and never contains fixture paths or response values.
+
+The hermetic local-`sshd` fixture supplies its generated SSH config with a
+test-only `-F` adapter after separately asserting that the production plans are
+the unchanged alias-only builders. Product code never uses that adapter: the
+installed app still executes the selected literal alias against the user's
+normal OpenSSH configuration. Run the gate locally on the supported Mac with:
+
+```bash
+unset SSH_AUTH_SOCK
+uv run python scripts/ci/run_desktop_system_ssh_integration.py --require-complete
+```
+
 Native workspace tests reject sparse allocation through deterministic metadata
 and extent-map contract tests. Filesystem integration fixtures skip only when
 the host filesystem physically allocates the complete logical file; they must

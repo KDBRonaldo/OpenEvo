@@ -2706,7 +2706,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert 'rm -rf "$mount_dir" "$copy_dir"' in shipped_app_smoke
 
     candidate_ssh_step = text.split(
-        "      - name: Exercise macOS SSH agent relay and fixed executable authority\n",
+        "      - name: Gate real macOS system OpenSSH workflows and fixed authority\n",
         maxsplit=1,
     )[1].split(
         "      - name: Resolve exact product version and runner architecture\n",
@@ -2720,6 +2720,11 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert 'chmod 700 "$ssh_test_root"' in candidate_ssh_step
     assert 'trap \'rm -rf -- "$ssh_test_root"\' EXIT' in candidate_ssh_step
     assert '--basetemp="$ssh_test_root/pytest"' in candidate_ssh_step
+    assert "scripts/ci/run_desktop_system_ssh_integration.py" in candidate_ssh_step
+    assert "--require-complete" in candidate_ssh_step
+    assert '--evidence-out "$ssh_test_root/desktop-system-ssh-integration.json"' in (
+        candidate_ssh_step
+    )
     assert "$RUNNER_TEMP" not in candidate_ssh_step
 
     version_step = text.split(

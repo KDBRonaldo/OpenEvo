@@ -88,6 +88,23 @@ def test_changed_key_failure_retains_only_bounded_fingerprint_evidence(
     assert "gpu.internal.example" not in repr(evidence)
 
 
+def test_macos_openssh_crlf_diagnostics_retain_closed_host_key_semantics(
+    tmp_path: Path,
+) -> None:
+    path = _known_hosts(tmp_path)
+    changed = classify_system_openssh_host_key_failure(
+        _changed_key_stderr(path).replace(b"\n", b"\r\n")
+    )
+    first_use = classify_system_openssh_host_key_failure(
+        b"No ED25519 host key is known and you have requested strict checking.\r\n"
+        b"Host key verification failed.\r\n"
+    )
+
+    assert changed.code is SystemHostKeyFailureCode.CHANGED
+    assert changed.presented_fingerprints == (("ssh-ed25519", _FINGERPRINT),)
+    assert first_use.code is SystemHostKeyFailureCode.FIRST_USE_FORBIDDEN
+
+
 @pytest.mark.parametrize(
     "stderr",
     [

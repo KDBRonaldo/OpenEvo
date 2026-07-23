@@ -228,6 +228,7 @@ jobs:
             tests/ci/test_openevo_release_candidate.py \
             tests/ci/test_openevo_release_evidence.py \
             tests/ci/test_validate_desktop_real_science_e2e.py \
+            tests/ci/test_desktop_system_ssh_integration.py \
             tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_darwin_sqlite_connection_uses_managed_path_and_persists_writes \
@@ -237,7 +238,7 @@ jobs:
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 
-      - name: Exercise macOS SSH agent relay and fixed executable authority
+      - name: Gate real macOS system OpenSSH workflows and fixed authority
         run: |
           unset SSH_AUTH_SOCK
           umask 077
@@ -256,8 +257,15 @@ jobs:
           uv run python -m pytest --basetemp="$ssh_test_root/pytest" \
             tests/openevo/remote/test_system_executables.py \
             tests/openevo/remote/test_host_keys.py \
+            tests/openevo/remote/test_system_host_keys.py \
+            tests/openevo/remote/test_system_openssh_alias.py \
             tests/openevo/remote/test_ssh_transport.py \
+            tests/openevo/sidecar/test_askpass_broker.py \
+            tests/openevo/sidecar/test_system_ssh_session.py \
             -q
+          uv run python scripts/ci/run_desktop_system_ssh_integration.py \
+            --require-complete \
+            --evidence-out "$ssh_test_root/desktop-system-ssh-integration.json"
 
       - name: Resolve exact product version and runner architecture
         run: |

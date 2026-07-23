@@ -382,8 +382,9 @@ def classify_system_openssh_host_key_failure(
         text = stderr.decode("utf-8", errors="strict")
     except UnicodeDecodeError:
         return generic
-    if "\r" in text or "\x00" in text:
+    if "\x00" in text or "\r" in text.replace("\r\n", ""):
         return generic
+    text = text.replace("\r\n", "\n")
     lines = text.splitlines()
     if not lines or len(lines) > 1_024 or any(len(line.encode("utf-8")) > 4_096 for line in lines):
         return generic
