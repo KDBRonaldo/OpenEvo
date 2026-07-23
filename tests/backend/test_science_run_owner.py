@@ -16,7 +16,11 @@ import pytest
 
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v1.store import CoreControlStoreV1
-from openevo.backend.run_control import CoreRunControlError
+from openevo.backend.run_control import (
+    RUN_OPERATION_IDS,
+    TASK_OPERATION_IDS_V2,
+    CoreRunControlError,
+)
 import openevo.backend.science_run_owner as owner_module
 from openevo.backend.science_run_owner import CoreScienceRunOwner, _AdmittingRolloutClient
 from openevo.backend.science_run_store import ScienceRunStore
@@ -52,6 +56,17 @@ _MEMORY_ENTRY = PayloadManifestEntry(
     sha256=hashlib.sha256(_MEMORY_PAYLOAD).hexdigest(),
 )
 _ARTIFACT_CONTENT_DIGEST = payload_tree_digest((_MEMORY_ENTRY,))
+
+
+def test_frozen_v1_run_owner_operation_set_excludes_v2_task_mutations() -> None:
+    assert "createCoreRunV1" in RUN_OPERATION_IDS
+    assert "submitCoreTaskV2" in TASK_OPERATION_IDS_V2
+    assert RUN_OPERATION_IDS.isdisjoint(TASK_OPERATION_IDS_V2)
+
+    owner = object.__new__(CoreScienceRunOwner)
+    with pytest.raises(CoreRunControlError) as unavailable:
+        owner.invoke("submitCoreTaskV2", {})
+    assert unavailable.value.code == "run_operation_unavailable"
 
 
 def _runtime_receipt(

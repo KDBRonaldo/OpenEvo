@@ -178,11 +178,10 @@ def _admission(
     *,
     head: dict[str, Any] | None = None,
     workspace: dict[str, Any] | None = None,
-    seed: str = "6",
 ) -> dict[str, Any]:
     head = head or _head(project_id)
     workspace = workspace or _workspace(project_id, "7")
-    return {
+    payload = {
         "schema_version": "2",
         "task_admission_id": "admission-1",
         "task_id": "task-1",
@@ -193,9 +192,18 @@ def _admission(
         "task_envelope_sha256": "9" * 64,
         "normalized_evolution_intent_sha256": "c" * 64,
         "registry_sha256": head["registry_sha256"],
-        "admission_sha256": seed * 64,
         "admitted_at": "2026-07-23T00:00:00Z",
     }
+    payload["admission_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return payload
 
 
 def _attempt(
@@ -387,6 +395,11 @@ def test_task_admission_and_attempt_bind_immutable_ownership() -> None:
             TaskAdmissionRefV2,
             {**admission, "registry_sha256": "f" * 64},
         )
+    with pytest.raises(ValidationError, match="admission digest"):
+        _json_model(
+            TaskAdmissionRefV2,
+            {**admission, "admission_sha256": "f" * 64},
+        )
 
 
 def test_successor_transition_binds_admission_attempt_and_adjacent_head() -> None:
@@ -461,7 +474,7 @@ def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
     assert openapi_sha256() == (
-        "f7fe3d2d862be66ba1494b30af9bb98407f1e7099f174a98d6612dafcc62f2f2"
+        "2ceda6959407c471b9ae83d168db70075f13c4eb0d36786cd431ec6b330f95b5"
     )
 
 

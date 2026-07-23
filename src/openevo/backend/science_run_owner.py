@@ -16,16 +16,18 @@ from typing import Any, Iterator, Protocol, cast
 from fastapi.responses import JSONResponse, Response
 
 from openevo.backend.contracts.v1 import models as m
+from openevo.backend.contracts.v2 import models as m2
 from openevo.backend.contracts.v1.store import (
     CoreControlStoreV1,
     ResourceConflictError,
     ResourceNotFoundError,
 )
-from openevo.backend.run_control import CoreRunControlError
+from openevo.backend.run_control import CoreRunControlError, CoreTaskControlError
 from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.science_execution import compile_science_execution
 from openevo.backend.science_run_store import (
     ProjectInFlightCoordinator,
+    ScienceAttemptNotFoundV2,
     ScienceProjectInFlight,
     ScienceRunConflict,
     ScienceRunIdempotencyConflict,
@@ -33,6 +35,17 @@ from openevo.backend.science_run_store import (
     ScienceRunPreconditionFailed,
     ScienceRunStore,
     ScienceRunStoreError,
+    ScienceProjectAdmissionAuthorityV2,
+    ScienceTaskConflictV2,
+    ScienceTaskIdempotencyConflictV2,
+    ScienceTaskNotFoundV2,
+    ScienceTaskNotReadyV2,
+    ScienceTaskPreconditionFailedV2,
+    ScienceTaskProjectInFlightV2,
+    ScienceTaskStaleSubmissionV2,
+    ScienceTaskStoreV2,
+    ScienceTaskStoreV2Error,
+    ScienceTaskTerminalV2,
     page_items,
 )
 from openevo.backend.service_supervisor import (
@@ -106,6 +119,148 @@ class _RunCancelled(RuntimeError):
 
 class _RunFinalizationConflict(ScienceRunConflict):
     pass
+
+
+class CoreScienceTaskOwnerV2:
+    """Own immutable v2 Task, admission, and Attempt identities only."""
+
+    def __init__(
+        self,
+        *,
+        state_root: str | Path,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._ledger = ScienceTaskStoreV2(Path(state_root) / "science-tasks-v2")
+
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
+        handlers: dict[str, Callable[[Mapping[str, object]], object]] = {
+            "appendCoreTaskAttemptV2": self._append_attempt,
+            "getCoreTaskAdmissionV2": self._get_admission,
+            "getCoreTaskAttemptV2": self._get_attempt,
+            "getCoreTaskV2": self._get_task,
+            "listCoreTaskAttemptsV2": self._list_attempts,
+            "listCoreTasksV2": self._list_tasks,
+            "submitCoreTaskV2": self._submit_task,
+        }
+        handler = handlers.get(operation_id)
+        if handler is None:
+            raise CoreTaskControlError(
+                "task_operation_unavailable",
+                "The v2 science Task owner does not implement this operation.",
+                http_status=503,
+                retryable=False,
+            )
+        try:
+            return handler(arguments)
+        except CoreTaskControlError:
+            raise
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id=operation_id)
+
+    def publish_project_admission_authority(
+        self,
+        authority: ScienceProjectAdmissionAuthorityV2,
+        *,
+        expected_project_head_id: str | None = None,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        try:
+            return self._ledger.publish_project_admission_authority(
+                authority,
+                expected_project_head_id=expected_project_head_id,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="publishCoreProjectAdmissionAuthorityV2",
+            )
+
+    def close_task(
+        self,
+        task_id: str,
+        request: m2.TaskActionRequestV2,
+    ) -> m2.TaskV2:
+        try:
+            return self._ledger.close_task(task_id, request, now=self._clock())
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="closeCoreTaskV2")
+
+    def ownership_counts(self) -> tuple[int, int, int]:
+        try:
+            return self._ledger.ownership_counts()
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="inspectCoreTaskOwnershipV2")
+
+    def close(self) -> None:
+        self._ledger.close()
+
+    def _submit_task(self, arguments: Mapping[str, object]) -> m2.TaskV2:
+        _require_v2_argument_keys(arguments, {"request", "idempotency_key"})
+        request = _v2_request_model(m2.TaskSubmitRequestV2, arguments["request"])
+        task, _replayed = self._ledger.submit_task(
+            request=request,
+            idempotency_key=_v2_string_argument(
+                arguments["idempotency_key"], label="idempotency key"
+            ),
+            now=self._clock(),
+        )
+        return task
+
+    def _get_task(self, arguments: Mapping[str, object]) -> m2.TaskV2:
+        _require_v2_argument_keys(arguments, {"task_id"})
+        return self._ledger.get_task(
+            _v2_string_argument(arguments["task_id"], label="task ID")
+        )
+
+    def _list_tasks(self, arguments: Mapping[str, object]) -> list[m2.TaskV2]:
+        _require_v2_argument_keys(arguments, set(), optional={"project_id"})
+        project_id = arguments.get("project_id")
+        return self._ledger.list_tasks(
+            project_id=(
+                None
+                if project_id is None
+                else _v2_string_argument(project_id, label="project ID")
+            )
+        )
+
+    def _get_admission(
+        self, arguments: Mapping[str, object]
+    ) -> m2.TaskAdmissionRefV2:
+        _require_v2_argument_keys(arguments, {"task_id"})
+        return self._ledger.get_admission(
+            _v2_string_argument(arguments["task_id"], label="task ID")
+        )
+
+    def _list_attempts(
+        self, arguments: Mapping[str, object]
+    ) -> list[m2.AttemptRefV2]:
+        _require_v2_argument_keys(arguments, {"task_id"})
+        return self._ledger.list_attempts(
+            _v2_string_argument(arguments["task_id"], label="task ID")
+        )
+
+    def _append_attempt(self, arguments: Mapping[str, object]) -> m2.AttemptRefV2:
+        _require_v2_argument_keys(
+            arguments,
+            {"task_id", "request", "idempotency_key"},
+        )
+        request = _v2_request_model(m2.AttemptAppendRequestV2, arguments["request"])
+        attempt, _replayed = self._ledger.append_attempt(
+            task_id=_v2_string_argument(arguments["task_id"], label="task ID"),
+            request=request,
+            idempotency_key=_v2_string_argument(
+                arguments["idempotency_key"], label="idempotency key"
+            ),
+            now=self._clock(),
+        )
+        return attempt
+
+    def _get_attempt(self, arguments: Mapping[str, object]) -> m2.AttemptRefV2:
+        _require_v2_argument_keys(arguments, {"task_id", "attempt_id"})
+        return self._ledger.get_attempt(
+            _v2_string_argument(arguments["task_id"], label="task ID"),
+            _v2_string_argument(arguments["attempt_id"], label="attempt ID"),
+        )
 
 
 class CoreScienceRunOwner:
@@ -2333,6 +2488,120 @@ def _owner_error(code: str, message: str, status: int, retryable: bool) -> CoreR
     return CoreRunControlError(code, message, http_status=status, retryable=retryable)
 
 
+def _raise_v2_owner_error(exc: Exception, *, operation_id: str) -> None:
+    if isinstance(exc, ScienceTaskNotReadyV2):
+        raise CoreTaskControlError(
+            "project_not_ready",
+            "The project has unresolved state and cannot admit a Task.",
+            http_status=409,
+            retryable=True,
+        ) from exc
+    if isinstance(exc, ScienceTaskStaleSubmissionV2):
+        raise CoreTaskControlError(
+            "task_submission_stale",
+            "The Task submission does not match the current project authority.",
+            http_status=409,
+            retryable=True,
+        ) from exc
+    if isinstance(exc, ScienceTaskIdempotencyConflictV2):
+        raise CoreTaskControlError(
+            "task_idempotency_key_reused",
+            "The idempotency key was already used for a different v2 request.",
+            http_status=409,
+            retryable=False,
+        ) from exc
+    if isinstance(exc, ScienceTaskProjectInFlightV2):
+        raise CoreTaskControlError(
+            "task_project_in_flight",
+            "The project already has an immutable Task in flight.",
+            http_status=409,
+            retryable=True,
+        ) from exc
+    if isinstance(exc, ScienceTaskPreconditionFailedV2):
+        code = (
+            "attempt_precondition_failed"
+            if operation_id == "appendCoreTaskAttemptV2"
+            else "task_precondition_failed"
+        )
+        raise CoreTaskControlError(
+            code,
+            "The immutable Task ownership precondition changed.",
+            http_status=412,
+            retryable=True,
+        ) from exc
+    if isinstance(exc, ScienceTaskTerminalV2):
+        raise CoreTaskControlError(
+            "task_terminal",
+            "The immutable Task can no longer be mutated.",
+            http_status=409,
+            retryable=False,
+        ) from exc
+    if isinstance(exc, ScienceAttemptNotFoundV2):
+        raise CoreTaskControlError(
+            "attempt_not_found",
+            "The requested v2 Attempt was not found.",
+            http_status=404,
+            retryable=False,
+        ) from exc
+    if isinstance(exc, ScienceTaskNotFoundV2):
+        raise CoreTaskControlError(
+            "task_not_found",
+            "The requested v2 Task was not found.",
+            http_status=404,
+            retryable=False,
+        ) from exc
+    if isinstance(exc, ScienceTaskConflictV2):
+        raise CoreTaskControlError(
+            "task_conflict",
+            "The v2 Task ownership mutation conflicts with durable state.",
+            http_status=409,
+            retryable=False,
+        ) from exc
+    if isinstance(exc, ScienceTaskStoreV2Error):
+        raise CoreTaskControlError(
+            "task_owner_unavailable",
+            "Core could not read or update durable v2 Task ownership.",
+            http_status=503,
+            retryable=True,
+        ) from exc
+    if isinstance(exc, (TypeError, ValueError, KeyError)):
+        raise CoreTaskControlError(
+            "task_request_invalid",
+            "The v2 Task ownership request is invalid.",
+            http_status=422,
+            retryable=False,
+        ) from exc
+    raise exc
+
+
+def _require_v2_argument_keys(
+    arguments: Mapping[str, object],
+    required: set[str],
+    *,
+    optional: set[str] | None = None,
+) -> None:
+    if not isinstance(arguments, Mapping):
+        raise TypeError("v2 Task arguments must be a mapping")
+    keys = set(arguments)
+    allowed = required | (optional or set())
+    if keys - allowed or not required.issubset(keys) or any(
+        not isinstance(key, str) for key in keys
+    ):
+        raise ValueError("v2 Task arguments do not match the closed operation")
+
+
+def _v2_request_model(model_type: type[m2.ContractModel], value: object) -> Any:
+    if type(value) is model_type:
+        return model_type.model_validate(value.model_dump(mode="python"))
+    return model_type.model_validate(value)
+
+
+def _v2_string_argument(value: object, *, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"v2 {label} must be a string")
+    return value
+
+
 def _readiness_error(code: ServiceRunReadinessCode) -> CoreRunControlError:
     messages = {
         ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE: (
@@ -2404,4 +2673,4 @@ def _bounded_identity(value: object) -> bool:
     return isinstance(value, str) and 0 < len(value.encode("utf-8")) <= 256
 
 
-__all__ = ["CoreScienceRunOwner"]
+__all__ = ["CoreScienceRunOwner", "CoreScienceTaskOwnerV2"]

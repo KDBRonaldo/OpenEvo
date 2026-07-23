@@ -23,6 +23,24 @@ RUN_OPERATION_IDS = frozenset(
     }
 )
 
+TASK_OPERATION_IDS_V2 = frozenset(
+    {
+        "appendCoreTaskAttemptV2",
+        "cancelCoreTaskAttemptV2",
+        "closeCoreTaskV2",
+        "getCoreTaskAdmissionV2",
+        "getCoreTaskAttemptV2",
+        "getCoreTaskContextV2",
+        "getCoreTaskLogsV2",
+        "getCoreTaskTimelineV2",
+        "getCoreTaskV2",
+        "listCoreTaskArtifactsV2",
+        "listCoreTaskAttemptsV2",
+        "listCoreTasksV2",
+        "submitCoreTaskV2",
+    }
+)
+
 
 class CoreRunControlError(RuntimeError):
     def __init__(
@@ -39,6 +57,10 @@ class CoreRunControlError(RuntimeError):
         self.retryable = retryable
 
 
+class CoreTaskControlError(CoreRunControlError):
+    """Typed v2 Task ownership failure, kept separate from frozen v1 routes."""
+
+
 class CoreRunControl(GenerationBoundRunAdmissionVerifier, Protocol):
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
 
@@ -47,4 +69,19 @@ class CoreRunControl(GenerationBoundRunAdmissionVerifier, Protocol):
     def close(self) -> None: ...
 
 
-__all__ = ["CoreRunControl", "CoreRunControlError", "RUN_OPERATION_IDS"]
+class CoreTaskControlV2(Protocol):
+    def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object: ...
+
+    def ownership_counts(self) -> tuple[int, int, int]: ...
+
+    def close(self) -> None: ...
+
+
+__all__ = [
+    "CoreRunControl",
+    "CoreRunControlError",
+    "CoreTaskControlError",
+    "CoreTaskControlV2",
+    "RUN_OPERATION_IDS",
+    "TASK_OPERATION_IDS_V2",
+]

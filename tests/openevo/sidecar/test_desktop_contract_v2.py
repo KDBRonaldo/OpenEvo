@@ -442,7 +442,7 @@ def test_desktop_v2_snapshots_are_exact_and_frozen() -> None:
     assert hashlib.sha256(openapi).hexdigest() == DESKTOP_OPENAPI_SHA256
     assert hashlib.sha256(events).hexdigest() == DESKTOP_EVENTS_SCHEMA_SHA256
     assert DESKTOP_OPENAPI_SHA256 == (
-        "f9b59dc9fe2274453d5961a1e3e43a963e860041a7af7e43671c64e5b0deb5fd"
+        "124ead258cb861f47052c57d90732e44fd5844159b49934d03eb887e9705bb64"
     )
     assert DESKTOP_EVENTS_SCHEMA_SHA256 == (
         "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"

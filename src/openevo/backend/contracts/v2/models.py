@@ -245,7 +245,25 @@ class TaskAdmissionRefV2(ContractModel):
             raise ValueError("workspace snapshot belongs to another project")
         if self.registry_sha256 != self.predecessor_project_head.registry_sha256:
             raise ValueError("admission registry digest differs from the predecessor head")
+        if self.admission_sha256 != task_admission_sha256_for(self):
+            raise ValueError("task admission digest does not match its immutable pins")
         return self
+
+
+def task_admission_sha256_for(admission: TaskAdmissionRefV2) -> str:
+    """Hash all immutable admission pins except the self-referential digest field."""
+
+    if type(admission) is not TaskAdmissionRefV2:
+        raise TypeError("task admission digest requires TaskAdmissionRefV2")
+    payload = admission.model_dump(mode="json", exclude={"admission_sha256"})
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 class AttemptRefV2(ContractModel):
@@ -510,7 +528,7 @@ class TaskV2(ContractModel):
     task_id: OpaqueId
     project_id: OpaqueId
     admission: TaskAdmissionRefV2
-    attempts: list[AttemptRefV2] = Field(max_length=100)
+    attempts: list[AttemptRefV2] = Field(min_length=1, max_length=100)
     authoritative_attempt_id: OpaqueId | None
     successor_transition: SuccessorTransitionRefV2 | None
     state: TaskStateV2
@@ -533,6 +551,8 @@ class TaskV2(ContractModel):
                 or attempt.project_id != self.project_id
                 or attempt.task_admission_id != self.admission.task_admission_id
                 or attempt.admission_sha256 != self.admission.admission_sha256
+                or attempt.predecessor_project_head_id
+                != self.admission.predecessor_project_head.project_head_id
             ):
                 raise ValueError("attempt does not belong to this task admission")
             if attempt.ordinal != expected_ordinal:
@@ -861,4 +881,5 @@ __all__ = [
     "TimelinePageV2",
     "VersionResponseV2",
     "WorkspaceSnapshotRefV2",
+    "task_admission_sha256_for",
 ]

@@ -6,10 +6,13 @@ import base64
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from enum import StrEnum
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sqlite3
 import stat
@@ -19,6 +22,7 @@ from typing import Iterator, TypeVar
 from pydantic import BaseModel
 
 from openevo.backend.contracts.v1 import models as m
+from openevo.backend.contracts.v2 import models as m2
 
 
 _T = TypeVar("_T", bound=BaseModel)
@@ -114,6 +118,62 @@ _MAX_ADMISSIONS_PER_RUN = 4_096
 _ACTIVE_STATUSES = frozenset({m.RunStatus.PREPARING, m.RunStatus.RUNNING, m.RunStatus.CANCELLING})
 _IN_FLIGHT_STATUSES = _ACTIVE_STATUSES | {m.RunStatus.QUEUED}
 
+_V2_SCHEMA = """
+CREATE TABLE IF NOT EXISTS metadata (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2)
+) STRICT;
+CREATE TABLE IF NOT EXISTS project_admission_authorities (
+    project_id TEXT PRIMARY KEY,
+    authority_json BLOB NOT NULL,
+    resource_version INTEGER NOT NULL CHECK (resource_version >= 1)
+) STRICT;
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    task_admission_id TEXT NOT NULL UNIQUE,
+    admission_sha256 TEXT NOT NULL CHECK (length(admission_sha256) = 64),
+    idempotency_key TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_json BLOB NOT NULL,
+    task_json BLOB NOT NULL,
+    closed INTEGER NOT NULL DEFAULT 0 CHECK (closed IN (0, 1)),
+    resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+    UNIQUE(project_id, idempotency_key)
+) STRICT;
+CREATE TABLE IF NOT EXISTS task_admissions (
+    task_admission_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL UNIQUE,
+    admission_sha256 TEXT NOT NULL UNIQUE CHECK (length(admission_sha256) = 64),
+    admission_json BLOB NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS attempts (
+    attempt_id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 100),
+    attempt_json BLOB NOT NULL,
+    UNIQUE(task_id, ordinal),
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS attempt_append_requests (
+    task_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_json BLOB NOT NULL,
+    attempt_id TEXT NOT NULL UNIQUE,
+    PRIMARY KEY(task_id, idempotency_key),
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id) ON DELETE RESTRICT
+) STRICT;
+CREATE UNIQUE INDEX IF NOT EXISTS one_open_task_per_project
+ON tasks(project_id)
+WHERE closed = 0;
+"""
+_MAX_V2_TASKS = 10_000
+_MAX_V2_PROJECTS = 10_000
+_V2_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
+
 
 class ScienceRunStoreError(RuntimeError):
     pass
@@ -137,6 +197,92 @@ class ScienceProjectInFlight(ScienceRunConflict):
 
 class ScienceRunPreconditionFailed(ScienceRunStoreError):
     pass
+
+
+class ScienceTaskStoreV2Error(RuntimeError):
+    pass
+
+
+class ScienceTaskNotFoundV2(ScienceTaskStoreV2Error):
+    pass
+
+
+class ScienceAttemptNotFoundV2(ScienceTaskNotFoundV2):
+    pass
+
+
+class ScienceTaskConflictV2(ScienceTaskStoreV2Error):
+    pass
+
+
+class ScienceTaskIdempotencyConflictV2(ScienceTaskConflictV2):
+    pass
+
+
+class ScienceTaskProjectInFlightV2(ScienceTaskConflictV2):
+    pass
+
+
+class ScienceTaskNotReadyV2(ScienceTaskConflictV2):
+    def __init__(self, blockers: tuple[ScienceProjectReadinessBlockerV2, ...]) -> None:
+        super().__init__("project is not ready for task admission")
+        self.blockers = blockers
+
+
+class ScienceTaskStaleSubmissionV2(ScienceTaskConflictV2):
+    pass
+
+
+class ScienceTaskPreconditionFailedV2(ScienceTaskConflictV2):
+    pass
+
+
+class ScienceTaskTerminalV2(ScienceTaskConflictV2):
+    pass
+
+
+class ScienceProjectReadinessBlockerV2(StrEnum):
+    SUCCESSOR_TRANSITION = "successor_transition"
+    SETTINGS_TRANSITION = "settings_transition"
+    CONTEXT_REBIND = "context_rebind"
+    WORKSPACE_PUBLICATION = "workspace_publication"
+
+
+@dataclass(frozen=True, slots=True)
+class ScienceProjectAdmissionAuthorityV2:
+    """Exact same-database authority checked before creating a v2 Task."""
+
+    project_id: str
+    active_project_head: m2.ProjectHeadRefV2
+    project_config_sha256: str
+    workspace_snapshot: m2.WorkspaceSnapshotRefV2
+    normalized_evolution_intent_sha256: str
+    blockers: tuple[ScienceProjectReadinessBlockerV2, ...] = ()
+
+    def __post_init__(self) -> None:
+        if _V2_ID_RE.fullmatch(self.project_id) is None:
+            raise ValueError("v2 project admission authority ID is invalid")
+        for value, label in (
+            (self.project_config_sha256, "project config"),
+            (self.normalized_evolution_intent_sha256, "evolution intent"),
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                raise ValueError(f"v2 {label} digest is invalid")
+        head = m2.ProjectHeadRefV2.model_validate(
+            self.active_project_head.model_dump(mode="python")
+        )
+        workspace = m2.WorkspaceSnapshotRefV2.model_validate(
+            self.workspace_snapshot.model_dump(mode="python")
+        )
+        if head.project_id != self.project_id or workspace.project_id != self.project_id:
+            raise ValueError("v2 project admission authority crosses project identities")
+        if (
+            not isinstance(self.blockers, tuple)
+            or any(type(item) is not ScienceProjectReadinessBlockerV2 for item in self.blockers)
+            or tuple(sorted(self.blockers, key=str)) != self.blockers
+            or len(set(self.blockers)) != len(self.blockers)
+        ):
+            raise ValueError("v2 project readiness blockers must be sorted and unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1140,6 +1286,853 @@ class ScienceRunStore:
         return connection
 
 
+class ScienceTaskStoreV2:
+    """Separate durable owner for immutable v2 Task/admission/Attempt state."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+        self._lock = threading.RLock()
+        self._closed = False
+        self._prepare_root()
+        self.database = self.root / "science-tasks-v2.sqlite3"
+        if self.database.exists() and self.database.is_symlink():
+            raise ScienceTaskStoreV2Error("v2 science task database must not be a symlink")
+        with self._reader() as connection:
+            connection.executescript(_V2_SCHEMA)
+            connection.execute(
+                "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 2)"
+            )
+            connection.commit()
+        os.chmod(self.database, 0o600)
+        self._verify_database()
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def publish_project_admission_authority(
+        self,
+        authority: ScienceProjectAdmissionAuthorityV2,
+        *,
+        expected_project_head_id: str | None = None,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        authority = _validate_v2_project_authority(authority)
+        payload = _v2_authority_bytes(authority)
+        with self._lock, self._transaction() as connection:
+            row = connection.execute(
+                "SELECT authority_json, resource_version FROM project_admission_authorities "
+                "WHERE project_id = ?",
+                (authority.project_id,),
+            ).fetchone()
+            if row is None:
+                if expected_project_head_id is not None:
+                    raise ScienceTaskPreconditionFailedV2(
+                        "v2 project admission authority does not exist"
+                    )
+                count = int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM project_admission_authorities"
+                    ).fetchone()[0]
+                )
+                if count >= _MAX_V2_PROJECTS:
+                    raise ScienceTaskConflictV2(
+                        "v2 project admission authority capacity is exhausted"
+                    )
+                connection.execute(
+                    "INSERT INTO project_admission_authorities("
+                    "project_id, authority_json, resource_version) VALUES (?, ?, 1)",
+                    (authority.project_id, payload),
+                )
+                return authority
+            current = _v2_authority_from_bytes(bytes(row["authority_json"]))
+            if payload == bytes(row["authority_json"]):
+                return current
+            if (
+                expected_project_head_id is None
+                or current.active_project_head.project_head_id
+                != expected_project_head_id
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 project admission authority changed"
+                )
+            open_task = connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
+                (authority.project_id,),
+            ).fetchone()
+            if open_task is not None:
+                raise ScienceTaskProjectInFlightV2(
+                    "project has an immutable v2 Task in flight"
+                )
+            connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (payload, authority.project_id),
+            )
+            return authority
+
+    def submit_task(
+        self,
+        *,
+        request: m2.TaskSubmitRequestV2,
+        idempotency_key: str,
+        now: datetime,
+    ) -> tuple[m2.TaskV2, bool]:
+        request = _validate_v2_model(m2.TaskSubmitRequestV2, request)
+        idempotency_key = _v2_idempotency_key(idempotency_key)
+        request_json = _v2_model_bytes(request)
+        request_sha256 = hashlib.sha256(request_json).hexdigest()
+        with self._lock, self._transaction() as connection:
+            existing = connection.execute(
+                "SELECT task_id, request_sha256, request_json FROM tasks "
+                "WHERE project_id = ? AND idempotency_key = ?",
+                (request.project_id, idempotency_key),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["request_sha256"] != request_sha256
+                    or bytes(existing["request_json"]) != request_json
+                ):
+                    raise ScienceTaskIdempotencyConflictV2(
+                        "v2 Task idempotency key was reused"
+                    )
+                return _load_v2_task_closure(connection, str(existing["task_id"])), True
+
+            authority_row = connection.execute(
+                "SELECT authority_json FROM project_admission_authorities "
+                "WHERE project_id = ?",
+                (request.project_id,),
+            ).fetchone()
+            if authority_row is None:
+                raise ScienceTaskNotReadyV2(
+                    (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                )
+            authority = _v2_authority_from_bytes(bytes(authority_row["authority_json"]))
+            if authority.blockers:
+                raise ScienceTaskNotReadyV2(authority.blockers)
+            _validate_v2_submission_authority(request, authority)
+            if connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
+                (request.project_id,),
+            ).fetchone() is not None:
+                raise ScienceTaskProjectInFlightV2(
+                    "project has an immutable v2 Task in flight"
+                )
+            if int(connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]) >= (
+                _MAX_V2_TASKS
+            ):
+                raise ScienceTaskConflictV2("v2 Task capacity is exhausted")
+
+            task = _new_v2_task(request=request, authority=authority, now=now)
+            admission = task.admission
+            first_attempt = task.attempts[0]
+            connection.execute(
+                "INSERT INTO tasks(task_id, project_id, task_admission_id, "
+                "admission_sha256, idempotency_key, request_sha256, request_json, "
+                "task_json, closed, resource_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, 1)",
+                (
+                    task.task_id,
+                    task.project_id,
+                    admission.task_admission_id,
+                    admission.admission_sha256,
+                    idempotency_key,
+                    request_sha256,
+                    request_json,
+                    _v2_model_bytes(task),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO task_admissions(task_admission_id, task_id, admission_sha256, "
+                "admission_json) VALUES (?, ?, ?, ?)",
+                (
+                    admission.task_admission_id,
+                    task.task_id,
+                    admission.admission_sha256,
+                    _v2_model_bytes(admission),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO attempts(attempt_id, task_id, ordinal, attempt_json) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    first_attempt.attempt_id,
+                    task.task_id,
+                    first_attempt.ordinal,
+                    _v2_model_bytes(first_attempt),
+                ),
+            )
+            return _load_v2_task_closure(connection, task.task_id), False
+
+    def append_attempt(
+        self,
+        *,
+        task_id: str,
+        request: m2.AttemptAppendRequestV2,
+        idempotency_key: str,
+        now: datetime,
+    ) -> tuple[m2.AttemptRefV2, bool]:
+        task_id = _v2_resource_id(task_id, label="task")
+        request = _validate_v2_model(m2.AttemptAppendRequestV2, request)
+        idempotency_key = _v2_idempotency_key(idempotency_key)
+        request_json = _v2_model_bytes(request)
+        request_sha256 = hashlib.sha256(request_json).hexdigest()
+        with self._lock, self._transaction() as connection:
+            replay = connection.execute(
+                "SELECT request_sha256, request_json, attempt_id "
+                "FROM attempt_append_requests WHERE task_id = ? AND idempotency_key = ?",
+                (task_id, idempotency_key),
+            ).fetchone()
+            if replay is not None:
+                if (
+                    replay["request_sha256"] != request_sha256
+                    or bytes(replay["request_json"]) != request_json
+                ):
+                    raise ScienceTaskIdempotencyConflictV2(
+                        "v2 Attempt idempotency key was reused"
+                    )
+                return _load_v2_attempt(
+                    connection,
+                    task_id=task_id,
+                    attempt_id=str(replay["attempt_id"]),
+                ), True
+
+            task = _load_v2_task_closure(connection, task_id)
+            if (
+                task.state not in {"admitted", "failed", "cancelled"}
+                or task.authoritative_attempt_id is not None
+                or task.successor_transition is not None
+            ):
+                raise ScienceTaskTerminalV2("v2 Task cannot accept another Attempt")
+            if (
+                request.task_admission_id != task.admission.task_admission_id
+                or request.admission_sha256 != task.admission.admission_sha256
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 Attempt request does not bind the immutable admission"
+                )
+            prior = task.attempts[-1]
+            if (
+                request.expected_previous_attempt_id != prior.attempt_id
+                or request.expected_next_ordinal != prior.ordinal + 1
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 Attempt append precondition changed"
+                )
+            attempt = m2.AttemptRefV2(
+                attempt_id=f"attempt-{secrets.token_hex(16)}",
+                ordinal=request.expected_next_ordinal,
+                task_id=task.task_id,
+                task_admission_id=task.admission.task_admission_id,
+                admission_sha256=task.admission.admission_sha256,
+                project_id=task.project_id,
+                predecessor_project_head_id=(
+                    task.admission.predecessor_project_head.project_head_id
+                ),
+                created_at=_v2_timestamp(now),
+            )
+            updated = _replace_v2_task(
+                task,
+                attempts=[*task.attempts, attempt],
+                updated_at=_v2_timestamp(now),
+            )
+            connection.execute(
+                "INSERT INTO attempts(attempt_id, task_id, ordinal, attempt_json) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    attempt.attempt_id,
+                    task.task_id,
+                    attempt.ordinal,
+                    _v2_model_bytes(attempt),
+                ),
+            )
+            connection.execute(
+                "INSERT INTO attempt_append_requests(task_id, idempotency_key, "
+                "request_sha256, request_json, attempt_id) VALUES (?, ?, ?, ?, ?)",
+                (
+                    task.task_id,
+                    idempotency_key,
+                    request_sha256,
+                    request_json,
+                    attempt.attempt_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(updated), task.task_id),
+            )
+            recovered = _load_v2_task_closure(connection, task.task_id)
+            if recovered.attempts[-1] != attempt:
+                raise ScienceTaskStoreV2Error("v2 Attempt append readback is inconsistent")
+            return attempt, False
+
+    def close_task(
+        self,
+        task_id: str,
+        request: m2.TaskActionRequestV2,
+        *,
+        now: datetime,
+    ) -> m2.TaskV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        request = _validate_v2_model(m2.TaskActionRequestV2, request)
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            if (
+                request.task_admission_id != task.admission.task_admission_id
+                or request.admission_sha256 != task.admission.admission_sha256
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 Task close does not bind the immutable admission"
+                )
+            if task.state == "closed":
+                return task
+            if task.authoritative_attempt_id is not None or task.successor_transition is not None:
+                raise ScienceTaskTerminalV2(
+                    "authoritative v2 Task ownership cannot be closed or rewritten"
+                )
+            updated = _replace_v2_task(
+                task,
+                state="closed",
+                updated_at=_v2_timestamp(now),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, closed = 1, "
+                "resource_version = resource_version + 1 WHERE task_id = ?",
+                (_v2_model_bytes(updated), task.task_id),
+            )
+            return _load_v2_task_closure(connection, task.task_id)
+
+    def get_task(self, task_id: str) -> m2.TaskV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        with self._lock, self._reader() as connection:
+            return _load_v2_task_closure(connection, task_id)
+
+    def list_tasks(self, *, project_id: str | None = None) -> list[m2.TaskV2]:
+        if project_id is not None:
+            project_id = _v2_resource_id(project_id, label="project")
+        with self._lock, self._reader() as connection:
+            if project_id is None:
+                rows = connection.execute(
+                    "SELECT task_id FROM tasks ORDER BY task_id LIMIT ?",
+                    (_MAX_V2_TASKS + 1,),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT task_id FROM tasks WHERE project_id = ? "
+                    "ORDER BY task_id LIMIT ?",
+                    (project_id, _MAX_V2_TASKS + 1),
+                ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 Task inventory exceeds its bound")
+            return [
+                _load_v2_task_closure(connection, str(row["task_id"])) for row in rows
+            ]
+
+    def get_admission(self, task_id: str) -> m2.TaskAdmissionRefV2:
+        return self.get_task(task_id).admission
+
+    def list_attempts(self, task_id: str) -> list[m2.AttemptRefV2]:
+        return list(self.get_task(task_id).attempts)
+
+    def get_attempt(self, task_id: str, attempt_id: str) -> m2.AttemptRefV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        with self._lock, self._reader() as connection:
+            _load_v2_task_closure(connection, task_id)
+            return _load_v2_attempt(
+                connection,
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
+
+    def ownership_counts(self) -> tuple[int, int, int]:
+        with self._lock, self._reader() as connection:
+            return tuple(
+                int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for table in ("tasks", "task_admissions", "attempts")
+            )  # type: ignore[return-value]
+
+    def _prepare_root(self) -> None:
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        metadata = self.root.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise ScienceTaskStoreV2Error(
+                "v2 science task root must be a private owned directory"
+            )
+
+    def _verify_database(self) -> None:
+        metadata = self.database.stat(follow_symlinks=False)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise ScienceTaskStoreV2Error(
+                "v2 science task database is not a private regular file"
+            )
+        with self._reader() as connection:
+            row = connection.execute(
+                "SELECT schema_version FROM metadata WHERE singleton = 1"
+            ).fetchone()
+            if row is None or int(row["schema_version"]) != 2:
+                raise ScienceTaskStoreV2Error("v2 science task schema identity is invalid")
+            authorities = connection.execute(
+                "SELECT project_id, authority_json FROM project_admission_authorities "
+                "ORDER BY project_id LIMIT ?",
+                (_MAX_V2_PROJECTS + 1,),
+            ).fetchall()
+            if len(authorities) > _MAX_V2_PROJECTS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project admission authority inventory exceeds its bound"
+                )
+            for authority_row in authorities:
+                authority = _v2_authority_from_bytes(
+                    bytes(authority_row["authority_json"])
+                )
+                if authority.project_id != authority_row["project_id"]:
+                    raise ScienceTaskStoreV2Error(
+                        "v2 project admission authority row is inconsistent"
+                    )
+            tasks = connection.execute(
+                "SELECT task_id FROM tasks ORDER BY task_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(tasks) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 Task inventory exceeds its bound")
+            for task_row in tasks:
+                _load_v2_task_closure(connection, str(task_row["task_id"]))
+            append_rows = connection.execute(
+                "SELECT task_id, idempotency_key, request_sha256, request_json, "
+                "attempt_id "
+                "FROM attempt_append_requests"
+            ).fetchall()
+            if len(append_rows) > _MAX_V2_TASKS * 99:
+                raise ScienceTaskStoreV2Error(
+                    "v2 Attempt append request inventory exceeds its bound"
+                )
+            for append_row in append_rows:
+                request_json = bytes(append_row["request_json"])
+                request = _v2_model_from_bytes(
+                    m2.AttemptAppendRequestV2,
+                    request_json,
+                )
+                if (
+                    hashlib.sha256(request_json).hexdigest()
+                    != append_row["request_sha256"]
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "v2 Attempt append request digest is inconsistent"
+                    )
+                attempt = _load_v2_attempt(
+                    connection,
+                    task_id=str(append_row["task_id"]),
+                    attempt_id=str(append_row["attempt_id"]),
+                )
+                task = _load_v2_task_closure(connection, attempt.task_id)
+                if (
+                    _v2_idempotency_key(str(append_row["idempotency_key"]))
+                    != append_row["idempotency_key"]
+                    or request.task_admission_id != attempt.task_admission_id
+                    or request.admission_sha256 != attempt.admission_sha256
+                    or request.expected_next_ordinal != attempt.ordinal
+                    or attempt.ordinal < 2
+                    or request.expected_previous_attempt_id
+                    != task.attempts[attempt.ordinal - 2].attempt_id
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "v2 Attempt append request authority is inconsistent"
+                    )
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield connection
+            connection.execute("COMMIT")
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _reader(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    def _connect(self) -> sqlite3.Connection:
+        if self._closed:
+            raise ScienceTaskStoreV2Error("v2 science task store is closed")
+        connection = sqlite3.connect(self.database, timeout=10.0)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        return connection
+
+
+def _validate_v2_project_authority(
+    authority: ScienceProjectAdmissionAuthorityV2,
+) -> ScienceProjectAdmissionAuthorityV2:
+    if type(authority) is not ScienceProjectAdmissionAuthorityV2:
+        raise TypeError("v2 project admission authority has the wrong type")
+    return ScienceProjectAdmissionAuthorityV2(
+        project_id=authority.project_id,
+        active_project_head=m2.ProjectHeadRefV2.model_validate(
+            authority.active_project_head.model_dump(mode="python")
+        ),
+        project_config_sha256=authority.project_config_sha256,
+        workspace_snapshot=m2.WorkspaceSnapshotRefV2.model_validate(
+            authority.workspace_snapshot.model_dump(mode="python")
+        ),
+        normalized_evolution_intent_sha256=(
+            authority.normalized_evolution_intent_sha256
+        ),
+        blockers=authority.blockers,
+    )
+
+
+def _v2_authority_bytes(authority: ScienceProjectAdmissionAuthorityV2) -> bytes:
+    return _v2_json_bytes(
+        {
+            "active_project_head": authority.active_project_head.model_dump(mode="json"),
+            "blockers": [blocker.value for blocker in authority.blockers],
+            "normalized_evolution_intent_sha256": (
+                authority.normalized_evolution_intent_sha256
+            ),
+            "project_config_sha256": authority.project_config_sha256,
+            "project_id": authority.project_id,
+            "workspace_snapshot": authority.workspace_snapshot.model_dump(mode="json"),
+        }
+    )
+
+
+def _v2_authority_from_bytes(payload: bytes | str) -> ScienceProjectAdmissionAuthorityV2:
+    raw = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    if len(raw) > _MAX_DOCUMENT_BYTES:
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 project admission authority exceeds its byte bound"
+        )
+    try:
+        value = json.loads(raw)
+        if not isinstance(value, dict) or set(value) != {
+            "active_project_head",
+            "blockers",
+            "normalized_evolution_intent_sha256",
+            "project_config_sha256",
+            "project_id",
+            "workspace_snapshot",
+        }:
+            raise ValueError("authority is not a closed object")
+        blockers = value["blockers"]
+        if not isinstance(blockers, list):
+            raise ValueError("authority blockers are invalid")
+        authority = ScienceProjectAdmissionAuthorityV2(
+            project_id=value["project_id"],
+            active_project_head=m2.ProjectHeadRefV2.model_validate(
+                value["active_project_head"]
+            ),
+            project_config_sha256=value["project_config_sha256"],
+            workspace_snapshot=m2.WorkspaceSnapshotRefV2.model_validate(
+                value["workspace_snapshot"]
+            ),
+            normalized_evolution_intent_sha256=value[
+                "normalized_evolution_intent_sha256"
+            ],
+            blockers=tuple(ScienceProjectReadinessBlockerV2(item) for item in blockers),
+        )
+    except Exception as exc:
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 project admission authority is invalid"
+        ) from exc
+    if _v2_authority_bytes(authority) != raw:
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 project admission authority is not canonical"
+        )
+    return authority
+
+
+def _validate_v2_model(model_type: type[_T], model: _T) -> _T:
+    if type(model) is not model_type:
+        raise TypeError(f"v2 {model_type.__name__} has the wrong type")
+    return model_type.model_validate(model.model_dump(mode="python"))
+
+
+def _v2_model_bytes(model: BaseModel) -> bytes:
+    return _v2_json_bytes(model.model_dump(mode="json"))
+
+
+def _v2_model_from_bytes(model_type: type[_T], payload: bytes | str) -> _T:
+    raw = payload.encode("utf-8") if isinstance(payload, str) else bytes(payload)
+    if len(raw) > _MAX_DOCUMENT_BYTES:
+        raise ScienceTaskStoreV2Error("persisted v2 document exceeds its byte bound")
+    try:
+        model = model_type.model_validate_json(raw)
+    except Exception as exc:
+        raise ScienceTaskStoreV2Error("persisted v2 document is invalid") from exc
+    if _v2_model_bytes(model) != raw:
+        raise ScienceTaskStoreV2Error("persisted v2 document is not canonical")
+    return model
+
+
+def _v2_json_bytes(value: object) -> bytes:
+    try:
+        payload = json.dumps(
+            value,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("v2 document is not canonical JSON data") from exc
+    if len(payload) > _MAX_DOCUMENT_BYTES:
+        raise ValueError("v2 document exceeds its byte bound")
+    return payload
+
+
+def _v2_idempotency_key(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > 256
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+    ):
+        raise ValueError("v2 idempotency key is invalid")
+    return value
+
+
+def _v2_resource_id(value: str, *, label: str) -> str:
+    if not isinstance(value, str) or _V2_ID_RE.fullmatch(value) is None:
+        raise ValueError(f"v2 {label} ID is invalid")
+    return value
+
+
+def _validate_v2_submission_authority(
+    request: m2.TaskSubmitRequestV2,
+    authority: ScienceProjectAdmissionAuthorityV2,
+) -> None:
+    if (
+        request.project_id != authority.project_id
+        or request.expected_project_head_id
+        != authority.active_project_head.project_head_id
+        or request.expected_project_head_manifest_sha256
+        != authority.active_project_head.manifest_sha256
+        or request.project_config_sha256 != authority.project_config_sha256
+        or request.workspace_snapshot != authority.workspace_snapshot
+        or request.normalized_evolution_intent_sha256
+        != authority.normalized_evolution_intent_sha256
+        or request.expected_registry_sha256
+        != authority.active_project_head.registry_sha256
+    ):
+        raise ScienceTaskStaleSubmissionV2(
+            "v2 Task submission no longer matches project admission authority"
+        )
+
+
+def _new_v2_task(
+    *,
+    request: m2.TaskSubmitRequestV2,
+    authority: ScienceProjectAdmissionAuthorityV2,
+    now: datetime,
+) -> m2.TaskV2:
+    timestamp = _v2_timestamp(now)
+    task_id = f"task-{secrets.token_hex(16)}"
+    task_admission_id = f"task-admission-{secrets.token_hex(16)}"
+    provisional_admission = m2.TaskAdmissionRefV2.model_construct(
+        schema_version="2",
+        task_admission_id=task_admission_id,
+        task_id=task_id,
+        project_id=request.project_id,
+        predecessor_project_head=authority.active_project_head,
+        workspace_snapshot=authority.workspace_snapshot,
+        project_config_sha256=request.project_config_sha256,
+        task_envelope_sha256=request.task_envelope_sha256,
+        normalized_evolution_intent_sha256=(
+            request.normalized_evolution_intent_sha256
+        ),
+        registry_sha256=request.expected_registry_sha256,
+        admission_sha256="0" * 64,
+        admitted_at=timestamp,
+    )
+    admission = m2.TaskAdmissionRefV2.model_validate(
+        {
+            **provisional_admission.model_dump(mode="python"),
+            "admission_sha256": m2.task_admission_sha256_for(provisional_admission),
+        }
+    )
+    first_attempt = m2.AttemptRefV2(
+        attempt_id=f"attempt-{secrets.token_hex(16)}",
+        ordinal=1,
+        task_id=task_id,
+        task_admission_id=task_admission_id,
+        admission_sha256=admission.admission_sha256,
+        project_id=request.project_id,
+        predecessor_project_head_id=authority.active_project_head.project_head_id,
+        created_at=timestamp,
+    )
+    return _replace_v2_task(
+        m2.TaskV2.model_construct(
+            schema_version="2",
+            task_id=task_id,
+            project_id=request.project_id,
+            admission=admission,
+            attempts=[first_attempt],
+            authoritative_attempt_id=None,
+            successor_transition=None,
+            state="admitted",
+            created_at=timestamp,
+            updated_at=timestamp,
+            etag=f'"{"0" * 64}"',
+        )
+    )
+
+
+def _v2_timestamp(value: datetime) -> str:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("v2 clock must return a timezone-aware datetime")
+    normalized = value.astimezone(timezone.utc)
+    return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _replace_v2_task(task: m2.TaskV2, **changes: object) -> m2.TaskV2:
+    data: dict[str, object] = {
+        "schema_version": task.schema_version,
+        "task_id": task.task_id,
+        "project_id": task.project_id,
+        "admission": task.admission,
+        "attempts": list(task.attempts),
+        "authoritative_attempt_id": task.authoritative_attempt_id,
+        "successor_transition": task.successor_transition,
+        "state": task.state,
+        "created_at": task.created_at,
+        "updated_at": task.updated_at,
+    }
+    data.update(changes)
+    provisional = m2.TaskV2.model_construct(
+        **data,
+        etag=f'"{"0" * 64}"',
+    )
+    etag_payload = _v2_json_bytes(
+        provisional.model_dump(mode="json", exclude={"etag"})
+    )
+    data["etag"] = f'"{hashlib.sha256(etag_payload).hexdigest()}"'
+    return m2.TaskV2.model_validate(data)
+
+
+def _load_v2_task_closure(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> m2.TaskV2:
+    row = connection.execute(
+        "SELECT project_id, task_admission_id, admission_sha256, idempotency_key, "
+        "request_sha256, request_json, task_json, closed FROM tasks WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        raise ScienceTaskNotFoundV2("v2 Task was not found")
+    request_json = bytes(row["request_json"])
+    request = _v2_model_from_bytes(m2.TaskSubmitRequestV2, request_json)
+    task = _v2_model_from_bytes(m2.TaskV2, bytes(row["task_json"]))
+    if (
+        task.task_id != task_id
+        or task.project_id != row["project_id"]
+        or request.project_id != task.project_id
+        or row["task_admission_id"] != task.admission.task_admission_id
+        or row["admission_sha256"] != task.admission.admission_sha256
+        or hashlib.sha256(request_json).hexdigest() != row["request_sha256"]
+        or not isinstance(row["idempotency_key"], str)
+        or _v2_idempotency_key(str(row["idempotency_key"])) != row["idempotency_key"]
+        or bool(row["closed"]) != (task.state == "closed")
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 Task row is inconsistent")
+    expected = _replace_v2_task(task)
+    if expected.etag != task.etag:
+        raise ScienceTaskStoreV2Error("persisted v2 Task ETag is inconsistent")
+
+    admission_row = connection.execute(
+        "SELECT task_id, admission_sha256, admission_json FROM task_admissions "
+        "WHERE task_admission_id = ?",
+        (task.admission.task_admission_id,),
+    ).fetchone()
+    if admission_row is None:
+        raise ScienceTaskStoreV2Error("persisted v2 Task admission is missing")
+    admission = _v2_model_from_bytes(
+        m2.TaskAdmissionRefV2,
+        bytes(admission_row["admission_json"]),
+    )
+    if (
+        admission != task.admission
+        or admission_row["task_id"] != task.task_id
+        or admission_row["admission_sha256"] != admission.admission_sha256
+        or m2.task_admission_sha256_for(admission) != admission.admission_sha256
+        or request.expected_project_head_id
+        != admission.predecessor_project_head.project_head_id
+        or request.expected_project_head_manifest_sha256
+        != admission.predecessor_project_head.manifest_sha256
+        or request.project_config_sha256 != admission.project_config_sha256
+        or request.task_envelope_sha256 != admission.task_envelope_sha256
+        or request.workspace_snapshot != admission.workspace_snapshot
+        or request.normalized_evolution_intent_sha256
+        != admission.normalized_evolution_intent_sha256
+        or request.expected_registry_sha256 != admission.registry_sha256
+    ):
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 Task admission closure is inconsistent"
+        )
+
+    attempt_rows = connection.execute(
+        "SELECT attempt_id, ordinal, attempt_json FROM attempts WHERE task_id = ? "
+        "ORDER BY ordinal LIMIT 101",
+        (task.task_id,),
+    ).fetchall()
+    if len(attempt_rows) > 100:
+        raise ScienceTaskStoreV2Error("persisted v2 Attempt inventory exceeds its bound")
+    attempts = [
+        _v2_model_from_bytes(m2.AttemptRefV2, bytes(item["attempt_json"]))
+        for item in attempt_rows
+    ]
+    if attempts != task.attempts or any(
+        item["attempt_id"] != attempt.attempt_id or item["ordinal"] != attempt.ordinal
+        for item, attempt in zip(attempt_rows, attempts, strict=True)
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 Attempt closure is inconsistent")
+    return task
+
+
+def _load_v2_attempt(
+    connection: sqlite3.Connection,
+    *,
+    task_id: str,
+    attempt_id: str,
+) -> m2.AttemptRefV2:
+    row = connection.execute(
+        "SELECT ordinal, attempt_json FROM attempts "
+        "WHERE task_id = ? AND attempt_id = ?",
+        (task_id, attempt_id),
+    ).fetchone()
+    if row is None:
+        raise ScienceAttemptNotFoundV2("v2 Attempt was not found")
+    attempt = _v2_model_from_bytes(m2.AttemptRefV2, bytes(row["attempt_json"]))
+    if (
+        attempt.task_id != task_id
+        or attempt.attempt_id != attempt_id
+        or attempt.ordinal != row["ordinal"]
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 Attempt row is inconsistent")
+    return attempt
+
+
 def page_items(
     items: Sequence[_T],
     *,
@@ -1393,6 +2386,9 @@ __all__ = [
     "ProjectInFlightCoordinator",
     "ProjectInFlightOwner",
     "ScienceProjectInFlight",
+    "ScienceProjectAdmissionAuthorityV2",
+    "ScienceProjectReadinessBlockerV2",
+    "ScienceAttemptNotFoundV2",
     "ScienceRunConflict",
     "ScienceRunCreateAdmission",
     "ScienceRunIdempotencyConflict",
@@ -1400,5 +2396,15 @@ __all__ = [
     "ScienceRunPreconditionFailed",
     "ScienceRunStore",
     "ScienceRunStoreError",
+    "ScienceTaskConflictV2",
+    "ScienceTaskIdempotencyConflictV2",
+    "ScienceTaskNotFoundV2",
+    "ScienceTaskNotReadyV2",
+    "ScienceTaskPreconditionFailedV2",
+    "ScienceTaskProjectInFlightV2",
+    "ScienceTaskStaleSubmissionV2",
+    "ScienceTaskStoreV2",
+    "ScienceTaskStoreV2Error",
+    "ScienceTaskTerminalV2",
     "page_items",
 ]
