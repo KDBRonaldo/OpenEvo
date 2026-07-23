@@ -28,6 +28,7 @@ from desktop.sidecar.contracts.v2.models import (
     DesktopServiceV2,
     DesktopTaskV2,
     DesktopTransitionV2,
+    DesktopVersionV2,
     EffectiveExecutionSnapshotRefV2,
     EvolutionRevisionRefV2,
     LegacyExplicitProfileV2,
@@ -393,6 +394,11 @@ def test_desktop_v2_route_inventory_is_exact_and_authenticated() -> None:
     assert operations == EXPECTED_OPERATIONS
     assert "/desktop/v1/state" not in schema["paths"]
     assert schema["x-openevo-contract-only"] is True
+    assert schema["paths"]["/version"]["get"]["x-openevo-discovery-only"] is True
+    assert (
+        schema["paths"]["/version"]["get"]["x-openevo-mutation-compatible"]
+        is False
+    )
     assert schema["components"]["securitySchemes"]["DesktopSessionV2"]["name"] == (
         "X-OpenEvo-Desktop-Session"
     )
@@ -436,7 +442,7 @@ def test_desktop_v2_snapshots_are_exact_and_frozen() -> None:
     assert hashlib.sha256(openapi).hexdigest() == DESKTOP_OPENAPI_SHA256
     assert hashlib.sha256(events).hexdigest() == DESKTOP_EVENTS_SCHEMA_SHA256
     assert DESKTOP_OPENAPI_SHA256 == (
-        "4242364f6ffc608b7d0ddb6e866c66f286ca6e2eddbf63480e45698d8e117910"
+        "f9b59dc9fe2274453d5961a1e3e43a963e860041a7af7e43671c64e5b0deb5fd"
     )
     assert DESKTOP_EVENTS_SCHEMA_SHA256 == (
         "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
@@ -462,3 +468,69 @@ def test_local_v2_models_are_closed_strict_and_immutable(
     with pytest.raises(ValidationError):
         setattr(parsed, next(iter(model.model_fields)), "changed")
     assert model.model_json_schema(mode="validation")["additionalProperties"] is False
+
+
+def _feature_set_sha256(features: list[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(features, ensure_ascii=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _desktop_v2_discovery() -> dict[str, Any]:
+    features = [
+        "core_control_v2",
+        "system_openssh_profiles",
+        "task_admission_v2",
+    ]
+    return {
+        "schema_version": "2",
+        "api_name": "openevo-desktop-local-api",
+        "preferred_major": 2,
+        "supported_majors": [2],
+        "mutation_major": 2,
+        "openapi_sha256": DESKTOP_OPENAPI_SHA256,
+        "event_schema_sha256": DESKTOP_EVENTS_SCHEMA_SHA256,
+        "release_version": "0.1.9",
+        "build_id": "a" * 64,
+        "source_commit": "abcdef0",
+        "build_channel": "release",
+        "provider_kind": "desktop_sidecar",
+        "feature_flags": features,
+        "feature_set_sha256": _feature_set_sha256(features),
+        "required_core_api_major": 2,
+        "mutation_compatible": True,
+    }
+
+
+def test_desktop_v2_discovery_binds_release_build_schema_and_feature_set() -> None:
+    version = _json_model(DesktopVersionV2, _desktop_v2_discovery())
+    assert version.preferred_major == 2
+    assert version.openapi_sha256 == DESKTOP_OPENAPI_SHA256
+    assert version.event_schema_sha256 == DESKTOP_EVENTS_SCHEMA_SHA256
+    assert version.required_core_api_major == 2
+
+    payload = _desktop_v2_discovery()
+    payload["feature_flags"] = list(reversed(payload["feature_flags"]))
+    with pytest.raises(ValidationError, match="sorted"):
+        _json_model(DesktopVersionV2, payload)
+    payload = _desktop_v2_discovery()
+    payload["feature_set_sha256"] = "f" * 64
+    with pytest.raises(ValidationError, match="feature-set digest"):
+        _json_model(DesktopVersionV2, payload)
+
+
+def test_desktop_v1_discovery_cannot_authorize_v2_mutation() -> None:
+    legacy = {
+        "schema_version": "1",
+        "api_name": "openevo-desktop-local-api",
+        "preferred_major": 1,
+        "supported_majors": [1],
+        "openapi_sha256": "a" * 64,
+        "build_version": "0.1.8",
+        "source_commit": "abcdef0",
+        "build_channel": "release",
+        "provider_kind": "desktop_sidecar",
+        "feature_flags": ["remote_profiles"],
+    }
+    with pytest.raises(ValidationError):
+        _json_model(DesktopVersionV2, legacy)

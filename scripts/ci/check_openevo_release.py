@@ -329,19 +329,25 @@ def validate_v019_contract_manifest(
         openapi_sha256,
     )
 
+    policy = payload.get("v019")
+    if not isinstance(policy, dict):
+        return ["The 0.1.9 release contract manifest is missing its closed v019 policy."]
+
     errors: list[str] = []
-    if payload.get("schema_version") != "2":
-        errors.append("The 0.1.9 release contract manifest must use schema_version 2.")
-    if payload.get("core_control_mutation_major") != 2:
+    if policy.get("release_version") != "0.1.9":
+        errors.append("The v019 release authority must bind release version 0.1.9.")
+    if policy.get("core_control_mutation_major") != 2:
         errors.append("The 0.1.9 release must require Core Control API v2 for mutation.")
-    if payload.get("accepted_core_openapi_digests") != [openapi_sha256()]:
+    if policy.get("accepted_core_openapi_digests") != [openapi_sha256()]:
         errors.append(
             "The 0.1.9 release manifest must pin the exact generated Core v2 OpenAPI digest."
         )
-    if payload.get("accepted_core_event_schema_digests") != [events_schema_sha256()]:
+    if policy.get("accepted_core_event_schema_digests") != [events_schema_sha256()]:
         errors.append(
             "The 0.1.9 release manifest must pin the exact generated Core v2 event schema digest."
         )
+    if policy.get("allow_legacy_route_fallback") is not False:
+        errors.append("The 0.1.9 release manifest must forbid legacy route fallback.")
     return errors
 
 

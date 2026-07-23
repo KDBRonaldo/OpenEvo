@@ -172,6 +172,7 @@ def _load_release_contract() -> tuple[str, frozenset[str]]:
         "allowed_provider_kinds",
         "required_feature_flags",
         "schema_version",
+        "v019",
     }:
         raise RuntimeError("Desktop release contract does not use the closed schema")
     digests = payload.get("accepted_openapi_digests")
@@ -188,6 +189,7 @@ def _load_release_contract() -> tuple[str, frozenset[str]]:
         or not features
         or any(type(feature) is not str for feature in features)
         or len(features) != len(set(features))
+        or type(payload.get("v019")) is not dict
     ):
         raise RuntimeError("Desktop release contract is invalid")
     return digests[0], frozenset(features)

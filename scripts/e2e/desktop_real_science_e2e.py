@@ -2626,6 +2626,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
             "allowed_provider_kinds",
             "required_feature_flags",
             "schema_version",
+            "v019",
         }
         or release_contract.get("schema_version") != "1"
         or release_contract.get("allowed_provider_kinds") != ["desktop_sidecar"]
@@ -2636,6 +2637,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         or not all(
             isinstance(flag, str) and flag for flag in release_contract["required_feature_flags"]
         )
+        or not isinstance(release_contract.get("v019"), dict)
     ):
         raise E2EFailure("desktop_version", "release_contract_invalid")
     version = api.request(
@@ -3314,12 +3316,14 @@ def _structural_check() -> None:
             "allowed_provider_kinds",
             "required_feature_flags",
             "schema_version",
+            "v019",
         }
         or contract_payload.get("schema_version") != "1"
         or contract_payload.get("allowed_provider_kinds") != ["desktop_sidecar"]
         or len(contract_payload.get("accepted_openapi_digests", [])) != 1
         or not _is_sha256(contract_payload["accepted_openapi_digests"][0])
         or not contract_payload.get("required_feature_flags")
+        or not isinstance(contract_payload.get("v019"), dict)
     ):
         raise E2EFailure("structural_check", "release_provider_policy_invalid")
     required = (

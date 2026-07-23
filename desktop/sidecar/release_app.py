@@ -54,7 +54,10 @@ from desktop.sidecar.release_provider import (
     LocalOperationCancellationUnavailableError,
     ProviderCapabilityUnavailableError,
 )
-from desktop.sidecar.release_capabilities import RELEASE_EXECUTION_MODE_CAPABILITIES_V1
+from desktop.sidecar.release_capabilities import (
+    RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
+    validate_v019_release_composition,
+)
 from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
     create_release_core_runtime,
@@ -324,7 +327,18 @@ def create_release_desktop_local_api_app(
     startup_phase: Callable[[str], None] | None = None,
     close_on_shutdown: bool = True,
 ) -> FastAPI:
-    """Create the release Desktop Local API v1 app and own its durable store."""
+    """Create the frozen 0.1.8 Local API v1 provider and own its durable store."""
+
+    if build_version == "0.1.9":
+        # The v1 provider must never become a mutation fallback merely because the
+        # package version advanced. Task 21 supplies the separate v2 provider.
+        validate_v019_release_composition(
+            provider_kind="desktop_sidecar",
+            local_api_major=1,
+            core_transport="active_project_ssh_tunnel",
+            allow_direct_core_url=False,
+            allow_legacy_route_fallback=False,
+        )
 
     if (
         type(session_token) is not str

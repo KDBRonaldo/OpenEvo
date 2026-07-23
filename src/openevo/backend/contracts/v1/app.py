@@ -199,6 +199,8 @@ LastEventId = Annotated[
 
 def create_core_control_contract_app(
     provider: CoreControlApiProviderV1 | None = None,
+    *,
+    mutation_enabled: bool = True,
 ) -> FastAPI:
     """Create the canonical app, optionally bound to a real business provider."""
 
@@ -842,6 +844,7 @@ def create_core_control_contract_app(
 
     if provider is not None:
         app.state.core_control_provider = provider
+        app.state.core_control_v1_mutation_enabled = mutation_enabled
 
         @app.middleware("http")
         async def enforce_provider_boundary(request: Request, call_next):
@@ -875,6 +878,22 @@ def create_core_control_contract_app(
                             retryable=False,
                             repair_action=m.RepairAction.USER_ACTION_REQUIRED,
                             next_action="Negotiate a supported major through GET /version.",
+                        )
+                    )
+                if not mutation_enabled and request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    return _provider_error_response(
+                        CoreControlHTTPError(
+                            426,
+                            code="v1_mutation_retired",
+                            message=(
+                                "Core Control API v1 is read-only migration input in this release."
+                            ),
+                            category=m.ErrorCategory.CONTRACT,
+                            retryable=False,
+                            repair_action=m.RepairAction.UNSUPPORTED,
+                            next_action=(
+                                "Reconnect through a compatible Core Control API v2 session."
+                            ),
                         )
                     )
             return await call_next(request)

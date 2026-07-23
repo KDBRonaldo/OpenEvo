@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from openevo.backend.contracts.v2.app import create_core_control_v2_contract_app
 from openevo.backend.contracts.v2.models import (
     AttemptRefV2,
+    ContractOfferV2,
     EffectiveExecutionSnapshotRefV2,
     EvolutionRevisionRefV2,
     ProjectHeadRefV2,
@@ -22,6 +23,7 @@ from openevo.backend.contracts.v2.models import (
     SuccessorTransitionRefV2,
     TaskAdmittedEventV2,
     TaskAdmissionRefV2,
+    VersionResponseV2,
     WorkspaceSnapshotRefV2,
 )
 from openevo.backend.contracts.v2.snapshots import (
@@ -438,6 +440,11 @@ def test_v2_contract_app_declares_authority_routes_and_is_contract_only() -> Non
     assert operations == EXPECTED_OPERATIONS
     assert openapi["x-openevo-contract-only"] is True
     assert "/v1/status" not in openapi["paths"]
+    assert openapi["paths"]["/version"]["get"]["x-openevo-discovery-only"] is True
+    assert (
+        openapi["paths"]["/version"]["get"]["x-openevo-mutation-compatible"]
+        is False
+    )
 
     client = TestClient(app)
     assert client.get("/v2/system/status").status_code == 501
@@ -454,7 +461,7 @@ def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
     assert openapi_sha256() == (
-        "4cf68e882557a706bf962a42eb9a380aa03aaf05f546a714f49cc2dc3162ef92"
+        "f7fe3d2d862be66ba1494b30af9bb98407f1e7099f174a98d6612dafcc62f2f2"
     )
 
 
@@ -579,10 +586,14 @@ def _load_release_checker() -> Any:
 
 def _v019_release_contract() -> dict[str, Any]:
     return {
-        "schema_version": "2",
-        "core_control_mutation_major": 2,
-        "accepted_core_openapi_digests": [openapi_sha256()],
-        "accepted_core_event_schema_digests": [events_schema_sha256()],
+        "schema_version": "1",
+        "v019": {
+            "release_version": "0.1.9",
+            "core_control_mutation_major": 2,
+            "accepted_core_openapi_digests": [openapi_sha256()],
+            "accepted_core_event_schema_digests": [events_schema_sha256()],
+            "allow_legacy_route_fallback": False,
+        },
     }
 
 
@@ -598,7 +609,7 @@ def test_v019_release_manifest_requires_exact_core_v2_schema_digests(
     assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9") == []
 
     payload = _v019_release_contract()
-    payload["accepted_core_openapi_digests"] = ["f" * 64]
+    payload["v019"]["accepted_core_openapi_digests"] = ["f" * 64]
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     assert "exact generated Core v2 OpenAPI digest" in " ".join(
         checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9")
@@ -611,7 +622,7 @@ def test_v019_release_manifest_forbids_v1_mutation_authority(tmp_path: Path) -> 
     desktop.mkdir()
     manifest = desktop / "release-contract.json"
     payload = _v019_release_contract()
-    payload["core_control_mutation_major"] = 1
+    payload["v019"]["core_control_mutation_major"] = 1
     manifest.write_text(json.dumps(payload), encoding="utf-8")
 
     errors = checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9")
@@ -619,3 +630,132 @@ def test_v019_release_manifest_forbids_v1_mutation_authority(tmp_path: Path) -> 
 
     # The guard is dormant for the retained 0.1.8 release identity until Task 25.
     assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.8") == []
+
+
+def _feature_set_sha256(features: list[str]) -> str:
+    return hashlib.sha256(
+        json.dumps(features, ensure_ascii=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _core_v2_discovery() -> dict[str, Any]:
+    features = [
+        "atomic_successor_v2",
+        "system_status_v2",
+        "task_admission_v2",
+    ]
+    return {
+        "schema_version": "2",
+        "api_name": "openevo-core-control-api",
+        "preferred_major": 2,
+        "supported_majors": [1, 2],
+        "mutation_major": 2,
+        "contracts": [
+            {
+                "schema_version": "2",
+                "api_major": 1,
+                "openapi_sha256": "1" * 64,
+                "event_schema_sha256": "2" * 64,
+                "access": "read_only_migration",
+                "mutation_compatible": False,
+            },
+            {
+                "schema_version": "2",
+                "api_major": 2,
+                "openapi_sha256": openapi_sha256(),
+                "event_schema_sha256": events_schema_sha256(),
+                "access": "mutation",
+                "mutation_compatible": True,
+            },
+        ],
+        "release_version": "0.1.9",
+        "build_id": "3" * 64,
+        "source_commit": "abcdef0",
+        "build_channel": "release",
+        "provider_kind": "openevo_daemon",
+        "feature_flags": features,
+        "feature_set_sha256": _feature_set_sha256(features),
+        "registry_sha256": "4" * 64,
+        "runtime_contract_sha256": "5" * 64,
+        "mutation_compatible": True,
+    }
+
+
+def test_core_v2_discovery_binds_release_build_schema_features_and_registry() -> None:
+    discovery = _json_model(VersionResponseV2, _core_v2_discovery())
+    assert discovery.mutation_major == 2
+    assert discovery.contracts[0].mutation_compatible is False
+    assert discovery.contracts[1].openapi_sha256 == openapi_sha256()
+    assert discovery.registry_sha256 == "4" * 64
+
+    payload = _core_v2_discovery()
+    payload["feature_set_sha256"] = "f" * 64
+    with pytest.raises(ValidationError, match="feature-set digest"):
+        _json_model(VersionResponseV2, payload)
+
+    payload = _core_v2_discovery()
+    payload["contracts"][1]["mutation_compatible"] = False
+    with pytest.raises(ValidationError, match="access and mutation"):
+        _json_model(VersionResponseV2, payload)
+
+
+def test_core_v1_discovery_cannot_satisfy_v2_mutation_negotiation() -> None:
+    legacy = {
+        "schema_version": "1",
+        "api_name": "openevo-core-control-api",
+        "preferred_major": 1,
+        "supported_majors": [1],
+        "openapi_sha256": "a" * 64,
+        "release_version": "0.1.8",
+    }
+    with pytest.raises(ValidationError):
+        _json_model(VersionResponseV2, legacy)
+
+
+def test_core_contract_offer_never_marks_v1_as_mutation_compatible() -> None:
+    with pytest.raises(ValidationError, match="v1 is read-only"):
+        _json_model(
+            ContractOfferV2,
+            {
+                "schema_version": "2",
+                "api_major": 1,
+                "openapi_sha256": "a" * 64,
+                "event_schema_sha256": "b" * 64,
+                "access": "mutation",
+                "mutation_compatible": True,
+            },
+        )
+
+
+def test_core_v1_provider_can_be_mounted_read_only_without_schema_drift() -> None:
+    from openevo.backend.contracts.v1.app import create_core_control_contract_app
+
+    class Provider:
+        def authenticate(self, _authorization_values: tuple[bytes, ...]) -> bool:
+            return True
+
+        async def invoke_async(
+            self, operation_id: str, _arguments: dict[str, object]
+        ) -> object:
+            if operation_id == "getCoreStatusV1":
+                return {
+                    "schema_version": "1",
+                    "status": "ready",
+                    "release_version": "0.1.8",
+                    "source_commit": "abcdef0",
+                    "build_channel": "release",
+                    "provider_kind": "openevo_core",
+                    "registry_digest": "a" * 64,
+                    "checked_at": "2026-07-23T00:00:00Z",
+                }
+            raise AssertionError("a retired v1 mutation reached the provider")
+
+    app = create_core_control_contract_app(Provider(), mutation_enabled=False)
+    client = TestClient(app)
+    response = client.post(
+        "/v1/runs",
+        headers={"Authorization": "Bearer token", "Idempotency-Key": "request-1"},
+        json={},
+    )
+    assert response.status_code == 426
+    assert response.json()["code"] == "v1_mutation_retired"

@@ -28,6 +28,14 @@ from desktop.sidecar.provider_store import (
     ProviderMutation,
 )
 import desktop.sidecar.release_app as release_app_module
+from desktop.sidecar.release_capabilities import (
+    ReleaseAuthorityNegotiationError,
+    V019_RELEASE_AUTHORITY_POLICY,
+    negotiate_core_v2_mutation,
+    negotiate_desktop_v2_mutation,
+    negotiate_v019_mutation_authority,
+    validate_v019_release_composition,
+)
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
 from desktop.sidecar.remote_lifecycle import (
@@ -38,6 +46,10 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleSupersededError,
 )
 from openevo import __version__ as OPENEVO_VERSION
+from openevo.backend.contracts.v2.snapshots import (
+    events_schema_sha256 as core_events_schema_sha256,
+    openapi_sha256 as core_openapi_sha256,
+)
 from openevo.deployment.host_keys import HostKeyCandidate
 
 
@@ -228,6 +240,176 @@ def _project(profile_id: str, *, name: str = "Protein design") -> dict[str, obje
         },
         "evolution": {"targets": {}},
     }
+
+
+def _canonical_feature_digest(features: list[str]) -> str:
+    import json
+
+    return hashlib.sha256(
+        json.dumps(features, ensure_ascii=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _v019_desktop_discovery() -> dict[str, object]:
+    policy = V019_RELEASE_AUTHORITY_POLICY
+    features = list(policy.required_desktop_feature_flags)
+    return {
+        "schema_version": "2",
+        "api_name": "openevo-desktop-local-api",
+        "preferred_major": 2,
+        "supported_majors": [2],
+        "mutation_major": 2,
+        "openapi_sha256": policy.desktop_openapi_sha256,
+        "event_schema_sha256": policy.desktop_event_schema_sha256,
+        "release_version": "0.1.9",
+        "build_id": "a" * 64,
+        "source_commit": SOURCE_COMMIT,
+        "build_channel": "release",
+        "provider_kind": "desktop_sidecar",
+        "feature_flags": features,
+        "feature_set_sha256": _canonical_feature_digest(features),
+        "required_core_api_major": 2,
+        "mutation_compatible": True,
+    }
+
+
+def _v019_core_discovery() -> dict[str, object]:
+    policy = V019_RELEASE_AUTHORITY_POLICY
+    features = list(policy.required_core_feature_flags)
+    return {
+        "schema_version": "2",
+        "api_name": "openevo-core-control-api",
+        "preferred_major": 2,
+        "supported_majors": [1, 2],
+        "mutation_major": 2,
+        "contracts": [
+            {
+                "schema_version": "2",
+                "api_major": 1,
+                "openapi_sha256": "1" * 64,
+                "event_schema_sha256": "2" * 64,
+                "access": "read_only_migration",
+                "mutation_compatible": False,
+            },
+            {
+                "schema_version": "2",
+                "api_major": 2,
+                "openapi_sha256": policy.core_openapi_sha256,
+                "event_schema_sha256": policy.core_event_schema_sha256,
+                "access": "mutation",
+                "mutation_compatible": True,
+            },
+        ],
+        "release_version": "0.1.9",
+        "build_id": "b" * 64,
+        "source_commit": SOURCE_COMMIT,
+        "build_channel": "release",
+        "provider_kind": "openevo_daemon",
+        "feature_flags": features,
+        "feature_set_sha256": _canonical_feature_digest(features),
+        "registry_sha256": "c" * 64,
+        "runtime_contract_sha256": "d" * 64,
+        "mutation_compatible": True,
+    }
+
+
+def test_v019_release_policy_pins_exact_local_and_core_v2_authority() -> None:
+    policy = V019_RELEASE_AUTHORITY_POLICY
+    assert policy.release_version == "0.1.9"
+    assert policy.desktop_mutation_api_major == 2
+    assert policy.core_mutation_api_major == 2
+    assert policy.core_openapi_sha256 == core_openapi_sha256()
+    assert policy.core_event_schema_sha256 == core_events_schema_sha256()
+    assert policy.allow_direct_core_url is False
+    assert policy.allow_legacy_route_fallback is False
+
+    assert negotiate_desktop_v2_mutation(_v019_desktop_discovery()).mutation_compatible
+    assert negotiate_core_v2_mutation(_v019_core_discovery()).registry_sha256 == "c" * 64
+    authority = negotiate_v019_mutation_authority(
+        _v019_desktop_discovery(), _v019_core_discovery()
+    )
+    assert authority.desktop_build_id == "a" * 64
+    assert authority.core_build_id == "b" * 64
+    assert authority.source_commit == SOURCE_COMMIT
+
+    mismatched_core = {**_v019_core_discovery(), "source_commit": "abcdef1"}
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="source identities"):
+        negotiate_v019_mutation_authority(_v019_desktop_discovery(), mismatched_core)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"provider_kind": "contract_simulator"}, "Desktop v2 discovery"),
+        ({"openapi_sha256": "f" * 64}, "Desktop OpenAPI"),
+        ({"event_schema_sha256": "f" * 64}, "Desktop event schema"),
+        ({"supported_majors": [1]}, "Desktop v2 discovery"),
+        ({"mutation_compatible": False}, "not mutation-compatible"),
+    ],
+)
+def test_v019_desktop_negotiation_rejects_nonrelease_authority(
+    override: dict[str, object], message: str
+) -> None:
+    with pytest.raises(ReleaseAuthorityNegotiationError, match=message):
+        negotiate_desktop_v2_mutation({**_v019_desktop_discovery(), **override})
+
+
+def test_v019_core_negotiation_rejects_v1_missing_registry_and_digest_drift() -> None:
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="Core v2 discovery"):
+        negotiate_core_v2_mutation(
+            {
+                "schema_version": "1",
+                "preferred_major": 1,
+                "supported_majors": [1],
+            }
+        )
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="registry"):
+        negotiate_core_v2_mutation({**_v019_core_discovery(), "registry_sha256": None})
+    payload = _v019_core_discovery()
+    contracts = cast(list[dict[str, object]], payload["contracts"])
+    contracts[1] = {**contracts[1], "openapi_sha256": "f" * 64}
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="Core OpenAPI"):
+        negotiate_core_v2_mutation(payload)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"provider_kind": "scaffold"},
+        {"provider_kind": "dry_run"},
+        {"provider_kind": "direct_backend"},
+        {"local_api_major": 1},
+        {"core_transport": "direct_core_url"},
+        {"allow_direct_core_url": True},
+        {"allow_legacy_route_fallback": True},
+    ],
+)
+def test_v019_release_composition_rejects_fallbacks(override: dict[str, object]) -> None:
+    values: dict[str, object] = {
+        "provider_kind": "desktop_sidecar",
+        "local_api_major": 2,
+        "core_transport": "active_project_ssh_tunnel",
+        "allow_direct_core_url": False,
+        "allow_legacy_route_fallback": False,
+    }
+    values.update(override)
+    with pytest.raises(ReleaseAuthorityNegotiationError):
+        validate_v019_release_composition(**values)
+
+
+def test_v019_cannot_start_the_frozen_v1_release_provider(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="Local API v2"):
+        create_release_desktop_local_api_app(
+            state_root=state_root,
+            session_token=SESSION_TOKEN,
+            instance_id=INSTANCE_ID,
+            readiness_key=READINESS_KEY,
+            source_commit=SOURCE_COMMIT,
+            build_version="0.1.9",
+            build_channel="release",
+        )
+    assert not state_root.exists()
 
 
 def test_release_app_marks_state_store_before_provider_store_failure(

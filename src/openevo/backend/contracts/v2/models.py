@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Literal, TypeAlias
 
 from pydantic import (
@@ -315,11 +317,71 @@ class SuccessorTransitionRefV2(ContractModel):
         return self
 
 
+class ContractOfferV2(ContractModel):
+    schema_version: Literal["2"] = "2"
+    api_major: Literal[1, 2]
+    openapi_sha256: Sha256Digest
+    event_schema_sha256: Sha256Digest
+    access: Literal["read_only_migration", "mutation"]
+    mutation_compatible: bool
+
+    @model_validator(mode="after")
+    def _valid_access(self) -> ContractOfferV2:
+        if self.api_major == 1 and (
+            self.access != "read_only_migration" or self.mutation_compatible
+        ):
+            raise ValueError("Core Control API v1 is read-only migration input")
+        if self.api_major == 2 and (
+            (self.access == "mutation") != self.mutation_compatible
+        ):
+            raise ValueError("v2 access and mutation compatibility differ")
+        return self
+
+
 class VersionResponseV2(ContractModel):
     schema_version: Literal["2"] = "2"
-    api_major: Literal["2"] = "2"
+    api_name: Literal["openevo-core-control-api"]
+    preferred_major: Literal[2]
+    supported_majors: list[Literal[1, 2]] = Field(min_length=1, max_length=2)
+    mutation_major: Literal[2]
+    contracts: list[ContractOfferV2] = Field(min_length=1, max_length=2)
     release_version: ShortText
+    build_id: Sha256Digest
     source_commit: SourceCommit
+    build_channel: Literal["release", "development", "test"]
+    provider_kind: Literal["openevo_daemon"]
+    feature_flags: list[OpaqueId] = Field(min_length=1, max_length=128)
+    feature_set_sha256: Sha256Digest
+    registry_sha256: Sha256Digest
+    runtime_contract_sha256: Sha256Digest
+    mutation_compatible: bool
+
+    @model_validator(mode="after")
+    def _bind_negotiated_authority(self) -> VersionResponseV2:
+        if self.supported_majors != sorted(set(self.supported_majors)):
+            raise ValueError("supported API majors must be sorted and unique")
+        contract_majors = [offer.api_major for offer in self.contracts]
+        if contract_majors != self.supported_majors:
+            raise ValueError("contract offers must exactly match supported API majors")
+        v2_offer = next(
+            (offer for offer in self.contracts if offer.api_major == self.mutation_major),
+            None,
+        )
+        if v2_offer is None or v2_offer.mutation_compatible != self.mutation_compatible:
+            raise ValueError("mutation major does not bind a matching contract offer")
+        if self.mutation_compatible and v2_offer.access != "mutation":
+            raise ValueError("mutation major is not available for mutation")
+        if self.feature_flags != sorted(set(self.feature_flags)):
+            raise ValueError("feature flags must be sorted and unique")
+        encoded_features = json.dumps(
+            self.feature_flags,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if hashlib.sha256(encoded_features).hexdigest() != self.feature_set_sha256:
+            raise ValueError("feature-set digest does not match feature flags")
+        return self
 
 
 class HealthResponseV2(ContractModel):
@@ -767,6 +829,7 @@ __all__ = [
     "AttemptRefV2",
     "CacheCleanupRequestV2",
     "ContractModel",
+    "ContractOfferV2",
     "ContractOnlyResponseV2",
     "DiagnosticRequestV2",
     "DiagnosticV2",

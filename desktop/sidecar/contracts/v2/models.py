@@ -332,12 +332,37 @@ class HostKeyReviewRequestV2(ProfileConnectionActionV2):
 
 class DesktopVersionV2(StrictModel):
     schema_version: Literal["2"] = "2"
+    api_name: Literal["openevo-desktop-local-api"]
+    preferred_major: Literal[2]
     supported_majors: list[Literal[2]] = Field(min_length=1, max_length=1)
+    mutation_major: Literal[2]
     openapi_sha256: Digest
     event_schema_sha256: Digest
     release_version: SafeSummary
+    build_id: Digest
     source_commit: Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{7,64}$")]
+    build_channel: Literal["release", "development", "test"]
     provider_kind: Literal["desktop_sidecar"]
+    feature_flags: list[OpaqueId] = Field(min_length=1, max_length=128)
+    feature_set_sha256: Digest
+    required_core_api_major: Literal[2]
+    mutation_compatible: bool
+
+    @model_validator(mode="after")
+    def _bind_negotiated_authority(self) -> DesktopVersionV2:
+        if self.supported_majors != [2]:
+            raise ValueError("Desktop v2 discovery must support only major 2")
+        if self.feature_flags != sorted(set(self.feature_flags)):
+            raise ValueError("feature flags must be sorted and unique")
+        encoded_features = json.dumps(
+            self.feature_flags,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if hashlib.sha256(encoded_features).hexdigest() != self.feature_set_sha256:
+            raise ValueError("feature-set digest does not match feature flags")
+        return self
 
 
 class DesktopHealthV2(StrictModel):

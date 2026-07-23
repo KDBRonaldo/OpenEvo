@@ -4,6 +4,7 @@ from .app import core_control_v2_contract_app, create_core_control_v2_contract_a
 from .models import (
     ApiErrorV2,
     AttemptRefV2,
+    ContractOfferV2,
     EffectiveExecutionSnapshotRefV2,
     EvolutionRevisionRefV2,
     ProjectHeadRefV2,
@@ -27,6 +28,7 @@ from .snapshots import (
 __all__ = [
     "ApiErrorV2",
     "AttemptRefV2",
+    "ContractOfferV2",
     "EffectiveExecutionSnapshotRefV2",
     "EvolutionRevisionRefV2",
     "ProjectHeadRefV2",

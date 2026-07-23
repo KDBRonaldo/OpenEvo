@@ -649,6 +649,10 @@ def create_desktop_local_v2_contract_app() -> FastAPI:
         )
         schema["x-openevo-contract-only"] = True
         schema["x-openevo-business-provider"] = False
+        for discovery_path in ("/version", "/health"):
+            operation = schema["paths"][discovery_path]["get"]
+            operation["x-openevo-discovery-only"] = True
+            operation["x-openevo-mutation-compatible"] = False
         events_operation = schema["paths"]["/desktop/v2/events"]["get"]
         events_operation["x-sse-delivery"] = "at-least-once"
         events_operation["x-sse-replay"] = "bounded"
