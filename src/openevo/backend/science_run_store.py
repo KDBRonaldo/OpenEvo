@@ -6,7 +6,7 @@ import base64
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import hashlib
 import json
@@ -23,6 +23,11 @@ from pydantic import BaseModel
 
 from openevo.backend.contracts.v1 import models as m
 from openevo.backend.contracts.v2 import models as m2
+from openevo.backend.science_successor import (
+    ScienceSuccessorPlanV2,
+    science_successor_plan_sha256,
+)
+from openevo.evolution.revisions import AtomicSuccessorCommitV2
 
 
 _T = TypeVar("_T", bound=BaseModel)
@@ -128,6 +133,17 @@ CREATE TABLE IF NOT EXISTS project_admission_authorities (
     authority_json BLOB NOT NULL,
     resource_version INTEGER NOT NULL CHECK (resource_version >= 1)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS project_heads (
+    project_head_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    predecessor_project_head_id TEXT,
+    manifest_sha256 TEXT NOT NULL CHECK (length(manifest_sha256) = 64),
+    head_json BLOB NOT NULL,
+    UNIQUE(project_id, generation),
+    FOREIGN KEY(predecessor_project_head_id)
+        REFERENCES project_heads(project_head_id) ON DELETE RESTRICT
+) STRICT;
 CREATE TABLE IF NOT EXISTS tasks (
     task_id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
@@ -166,13 +182,35 @@ CREATE TABLE IF NOT EXISTS attempt_append_requests (
     FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
     FOREIGN KEY(attempt_id) REFERENCES attempts(attempt_id) ON DELETE RESTRICT
 ) STRICT;
+CREATE TABLE IF NOT EXISTS successor_transitions (
+    successor_transition_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    task_id TEXT NOT NULL UNIQUE,
+    plan_sha256 TEXT NOT NULL CHECK (length(plan_sha256) = 64),
+    plan_json BLOB NOT NULL,
+    transition_json BLOB NOT NULL,
+    resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS successor_commits (
+    successor_transition_id TEXT PRIMARY KEY,
+    manifest_sha256 TEXT NOT NULL UNIQUE CHECK (length(manifest_sha256) = 64),
+    commit_json BLOB NOT NULL,
+    FOREIGN KEY(successor_transition_id)
+        REFERENCES successor_transitions(successor_transition_id) ON DELETE RESTRICT
+) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_task_per_project
 ON tasks(project_id)
 WHERE closed = 0;
 """
 _MAX_V2_TASKS = 10_000
 _MAX_V2_PROJECTS = 10_000
+_MAX_V2_PROJECT_HEADS = _MAX_V2_PROJECTS + _MAX_V2_TASKS
 _V2_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
+
+
+def _before_v2_successor_commit(*_args: object, **_kwargs: object) -> None:
+    """Test-only fault boundary immediately before the atomic successor writes."""
 
 
 class ScienceRunStoreError(RuntimeError):
@@ -1302,6 +1340,7 @@ class ScienceTaskStoreV2:
             connection.execute(
                 "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 2)"
             )
+            _backfill_v2_project_heads(connection)
             connection.commit()
         os.chmod(self.database, 0o600)
         self._verify_database()
@@ -1343,6 +1382,7 @@ class ScienceTaskStoreV2:
                     "project_id, authority_json, resource_version) VALUES (?, ?, 1)",
                     (authority.project_id, payload),
                 )
+                _store_v2_project_head(connection, authority.active_project_head)
                 return authority
             current = _v2_authority_from_bytes(bytes(row["authority_json"]))
             if payload == bytes(row["authority_json"]):
@@ -1368,7 +1408,500 @@ class ScienceTaskStoreV2:
                 "resource_version = resource_version + 1 WHERE project_id = ?",
                 (payload, authority.project_id),
             )
+            _store_v2_project_head(connection, authority.active_project_head)
             return authority
+
+    def project_admission_authority(
+        self,
+        project_id: str,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        project_id = _v2_resource_id(project_id, label="project")
+        with self._lock, self._reader() as connection:
+            row = connection.execute(
+                "SELECT authority_json FROM project_admission_authorities "
+                "WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+            if row is None:
+                raise ScienceTaskNotFoundV2(
+                    "v2 project admission authority was not found"
+                )
+            authority = _v2_authority_from_bytes(bytes(row["authority_json"]))
+            active = _load_v2_project_head(
+                connection,
+                authority.active_project_head.project_head_id,
+            )
+            if active != authority.active_project_head:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project admission authority does not bind its active head"
+                )
+            return authority
+
+    def active_project_head(self, project_id: str) -> m2.ProjectHeadRefV2:
+        return self.project_admission_authority(project_id).active_project_head
+
+    def list_project_heads(self, project_id: str) -> list[m2.ProjectHeadRefV2]:
+        project_id = _v2_resource_id(project_id, label="project")
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT project_head_id FROM project_heads WHERE project_id = ? "
+                "ORDER BY generation LIMIT ?",
+                (project_id, _MAX_V2_TASKS + 2),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS + 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project-head history exceeds its bound"
+                )
+            heads = [
+                _load_v2_project_head(connection, str(row["project_head_id"]))
+                for row in rows
+            ]
+            _validate_v2_project_head_chain(heads)
+            return heads
+
+    def start_successor_transition(
+        self,
+        *,
+        task_id: str,
+        accepted_attempt_id: str,
+        plan: ScienceSuccessorPlanV2,
+        now: datetime,
+    ) -> m2.SuccessorTransitionV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        accepted_attempt_id = _v2_resource_id(
+            accepted_attempt_id,
+            label="accepted Attempt",
+        )
+        plan = _validate_v2_model(ScienceSuccessorPlanV2, plan)
+        plan_sha256 = science_successor_plan_sha256(plan)
+        timestamp = _v2_timestamp(now)
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            if (
+                task.state != "admitted"
+                or task.authoritative_attempt_id is not None
+                or task.successor_transition is not None
+            ):
+                raise ScienceTaskTerminalV2(
+                    "v2 Task already has authoritative result ownership"
+                )
+            attempts = {
+                attempt.attempt_id: attempt for attempt in task.attempts
+            }
+            accepted_attempt = attempts.get(accepted_attempt_id)
+            if accepted_attempt is None:
+                raise ScienceTaskPreconditionFailedV2(
+                    "accepted Attempt does not belong to the immutable v2 Task"
+                )
+            if (
+                plan.project_id != task.project_id
+                or plan.task_id != task.task_id
+                or plan.task_admission_id != task.admission.task_admission_id
+                or plan.admission_sha256 != task.admission.admission_sha256
+                or plan.accepted_attempt_id != accepted_attempt.attempt_id
+                or plan.predecessor_project_head_id
+                != task.admission.predecessor_project_head.project_head_id
+                or plan.normalized_evolution_intent_sha256
+                != task.admission.normalized_evolution_intent_sha256
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "successor plan does not bind the immutable v2 Task"
+                )
+            authority = _load_v2_project_authority(connection, task.project_id)
+            if (
+                authority.blockers
+                or authority.active_project_head
+                != task.admission.predecessor_project_head
+            ):
+                raise ScienceTaskNotReadyV2(
+                    authority.blockers
+                    or (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                )
+            transition_id = f"successor-{secrets.token_hex(16)}"
+            reference = m2.SuccessorTransitionRefV2(
+                successor_transition_id=transition_id,
+                project_id=task.project_id,
+                kind="run_result",
+                predecessor_project_head=task.admission.predecessor_project_head,
+                expected_successor_generation=(
+                    task.admission.predecessor_project_head.generation + 1
+                ),
+                plan_sha256=plan_sha256,
+                task_admission=task.admission,
+                accepted_attempt=accepted_attempt,
+                successor_project_head=None,
+            )
+            transition = m2.SuccessorTransitionV2(
+                transition=reference,
+                state="pending",
+                progress_completed=0,
+                progress_total=6,
+                error=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            updated_task = _replace_v2_task(
+                task,
+                authoritative_attempt_id=accepted_attempt.attempt_id,
+                successor_transition=reference,
+                state="waiting_for_successor",
+                updated_at=timestamp,
+            )
+            blocked_authority = ScienceProjectAdmissionAuthorityV2(
+                project_id=authority.project_id,
+                active_project_head=authority.active_project_head,
+                project_config_sha256=authority.project_config_sha256,
+                workspace_snapshot=authority.workspace_snapshot,
+                normalized_evolution_intent_sha256=(
+                    authority.normalized_evolution_intent_sha256
+                ),
+                blockers=(ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,),
+            )
+            connection.execute(
+                "INSERT INTO successor_transitions("
+                "successor_transition_id, project_id, task_id, plan_sha256, "
+                "plan_json, transition_json, resource_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1)",
+                (
+                    transition_id,
+                    task.project_id,
+                    task.task_id,
+                    plan_sha256,
+                    _v2_model_bytes(plan),
+                    _v2_model_bytes(transition),
+                ),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(updated_task), task.task_id),
+            )
+            connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(blocked_authority), task.project_id),
+            )
+            return _load_v2_successor_transition(connection, transition_id)
+
+    def advance_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        state: str,
+        now: datetime,
+    ) -> m2.SuccessorTransitionV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        phases = (
+            "pending",
+            "sealing_dataset",
+            "running_methods",
+            "validating",
+            "materializing",
+            "committing",
+        )
+        if state not in phases[1:]:
+            raise ValueError("v2 successor transition phase is invalid")
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            current_index = phases.index(transition.state)
+            next_index = phases.index(state)
+            if next_index != current_index + 1:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor transition phase is not adjacent"
+                )
+            updated = _replace_v2_successor_transition(
+                transition,
+                state=state,
+                progress_completed=next_index,
+                updated_at=_v2_successor_timestamp(transition, now),
+            )
+            connection.execute(
+                "UPDATE successor_transitions SET transition_json = ?, "
+                "resource_version = resource_version + 1 "
+                "WHERE successor_transition_id = ?",
+                (_v2_model_bytes(updated), successor_transition_id),
+            )
+            return _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+
+    def fail_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        error: m2.ApiErrorV2,
+        now: datetime,
+    ) -> m2.SuccessorTransitionV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        error = _validate_v2_model(m2.ApiErrorV2, error)
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            timestamp = _v2_successor_timestamp(transition, now)
+            if transition.state == "failed":
+                return transition
+            if transition.state in {"committed", "cancelled", "superseded"}:
+                raise ScienceTaskTerminalV2(
+                    "terminal v2 successor transition cannot be failed"
+                )
+            task = _load_v2_task_closure(
+                connection,
+                transition.transition.task_admission.task_id,  # type: ignore[union-attr]
+            )
+            if task.successor_transition != transition.transition:
+                raise ScienceTaskStoreV2Error(
+                    "v2 Task and successor transition ownership differ"
+                )
+            updated_transition = _replace_v2_successor_transition(
+                transition,
+                state="failed",
+                error=error,
+                updated_at=timestamp,
+            )
+            updated_task = _replace_v2_task(
+                task,
+                state="failed",
+                updated_at=timestamp,
+            )
+            connection.execute(
+                "UPDATE successor_transitions SET transition_json = ?, "
+                "resource_version = resource_version + 1 "
+                "WHERE successor_transition_id = ?",
+                (_v2_model_bytes(updated_transition), successor_transition_id),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(updated_task), task.task_id),
+            )
+            return _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+
+    def commit_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        successor: m2.ProjectHeadRefV2,
+        commit: AtomicSuccessorCommitV2,
+        now: datetime,
+    ) -> m2.SuccessorTransitionV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        successor = _validate_v2_model(m2.ProjectHeadRefV2, successor)
+        commit = _validate_v2_model(AtomicSuccessorCommitV2, commit)
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            timestamp = _v2_successor_timestamp(transition, now)
+            if transition.state != "committing":
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor transition is not ready to commit"
+                )
+            reference = transition.transition
+            if reference.task_admission is None or reference.accepted_attempt is None:
+                raise ScienceTaskStoreV2Error(
+                    "v2 run-result transition lost its Task ownership"
+                )
+            task = _load_v2_task_closure(
+                connection,
+                reference.task_admission.task_id,
+            )
+            authority = _load_v2_project_authority(connection, task.project_id)
+            if (
+                task.state != "waiting_for_successor"
+                or task.authoritative_attempt_id
+                != reference.accepted_attempt.attempt_id
+                or task.successor_transition != reference
+                or authority.active_project_head != reference.predecessor_project_head
+                or authority.blockers
+                != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor commit authority changed"
+                )
+            _validate_v2_successor_commit_closure(
+                task=task,
+                transition=transition,
+                successor=successor,
+                commit=commit,
+            )
+            if int(
+                connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0]
+            ) >= _MAX_V2_PROJECT_HEADS:
+                raise ScienceTaskConflictV2("v2 project-head capacity is exhausted")
+
+            _before_v2_successor_commit(
+                successor_transition_id,
+                successor,
+                commit,
+            )
+            _store_v2_project_head(connection, successor)
+            connection.execute(
+                "INSERT INTO successor_commits("
+                "successor_transition_id, manifest_sha256, commit_json) "
+                "VALUES (?, ?, ?)",
+                (
+                    successor_transition_id,
+                    commit.manifest_sha256,
+                    _v2_model_bytes(commit),
+                ),
+            )
+            committed_reference = m2.SuccessorTransitionRefV2.model_validate(
+                {
+                    **reference.model_dump(mode="python"),
+                    "successor_project_head": successor,
+                }
+            )
+            committed_transition = _replace_v2_successor_transition(
+                transition,
+                transition=committed_reference,
+                state="committed",
+                progress_completed=transition.progress_total,
+                error=None,
+                updated_at=timestamp,
+            )
+            completed_task = _replace_v2_task(
+                task,
+                successor_transition=committed_reference,
+                state="completed",
+                updated_at=timestamp,
+            )
+            next_authority = ScienceProjectAdmissionAuthorityV2(
+                project_id=authority.project_id,
+                active_project_head=successor,
+                project_config_sha256=authority.project_config_sha256,
+                workspace_snapshot=successor.workspace_snapshot,
+                normalized_evolution_intent_sha256=(
+                    authority.normalized_evolution_intent_sha256
+                ),
+                blockers=(),
+            )
+            connection.execute(
+                "UPDATE successor_transitions SET transition_json = ?, "
+                "resource_version = resource_version + 1 "
+                "WHERE successor_transition_id = ?",
+                (_v2_model_bytes(committed_transition), successor_transition_id),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, closed = 1, "
+                "resource_version = resource_version + 1 WHERE task_id = ?",
+                (_v2_model_bytes(completed_task), task.task_id),
+            )
+            connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(next_authority), authority.project_id),
+            )
+            return _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+
+    def get_successor_transition(
+        self,
+        successor_transition_id: str,
+    ) -> m2.SuccessorTransitionV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            return _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+
+    def get_successor_transition_for_task(
+        self,
+        task_id: str,
+    ) -> m2.SuccessorTransitionV2:
+        task_id = _v2_resource_id(task_id, label="task")
+        with self._lock, self._reader() as connection:
+            row = connection.execute(
+                "SELECT successor_transition_id FROM successor_transitions "
+                "WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                raise ScienceTaskNotFoundV2(
+                    "v2 Task successor transition was not found"
+                )
+            return _load_v2_successor_transition(
+                connection,
+                str(row["successor_transition_id"]),
+            )
+
+    def successor_commit(
+        self,
+        successor_transition_id: str,
+    ) -> AtomicSuccessorCommitV2 | None:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            row = connection.execute(
+                "SELECT manifest_sha256, commit_json FROM successor_commits "
+                "WHERE successor_transition_id = ?",
+                (successor_transition_id,),
+            ).fetchone()
+            if row is None:
+                if transition.state == "committed":
+                    raise ScienceTaskStoreV2Error(
+                        "committed v2 successor transition has no commit receipt"
+                    )
+                return None
+            commit = _v2_model_from_bytes(
+                AtomicSuccessorCommitV2,
+                bytes(row["commit_json"]),
+            )
+            if (
+                row["manifest_sha256"] != commit.manifest_sha256
+                or transition.state != "committed"
+            ):
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor commit row is inconsistent"
+                )
+            return commit
+
+    def nonterminal_successor_transition_ids(self) -> list[str]:
+        terminal = ("committed", "failed", "cancelled", "superseded")
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT successor_transition_id, transition_json "
+                "FROM successor_transitions ORDER BY successor_transition_id"
+            ).fetchall()
+            result: list[str] = []
+            for row in rows:
+                transition = _v2_model_from_bytes(
+                    m2.SuccessorTransitionV2,
+                    bytes(row["transition_json"]),
+                )
+                if transition.state not in terminal:
+                    result.append(str(row["successor_transition_id"]))
+            return result
 
     def submit_task(
         self,
@@ -1689,13 +2222,53 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskStoreV2Error(
                     "v2 project admission authority inventory exceeds its bound"
                 )
+            head_inventory = connection.execute(
+                "SELECT project_head_id, project_id FROM project_heads "
+                "ORDER BY project_head_id LIMIT ?",
+                (_MAX_V2_PROJECT_HEADS + 1,),
+            ).fetchall()
+            if len(head_inventory) > _MAX_V2_PROJECT_HEADS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project-head inventory exceeds its bound"
+                )
+            authority_projects = {str(item["project_id"]) for item in authorities}
+            head_projects = {str(item["project_id"]) for item in head_inventory}
+            if head_projects != authority_projects:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project-head inventory has no exact project authority"
+                )
             for authority_row in authorities:
                 authority = _v2_authority_from_bytes(
                     bytes(authority_row["authority_json"])
                 )
-                if authority.project_id != authority_row["project_id"]:
+                if (
+                    authority.project_id != authority_row["project_id"]
+                    or _load_v2_project_head(
+                        connection,
+                        authority.active_project_head.project_head_id,
+                    )
+                    != authority.active_project_head
+                ):
                     raise ScienceTaskStoreV2Error(
                         "v2 project admission authority row is inconsistent"
+                    )
+                head_rows = connection.execute(
+                    "SELECT project_head_id FROM project_heads WHERE project_id = ? "
+                    "ORDER BY generation LIMIT ?",
+                    (authority.project_id, _MAX_V2_TASKS + 2),
+                ).fetchall()
+                if len(head_rows) > _MAX_V2_TASKS + 1:
+                    raise ScienceTaskStoreV2Error(
+                        "v2 project-head history exceeds its bound"
+                    )
+                heads = [
+                    _load_v2_project_head(connection, str(item["project_head_id"]))
+                    for item in head_rows
+                ]
+                _validate_v2_project_head_chain(heads)
+                if not heads or heads[-1] != authority.active_project_head:
+                    raise ScienceTaskStoreV2Error(
+                        "v2 project authority is not the project-head tip"
                     )
             tasks = connection.execute(
                 "SELECT task_id FROM tasks ORDER BY task_id LIMIT ?",
@@ -1705,6 +2278,20 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskStoreV2Error("v2 Task inventory exceeds its bound")
             for task_row in tasks:
                 _load_v2_task_closure(connection, str(task_row["task_id"]))
+            transition_rows = connection.execute(
+                "SELECT successor_transition_id FROM successor_transitions "
+                "ORDER BY successor_transition_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(transition_rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor transition inventory exceeds its bound"
+                )
+            for transition_row in transition_rows:
+                _load_v2_successor_transition(
+                    connection,
+                    str(transition_row["successor_transition_id"]),
+                )
             append_rows = connection.execute(
                 "SELECT task_id, idempotency_key, request_sha256, request_json, "
                 "attempt_id "
@@ -1779,6 +2366,271 @@ class ScienceTaskStoreV2:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 10000")
         return connection
+
+
+def _backfill_v2_project_heads(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT authority_json FROM project_admission_authorities ORDER BY project_id"
+    ).fetchall()
+    for row in rows:
+        authority = _v2_authority_from_bytes(bytes(row["authority_json"]))
+        _store_v2_project_head(connection, authority.active_project_head)
+
+
+def _load_v2_project_authority(
+    connection: sqlite3.Connection,
+    project_id: str,
+) -> ScienceProjectAdmissionAuthorityV2:
+    row = connection.execute(
+        "SELECT authority_json FROM project_admission_authorities WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()
+    if row is None:
+        raise ScienceTaskNotFoundV2("v2 project admission authority was not found")
+    return _v2_authority_from_bytes(bytes(row["authority_json"]))
+
+
+def _store_v2_project_head(
+    connection: sqlite3.Connection,
+    head: m2.ProjectHeadRefV2,
+) -> None:
+    head = _validate_v2_model(m2.ProjectHeadRefV2, head)
+    payload = _v2_model_bytes(head)
+    existing = connection.execute(
+        "SELECT project_id, generation, predecessor_project_head_id, "
+        "manifest_sha256, head_json FROM project_heads WHERE project_head_id = ?",
+        (head.project_head_id,),
+    ).fetchone()
+    if existing is not None:
+        if (
+            existing["project_id"] != head.project_id
+            or int(existing["generation"]) != head.generation
+            or existing["predecessor_project_head_id"]
+            != head.predecessor_project_head_id
+            or existing["manifest_sha256"] != head.manifest_sha256
+            or bytes(existing["head_json"]) != payload
+        ):
+            raise ScienceTaskStoreV2Error(
+                "v2 project-head identity was reused with different content"
+            )
+        return
+    if int(connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0]) >= (
+        _MAX_V2_PROJECT_HEADS
+    ):
+        raise ScienceTaskConflictV2("v2 project-head capacity is exhausted")
+    same_generation = connection.execute(
+        "SELECT 1 FROM project_heads WHERE project_id = ? AND generation = ?",
+        (head.project_id, head.generation),
+    ).fetchone()
+    if same_generation is not None:
+        raise ScienceTaskConflictV2(
+            "v2 project already has a different head at this generation"
+        )
+    if head.generation == 0:
+        if head.predecessor_project_head_id is not None:
+            raise ScienceTaskStoreV2Error("v2 genesis project head has a predecessor")
+    else:
+        if head.predecessor_project_head_id is None:
+            raise ScienceTaskStoreV2Error("v2 successor project head lacks a predecessor")
+        predecessor = _load_v2_project_head(
+            connection,
+            head.predecessor_project_head_id,
+        )
+        if (
+            predecessor.project_id != head.project_id
+            or head.generation != predecessor.generation + 1
+        ):
+            raise ScienceTaskStoreV2Error(
+                "v2 project-head predecessor is not adjacent"
+            )
+    connection.execute(
+        "INSERT INTO project_heads(project_head_id, project_id, generation, "
+        "predecessor_project_head_id, manifest_sha256, head_json) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            head.project_head_id,
+            head.project_id,
+            head.generation,
+            head.predecessor_project_head_id,
+            head.manifest_sha256,
+            payload,
+        ),
+    )
+
+
+def _load_v2_project_head(
+    connection: sqlite3.Connection,
+    project_head_id: str,
+) -> m2.ProjectHeadRefV2:
+    row = connection.execute(
+        "SELECT project_id, generation, predecessor_project_head_id, "
+        "manifest_sha256, head_json FROM project_heads WHERE project_head_id = ?",
+        (project_head_id,),
+    ).fetchone()
+    if row is None:
+        raise ScienceTaskStoreV2Error("persisted v2 project head is missing")
+    head = _v2_model_from_bytes(m2.ProjectHeadRefV2, bytes(row["head_json"]))
+    if (
+        head.project_head_id != project_head_id
+        or head.project_id != row["project_id"]
+        or head.generation != int(row["generation"])
+        or head.predecessor_project_head_id != row["predecessor_project_head_id"]
+        or head.manifest_sha256 != row["manifest_sha256"]
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 project-head row is inconsistent")
+    return head
+
+
+def _validate_v2_project_head_chain(heads: Sequence[m2.ProjectHeadRefV2]) -> None:
+    for index, head in enumerate(heads):
+        if head.generation != index:
+            raise ScienceTaskStoreV2Error("v2 project-head generations are not contiguous")
+        if index == 0:
+            if head.predecessor_project_head_id is not None:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project-head history does not begin at genesis"
+                )
+        elif head.predecessor_project_head_id != heads[index - 1].project_head_id:
+            raise ScienceTaskStoreV2Error("v2 project-head chain is not adjacent")
+
+
+def _replace_v2_successor_transition(
+    current: m2.SuccessorTransitionV2,
+    **changes: object,
+) -> m2.SuccessorTransitionV2:
+    data = current.model_dump(mode="python")
+    data.update(changes)
+    return m2.SuccessorTransitionV2.model_validate(data)
+
+
+def _load_v2_successor_transition(
+    connection: sqlite3.Connection,
+    successor_transition_id: str,
+) -> m2.SuccessorTransitionV2:
+    row = connection.execute(
+        "SELECT project_id, task_id, plan_sha256, plan_json, transition_json "
+        "FROM successor_transitions WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if row is None:
+        raise ScienceTaskNotFoundV2("v2 successor transition was not found")
+    plan = _v2_model_from_bytes(ScienceSuccessorPlanV2, bytes(row["plan_json"]))
+    transition = _v2_model_from_bytes(
+        m2.SuccessorTransitionV2,
+        bytes(row["transition_json"]),
+    )
+    reference = transition.transition
+    if (
+        reference.successor_transition_id != successor_transition_id
+        or reference.project_id != row["project_id"]
+        or plan.project_id != row["project_id"]
+        or plan.task_id != row["task_id"]
+        or reference.task_admission is None
+        or reference.task_admission.task_id != row["task_id"]
+        or reference.plan_sha256 != row["plan_sha256"]
+        or science_successor_plan_sha256(plan) != row["plan_sha256"]
+    ):
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 successor transition row is inconsistent"
+        )
+    task = _load_v2_task_closure(connection, str(row["task_id"]))
+    if (
+        task.successor_transition != reference
+        or task.authoritative_attempt_id
+        != (
+            None
+            if reference.accepted_attempt is None
+            else reference.accepted_attempt.attempt_id
+        )
+    ):
+        raise ScienceTaskStoreV2Error(
+            "persisted v2 successor transition ownership is inconsistent"
+        )
+    commit_row = connection.execute(
+        "SELECT manifest_sha256, commit_json FROM successor_commits "
+        "WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if transition.state == "committed":
+        if commit_row is None or reference.successor_project_head is None:
+            raise ScienceTaskStoreV2Error(
+                "committed v2 successor transition is incomplete"
+            )
+        commit = _v2_model_from_bytes(
+            AtomicSuccessorCommitV2,
+            bytes(commit_row["commit_json"]),
+        )
+        if commit.manifest_sha256 != commit_row["manifest_sha256"]:
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 successor commit digest is inconsistent"
+            )
+        _validate_v2_successor_commit_closure(
+            task=task,
+            transition=transition,
+            successor=reference.successor_project_head,
+            commit=commit,
+        )
+    elif commit_row is not None or reference.successor_project_head is not None:
+        raise ScienceTaskStoreV2Error(
+            "noncommitted v2 successor transition exposes a successor"
+        )
+    return transition
+
+
+def _validate_v2_successor_commit_closure(
+    *,
+    task: m2.TaskV2,
+    transition: m2.SuccessorTransitionV2,
+    successor: m2.ProjectHeadRefV2,
+    commit: AtomicSuccessorCommitV2,
+) -> None:
+    reference = transition.transition
+    admission = reference.task_admission
+    attempt = reference.accepted_attempt
+    if admission is None or attempt is None:
+        raise ScienceTaskStoreV2Error("v2 successor commit lacks Task ownership")
+    manifest = commit.manifest
+    predecessor = reference.predecessor_project_head
+    if (
+        manifest.project_id != task.project_id
+        or manifest.successor_transition_id != reference.successor_transition_id
+        or manifest.task_id != task.task_id
+        or manifest.task_admission_id != admission.task_admission_id
+        or manifest.admission_sha256 != admission.admission_sha256
+        or manifest.accepted_attempt_id != attempt.attempt_id
+        or manifest.predecessor_project_head_id != predecessor.project_head_id
+        or manifest.predecessor_generation != predecessor.generation
+        or manifest.predecessor_manifest_sha256 != predecessor.manifest_sha256
+        or manifest.successor_project_head_id != successor.project_head_id
+        or manifest.successor_generation != successor.generation
+        or manifest.successor_manifest_sha256 != successor.manifest_sha256
+        or manifest.workspace_snapshot_id
+        != successor.workspace_snapshot.workspace_snapshot_id
+        or manifest.workspace_manifest_sha256
+        != successor.workspace_snapshot.manifest_sha256
+        or manifest.evolution_revision_id
+        != successor.evolution_revision.evolution_revision_id
+        or manifest.evolution_revision_manifest_sha256
+        != successor.evolution_revision.manifest_sha256
+        or manifest.runtime_context_snapshot_id
+        != successor.runtime_context_snapshot.runtime_context_snapshot_id
+        or manifest.runtime_context_manifest_sha256
+        != successor.runtime_context_snapshot.manifest_sha256
+        or manifest.effective_execution_snapshot_id
+        != successor.effective_execution_snapshot.effective_execution_snapshot_id
+        or manifest.effective_execution_snapshot_sha256
+        != successor.effective_execution_snapshot.snapshot_sha256
+        or manifest.registry_sha256 != successor.registry_sha256
+        or manifest.normalized_evolution_intent_sha256
+        != admission.normalized_evolution_intent_sha256
+        or successor.predecessor_project_head_id != predecessor.project_head_id
+        or successor.generation != reference.expected_successor_generation
+        or successor.effective_execution_snapshot
+        != predecessor.effective_execution_snapshot
+    ):
+        raise ScienceTaskPreconditionFailedV2(
+            "atomic v2 successor receipt does not match its authoritative closure"
+        )
 
 
 def _validate_v2_project_authority(
@@ -2005,6 +2857,17 @@ def _v2_timestamp(value: datetime) -> str:
     return normalized.isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
+def _v2_successor_timestamp(
+    current: m2.SuccessorTransitionV2,
+    value: datetime,
+) -> str:
+    candidate = _v2_timestamp(value)
+    if candidate > current.updated_at:
+        return candidate
+    previous = datetime.fromisoformat(current.updated_at.replace("Z", "+00:00"))
+    return _v2_timestamp(previous + timedelta(microseconds=1))
+
+
 def _replace_v2_task(task: m2.TaskV2, **changes: object) -> m2.TaskV2:
     data: dict[str, object] = {
         "schema_version": task.schema_version,
@@ -2053,7 +2916,7 @@ def _load_v2_task_closure(
         or hashlib.sha256(request_json).hexdigest() != row["request_sha256"]
         or not isinstance(row["idempotency_key"], str)
         or _v2_idempotency_key(str(row["idempotency_key"])) != row["idempotency_key"]
-        or bool(row["closed"]) != (task.state == "closed")
+        or bool(row["closed"]) != (task.state in {"closed", "completed"})
     ):
         raise ScienceTaskStoreV2Error("persisted v2 Task row is inconsistent")
     expected = _replace_v2_task(task)
@@ -2107,6 +2970,45 @@ def _load_v2_task_closure(
         for item, attempt in zip(attempt_rows, attempts, strict=True)
     ):
         raise ScienceTaskStoreV2Error("persisted v2 Attempt closure is inconsistent")
+    transition_rows = connection.execute(
+        "SELECT transition_json FROM successor_transitions WHERE task_id = ? LIMIT 2",
+        (task.task_id,),
+    ).fetchall()
+    if task.successor_transition is None:
+        if transition_rows:
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 Task omits its successor transition"
+            )
+    else:
+        if len(transition_rows) != 1:
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 Task successor transition is missing or duplicated"
+            )
+        transition = _v2_model_from_bytes(
+            m2.SuccessorTransitionV2,
+            bytes(transition_rows[0]["transition_json"]),
+        )
+        nonterminal = {
+            "pending",
+            "sealing_dataset",
+            "running_methods",
+            "validating",
+            "materializing",
+            "committing",
+        }
+        if (
+            transition.transition != task.successor_transition
+            or (
+                task.state == "waiting_for_successor"
+                and transition.state not in nonterminal
+            )
+            or (task.state == "failed" and transition.state != "failed")
+            or (task.state == "completed" and transition.state != "committed")
+            or task.state not in {"waiting_for_successor", "failed", "completed"}
+        ):
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 Task successor state is inconsistent"
+            )
     return task
 
 

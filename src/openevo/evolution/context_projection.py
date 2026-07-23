@@ -263,6 +263,14 @@ class ContextProjectionResolveRequest(_ProjectionContract):
     projection_contract_version: Literal["1"] = "1"
     task_id: str = Field(min_length=1, max_length=4096)
     instruction: str = Field(min_length=1, max_length=MAX_CONTRIBUTION_TEXT)
+    successor_transition_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    predecessor_project_head_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     agent: ContextProjectionAgent
     base_model: str | None = Field(default=None, max_length=4096)
     policy_version: str | None = Field(default=None, max_length=4096)
@@ -280,6 +288,11 @@ class ContextProjectionResolveRequest(_ProjectionContract):
     )
 
     _text_fields = field_validator("task_id", "instruction")(_text)
+
+    @field_validator("successor_transition_id", "predecessor_project_head_id")
+    @classmethod
+    def _optional_successor_identity(cls, value: str | None) -> str | None:
+        return None if value is None else _stable_id(value)
 
     @field_validator("base_model", "policy_version")
     @classmethod
@@ -349,6 +362,12 @@ class ContextProjectionResolveRequest(_ProjectionContract):
 
     @model_validator(mode="after")
     def _bounded_canonical_request(self) -> ContextProjectionResolveRequest:
+        if (self.successor_transition_id is None) != (
+            self.predecessor_project_head_id is None
+        ):
+            raise ValueError(
+                "successor transition and predecessor project head must be provided together"
+            )
         encoded = canonical_json(self.model_dump(mode="json"))
         if len(encoded.encode("utf-8")) > MAX_CONTEXT_PROJECTION_REQUEST_BYTES:
             raise ValueError("context projection request exceeds the byte budget")

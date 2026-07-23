@@ -22,6 +22,8 @@ from openevo.evolution.framework import (
 )
 from openevo.evolution.revisions import (
     AdmissionStatus,
+    AtomicSuccessorCommitV2,
+    AtomicSuccessorManifestV2,
     ContentAddressedSnapshotRef,
     ExecutionModelIdentity,
     ExecutionRuntimeIdentity,
@@ -41,6 +43,7 @@ from openevo.evolution.revisions import (
     TaskExecutionEnvelopeV1,
     VerifiedExecutionSnapshot,
     admission_id_for_request,
+    atomic_successor_manifest_sha256,
     bind_task_admission,
     content_addressed_snapshot_ref,
     execution_snapshot_id_for_snapshot,
@@ -50,6 +53,62 @@ from openevo.evolution.revisions import (
 from openevo.evolution.store import EvolutionStore
 from tests.framework_testkit import verified_builtin_registry
 from tests.revision_testkit import verified_execution_snapshot_for_test
+
+
+def _atomic_successor_manifest(**changes: object) -> AtomicSuccessorManifestV2:
+    payload: dict[str, object] = {
+        "project_id": "project",
+        "successor_transition_id": "successor-1",
+        "task_id": "task-1",
+        "task_admission_id": "admission-1",
+        "admission_sha256": "1" * 64,
+        "accepted_attempt_id": "attempt-1",
+        "predecessor_project_head_id": "head-0",
+        "predecessor_generation": 0,
+        "predecessor_manifest_sha256": "2" * 64,
+        "successor_project_head_id": "head-1",
+        "successor_generation": 1,
+        "successor_manifest_sha256": "3" * 64,
+        "workspace_snapshot_id": "workspace-1",
+        "workspace_manifest_sha256": "4" * 64,
+        "evolution_revision_id": "evolution-1",
+        "evolution_revision_manifest_sha256": "5" * 64,
+        "runtime_context_snapshot_id": "runtime-context-1",
+        "runtime_context_manifest_sha256": "6" * 64,
+        "effective_execution_snapshot_id": "execution-1",
+        "effective_execution_snapshot_sha256": "7" * 64,
+        "registry_sha256": "8" * 64,
+        "normalized_evolution_intent_sha256": "9" * 64,
+        "dataset_id": "dataset-1",
+        "dataset_artifact_id": "artifact-dataset",
+        "dataset_manifest_sha256": "a" * 64,
+        "materialized_context_id": "materialized-context-1",
+        "materialized_context_manifest_sha256": "b" * 64,
+        "method_artifact_ids": ("artifact-memory",),
+    }
+    payload.update(changes)
+    return AtomicSuccessorManifestV2.model_validate(payload)
+
+
+def test_atomic_successor_receipt_is_adjacent_closed_and_content_addressed() -> None:
+    manifest = _atomic_successor_manifest()
+    digest = atomic_successor_manifest_sha256(manifest)
+
+    assert AtomicSuccessorCommitV2(
+        manifest_sha256=digest,
+        manifest=manifest,
+    ).manifest == manifest
+    with pytest.raises(ValidationError, match="adjacent"):
+        _atomic_successor_manifest(successor_generation=2)
+    with pytest.raises(ValidationError, match="digest"):
+        AtomicSuccessorCommitV2(
+            manifest_sha256="f" * 64,
+            manifest=manifest,
+        )
+    with pytest.raises(ValidationError, match="extra"):
+        AtomicSuccessorManifestV2.model_validate(
+            {**manifest.model_dump(mode="python"), "host_path": "/private/state"}
+        )
 
 
 def _projection_request(*, subscription: bool = False) -> ContextProjectionResolveRequest:

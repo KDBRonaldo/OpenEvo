@@ -6,6 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from openevo.backend.contracts.v1 import models as m
+from openevo.backend.science_successor import (
+    AcceptedWorkspaceResultV2,
+    ScienceMethodOutputV2,
+    ScienceSuccessorMethodPlanV2,
+    ScienceSuccessorPlanV2,
+    ScienceSuccessorPreparationContextV2,
+    SealedTranscriptDatasetV2,
+    SuccessorMaterializationV2,
+    ValidatedScienceOutputsV2,
+    science_successor_plan_sha256,
+)
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.evolution.framework import EvolutionExecutionProfile
 from openevo.experiments.compiler import (
@@ -28,8 +39,6 @@ from openevo.runtime.managed import (
 
 
 _MANAGED_PROXY_CODEX_HOME = f"{MANAGED_HOME}/.codex"
-
-
 @dataclass(frozen=True, slots=True)
 class CompiledScienceExecution:
     config: ExperimentConfig
@@ -176,4 +185,16 @@ def _workspace_path(project: m.ProjectV1, workspace_path: Path | None) -> Path |
     return path
 
 
-__all__ = ["CompiledScienceExecution", "compile_science_execution"]
+__all__ = [
+    "AcceptedWorkspaceResultV2",
+    "CompiledScienceExecution",
+    "ScienceMethodOutputV2",
+    "ScienceSuccessorMethodPlanV2",
+    "ScienceSuccessorPlanV2",
+    "ScienceSuccessorPreparationContextV2",
+    "SealedTranscriptDatasetV2",
+    "SuccessorMaterializationV2",
+    "ValidatedScienceOutputsV2",
+    "compile_science_execution",
+    "science_successor_plan_sha256",
+]

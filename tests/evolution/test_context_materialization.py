@@ -297,7 +297,11 @@ def _payload_service(monkeypatch: pytest.MonkeyPatch):
     )
 
 
-def _request() -> ContextProjectionResolveRequest:
+def _request(
+    *,
+    successor_transition_id: str | None = None,
+    predecessor_project_head_id: str | None = None,
+) -> ContextProjectionResolveRequest:
     roots = RuntimeDestinationRoots(
         target_data="/runtime/data",
         harness_skills="/runtime/extensions",
@@ -306,6 +310,8 @@ def _request() -> ContextProjectionResolveRequest:
     return ContextProjectionResolveRequest(
         task_id="task",
         instruction="run",
+        successor_transition_id=successor_transition_id,
+        predecessor_project_head_id=predecessor_project_head_id,
         agent={"harness": "runner"},
         base_model="base",
         execution_profile=EvolutionExecutionProfile(
@@ -394,6 +400,49 @@ def test_materializer_requires_verified_registry(
     )
     with pytest.raises((TypeError, ValueError), match="verified|registry"):
         ContextMaterializer(tmp_path / "artifacts", tmp_path / "contexts", object())
+
+
+def test_materialization_preserves_atomic_successor_ownership(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def test_noreplace(
+        source: str,
+        destination: str,
+        *,
+        directory_fd: int,
+    ) -> None:
+        with pytest.raises(FileNotFoundError):
+            os.stat(destination, dir_fd=directory_fd, follow_symlinks=False)
+        os.rename(
+            source,
+            destination,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+
+    monkeypatch.setattr(context_materialization, "_rename_noreplace", test_noreplace)
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    source = artifacts / "source.txt"
+    source.write_text("x", encoding="utf-8")
+    request = _request(
+        successor_transition_id="successor-1",
+        predecessor_project_head_id="project-head-0",
+    )
+    projection = _inline_projection()
+    response = _response(request, projection)
+
+    result = _materializer(artifacts, tmp_path / "contexts").materialize(
+        request,
+        response,
+        (_row("artifact-a", source),),
+    )
+
+    assert result.successor_transition_id == "successor-1"
+    assert result.predecessor_project_head_id == "project-head-0"
+    with pytest.raises(ValueError, match="together"):
+        _request(successor_transition_id="successor-1")
 
 
 def test_materializer_rejects_registry_or_handler_identity_mismatch(tmp_path: Path) -> None:

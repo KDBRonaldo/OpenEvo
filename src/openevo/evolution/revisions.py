@@ -10,7 +10,7 @@ from typing import Literal
 import unicodedata
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ConfigDict, Field, field_validator, model_validator
 
 from openevo.evolution.context_materialization import MaterializedAdapter
 from openevo.evolution.framework.contracts import (
@@ -518,6 +518,119 @@ class RevisionManifestV1(_Contract):
         return self
 
 
+class _AtomicSuccessorContract(_Contract):
+    model_config = ConfigDict(
+        extra="forbid",
+        frozen=True,
+        strict=True,
+        validate_default=True,
+    )
+
+
+class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
+    """Closed receipt for one fully prepared adjacent science successor."""
+
+    atomic_successor_contract_version: Literal["2"] = "2"
+    project_id: str
+    successor_transition_id: str
+    task_id: str
+    task_admission_id: str
+    admission_sha256: str
+    accepted_attempt_id: str
+    predecessor_project_head_id: str
+    predecessor_generation: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    predecessor_manifest_sha256: str
+    successor_project_head_id: str
+    successor_generation: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    successor_manifest_sha256: str
+    workspace_snapshot_id: str
+    workspace_manifest_sha256: str
+    evolution_revision_id: str
+    evolution_revision_manifest_sha256: str
+    runtime_context_snapshot_id: str
+    runtime_context_manifest_sha256: str
+    effective_execution_snapshot_id: str
+    effective_execution_snapshot_sha256: str
+    registry_sha256: str
+    normalized_evolution_intent_sha256: str
+    dataset_id: str
+    dataset_artifact_id: str
+    dataset_manifest_sha256: str
+    materialized_context_id: str
+    materialized_context_manifest_sha256: str
+    method_artifact_ids: tuple[str, ...] = Field(default=(), max_length=128)
+
+    _ids = field_validator(
+        "project_id",
+        "successor_transition_id",
+        "task_id",
+        "task_admission_id",
+        "accepted_attempt_id",
+        "predecessor_project_head_id",
+        "successor_project_head_id",
+        "workspace_snapshot_id",
+        "evolution_revision_id",
+        "runtime_context_snapshot_id",
+        "effective_execution_snapshot_id",
+        "dataset_id",
+        "dataset_artifact_id",
+        "materialized_context_id",
+    )(_stable_id)
+    _digests = field_validator(
+        "admission_sha256",
+        "predecessor_manifest_sha256",
+        "successor_manifest_sha256",
+        "workspace_manifest_sha256",
+        "evolution_revision_manifest_sha256",
+        "runtime_context_manifest_sha256",
+        "effective_execution_snapshot_sha256",
+        "registry_sha256",
+        "normalized_evolution_intent_sha256",
+        "dataset_manifest_sha256",
+        "materialized_context_manifest_sha256",
+    )(_digest)
+    _generations = field_validator(
+        "predecessor_generation",
+        "successor_generation",
+        mode="before",
+    )(_strict_integer)
+
+    @field_validator("method_artifact_ids")
+    @classmethod
+    def _ordered_method_artifacts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _ordered_stable_ids(value, label="method artifact IDs")
+
+    @model_validator(mode="after")
+    def _adjacent_successor(self) -> AtomicSuccessorManifestV2:
+        if self.successor_generation != self.predecessor_generation + 1:
+            raise ValueError("atomic successor generation must be adjacent")
+        if self.successor_project_head_id == self.predecessor_project_head_id:
+            raise ValueError("atomic successor must have a new project-head identity")
+        if len(canonical_json(self).encode("utf-8")) > MAX_REVISION_MANIFEST_BYTES:
+            raise ValueError("atomic successor manifest exceeds the byte limit")
+        return self
+
+
+def atomic_successor_manifest_sha256(manifest: AtomicSuccessorManifestV2) -> str:
+    if type(manifest) is not AtomicSuccessorManifestV2:
+        raise TypeError("atomic successor digest requires AtomicSuccessorManifestV2")
+    return canonical_digest(manifest)
+
+
+class AtomicSuccessorCommitV2(_AtomicSuccessorContract):
+    atomic_successor_commit_contract_version: Literal["2"] = "2"
+    manifest_sha256: str
+    manifest: AtomicSuccessorManifestV2
+
+    _digest = field_validator("manifest_sha256")(_digest)
+
+    @model_validator(mode="after")
+    def _manifest_identity(self) -> AtomicSuccessorCommitV2:
+        if self.manifest_sha256 != atomic_successor_manifest_sha256(self.manifest):
+            raise ValueError("atomic successor commit digest is inconsistent")
+        return self
+
+
 class RevisionRecord(_Contract):
     revision_id: str
     manifest_digest: str
@@ -730,6 +843,8 @@ def bind_task_admission(
 __all__ = [
     "AdmissionQueueReason",
     "AdmissionStatus",
+    "AtomicSuccessorCommitV2",
+    "AtomicSuccessorManifestV2",
     "ContentAddressedSnapshotRef",
     "ExecutionModelIdentity",
     "ExecutionRuntimeIdentity",
@@ -758,6 +873,7 @@ __all__ = [
     "TaskExecutionEnvelopeV1",
     "VerifiedExecutionSnapshot",
     "admission_id_for_request",
+    "atomic_successor_manifest_sha256",
     "bind_task_admission",
     "content_addressed_snapshot_ref",
     "execution_snapshot_id_for_snapshot",

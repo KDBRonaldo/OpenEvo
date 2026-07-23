@@ -148,6 +148,14 @@ class MaterializedContext(_Contract):
     context_id: str
     request_digest: str
     registry_digest: str
+    successor_transition_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    predecessor_project_head_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     base_model: str | None = None
     projections: tuple[TargetHandlerOutput, ...] = Field(default=(), max_length=128)
     selection: ContextProjectionSelection
@@ -161,8 +169,19 @@ class MaterializedContext(_Contract):
     _context = field_validator("context_id")(_stable_id)
     _digests = field_validator("request_digest", "registry_digest")(_digest)
 
+    @field_validator("successor_transition_id", "predecessor_project_head_id")
+    @classmethod
+    def _optional_successor_identity(cls, value: str | None) -> str | None:
+        return None if value is None else _stable_id(value)
+
     @model_validator(mode="after")
     def _unique_blob_and_environment_ids(self) -> MaterializedContext:
+        if (self.successor_transition_id is None) != (
+            self.predecessor_project_head_id is None
+        ):
+            raise ValueError(
+                "successor transition and predecessor project head must be provided together"
+            )
         blob_ids = tuple(item.blob_id for item in self.blobs)
         if len(blob_ids) != len(set(blob_ids)):
             raise ValueError("materialized blob IDs must be unique")
@@ -659,6 +678,8 @@ class ContextMaterializer:
                 context_id=response.context_id,
                 request_digest=response.request_digest,
                 registry_digest=response.registry_digest,
+                successor_transition_id=request.successor_transition_id,
+                predecessor_project_head_id=request.predecessor_project_head_id,
                 base_model=response.base_model,
                 projections=response.projections,
                 selection=response.selection,

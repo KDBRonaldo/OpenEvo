@@ -25,6 +25,15 @@ from openevo.backend.contracts.v1.store import (
 from openevo.backend.run_control import CoreRunControlError, CoreTaskControlError
 from openevo.backend.service_control import CoreServiceControlError
 from openevo.backend.science_execution import compile_science_execution
+from openevo.backend.science_successor import (
+    AcceptedWorkspaceResultV2,
+    ScienceMethodOutputV2,
+    ScienceSuccessorPlanV2,
+    ScienceSuccessorPreparationContextV2,
+    SealedTranscriptDatasetV2,
+    SuccessorMaterializationV2,
+    ValidatedScienceOutputsV2,
+)
 from openevo.backend.science_run_store import (
     ProjectInFlightCoordinator,
     ScienceAttemptNotFoundV2,
@@ -59,6 +68,11 @@ from openevo.backend.service_supervisor import (
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.evolution.framework.execution import ResolvedMethodInputBinding
 from openevo.evolution.runtime_injection import build_runtime_injection_plan
+from openevo.evolution.revisions import (
+    AtomicSuccessorCommitV2,
+    AtomicSuccessorManifestV2,
+    atomic_successor_manifest_sha256,
+)
 from openevo.experiments import EvolutionHttpClient, RolloutHttpClient
 from openevo.experiments.clients import EvolutionClientProtocol, RolloutClientProtocol
 from openevo.experiments.runner import _run_core_authoritative_experiment
@@ -113,6 +127,39 @@ RolloutFactory = Callable[[ServiceRunBinding], RolloutClientProtocol]
 EvolutionFactory = Callable[[ServiceRunBinding], EvolutionClientProtocol]
 
 
+class ScienceSuccessorPreparerV2(Protocol):
+    """Prepare all evidence before the Core owner atomically advances a head."""
+
+    def seal_dataset(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+    ) -> SealedTranscriptDatasetV2: ...
+
+    def run_methods(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        dataset: SealedTranscriptDatasetV2,
+    ) -> tuple[ScienceMethodOutputV2, ...]: ...
+
+    def validate_outputs(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        dataset: SealedTranscriptDatasetV2,
+        outputs: tuple[ScienceMethodOutputV2, ...],
+    ) -> ValidatedScienceOutputsV2: ...
+
+    def materialize_context(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        validated: ValidatedScienceOutputsV2,
+    ) -> SuccessorMaterializationV2: ...
+
+    def capture_workspace_result(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+    ) -> AcceptedWorkspaceResultV2: ...
+
+
 class _RunCancelled(RuntimeError):
     pass
 
@@ -129,9 +176,12 @@ class CoreScienceTaskOwnerV2:
         *,
         state_root: str | Path,
         clock: Callable[[], datetime] | None = None,
+        successor_preparer: ScienceSuccessorPreparerV2 | None = None,
     ) -> None:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._ledger = ScienceTaskStoreV2(Path(state_root) / "science-tasks-v2")
+        self._successor_preparer = successor_preparer
+        self._recover_interrupted_successor_transitions()
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handlers: dict[str, Callable[[Mapping[str, object]], object]] = {
@@ -173,6 +223,226 @@ class CoreScienceTaskOwnerV2:
             _raise_v2_owner_error(
                 exc,
                 operation_id="publishCoreProjectAdmissionAuthorityV2",
+            )
+
+    def project_admission_authority(
+        self,
+        project_id: str,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        try:
+            return self._ledger.project_admission_authority(project_id)
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="getCoreProjectAdmissionAuthorityV2",
+            )
+
+    def active_project_head(self, project_id: str) -> m2.ProjectHeadRefV2:
+        try:
+            return self._ledger.active_project_head(project_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreActiveProjectHeadV2")
+
+    def list_project_heads(self, project_id: str) -> list[m2.ProjectHeadRefV2]:
+        try:
+            return self._ledger.list_project_heads(project_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="listCoreProjectHeadsV2")
+
+    def get_successor_transition(
+        self,
+        successor_transition_id: str,
+    ) -> m2.SuccessorTransitionV2:
+        try:
+            return self._ledger.get_successor_transition(successor_transition_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreSuccessorTransitionV2")
+
+    def get_successor_transition_for_task(
+        self,
+        task_id: str,
+    ) -> m2.SuccessorTransitionV2:
+        try:
+            return self._ledger.get_successor_transition_for_task(task_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreTaskSuccessorTransitionV2")
+
+    def successor_commit(
+        self,
+        successor_transition_id: str,
+    ) -> AtomicSuccessorCommitV2 | None:
+        try:
+            return self._ledger.successor_commit(successor_transition_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreSuccessorCommitV2")
+
+    def run_successor_transition(
+        self,
+        task_id: str,
+        *,
+        accepted_attempt_id: str,
+        plan: ScienceSuccessorPlanV2,
+    ) -> m2.SuccessorTransitionV2:
+        preparer = self._successor_preparer
+        if preparer is None:
+            raise CoreTaskControlError(
+                "successor_preparer_unavailable",
+                "Core has no verified science successor preparer.",
+                http_status=503,
+                retryable=False,
+            )
+        try:
+            transition = self._ledger.start_successor_transition(
+                task_id=task_id,
+                accepted_attempt_id=accepted_attempt_id,
+                plan=plan,
+                now=self._clock(),
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="startCoreSuccessorTransitionV2")
+
+        transition_id = transition.transition.successor_transition_id
+        try:
+            context = self._advance_successor_phase(
+                transition_id,
+                state="sealing_dataset",
+                plan=plan,
+            )
+            dataset = _validate_sealed_successor_dataset(
+                preparer.seal_dataset(context),
+                context=context,
+            )
+
+            context = self._advance_successor_phase(
+                transition_id,
+                state="running_methods",
+                plan=plan,
+            )
+            outputs = _validate_successor_method_outputs(
+                preparer.run_methods(context, dataset),
+                plan=plan,
+            )
+
+            context = self._advance_successor_phase(
+                transition_id,
+                state="validating",
+                plan=plan,
+            )
+            validated = _validate_successor_outputs_receipt(
+                preparer.validate_outputs(context, dataset, outputs),
+                context=context,
+                dataset=dataset,
+                outputs=outputs,
+            )
+
+            context = self._advance_successor_phase(
+                transition_id,
+                state="materializing",
+                plan=plan,
+            )
+            materialized = _validate_successor_materialization_receipt(
+                preparer.materialize_context(context, validated),
+                context=context,
+                validated=validated,
+            )
+            workspace = _validate_accepted_workspace_result(
+                preparer.capture_workspace_result(context),
+                context=context,
+            )
+
+            context = self._advance_successor_phase(
+                transition_id,
+                state="committing",
+                plan=plan,
+            )
+            successor = _build_v2_successor_project_head(
+                context=context,
+                workspace=workspace,
+                validated=validated,
+                materialized=materialized,
+            )
+            manifest = _build_atomic_successor_manifest(
+                context=context,
+                dataset=dataset,
+                outputs=outputs,
+                workspace=workspace,
+                validated=validated,
+                materialized=materialized,
+                successor=successor,
+            )
+            commit = AtomicSuccessorCommitV2(
+                manifest_sha256=atomic_successor_manifest_sha256(manifest),
+                manifest=manifest,
+            )
+            return self._ledger.commit_successor_transition(
+                transition_id,
+                successor=successor,
+                commit=commit,
+                now=self._clock(),
+            )
+        except Exception as exc:
+            error = _successor_transition_api_error(
+                code="successor_transition_failed",
+                message="Core could not prepare and atomically commit the successor state.",
+            )
+            try:
+                self._ledger.fail_successor_transition(
+                    transition_id,
+                    error=error,
+                    now=self._clock(),
+                )
+            except Exception as persistence_exc:
+                raise CoreTaskControlError(
+                    "successor_transition_failed",
+                    "Core could not preserve the failed successor transition.",
+                    http_status=503,
+                    retryable=False,
+                ) from persistence_exc
+            raise CoreTaskControlError(
+                "successor_transition_failed",
+                "Core preserved the failed successor transition without advancing the project head.",
+                http_status=503,
+                retryable=False,
+            ) from exc
+
+    def _advance_successor_phase(
+        self,
+        successor_transition_id: str,
+        *,
+        state: str,
+        plan: ScienceSuccessorPlanV2,
+    ) -> ScienceSuccessorPreparationContextV2:
+        transition = self._ledger.advance_successor_transition(
+            successor_transition_id,
+            state=state,
+            now=self._clock(),
+        )
+        admission = transition.transition.task_admission
+        attempt = transition.transition.accepted_attempt
+        if admission is None or attempt is None:
+            raise ScienceTaskStoreV2Error(
+                "run-result successor transition lost its Task ownership"
+            )
+        task = self._ledger.get_task(admission.task_id)
+        return ScienceSuccessorPreparationContextV2(
+            task=task,
+            accepted_attempt=attempt,
+            transition=transition,
+            plan=plan,
+        )
+
+    def _recover_interrupted_successor_transitions(self) -> None:
+        for transition_id in self._ledger.nonterminal_successor_transition_ids():
+            self._ledger.fail_successor_transition(
+                transition_id,
+                error=_successor_transition_api_error(
+                    code="successor_transition_interrupted",
+                    message=(
+                        "Core restarted before the successor transition committed; "
+                        "the predecessor remains active."
+                    ),
+                ),
+                now=self._clock(),
             )
 
     def close_task(
@@ -261,6 +531,245 @@ class CoreScienceTaskOwnerV2:
             _v2_string_argument(arguments["task_id"], label="task ID"),
             _v2_string_argument(arguments["attempt_id"], label="attempt ID"),
         )
+
+
+def _validate_sealed_successor_dataset(
+    value: SealedTranscriptDatasetV2,
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+) -> SealedTranscriptDatasetV2:
+    if type(value) is not SealedTranscriptDatasetV2:
+        raise TypeError("successor dataset has the wrong type")
+    dataset = SealedTranscriptDatasetV2.model_validate(value.model_dump(mode="python"))
+    if (
+        dataset.task_id != context.task.task_id
+        or dataset.task_admission_id
+        != context.task.admission.task_admission_id
+        or dataset.accepted_attempt_id != context.accepted_attempt.attempt_id
+    ):
+        raise ValueError("sealed successor dataset has different Task ownership")
+    return dataset
+
+
+def _validate_successor_method_outputs(
+    value: tuple[ScienceMethodOutputV2, ...],
+    *,
+    plan: ScienceSuccessorPlanV2,
+) -> tuple[ScienceMethodOutputV2, ...]:
+    if type(value) is not tuple or any(
+        type(item) is not ScienceMethodOutputV2 for item in value
+    ):
+        raise TypeError("successor method outputs have the wrong type")
+    outputs = tuple(
+        ScienceMethodOutputV2.model_validate(item.model_dump(mode="python"))
+        for item in value
+    )
+    expected = tuple(
+        (item.target_id, item.method_id, item.output_artifact_type)
+        for item in plan.enabled_methods
+    )
+    actual = tuple(
+        (item.target_id, item.method_id, item.artifact_type) for item in outputs
+    )
+    if actual != expected:
+        raise ValueError(
+            "successor method outputs do not exactly cover the enabled method plan"
+        )
+    if len({item.artifact_id for item in outputs}) != len(outputs):
+        raise ValueError("successor method output artifact IDs must be unique")
+    return outputs
+
+
+def _validate_successor_outputs_receipt(
+    value: ValidatedScienceOutputsV2,
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    dataset: SealedTranscriptDatasetV2,
+    outputs: tuple[ScienceMethodOutputV2, ...],
+) -> ValidatedScienceOutputsV2:
+    if type(value) is not ValidatedScienceOutputsV2:
+        raise TypeError("validated successor outputs have the wrong type")
+    validated = ValidatedScienceOutputsV2.model_validate(
+        value.model_dump(mode="python")
+    )
+    if (
+        validated.project_id != context.task.project_id
+        or validated.successor_transition_id
+        != context.transition.transition.successor_transition_id
+        or validated.predecessor_project_head_id
+        != context.task.admission.predecessor_project_head.project_head_id
+        or validated.dataset != dataset
+        or validated.outputs != outputs
+    ):
+        raise ValueError("validated successor outputs do not bind their preparation")
+    return validated
+
+
+def _validate_successor_materialization_receipt(
+    value: SuccessorMaterializationV2,
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    validated: ValidatedScienceOutputsV2,
+) -> SuccessorMaterializationV2:
+    if type(value) is not SuccessorMaterializationV2:
+        raise TypeError("successor materialization has the wrong type")
+    materialized = SuccessorMaterializationV2.model_validate(
+        value.model_dump(mode="python")
+    )
+    runtime = materialized.runtime_context_snapshot
+    evolution = validated.evolution_revision
+    if (
+        materialized.project_id != context.task.project_id
+        or materialized.successor_transition_id
+        != context.transition.transition.successor_transition_id
+        or materialized.predecessor_project_head_id
+        != context.task.admission.predecessor_project_head.project_head_id
+        or runtime.evolution_revision_id != evolution.evolution_revision_id
+        or runtime.evolution_revision_manifest_sha256 != evolution.manifest_sha256
+        or runtime.registry_sha256 != context.task.admission.registry_sha256
+    ):
+        raise ValueError("successor materialization does not bind validated outputs")
+    return materialized
+
+
+def _validate_accepted_workspace_result(
+    value: AcceptedWorkspaceResultV2,
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+) -> AcceptedWorkspaceResultV2:
+    if type(value) is not AcceptedWorkspaceResultV2:
+        raise TypeError("accepted workspace result has the wrong type")
+    workspace = AcceptedWorkspaceResultV2.model_validate(
+        value.model_dump(mode="python")
+    )
+    if (
+        workspace.project_id != context.task.project_id
+        or workspace.task_id != context.task.task_id
+        or workspace.accepted_attempt_id != context.accepted_attempt.attempt_id
+    ):
+        raise ValueError("accepted workspace result has different Task ownership")
+    return workspace
+
+
+def _build_v2_successor_project_head(
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    workspace: AcceptedWorkspaceResultV2,
+    validated: ValidatedScienceOutputsV2,
+    materialized: SuccessorMaterializationV2,
+) -> m2.ProjectHeadRefV2:
+    predecessor = context.task.admission.predecessor_project_head
+    composition = {
+        "effective_execution_snapshot": predecessor.effective_execution_snapshot.model_dump(
+            mode="json"
+        ),
+        "evolution_revision": validated.evolution_revision.model_dump(mode="json"),
+        "generation": predecessor.generation + 1,
+        "predecessor_project_head_id": predecessor.project_head_id,
+        "project_id": context.task.project_id,
+        "registry_sha256": materialized.runtime_context_snapshot.registry_sha256,
+        "runtime_context_snapshot": materialized.runtime_context_snapshot.model_dump(
+            mode="json"
+        ),
+        "successor_transition_id": (
+            context.transition.transition.successor_transition_id
+        ),
+        "workspace_snapshot": workspace.workspace_snapshot.model_dump(mode="json"),
+    }
+    payload = json.dumps(
+        composition,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    manifest_sha256 = hashlib.sha256(payload).hexdigest()
+    return m2.ProjectHeadRefV2(
+        project_head_id=f"project-head-{manifest_sha256[:32]}",
+        project_id=context.task.project_id,
+        generation=predecessor.generation + 1,
+        predecessor_project_head_id=predecessor.project_head_id,
+        workspace_snapshot=workspace.workspace_snapshot,
+        evolution_revision=validated.evolution_revision,
+        runtime_context_snapshot=materialized.runtime_context_snapshot,
+        effective_execution_snapshot=predecessor.effective_execution_snapshot,
+        registry_sha256=materialized.runtime_context_snapshot.registry_sha256,
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _build_atomic_successor_manifest(
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    dataset: SealedTranscriptDatasetV2,
+    outputs: tuple[ScienceMethodOutputV2, ...],
+    workspace: AcceptedWorkspaceResultV2,
+    validated: ValidatedScienceOutputsV2,
+    materialized: SuccessorMaterializationV2,
+    successor: m2.ProjectHeadRefV2,
+) -> AtomicSuccessorManifestV2:
+    predecessor = context.task.admission.predecessor_project_head
+    execution = successor.effective_execution_snapshot
+    return AtomicSuccessorManifestV2(
+        project_id=context.task.project_id,
+        successor_transition_id=(
+            context.transition.transition.successor_transition_id
+        ),
+        task_id=context.task.task_id,
+        task_admission_id=context.task.admission.task_admission_id,
+        admission_sha256=context.task.admission.admission_sha256,
+        accepted_attempt_id=context.accepted_attempt.attempt_id,
+        predecessor_project_head_id=predecessor.project_head_id,
+        predecessor_generation=predecessor.generation,
+        predecessor_manifest_sha256=predecessor.manifest_sha256,
+        successor_project_head_id=successor.project_head_id,
+        successor_generation=successor.generation,
+        successor_manifest_sha256=successor.manifest_sha256,
+        workspace_snapshot_id=workspace.workspace_snapshot.workspace_snapshot_id,
+        workspace_manifest_sha256=workspace.workspace_snapshot.manifest_sha256,
+        evolution_revision_id=validated.evolution_revision.evolution_revision_id,
+        evolution_revision_manifest_sha256=(
+            validated.evolution_revision.manifest_sha256
+        ),
+        runtime_context_snapshot_id=(
+            materialized.runtime_context_snapshot.runtime_context_snapshot_id
+        ),
+        runtime_context_manifest_sha256=(
+            materialized.runtime_context_snapshot.manifest_sha256
+        ),
+        effective_execution_snapshot_id=(
+            execution.effective_execution_snapshot_id
+        ),
+        effective_execution_snapshot_sha256=execution.snapshot_sha256,
+        registry_sha256=successor.registry_sha256,
+        normalized_evolution_intent_sha256=(
+            context.task.admission.normalized_evolution_intent_sha256
+        ),
+        dataset_id=dataset.dataset_id,
+        dataset_artifact_id=dataset.artifact_id,
+        dataset_manifest_sha256=dataset.manifest_sha256,
+        materialized_context_id=materialized.materialized_context_id,
+        materialized_context_manifest_sha256=(
+            materialized.materialized_context_manifest_sha256
+        ),
+        method_artifact_ids=tuple(sorted(item.artifact_id for item in outputs)),
+    )
+
+
+def _successor_transition_api_error(*, code: str, message: str) -> m2.ApiErrorV2:
+    return m2.ApiErrorV2(
+        request_id=f"successor-error-{secrets.token_hex(12)}",
+        code=code,
+        http_status=503,
+        message=message,
+        category="transition",
+        retryable=False,
+        repair_action="repair",
+        next_action=(
+            "Inspect remote diagnostics and repair the preserved transition before "
+            "submitting another Task."
+        ),
+    )
 
 
 class CoreScienceRunOwner:
