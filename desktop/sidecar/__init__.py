@@ -47,6 +47,13 @@ from desktop.sidecar.core_client_v1 import (
 from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import DesktopReleaseProvider
+from desktop.sidecar.system_ssh_session import (
+    AskpassHelperAuthority,
+    SystemOpenSshSession,
+    SystemOpenSshSessionError,
+    SystemOpenSshSessionOwner,
+    SystemOpenSshSessionSnapshot,
+)
 from desktop.sidecar.workspace_imports import (
     WorkspaceArchiveValidationError,
     WorkspaceImportError,
@@ -75,6 +82,7 @@ from openevo.deployment.workspace import (
 __all__ = [
     "DesktopExecutionStatus",
     "DesktopReleaseProvider",
+    "AskpassHelperAuthority",
     "BackendClient",
     "BackendConnection",
     "DesktopBackendError",
@@ -104,6 +112,10 @@ __all__ = [
     "SSHAuthConfig",
     "SidecarHealth",
     "SidecarSciencePlan",
+    "SystemOpenSshSession",
+    "SystemOpenSshSessionError",
+    "SystemOpenSshSessionOwner",
+    "SystemOpenSshSessionSnapshot",
     "WorkspacePreparationAction",
     "WorkspacePreparationPlan",
     "WorkspaceArchiveValidationError",

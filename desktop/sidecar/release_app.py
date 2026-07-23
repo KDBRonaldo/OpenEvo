@@ -68,6 +68,7 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleError,
     RemoteLifecycleSupersededError,
 )
+from desktop.sidecar.system_ssh_session import AskpassHelperAuthority
 from desktop.sidecar.workspace_imports import (
     WorkspaceImportError,
     WorkspaceImportIntegrityError,
@@ -324,6 +325,7 @@ def create_release_desktop_local_api_app(
     release_assets_root: Path | str | None = None,
     core_bridge: DesktopCoreBridgeV1 | None = None,
     event_broker: DesktopEventBrokerV1 | None = None,
+    system_ssh_askpass_helper: AskpassHelperAuthority | None = None,
     startup_phase: Callable[[str], None] | None = None,
     close_on_shutdown: bool = True,
 ) -> FastAPI:
@@ -415,6 +417,7 @@ def create_release_desktop_local_api_app(
             readiness_key=readiness_key,
             execution_mode_capabilities=RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
             remote_lifecycle=lifecycle,
+            system_ssh_askpass_helper=system_ssh_askpass_helper,
             core_runtime=core_runtime,
             core_bridge=core_bridge,
             event_broker=event_broker,
@@ -432,6 +435,8 @@ def create_release_desktop_local_api_app(
             _cleanup_after_primary_failure(core_bridge.close)
         if lifecycle is not None:
             _cleanup_after_primary_failure(lifecycle.close)
+        if system_ssh_askpass_helper is not None:
+            _cleanup_after_primary_failure(system_ssh_askpass_helper.close)
         _cleanup_after_primary_failure(store.close)
         if workspace_import_store is not None:
             _cleanup_after_primary_failure(workspace_import_store.close)

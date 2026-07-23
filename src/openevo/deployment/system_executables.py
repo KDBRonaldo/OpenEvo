@@ -23,6 +23,8 @@ SSH_KEYGEN_EXECUTABLE = "/usr/bin/ssh-keygen"
 SSH_KEYSCAN_EXECUTABLE = "/usr/bin/ssh-keyscan"
 RSYNC_EXECUTABLE = "/usr/bin/rsync"
 OWNED_SUBPROCESS_BIRTH_ARGUMENT = "--openevo-owned-subprocess-birth-v1"
+SYSTEM_OPENSSH_OWNER_ARGUMENT = "--openevo-system-ssh-owner-v1"
+SYSTEM_OPENSSH_OWNER_PID_ENV = "OPENEVO_SSH_OWNER_PID"
 MACOS_SYSTEM_COMMAND_PATH = ":".join(
     (
         "/usr/local/bin",
@@ -73,6 +75,33 @@ _LINUX_INOTIFY_TARGET_MASK = (
 _LINUX_INOTIFY_EVENT = struct.Struct("iIII")
 _MAX_INOTIFY_OBSERVATION_BYTES = 1024 * 1024
 _SSH_AGENT_AUTHORITY_FAILURE = "SSH agent authority validation failed."
+_SYSTEM_OPENSSH_OWNER_ENV_KEYS = (
+    "DISPLAY",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    "OPENEVO_SSH_ASKPASS_CAPABILITY",
+    "OPENEVO_SSH_ASKPASS_SOCKET",
+    "OPENEVO_SSH_CONNECTION_GENERATION",
+    "PATH",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "SSH_AUTH_SOCK",
+)
+_SYSTEM_OPENSSH_OWNER_REQUIRED_ENV_KEYS = frozenset(
+    {
+        "DISPLAY",
+        "HOME",
+        "OPENEVO_SSH_ASKPASS_CAPABILITY",
+        "OPENEVO_SSH_ASKPASS_SOCKET",
+        "OPENEVO_SSH_CONNECTION_GENERATION",
+        "PATH",
+        "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE",
+    }
+)
 
 _AGENT_PROXY_SETUP_GUARD = threading.Lock()
 _PENDING_AGENT_PROXY_CLEANUPS: dict[
@@ -1307,6 +1336,40 @@ def run_packaged_owned_subprocess_birth(arguments: list[str]) -> None:
     )
 
 
+def run_packaged_system_openssh_owner(arguments: list[str]) -> None:
+    """Set the post-birth owner PID and exec the held Apple OpenSSH image."""
+
+    positions = [
+        index for index, value in enumerate(arguments) if value == SYSTEM_OPENSSH_OWNER_ARGUMENT
+    ]
+    if len(positions) != 1:
+        raise ValueError("system OpenSSH owner invocation is invalid")
+    payload = arguments[positions[0] + 1 :]
+    if len(payload) < 3 or payload[1] != SSH_EXECUTABLE:
+        raise ValueError("system OpenSSH owner payload is invalid")
+    executable_descriptor = _canonical_descriptor(payload[0])
+    executable_metadata = os.fstat(executable_descriptor)
+    _require_root_owned_executable(executable_metadata)
+    path_metadata = os.stat(payload[1], follow_symlinks=False)
+    _require_root_owned_executable(path_metadata)
+    if _executable_identity(path_metadata) != _executable_identity(executable_metadata):
+        raise ValueError("system OpenSSH owner executable binding changed")
+    if SYSTEM_OPENSSH_OWNER_PID_ENV in os.environ:
+        raise ValueError("system OpenSSH owner PID is already present")
+    environment = {
+        key: os.environ[key] for key in _SYSTEM_OPENSSH_OWNER_ENV_KEYS if key in os.environ
+    }
+    if not _SYSTEM_OPENSSH_OWNER_REQUIRED_ENV_KEYS.issubset(environment):
+        raise ValueError("system OpenSSH owner environment is incomplete")
+    owner_pid = os.getpid()
+    if owner_pid <= 1 or owner_pid > (1 << 31) - 1:
+        raise ValueError("system OpenSSH owner PID is invalid")
+    environment[SYSTEM_OPENSSH_OWNER_PID_ENV] = str(owner_pid)
+    os.set_inheritable(executable_descriptor, False)
+    execution_path = _verified_execution_path(payload[1], executable_descriptor)
+    os.execve(execution_path, payload[1:], environment)
+
+
 def _verified_execution_path(path: str, descriptor: int) -> str:
     if sys.platform.startswith("linux"):
         return f"/dev/fd/{descriptor}"
@@ -1728,6 +1791,8 @@ def _zero_bytearray(buffer: bytearray) -> None:
 __all__ = (
     "RSYNC_EXECUTABLE",
     "OWNED_SUBPROCESS_BIRTH_ARGUMENT",
+    "SYSTEM_OPENSSH_OWNER_ARGUMENT",
+    "SYSTEM_OPENSSH_OWNER_PID_ENV",
     "SSH_EXECUTABLE",
     "SSH_KEYSCAN_EXECUTABLE",
     "SshAgentAuthorityError",
@@ -1737,4 +1802,5 @@ __all__ = (
     "VerifiedSystemExecutable",
     "closed_ssh_environment",
     "run_packaged_owned_subprocess_birth",
+    "run_packaged_system_openssh_owner",
 )

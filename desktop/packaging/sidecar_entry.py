@@ -129,16 +129,20 @@ def _load_packaged_build_metadata() -> _PackagedBuildMetadata:
         raise ValueError("invalid packaged sidecar build metadata")
     platform_identity = (architecture, target_triple, helper["signature"])
     if (
-        sys.platform == "darwin"
-        and platform_identity
-        not in {
-            ("arm64", "aarch64-apple-darwin", "adhoc"),
-            ("x86_64", "x86_64-apple-darwin", "adhoc"),
-        }
-    ) or (
-        sys.platform == "linux"
-        and platform_identity != ("x86_64", "x86_64-unknown-linux-gnu", "none")
-    ) or sys.platform not in {"darwin", "linux"}:
+        (
+            sys.platform == "darwin"
+            and platform_identity
+            not in {
+                ("arm64", "aarch64-apple-darwin", "adhoc"),
+                ("x86_64", "x86_64-apple-darwin", "adhoc"),
+            }
+        )
+        or (
+            sys.platform == "linux"
+            and platform_identity != ("x86_64", "x86_64-unknown-linux-gnu", "none")
+        )
+        or sys.platform not in {"darwin", "linux"}
+    ):
         raise ValueError("invalid packaged sidecar build metadata")
     return _PackagedBuildMetadata(
         source_commit=source_commit,
@@ -156,7 +160,9 @@ def _startup_main() -> int:
     try:
         from openevo.deployment.system_executables import (
             OWNED_SUBPROCESS_BIRTH_ARGUMENT,
+            SYSTEM_OPENSSH_OWNER_ARGUMENT,
             run_packaged_owned_subprocess_birth,
+            run_packaged_system_openssh_owner,
         )
     except (Exception, SystemExit):
         _emit_startup_diagnostic("python_import", "owned_subprocess_import_failed")
@@ -165,6 +171,13 @@ def _startup_main() -> int:
     if OWNED_SUBPROCESS_BIRTH_ARGUMENT in sys.argv:
         try:
             run_packaged_owned_subprocess_birth(sys.argv)
+        except (Exception, SystemExit):
+            _emit_startup_diagnostic("python_owned_subprocess", "execution_failed")
+            return 1
+        return 126
+    if SYSTEM_OPENSSH_OWNER_ARGUMENT in sys.argv:
+        try:
+            run_packaged_system_openssh_owner(sys.argv)
         except (Exception, SystemExit):
             _emit_startup_diagnostic("python_owned_subprocess", "execution_failed")
             return 1
@@ -188,7 +201,11 @@ def _startup_main() -> int:
         _emit_startup_diagnostic("python_metadata", "load_failed")
         return 1
     try:
-        return main(packaged_source_commit=metadata.source_commit)
+        return main(
+            packaged_source_commit=metadata.source_commit,
+            packaged_askpass_helper_sha256=metadata.ssh_askpass_helper.sha256,
+            packaged_askpass_helper_byte_size=metadata.ssh_askpass_helper.byte_size,
+        )
     except PackagedLauncherStartupError as exc:
         _emit_startup_diagnostic("python_launcher", exc.code)
         return 1

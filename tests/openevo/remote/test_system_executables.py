@@ -85,9 +85,7 @@ def test_darwin_system_executable_uses_revalidated_root_owned_path(
 ) -> None:
     monkeypatch.setattr(executables.sys, "platform", "darwin")
 
-    with executables.VerifiedSystemExecutable.open(
-        executables.SSH_EXECUTABLE
-    ) as authority:
+    with executables.VerifiedSystemExecutable.open(executables.SSH_EXECUTABLE) as authority:
         authority.verify_path_binding()
         assert authority.execution_path == executables.SSH_EXECUTABLE
 
@@ -97,9 +95,7 @@ def test_system_executable_rejects_unsupported_execution_platform(
 ) -> None:
     monkeypatch.setattr(executables.sys, "platform", "win32")
 
-    with executables.VerifiedSystemExecutable.open(
-        executables.SSH_EXECUTABLE
-    ) as authority:
+    with executables.VerifiedSystemExecutable.open(executables.SSH_EXECUTABLE) as authority:
         with pytest.raises(OSError) as caught:
             _ = authority.execution_path
 
@@ -1127,9 +1123,7 @@ def test_owned_subprocess_birth_uses_platform_execution_authority(
     birth_path = tmp_path / "birth-record"
     birth_path.touch(mode=0o600)
 
-    with executables.VerifiedSystemExecutable.open(
-        executables.SSH_EXECUTABLE
-    ) as executable:
+    with executables.VerifiedSystemExecutable.open(executables.SSH_EXECUTABLE) as executable:
         with birth_path.open("r+b", buffering=0) as birth_record:
             inherited_birth_fd = os.dup(birth_record.fileno())
             try:
@@ -1161,6 +1155,88 @@ def test_owned_subprocess_birth_uses_platform_execution_authority(
             )
         ]
         executable.verify_path_binding()
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected_path_kind"),
+    [("linux", "descriptor"), ("darwin", "verified_path")],
+)
+def test_packaged_system_openssh_owner_sets_its_exact_pid_and_closed_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    expected_path_kind: str,
+) -> None:
+    observed: list[tuple[str | int, list[str], dict[str, str]]] = []
+    for key in (
+        *executables._SYSTEM_OPENSSH_OWNER_ENV_KEYS,
+        executables.SYSTEM_OPENSSH_OWNER_PID_ENV,
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    def execve(
+        path: str | int,
+        argv: list[str],
+        environment: dict[str, str],
+    ) -> None:
+        observed.append((path, argv, environment))
+
+    inherited = {
+        "HOME": "/Users/alice",
+        "PATH": executables.MACOS_SYSTEM_COMMAND_PATH,
+        "DISPLAY": "openevo-ssh-askpass",
+        "SSH_ASKPASS": "/Applications/OpenEvo Desktop.app/Contents/MacOS/openevo-ssh-askpass",
+        "SSH_ASKPASS_REQUIRE": "force",
+        "OPENEVO_SSH_ASKPASS_SOCKET": "/tmp/oe-s/a",
+        "OPENEVO_SSH_ASKPASS_CAPABILITY": "a" * 64,
+        "OPENEVO_SSH_CONNECTION_GENERATION": "9",
+        "SSH_AUTH_SOCK": "/tmp/agent",
+    }
+    for key, value in inherited.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "must-not-leak")
+    monkeypatch.setattr(executables.sys, "platform", platform)
+    monkeypatch.setattr(executables.os, "getpid", lambda: 4321)
+    monkeypatch.setattr(executables.os, "execve", execve)
+
+    with executables.VerifiedSystemExecutable.open(executables.SSH_EXECUTABLE) as executable:
+        executables.run_packaged_system_openssh_owner(
+            [
+                "ignored-prefix",
+                executables.SYSTEM_OPENSSH_OWNER_ARGUMENT,
+                str(executable.descriptor),
+                executables.SSH_EXECUTABLE,
+                "-V",
+            ]
+        )
+        expected_path = (
+            f"/dev/fd/{executable.descriptor}"
+            if expected_path_kind == "descriptor"
+            else executables.SSH_EXECUTABLE
+        )
+
+    assert observed == [
+        (
+            expected_path,
+            [executables.SSH_EXECUTABLE, "-V"],
+            {**inherited, executables.SYSTEM_OPENSSH_OWNER_PID_ENV: "4321"},
+        )
+    ]
+
+
+def test_packaged_system_openssh_owner_rejects_replayed_owner_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(executables.SYSTEM_OPENSSH_OWNER_PID_ENV, "999")
+    with executables.VerifiedSystemExecutable.open(executables.SSH_EXECUTABLE) as executable:
+        with pytest.raises(ValueError, match="already present"):
+            executables.run_packaged_system_openssh_owner(
+                [
+                    executables.SYSTEM_OPENSSH_OWNER_ARGUMENT,
+                    str(executable.descriptor),
+                    executables.SSH_EXECUTABLE,
+                    "-V",
+                ]
+            )
 
 
 def test_packaged_birth_dispatch_rejects_non_file_birth_authority() -> None:

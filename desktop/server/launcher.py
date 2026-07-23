@@ -31,6 +31,7 @@ from desktop.sidecar.native_workspace import (
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_provider import NATIVE_SIDECAR_PROTOCOL
+from desktop.sidecar.system_ssh_session import AskpassHelperAuthority
 from desktop.sidecar.workspace_identity import (
     native_import_id_for_action,
     ownership_for_native_import,
@@ -352,6 +353,9 @@ def create_app(
     build_channel: Literal["release", "development", "test"],
     core_assets_root: Path | str | None = None,
     release_assets_root: Path | str | None = None,
+    packaged_askpass_helper_path: Path | str | None = None,
+    packaged_askpass_helper_sha256: str | None = None,
+    packaged_askpass_helper_byte_size: int | None = None,
 ) -> FastAPI:
     _validate_source_commit(source_commit, build_channel=build_channel)
     owned_apps: list[FastAPI] = []
@@ -364,6 +368,9 @@ def create_app(
             build_channel=build_channel,
             core_assets_root=core_assets_root,
             release_assets_root=release_assets_root,
+            packaged_askpass_helper_path=packaged_askpass_helper_path,
+            packaged_askpass_helper_sha256=packaged_askpass_helper_sha256,
+            packaged_askpass_helper_byte_size=packaged_askpass_helper_byte_size,
             owned_apps=owned_apps,
         )
     except PackagedLauncherStartupError:
@@ -393,6 +400,9 @@ def _create_app(
     build_channel: Literal["release", "development", "test"],
     core_assets_root: Path | str | None = None,
     release_assets_root: Path | str | None = None,
+    packaged_askpass_helper_path: Path | str | None = None,
+    packaged_askpass_helper_sha256: str | None = None,
+    packaged_askpass_helper_byte_size: int | None = None,
     owned_apps: list[FastAPI],
 ) -> FastAPI:
     startup_phase = "bundled_core_assets"
@@ -404,11 +414,30 @@ def _create_app(
         startup_phase = value
 
     state_root = resolve_desktop_state_root(desktop_config_root)
+    askpass_helper: AskpassHelperAuthority | None = None
     try:
         if build_channel == "release" and release_assets_root is None and core_assets_root is None:
             raise ValueError("release assets root must be provided by the native host")
         if release_assets_root is not None and not Path(release_assets_root).is_absolute():
             raise ValueError("release assets root must be an absolute native-owned path")
+        helper_identity = (
+            packaged_askpass_helper_path,
+            packaged_askpass_helper_sha256,
+            packaged_askpass_helper_byte_size,
+        )
+        if any(value is not None for value in helper_identity) != all(
+            value is not None for value in helper_identity
+        ):
+            raise ValueError("packaged askpass helper identity is incomplete")
+        if packaged_askpass_helper_path is not None:
+            startup_phase = "remote_lifecycle"
+            assert packaged_askpass_helper_sha256 is not None
+            assert packaged_askpass_helper_byte_size is not None
+            askpass_helper = AskpassHelperAuthority.open(
+                packaged_askpass_helper_path,
+                expected_sha256=packaged_askpass_helper_sha256,
+                expected_byte_size=packaged_askpass_helper_byte_size,
+            )
         app = create_release_desktop_local_api_app(
             state_root=state_root,
             session_token=native_frame.session_token,
@@ -418,10 +447,13 @@ def _create_app(
             build_channel=build_channel,
             core_assets_root=core_assets_root,
             release_assets_root=release_assets_root,
+            system_ssh_askpass_helper=askpass_helper,
             startup_phase=record_startup_phase if build_channel == "release" else None,
             close_on_shutdown=build_channel != "release",
         )
     except Exception as exc:
+        if askpass_helper is not None:
+            askpass_helper.close()
         if build_channel == "release":
             raise PackagedLauncherStartupError(f"{startup_phase}_failed") from exc
         raise
@@ -735,6 +767,9 @@ def main(
     argv: list[str] | None = None,
     *,
     packaged_source_commit: str | None = None,
+    packaged_askpass_helper_path: Path | str | None = None,
+    packaged_askpass_helper_sha256: str | None = None,
+    packaged_askpass_helper_byte_size: int | None = None,
 ) -> int:
     parser = argparse.ArgumentParser(description="Run the OpenEvo Desktop sidecar.")
     parser.add_argument("--static-root", type=Path, default=None)
@@ -746,6 +781,13 @@ def main(
     parser.add_argument("--listener-fd", type=int, required=True)
     parser.add_argument("--native-instance-stdin", action="store_true", required=True)
     parser.add_argument("--release-assets-root", type=Path, default=None)
+    parser.add_argument(
+        "--ssh-askpass-helper-path",
+        type=Path,
+        required=(
+            packaged_source_commit is not None and packaged_askpass_helper_sha256 is not None
+        ),
+    )
     if packaged_source_commit is None:
         parser.add_argument("--source-commit", required=True)
         parser.add_argument(
@@ -784,6 +826,13 @@ def main(
         source_commit=source_commit,
         build_channel=build_channel,
         release_assets_root=args.release_assets_root,
+        packaged_askpass_helper_path=(
+            args.ssh_askpass_helper_path
+            if packaged_source_commit is not None
+            else packaged_askpass_helper_path
+        ),
+        packaged_askpass_helper_sha256=packaged_askpass_helper_sha256,
+        packaged_askpass_helper_byte_size=packaged_askpass_helper_byte_size,
     )
     listener: socket.socket | None = None
     try:

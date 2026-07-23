@@ -462,6 +462,38 @@ def test_python_startup_failure_is_redacted(monkeypatch: pytest.MonkeyPatch, cap
     assert canary not in captured.err
 
 
+def test_python_startup_dispatches_system_ssh_owner_before_native_handoff(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    entry = _load_module(
+        "openevo_sidecar_entry_system_ssh_owner_test",
+        "desktop/packaging/sidecar_entry.py",
+    )
+    from openevo.deployment import system_executables
+
+    calls: list[list[str]] = []
+    arguments = [
+        "openevo-desktop-sidecar",
+        system_executables.SYSTEM_OPENSSH_OWNER_ARGUMENT,
+        "17",
+        system_executables.SSH_EXECUTABLE,
+        "-V",
+    ]
+    monkeypatch.setattr(entry.sys, "argv", arguments)
+    monkeypatch.setattr(
+        system_executables,
+        "run_packaged_system_openssh_owner",
+        lambda value: calls.append(value),
+    )
+
+    assert entry._startup_main() == 126
+    assert calls == [arguments]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
+
+
 def test_native_frame_broken_pipe_surfaces_only_closed_startup_diagnostic(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

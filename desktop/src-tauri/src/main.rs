@@ -35,6 +35,7 @@ use desktop_log::{
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
 
 const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
+const BUNDLED_ASKPASS_BINARY: &str = "openevo-ssh-askpass";
 const RELEASE_ASSETS_DIRECTORY: &str = "openevo-release-assets";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
@@ -160,7 +161,7 @@ const SIDECAR_EXIT_EMERGENCY_TERM_GRACE: Duration = Duration::from_millis(250);
 const MACOS_PROCESS_GROUP_LIST_RETRIES: usize = 4;
 #[cfg(any(test, target_os = "macos"))]
 const MACOS_PROCESS_GROUP_MAX_PIDS: usize = 1_048_576;
-const RELEASE_FORBIDDEN_SIDECAR_ENV: [&str; 8] = [
+const RELEASE_FORBIDDEN_SIDECAR_ENV: [&str; 14] = [
     "OPENEVO_DESKTOP_SIDECAR_COMMAND",
     "OPENEVO_DESKTOP_SIDECAR_PROGRAM",
     "OPENEVO_DESKTOP_SIDECAR_ARGS_JSON",
@@ -169,6 +170,12 @@ const RELEASE_FORBIDDEN_SIDECAR_ENV: [&str; 8] = [
     NATIVE_LISTENER_FD_ENV,
     NATIVE_EXECUTABLE_FD_ENV,
     NATIVE_EXECUTABLE_PATH_ENV,
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "OPENEVO_SSH_ASKPASS_SOCKET",
+    "OPENEVO_SSH_ASKPASS_CAPABILITY",
+    "OPENEVO_SSH_CONNECTION_GENERATION",
+    "OPENEVO_SSH_OWNER_PID",
 ];
 
 type HostResult<T> = Result<T, NativeHostError>;
@@ -2253,6 +2260,13 @@ fn release_sidecar_launch_spec(
 ) -> HostResult<SidecarLaunchSpec> {
     let source = bundled_path.ok_or_else(bundled_sidecar_missing_error)?;
     let release_assets_root = packaged_release_assets_root(source)?;
+    let askpass_helper = source
+        .parent()
+        .ok_or_else(packaged_release_assets_path_error)?
+        .join(BUNDLED_ASKPASS_BINARY);
+    if !askpass_helper.is_absolute() {
+        return Err(packaged_release_assets_path_error());
+    }
     #[cfg(target_os = "linux")]
     let (verified_executable, private_launch_dir) = prepare_packaged_sidecar(source)?;
     #[cfg(target_os = "linux")]
@@ -2267,6 +2281,13 @@ fn release_sidecar_launch_spec(
     args.push("--release-assets-root".to_string());
     args.push(
         release_assets_root
+            .to_str()
+            .ok_or_else(packaged_release_assets_path_error)?
+            .to_string(),
+    );
+    args.push("--ssh-askpass-helper-path".to_string());
+    args.push(
+        askpass_helper
             .to_str()
             .ok_or_else(packaged_release_assets_path_error)?
             .to_string(),
@@ -8267,6 +8288,13 @@ mod tests {
             .unwrap()
             .to_string_lossy()
             .into_owned();
+        let expected_askpass = fixture
+            .path()
+            .parent()
+            .unwrap()
+            .join(BUNDLED_ASKPASS_BINARY)
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             spec.args,
             vec![
@@ -8275,6 +8303,8 @@ mod tests {
                 "--native-instance-stdin",
                 "--release-assets-root",
                 expected_assets.as_str(),
+                "--ssh-askpass-helper-path",
+                expected_askpass.as_str(),
             ]
         );
         assert!(spec.current_dir.is_none());

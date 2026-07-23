@@ -82,6 +82,7 @@ from desktop.sidecar.ssh_config_catalog import (
     OpenSshCatalogScan,
     OpenSshHostCatalogLoader,
 )
+from desktop.sidecar.system_ssh_session import AskpassHelperAuthority
 from openevo.backend.contracts.v1 import models as core_v1
 from openevo.backend.contracts.v1.models import ErrorCategory, ErrorSeverity, RepairAction
 from desktop.sidecar.workspace_identity import ownership_for_native_import
@@ -495,6 +496,7 @@ class DesktopReleaseProvider:
         readiness_key: bytes,
         execution_mode_capabilities: ExecutionModeCapabilitiesV1,
         remote_lifecycle: DesktopRemoteLifecycle,
+        system_ssh_askpass_helper: AskpassHelperAuthority | None = None,
         core_runtime: DesktopCoreRuntimeOwnerV1 | None = None,
         core_bridge: DesktopCoreBridgeV1 | None = None,
         event_broker: DesktopEventBrokerV1 | None = None,
@@ -506,9 +508,14 @@ class DesktopReleaseProvider:
             raise ValueError("native readiness key must contain exactly 32 bytes")
         if core_runtime is not None and (core_bridge is not None or event_broker is not None):
             raise ValueError("core_runtime cannot be combined with injected Core resources")
+        if system_ssh_askpass_helper is not None and not isinstance(
+            system_ssh_askpass_helper, AskpassHelperAuthority
+        ):
+            raise TypeError("system SSH askpass helper authority is invalid")
         self._store = store
         self._workspace_import_store = workspace_import_store
         self._remote_lifecycle = remote_lifecycle
+        self._system_ssh_askpass_helper = system_ssh_askpass_helper
         self._core_runtime = core_runtime
         self._core_bridge = core_runtime.core_bridge if core_runtime is not None else core_bridge
         self._event_broker = (
@@ -625,6 +632,12 @@ class DesktopReleaseProvider:
         elif self._event_broker is not None:
             failure = _collect_cleanup_failure(self._event_broker.close, failure)
         failure = _collect_cleanup_failure(self._remote_lifecycle.close, failure)
+        askpass_helper = getattr(self, "_system_ssh_askpass_helper", None)
+        if askpass_helper is not None:
+            failure = _collect_cleanup_failure(
+                askpass_helper.close,
+                failure,
+            )
         failure = _collect_cleanup_failure(self._store.close, failure)
         failure = _collect_cleanup_failure(self._workspace_import_store.close, failure)
         if failure is not None:
@@ -633,6 +646,12 @@ class DesktopReleaseProvider:
     @property
     def workspace_import_store(self) -> WorkspaceImportStore:
         return self._workspace_import_store
+
+    @property
+    def system_ssh_askpass_helper(self) -> AskpassHelperAuthority | None:
+        """Return the sealed helper authority reserved for the v2 lifecycle."""
+
+        return self._system_ssh_askpass_helper
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handler = self._handlers.get(operation_id)
