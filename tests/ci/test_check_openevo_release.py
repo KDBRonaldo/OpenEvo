@@ -3472,9 +3472,11 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
 
 
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
+    from openevo import __version__ as core_version
     from desktop.sidecar.contracts.v2 import DESKTOP_OPENAPI_SHA256
 
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
+    package_config = json.loads(Path("desktop/package.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
     cargo_config = tomllib.loads(cargo)
     project_config = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
@@ -3550,6 +3552,9 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         config["version"]
         == cargo_config["package"]["version"]
         == project_config["project"]["version"]
+        == package_config["version"]
+        == release_contract["v019"]["release_version"]
+        == core_version
     )
     assert config["identifier"] == "org.openevo.desktop"
     assert config["app"]["windows"] == [
