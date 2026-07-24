@@ -41,6 +41,7 @@ from openevo.deployment.daemon_bundle_transport import (
     build_daemon_bundle_observe_command,
     build_daemon_bundle_stage_command,
     build_daemon_bundle_stop_command,
+    daemon_bundle_service_root_for_user,
     parse_daemon_bundle_identity,
     parse_daemon_bundle_error_code,
     parse_daemon_bundle_service_predecessor,
@@ -1358,7 +1359,12 @@ class SshRemoteExecutorTransport:
                 system_openssh_authority.verify_authority()
             except Exception:
                 raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
+        try:
+            daemon_bundle_service_root = daemon_bundle_service_root_for_user(profile.user)
+        except DaemonBundleTransportContractError:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         self._profile = profile
+        self._daemon_bundle_service_root = daemon_bundle_service_root
         self._trusted_host = trusted_host
         self._system_openssh_authority = system_openssh_authority
         self._runner = runner or _run_subprocess
@@ -1726,7 +1732,7 @@ class SshRemoteExecutorTransport:
             or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
-        service_root = f"/home/{self._profile.user}/.openevo/daemon-bundles"
+        service_root = self._daemon_bundle_service_root
         snapshot: OpenedDaemonBundle | None = None
         manifest_snapshot: OpenedDaemonBundle | None = None
         try:
@@ -2030,7 +2036,7 @@ class SshRemoteExecutorTransport:
             bundle.__post_init__()
             if (
                 bundle.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
-                or bundle._service_root != f"/home/{self._profile.user}/.openevo/daemon-bundles"
+                or bundle._service_root != self._daemon_bundle_service_root
             ):
                 raise DaemonBundleTransportContractError(
                     "Daemon bundle receipt is not authoritative for this transport."
@@ -2310,7 +2316,7 @@ class SshRemoteExecutorTransport:
             bundle.__post_init__()
             if (
                 bundle.host_profile != DOCKER_USER_CONTAINER_V1.profile_id
-                or bundle._service_root != f"/home/{self._profile.user}/.openevo/daemon-bundles"
+                or bundle._service_root != self._daemon_bundle_service_root
                 or isinstance(timeout_seconds, bool)
                 or not isinstance(timeout_seconds, (int, float))
                 or not 0 < timeout_seconds <= 300

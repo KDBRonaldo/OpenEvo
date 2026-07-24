@@ -21,7 +21,10 @@ _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 _VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}\Z")
 _REMOTE_PATH_PATTERN = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
-_BUNDLE_ROOT_PATTERN = re.compile(r"/home/[A-Za-z0-9._@%+=,-]+/\.openevo/daemon-bundles\Z")
+_REMOTE_USER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]{0,127}\Z", re.ASCII)
+_BUNDLE_ROOT_PATTERN = re.compile(
+    r"(?:/root|/home/[A-Za-z0-9._@%+=,-]+)/\.openevo/daemon-bundles\Z"
+)
 _TRANSFER_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
@@ -73,6 +76,15 @@ DOCKER_USER_CONTAINER_V1 = DaemonBundleHostProfile(
         "stat",
     ),
 )
+
+
+def daemon_bundle_service_root_for_user(remote_user: str) -> str:
+    """Return the closed conventional Linux home root for one SSH account."""
+
+    if type(remote_user) is not str or _REMOTE_USER_PATTERN.fullmatch(remote_user) is None:
+        raise DaemonBundleTransportContractError("Daemon bundle remote user is invalid.")
+    home = "/root" if remote_user == "root" else f"/home/{remote_user}"
+    return f"{home}/.openevo/daemon-bundles"
 
 
 @dataclass(frozen=True, slots=True)
@@ -844,10 +856,17 @@ trap 'exit 129' 1
 trap 'exit 130' 2
 trap 'exit 143' 15
 
-relative_root=${root#/home/}
-remote_user=${relative_root%%/*}
-[ -n "$remote_user" ]
-[ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
+if [ "$root" = "/root/.openevo/daemon-bundles" ]; then
+    [ "$(id -u)" = "0" ] || exit 64
+    [ "$(id -un)" = "root" ] || exit 64
+else
+    relative_root=${root#/home/}
+    remote_user=${relative_root%%/*}
+    [ -n "$remote_user" ]
+    [ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
+    [ "$(id -un)" = "$remote_user" ] || exit 64
+    [ "$(id -u)" != "0" ] || exit 64
+fi
 
 mkdir -p -- "$root"
 root_meta=$(stat -c '%F|%u|%a|%h|%d|%i' -- "$root")

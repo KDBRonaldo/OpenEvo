@@ -25,7 +25,9 @@ from openevo.deployment.daemon_bundle_transport import (
     _STAGE_SCRIPT,
     build_daemon_bundle_ensure_command,
     build_daemon_bundle_observe_command,
+    build_daemon_bundle_stage_command,
     build_daemon_bundle_stop_command,
+    daemon_bundle_service_root_for_user,
     parse_daemon_bundle_error_code,
     parse_daemon_bundle_identity,
     parse_daemon_bundle_service_predecessor,
@@ -42,10 +44,17 @@ from openevo.deployment.ssh import (
 from tests.managed_runtime_testkit import write_test_managed_runtime_archive
 
 
-_ROOT_ADMISSION = """relative_root=${root#/home/}
-remote_user=${relative_root%%/*}
-[ -n "$remote_user" ]
-[ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
+_ROOT_ADMISSION = """if [ "$root" = "/root/.openevo/daemon-bundles" ]; then
+    [ "$(id -u)" = "0" ] || exit 64
+    [ "$(id -un)" = "root" ] || exit 64
+else
+    relative_root=${root#/home/}
+    remote_user=${relative_root%%/*}
+    [ -n "$remote_user" ]
+    [ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
+    [ "$(id -un)" = "$remote_user" ] || exit 64
+    [ "$(id -u)" != "0" ] || exit 64
+fi
 """
 _MANIFEST_DIGEST = "8" * 64
 
@@ -54,14 +63,14 @@ def _canonical(value: object) -> str:
     return json.dumps(value, separators=(",", ":"), sort_keys=True) + "\n"
 
 
-def _profile() -> RemoteProfileConfig:
+def _profile(*, user: str = "alice") -> RemoteProfileConfig:
     return RemoteProfileConfig.model_validate(
         {
             "version": 1,
             "id": "clean-host",
             "host": "clean.example.test",
             "port": 22,
-            "user": "alice",
+            "user": user,
         }
     )
 
@@ -108,10 +117,16 @@ def _completion_stderr(remote_command: str, return_code: int = 0) -> str:
     return f"\n{matches[0]}{return_code}\n"
 
 
-def _stage_receipt(*, digest: str, size: int, reused: bool = False) -> str:
+def _stage_receipt(
+    *,
+    digest: str,
+    size: int,
+    reused: bool = False,
+    service_root: str = "/home/alice/.openevo/daemon-bundles",
+) -> str:
     return _canonical(
         {
-            "executable_path": f"/home/alice/.openevo/daemon-bundles/bundle-{digest}",
+            "executable_path": f"{service_root}/bundle-{digest}",
             "host_profile": "docker_user_container_v1",
             "reused": reused,
             "schema_version": 1,
@@ -269,6 +284,8 @@ def test_host_profile_declares_clean_host_tools_without_python_rsync_or_scp() ->
     assert 'cat > "$tmp"' in _STAGE_SCRIPT
     assert 'mkdir -- "$lock"' in _STAGE_SCRIPT
     assert 'ln -- "$tmp" "$target"' in _STAGE_SCRIPT
+    assert '[ "$(id -un)" = "$remote_user" ]' in _STAGE_SCRIPT
+    assert '[ "$(id -un)" = "root" ]' in _STAGE_SCRIPT
     assert "trap cleanup 0" in _STAGE_SCRIPT
 
 
@@ -602,6 +619,31 @@ def test_ssh_stage_streams_bundle_fd_without_binary_in_argv(tmp_path: Path) -> N
     assert "python" not in remote_command
     assert "rsync" not in remote_command
     assert "scp" not in remote_command
+
+
+def test_root_profile_uses_root_home_daemon_bundle_authority() -> None:
+    digest = "a" * 64
+    service_root = daemon_bundle_service_root_for_user("root")
+    staged = StagedDaemonBundle(
+        host_profile="docker_user_container_v1",
+        sha256=digest,
+        size=12,
+        reused=False,
+        _service_root=service_root,
+        _executable_path=f"{service_root}/bundle-{digest}",
+    )
+
+    command = build_daemon_bundle_stage_command(
+        service_root=service_root,
+        sha256=digest,
+        size=12,
+        transfer_id="b" * 32,
+    )
+
+    assert service_root == "/root/.openevo/daemon-bundles"
+    assert "/root/.openevo/daemon-bundles" in command
+    assert "/home/root/" not in command
+    assert staged._service_root == service_root
 
 
 def test_ssh_stage_revalidates_host_key_authority_before_streaming(tmp_path: Path) -> None:
