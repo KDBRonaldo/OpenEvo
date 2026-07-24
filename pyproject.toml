@@ -64,6 +64,8 @@ include = ["openevo*", "slime_bridge*"]
 
 [tool.setuptools.package-data]
 openevo = [
+    "backend/contracts/v1/*.json",
+    "backend/contracts/v2/*.json",
     "wheels/*.whl",
 ]
 slime_bridge = ["README.md"]

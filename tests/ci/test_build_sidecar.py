@@ -601,6 +601,24 @@ def test_core_wheel_and_lock_build_are_reproducible(tmp_path: Path) -> None:
     assert first_lock == second_lock
 
 
+def test_core_wheel_contains_exact_control_contract_snapshots(tmp_path: Path) -> None:
+    builder = _load_builder()
+    repo = Path.cwd()
+    wheel = builder._build_core_wheel(repo, tmp_path / "build")
+    snapshots = (
+        "backend/contracts/v1/events.schema.json",
+        "backend/contracts/v1/openapi.json",
+        "backend/contracts/v2/events.schema.json",
+        "backend/contracts/v2/openapi.json",
+    )
+
+    with ZipFile(wheel) as archive:
+        for relative_path in snapshots:
+            assert archive.read(f"openevo/{relative_path}") == (
+                repo / "src/openevo" / relative_path
+            ).read_bytes()
+
+
 def test_validate_core_wheel_rejects_nested_wheel(tmp_path: Path) -> None:
     builder = _load_builder()
     wheel = tmp_path / "openevo-0.1.0-py3-none-any.whl"
