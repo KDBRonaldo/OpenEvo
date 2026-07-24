@@ -71,59 +71,13 @@ _MAX_CLEANUP_TIMEOUT_SECONDS = 10.0
 _CONTROL_SOCKET_NAME = "m"
 _BROKER_SOCKET_NAME = "a"
 _RUNTIME_PREFIX = "oe-s-"
-_SSH_OWNER_LAUNCHER = r"""
-import os
-import stat
-import sys
 
-if len(sys.argv) < 5 or sys.argv[1] != "--openevo-system-ssh-owner-v1":
-    raise SystemExit(126)
-descriptor_text = sys.argv[2]
-if not descriptor_text.isascii() or not descriptor_text.isdecimal():
-    raise SystemExit(126)
-descriptor = int(descriptor_text)
-argv = sys.argv[3:]
-if not argv or argv[0] != "/usr/bin/ssh":
-    raise SystemExit(126)
-allowed = {
-    "DISPLAY",
-    "HOME",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "LC_MESSAGES",
-    "OPENEVO_SSH_ASKPASS_CAPABILITY",
-    "OPENEVO_SSH_ASKPASS_SOCKET",
-    "OPENEVO_SSH_CONNECTION_GENERATION",
-    "PATH",
-    "SSH_ASKPASS",
-    "SSH_ASKPASS_REQUIRE",
-    "SSH_AUTH_SOCK",
-}
-if set(os.environ) - allowed:
-    raise SystemExit(126)
-identity_fields = (
-    "st_dev",
-    "st_ino",
-    "st_mode",
-    "st_uid",
-    "st_nlink",
-    "st_size",
-    "st_mtime_ns",
-    "st_ctime_ns",
-)
-opened = os.fstat(descriptor)
-resolved = os.stat(argv[0], follow_symlinks=False)
-if not stat.S_ISREG(opened.st_mode) or tuple(
-    getattr(opened, field) for field in identity_fields
-) != tuple(getattr(resolved, field) for field in identity_fields):
-    raise SystemExit(126)
-environment = dict(os.environ)
-environment["OPENEVO_SSH_OWNER_PID"] = str(os.getpid())
-os.set_inheritable(descriptor, False)
-execution_path = argv[0] if sys.platform == "darwin" else f"/dev/fd/{descriptor}"
-os.execve(execution_path, argv, environment)
-"""
+
+def _default_runtime_parent_for_platform(platform: str) -> Path:
+    return Path("/private/tmp") if platform == "darwin" else Path("/tmp")
+
+
+_DEFAULT_RUNTIME_PARENT = _default_runtime_parent_for_platform(sys.platform)
 
 
 class SystemOpenSshSessionError(RuntimeError):
@@ -558,6 +512,11 @@ class _CapturedSshMasterProcess:
 
 
 class _SystemSshMasterLauncher:
+    def __init__(self, owner_helper: AskpassHelperAuthority) -> None:
+        if type(owner_helper) is not AskpassHelperAuthority:
+            raise TypeError("system OpenSSH owner helper is invalid")
+        self._owner_helper = owner_helper
+
     def spawn(
         self,
         argv: list[str],
@@ -566,16 +525,15 @@ class _SystemSshMasterLauncher:
         control_path: Path,
     ) -> OwnedSshMasterProcess:
         del control_path
+        self._owner_helper.verify()
         executable = VerifiedSystemExecutable.open(SSH_EXECUTABLE)
+        process: subprocess.Popen[bytes] | None = None
         try:
             executable.verify_path_binding()
-            launcher = _owned_python_launcher()
+            launcher = os.fspath(self._owner_helper.path)
             process = subprocess.Popen(
                 [
                     launcher,
-                    "-I",
-                    "-c",
-                    _SSH_OWNER_LAUNCHER,
                     SYSTEM_OPENSSH_OWNER_ARGUMENT,
                     str(executable.descriptor),
                     *argv,
@@ -590,7 +548,17 @@ class _SystemSshMasterLauncher:
                 env=environment,
             )
             executable.verify_path_binding()
+            self._owner_helper.verify()
             return _CapturedSshMasterProcess(process)
+        except BaseException:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=0.5)
+            raise
         finally:
             executable.close()
 
@@ -682,7 +650,7 @@ class SystemOpenSshSession:
         home: Path | str,
         inherited_environment: Mapping[str, str],
         owns_askpass_helper: bool = False,
-        runtime_parent: Path | str = "/tmp",
+        runtime_parent: Path | str = _DEFAULT_RUNTIME_PARENT,
         inspector: ProcessInspector | None = None,
         launcher: SshMasterLauncher | None = None,
         runner: SessionRunner | None = None,
@@ -718,7 +686,7 @@ class SystemOpenSshSession:
         self._inherited_environment = dict(inherited_environment)
         self._runtime_parent = Path(runtime_parent)
         self._inspector = inspector or SystemProcessInspector()
-        self._launcher = launcher or _SystemSshMasterLauncher()
+        self._launcher = launcher or _SystemSshMasterLauncher(askpass_helper)
         self._runner = runner or _run_bounded_subprocess
         self._owns_host_trust = host_trust is None
         self._host_trust = host_trust or SystemOpenSshHostTrust(
@@ -1659,12 +1627,6 @@ def _signal_follower_group(
         os.killpg(process.pid, signal_number)
     except ProcessLookupError:
         return
-
-
-def _owned_python_launcher() -> str:
-    if sys.platform.startswith("linux") and getattr(sys, "frozen", False) is True:
-        return "/proc/self/exe"
-    return sys.executable
 
 
 def _run_bounded_subprocess(

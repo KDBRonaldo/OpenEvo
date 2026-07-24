@@ -334,6 +334,50 @@ def test_bundle_smoke_launches_tauri_main_and_requires_native_evidence(
     assert json.loads(evidence_path.read_text(encoding="utf-8")) == evidence
 
 
+def test_bundle_smoke_keeps_app_in_login_session_with_private_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    smoke = _load_bundle_smoke_module()
+    monkeypatch.setattr(smoke.sys, "platform", "linux")
+    app = tmp_path / "OpenEvo Desktop.app"
+    executable = app / "Contents" / "MacOS" / "OpenEvo Desktop"
+    sidecar = executable.with_name("openevo-desktop-sidecar")
+    _write_fake_tauri_release_smoke(executable)
+    sidecar.write_bytes(b"packaged externalBin")
+    sidecar.chmod(0o755)
+    with (app / "Contents" / "Info.plist").open("wb") as stream:
+        plistlib.dump({"CFBundleExecutable": executable.name}, stream)
+    source_dmg = tmp_path / "candidate.dmg"
+    source_dmg.write_bytes(b"dmg")
+    monkeypatch.setattr(
+        smoke,
+        "inspect_mach_o",
+        lambda _path: {
+            "file_output": "Mach-O 64-bit executable arm64",
+            "slices": ["arm64"],
+        },
+    )
+    launch_kwargs: dict[str, object] = {}
+
+    def reject_launch(_arguments, **kwargs):
+        launch_kwargs.update(kwargs)
+        raise OSError("synthetic launch stop")
+
+    monkeypatch.setattr(smoke.subprocess, "Popen", reject_launch)
+
+    with pytest.raises(smoke.SmokeFailure, match="could not be launched"):
+        smoke.smoke_bundle(
+            tmp_path,
+            launch_origin="mounted_dmg",
+            source_dmg=source_dmg,
+            timeout_seconds=5,
+        )
+
+    assert launch_kwargs["process_group"] == 0
+    assert "start_new_session" not in launch_kwargs
+
+
 def test_bundle_smoke_existing_home_must_be_owner_controlled(tmp_path: Path) -> None:
     smoke = _load_bundle_smoke_module()
     home = tmp_path / "existing-home"

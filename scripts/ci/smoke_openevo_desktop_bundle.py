@@ -1269,7 +1269,10 @@ def smoke_bundle(
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                start_new_session=True,
+                # Keep the app in the caller's macOS login session so Tahoe's
+                # WKWebView can deliver Tauri invoke replies. A private process
+                # group still gives cleanup exact authority over this launch.
+                process_group=0,
             )
         except OSError as exc:
             raise SmokeFailure("OpenEvo Desktop native executable could not be launched") from exc
@@ -1407,7 +1410,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("bundle_root", type=Path)
     parser.add_argument("--launch-origin", choices=sorted(LAUNCH_ORIGINS), required=True)
     parser.add_argument("--source-dmg", type=Path, required=True)
-    parser.add_argument("--timeout-seconds", type=float, default=30.0)
+    parser.add_argument("--timeout-seconds", type=float, default=120.0)
     parser.add_argument("--evidence-out", type=Path)
     parser.add_argument(
         "--existing-home",

@@ -277,7 +277,12 @@ with `proc_pidinfo(PROC_PIDTBSDINFO)` before FD observation.
 The private launch pathname remains within the documented same-UID trust
 boundary until native cleanup. The smoke does not reopen the pathname reported
 by `lsof`; it trusts only the marker-bound live FD identity. Its macOS probes
-share the 120-second app-smoke readiness deadline and run in private sessions.
+share the 120-second app-smoke readiness deadline and run in a private process
+group within the caller's macOS login session. Do not use `setsid` for this app
+launch: on macOS Tahoe that synthetic non-login-session launch can prevent
+WKWebView from delivering a completed Tauri invoke reply even though the native
+command and sidecar startup both completed. The private process group preserves
+bounded cleanup authority without changing the user-visible launch session.
 The native host retains a separate 60-second bounded allowance for a cold
 PyInstaller onefile startup; the larger outer deadline also covers renderer and
 FD observation. Cleanup subsequently keeps its separate 5-second

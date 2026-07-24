@@ -695,7 +695,7 @@ class _FixtureSession:
             self.paths.client_config,
         )
         try:
-            self.process = _SystemSshMasterLauncher().spawn(
+            self.process = _SystemSshMasterLauncher(self.helper).spawn(
                 argv,
                 environment=self.environment,
                 control_path=self.control_path,
@@ -966,6 +966,82 @@ def _askpass_fixture_source(paths: FixturePaths) -> bytes:
 
 #define RESPONSE_PATH __RESPONSE_PATH__
 #define EVENT_PATH __EVENT_PATH__
+#define SSH_PATH "/usr/bin/ssh"
+#define SSH_OWNER_ARGUMENT "--openevo-system-ssh-owner-v1"
+
+extern char **environ;
+
+static int owner_environment_key_allowed(const char *entry) {
+    static const char *allowed[] = {
+        "DISPLAY", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LC_MESSAGES",
+        "OPENEVO_SSH_ASKPASS_CAPABILITY", "OPENEVO_SSH_ASKPASS_SOCKET",
+        "OPENEVO_SSH_CONNECTION_GENERATION", "PATH", "SSH_ASKPASS",
+        "SSH_ASKPASS_REQUIRE", "SSH_AUTH_SOCK"
+    };
+    const char *separator = strchr(entry, '=');
+    if (!separator || separator == entry) return 0;
+    size_t key_bytes = (size_t)(separator - entry);
+    for (size_t index = 0; index < sizeof(allowed) / sizeof(allowed[0]); ++index) {
+        if (strlen(allowed[index]) == key_bytes &&
+            strncmp(entry, allowed[index], key_bytes) == 0) return 1;
+    }
+    return 0;
+}
+
+static int owner_environment_is_closed(void) {
+    static const char *required[] = {
+        "DISPLAY", "HOME", "OPENEVO_SSH_ASKPASS_CAPABILITY",
+        "OPENEVO_SSH_ASKPASS_SOCKET", "OPENEVO_SSH_CONNECTION_GENERATION",
+        "PATH", "SSH_ASKPASS", "SSH_ASKPASS_REQUIRE"
+    };
+    if (getenv("OPENEVO_SSH_OWNER_PID")) return 0;
+    for (char **entry = environ; *entry; ++entry)
+        if (!owner_environment_key_allowed(*entry)) return 0;
+    for (size_t index = 0; index < sizeof(required) / sizeof(required[0]); ++index)
+        if (!getenv(required[index]) || !*getenv(required[index])) return 0;
+    return strcmp(getenv("DISPLAY"), "openevo-ssh-askpass") == 0 &&
+           strcmp(getenv("SSH_ASKPASS_REQUIRE"), "force") == 0;
+}
+
+static int same_system_executable(const struct stat *left, const struct stat *right) {
+    return S_ISREG(left->st_mode) && S_ISREG(right->st_mode) &&
+           left->st_uid == 0 && right->st_uid == 0 &&
+           left->st_nlink == 1 && right->st_nlink == 1 &&
+           !(left->st_mode & 022) && !(right->st_mode & 022) &&
+           (left->st_mode & 0111) && (right->st_mode & 0111) &&
+           left->st_dev == right->st_dev && left->st_ino == right->st_ino &&
+           left->st_mode == right->st_mode && left->st_size == right->st_size;
+}
+
+static int run_system_ssh_owner(int argc, char **argv) {
+    if (argc < 5 || strcmp(argv[1], SSH_OWNER_ARGUMENT) != 0 ||
+        strcmp(argv[3], SSH_PATH) != 0) return 126;
+    errno = 0;
+    char *descriptor_end = NULL;
+    long descriptor_value = strtol(argv[2], &descriptor_end, 10);
+    char canonical_descriptor[32];
+    if (errno || !descriptor_end || *descriptor_end || descriptor_value < 3 ||
+        descriptor_value > INT_MAX ||
+        snprintf(canonical_descriptor, sizeof(canonical_descriptor), "%ld",
+                 descriptor_value) <= 0 ||
+        strcmp(canonical_descriptor, argv[2]) != 0) return 126;
+    unsetenv("__CF_USER_TEXT_ENCODING");
+    if (!owner_environment_is_closed()) return 126;
+    int descriptor = (int)descriptor_value;
+    struct stat held;
+    struct stat current;
+    if (fstat(descriptor, &held) != 0 || lstat(SSH_PATH, &current) != 0 ||
+        !same_system_executable(&held, &current)) return 126;
+    char owner_pid[32];
+    if (snprintf(owner_pid, sizeof(owner_pid), "%d", getpid()) <= 0 ||
+        setenv("OPENEVO_SSH_OWNER_PID", owner_pid, 1) != 0) return 126;
+    int flags = fcntl(descriptor, F_GETFD);
+    if (flags < 0 || fcntl(descriptor, F_SETFD, flags | FD_CLOEXEC) != 0 ||
+        fstat(descriptor, &held) != 0 || lstat(SSH_PATH, &current) != 0 ||
+        !same_system_executable(&held, &current)) return 126;
+    execve(SSH_PATH, &argv[3], environ);
+    return 126;
+}
 
 static void zero_memory(void *raw, size_t length) {
     volatile unsigned char *value = raw;
@@ -1085,6 +1161,8 @@ static void record_event(const char *kind, const char *outcome) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], SSH_OWNER_ARGUMENT) == 0)
+        return run_system_ssh_owner(argc, argv);
     if (argc != 2) return 126;
     const char *prompt = argv[1];
     size_t prompt_bytes = strlen(prompt);

@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 from dataclasses import replace
 import hashlib
+import io
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,7 +37,11 @@ from openevo.deployment.ssh import (
     SystemOpenSshAskpassEnvironment,
     build_system_openssh_environment,
 )
-from openevo.deployment.system_executables import SSH_EXECUTABLE, SSH_KEYGEN_EXECUTABLE
+from openevo.deployment.system_executables import (
+    SSH_EXECUTABLE,
+    SSH_KEYGEN_EXECUTABLE,
+    SYSTEM_OPENSSH_OWNER_ARGUMENT,
+)
 
 
 @pytest.fixture
@@ -60,6 +65,13 @@ def short_tmp_path() -> Path:
 
 def _profile(profile_id: str = "profile-1", alias: str = "evolab") -> SystemOpenSshAliasProfile:
     return SystemOpenSshAliasProfile(profile_id=profile_id, ssh_host_alias=alias)
+
+
+def test_default_runtime_parent_avoids_the_macos_tmp_symlink() -> None:
+    assert session_module._default_runtime_parent_for_platform("darwin") == Path(
+        "/private/tmp"
+    )
+    assert session_module._default_runtime_parent_for_platform("linux") == Path("/tmp")
 
 
 class _FakeProcess(OwnedSshMasterProcess):
@@ -426,6 +438,19 @@ def test_helper_authority_rejects_symlink_digest_drift_and_insecure_mode(
 def test_default_owner_launcher_execs_the_verified_system_ssh_image(
     short_tmp_path: Path,
 ) -> None:
+    owner_path = short_tmp_path / "openevo-ssh-owner-fixture"
+    owner_path.write_text(
+        "#!/bin/sh\n"
+        f"[ \"$1\" = \"{SYSTEM_OPENSSH_OWNER_ARGUMENT}\" ] || exit 126\n"
+        "shift 2\n"
+        "exec \"$@\"\n",
+        encoding="ascii",
+    )
+    owner_path.chmod(0o755)
+    owner = AskpassHelperAuthority.open(
+        owner_path,
+        expected_sha256=hashlib.sha256(owner_path.read_bytes()).hexdigest(),
+    )
     environment = build_system_openssh_environment(
         home=str(short_tmp_path),
         inherited={},
@@ -436,13 +461,74 @@ def test_default_owner_launcher_execs_the_verified_system_ssh_image(
             connection_generation=1,
         ),
     )
-    process = session_module._SystemSshMasterLauncher().spawn(
+    process = session_module._SystemSshMasterLauncher(owner).spawn(
         [SSH_EXECUTABLE, "-V"],
         environment=environment,
         control_path=short_tmp_path / "unused",
     )
 
     assert process.wait(timeout=3.0) == 0
+
+
+def test_native_helper_owner_launcher_bypasses_the_frozen_python_archive(
+    short_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    helper = _helper(short_tmp_path)
+    observed: dict[str, object] = {}
+
+    class SpawnedProcess:
+        pid = 902
+        returncode: int | None = 0
+        stderr = io.BytesIO()
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def wait(self, timeout: float | None = None) -> int:
+            del timeout
+            assert self.returncode is not None
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+    def popen(argv: list[str], **options: object) -> SpawnedProcess:
+        observed["argv"] = list(argv)
+        observed.update(options)
+        return SpawnedProcess()
+
+    monkeypatch.setattr(session_module.subprocess, "Popen", popen)
+    environment = build_system_openssh_environment(
+        home=str(short_tmp_path),
+        inherited={},
+        askpass=SystemOpenSshAskpassEnvironment(
+            helper_path=str(helper.path),
+            broker_socket=str(short_tmp_path / "broker"),
+            capability="a" * 64,
+            connection_generation=1,
+        ),
+    )
+
+    process = session_module._SystemSshMasterLauncher(helper).spawn(
+        [SSH_EXECUTABLE, "-V"],
+        environment=environment,
+        control_path=short_tmp_path / "unused",
+    )
+
+    argv = observed["argv"]
+    assert isinstance(argv, list)
+    assert argv[:2] == [str(helper.path), SYSTEM_OPENSSH_OWNER_ARGUMENT]
+    assert argv[2].isascii() and argv[2].isdecimal()
+    assert argv[3:] == [SSH_EXECUTABLE, "-V"]
+    assert observed["executable"] == str(helper.path)
+    assert observed["env"] == environment
+    assert observed["pass_fds"] == (int(argv[2]),)
+    assert observed["start_new_session"] is False
+    assert process.wait(timeout=1.0) == 0
 
 
 def test_changed_host_key_failure_issues_path_free_review_from_effective_config(

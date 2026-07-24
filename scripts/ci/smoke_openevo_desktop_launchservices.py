@@ -77,6 +77,7 @@ _DESKTOP_LOG_EVENTS = {
     "sidecar_start_succeeded",
     "sidecar_start_failed",
     "sidecar_startup_diagnostic",
+    "legacy_startup_diagnostic",
     "sidecar_exited_before_ready",
     "sidecar_pre_python_exit",
     "sidecar_unstructured_output_discarded",

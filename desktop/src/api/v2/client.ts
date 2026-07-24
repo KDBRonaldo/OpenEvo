@@ -99,6 +99,7 @@ export const IF_MATCH_HEADER = "If-Match";
 export const LAST_EVENT_ID_HEADER = "Last-Event-ID";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS = 330_000;
 const MAX_RESPONSE_BYTES = 1_048_576;
 
 export type FetchLikeV2 = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -346,6 +347,7 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       readonly mutation?: MutationRequestOptionsV2;
       readonly ifMatch?: string;
       readonly authenticated?: boolean;
+      readonly timeoutMs?: number;
     } = {},
   ): Promise<z.output<S>> {
     const bootstrap = await context();
@@ -360,7 +362,7 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       headers.set("Content-Type", "application/json");
     }
     try {
-      return await withRequestDeadline(requestTimeoutMs, async (signal) => {
+      return await withRequestDeadline(requestOptions.timeoutMs ?? requestTimeoutMs, async (signal) => {
         const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
           method,
           headers,
@@ -422,11 +424,13 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
     bodySchema: ZodType,
     responseSchema: S,
     options: ResourceMutationRequestOptionsV2,
+    timeoutMs?: number,
   ) => request("POST", path, responseSchema, 202, {
     body,
     bodySchema,
     mutation: options,
     ifMatch: options.ifMatch,
+    timeoutMs,
   });
 
   return {
@@ -479,13 +483,13 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       "profile rebind",
     ),
     connectProfile: (profileId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/connect`, input, profileConnectionActionV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/connect`, input, profileConnectionActionV2Schema, localOperationV2Schema, mutation, REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS,
     ),
     disconnectProfile: (profileId, input, mutation) => resourceAction(
       `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/disconnect`, input, profileConnectionActionV2Schema, localOperationV2Schema, mutation,
     ),
     reviewProfileHostKey: (profileId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/host-key/review`, input, hostKeyReviewRequestV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/host-key/review`, input, hostKeyReviewRequestV2Schema, localOperationV2Schema, mutation, REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS,
     ),
     listProjects: (listOptions) => request("GET", withListQuery(`${DESKTOP_API_V2_PREFIX}/projects`, listOptions), projectPageV2Schema, 200),
     createProject: (input, mutation) => request("POST", `${DESKTOP_API_V2_PREFIX}/projects`, projectV2Schema, 201, {
@@ -511,7 +515,7 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       "project update",
     ),
     activateProject: (projectId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/activate`, input, projectActionV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/activate`, input, projectActionV2Schema, localOperationV2Schema, mutation, REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS,
     ),
     projectCapabilities: async (projectId) => assertIdentity(
       await request("GET", `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/capabilities`, projectCapabilityProjectionV2Schema, 200),

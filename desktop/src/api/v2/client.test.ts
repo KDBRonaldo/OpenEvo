@@ -135,6 +135,77 @@ describe("Desktop Local API v2 client", () => {
     expect(new Headers(init?.headers).get("If-Match")).toBe(`"${"b".repeat(64)}"`);
   });
 
+  it("does not apply the short Local API deadline to first-connect bootstrap", async () => {
+    vi.useFakeTimers();
+    try {
+      const operation = {
+        schema_version: "2",
+        operation_id: "operation-connect-long-bootstrap",
+        kind: "profile_connect",
+        status: "succeeded",
+        failure: null,
+        created_at: "2026-07-23T06:00:00Z",
+        updated_at: "2026-07-23T06:00:40Z",
+      };
+      let resolveFetch: ((response: Response) => void) | undefined;
+      let observedSignal: AbortSignal | undefined;
+      const fetch = vi.fn<FetchLikeV2>((_input, init) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        });
+      });
+      const client = createDesktopApiClientV2({
+        fetch,
+        bootstrap: async () => bootstrap(),
+        contract,
+        requestTimeoutMs: 25,
+      });
+
+      const pending = client.connectProfile("profile-lab", {
+        schema_version: "2",
+        expected_connection_generation: 4,
+      }, {
+        resourceGeneration: 4,
+        ifMatch: `"${"b".repeat(64)}"`,
+        idempotencyKey: "connect-profile-long-bootstrap-0001",
+      });
+      await vi.advanceTimersByTimeAsync(30);
+
+      expect(observedSignal?.aborted).toBe(false);
+      resolveFetch?.(jsonResponse(operation, 202));
+      await expect(pending).resolves.toMatchObject({ status: "succeeded" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("retains the short bounded deadline for ordinary Local API reads", async () => {
+    vi.useFakeTimers();
+    try {
+      let observedSignal: AbortSignal | undefined;
+      const fetch = vi.fn<FetchLikeV2>((_input, init) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => undefined);
+      });
+      const client = createDesktopApiClientV2({
+        fetch,
+        bootstrap: async () => bootstrap(),
+        contract,
+        requestTimeoutMs: 25,
+      });
+
+      const pending = client.state();
+      const rejected = expect(pending).rejects.toThrow(/timed out/i);
+      await vi.advanceTimersByTimeAsync(30);
+
+      await rejected;
+      expect(observedSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("rejects strict error envelopes carrying secret/path canaries", async () => {
     const error = {
       schema_version: "2",

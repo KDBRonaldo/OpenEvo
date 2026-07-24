@@ -60,13 +60,30 @@ export interface ReleaseProviderFactoryDependenciesV2 {
 const SIDECAR_BOOTSTRAP_POLL_INTERVAL_MS = 100;
 const SIDECAR_BOOTSTRAP_TIMEOUT_MS = 70_000;
 
+type NativeBeginOutcome =
+  | { readonly status: "fulfilled" }
+  | { readonly status: "rejected"; readonly error: unknown };
+
 async function bootstrapTauriSidecar(): Promise<DesktopBootstrapContextV2> {
-  await invoke<void>("begin_sidecar_start");
+  const beginOutcome: { current?: NativeBeginOutcome } = {};
+  void invoke<void>("begin_sidecar_start").then(
+    () => {
+      beginOutcome.current = { status: "fulfilled" };
+    },
+    (error: unknown) => {
+      beginOutcome.current = { status: "rejected", error };
+    },
+  );
   const deadline = Date.now() + SIDECAR_BOOTSTRAP_TIMEOUT_MS;
+  await Promise.resolve();
   for (;;) {
+    const begin = beginOutcome.current;
+    if (begin?.status === "rejected") throw begin.error;
     try {
       return await invoke<DesktopBootstrapContextV2>("sidecar_bootstrap_context");
     } catch (error) {
+      const rejected = beginOutcome.current;
+      if (rejected?.status === "rejected") throw rejected.error;
       if (!isPendingSidecarBootstrapError(error)) throw error;
     }
 

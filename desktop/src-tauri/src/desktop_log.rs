@@ -1195,6 +1195,14 @@ fn migrate_recovered_events(
                     legacy_attempt_id = Some(legacy_attempt_id_for(&event)?);
                 }
                 legacy_attempt_sequence = legacy_attempt_sequence.saturating_add(1);
+                let migrated_event = if matches!(
+                    event.event.as_str(),
+                    "sidecar_startup_diagnostic" | "renderer_stage"
+                ) {
+                    "legacy_startup_diagnostic".to_string()
+                } else {
+                    event.event
+                };
                 events.push(DesktopDiagnosticEventV2 {
                     schema_version: LOG_SCHEMA_VERSION_V2.to_string(),
                     sequence: event.sequence,
@@ -1204,7 +1212,7 @@ fn migrate_recovered_events(
                     attempt_sequence: Some(legacy_attempt_sequence),
                     component: event.source,
                     level: event.level,
-                    event: event.event,
+                    event: migrated_event,
                     stage: None,
                     result: None,
                     code: event.code,
@@ -1439,6 +1447,7 @@ fn is_known_event(event: &str) -> bool {
             | "sidecar_start_succeeded"
             | "sidecar_start_failed"
             | "sidecar_startup_diagnostic"
+            | "legacy_startup_diagnostic"
             | "sidecar_exited_before_ready"
             | "sidecar_pre_python_exit"
             | "sidecar_unstructured_output_discarded"
@@ -1726,7 +1735,21 @@ mod tests {
             signal: None,
             errno: None,
         };
+        let legacy_renderer_stage = DesktopLogEventV1 {
+            schema_version: "1".to_string(),
+            sequence: 8,
+            occurred_at: "2026-07-22T14:55:02.123Z".to_string(),
+            source: "renderer".to_string(),
+            level: "info".to_string(),
+            event: "renderer_stage".to_string(),
+            code: Some("provider_create_failed".to_string()),
+            exit_code: None,
+            signal: None,
+            errno: None,
+        };
         let mut encoded = serde_json::to_vec(&legacy).unwrap();
+        encoded.push(b'\n');
+        encoded.extend(serde_json::to_vec(&legacy_renderer_stage).unwrap());
         encoded.push(b'\n');
         fs::write(logs.join(CURRENT_LOG_FILE), encoded).unwrap();
         fs::set_permissions(
@@ -1753,7 +1776,7 @@ mod tests {
         assert!(second.set_environment(test_environment()));
         assert!(second.bind_app_data_root(root.path()));
         let export = second.export_snapshot();
-        assert_eq!(export.entries.len(), 2);
+        assert_eq!(export.entries.len(), 3);
         assert!(export
             .entries
             .iter()
@@ -1761,7 +1784,14 @@ mod tests {
         assert_eq!(export.entries[0].sequence, 7);
         assert_eq!(export.entries[0].event, "sidecar_pre_python_exit");
         assert_eq!(export.entries[1].sequence, 8);
-        assert_eq!(export.entries[1].event, "startup_stage");
+        assert_eq!(export.entries[1].event, "legacy_startup_diagnostic");
+        assert_eq!(
+            export.entries[1].code.as_deref(),
+            Some("provider_create_failed")
+        );
+        assert_eq!(export.entries[1].product_version, "legacy");
+        assert_eq!(export.entries[2].sequence, 9);
+        assert_eq!(export.entries[2].event, "startup_stage");
     }
 
     #[test]

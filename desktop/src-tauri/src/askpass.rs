@@ -1,11 +1,17 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 #[cfg(target_os = "macos")]
 use std::ffi::CStr;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::fs::{File, Metadata};
 use std::io::{Read, Write};
+use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +27,218 @@ const ASKPASS_SOCKET_ENV: &str = "OPENEVO_SSH_ASKPASS_SOCKET";
 const ASKPASS_CAPABILITY_ENV: &str = "OPENEVO_SSH_ASKPASS_CAPABILITY";
 const CONNECTION_GENERATION_ENV: &str = "OPENEVO_SSH_CONNECTION_GENERATION";
 const SSH_OWNER_PID_ENV: &str = "OPENEVO_SSH_OWNER_PID";
+const SYSTEM_SSH_OWNER_ARGUMENT: &str = "--openevo-system-ssh-owner-v1";
+const MACOS_RUNTIME_INJECTED_ENV: &str = "__CF_USER_TEXT_ENCODING";
+const SYSTEM_SSH_OWNER_ALLOWED_ENV: [&str; 13] = [
+    "DISPLAY",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "LC_MESSAGES",
+    ASKPASS_CAPABILITY_ENV,
+    ASKPASS_SOCKET_ENV,
+    CONNECTION_GENERATION_ENV,
+    "PATH",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+    "SSH_AUTH_SOCK",
+];
+const SYSTEM_SSH_OWNER_REQUIRED_ENV: [&str; 8] = [
+    "DISPLAY",
+    "HOME",
+    ASKPASS_CAPABILITY_ENV,
+    ASKPASS_SOCKET_ENV,
+    CONNECTION_GENERATION_ENV,
+    "PATH",
+    "SSH_ASKPASS",
+    "SSH_ASKPASS_REQUIRE",
+];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SystemSshOwnerError {
+    InvalidArguments,
+    InvalidEnvironment,
+    InvalidExecutable,
+    ExecutionFailed,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct SystemSshOwnerInvocation {
+    executable_descriptor: RawFd,
+    ssh_arguments: Vec<OsString>,
+}
+
+fn parse_system_ssh_owner_arguments(
+    arguments: impl IntoIterator<Item = OsString>,
+) -> Result<SystemSshOwnerInvocation, SystemSshOwnerError> {
+    let arguments = arguments.into_iter().collect::<Vec<_>>();
+    if arguments.len() < 5
+        || arguments[1] != OsStr::new(SYSTEM_SSH_OWNER_ARGUMENT)
+        || arguments[3] != OsStr::new(SYSTEM_SSH_PATH)
+        || arguments[2..]
+            .iter()
+            .any(|value| value == OsStr::new(SYSTEM_SSH_OWNER_ARGUMENT))
+    {
+        return Err(SystemSshOwnerError::InvalidArguments);
+    }
+    let descriptor_text = arguments[2]
+        .to_str()
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 10
+                && value.bytes().all(|byte| byte.is_ascii_digit())
+        })
+        .ok_or(SystemSshOwnerError::InvalidArguments)?;
+    let executable_descriptor = descriptor_text
+        .parse::<RawFd>()
+        .ok()
+        .filter(|value| *value >= 3 && value.to_string() == descriptor_text)
+        .ok_or(SystemSshOwnerError::InvalidArguments)?;
+    Ok(SystemSshOwnerInvocation {
+        executable_descriptor,
+        ssh_arguments: arguments[3..].to_vec(),
+    })
+}
+
+fn prepare_system_ssh_owner_environment(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+    owner_pid: u32,
+) -> Result<BTreeMap<OsString, OsString>, SystemSshOwnerError> {
+    if owner_pid <= 1 || owner_pid > i32::MAX as u32 {
+        return Err(SystemSshOwnerError::InvalidEnvironment);
+    }
+    let allowed = SYSTEM_SSH_OWNER_ALLOWED_ENV
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut closed = BTreeMap::new();
+    for (key, value) in environment {
+        let key_text = key
+            .to_str()
+            .filter(|candidate| allowed.contains(candidate))
+            .ok_or(SystemSshOwnerError::InvalidEnvironment)?;
+        if value.as_bytes().is_empty() || value.as_bytes().contains(&0) {
+            return Err(SystemSshOwnerError::InvalidEnvironment);
+        }
+        if closed.insert(OsString::from(key_text), value).is_some() {
+            return Err(SystemSshOwnerError::InvalidEnvironment);
+        }
+    }
+    if SYSTEM_SSH_OWNER_REQUIRED_ENV
+        .iter()
+        .any(|key| !closed.contains_key(OsStr::new(key)))
+        || closed
+            .get(OsStr::new("DISPLAY"))
+            .and_then(|value| value.to_str())
+            != Some("openevo-ssh-askpass")
+        || closed
+            .get(OsStr::new("SSH_ASKPASS_REQUIRE"))
+            .and_then(|value| value.to_str())
+            != Some("force")
+    {
+        return Err(SystemSshOwnerError::InvalidEnvironment);
+    }
+    closed.insert(
+        OsString::from(SSH_OWNER_PID_ENV),
+        OsString::from(owner_pid.to_string()),
+    );
+    Ok(closed)
+}
+
+fn system_executable_identity(
+    metadata: &Metadata,
+) -> (u64, u64, u32, u32, u64, u64, i64, i64, i64, i64) {
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.uid(),
+        metadata.nlink(),
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+fn require_trusted_system_executable(metadata: &Metadata) -> Result<(), SystemSshOwnerError> {
+    let mode = metadata.mode();
+    if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+        || metadata.uid() != 0
+        || metadata.nlink() != 1
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+    {
+        return Err(SystemSshOwnerError::InvalidExecutable);
+    }
+    Ok(())
+}
+
+fn verify_system_ssh_descriptor(descriptor: RawFd) -> Result<(), SystemSshOwnerError> {
+    if descriptor < 3 {
+        return Err(SystemSshOwnerError::InvalidExecutable);
+    }
+    let held_file = unsafe { File::from_raw_fd(descriptor) };
+    let held = held_file
+        .metadata()
+        .map_err(|_| SystemSshOwnerError::InvalidExecutable);
+    let _ = held_file.into_raw_fd();
+    let held = held?;
+    let current = std::fs::symlink_metadata(SYSTEM_SSH_PATH)
+        .map_err(|_| SystemSshOwnerError::InvalidExecutable)?;
+    require_trusted_system_executable(&held)?;
+    require_trusted_system_executable(&current)?;
+    if system_executable_identity(&held) != system_executable_identity(&current) {
+        return Err(SystemSshOwnerError::InvalidExecutable);
+    }
+    Ok(())
+}
+
+fn set_descriptor_close_on_exec(descriptor: RawFd) -> Result<(), SystemSshOwnerError> {
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0
+    {
+        return Err(SystemSshOwnerError::InvalidExecutable);
+    }
+    Ok(())
+}
+
+fn native_system_ssh_owner() -> Result<(), SystemSshOwnerError> {
+    let invocation = parse_system_ssh_owner_arguments(std::env::args_os())?;
+    let owner_pid = u32::try_from(unsafe { libc::getpid() })
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or(SystemSshOwnerError::InvalidEnvironment)?;
+    // CoreFoundation injects this process-local display preference even when the
+    // parent supplied an exact envp. It is not part of the SSH authority and is
+    // removed before the closed environment is validated and reissued.
+    std::env::remove_var(MACOS_RUNTIME_INJECTED_ENV);
+    let environment = prepare_system_ssh_owner_environment(std::env::vars_os(), owner_pid)?;
+    verify_system_ssh_descriptor(invocation.executable_descriptor)?;
+    set_descriptor_close_on_exec(invocation.executable_descriptor)?;
+    verify_system_ssh_descriptor(invocation.executable_descriptor)?;
+
+    let mut command = Command::new(SYSTEM_SSH_PATH);
+    command
+        .args(invocation.ssh_arguments.iter().skip(1))
+        .env_clear()
+        .envs(environment);
+    let _error = command.exec();
+    Err(SystemSshOwnerError::ExecutionFailed)
+}
+
+pub fn is_system_ssh_owner_invocation() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(OsStr::new(SYSTEM_SSH_OWNER_ARGUMENT))
+}
+
+pub fn run_native_system_ssh_owner() -> i32 {
+    if native_system_ssh_owner().is_ok() {
+        0
+    } else {
+        126
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PromptKind {
@@ -931,7 +1149,9 @@ mod appkit {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::io::{BufRead, BufReader};
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -956,6 +1176,110 @@ mod tests {
             parents: HashMap::from([(300, 200), (200, 1)]),
             paths: HashMap::from([(200, PathBuf::from(SYSTEM_SSH_PATH))]),
         }
+    }
+
+    #[test]
+    fn parses_only_the_closed_system_ssh_owner_invocation() {
+        let parsed = parse_system_ssh_owner_arguments(vec![
+            OsString::from("openevo-ssh-askpass"),
+            OsString::from(SYSTEM_SSH_OWNER_ARGUMENT),
+            OsString::from("17"),
+            OsString::from(SYSTEM_SSH_PATH),
+            OsString::from("-V"),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.executable_descriptor, 17);
+        assert_eq!(
+            parsed.ssh_arguments,
+            vec![OsString::from(SYSTEM_SSH_PATH), OsString::from("-V")]
+        );
+
+        for arguments in [
+            vec![
+                OsString::from("helper"),
+                OsString::from(SYSTEM_SSH_OWNER_ARGUMENT),
+                OsString::from("017"),
+                OsString::from(SYSTEM_SSH_PATH),
+            ],
+            vec![
+                OsString::from("helper"),
+                OsString::from(SYSTEM_SSH_OWNER_ARGUMENT),
+                OsString::from("2"),
+                OsString::from(SYSTEM_SSH_PATH),
+            ],
+            vec![
+                OsString::from("helper"),
+                OsString::from(SYSTEM_SSH_OWNER_ARGUMENT),
+                OsString::from("17"),
+                OsString::from("/tmp/ssh"),
+            ],
+        ] {
+            assert!(parse_system_ssh_owner_arguments(arguments).is_err());
+        }
+    }
+
+    #[test]
+    fn system_ssh_owner_environment_is_closed_and_sets_the_exact_pid() {
+        let environment = prepare_system_ssh_owner_environment(
+            vec![
+                (OsString::from("HOME"), OsString::from("/Users/alice")),
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+                (
+                    OsString::from("DISPLAY"),
+                    OsString::from("openevo-ssh-askpass"),
+                ),
+                (
+                    OsString::from("SSH_ASKPASS"),
+                    OsString::from(
+                        "/Applications/OpenEvo Desktop.app/Contents/MacOS/openevo-ssh-askpass",
+                    ),
+                ),
+                (
+                    OsString::from("SSH_ASKPASS_REQUIRE"),
+                    OsString::from("force"),
+                ),
+                (
+                    OsString::from(ASKPASS_SOCKET_ENV),
+                    OsString::from("/private/tmp/oe-s/a"),
+                ),
+                (
+                    OsString::from(ASKPASS_CAPABILITY_ENV),
+                    OsString::from("a".repeat(64)),
+                ),
+                (
+                    OsString::from(CONNECTION_GENERATION_ENV),
+                    OsString::from("9"),
+                ),
+                (
+                    OsString::from("SSH_AUTH_SOCK"),
+                    OsString::from("/private/tmp/agent"),
+                ),
+            ],
+            4321,
+        )
+        .unwrap();
+
+        assert_eq!(
+            environment.get(std::ffi::OsStr::new(SSH_OWNER_PID_ENV)),
+            Some(&OsString::from("4321"))
+        );
+        assert_eq!(environment.len(), 10);
+
+        for extra in ["AWS_SECRET_ACCESS_KEY", SSH_OWNER_PID_ENV] {
+            let mut rejected = environment.clone();
+            rejected.remove(OsStr::new(SSH_OWNER_PID_ENV));
+            rejected.insert(OsString::from(extra), OsString::from("must-not-leak"));
+            assert!(prepare_system_ssh_owner_environment(rejected, 4321).is_err());
+        }
+    }
+
+    #[test]
+    fn system_ssh_owner_accepts_the_exact_held_system_executable() {
+        let ssh = File::open(SYSTEM_SSH_PATH).unwrap();
+        assert_eq!(verify_system_ssh_descriptor(ssh.as_raw_fd()), Ok(()));
+        assert_eq!(set_descriptor_close_on_exec(ssh.as_raw_fd()), Ok(()));
+        assert_eq!(verify_system_ssh_descriptor(ssh.as_raw_fd()), Ok(()));
     }
 
     struct OneUseAuthorizer {
