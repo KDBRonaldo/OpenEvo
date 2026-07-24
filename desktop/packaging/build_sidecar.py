@@ -23,7 +23,7 @@ import sys
 import tarfile
 from tempfile import TemporaryDirectory
 import tomllib
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 from zipfile import BadZipFile, ZipFile
 import zlib
 
@@ -313,6 +313,7 @@ NATIVE_EXECUTABLE_BASENAME = "openevo-desktop-sidecar"
 _MAX_PYINSTALLER_SDIST_BYTES = 16 * 1024 * 1024
 _MAX_PYINSTALLER_SOURCE_BYTES = 32 * 1024 * 1024
 _MAX_PYINSTALLER_SOURCE_MEMBERS = 5_000
+_LOCKED_DOWNLOAD_ATTEMPTS = 3
 _BOOTLOADER_MACOS_INCLUDE_NEEDLE = """#if defined(__APPLE__)
     #include <mach-o/dyld.h>  /* _NSGetExecutablePath() */
 #endif
@@ -2081,20 +2082,63 @@ def _download_locked_file(
     expected_digest: str,
     expected_size: int,
 ) -> None:
-    hasher = hashlib.sha256()
-    received = 0
+    last_download_error: OSError | None = None
     try:
-        with urlopen(url, timeout=30) as response, destination.open("xb") as output:
-            while chunk := response.read(1024 * 1024):
-                received += len(chunk)
-                if received > expected_size:
-                    raise RuntimeError("PyInstaller sdist exceeded its locked size")
-                hasher.update(chunk)
-                output.write(chunk)
+        with destination.open("xb") as output:
+            received = 0
+            hasher = hashlib.sha256()
+            for _attempt in range(_LOCKED_DOWNLOAD_ATTEMPTS):
+                requested_offset = received
+                request: str | Request = url
+                if requested_offset > 0:
+                    request = Request(
+                        url,
+                        headers={
+                            "Range": f"bytes={requested_offset}-{expected_size - 1}",
+                        },
+                    )
+                try:
+                    with urlopen(request, timeout=30) as response:
+                        if requested_offset > 0:
+                            expected_remaining = expected_size - requested_offset
+                            if (
+                                getattr(response, "status", None) != 206
+                                or response.headers.get("Content-Length")
+                                != str(expected_remaining)
+                                or response.headers.get("Content-Range")
+                                != (
+                                    f"bytes {requested_offset}-{expected_size - 1}/"
+                                    f"{expected_size}"
+                                )
+                            ):
+                                raise RuntimeError(
+                                    "PyInstaller sdist range response is invalid"
+                                )
+                        while received < expected_size:
+                            chunk = response.read(min(1024 * 1024, expected_size - received))
+                            if not chunk:
+                                break
+                            received += len(chunk)
+                            hasher.update(chunk)
+                            output.write(chunk)
+                        if received == expected_size and response.read(1):
+                            raise RuntimeError("PyInstaller sdist exceeded its locked size")
+                except OSError as exc:
+                    last_download_error = exc
+                    continue
+                if received == expected_size and hasher.hexdigest() == expected_digest:
+                    return
+                if received == expected_size:
+                    output.seek(0)
+                    output.truncate()
+                    received = 0
+                    hasher = hashlib.sha256()
+                last_download_error = None
     except OSError as exc:
         raise RuntimeError("failed to download locked PyInstaller sdist") from exc
-    if received != expected_size or hasher.hexdigest() != expected_digest:
-        raise RuntimeError("PyInstaller sdist does not match its locked identity")
+    if last_download_error is not None:
+        raise RuntimeError("failed to download locked PyInstaller sdist") from last_download_error
+    raise RuntimeError("PyInstaller sdist does not match its locked identity")
 
 
 def _extract_locked_pyinstaller_sdist(

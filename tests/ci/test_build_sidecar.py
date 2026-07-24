@@ -1515,6 +1515,90 @@ sdist = { url = "https://files.pythonhosted.org/source.tar.gz", hash = "sha256:a
     )
 
 
+def test_locked_download_retries_a_truncated_response_on_the_same_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    payload = b"locked-pyinstaller-source"
+    calls = 0
+    output_inodes: list[int] = []
+    destination = tmp_path / "pyinstaller.tar.gz"
+
+    class Response(BytesIO):
+        def __init__(
+            self,
+            value: bytes,
+            *,
+            status: int,
+            headers: dict[str, str] | None = None,
+        ) -> None:
+            super().__init__(value)
+            self.status = status
+            self.headers = headers or {}
+
+    def urlopen(request: object, *, timeout: int) -> BytesIO:
+        nonlocal calls
+        calls += 1
+        assert timeout == 30
+        output_inodes.append(destination.stat().st_ino)
+        if calls == 1:
+            assert request == "https://files.pythonhosted.org/locked.tar.gz"
+            return Response(payload[:-1], status=200)
+        assert request.get_header("Range") == f"bytes={len(payload) - 1}-{len(payload) - 1}"
+        return Response(
+            payload[-1:],
+            status=206,
+            headers={
+                "Content-Length": "1",
+                "Content-Range": f"bytes {len(payload) - 1}-{len(payload) - 1}/{len(payload)}",
+            },
+        )
+
+    monkeypatch.setattr(builder, "urlopen", urlopen)
+
+    builder._download_locked_file(
+        "https://files.pythonhosted.org/locked.tar.gz",
+        destination,
+        expected_digest=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+    )
+
+    assert calls == 2
+    assert len(set(output_inodes)) == 1
+    assert destination.read_bytes() == payload
+
+
+def test_locked_download_fails_closed_after_bounded_identity_mismatches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    payload = b"locked-pyinstaller-source"
+    mismatched_payload = payload[:-1] + b"!"
+    calls = 0
+
+    def urlopen(_url: str, *, timeout: int) -> BytesIO:
+        nonlocal calls
+        calls += 1
+        assert timeout == 30
+        return BytesIO(mismatched_payload)
+
+    monkeypatch.setattr(builder, "urlopen", urlopen)
+    destination = tmp_path / "pyinstaller.tar.gz"
+
+    with pytest.raises(RuntimeError, match="does not match its locked identity"):
+        builder._download_locked_file(
+            "https://files.pythonhosted.org/locked.tar.gz",
+            destination,
+            expected_digest=hashlib.sha256(payload).hexdigest(),
+            expected_size=len(payload),
+        )
+
+    assert calls == builder._LOCKED_DOWNLOAD_ATTEMPTS
+    assert destination.read_bytes() == b""
+
+
 def test_core_release_inputs_publish_one_complete_directory(tmp_path: Path) -> None:
     builder = _load_builder()
     wheel, lock = _write_export_inputs(builder, tmp_path)
