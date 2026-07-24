@@ -287,6 +287,42 @@ def test_system_openssh_authority_drives_commands_and_owned_core_tunnel() -> Non
     transport.close()
 
 
+def test_system_openssh_core_tunnel_renews_follower_authority_per_socket() -> None:
+    class OneShotFollowerAuthority(RecordingSystemOpenSshAuthority):
+        def __init__(self) -> None:
+            super().__init__()
+            self.issued_tunnels = 0
+
+        def core_tunnel_argv(self, *, remote_port: int) -> list[str]:
+            self.issued_tunnels += 1
+            return super().core_tunnel_argv(remote_port=remote_port)
+
+        def start_tunnel(self, argv: list[str], stream_fd: int) -> FakeTunnelProcess:
+            if self.issued_tunnels <= 0:
+                raise RuntimeError("system OpenSSH follower authority was already consumed")
+            self.issued_tunnels -= 1
+            return super().start_tunnel(argv, stream_fd)
+
+    authority = OneShotFollowerAuthority()
+    transport = SshRemoteExecutorTransport(
+        _profile(host="gpu-lab", port=22, user="alice"),
+        system_openssh_authority=authority,
+    )
+    tunnel = transport.open_core_tunnel(remote_port=8765)
+
+    first = tunnel.open_verified_socket(timeout_seconds=1.0)
+    second = tunnel.open_verified_socket(timeout_seconds=1.0)
+
+    assert len(authority.tunnels) == 2
+    assert authority.issued_tunnels == 0
+    first.close()
+    second.close()
+    tunnel.close()
+    for child_stream in authority.streams:
+        child_stream.close()
+    transport.close()
+
+
 def _trusted_binding(
     tmp_path: Path,
     profile: RemoteProfileConfig | None = None,

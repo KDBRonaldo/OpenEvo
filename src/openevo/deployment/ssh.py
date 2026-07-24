@@ -116,6 +116,7 @@ StreamingRunner = Callable[
 PortAllocator = Callable[[], int]
 TunnelStarter = Callable[[list[str]], "TunnelProcess"]
 CoreConnectionStarter = Callable[[list[str], int], "TunnelProcess"]
+CoreConnectionArgvFactory = Callable[[], list[str]]
 
 
 class SystemOpenSshFollowerAuthority(Protocol):
@@ -149,6 +150,7 @@ class SystemOpenSshFollowerAuthority(Protocol):
     def start_tunnel(self, argv: list[str], stream_fd: int) -> TunnelProcess: ...
 
     def verify_authority(self) -> None: ...
+
 
 logger = logging.getLogger(__name__)
 
@@ -267,9 +269,7 @@ def build_system_openssh_environment(
                 "DISPLAY": "openevo-ssh-askpass",
                 "OPENEVO_SSH_ASKPASS_SOCKET": askpass.broker_socket,
                 "OPENEVO_SSH_ASKPASS_CAPABILITY": askpass.capability,
-                "OPENEVO_SSH_CONNECTION_GENERATION": str(
-                    askpass.connection_generation
-                ),
+                "OPENEVO_SSH_CONNECTION_GENERATION": str(askpass.connection_generation),
             }
         )
     return environment
@@ -780,9 +780,11 @@ class _CoreTunnelEndpoint:
         trusted_host: TrustedKnownHostsBinding | None,
         agent_socket_source: SshAgentSocketSource | None,
         authority_verifier: Callable[[], None] | None = None,
+        connection_argv_factory: CoreConnectionArgvFactory | None = None,
     ) -> None:
         self._connection_starter = connection_starter
         self._connection_argv = connection_argv
+        self._connection_argv_factory = connection_argv_factory
         self._agent_socket_source = agent_socket_source
         self._authority_verifier = authority_verifier
         self._trust_lease: AbstractContextManager[Path] | None = trust_lease
@@ -852,8 +854,13 @@ class _CoreTunnelEndpoint:
                     )
                     child.process = authority.process
                 else:
+                    connection_argv = (
+                        self._connection_argv_factory()
+                        if self._connection_argv_factory is not None
+                        else list(self._connection_argv)
+                    )
                     process = self._connection_starter(
-                        list(self._connection_argv),
+                        connection_argv,
                         child_stream.fileno(),
                     )
                     child = _TunnelChild(process=process)
@@ -3198,16 +3205,16 @@ class SshRemoteExecutorTransport:
         if system_authority is not None:
             try:
                 system_authority.verify_authority()
-                connection_argv = system_authority.core_tunnel_argv(
-                    remote_port=remote_port
-                )
                 endpoint = _CoreTunnelEndpoint(
                     connection_starter=system_authority.start_tunnel,
-                    connection_argv=connection_argv,
+                    connection_argv=[],
                     trust_lease=None,
                     trusted_host=None,
                     agent_socket_source=None,
                     authority_verifier=system_authority.verify_authority,
+                    connection_argv_factory=lambda: system_authority.core_tunnel_argv(
+                        remote_port=remote_port
+                    ),
                 )
                 tunnel = SshCoreTunnel(endpoint)
                 self._register_tunnel(tunnel)
