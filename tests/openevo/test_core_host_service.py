@@ -99,6 +99,11 @@ DAEMON_V9 = CoreDaemonBundleIdentity(
     canonical_manifest_sha256="4" * 64,
     lifecycle_compatibility=9,
 )
+DAEMON_V10 = CoreDaemonBundleIdentity(
+    bundle_sha256="f" * 64,
+    canonical_manifest_sha256="5" * 64,
+    lifecycle_compatibility=10,
+)
 
 
 class FakeController:
@@ -1160,7 +1165,8 @@ def test_release_status_proof_requires_the_complete_production_v2_identity(
 
 def test_release_launcher_ready_payload_binds_v2_contract_and_runtime() -> None:
     assert service._identity_requires_production_v2(DAEMON_V8) is False
-    assert service._identity_requires_production_v2(DAEMON_V9) is True
+    assert service._identity_requires_production_v2(DAEMON_V9) is False
+    assert service._identity_requires_production_v2(DAEMON_V10) is True
     payload = {
         "schema_version": 2,
         "generation": "3" * 32,
@@ -1932,6 +1938,49 @@ def test_v8_candidate_starts_after_conditional_stop_persists_v7_floor(
     assert upgraded.attached is False
     assert upgraded.generation != old.generation
     assert upgraded.lifecycle_compatibility == 8
+
+
+def test_v10_candidate_starts_after_conditional_stop_persists_v9_floor(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V9,
+        process_controller=controller,
+    )
+
+    stopped = service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=old.generation,
+        expected_release_identity=old.release_identity,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        floor = pinned.read_json("service.json")
+
+    upgraded = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V10,
+        process_controller=controller,
+    )
+
+    assert stopped is True
+    assert floor["state"] == "stopped"
+    assert floor["lifecycle_compatibility"] == 9
+    assert upgraded.attached is False
+    assert upgraded.generation != old.generation
+    assert upgraded.lifecycle_compatibility == 10
 
 
 def test_dead_newer_daemon_floor_rejects_stale_desktop_downgrade(
