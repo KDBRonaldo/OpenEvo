@@ -462,11 +462,32 @@ class DesktopCoreSshBridgeAdapterV2:
             raise _transport_changed_error(profile_id)
         verified: VerifiedCoreControlTunnel | None = None
         try:
-            verified = open_core_control_tunnel(
-                authority.attachment,
-                transport,
-                timeout_seconds=min(_remaining(deadline), 60.0),
-            )
+            for attempt in range(2):
+                try:
+                    verified = open_core_control_tunnel(
+                        authority.attachment,
+                        transport,
+                        timeout_seconds=min(_remaining(deadline), 60.0),
+                    )
+                    break
+                except CoreControlBootstrapError as exc:
+                    if attempt != 0 or not exc.retryable:
+                        raise
+                    # A freshly published Daemon can lose one short-lived mux
+                    # follower without invalidating the owned SSH generation.
+                    self._require_same_transport(
+                        profile_id,
+                        profile_connection_generation,
+                        transport,
+                    )
+            if verified is None:
+                raise _adapter_error(
+                    "core_tunnel_open_failed",
+                    "The private Core tunnel could not be opened.",
+                    retryable=True,
+                    action="retry",
+                    affected_resource_id=profile_id,
+                )
             self._require_same_transport(profile_id, profile_connection_generation, transport)
             with self._lock:
                 if self._authority is not authority or session_id in self._tunnels:

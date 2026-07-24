@@ -180,6 +180,137 @@ def test_adapter_opens_only_verified_tunnel_transport_and_closes_owned_session(
         adapter.new_http_transport()
 
 
+def test_adapter_retries_one_retryable_verified_tunnel_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    adapter = DesktopCoreSshBridgeAdapterV2(lifecycle, _bootstrap(tmp_path))
+    attachment = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    attempts: list[float] = []
+
+    def open_tunnel_once_then_succeed(
+        _attachment: object,
+        active_transport: object,
+        *,
+        timeout_seconds: float,
+    ) -> object:
+        assert active_transport is transport
+        attempts.append(timeout_seconds)
+        if len(attempts) == 1:
+            raise core_control.CoreControlBootstrapError(
+                core_control.CoreControlBootstrapErrorCode.SERVICE_FAILED,
+                "transient mux follower failure",
+                retryable=True,
+            )
+        return transport.tunnel
+
+    monkeypatch.setattr(
+        "desktop.sidecar.core_bridge_adapters_v2.open_core_control_tunnel",
+        open_tunnel_once_then_succeed,
+    )
+
+    tunnel = adapter.open_tunnel(
+        profile_id=PROFILE_ID,
+        profile_connection_generation=7,
+        remote_port=attachment.remote_port,
+        session_id="session-retry",
+        deadline=time.monotonic() + 5,
+    )
+
+    assert len(attempts) == 2
+    assert all(0 < timeout <= 5 for timeout in attempts)
+    tunnel.close(deadline=time.monotonic() + 5)
+    assert transport.tunnel.close_calls == 1
+
+
+def test_adapter_retry_fails_closed_if_system_ssh_transport_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    adapter = DesktopCoreSshBridgeAdapterV2(lifecycle, _bootstrap(tmp_path))
+    attachment = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    attempts = 0
+
+    def fail_first_tunnel(
+        _attachment: object,
+        active_transport: object,
+        *,
+        timeout_seconds: float,
+    ) -> object:
+        nonlocal attempts
+        del active_transport, timeout_seconds
+        attempts += 1
+        lifecycle.transport = FakeCoreTransport()
+        raise core_control.CoreControlBootstrapError(
+            core_control.CoreControlBootstrapErrorCode.SERVICE_FAILED,
+            "transient mux follower failure",
+            retryable=True,
+        )
+
+    monkeypatch.setattr(
+        "desktop.sidecar.core_bridge_adapters_v2.open_core_control_tunnel",
+        fail_first_tunnel,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as caught:
+        adapter.open_tunnel(
+            profile_id=PROFILE_ID,
+            profile_connection_generation=7,
+            remote_port=attachment.remote_port,
+            session_id="session-transport-changed",
+            deadline=time.monotonic() + 5,
+        )
+
+    assert caught.value.error.code == "core_ssh_transport_identity_changed"
+    assert attempts == 1
+
+
+def test_adapter_does_not_retry_non_retryable_tunnel_identity_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeCoreTransport()
+    adapter = DesktopCoreSshBridgeAdapterV2(_Lifecycle(transport), _bootstrap(tmp_path))
+    attachment = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    attempts = 0
+
+    def reject_tunnel_identity(
+        _attachment: object,
+        active_transport: object,
+        *,
+        timeout_seconds: float,
+    ) -> object:
+        nonlocal attempts
+        del active_transport, timeout_seconds
+        attempts += 1
+        raise core_control.CoreControlBootstrapError(
+            core_control.CoreControlBootstrapErrorCode.RESPONSE_INVALID,
+            "verified tunnel identity mismatch",
+            retryable=False,
+        )
+
+    monkeypatch.setattr(
+        "desktop.sidecar.core_bridge_adapters_v2.open_core_control_tunnel",
+        reject_tunnel_identity,
+    )
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as caught:
+        adapter.open_tunnel(
+            profile_id=PROFILE_ID,
+            profile_connection_generation=7,
+            remote_port=attachment.remote_port,
+            session_id="session-identity-mismatch",
+            deadline=time.monotonic() + 5,
+        )
+
+    assert caught.value.error.code == "core_tunnel_open_failed"
+    assert attempts == 1
+
+
 def test_adapter_source_has_no_v1_contract_or_shared_backend_fallback() -> None:
     source = Path("desktop/sidecar/core_bridge_adapters_v2.py").read_text(encoding="utf-8")
     assert "contracts.v1" not in source
