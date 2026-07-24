@@ -108,9 +108,23 @@ def _binding(
 class _Services:
     def __init__(self, binding: ServiceRunBinding | None) -> None:
         self.binding = binding
+        self.require_ensure = False
+        self.ensured = False
+        self.ensure_calls: list[tuple[object, str | None, str | None]] = []
+
+    def ensure(
+        self,
+        execution_mode: object,
+        *,
+        codex_model: str | None = None,
+        runtime_image: str | None = None,
+    ) -> object:
+        self.ensure_calls.append((execution_mode, codex_model, runtime_image))
+        self.ensured = True
+        return object()
 
     def run_binding(self) -> ServiceRunBinding:
-        if self.binding is None:
+        if self.binding is None or (self.require_ensure and not self.ensured):
             raise RuntimeError("service group is unavailable")
         return self.binding
 
@@ -222,6 +236,27 @@ def test_genesis_is_content_addressed_verified_and_restart_stable(
         owner.close()
         workspaces.close()
         catalog.close()
+
+
+def test_genesis_ensures_the_managed_subscription_service_group_before_binding(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    runtime.services.require_ensure = True
+    record = runtime.create()
+    try:
+        authority = runtime.authority.ensure_project(record)
+
+        assert authority is not None
+        assert runtime.services.ensure_calls == [
+            (
+                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                "gpt-5.5",
+                MANAGED_RUNTIME_IMAGES["managed_science"],
+            )
+        ]
+    finally:
+        runtime.close()
 
 
 def test_unavailable_or_drifted_runtime_is_not_ready_without_partial_head(

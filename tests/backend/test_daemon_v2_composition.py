@@ -112,6 +112,9 @@ class _ReleaseServices:
     def run_binding(self) -> ServiceRunBinding:
         return self._binding
 
+    def ensure(self, *_args: object, **_kwargs: object) -> object:
+        return object()
+
     def ensure_run_binding(self, *_args: object, **_kwargs: object) -> tuple[object, object]:
         snapshot = ServiceGroupSnapshot(
             execution_mode=self._binding.execution_mode,

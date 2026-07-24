@@ -27,7 +27,7 @@ from openevo.backend.run_admission import (
 from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
 from openevo.backend.science_run_store import ScienceProjectAdmissionAuthorityV2
-from openevo.backend.service_supervisor import ServiceRunBinding
+from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.backend.workspace_store_v2 import (
     WorkspaceIntegrityErrorV2,
     WorkspaceNotFoundV2,
@@ -44,6 +44,7 @@ from openevo.evolution.revisions import (
     VerifiedExecutionSnapshot,
     require_verified_execution_snapshot,
 )
+from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
 from openevo.experiments import (
     ProjectEvolutionValidationError,
     validate_project_evolution_selections,
@@ -85,6 +86,14 @@ class ProjectAuthorityReadinessV2:
 
 
 class ServiceBindingProviderV2(Protocol):
+    def ensure(
+        self,
+        execution_mode: ServiceExecutionMode,
+        *,
+        codex_model: str | None = None,
+        runtime_image: str | None = None,
+    ) -> object: ...
+
     def run_binding(self) -> ServiceRunBinding: ...
 
 
@@ -183,7 +192,10 @@ class ProjectAuthorityV2:
             raise TypeError("project authority requires the exact v2 workspace store")
         if type(task_owner) is not CoreScienceTaskOwnerV2:
             raise TypeError("project authority requires the exact v2 Task owner")
-        if not callable(getattr(service_binding_provider, "run_binding", None)):
+        if any(
+            not callable(getattr(service_binding_provider, method, None))
+            for method in ("ensure", "run_binding")
+        ):
             raise TypeError("project authority requires a service binding provider")
         self._catalog = catalog_store
         self._workspaces = workspace_store
@@ -280,7 +292,10 @@ class ProjectAuthorityV2:
                     return self._mark_published(document, authority_record, authority)
             if authority_record.workspace_snapshot is None:
                 return None
-            resolved = self._resolve_execution(project.config)
+            resolved = self._resolve_execution(
+                project.config,
+                ensure_services=True,
+            )
             if resolved is None:
                 return None
             verified, binding = resolved
@@ -718,8 +733,16 @@ class ProjectAuthorityV2:
     def _resolve_execution(
         self,
         config: m.ScienceProjectConfigV2,
+        *,
+        ensure_services: bool = False,
     ) -> tuple[VerifiedExecutionSnapshot, ServiceRunBinding] | None:
         try:
+            if ensure_services:
+                self._services.ensure(
+                    ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                    codex_model=config.execution.codex_model,
+                    runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+                )
             binding = self._services.run_binding()
         except Exception:
             return None
