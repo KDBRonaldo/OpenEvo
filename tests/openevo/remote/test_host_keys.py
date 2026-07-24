@@ -16,6 +16,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -561,7 +562,15 @@ def test_store_alias_validation_failure_closes_ancestor_fd_once(
         "_validate_darwin_system_alias_binding",
         reject_alias,
     )
-    monkeypatch.setattr(host_keys_module.os, "close", record_close)
+    # Replacing ``os.close`` mutates the process-global stdlib module and can
+    # count unrelated background cleanup after this descriptor number is
+    # reused.  A module-local proxy keeps this assertion scoped to the exact
+    # _StoreAnchor failure path while still recording repeated product calls.
+    monkeypatch.setattr(
+        host_keys_module,
+        "os",
+        SimpleNamespace(fstat=os.fstat, close=record_close),
+    )
 
     with pytest.raises(ValueError, match="injected alias mismatch"):
         host_keys_module._StoreAnchor(
