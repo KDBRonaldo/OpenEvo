@@ -130,14 +130,13 @@ describe("v0.1.9 release provider", () => {
     ]);
   });
 
-  it("recovers bootstrap context when the long native start reply never settles", async () => {
+  it("uses a quick native start request before observing the published bootstrap context", async () => {
     const fetch = vi.fn<FetchLikeV2>().mockResolvedValue(new Response(JSON.stringify(version()), {
       status: 200,
       headers: { "Content-Type": "application/json" },
     }));
-    const neverSettles = new Promise<never>(() => {});
     invokeMock.mockImplementation((command?: string) => {
-      if (command === "start_sidecar") return neverSettles;
+      if (command === "begin_sidecar_start") return Promise.resolve(undefined);
       if (command === "sidecar_bootstrap_context") return Promise.resolve(bootstrap());
       return Promise.resolve(undefined);
     });
@@ -152,10 +151,11 @@ describe("v0.1.9 release provider", () => {
       apiVersion: 2,
       providerKind: "desktop_sidecar",
     });
-    expect(invokeMock).toHaveBeenCalledWith("start_sidecar");
+    expect(invokeMock).not.toHaveBeenCalledWith("start_sidecar");
+    expect(invokeMock).toHaveBeenCalledWith("begin_sidecar_start");
     expect(invokeMock).toHaveBeenCalledWith("sidecar_bootstrap_context");
     expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
-      "start_sidecar",
+      "begin_sidecar_start",
       "sidecar_bootstrap_context",
     ]);
   });

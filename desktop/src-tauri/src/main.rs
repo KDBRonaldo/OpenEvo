@@ -1657,6 +1657,8 @@ struct DesktopHostStateInner {
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
     startup_in_progress: AtomicBool,
+    start_task_in_progress: AtomicBool,
+    start_task_error: Mutex<Option<NativeHostError>>,
     cancellation_epoch: AtomicU64,
     launch_state: AtomicU64,
     shutdown_requested: AtomicBool,
@@ -1687,6 +1689,8 @@ impl Default for DesktopHostState {
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
             startup_in_progress: AtomicBool::new(false),
+            start_task_in_progress: AtomicBool::new(false),
+            start_task_error: Mutex::new(None),
             cancellation_epoch: AtomicU64::new(0),
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
             shutdown_requested: AtomicBool::new(false),
@@ -1731,19 +1735,30 @@ struct StartupClaim<'a> {
 
 impl<'a> StartupClaim<'a> {
     fn acquire(state: &'a DesktopHostState) -> HostResult<(Self, u64)> {
+        let (expected_epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
+        Self::acquire_expected(state, expected_epoch)
+    }
+
+    fn acquire_expected(
+        state: &'a DesktopHostState,
+        expected_epoch: u64,
+    ) -> HostResult<(Self, u64)> {
         if state.shutdown_requested.load(Ordering::Acquire) {
             return Err(NativeHostError::new(
                 "sidecar_host_shutting_down",
                 "OpenEvo Desktop is shutting down its native sidecar host.",
             ));
         }
-        let (epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
+        let (observed_epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
+        if observed_epoch != expected_epoch {
+            return Err(sidecar_start_cancelled_error());
+        }
         state
             .startup_in_progress
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| sidecar_start_in_progress_error())?;
         let (confirmed_epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
-        if confirmed_epoch != epoch || state.shutdown_requested.load(Ordering::Acquire) {
+        if confirmed_epoch != expected_epoch || state.shutdown_requested.load(Ordering::Acquire) {
             state.startup_in_progress.store(false, Ordering::Release);
             return Err(sidecar_start_cancelled_error());
         }
@@ -1751,7 +1766,7 @@ impl<'a> StartupClaim<'a> {
             Self {
                 in_progress: &state.startup_in_progress,
             },
-            epoch,
+            expected_epoch,
         ))
     }
 }
@@ -5447,11 +5462,15 @@ fn wait_for_startup_to_finish<C: ProcessControl>(
     control: &C,
     timeout: Duration,
 ) -> HostResult<()> {
-    if !state.startup_in_progress.load(Ordering::Acquire) {
+    if !state.startup_in_progress.load(Ordering::Acquire)
+        && !state.start_task_in_progress.load(Ordering::Acquire)
+    {
         return Ok(());
     }
     let deadline = Instant::now() + timeout;
-    while state.startup_in_progress.load(Ordering::Acquire) {
+    while state.startup_in_progress.load(Ordering::Acquire)
+        || state.start_task_in_progress.load(Ordering::Acquire)
+    {
         if Instant::now() >= deadline {
             return Err(NativeHostError::new(
                 "sidecar_state_timeout",
@@ -5515,10 +5534,22 @@ fn sidecar_bootstrap_context_inner(
         "starting" => return Err(sidecar_start_in_progress_error()),
         "cleanup_pending" => return Err(sidecar_stop_error()),
         "running" => {}
-        _ if state.startup_in_progress.load(Ordering::Acquire) => {
+        _ if state.startup_in_progress.load(Ordering::Acquire)
+            || state.start_task_in_progress.load(Ordering::Acquire) =>
+        {
             return Err(sidecar_start_in_progress_error());
         }
-        _ => return Err(sidecar_state_error()),
+        _ => {
+            if let Some(error) = state
+                .start_task_error
+                .lock()
+                .map_err(|_| sidecar_state_error())?
+                .clone()
+            {
+                return Err(error);
+            }
+            return Err(sidecar_state_error());
+        }
     }
 
     let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
@@ -5649,15 +5680,49 @@ fn start_sidecar_inner(
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
 ) -> HostResult<DesktopBootstrapContextV2> {
-    let context = start_sidecar_inner_with(state, policy, bundled_path, &OsProcessControl)?;
+    let context = start_sidecar_inner_with_expected_epoch(
+        state,
+        policy,
+        bundled_path,
+        None,
+        &OsProcessControl,
+    )?;
     ensure_running_sidecar_monitor(state, &context)?;
     Ok(context)
 }
 
+fn start_sidecar_inner_for_epoch(
+    state: &DesktopHostState,
+    policy: LaunchPolicy,
+    bundled_path: Option<&Path>,
+    expected_epoch: u64,
+) -> HostResult<DesktopBootstrapContextV2> {
+    let context = start_sidecar_inner_with_expected_epoch(
+        state,
+        policy,
+        bundled_path,
+        Some(expected_epoch),
+        &OsProcessControl,
+    )?;
+    ensure_running_sidecar_monitor(state, &context)?;
+    Ok(context)
+}
+
+#[cfg(test)]
 fn start_sidecar_inner_with<C: ProcessControl>(
     state: &DesktopHostState,
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
+    control: &C,
+) -> HostResult<DesktopBootstrapContextV2> {
+    start_sidecar_inner_with_expected_epoch(state, policy, bundled_path, None, control)
+}
+
+fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
+    state: &DesktopHostState,
+    policy: LaunchPolicy,
+    bundled_path: Option<&Path>,
+    expected_epoch: Option<u64>,
     control: &C,
 ) -> HostResult<DesktopBootstrapContextV2> {
     if state.shutdown_requested.load(Ordering::Acquire) {
@@ -5666,7 +5731,10 @@ fn start_sidecar_inner_with<C: ProcessControl>(
             "OpenEvo Desktop is shutting down its native sidecar host.",
         ));
     }
-    let (_startup_claim, startup_epoch) = StartupClaim::acquire(state)?;
+    let (_startup_claim, startup_epoch) = match expected_epoch {
+        Some(epoch) => StartupClaim::acquire_expected(state, epoch)?,
+        None => StartupClaim::acquire(state)?,
+    };
     let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     if let Some(managed) = sidecar.as_mut() {
         if managed.lifecycle == ManagedLifecycle::CleanupPending {
@@ -7025,74 +7093,145 @@ fn write_desktop_diagnostics_export(
     parent_directory.sync_all()
 }
 
+struct SidecarStartTaskReset {
+    state: DesktopHostState,
+}
+
+impl Drop for SidecarStartTaskReset {
+    fn drop(&mut self) {
+        self.state
+            .start_task_in_progress
+            .store(false, Ordering::Release);
+    }
+}
+
+fn run_logged_sidecar_start(
+    state: &DesktopHostState,
+    expected_epoch: Option<u64>,
+) -> HostResult<DesktopBootstrapContextV2> {
+    state.desktop_logs.ensure_startup_attempt();
+    state.desktop_logs.record_startup_stage(
+        DesktopLogSource::Native,
+        DesktopStartupStage::BundleVerification,
+        DesktopStartupResult::Started,
+        Some("verification_started"),
+        None,
+        None,
+        None,
+    );
+    emit_renderer_stage("sidecar_start_requested");
+    state.desktop_logs.record(
+        DesktopLogSource::Native,
+        DesktopLogLevel::Info,
+        "sidecar_start_requested",
+        None,
+        None,
+        None,
+        None,
+    );
+    let bundled_path = bundled_sidecar_path();
+    let result = match expected_epoch {
+        Some(epoch) => start_sidecar_inner_for_epoch(
+            state,
+            active_launch_policy(),
+            bundled_path.as_deref(),
+            epoch,
+        ),
+        None => start_sidecar_inner(state, active_launch_policy(), bundled_path.as_deref()),
+    };
+    if let Err(error) = result.as_ref() {
+        if !state.desktop_logs.current_attempt_failed() {
+            state.desktop_logs.record_startup_stage(
+                DesktopLogSource::Native,
+                startup_stage_for_native_error(error),
+                DesktopStartupResult::Failed,
+                Some(error.code.as_str()),
+                None,
+                None,
+                None,
+            );
+        }
+    }
+    state.desktop_logs.record(
+        DesktopLogSource::Native,
+        if result.is_ok() {
+            DesktopLogLevel::Info
+        } else {
+            DesktopLogLevel::Error
+        },
+        if result.is_ok() {
+            "sidecar_start_succeeded"
+        } else {
+            "sidecar_start_failed"
+        },
+        result.as_ref().err().map(|error| error.code.as_str()),
+        None,
+        None,
+        None,
+    );
+    emit_renderer_stage(if result.is_ok() {
+        "sidecar_start_returned"
+    } else {
+        "sidecar_start_failed"
+    });
+    result
+}
+
+fn begin_sidecar_start_inner(state: &DesktopHostState) -> HostResult<()> {
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        return Err(NativeHostError::new(
+            "sidecar_host_shutting_down",
+            "OpenEvo Desktop is shutting down its native sidecar host.",
+        ));
+    }
+    let (scheduled_epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
+    state
+        .start_task_in_progress
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .map_err(|_| sidecar_start_in_progress_error())?;
+    match state.start_task_error.lock() {
+        Ok(mut error) => *error = None,
+        Err(_) => {
+            state.start_task_in_progress.store(false, Ordering::Release);
+            return Err(sidecar_state_error());
+        }
+    }
+
+    let thread_state = state.clone();
+    let spawn = thread::Builder::new()
+        .name("openevo-sidecar-start".to_string())
+        .spawn(move || {
+            let _reset = SidecarStartTaskReset {
+                state: thread_state.clone(),
+            };
+            let result = run_logged_sidecar_start(&thread_state, Some(scheduled_epoch));
+            if let Err(error) = result {
+                if let Ok(mut stored) = thread_state.start_task_error.lock() {
+                    *stored = Some(error);
+                }
+            }
+        });
+    if spawn.is_err() {
+        state.start_task_in_progress.store(false, Ordering::Release);
+        return Err(sidecar_start_task_error());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn begin_sidecar_start(state: tauri::State<'_, DesktopHostState>) -> HostResult<()> {
+    begin_sidecar_start_inner(&state)
+}
+
 #[tauri::command]
 async fn start_sidecar(
     _app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
 ) -> HostResult<DesktopBootstrapContextV2> {
     let state = state.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || {
-        state.desktop_logs.ensure_startup_attempt();
-        state.desktop_logs.record_startup_stage(
-            DesktopLogSource::Native,
-            DesktopStartupStage::BundleVerification,
-            DesktopStartupResult::Started,
-            Some("verification_started"),
-            None,
-            None,
-            None,
-        );
-        emit_renderer_stage("sidecar_start_requested");
-        state.desktop_logs.record(
-            DesktopLogSource::Native,
-            DesktopLogLevel::Info,
-            "sidecar_start_requested",
-            None,
-            None,
-            None,
-            None,
-        );
-        let bundled_path = bundled_sidecar_path();
-        let result = start_sidecar_inner(&state, active_launch_policy(), bundled_path.as_deref());
-        if let Err(error) = result.as_ref() {
-            if !state.desktop_logs.current_attempt_failed() {
-                state.desktop_logs.record_startup_stage(
-                    DesktopLogSource::Native,
-                    startup_stage_for_native_error(error),
-                    DesktopStartupResult::Failed,
-                    Some(error.code.as_str()),
-                    None,
-                    None,
-                    None,
-                );
-            }
-        }
-        state.desktop_logs.record(
-            DesktopLogSource::Native,
-            if result.is_ok() {
-                DesktopLogLevel::Info
-            } else {
-                DesktopLogLevel::Error
-            },
-            if result.is_ok() {
-                "sidecar_start_succeeded"
-            } else {
-                "sidecar_start_failed"
-            },
-            result.as_ref().err().map(|error| error.code.as_str()),
-            None,
-            None,
-            None,
-        );
-        emit_renderer_stage(if result.is_ok() {
-            "sidecar_start_returned"
-        } else {
-            "sidecar_start_failed"
-        });
-        result
-    })
-    .await
-    .map_err(|_| sidecar_start_task_error())?
+    tauri::async_runtime::spawn_blocking(move || run_logged_sidecar_start(&state, None))
+        .await
+        .map_err(|_| sidecar_start_task_error())?
 }
 
 #[tauri::command]
@@ -7475,6 +7614,7 @@ fn main() {
             get_desktop_log_tail,
             reveal_desktop_log_directory,
             export_desktop_diagnostics,
+            begin_sidecar_start,
             start_sidecar,
             stop_sidecar,
             renderer_bootstrap_stage,
@@ -8057,6 +8197,33 @@ mod tests {
 
         stop_sidecar_inner(&state).unwrap();
         assert!(!private_root.exists());
+    }
+
+    #[test]
+    fn bootstrap_context_observer_returns_the_background_start_error() {
+        let state = DesktopHostState::default();
+        *state.start_task_error.lock().unwrap() = Some(NativeHostError::new(
+            "synthetic_start_failure",
+            "Synthetic closed startup failure.",
+        ));
+
+        let error = expect_host_error(sidecar_bootstrap_context_inner(&state));
+
+        assert_eq!(error.code, "synthetic_start_failure");
+        assert_eq!(error.message, "Synthetic closed startup failure.");
+    }
+
+    #[test]
+    fn scheduled_start_claim_is_cancelled_by_a_newer_stop_epoch() {
+        let state = DesktopHostState::default();
+        let (scheduled_epoch, _) = decode_launch_state(state.launch_state.load(Ordering::Acquire));
+
+        advance_cancellation(&state);
+        let error =
+            expect_host_error(StartupClaim::acquire_expected(&state, scheduled_epoch).map(|_| ()));
+
+        assert_eq!(error.code, "sidecar_start_cancelled");
+        assert!(!state.startup_in_progress.load(Ordering::Acquire));
     }
 
     #[test]
