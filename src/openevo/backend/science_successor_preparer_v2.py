@@ -646,10 +646,13 @@ class ProductionScienceSuccessorPreparerV2:
             prior_dataset_artifact_ids=prior_dataset_ids,
         )
         methods = tuple(
-            compiled.evolution_methods_for_round(
-                0,
-                prior_dataset_artifact_ids=prior_dataset_ids,
-                task_id=context.task.task_id,
+            sorted(
+                compiled.evolution_methods_for_round(
+                    0,
+                    prior_dataset_artifact_ids=prior_dataset_ids,
+                    task_id=context.task.task_id,
+                ),
+                key=lambda item: item.target_id,
             )
         )
         plan = compiled.evolution_plan_for_round(

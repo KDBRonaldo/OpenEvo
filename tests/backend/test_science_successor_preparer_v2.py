@@ -89,11 +89,11 @@ class _Evolution:
         }
         artifact = ArtifactResponse(
             artifact_id=artifact_id,
-            type="text_memory",
-            name="Verified successor memory",
+            type=request.target_id,
+            name=f"Verified successor {request.target_id}",
             version=1,
             state="active",
-            uri="file:///opaque/memory.md",
+            uri=f"file:///opaque/{request.target_id}",
             manifest=manifest,
             compatibility={"agent_harness": ["codex"]},
             scores={"quality": 1.0},
@@ -104,7 +104,7 @@ class _Evolution:
         job_id = f"job-{request.target_id}-successor"
         output = {
             "artifact_id": artifact_id,
-            "type": "text_memory",
+            "type": request.target_id,
             "name": artifact["name"],
             "manifest": manifest,
             "lineage": {"plan_id": request.plan.plan_id},
@@ -123,7 +123,18 @@ class _Evolution:
             "state": "succeeded",
             "outputs": [output],
         }
-        assert selection.method_id == "text_memory_reflector"
+        expected_methods = {
+            "agent_system": {
+                "agent_system_reflector",
+                "agent_system_history_reflector",
+            },
+            "skill_bundle": {"skill_bundle_reflector"},
+            "text_memory": {
+                "text_memory_reflector",
+                "text_memory_expel_reflector",
+            },
+        }
+        assert selection.method_id in expected_methods[request.target_id]
         return {"job_id": job_id, "state": "pending"}
 
     def get_internal_job_result(self, job_id: str) -> dict:
@@ -191,7 +202,26 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
 ) -> None:
     clock = _Clock()
     registry = verified_builtin_registry(tmp_path / "registry")
-    config = _project_config()
+    base_config = _project_config()
+    config_json = base_config.model_dump(mode="json")
+    config_json["evolution"]["targets"] = {
+        "agent_system": {
+            "enabled": True,
+            "method": "auto",
+            "config": {},
+        },
+        "skill_bundle": {
+            "enabled": True,
+            "method": "skill_bundle_reflector",
+            "config": {},
+        },
+        "text_memory": {
+            "enabled": True,
+            "method": "text_memory_expel_reflector",
+            "config": {},
+        },
+    }
+    config = type(base_config).model_validate(config_json)
     binding = _service_binding(registry.snapshot.registry_digest)
     project_id = "project-execution"
     workspaces = WorkspaceStoreV2(tmp_path / "workspaces")
@@ -308,7 +338,7 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         assert successor.generation == 1
         assert successor.project_head_id == f"project-head-{successor.manifest_sha256}"
         assert successor.predecessor_project_head_id == head.project_head_id
-        assert successor.evolution_revision.artifact_count == 1
+        assert successor.evolution_revision.artifact_count == 3
         assert successor.runtime_context_snapshot.evolution_revision_id == (
             successor.evolution_revision.evolution_revision_id
         )
@@ -320,7 +350,11 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         commit = owner.successor_commit(transition.transition.successor_transition_id)
         assert commit is not None
         assert commit.manifest.dataset_artifact_id == ("artifact-dataset-successor")
-        assert commit.manifest.method_artifact_ids == ("artifact-text_memory-successor",)
+        assert commit.manifest.method_artifact_ids == (
+            "artifact-agent_system-successor",
+            "artifact-skill_bundle-successor",
+            "artifact-text_memory-successor",
+        )
         assert commit.manifest.materialized_context_id == "ctx-successor-v2"
 
         next_authority = owner.project_admission_authority(project_id)
