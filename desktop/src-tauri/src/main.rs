@@ -12110,7 +12110,7 @@ https://user:password@example.invalid/private\n"[..],
         let state = DesktopHostState::default();
 
         let context = start_sidecar_inner(&state, LaunchPolicy::Release, Some(&path)).unwrap();
-        assert_eq!(context.schema_version, "1");
+        assert_eq!(context.schema_version, "2");
         let endpoint_port = context
             .endpoint
             .strip_prefix("http://127.0.0.1:")
