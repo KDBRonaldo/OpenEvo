@@ -54,6 +54,7 @@ _MANAGED_SUBSCRIPTION_SECURITY_OPTIONS: Final[tuple[str, ...]] = (
     "seccomp=unconfined",
     "apparmor=unconfined",
 )
+_MANAGED_SUBSCRIPTION_ROOT_CAP_ADD: Final[str] = "CAP_SETFCAP"
 _MANAGED_SUBSCRIPTION_APPARMOR_PROFILES: Final[frozenset[str]] = frozenset({"", "unconfined"})
 _MANAGED_SUBSCRIPTION_TMPFS_DESTINATION: Final[str] = "/tmp"
 _MANAGED_SUBSCRIPTION_TMPFS_OPTIONS: Final[str] = (
@@ -669,6 +670,9 @@ class DockerRuntime(BaseRuntime):
         mounts = evidence["mounts"]
         host_config = evidence["host_config"]
         apparmor_profile = evidence["apparmor_profile"]
+        expected_cap_add = (
+            [_MANAGED_SUBSCRIPTION_ROOT_CAP_ADD] if os.getuid() == 0 else None
+        )
         session_source = os.fspath(self._session_docker_source)
         destinations = {
             self.runtime_session_dir: (session_source, True),
@@ -683,6 +687,7 @@ class DockerRuntime(BaseRuntime):
             or not all(isinstance(mount.get("Destination"), str) for mount in mounts)
             or {mount.get("Destination") for mount in mounts} != set(destinations)
             or not isinstance(host_config, dict)
+            or host_config.get("CapAdd") != expected_cap_add
             or host_config.get("CapDrop") != ["ALL"]
             or host_config.get("SecurityOpt") != list(_MANAGED_SUBSCRIPTION_SECURITY_OPTIONS)
             or host_config.get("Privileged") is not False
@@ -1008,6 +1013,11 @@ class DockerRuntime(BaseRuntime):
                     ),
                 ]
             )
+            if os.getuid() == 0:
+                # Bubblewrap must map UID 0 into its user namespace. Linux
+                # requires CAP_SETFCAP for that mapping; no other capability is
+                # restored, and no-new-privileges remains in force.
+                create_args.append("--cap-add=SETFCAP")
         if self.spec.container_user == "host":
             create_args.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
             # Docker creates a missing image WORKDIR as root before switching

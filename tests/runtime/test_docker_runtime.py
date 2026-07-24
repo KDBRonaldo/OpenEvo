@@ -267,7 +267,11 @@ def _credential_mount_inspect_output(
     runtime: DockerRuntime,
     *,
     apparmor_profile: str = "unconfined",
+    cap_add: list[str] | None = None,
 ) -> str:
+    effective_cap_add = (
+        ["CAP_SETFCAP"] if cap_add is None and os.getuid() == 0 else cap_add
+    )
     return json.dumps(
         {
             "mounts": [
@@ -291,6 +295,7 @@ def _credential_mount_inspect_output(
                 },
             ],
             "host_config": {
+                "CapAdd": effective_cap_add,
                 "CapDrop": ["ALL"],
                 "Privileged": False,
                 "SecurityOpt": [
@@ -1036,6 +1041,75 @@ async def test_private_credential_root_is_mounted_outside_the_session_tree(
     assert not credential_dir.is_relative_to(session_dir)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("host_uid", "expected_cap_add"),
+    [
+        (0, ["--cap-add=SETFCAP"]),
+        (1000, []),
+    ],
+)
+async def test_host_credential_sandbox_uses_uid_scoped_capabilities(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    host_uid: int,
+    expected_cap_add: list[str],
+) -> None:
+    container_id = "4" * 64
+    session_dir = tmp_path / "session"
+    credential_dir = tmp_path / "credentials"
+    session_dir.mkdir()
+    credential_mount = _credential_mount(credential_dir)
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
+    monkeypatch.setattr(docker_module.os, "getuid", lambda: host_uid)
+    monkeypatch.setattr(docker_module.os, "getgid", lambda: host_uid)
+    runtime = DockerRuntime(
+        RuntimeSpec(
+            profile="managed_science",
+            image="openevo/science-runtime:0.1.1",
+            container_user="host",
+        ),
+        "root-science-session",
+        session_dir,
+        credential_mount=credential_mount,
+    )
+
+    async def run_command_impl(*args, **kwargs):
+        del kwargs
+        if args[1:3] == ("image", "inspect"):
+            digest = MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+            return 0, json.dumps([_managed_image_record(digest)]), None
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id + "\n", None
+        if args[1:3] == ("container", "inspect"):
+            if any("json .Mounts" in str(value) for value in args):
+                return (
+                    0,
+                    _credential_mount_inspect_output(
+                        credential_mount,
+                        runtime,
+                    ),
+                    None,
+                )
+            if any("State.Pid" in str(value) for value in args):
+                return 0, f"{container_id}|1234|started-at|true|0\n", None
+            return 0, container_id + "\n", None
+        if args[1] == "exec" and "/usr/bin/stat" in args:
+            return 0, _credential_stat_output(credential_mount), None
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    await runtime.start()
+
+    create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
+    cap_add = [value for value in create if value.startswith("--cap-add=")]
+    assert cap_add == expected_cap_add
+    assert "--cap-drop=ALL" in create
+
+
 def test_credential_mount_forbids_custom_docker_options(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="forbid custom Docker options"):
         DockerRuntime(
@@ -1058,6 +1132,7 @@ async def test_credential_sandbox_accepts_closed_apparmor_platform_evidence(
     apparmor_profile: str,
 ) -> None:
     authority = _credential_mount(tmp_path / "credentials")
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         "credential-apparmor",
@@ -1090,6 +1165,7 @@ async def test_credential_sandbox_accepts_closed_apparmor_platform_evidence(
 @pytest.mark.parametrize(
     "mutation",
     [
+        "cap_add",
         "cap_drop",
         "security_opt",
         "privileged",
@@ -1104,6 +1180,7 @@ async def test_credential_sandbox_rejects_changed_security_or_mount_evidence(
     mutation: str,
 ) -> None:
     authority = _credential_mount(tmp_path / "credentials")
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         f"credential-sandbox-{mutation}",
@@ -1113,7 +1190,9 @@ async def test_credential_sandbox_rejects_changed_security_or_mount_evidence(
     runtime._container_id = "b" * 64
     runtime._ownership_state = "verified"
     evidence = json.loads(_credential_mount_inspect_output(authority, runtime))
-    if mutation == "cap_drop":
+    if mutation == "cap_add":
+        evidence["host_config"]["CapAdd"] = ["SYS_ADMIN"]
+    elif mutation == "cap_drop":
         evidence["host_config"]["CapDrop"] = []
     elif mutation == "security_opt":
         evidence["host_config"]["SecurityOpt"].append("label=disable")
