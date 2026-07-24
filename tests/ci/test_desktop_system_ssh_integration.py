@@ -98,7 +98,9 @@ def test_integration_plan_delegates_to_production_alias_builders(tmp_path: Path)
         profile_id="fixture-profile",
         ssh_host_alias="proxy-jump",
     )
-    control_path = tmp_path / "m"
+    # Darwin's pytest temp root can itself exceed the Unix socket path budget.
+    # The production sidecar also allocates this authority from a short root.
+    control_path = Path("/tmp/openevo-system-ssh-integration-m")
 
     plan = integration.build_production_plan(
         profile,

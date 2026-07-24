@@ -181,6 +181,31 @@ describe("v0.1.9 release provider", () => {
     expect(invokeMock).not.toHaveBeenCalledWith("sidecar_bootstrap_context");
   });
 
+  it("does not accept a bootstrap context before a queued native start rejection settles", async () => {
+    const failure = {
+      code: "sidecar_start_task_failed",
+      message: "OpenEvo Desktop could not schedule its local service startup task.",
+    };
+    const fetch = vi.fn<FetchLikeV2>();
+    invokeMock.mockImplementation((command?: string) => {
+      if (command === "begin_sidecar_start") {
+        return Promise.resolve().then(() => {
+          throw failure;
+        });
+      }
+      if (command === "sidecar_bootstrap_context") return Promise.resolve(bootstrap());
+      return Promise.resolve(undefined);
+    });
+
+    await expect(createReleaseDesktopProductProvider({
+      fetch,
+      reportStage: vi.fn(),
+    })).rejects.toEqual(failure);
+
+    expect(fetch).not.toHaveBeenCalled();
+    expect(invokeMock).toHaveBeenCalledWith("sidecar_bootstrap_context");
+  });
+
   it("fails closed on a v1 bootstrap without calling the Local API", async () => {
     const fetch = vi.fn<FetchLikeV2>();
 

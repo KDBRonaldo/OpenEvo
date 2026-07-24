@@ -181,10 +181,19 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
     { method: "GET", path: "/desktop/v2/events", authenticated: true },
   ]));
   expect(sidecarObservation.httpCalls.every(({ method }) => method === "GET")).toBe(true);
-  expect(connectedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(true);
+  expect(
+    connectedObservation.nativeCalls.some(({ command }) => command === "begin_sidecar_start"),
+  ).toBe(true);
+  expect(
+    connectedObservation.nativeCalls.some(({ command }) => command === "sidecar_bootstrap_context"),
+  ).toBe(true);
+  expect(connectedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(
+    false,
+  );
   expect(connectedObservation.nativeCalls.some(({ command }) => command === "renderer_ready")).toBe(true);
   expect(connectedObservation.nativeCalls.every(({ command }) => [
-    "start_sidecar",
+    "begin_sidecar_start",
+    "sidecar_bootstrap_context",
     "stop_sidecar",
     "renderer_bootstrap_stage",
     "renderer_ready",
@@ -279,10 +288,19 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   expect(sidecarObservation.unexpectedCalls).toEqual([]);
   expect(failedObservation.unexpectedCalls).toEqual([]);
   expect(externalNetworkCalls).toEqual([]);
-  expect(failedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(true);
+  expect(
+    failedObservation.nativeCalls.some(({ command }) => command === "begin_sidecar_start"),
+  ).toBe(true);
+  expect(
+    failedObservation.nativeCalls.some(({ command }) => command === "sidecar_bootstrap_context"),
+  ).toBe(true);
+  expect(failedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(
+    false,
+  );
   expect(failedObservation.nativeCalls.some(({ command }) => command === "renderer_ready")).toBe(false);
   expect(failedObservation.nativeCalls.every(({ command }) => [
-    "start_sidecar",
+    "begin_sidecar_start",
+    "sidecar_bootstrap_context",
     "stop_sidecar",
     "renderer_bootstrap_stage",
   ].includes(command))).toBe(true);
@@ -318,9 +336,12 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
               "bootstrap_context_validated",
               "bootstrap_context_failed",
               "local_api_version_verified",
+              "local_api_version_failed",
               "provider_adapter_ready",
+              "provider_adapter_failed",
               "provider_created",
               "provider_create_failed",
+              "initial_snapshot_failed",
               "product_committed",
             ]);
             if (!allowedStages.has(String(args.stage))) {
@@ -340,10 +361,13 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
             }
             return null;
           }
-          if (command === "start_sidecar") {
+          if (command === "begin_sidecar_start") {
             if (new URL(window.location.href).searchParams.get("native") === "readiness-failure") {
               throw new Error("Native sidecar readiness failed");
             }
+            return null;
+          }
+          if (command === "sidecar_bootstrap_context") {
             return {
               schema_version: "2",
               endpoint: contract.endpoint,

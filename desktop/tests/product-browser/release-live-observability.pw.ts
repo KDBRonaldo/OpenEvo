@@ -593,7 +593,12 @@ test("packaged renderer observes the live Desktop Local API state", async ({ pag
 
   const native = await readNativeObservation(page);
   assertClosed(native.rendererReady, "renderer readiness was not acknowledged");
-  assertClosed(native.commands.includes("start_sidecar"), "native bootstrap was not invoked");
+  assertClosed(
+    native.commands.includes("begin_sidecar_start")
+    && native.commands.includes("sidecar_bootstrap_context")
+    && !native.commands.includes("start_sidecar"),
+    "native bootstrap was not invoked through the release v2 protocol",
+  );
   assertClosed(native.stages.includes("product_committed"), "product commit was not reported");
   assertClosed(native.unexpected.length === 0, "renderer invoked an unsupported native command");
   const timelineEntries = handoff.expected.sessions.flatMap(
@@ -876,7 +881,8 @@ async function installNativeBridge(
       value: {
         invoke: async (command: string, args: Record<string, unknown> = {}) => {
           observation.commands.push(command);
-          if (command === "start_sidecar") return context;
+          if (command === "begin_sidecar_start") return null;
+          if (command === "sidecar_bootstrap_context") return context;
           // The packaged shell owns lifecycle calls. They terminate at this
           // no-op bridge and can never stop the live sidecar owned by Python.
           if (command === "stop_sidecar") return null;

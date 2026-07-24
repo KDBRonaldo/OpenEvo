@@ -279,10 +279,13 @@ treating the degraded environment as runnable.
 renderer until native bootstrap, Local API negotiation, and provider creation
 all succeed. Native transitions are serialized through Tauri: initial startup,
 retry, StrictMode supersession, and renderer unmount first complete
-`stop_sidecar` before another `start_sidecar` can issue a credential. Failed or
-superseded attempts are stopped before the next transition, so they cannot
-leave an unowned sidecar or publish/reuse their session token. A bounded native
-cleanup failure remains visible as retryable startup failure.
+`stop_sidecar` before another `begin_sidecar_start` can schedule startup; the
+renderer then observes only the published `sidecar_bootstrap_context`. A queued
+native-start rejection is rechecked after every context read before that context
+can be accepted. Failed or superseded attempts are stopped before the next
+transition, so they cannot leave an unowned sidecar or publish/reuse their
+session token. A bounded native cleanup failure remains visible as retryable
+startup failure.
 
 The Local API release digest is
 `26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb`.

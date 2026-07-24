@@ -80,7 +80,10 @@ async function bootstrapTauriSidecar(): Promise<DesktopBootstrapContextV2> {
     const begin = beginOutcome.current;
     if (begin?.status === "rejected") throw begin.error;
     try {
-      return await invoke<DesktopBootstrapContextV2>("sidecar_bootstrap_context");
+      const context = await invoke<DesktopBootstrapContextV2>("sidecar_bootstrap_context");
+      const rejected = beginOutcome.current;
+      if (rejected?.status === "rejected") throw rejected.error;
+      return context;
     } catch (error) {
       const rejected = beginOutcome.current;
       if (rejected?.status === "rejected") throw rejected.error;
