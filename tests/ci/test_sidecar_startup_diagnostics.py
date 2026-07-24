@@ -146,7 +146,7 @@ def test_stock_loader_failure_maps_to_closed_diagnostic_without_canaries(
         failure = smoke._render_process_failure(255, stream)
 
     assert failure == (
-        "sidecar exited before serving /health (exit 255).\n"
+        "sidecar exited before proving native health (exit 255).\n"
         "startup diagnostics:\n"
         "OPENEVO_STARTUP_CLASSIFIED_V1 stage=embedded_python_loader "
         "code=python_shared_library_validation_failed"
@@ -323,7 +323,7 @@ def test_bundle_smoke_rejects_a_failed_v2_startup_attempt() -> None:
         "event": "startup_stage",
         "stage": "state_store",
         "result": "failed",
-        "code": "provider_store_failed",
+        "code": "provider_store_v2_failed",
         "duration_bucket": "under_1s",
         "product_version": "0.1.9",
         "source_commit": None,
@@ -362,7 +362,7 @@ def test_smoke_failure_exposes_only_bounded_allowlisted_startup_lines(tmp_path: 
         failure = smoke._render_process_failure(255, stream)
 
     assert failure.startswith(
-        "sidecar exited before serving /health (exit 255).\n"
+        "sidecar exited before proving native health (exit 255).\n"
         "startup diagnostics:\n"
         "OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed\n"
         "OPENEVO_STARTUP_V1 stage=python_metadata code=load_failed errno=13\n"
@@ -527,7 +527,7 @@ def test_native_frame_broken_pipe_surfaces_only_closed_startup_diagnostic(
             )
 
     assert str(rejected.value) == (
-        "sidecar exited before serving /health (exit 255).\n"
+        "sidecar exited before proving native health (exit 255).\n"
         "startup diagnostics:\n"
         "OPENEVO_STARTUP_V1 stage=bootloader_archive code=archive_open_failed"
     )
@@ -774,7 +774,7 @@ def test_python_startup_preserves_typed_redacted_launcher_failure(
         try:
             raise RuntimeError(canary)
         except RuntimeError as exc:
-            raise launcher.PackagedLauncherStartupError("core_bridge_store_failed") from exc
+            raise launcher.PackagedLauncherStartupError("core_bridge_store_v2_failed") from exc
 
     monkeypatch.setattr(launcher, "main", fail_launcher)
 
@@ -782,7 +782,8 @@ def test_python_startup_preserves_typed_redacted_launcher_failure(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert (
-        captured.err == "OPENEVO_STARTUP_V1 stage=python_launcher code=core_bridge_store_failed\n"
+        captured.err
+        == "OPENEVO_STARTUP_V1 stage=python_launcher code=core_bridge_store_v2_failed\n"
     )
     assert canary not in captured.err
 

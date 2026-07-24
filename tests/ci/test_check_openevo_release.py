@@ -20,14 +20,18 @@ from desktop.sidecar.release_capabilities import (
     RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
 )
 
-
 RELEASE_CONTRACT = json.loads(
     (Path(__file__).resolve().parents[2] / "desktop/release-contract.json").read_text(
         encoding="utf-8"
     )
 )
-RELEASE_OPENAPI_SHA256 = RELEASE_CONTRACT["accepted_openapi_digests"][0]
-RELEASE_FEATURE_FLAGS = RELEASE_CONTRACT["required_feature_flags"]
+V019_RELEASE_CONTRACT = RELEASE_CONTRACT["v019"]
+RELEASE_VERSION = V019_RELEASE_CONTRACT["release_version"]
+RELEASE_OPENAPI_SHA256 = V019_RELEASE_CONTRACT["accepted_desktop_openapi_digests"][0]
+RELEASE_EVENT_SCHEMA_SHA256 = V019_RELEASE_CONTRACT[
+    "accepted_desktop_event_schema_digests"
+][0]
+RELEASE_FEATURE_FLAGS = V019_RELEASE_CONTRACT["required_desktop_feature_flags"]
 
 
 GOOD_METADATA = "\n".join(
@@ -232,8 +236,11 @@ def test_sidecar_smoke_rejects_core_owned_fields_in_project_contract() -> None:
 
 def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> None:
     smoke = _load_sidecar_smoke_module()
-    sidecar = tmp_path / "fake-openevo-desktop-sidecar"
+    sidecar = tmp_path / "openevo-desktop-sidecar-test-target"
+    helper = tmp_path / "openevo-ssh-askpass-test-target"
     _write_fake_sidecar(sidecar)
+    helper.write_bytes(b"packaged askpass helper fixture")
+    helper.chmod(0o755)
 
     smoke.smoke_sidecar(sidecar, timeout_seconds=5)
 
@@ -251,8 +258,16 @@ def test_sidecar_smoke_rejects_missing_required_feature() -> None:
     smoke = _load_sidecar_smoke_module()
     payload = _release_version_payload()
     payload["feature_flags"] = RELEASE_FEATURE_FLAGS[:-1]
+    payload["feature_set_sha256"] = hashlib.sha256(
+        json.dumps(
+            payload["feature_flags"],
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
 
-    with pytest.raises(smoke.SmokeFailure, match="omitted required release features"):
+    with pytest.raises(smoke.SmokeFailure, match="invalid release contract"):
         smoke._assert_release_version(payload)
 
 
@@ -631,7 +646,7 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
         "\n".join(
             [
                 "unrelated bounded native diagnostic",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 sidecar_start_requested",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 sidecar_start_requested",
                 (
                     "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2 "
                     "pid=41 pgid=41 sid=41 birth=darwin:1700000000:123 "
@@ -644,16 +659,19 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
                     "executable_device=42 executable_inode=99 "
                     f"executable_sha256={'b' * 64} executable_size=19"
                 ),
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 sidecar_start_returned",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 bootstrap_context_validated",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 local_api_version_verified",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 retry_recovery_ready",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 provider_adapter_ready",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 provider_created",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 product_committed",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 ready_requested",
-                "OPENEVO_DESKTOP_RENDERER_STAGE_V1 window_not_visible",
-                f"OPENEVO_DESKTOP_RENDERER_READY_V2 {RELEASE_OPENAPI_SHA256}",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 sidecar_start_returned",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 bootstrap_context_validated",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 local_api_version_verified",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 provider_adapter_ready",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 provider_created",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 product_committed",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 ready_requested",
+                "OPENEVO_DESKTOP_RENDERER_STAGE_V2 window_not_visible",
+                (
+                    "OPENEVO_DESKTOP_RENDERER_READY_V2 "
+                    f"{RELEASE_VERSION} {RELEASE_OPENAPI_SHA256} "
+                    f"{RELEASE_EVENT_SCHEMA_SHA256}"
+                ),
             ]
         )
         + "\n",
@@ -675,7 +693,6 @@ def test_bundle_smoke_parses_latest_native_lifecycle_without_exposing_credential
             "sidecar_start_returned",
             "bootstrap_context_validated",
             "local_api_version_verified",
-            "retry_recovery_ready",
             "provider_adapter_ready",
             "provider_created",
             "product_committed",
@@ -704,7 +721,16 @@ def test_bundle_smoke_rejects_unknown_renderer_stage() -> None:
 
     with pytest.raises(smoke.SmokeFailure, match="renderer stage is malformed"):
         smoke._parse_native_host_observation(
-            b"OPENEVO_DESKTOP_RENDERER_STAGE_V1 credential_dumped\n"
+            b"OPENEVO_DESKTOP_RENDERER_STAGE_V2 credential_dumped\n"
+        )
+
+
+def test_bundle_smoke_rejects_frozen_v1_renderer_stage_marker() -> None:
+    smoke = _load_bundle_smoke_module()
+
+    with pytest.raises(smoke.SmokeFailure, match="renderer stage is malformed"):
+        smoke._parse_native_host_observation(
+            b"OPENEVO_DESKTOP_RENDERER_STAGE_V1 provider_created\n"
         )
 
 
@@ -774,7 +800,11 @@ def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
     payload = "\n".join(
         [
             process_marker.format(pid=41, seconds=1700000000, inode=98),
-            f"OPENEVO_DESKTOP_RENDERER_READY_V2 {RELEASE_OPENAPI_SHA256}",
+            (
+                "OPENEVO_DESKTOP_RENDERER_READY_V2 "
+                f"{RELEASE_VERSION} {RELEASE_OPENAPI_SHA256} "
+                f"{RELEASE_EVENT_SCHEMA_SHA256}"
+            ),
             process_marker.format(pid=42, seconds=1700000001, inode=99),
         ]
     ).encode("ascii") + b"\n"
@@ -787,7 +817,11 @@ def test_bundle_smoke_bounds_native_log_and_resets_stale_renderer_ack() -> None:
         smoke._parse_native_host_observation(b"x" * (smoke.NATIVE_HOST_LOG_MAX_BYTES + 1))
     with pytest.raises(smoke.SmokeFailure, match="renderer marker is malformed"):
         smoke._parse_native_host_observation(
-            payload + f"OPENEVO_DESKTOP_RENDERER_READY_V2 {'b' * 64}\n".encode("ascii")
+            payload
+            + (
+                "OPENEVO_DESKTOP_RENDERER_READY_V2 "
+                f"{RELEASE_VERSION} {RELEASE_OPENAPI_SHA256} {'b' * 64}\n"
+            ).encode("ascii")
         )
 
 
@@ -3438,7 +3472,7 @@ def test_release_docs_and_notes_match_execution_mode_and_native_storage_authorit
 
 
 def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
-    from desktop.sidecar.contracts.v1 import DESKTOP_OPENAPI_SHA256
+    from desktop.sidecar.contracts.v2 import DESKTOP_OPENAPI_SHA256
 
     config = json.loads(Path("desktop/src-tauri/tauri.conf.json").read_text(encoding="utf-8"))
     cargo = Path("desktop/src-tauri/Cargo.toml").read_text(encoding="utf-8")
@@ -3525,6 +3559,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
             "height": 860,
             "minWidth": 760,
             "minHeight": 600,
+            "incognito": True,
         }
     ]
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
@@ -4143,43 +4178,40 @@ def _write_fake_tauri_release_smoke(path: Path) -> None:
 
 def _release_version_payload() -> dict[str, object]:
     return {
-        "schema_version": "1",
+        "schema_version": "2",
         "api_name": "openevo-desktop-local-api",
-        "preferred_major": 1,
-        "supported_majors": [1],
+        "preferred_major": 2,
+        "supported_majors": [2],
+        "mutation_major": 2,
         "provider_kind": "desktop_sidecar",
         "build_channel": "release",
         "openapi_sha256": RELEASE_OPENAPI_SHA256,
-        "build_version": "0.1.0",
+        "event_schema_sha256": RELEASE_EVENT_SCHEMA_SHA256,
+        "release_version": "0.1.9",
+        "build_id": "ab" * 32,
         "source_commit": "89baeb26",
         "feature_flags": RELEASE_FEATURE_FLAGS,
+        "feature_set_sha256": hashlib.sha256(
+            json.dumps(
+                RELEASE_FEATURE_FLAGS,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "required_core_api_major": 2,
+        "mutation_compatible": True,
     }
 
 
 def _desktop_state_payload() -> dict[str, object]:
     return {
-        "schema_version": "1",
-        "observed_at": "2026-07-15T00:00:00Z",
-        "contract": {
-            "selected_major": 1,
-            "desktop_openapi_sha256": RELEASE_OPENAPI_SHA256,
-            "core_openapi_sha256": None,
-            "compatible": True,
-        },
-        "execution_mode_capabilities": (
-            RELEASE_EXECUTION_MODE_CAPABILITIES_V1.model_dump(mode="json")
-        ),
-        "core": {
-            "state": "disconnected",
-            "profile_id": None,
-            "active_tunnel": False,
-            "operation_id": None,
-            "host_key_review": None,
-            "core": None,
-            "failure": None,
-        },
-        "active_project": None,
-        "pending_operation_ids": [],
+        "schema_version": "2",
+        "profiles": [],
+        "active_profile_id": None,
+        "active_project_id": None,
+        "last_event_id": None,
+        "updated_at": "2026-07-15T00:00:00Z",
     }
 
 
@@ -4206,7 +4238,7 @@ def _write_fake_sidecar(path: Path) -> None:
                 "",
                 "class Handler(BaseHTTPRequestHandler):",
                 "    def do_GET(self):",
-                "        if self.path == '/health':",
+                "        if self.path == '/openevo-native/health':",
                 "            challenge = self.headers.get('X-OpenEvo-Native-Challenge')",
                 "            if challenge is None:",
                 "                self.send_response(403)",
@@ -4235,7 +4267,7 @@ def _write_fake_sidecar(path: Path) -> None:
                 "            self.end_headers()",
                 "            self.wfile.write(body)",
                 "            return",
-                "        if self.path == '/desktop/v1/state':",
+                "        if self.path == '/desktop/v2/state':",
                 "            if self.headers.get('X-OpenEvo-Desktop-Session') != session_token:",
                 "                self.send_response(401)",
                 "                self.end_headers()",
@@ -4278,9 +4310,11 @@ def _write_fake_sidecar(path: Path) -> None:
                 "parser.add_argument('--host', default='127.0.0.1')",
                 "parser.add_argument('--desktop-config-root')",
                 "parser.add_argument('--release-assets-root', required=True)",
+                "parser.add_argument('--ssh-askpass-helper-path', required=True)",
                 "parser.add_argument('--listener-fd', type=int, required=True)",
                 "parser.add_argument('--native-instance-stdin', action='store_true', required=True)",
                 "args = parser.parse_args()",
+                "assert args.ssh_askpass_helper_path.endswith('/openevo-ssh-askpass')",
                 "server = HTTPServer((args.host, 0), Handler, bind_and_activate=False)",
                 "server.socket = socket.socket(fileno=args.listener_fd)",
                 "server.server_address = server.socket.getsockname()",

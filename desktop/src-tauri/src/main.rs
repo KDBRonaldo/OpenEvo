@@ -36,14 +36,20 @@ compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux 
 
 const BUNDLED_SIDECAR_BINARY: &str = "openevo-desktop-sidecar";
 const BUNDLED_ASKPASS_BINARY: &str = "openevo-ssh-askpass";
+const MAX_BUNDLED_ASKPASS_BYTES: u64 = 16 * 1024 * 1024;
 const RELEASE_ASSETS_DIRECTORY: &str = "openevo-release-assets";
-const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v1";
+const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v2";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb";
+    "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
+const DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256: &str =
+    "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
+const DESKTOP_RELEASE_VERSION: &str = "0.1.9";
+const DESKTOP_FEATURE_SET_SHA256: &str =
+    "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
-const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V1";
-const RENDERER_STAGE_VOCABULARY: [&str; 22] = [
+const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V2";
+const RENDERER_STAGE_VOCABULARY: [&str; 20] = [
     "sidecar_start_requested",
     "sidecar_start_returned",
     "sidecar_start_failed",
@@ -51,8 +57,6 @@ const RENDERER_STAGE_VOCABULARY: [&str; 22] = [
     "bootstrap_context_failed",
     "local_api_version_verified",
     "local_api_version_failed",
-    "retry_recovery_ready",
-    "retry_recovery_failed",
     "provider_adapter_ready",
     "provider_adapter_failed",
     "provider_created",
@@ -70,13 +74,11 @@ const RENDERER_STAGE_VOCABULARY: [&str; 22] = [
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum RendererBootstrapStageV1 {
+enum RendererBootstrapStageV2 {
     BootstrapContextValidated,
     BootstrapContextFailed,
     LocalApiVersionVerified,
     LocalApiVersionFailed,
-    RetryRecoveryReady,
-    RetryRecoveryFailed,
     ProviderAdapterReady,
     ProviderAdapterFailed,
     ProviderCreated,
@@ -85,15 +87,13 @@ enum RendererBootstrapStageV1 {
     ProductCommitted,
 }
 
-impl RendererBootstrapStageV1 {
+impl RendererBootstrapStageV2 {
     fn as_str(self) -> &'static str {
         match self {
             Self::BootstrapContextValidated => "bootstrap_context_validated",
             Self::BootstrapContextFailed => "bootstrap_context_failed",
             Self::LocalApiVersionVerified => "local_api_version_verified",
             Self::LocalApiVersionFailed => "local_api_version_failed",
-            Self::RetryRecoveryReady => "retry_recovery_ready",
-            Self::RetryRecoveryFailed => "retry_recovery_failed",
             Self::ProviderAdapterReady => "provider_adapter_ready",
             Self::ProviderAdapterFailed => "provider_adapter_failed",
             Self::ProviderCreated => "provider_created",
@@ -105,6 +105,8 @@ impl RendererBootstrapStageV1 {
 }
 const SIDECAR_PROCESS_MARKER: &str = "OPENEVO_DESKTOP_SIDECAR_PROCESS_V2";
 const LEGACY_DESKTOP_SHELL_ROUTE: &str = "/openevo-api/desktop/shell";
+const LEGACY_DESKTOP_V1_STATE_ROUTE: &str = "/desktop/v1/state";
+const NATIVE_HEALTH_ROUTE: &str = "/openevo-native/health";
 const NATIVE_SESSION_PROBE_ROUTE: &str = "/openevo-native/session";
 const NATIVE_WORKSPACE_IMPORT_ROUTE: &str = "/openevo-native/workspace-imports";
 const NATIVE_WORKSPACE_CANCEL_ROUTE: &str = "/openevo-native/workspace-imports/cancel";
@@ -1141,19 +1143,18 @@ fn startup_diagnostic_pair(stage: &[u8], code: &[u8]) -> Option<(&'static str, &
         ("python_metadata", "load_failed"),
         ("python_launcher", "execution_failed"),
         ("python_launcher", "bundled_core_assets_failed"),
-        ("python_launcher", "provider_store_failed"),
-        ("python_launcher", "credential_reset_failed"),
-        ("python_launcher", "remote_lifecycle_failed"),
-        ("python_launcher", "workspace_store_failed"),
-        ("python_launcher", "core_assets_failed"),
-        ("python_launcher", "core_bridge_store_failed"),
-        ("python_launcher", "event_broker_failed"),
-        ("python_launcher", "core_adapter_failed"),
-        ("python_launcher", "core_bridge_failed"),
-        ("python_launcher", "core_runtime_failed"),
-        ("python_launcher", "release_provider_failed"),
-        ("python_launcher", "contract_app_failed"),
-        ("python_launcher", "release_routes_failed"),
+        ("python_launcher", "provider_store_v2_failed"),
+        ("python_launcher", "restart_reconciliation_v2_failed"),
+        ("python_launcher", "workspace_store_v2_failed"),
+        ("python_launcher", "ssh_catalog_v2_failed"),
+        ("python_launcher", "remote_lifecycle_v2_failed"),
+        ("python_launcher", "core_bridge_store_v2_failed"),
+        ("python_launcher", "event_broker_v2_failed"),
+        ("python_launcher", "core_adapter_v2_failed"),
+        ("python_launcher", "core_bridge_v2_failed"),
+        ("python_launcher", "core_runtime_v2_failed"),
+        ("python_launcher", "release_provider_v2_failed"),
+        ("python_launcher", "contract_app_v2_failed"),
         ("python_launcher", "static_app_failed"),
         ("python_launcher", "native_frame_failed"),
         ("python_launcher", "native_routes_failed"),
@@ -1181,7 +1182,9 @@ fn startup_stage_for_diagnostic(diagnostic: StartupDiagnostic) -> DesktopStartup
     if diagnostic.stage == "python_launcher" {
         if matches!(
             diagnostic.code,
-            "provider_store_failed" | "credential_reset_failed" | "workspace_store_failed"
+            "provider_store_v2_failed"
+                | "restart_reconciliation_v2_failed"
+                | "workspace_store_v2_failed"
         ) {
             return DesktopStartupStage::StateStore;
         }
@@ -1190,8 +1193,7 @@ fn startup_stage_for_diagnostic(diagnostic: StartupDiagnostic) -> DesktopStartup
             "listener_failed"
                 | "server_failed"
                 | "server_import_failed"
-                | "contract_app_failed"
-                | "release_routes_failed"
+                | "contract_app_v2_failed"
                 | "static_app_failed"
                 | "native_routes_failed"
         ) {
@@ -1378,38 +1380,57 @@ impl Drop for HandoffCredential {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum FeatureFlagV1 {
-    RemoteProfiles,
-    ProjectValidation,
-    OperationEvents,
-    RunObservability,
-    ArtifactInspection,
-    ServiceControl,
-    Diagnostics,
-    Maintenance,
+enum FeatureFlagV2 {
+    CoreControlV2,
+    DaemonBundleV2,
+    EventReplayV2,
+    HostKeyReview,
+    NativeAskpass,
+    SystemOpensshProfiles,
+    TaskAdmissionV2,
 }
 
+const REQUIRED_DESKTOP_FEATURE_FLAGS: [FeatureFlagV2; 7] = [
+    FeatureFlagV2::CoreControlV2,
+    FeatureFlagV2::DaemonBundleV2,
+    FeatureFlagV2::EventReplayV2,
+    FeatureFlagV2::HostKeyReview,
+    FeatureFlagV2::NativeAskpass,
+    FeatureFlagV2::SystemOpensshProfiles,
+    FeatureFlagV2::TaskAdmissionV2,
+];
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct NegotiatedContractV1 {
+struct NegotiatedContractV2 {
+    schema_version: &'static str,
     major: u8,
+    mutation_major: u8,
     openapi_sha256: String,
+    event_schema_sha256: String,
+    release_version: String,
+    build_id: String,
+    source_commit: String,
+    build_channel: String,
     provider_kind: String,
-    feature_flags: Vec<FeatureFlagV1>,
+    feature_flags: Vec<FeatureFlagV2>,
+    feature_set_sha256: String,
+    required_core_api_major: u8,
+    mutation_compatible: bool,
 }
 
 #[derive(Debug)]
-struct ValidatedSidecarContractV1 {
-    negotiated: NegotiatedContractV1,
-    build_version: String,
+struct ValidatedSidecarContractV2 {
+    negotiated: NegotiatedContractV2,
+    release_version: String,
     source_commit: String,
 }
 
 #[derive(Clone, Serialize)]
-struct DesktopBootstrapContextV1 {
+struct DesktopBootstrapContextV2 {
     schema_version: &'static str,
     endpoint: String,
     session_token: String,
-    negotiated_contract: NegotiatedContractV1,
+    negotiated_contract: NegotiatedContractV2,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1431,7 +1452,7 @@ struct NativeWorkspaceImportRequest<'a> {
 }
 
 #[derive(Serialize)]
-struct NativeWorkspaceCancelRequestV1<'a> {
+struct NativeWorkspaceCancelRequestV2<'a> {
     schema_version: &'static str,
     action_id: &'a str,
     cancellation_token: &'a str,
@@ -1448,7 +1469,7 @@ struct NativeWorkspaceSelection<'a> {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeWorkspaceImportRefV1 {
+struct NativeWorkspaceImportRefV2 {
     import_id: String,
     content_sha256: String,
     byte_size: u64,
@@ -1458,25 +1479,25 @@ struct NativeWorkspaceImportRefV1 {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeProjectSourceV1 {
+struct NativeProjectSourceV2 {
     kind: String,
     display_name: String,
-    import_ref: NativeWorkspaceImportRefV1,
+    import_ref: NativeWorkspaceImportRefV2,
 }
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeWorkspaceImportResponseV1 {
+struct NativeWorkspaceImportResponseV2 {
     schema_version: String,
-    source: NativeProjectSourceV1,
+    source: NativeProjectSourceV2,
     lease_token: String,
 }
 
 #[derive(Serialize)]
-struct NativeWorkspaceDiscardRequestV1<'a> {
+struct NativeWorkspaceDiscardRequestV2<'a> {
     schema_version: &'static str,
     action_id: &'a str,
-    import_ref: &'a NativeWorkspaceImportRefV1,
+    import_ref: &'a NativeWorkspaceImportRefV2,
     lease_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_id: Option<&'a str>,
@@ -1487,7 +1508,7 @@ struct PendingNativeWorkspaceImport {
     sidecar_instance: [u8; INSTANCE_ID_BYTES],
     action_id: String,
     project_id: Option<String>,
-    source: NativeProjectSourceV1,
+    source: NativeProjectSourceV2,
     lease_token: String,
 }
 
@@ -1543,7 +1564,7 @@ struct SidecarBootstrapState {
     session_credential: SessionCredential,
     readiness_credential: ReadinessCredential,
     handoff_credential: HandoffCredential,
-    negotiated_contract: NegotiatedContractV1,
+    negotiated_contract: NegotiatedContractV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1616,11 +1637,11 @@ impl ManagedSidecar {
         }
     }
 
-    fn bootstrap_context(&self) -> HostResult<DesktopBootstrapContextV1> {
+    fn bootstrap_context(&self) -> HostResult<DesktopBootstrapContextV2> {
         let bootstrap = self.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
         let port = self.status.port.ok_or_else(sidecar_state_error)?;
-        Ok(DesktopBootstrapContextV1 {
-            schema_version: "1",
+        Ok(DesktopBootstrapContextV2 {
+            schema_version: "2",
             endpoint: format!("http://127.0.0.1:{port}"),
             session_token: bootstrap.session_credential.expose(),
             negotiated_contract: bootstrap.negotiated_contract.clone(),
@@ -1844,17 +1865,23 @@ struct NativeHealthResponse {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct VersionInfoV1 {
+struct VersionInfoV2 {
     schema_version: String,
     api_name: String,
     preferred_major: u8,
     supported_majors: Vec<u8>,
+    mutation_major: u8,
     openapi_sha256: String,
-    build_version: String,
+    event_schema_sha256: String,
+    release_version: String,
+    build_id: String,
     source_commit: String,
     build_channel: String,
     provider_kind: String,
-    feature_flags: Vec<FeatureFlagV1>,
+    feature_flags: Vec<FeatureFlagV2>,
+    feature_set_sha256: String,
+    required_core_api_major: u8,
+    mutation_compatible: bool,
 }
 
 trait ProcessControl {
@@ -2259,14 +2286,6 @@ fn release_sidecar_launch_spec(
     _port: u16,
 ) -> HostResult<SidecarLaunchSpec> {
     let source = bundled_path.ok_or_else(bundled_sidecar_missing_error)?;
-    let release_assets_root = packaged_release_assets_root(source)?;
-    let askpass_helper = source
-        .parent()
-        .ok_or_else(packaged_release_assets_path_error)?
-        .join(BUNDLED_ASKPASS_BINARY);
-    if !askpass_helper.is_absolute() {
-        return Err(packaged_release_assets_path_error());
-    }
     #[cfg(target_os = "linux")]
     let (verified_executable, private_launch_dir) = prepare_packaged_sidecar(source)?;
     #[cfg(target_os = "linux")]
@@ -2277,6 +2296,15 @@ fn release_sidecar_launch_spec(
     let private_launch_dir = None;
     #[cfg(target_os = "macos")]
     let program = source.to_path_buf();
+    let release_assets_root = packaged_release_assets_root(source)?;
+    let askpass_helper = source
+        .parent()
+        .ok_or_else(packaged_release_assets_path_error)?
+        .join(BUNDLED_ASKPASS_BINARY);
+    if !askpass_helper.is_absolute() {
+        return Err(packaged_release_assets_path_error());
+    }
+    let (askpass_sha256, askpass_byte_size) = inventory_packaged_askpass_helper(&askpass_helper)?;
     let mut args = local_sidecar_args();
     args.push("--release-assets-root".to_string());
     args.push(
@@ -2292,6 +2320,10 @@ fn release_sidecar_launch_spec(
             .ok_or_else(packaged_release_assets_path_error)?
             .to_string(),
     );
+    args.push("--ssh-askpass-helper-sha256".to_string());
+    args.push(askpass_sha256);
+    args.push("--ssh-askpass-helper-byte-size".to_string());
+    args.push(askpass_byte_size.to_string());
     Ok(SidecarLaunchSpec {
         program,
         args,
@@ -2303,6 +2335,35 @@ fn release_sidecar_launch_spec(
         private_launch_dir,
         verified_executable: Some(verified_executable),
     })
+}
+
+fn inventory_packaged_askpass_helper(path: &Path) -> HostResult<(String, u64)> {
+    let owner_policy = packaged_source_owner_policy()?;
+    let (parent, name) = open_trusted_source_parent(path)?;
+    let initial_identity = source_identity_at(&parent, &name)?;
+    validate_packaged_source_identity(&initial_identity, owner_policy)?;
+    if initial_identity.mode & 0o777 != 0o755 || initial_identity.size > MAX_BUNDLED_ASKPASS_BYTES {
+        return Err(packaged_askpass_helper_error());
+    }
+    let helper = openat_file(
+        parent.as_raw_fd(),
+        &name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|_| packaged_askpass_helper_error())?;
+    if file_identity(&helper).map_err(|_| packaged_askpass_helper_error())? != initial_identity {
+        return Err(packaged_askpass_helper_error());
+    }
+    validate_anchored_extended_acl(&helper).map_err(|_| packaged_askpass_helper_error())?;
+    let digest = hash_file_at(&helper, initial_identity.size)
+        .map_err(|_| packaged_askpass_helper_error())?;
+    if file_identity(&helper).map_err(|_| packaged_askpass_helper_error())? != initial_identity
+        || source_identity_at(&parent, &name)? != initial_identity
+    {
+        return Err(packaged_askpass_helper_error());
+    }
+    Ok((encode_hex(&digest), initial_identity.size))
 }
 
 fn packaged_release_assets_root(sidecar: &Path) -> HostResult<PathBuf> {
@@ -3019,6 +3080,13 @@ fn packaged_release_assets_path_error() -> NativeHostError {
     NativeHostError::new(
         "packaged_release_assets_path_invalid",
         "OpenEvo Desktop could not bind its packaged remote release assets. Reinstall the app.",
+    )
+}
+
+fn packaged_askpass_helper_error() -> NativeHostError {
+    NativeHostError::new(
+        "packaged_askpass_helper_invalid",
+        "OpenEvo Desktop could not bind its packaged SSH prompt helper. Reinstall the app.",
     )
 }
 
@@ -3883,7 +3951,7 @@ fn check_sidecar_health_with_challenge_for_instance(
     }
     let response = loopback_http_get(
         port,
-        "/health",
+        NATIVE_HEALTH_ROUTE,
         Some(("X-OpenEvo-Native-Challenge", challenge)),
     )?;
     if response.status != 200 {
@@ -3906,55 +3974,72 @@ fn check_sidecar_health_with_challenge_for_instance(
 }
 
 #[cfg(test)]
-fn check_sidecar_contract(port: u16) -> HostResult<NegotiatedContractV1> {
+fn check_sidecar_contract(port: u16) -> HostResult<NegotiatedContractV2> {
     Ok(check_sidecar_contract_with_identity(port)?.negotiated)
 }
 
-fn check_sidecar_contract_with_identity(port: u16) -> HostResult<ValidatedSidecarContractV1> {
+fn check_sidecar_contract_with_identity(port: u16) -> HostResult<ValidatedSidecarContractV2> {
     let version = read_validated_sidecar_version(port)?;
     let legacy = loopback_http_get(port, LEGACY_DESKTOP_SHELL_ROUTE, None)
         .map_err(|_| sidecar_contract_incompatible_error())?;
     if legacy.status != 404 {
         return Err(sidecar_contract_incompatible_error());
     }
-    Ok(ValidatedSidecarContractV1 {
-        negotiated: NegotiatedContractV1 {
-            major: 1,
-            openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
-            provider_kind: "desktop_sidecar".to_string(),
+    let legacy_v1 = loopback_http_get(port, LEGACY_DESKTOP_V1_STATE_ROUTE, None)
+        .map_err(|_| sidecar_contract_incompatible_error())?;
+    if legacy_v1.status != 404 {
+        return Err(sidecar_contract_incompatible_error());
+    }
+    Ok(ValidatedSidecarContractV2 {
+        negotiated: NegotiatedContractV2 {
+            schema_version: "2",
+            major: version.preferred_major,
+            mutation_major: version.mutation_major,
+            openapi_sha256: version.openapi_sha256,
+            event_schema_sha256: version.event_schema_sha256,
+            release_version: version.release_version.clone(),
+            build_id: version.build_id,
+            source_commit: version.source_commit.clone(),
+            build_channel: version.build_channel,
+            provider_kind: version.provider_kind,
             feature_flags: version.feature_flags,
+            feature_set_sha256: version.feature_set_sha256,
+            required_core_api_major: version.required_core_api_major,
+            mutation_compatible: version.mutation_compatible,
         },
-        build_version: version.build_version,
+        release_version: version.release_version,
         source_commit: version.source_commit,
     })
 }
 
-fn read_validated_sidecar_version(port: u16) -> HostResult<VersionInfoV1> {
+fn read_validated_sidecar_version(port: u16) -> HostResult<VersionInfoV2> {
     let response = loopback_http_get(port, "/version", None)
         .map_err(|_| sidecar_contract_incompatible_error())?;
     if response.status != 200 {
         return Err(sidecar_contract_incompatible_error());
     }
-    let version: VersionInfoV1 =
+    let version: VersionInfoV2 =
         serde_json::from_str(&response.body).map_err(|_| sidecar_contract_incompatible_error())?;
-    let duplicate_features = version
-        .feature_flags
-        .iter()
-        .enumerate()
-        .any(|(index, flag)| version.feature_flags[..index].contains(flag));
-    if version.schema_version != "1"
+    if version.schema_version != "2"
         || version.api_name != DESKTOP_LOCAL_API_NAME
-        || version.preferred_major != 1
-        || version.supported_majors.is_empty()
-        || version.supported_majors.iter().any(|major| *major != 1)
+        || version.preferred_major != 2
+        || version.supported_majors != [2]
+        || version.mutation_major != 2
         || version.openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256
-        || version.build_version != env!("CARGO_PKG_VERSION")
+        || version.event_schema_sha256 != DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256
+        || version.release_version != DESKTOP_RELEASE_VERSION
+        || version.build_id.len() != 64
+        || !version.build_id.bytes().all(is_lower_hex)
+        || version.build_id.bytes().all(|byte| byte == b'0')
         || !(7..=40).contains(&version.source_commit.len())
         || !version.source_commit.bytes().all(is_lower_hex)
         || version.source_commit.bytes().all(|byte| byte == b'0')
         || version.build_channel != "release"
         || version.provider_kind != "desktop_sidecar"
-        || duplicate_features
+        || version.feature_flags != REQUIRED_DESKTOP_FEATURE_FLAGS
+        || version.feature_set_sha256 != DESKTOP_FEATURE_SET_SHA256
+        || version.required_core_api_major != 2
+        || !version.mutation_compatible
     {
         return Err(sidecar_contract_incompatible_error());
     }
@@ -3963,11 +4048,11 @@ fn read_validated_sidecar_version(port: u16) -> HostResult<VersionInfoV1> {
 
 fn retain_sidecar_release_identity(
     state: &DesktopHostState,
-    contract: &ValidatedSidecarContractV1,
+    contract: &ValidatedSidecarContractV2,
 ) -> HostResult<()> {
     if !state
         .desktop_logs
-        .update_release_identity(&contract.build_version, &contract.source_commit)
+        .update_release_identity(&contract.release_version, &contract.source_commit)
     {
         return Err(sidecar_contract_incompatible_error());
     }
@@ -3997,7 +4082,7 @@ fn register_native_workspace_source(
     handoff_token: &str,
     selection: NativeWorkspaceSelection<'_>,
     operation: &NativePickerOperation,
-) -> HostResult<NativeWorkspaceImportResponseV1> {
+) -> HostResult<NativeWorkspaceImportResponseV2> {
     if selection.kind != "native_folder_snapshot"
         || selection.action_id.len() < 16
         || selection.action_id.len() > 256
@@ -4020,7 +4105,7 @@ fn register_native_workspace_source(
         .ok_or_else(workspace_selection_error)?;
     let cancellation_token = operation.encoded_cancellation_token();
     let request = NativeWorkspaceImportRequest {
-        schema_version: "1",
+        schema_version: "2",
         kind: "native_folder_snapshot",
         action_id: selection.action_id,
         selected_path,
@@ -4054,9 +4139,9 @@ fn register_native_workspace_source(
             workspace_import_error()
         });
     }
-    let pending: NativeWorkspaceImportResponseV1 =
+    let pending: NativeWorkspaceImportResponseV2 =
         serde_json::from_str(&response.body).map_err(|_| workspace_import_error())?;
-    if pending.schema_version != "1"
+    if pending.schema_version != "2"
         || pending.lease_token.len() != 64
         || !pending.lease_token.bytes().all(is_lower_hex)
     {
@@ -4072,8 +4157,8 @@ fn cancel_native_workspace_operation(
     operation: &NativePickerOperation,
 ) -> HostResult<()> {
     let cancellation_token = operation.encoded_cancellation_token();
-    let body = serde_json::to_vec(&NativeWorkspaceCancelRequestV1 {
-        schema_version: "1",
+    let body = serde_json::to_vec(&NativeWorkspaceCancelRequestV2 {
+        schema_version: "2",
         action_id: &operation.action_id,
         cancellation_token: cancellation_token.expose(),
     })
@@ -4099,8 +4184,8 @@ fn discard_native_workspace_source(
     handoff_token: &str,
     pending: &PendingNativeWorkspaceImport,
 ) -> HostResult<()> {
-    let body = serde_json::to_vec(&NativeWorkspaceDiscardRequestV1 {
-        schema_version: "1",
+    let body = serde_json::to_vec(&NativeWorkspaceDiscardRequestV2 {
+        schema_version: "2",
         action_id: &pending.action_id,
         import_ref: &pending.source.import_ref,
         lease_token: &pending.lease_token,
@@ -4123,7 +4208,7 @@ fn discard_native_workspace_source(
     Ok(())
 }
 
-fn validate_native_project_source(source: &NativeProjectSourceV1) -> HostResult<()> {
+fn validate_native_project_source(source: &NativeProjectSourceV2) -> HostResult<()> {
     let import = &source.import_ref;
     let import_suffix = import
         .import_id
@@ -4300,7 +4385,7 @@ fn wait_for_sidecar_ready(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
-) -> HostResult<ValidatedSidecarContractV1> {
+) -> HostResult<ValidatedSidecarContractV2> {
     wait_for_sidecar_ready_with_inspection(port, credential, timeout, is_cancelled, || {
         OsProcessControl
             .leader_exit_disposition(child)
@@ -4315,7 +4400,7 @@ fn wait_for_state_owned_sidecar_ready<C: ProcessControl>(
     credential: &NativeInstanceCredential,
     timeout: Duration,
     startup_epoch: u64,
-) -> HostResult<ValidatedSidecarContractV1> {
+) -> HostResult<ValidatedSidecarContractV2> {
     wait_for_sidecar_ready_with_inspection(
         port,
         credential,
@@ -4366,7 +4451,7 @@ fn wait_for_sidecar_ready_with_inspection(
     timeout: Duration,
     is_cancelled: impl Fn() -> bool,
     mut child_exit_disposition: impl FnMut() -> HostResult<Option<StartupExitDisposition>>,
-) -> HostResult<ValidatedSidecarContractV1> {
+) -> HostResult<ValidatedSidecarContractV2> {
     let deadline = Instant::now() + timeout;
     loop {
         if is_cancelled() {
@@ -5185,7 +5270,7 @@ fn publish_sidecar_gated(
     state: &DesktopHostState,
     startup_epoch: u64,
     bootstrap: SidecarBootstrapState,
-) -> HostResult<DesktopBootstrapContextV1> {
+) -> HostResult<DesktopBootstrapContextV2> {
     publish_sidecar_gated_with(
         state,
         startup_epoch,
@@ -5201,7 +5286,7 @@ fn publish_sidecar_gated_with(
     bootstrap: SidecarBootstrapState,
     state_lock_timeout: Duration,
     before_state_lock: impl FnOnce(),
-) -> HostResult<DesktopBootstrapContextV1> {
+) -> HostResult<DesktopBootstrapContextV2> {
     if startup_cancelled(state, startup_epoch) {
         return Err(sidecar_start_cancelled_error());
     }
@@ -5418,7 +5503,7 @@ fn host_status_inner_with<C: ProcessControl>(
 
 fn ensure_running_sidecar_monitor(
     state: &DesktopHostState,
-    expected_context: &DesktopBootstrapContextV1,
+    expected_context: &DesktopBootstrapContextV2,
 ) -> HostResult<()> {
     let instance_id = {
         let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
@@ -5535,7 +5620,7 @@ fn start_sidecar_inner(
     state: &DesktopHostState,
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
-) -> HostResult<DesktopBootstrapContextV1> {
+) -> HostResult<DesktopBootstrapContextV2> {
     let context = start_sidecar_inner_with(state, policy, bundled_path, &OsProcessControl)?;
     ensure_running_sidecar_monitor(state, &context)?;
     Ok(context)
@@ -5546,7 +5631,7 @@ fn start_sidecar_inner_with<C: ProcessControl>(
     policy: LaunchPolicy,
     bundled_path: Option<&Path>,
     control: &C,
-) -> HostResult<DesktopBootstrapContextV1> {
+) -> HostResult<DesktopBootstrapContextV2> {
     if state.shutdown_requested.load(Ordering::Acquire) {
         return Err(NativeHostError::new(
             "sidecar_host_shutting_down",
@@ -5739,16 +5824,32 @@ fn stop_sidecar_inner(state: &DesktopHostState) -> HostResult<HostStatus> {
     stop_sidecar_inner_with(state, &OsProcessControl, SIDECAR_STATE_LOCK_TIMEOUT)
 }
 
-fn renderer_ready_inner(state: &DesktopHostState, openapi_sha256: &str) -> HostResult<()> {
-    renderer_ready_inner_with(state, openapi_sha256, &OsProcessControl)
+fn renderer_ready_inner(
+    state: &DesktopHostState,
+    openapi_sha256: &str,
+    event_schema_sha256: &str,
+    release_version: &str,
+) -> HostResult<()> {
+    renderer_ready_inner_with(
+        state,
+        openapi_sha256,
+        event_schema_sha256,
+        release_version,
+        &OsProcessControl,
+    )
 }
 
 fn renderer_ready_inner_with<C: ProcessControl>(
     state: &DesktopHostState,
     openapi_sha256: &str,
+    event_schema_sha256: &str,
+    release_version: &str,
     control: &C,
 ) -> HostResult<()> {
-    if openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256 {
+    if openapi_sha256 != DESKTOP_LOCAL_API_OPENAPI_SHA256
+        || event_schema_sha256 != DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256
+        || release_version != DESKTOP_RELEASE_VERSION
+    {
         return Err(sidecar_contract_incompatible_error());
     }
     let (instance_id, port, session_token) = {
@@ -5765,10 +5866,12 @@ fn renderer_ready_inner_with<C: ProcessControl>(
             return Err(sidecar_state_error());
         }
         let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
-        if bootstrap.negotiated_contract.major != 1
-            || bootstrap.negotiated_contract.openapi_sha256 != openapi_sha256
-            || bootstrap.negotiated_contract.provider_kind != "desktop_sidecar"
-        {
+        if !negotiated_contract_matches_renderer(
+            &bootstrap.negotiated_contract,
+            openapi_sha256,
+            event_schema_sha256,
+            release_version,
+        ) {
             return Err(sidecar_contract_incompatible_error());
         }
         (
@@ -5794,9 +5897,12 @@ fn renderer_ready_inner_with<C: ProcessControl>(
     }
     let bootstrap = managed.bootstrap.as_ref().ok_or_else(sidecar_state_error)?;
     if managed.status.port != Some(port)
-        || bootstrap.negotiated_contract.major != 1
-        || bootstrap.negotiated_contract.openapi_sha256 != openapi_sha256
-        || bootstrap.negotiated_contract.provider_kind != "desktop_sidecar"
+        || !negotiated_contract_matches_renderer(
+            &bootstrap.negotiated_contract,
+            openapi_sha256,
+            event_schema_sha256,
+            release_version,
+        )
     {
         return Err(sidecar_contract_incompatible_error());
     }
@@ -5811,8 +5917,28 @@ fn renderer_ready_inner_with<C: ProcessControl>(
     {
         return Err(sidecar_inspection_error());
     }
-    eprintln!("{RENDERER_READY_MARKER} {openapi_sha256}");
+    eprintln!("{RENDERER_READY_MARKER} {release_version} {openapi_sha256} {event_schema_sha256}");
     Ok(())
+}
+
+fn negotiated_contract_matches_renderer(
+    contract: &NegotiatedContractV2,
+    openapi_sha256: &str,
+    event_schema_sha256: &str,
+    release_version: &str,
+) -> bool {
+    contract.schema_version == "2"
+        && contract.major == 2
+        && contract.mutation_major == 2
+        && contract.openapi_sha256 == openapi_sha256
+        && contract.event_schema_sha256 == event_schema_sha256
+        && contract.release_version == release_version
+        && contract.build_channel == "release"
+        && contract.provider_kind == "desktop_sidecar"
+        && contract.feature_flags == REQUIRED_DESKTOP_FEATURE_FLAGS
+        && contract.feature_set_sha256 == DESKTOP_FEATURE_SET_SHA256
+        && contract.required_core_api_major == 2
+        && contract.mutation_compatible
 }
 
 fn stop_sidecar_inner_with<C: ProcessControl>(
@@ -6868,7 +6994,7 @@ fn write_desktop_diagnostics_export(
 async fn start_sidecar(
     _app: tauri::AppHandle,
     state: tauri::State<'_, DesktopHostState>,
-) -> HostResult<DesktopBootstrapContextV1> {
+) -> HostResult<DesktopBootstrapContextV2> {
     let state = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         state.desktop_logs.ensure_startup_attempt();
@@ -6969,21 +7095,20 @@ fn stop_sidecar(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostSta
 #[tauri::command]
 fn renderer_bootstrap_stage(
     state: tauri::State<'_, DesktopHostState>,
-    stage: RendererBootstrapStageV1,
+    stage: RendererBootstrapStageV2,
 ) {
     record_renderer_bootstrap_stage(&state, stage);
     emit_renderer_stage(stage.as_str());
 }
 
-fn record_renderer_bootstrap_stage(state: &DesktopHostState, stage: RendererBootstrapStageV1) {
+fn record_renderer_bootstrap_stage(state: &DesktopHostState, stage: RendererBootstrapStageV2) {
     let failed = matches!(
         stage,
-        RendererBootstrapStageV1::BootstrapContextFailed
-            | RendererBootstrapStageV1::LocalApiVersionFailed
-            | RendererBootstrapStageV1::RetryRecoveryFailed
-            | RendererBootstrapStageV1::ProviderAdapterFailed
-            | RendererBootstrapStageV1::ProviderCreateFailed
-            | RendererBootstrapStageV1::InitialSnapshotFailed
+        RendererBootstrapStageV2::BootstrapContextFailed
+            | RendererBootstrapStageV2::LocalApiVersionFailed
+            | RendererBootstrapStageV2::ProviderAdapterFailed
+            | RendererBootstrapStageV2::ProviderCreateFailed
+            | RendererBootstrapStageV2::InitialSnapshotFailed
     );
     state.desktop_logs.record_startup_stage(
         DesktopLogSource::Renderer,
@@ -7005,6 +7130,8 @@ fn renderer_ready(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, DesktopHostState>,
     openapi_sha256: String,
+    event_schema_sha256: String,
+    release_version: String,
 ) -> HostResult<()> {
     state.desktop_logs.ensure_startup_attempt();
     state.desktop_logs.record_startup_stage(
@@ -7055,7 +7182,12 @@ fn renderer_ready(
         }),
         Err(_) => emit_renderer_stage("window_visibility_unknown"),
     }
-    let result = renderer_ready_inner(&state, &openapi_sha256);
+    let result = renderer_ready_inner(
+        &state,
+        &openapi_sha256,
+        &event_schema_sha256,
+        &release_version,
+    );
     if result.is_err() {
         emit_renderer_stage("ready_validation_failed");
     }
@@ -7099,7 +7231,7 @@ async fn select_project_source(
     kind: String,
     action_id: String,
     project_id: Option<String>,
-) -> HostResult<NativeProjectSourceV1> {
+) -> HostResult<NativeProjectSourceV2> {
     if kind != "native_folder_snapshot" {
         return Err(workspace_selection_error());
     }
@@ -7288,6 +7420,16 @@ fn main() {
         .setup(|app| {
             let state = app.state::<DesktopHostState>();
             initialize_desktop_logs(app.handle(), &state);
+            #[cfg(target_os = "macos")]
+            app.show()?;
+            let main_window = app.get_webview_window("main").ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "OpenEvo Desktop main window is unavailable",
+                )
+            })?;
+            main_window.show()?;
+            main_window.set_focus()?;
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -7802,8 +7944,8 @@ mod tests {
 
     #[test]
     fn bootstrap_and_host_status_use_exact_disjoint_renderer_dtos() {
-        let context = DesktopBootstrapContextV1 {
-            schema_version: "1",
+        let context = DesktopBootstrapContextV2 {
+            schema_version: "2",
             endpoint: "http://127.0.0.1:49152".to_string(),
             session_token: "7c".repeat(SESSION_TOKEN_BYTES),
             negotiated_contract: test_bootstrap_state().negotiated_contract,
@@ -7835,7 +7977,22 @@ mod tests {
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>(),
-            ["feature_flags", "major", "openapi_sha256", "provider_kind"]
+            [
+                "build_channel",
+                "build_id",
+                "event_schema_sha256",
+                "feature_flags",
+                "feature_set_sha256",
+                "major",
+                "mutation_compatible",
+                "mutation_major",
+                "openapi_sha256",
+                "provider_kind",
+                "release_version",
+                "required_core_api_major",
+                "schema_version",
+                "source_commit",
+            ]
         );
         assert_eq!(status, serde_json::json!({"state": "running"}));
         for forbidden in ["endpoint", "session_token", "pid", "port", "url", "command"] {
@@ -7901,8 +8058,6 @@ mod tests {
                 "bootstrap_context_failed",
                 "local_api_version_verified",
                 "local_api_version_failed",
-                "retry_recovery_ready",
-                "retry_recovery_failed",
                 "provider_adapter_ready",
                 "provider_adapter_failed",
                 "provider_created",
@@ -7933,8 +8088,6 @@ mod tests {
                 "local_api_version_verified",
             ),
             ("\"local_api_version_failed\"", "local_api_version_failed"),
-            ("\"retry_recovery_ready\"", "retry_recovery_ready"),
-            ("\"retry_recovery_failed\"", "retry_recovery_failed"),
             ("\"provider_adapter_ready\"", "provider_adapter_ready"),
             ("\"provider_adapter_failed\"", "provider_adapter_failed"),
             ("\"provider_created\"", "provider_created"),
@@ -7942,17 +8095,19 @@ mod tests {
             ("\"initial_snapshot_failed\"", "initial_snapshot_failed"),
             ("\"product_committed\"", "product_committed"),
         ] {
-            let stage: RendererBootstrapStageV1 = serde_json::from_str(encoded).unwrap();
+            let stage: RendererBootstrapStageV2 = serde_json::from_str(encoded).unwrap();
             assert_eq!(stage.as_str(), expected);
         }
         for forbidden in [
             "ready_requested",
             "window_identity_valid",
             "sidecar_start_returned",
+            "retry_recovery_ready",
+            "retry_recovery_failed",
             "credential_dumped",
         ] {
             assert!(
-                serde_json::from_str::<RendererBootstrapStageV1>(&format!("\"{forbidden}\""))
+                serde_json::from_str::<RendererBootstrapStageV2>(&format!("\"{forbidden}\""))
                     .is_err()
             );
         }
@@ -7962,9 +8117,14 @@ mod tests {
     fn renderer_readiness_requires_a_running_sidecar_with_the_frozen_contract() {
         let empty = DesktopHostState::default();
         assert_eq!(
-            renderer_ready_inner(&empty, DESKTOP_LOCAL_API_OPENAPI_SHA256)
-                .unwrap_err()
-                .code,
+            renderer_ready_inner(
+                &empty,
+                DESKTOP_LOCAL_API_OPENAPI_SHA256,
+                DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256,
+                DESKTOP_RELEASE_VERSION,
+            )
+            .unwrap_err()
+            .code,
             "sidecar_state_unavailable"
         );
 
@@ -7973,15 +8133,39 @@ mod tests {
         let session_listener = managed._listener.try_clone().unwrap();
         let session_server = thread::spawn(move || serve_session_probe(&session_listener, false));
         *state.sidecar.lock().unwrap() = Some(managed);
-        renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap();
+        renderer_ready_inner(
+            &state,
+            DESKTOP_LOCAL_API_OPENAPI_SHA256,
+            DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256,
+            DESKTOP_RELEASE_VERSION,
+        )
+        .unwrap();
         session_server.join().unwrap();
 
-        assert_eq!(
-            renderer_ready_inner(&state, &"0".repeat(64))
-                .unwrap_err()
-                .code,
-            "sidecar_contract_incompatible"
-        );
+        for (openapi, events, release) in [
+            (
+                "0".repeat(64),
+                DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256.to_string(),
+                DESKTOP_RELEASE_VERSION.to_string(),
+            ),
+            (
+                DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
+                "0".repeat(64),
+                DESKTOP_RELEASE_VERSION.to_string(),
+            ),
+            (
+                DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
+                DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256.to_string(),
+                "0.1.8".to_string(),
+            ),
+        ] {
+            assert_eq!(
+                renderer_ready_inner(&state, &openapi, &events, &release)
+                    .unwrap_err()
+                    .code,
+                "sidecar_contract_incompatible"
+            );
+        }
         stop_sidecar_inner(&state).unwrap();
     }
 
@@ -8036,7 +8220,13 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
 
-        let error = renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap_err();
+        let error = renderer_ready_inner(
+            &state,
+            DESKTOP_LOCAL_API_OPENAPI_SHA256,
+            DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256,
+            DESKTOP_RELEASE_VERSION,
+        )
+        .unwrap_err();
 
         assert_eq!(error.code, "sidecar_state_unavailable");
         assert!(!error.message.contains(&process_group.to_string()));
@@ -8053,7 +8243,13 @@ mod tests {
         drop(unreachable);
         *state.sidecar.lock().unwrap() = Some(managed);
 
-        let error = renderer_ready_inner(&state, DESKTOP_LOCAL_API_OPENAPI_SHA256).unwrap_err();
+        let error = renderer_ready_inner(
+            &state,
+            DESKTOP_LOCAL_API_OPENAPI_SHA256,
+            DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256,
+            DESKTOP_RELEASE_VERSION,
+        )
+        .unwrap_err();
 
         assert_eq!(error.code, "sidecar_session_unavailable");
         assert!(!error.message.contains(&unreachable_port.to_string()));
@@ -8295,6 +8491,7 @@ mod tests {
             .join(BUNDLED_ASKPASS_BINARY)
             .to_string_lossy()
             .into_owned();
+        let expected_askpass_sha256 = encode_hex(&Sha256::digest(b"packaged-askpass-v2"));
         assert_eq!(
             spec.args,
             vec![
@@ -8305,6 +8502,10 @@ mod tests {
                 expected_assets.as_str(),
                 "--ssh-askpass-helper-path",
                 expected_askpass.as_str(),
+                "--ssh-askpass-helper-sha256",
+                expected_askpass_sha256.as_str(),
+                "--ssh-askpass-helper-byte-size",
+                "19",
             ]
         );
         assert!(spec.current_dir.is_none());
@@ -9049,7 +9250,7 @@ mod tests {
                 &mut accepted,
                 201,
                 serde_json::json!({
-                    "schema_version": "1",
+                    "schema_version": "2",
                     "lease_token": "3c".repeat(32),
                     "source": {
                         "kind": "native_folder_snapshot",
@@ -9169,7 +9370,7 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
                 serde_json::json!({
-                    "schema_version": "1",
+                    "schema_version": "2",
                     "action_id": "native-picker-cancel-route-0001",
                     "cancellation_token": "4d".repeat(32),
                 })
@@ -9237,10 +9438,10 @@ mod tests {
                     sidecar_instance: [0x11; INSTANCE_ID_BYTES],
                     action_id,
                     project_id: None,
-                    source: NativeProjectSourceV1 {
+                    source: NativeProjectSourceV2 {
                         kind: "native_folder_snapshot".to_string(),
                         display_name: "study".to_string(),
-                        import_ref: NativeWorkspaceImportRefV1 {
+                        import_ref: NativeWorkspaceImportRefV2 {
                             import_id: format!("workspace-import-{:048x}", index),
                             content_sha256: format!("{:064x}", index),
                             byte_size: 1024,
@@ -9286,10 +9487,10 @@ mod tests {
             sidecar_instance: [0x11; INSTANCE_ID_BYTES],
             action_id: "native-pending-action-discard-0001".to_string(),
             project_id: Some("project-existing-1".to_string()),
-            source: NativeProjectSourceV1 {
+            source: NativeProjectSourceV2 {
                 kind: "native_folder_snapshot".to_string(),
                 display_name: "study".to_string(),
-                import_ref: NativeWorkspaceImportRefV1 {
+                import_ref: NativeWorkspaceImportRefV2 {
                     import_id: format!("workspace-import-{}", "1a".repeat(24)),
                     content_sha256: "2b".repeat(32),
                     byte_size: 1024,
@@ -9400,7 +9601,7 @@ mod tests {
             assert_eq!(
                 serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
                 serde_json::json!({
-                    "schema_version": "1",
+                    "schema_version": "2",
                     "kind": "native_folder_snapshot",
                     "action_id": "native-source-action-0001",
                     "selected_path": expected_path.to_str().unwrap(),
@@ -9414,7 +9615,7 @@ mod tests {
                 &mut stream,
                 201,
                 serde_json::json!({
-                    "schema_version": "1",
+                    "schema_version": "2",
                     "lease_token": "3c".repeat(32),
                     "source": {
                         "kind": "native_folder_snapshot",
@@ -9461,7 +9662,7 @@ mod tests {
     fn native_workspace_registration_rejects_open_or_malformed_responses() {
         for body in [
             serde_json::json!({
-                "schema_version": "1",
+                "schema_version": "2",
                 "lease_token": "3c".repeat(32),
                 "source": {
                     "kind": "native_folder_snapshot",
@@ -9477,7 +9678,7 @@ mod tests {
                 },
             }),
             serde_json::json!({
-                "schema_version": "1",
+                "schema_version": "2",
                 "lease_token": "3c".repeat(32),
                 "source": {
                     "kind": "native_folder_snapshot",
@@ -9492,7 +9693,7 @@ mod tests {
                 },
             }),
             serde_json::json!({
-                "schema_version": "1",
+                "schema_version": "2",
                 "lease_token": "3c".repeat(32),
                 "source": {
                     "kind": "native_folder_snapshot",
@@ -9585,25 +9786,26 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (requests_tx, requests_rx) = mpsc::channel();
         let server = thread::spawn(move || {
-            serve_contract_response(&listener, valid_version_response(), 404, requests_tx)
+            serve_contract_response(&listener, valid_version_response(), 404, 404, requests_tx)
         });
 
         let contract = check_sidecar_contract(port).unwrap();
         server.join().unwrap();
 
-        assert_eq!(contract.major, 1);
+        assert_eq!(contract.major, 2);
+        assert_eq!(contract.mutation_major, 2);
         assert_eq!(contract.openapi_sha256, DESKTOP_LOCAL_API_OPENAPI_SHA256);
-        assert_eq!(contract.provider_kind, "desktop_sidecar");
         assert_eq!(
-            contract.feature_flags,
-            [
-                FeatureFlagV1::RemoteProfiles,
-                FeatureFlagV1::ProjectValidation,
-            ]
+            contract.event_schema_sha256,
+            DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256
         );
+        assert_eq!(contract.release_version, DESKTOP_RELEASE_VERSION);
+        assert_eq!(contract.provider_kind, "desktop_sidecar");
+        assert_eq!(contract.feature_flags, REQUIRED_DESKTOP_FEATURE_FLAGS);
         let requests = requests_rx.into_iter().collect::<Vec<_>>().join("\n");
         assert!(requests.contains("GET /version HTTP/1.1"));
         assert!(requests.contains(&format!("GET {LEGACY_DESKTOP_SHELL_ROUTE} HTTP/1.1")));
+        assert!(requests.contains(&format!("GET {LEGACY_DESKTOP_V1_STATE_ROUTE} HTTP/1.1")));
         assert!(!requests.contains(&"7c".repeat(SESSION_TOKEN_BYTES)));
     }
 
@@ -9611,14 +9813,18 @@ mod tests {
     fn contract_handshake_rejects_digest_provider_and_legacy_route_inventory_mismatches() {
         for version in [
             valid_version_response_with("openapi_sha256", serde_json::json!("0".repeat(64))),
-            valid_version_response_with("build_version", serde_json::json!("0.0.0")),
+            valid_version_response_with("event_schema_sha256", serde_json::json!("0".repeat(64))),
+            valid_version_response_with("release_version", serde_json::json!("0.1.8")),
+            valid_version_response_with("build_id", serde_json::json!("0".repeat(64))),
             valid_version_response_with("source_commit", serde_json::json!("0".repeat(40))),
             valid_version_response_with("provider_kind", serde_json::json!("contract_simulator")),
             valid_version_response_with("unexpected", serde_json::json!(true)),
             valid_version_response_with(
                 "feature_flags",
-                serde_json::json!(["remote_profiles", "remote_profiles"]),
+                serde_json::json!(["core_control_v2", "core_control_v2"]),
             ),
+            valid_version_response_with("feature_set_sha256", serde_json::json!("0".repeat(64))),
+            valid_version_response_with("mutation_compatible", serde_json::json!(false)),
         ] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
@@ -9638,7 +9844,19 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (requests_tx, _) = mpsc::channel();
         let server = thread::spawn(move || {
-            serve_contract_response(&listener, valid_version_response(), 200, requests_tx)
+            serve_contract_response(&listener, valid_version_response(), 200, 404, requests_tx)
+        });
+
+        let error = check_sidecar_contract(port).unwrap_err();
+        server.join().unwrap();
+
+        assert_eq!(error.code, "sidecar_contract_incompatible");
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (requests_tx, _) = mpsc::channel();
+        let server = thread::spawn(move || {
+            serve_contract_response(&listener, valid_version_response(), 404, 200, requests_tx)
         });
 
         let error = check_sidecar_contract(port).unwrap_err();
@@ -9704,7 +9922,7 @@ mod tests {
         let server = thread::spawn(move || {
             serve_health_on_listener(&listener, instance_id, readiness_key, None, false);
             let (requests_tx, _) = mpsc::channel();
-            serve_contract_response(&listener, valid_version_response(), 404, requests_tx);
+            serve_contract_response(&listener, valid_version_response(), 404, 404, requests_tx);
             let (mut stream, _) = listener.accept().unwrap();
             let _ = read_http_request(&mut stream);
             write_empty_response(&mut stream, 403);
@@ -9851,7 +10069,13 @@ mod tests {
                 false,
             );
             let (requests, _) = mpsc::channel();
-            serve_contract_response(&probe_listener, valid_version_response(), 404, requests);
+            serve_contract_response(
+                &probe_listener,
+                valid_version_response(),
+                404,
+                404,
+                requests,
+            );
             serve_session_probe(&probe_listener, false);
         });
         *state.sidecar.lock().unwrap() = Some(replacement);
@@ -9901,8 +10125,8 @@ mod tests {
         replacement.monitor_started = true;
         let process_group = replacement.process_group;
         *state.sidecar.lock().unwrap() = Some(replacement);
-        let stale_context = DesktopBootstrapContextV1 {
-            schema_version: "1",
+        let stale_context = DesktopBootstrapContextV2 {
+            schema_version: "2",
             endpoint: format!("http://127.0.0.1:{listener_port}"),
             session_token: "33".repeat(SESSION_TOKEN_BYTES),
             negotiated_contract: test_bootstrap_state().negotiated_contract,
@@ -10295,7 +10519,7 @@ mapping process and mapped file have different Team IDs";
             (
                 StartupDiagnostic {
                     stage: "python_launcher",
-                    code: "provider_store_failed",
+                    code: "provider_store_v2_failed",
                     errno: None,
                 },
                 DesktopStartupStage::StateStore,
@@ -10328,7 +10552,7 @@ mapping process and mapped file have different Team IDs";
         let state = DesktopHostState::default();
         state.desktop_logs.begin_startup_attempt();
 
-        record_renderer_bootstrap_stage(&state, RendererBootstrapStageV1::ProviderCreateFailed);
+        record_renderer_bootstrap_stage(&state, RendererBootstrapStageV2::ProviderCreateFailed);
 
         let export = state.desktop_logs.export_snapshot();
         assert_eq!(export.attempts.len(), 1);
@@ -11234,7 +11458,7 @@ https://user:password@example.invalid/private\n"[..],
         drop(guard);
 
         let status = publication.join().unwrap().unwrap();
-        assert_eq!(status.schema_version, "1");
+        assert_eq!(status.schema_version, "2");
         assert_eq!(
             lock_sidecar_bounded(&state, Duration::ZERO)
                 .unwrap()
@@ -11778,7 +12002,8 @@ https://user:password@example.invalid/private\n"[..],
     fn serve_contract_response(
         listener: &TcpListener,
         version: serde_json::Value,
-        legacy_status: u16,
+        legacy_shell_status: u16,
+        legacy_v1_status: u16,
         requests: mpsc::Sender<String>,
     ) {
         let (mut version_stream, _) = listener.accept().unwrap();
@@ -11792,7 +12017,20 @@ https://user:password@example.invalid/private\n"[..],
         let _ = requests.send(legacy_request);
         write_json_response(
             &mut legacy_stream,
-            legacy_status,
+            legacy_shell_status,
+            serde_json::json!({"detail": "not found"}),
+        );
+        drop(legacy_stream);
+        if legacy_shell_status != 404 {
+            return;
+        }
+
+        let (mut legacy_v1_stream, _) = listener.accept().unwrap();
+        let legacy_v1_request = read_http_request(&mut legacy_v1_stream);
+        let _ = requests.send(legacy_v1_request);
+        write_json_response(
+            &mut legacy_v1_stream,
+            legacy_v1_status,
             serde_json::json!({"detail": "not found"}),
         );
     }
@@ -11852,16 +12090,30 @@ https://user:password@example.invalid/private\n"[..],
 
     fn valid_version_response() -> serde_json::Value {
         serde_json::json!({
-            "schema_version": "1",
+            "schema_version": "2",
             "api_name": DESKTOP_LOCAL_API_NAME,
-            "preferred_major": 1,
-            "supported_majors": [1],
+            "preferred_major": 2,
+            "supported_majors": [2],
+            "mutation_major": 2,
             "openapi_sha256": DESKTOP_LOCAL_API_OPENAPI_SHA256,
-            "build_version": env!("CARGO_PKG_VERSION"),
+            "event_schema_sha256": DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256,
+            "release_version": DESKTOP_RELEASE_VERSION,
+            "build_id": "abababababababababababababababababababababababababababababababab",
             "source_commit": "0123456789abcdef0123456789abcdef01234567",
             "build_channel": "release",
             "provider_kind": "desktop_sidecar",
-            "feature_flags": ["remote_profiles", "project_validation"],
+            "feature_flags": [
+                "core_control_v2",
+                "daemon_bundle_v2",
+                "event_replay_v2",
+                "host_key_review",
+                "native_askpass",
+                "system_openssh_profiles",
+                "task_admission_v2"
+            ],
+            "feature_set_sha256": DESKTOP_FEATURE_SET_SHA256,
+            "required_core_api_major": 2,
+            "mutation_compatible": true,
         })
     }
 
@@ -12011,14 +12263,21 @@ https://user:password@example.invalid/private\n"[..],
             session_credential: SessionCredential([0x7c; SESSION_TOKEN_BYTES]),
             readiness_credential: ReadinessCredential([0x5a; READINESS_KEY_BYTES]),
             handoff_credential: HandoffCredential([0x8d; HANDOFF_TOKEN_BYTES]),
-            negotiated_contract: NegotiatedContractV1 {
-                major: 1,
+            negotiated_contract: NegotiatedContractV2 {
+                schema_version: "2",
+                major: 2,
+                mutation_major: 2,
                 openapi_sha256: DESKTOP_LOCAL_API_OPENAPI_SHA256.to_string(),
+                event_schema_sha256: DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256.to_string(),
+                release_version: DESKTOP_RELEASE_VERSION.to_string(),
+                build_id: "ab".repeat(32),
+                source_commit: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                build_channel: "release".to_string(),
                 provider_kind: "desktop_sidecar".to_string(),
-                feature_flags: vec![
-                    FeatureFlagV1::RemoteProfiles,
-                    FeatureFlagV1::ProjectValidation,
-                ],
+                feature_flags: REQUIRED_DESKTOP_FEATURE_FLAGS.to_vec(),
+                feature_set_sha256: DESKTOP_FEATURE_SET_SHA256.to_string(),
+                required_core_api_major: 2,
+                mutation_compatible: true,
             },
         }
     }
@@ -12071,6 +12330,7 @@ https://user:password@example.invalid/private\n"[..],
             let path = root.join(BUNDLED_SIDECAR_BINARY);
             fs::copy(source, &path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self::write_askpass_helper(&root);
             Self { root, path }
         }
 
@@ -12111,7 +12371,14 @@ https://user:password@example.invalid/private\n"[..],
             let path = root.join(BUNDLED_SIDECAR_BINARY);
             fs::write(&path, contents).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+            Self::write_askpass_helper(&root);
             Self { root, path }
+        }
+
+        fn write_askpass_helper(root: &Path) {
+            let helper = root.join(BUNDLED_ASKPASS_BINARY);
+            fs::write(helper.as_path(), b"packaged-askpass-v2").unwrap();
+            fs::set_permissions(helper, fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         fn symlink() -> Self {

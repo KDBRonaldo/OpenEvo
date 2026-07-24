@@ -18,6 +18,7 @@ import secrets
 import signal
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -43,7 +44,10 @@ from openevo_startup_diagnostics import (  # noqa: E402
     unknown_output_fingerprint,
 )
 
-from desktop.sidecar.contracts.v1 import DesktopStateV1, VersionV1  # noqa: E402
+from desktop.sidecar.contracts.v2.models import (  # noqa: E402
+    DesktopStateV2,
+    DesktopVersionV2,
+)
 from openevo.deployment.ssh import (  # noqa: E402
     _SubprocessExitObserver,
     _confirm_owned_process_group_disappeared,
@@ -67,7 +71,7 @@ EXPECTED_ACTIVE_SELECTIONS = {
 }
 DESKTOP_SESSION_HEADER = "X-OpenEvo-Desktop-Session"
 NATIVE_CHALLENGE_HEADER = "X-OpenEvo-Native-Challenge"
-NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v1"
+NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v2"
 NATIVE_LISTENER_FD_ENV = "OPENEVO_NATIVE_LISTENER_FD"
 NATIVE_ARCHIVE_FD_ENV = "OPENEVO_NATIVE_EXECUTABLE_FD"
 NATIVE_ARCHIVE_PATH_ENV = "OPENEVO_NATIVE_EXECUTABLE_PATH"
@@ -75,6 +79,7 @@ NATIVE_LISTENER_FD = 3
 NATIVE_ARCHIVE_FD = 4
 NATIVE_GUARD_MIN_FD = 64
 NATIVE_SIDECAR_BASENAME = "openevo-desktop-sidecar"
+NATIVE_ASKPASS_BASENAME = "openevo-ssh-askpass"
 STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES = 32 * 1024
 STARTUP_DIAGNOSTIC_MAX_LINES = 8
 _STARTUP_DIAGNOSTIC_PATTERN = re.compile(
@@ -135,19 +140,18 @@ _STARTUP_DIAGNOSTIC_CODES = {
         {
             "execution_failed",
             "bundled_core_assets_failed",
-            "provider_store_failed",
-            "credential_reset_failed",
-            "remote_lifecycle_failed",
-            "workspace_store_failed",
-            "core_assets_failed",
-            "core_bridge_store_failed",
-            "event_broker_failed",
-            "core_adapter_failed",
-            "core_bridge_failed",
-            "core_runtime_failed",
-            "release_provider_failed",
-            "contract_app_failed",
-            "release_routes_failed",
+            "provider_store_v2_failed",
+            "restart_reconciliation_v2_failed",
+            "workspace_store_v2_failed",
+            "ssh_catalog_v2_failed",
+            "remote_lifecycle_v2_failed",
+            "core_bridge_store_v2_failed",
+            "event_broker_v2_failed",
+            "core_adapter_v2_failed",
+            "core_bridge_v2_failed",
+            "core_runtime_v2_failed",
+            "release_provider_v2_failed",
+            "contract_app_v2_failed",
             "static_app_failed",
             "native_frame_failed",
             "native_routes_failed",
@@ -161,7 +165,7 @@ _STARTUP_DIAGNOSTIC_CODES = {
 _LOCAL_HTTP_OPENER = build_opener(ProxyHandler({}))
 
 
-def _load_release_contract() -> tuple[str, frozenset[str]]:
+def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
     path = REPOSITORY_ROOT / "desktop" / "release-contract.json"
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -175,27 +179,44 @@ def _load_release_contract() -> tuple[str, frozenset[str]]:
         "v019",
     }:
         raise RuntimeError("Desktop release contract does not use the closed schema")
-    digests = payload.get("accepted_openapi_digests")
-    provider_kinds = payload.get("allowed_provider_kinds")
-    features = payload.get("required_feature_flags")
+    policy = payload.get("v019")
+    digests = policy.get("accepted_desktop_openapi_digests") if type(policy) is dict else None
+    event_digests = (
+        policy.get("accepted_desktop_event_schema_digests")
+        if type(policy) is dict
+        else None
+    )
+    provider_kinds = policy.get("allowed_provider_kinds") if type(policy) is dict else None
+    features = policy.get("required_desktop_feature_flags") if type(policy) is dict else None
+    release_version = policy.get("release_version") if type(policy) is dict else None
     if (
         payload.get("schema_version") != "1"
         or type(digests) is not list
         or len(digests) != 1
         or type(digests[0]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", digests[0]) is None
+        or type(event_digests) is not list
+        or len(event_digests) != 1
+        or type(event_digests[0]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event_digests[0]) is None
+        or release_version != "0.1.9"
         or provider_kinds != ["desktop_sidecar"]
         or type(features) is not list
         or not features
         or any(type(feature) is not str for feature in features)
         or len(features) != len(set(features))
-        or type(payload.get("v019")) is not dict
+        or features != sorted(features)
     ):
         raise RuntimeError("Desktop release contract is invalid")
-    return digests[0], frozenset(features)
+    return digests[0], event_digests[0], release_version, tuple(features)
 
 
-EXPECTED_DESKTOP_OPENAPI_SHA256, REQUIRED_DESKTOP_FEATURE_FLAGS = _load_release_contract()
+(
+    EXPECTED_DESKTOP_OPENAPI_SHA256,
+    EXPECTED_DESKTOP_EVENT_SCHEMA_SHA256,
+    EXPECTED_DESKTOP_RELEASE_VERSION,
+    REQUIRED_DESKTOP_FEATURE_FLAGS,
+) = _load_release_contract()
 
 
 class SmokeFailure(RuntimeError):
@@ -353,9 +374,29 @@ def _launch_native_sidecar(
     int,
     _SubprocessExitObserver,
 ]:
+    helper_source: Path | None = None
+    if sidecar.name.startswith(NATIVE_SIDECAR_BASENAME):
+        target_suffix = sidecar.name.removeprefix(NATIVE_SIDECAR_BASENAME)
+        helper_source = sidecar.with_name(f"{NATIVE_ASKPASS_BASENAME}{target_suffix}")
+        try:
+            helper_metadata = helper_source.lstat()
+        except OSError as exc:
+            raise SmokeFailure("packaged SSH askpass helper is unavailable") from exc
+        if (
+            not stat.S_ISREG(helper_metadata.st_mode)
+            or stat.S_IMODE(helper_metadata.st_mode) != 0o755
+            or helper_metadata.st_nlink != 1
+            or not 0 < helper_metadata.st_size <= 16 * 1024 * 1024
+        ):
+            raise SmokeFailure("packaged SSH askpass helper metadata is invalid")
     launch_path = config_root.parent / NATIVE_SIDECAR_BASENAME
     shutil.copyfile(sidecar, launch_path)
     launch_path.chmod(0o500)
+    helper_launch_path: Path | None = None
+    if helper_source is not None:
+        helper_launch_path = config_root.parent / NATIVE_ASKPASS_BASENAME
+        shutil.copyfile(helper_source, helper_launch_path)
+        helper_launch_path.chmod(0o755)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
@@ -385,6 +426,8 @@ def _launch_native_sidecar(
         "--desktop-config-root",
         str(config_root),
     ]
+    if helper_launch_path is not None:
+        command.extend(("--ssh-askpass-helper-path", str(helper_launch_path)))
     try:
         with _fixed_native_descriptors(listener.fileno(), archive_fd):
             process = subprocess.Popen(
@@ -652,41 +695,41 @@ def _assert_project_method_contract(method: dict[str, Any]) -> None:
 
 def _assert_release_version(payload: dict[str, Any]) -> None:
     try:
-        version = VersionV1.model_validate_json(
+        version = DesktopVersionV2.model_validate_json(
             json.dumps(payload, separators=(",", ":"), sort_keys=True)
         )
     except ValidationError as exc:
         raise SmokeFailure("packaged sidecar returned an invalid release contract") from exc
     if version.openapi_sha256 != EXPECTED_DESKTOP_OPENAPI_SHA256:
         raise SmokeFailure("packaged sidecar returned an unreviewed OpenAPI digest")
-    missing_features = REQUIRED_DESKTOP_FEATURE_FLAGS.difference(version.feature_flags)
-    if missing_features:
-        raise SmokeFailure(
-            "packaged sidecar omitted required release features: "
-            + ", ".join(sorted(missing_features))
-        )
     if (
-        version.schema_version != "1"
+        version.schema_version != "2"
         or version.api_name != "openevo-desktop-local-api"
         or version.provider_kind != "desktop_sidecar"
         or version.build_channel != "release"
-        or version.preferred_major != 1
-        or version.supported_majors != (1,)
+        or version.preferred_major != 2
+        or version.supported_majors != [2]
+        or version.mutation_major != 2
+        or version.event_schema_sha256 != EXPECTED_DESKTOP_EVENT_SCHEMA_SHA256
+        or version.release_version != EXPECTED_DESKTOP_RELEASE_VERSION
+        or tuple(version.feature_flags) != REQUIRED_DESKTOP_FEATURE_FLAGS
+        or version.required_core_api_major != 2
+        or not version.mutation_compatible
     ):
         raise SmokeFailure("packaged sidecar returned an invalid release contract")
 
 
 def _assert_desktop_state(payload: dict[str, Any]) -> None:
     try:
-        state = DesktopStateV1.model_validate_json(
+        state = DesktopStateV2.model_validate_json(
             json.dumps(payload, separators=(",", ":"), sort_keys=True)
         )
     except ValidationError as exc:
         raise SmokeFailure("packaged sidecar returned an invalid Desktop state") from exc
     if (
-        state.contract.selected_major != 1
-        or not state.contract.compatible
-        or state.contract.desktop_openapi_sha256 != EXPECTED_DESKTOP_OPENAPI_SHA256
+        state.schema_version != "2"
+        or state.active_profile_id is not None
+        or state.active_project_id is not None
     ):
         raise SmokeFailure("packaged sidecar state does not bind the release contract")
 
@@ -769,7 +812,7 @@ def smoke_sidecar(
                 try:
                     challenge = secrets.token_hex(32)
                     health = _read_json(
-                        f"{base_url}/health",
+                        f"{base_url}/openevo-native/health",
                         headers={NATIVE_CHALLENGE_HEADER: challenge},
                     )
                     domain = (
@@ -798,12 +841,12 @@ def smoke_sidecar(
             session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
             _assert_desktop_state(
                 _read_json(
-                    f"{base_url}/desktop/v1/state",
+                    f"{base_url}/desktop/v2/state",
                     headers=session_headers,
                 )
             )
             _read_url(
-                f"{base_url}/desktop/v1/state",
+                f"{base_url}/desktop/v2/state",
                 expected_status=401,
             )
             _read_url(
@@ -817,6 +860,11 @@ def smoke_sidecar(
             )
             _read_url(
                 f"{base_url}/openevo-api/desktop/shell",
+                expected_status=404,
+            )
+            _read_url(
+                f"{base_url}/desktop/v1/state",
+                headers=session_headers,
                 expected_status=404,
             )
 
@@ -866,7 +914,10 @@ def _render_process_failure(returncode: int | None, output) -> str:
         if diagnostics
         else "no valid OPENEVO_STARTUP_V1 diagnostic was emitted"
     )
-    return f"sidecar exited before serving /health (exit {returncode}).\n{detail}"
+    return (
+        "sidecar exited before proving native health "
+        f"(exit {returncode}).\n{detail}"
+    )
 
 
 def _read_startup_diagnostics(process_output) -> tuple[str, ...]:

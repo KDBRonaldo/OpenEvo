@@ -70,6 +70,10 @@ def _write_repo_skeleton(repo: Path) -> None:
         encoding="utf-8",
     )
     (repo / "desktop/packaging/sidecar_entry.py").write_text("", encoding="utf-8")
+    (repo / "desktop/release-contract.json").write_text(
+        '{"schema_version":"test-release-authority"}',
+        encoding="utf-8",
+    )
     (repo / "README.md").write_text("# OpenEvo\n", encoding="utf-8")
     (repo / "LICENSE").write_text("test license\n", encoding="utf-8")
     (repo / "src/openevo").mkdir(parents=True)
@@ -760,6 +764,27 @@ def test_sidecar_archive_product_web_matches_audited_build_and_rejects_tampering
         builder._validate_embedded_product_web(executable, repo / "desktop", digest)
 
 
+def test_sidecar_archive_embeds_the_exact_release_authority_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    executable = tmp_path / "sidecar"
+    executable.write_bytes(b"sidecar")
+    manifest = tmp_path / "release-contract.json"
+    source = b'{"schema_version":"test-release-authority"}'
+    manifest.write_bytes(source)
+    payloads = {"desktop/release-contract.json": source}
+    monkeypatch.setattr(builder, "_archive_member_names", lambda _: tuple(payloads))
+    monkeypatch.setattr(builder, "_archive_member_bytes", lambda _, name: payloads[name])
+
+    builder._validate_embedded_release_contract(executable, manifest)
+
+    payloads["desktop/release-contract.json"] = b'{"schema_version":"tampered"}'
+    with pytest.raises(RuntimeError, match="release authority manifest differs"):
+        builder._validate_embedded_release_contract(executable, manifest)
+
+
 @pytest.mark.parametrize("clean", [False, True])
 @pytest.mark.parametrize("release_build", [False, True])
 def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
@@ -865,6 +890,13 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
             metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
             assert metadata["schema_version"] == "2"
             assert metadata["ssh_askpass_helper"]["filename"] == builder.ASKPASS_NAME
+            assert any(
+                Path(source) == repo / builder.RELEASE_CONTRACT_RELATIVE_PATH
+                and destination == builder.RELEASE_CONTRACT_RELATIVE_PATH.parent.as_posix()
+                for source, destination in (
+                    value.rsplit(os.pathsep, 1) for value in add_data
+                )
+            )
             dist_dir = Path(command[command.index("--distpath") + 1])
             dist_dir.mkdir(parents=True, exist_ok=True)
             (dist_dir / builder.SIDECAR_NAME).write_bytes(b"packaged-sidecar")
@@ -898,6 +930,7 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
                 for path in sorted((repo / "desktop/packaging/web").rglob("*"))
                 if path.is_file()
             ),
+            builder.RELEASE_CONTRACT_RELATIVE_PATH.as_posix(),
         ),
     )
     web_payloads = {
@@ -905,6 +938,9 @@ def test_build_sidecar_uses_isolated_source_and_preserves_repository_outputs(
         for path in (repo / "desktop/packaging/web").rglob("*")
         if path.is_file()
     }
+    web_payloads[builder.RELEASE_CONTRACT_RELATIVE_PATH.as_posix()] = (
+        repo / builder.RELEASE_CONTRACT_RELATIVE_PATH
+    ).read_bytes()
     monkeypatch.setattr(
         builder,
         "_archive_member_bytes",
@@ -1698,6 +1734,7 @@ def test_temporary_directory_cleanup_failure_keeps_complete_published_pair(
         builder, "_validate_sidecar_excludes_remote_release_assets", lambda *_: None
     )
     monkeypatch.setattr(builder, "_validate_embedded_product_web", lambda *args: None)
+    monkeypatch.setattr(builder, "_validate_embedded_release_contract", lambda *args: None)
 
     with pytest.raises(OSError, match="TemporaryDirectory cleanup failure"):
         builder.build_sidecar(clean=True, core_wheel_output_dir=output)

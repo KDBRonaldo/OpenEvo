@@ -67,6 +67,7 @@ FORBIDDEN_LEGACY_SIDECAR_MODULES = frozenset(
 )
 PRODUCT_WEB_MANIFEST = ".openevo-product-web.json"
 SIDECAR_BUILD_METADATA_RELATIVE_PATH = Path("desktop/packaging/sidecar-build-metadata.json")
+RELEASE_CONTRACT_RELATIVE_PATH = Path("desktop/release-contract.json")
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
 _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 _MACOS_CODESIGN_FLAGS_PATTERN = re.compile(r"\bflags=0x[0-9a-fA-F]+\(([^)]*)\)")
@@ -2444,6 +2445,19 @@ def _validate_embedded_product_web(
         raise RuntimeError("Desktop sidecar product web build digest differs from dist")
 
 
+def _validate_embedded_release_contract(executable: Path, source: Path) -> None:
+    member = RELEASE_CONTRACT_RELATIVE_PATH.as_posix()
+    members = tuple(name for name in _archive_member_names(executable) if name == member)
+    if members != (member,):
+        raise RuntimeError("Desktop sidecar release authority manifest is unavailable")
+    try:
+        expected = source.read_bytes()
+    except OSError as exc:
+        raise RuntimeError("Desktop release authority manifest is unavailable") from exc
+    if _archive_member_bytes(executable, member) != expected:
+        raise RuntimeError("Desktop sidecar release authority manifest differs from source")
+
+
 def _validate_embedded_managed_runtime_archive(
     executable: Path,
     archive: Path,
@@ -2871,6 +2885,11 @@ def build_sidecar(
                 f"{build_metadata}{os.pathsep}"
                 f"{SIDECAR_BUILD_METADATA_RELATIVE_PATH.parent.as_posix()}"
             ),
+            "--add-data",
+            (
+                f"{repo / RELEASE_CONTRACT_RELATIVE_PATH}{os.pathsep}"
+                f"{RELEASE_CONTRACT_RELATIVE_PATH.parent.as_posix()}"
+            ),
             "--hidden-import",
             "uvicorn.logging",
             "--hidden-import",
@@ -2906,6 +2925,10 @@ def build_sidecar(
         _validate_fd_bound_bootloader(built)
         _validate_sidecar_excludes_remote_release_assets(built)
         _validate_embedded_product_web(built, desktop_root, product_web_digest)
+        _validate_embedded_release_contract(
+            built,
+            repo / RELEASE_CONTRACT_RELATIVE_PATH,
+        )
         if provided_core_wheel is not None and provided_core_lock is not None:
             _verify_core_release_input(provided_core_wheel)
             _verify_core_release_input(provided_core_lock)

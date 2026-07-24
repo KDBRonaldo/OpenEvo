@@ -25,7 +25,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from smoke_openevo_desktop_sidecar import (  # noqa: E402
+    EXPECTED_DESKTOP_EVENT_SCHEMA_SHA256,
     EXPECTED_DESKTOP_OPENAPI_SHA256,
+    EXPECTED_DESKTOP_RELEASE_VERSION,
     SmokeFailure,
     _STARTUP_DIAGNOSTIC_CODES,
 )
@@ -104,7 +106,9 @@ NATIVE_RENDERER_STAGES = frozenset(
 )
 REQUIRED_RENDERER_COMPLETION_STAGES = frozenset(
     {
-        "retry_recovery_ready",
+        "bootstrap_context_validated",
+        "local_api_version_verified",
+        "provider_adapter_ready",
         "provider_created",
         "product_committed",
         "ready_requested",
@@ -132,10 +136,12 @@ _NATIVE_PROCESS_MARKER_PATTERN = re.compile(
     rb"executable_sha256=([0-9a-f]{64}) executable_size=([1-9][0-9]{0,19})"
 )
 _NATIVE_RENDERER_MARKER_PATTERN = re.compile(
-    rb"OPENEVO_DESKTOP_RENDERER_READY_V2 ([0-9a-f]{64})"
+    rb"OPENEVO_DESKTOP_RENDERER_READY_V2 "
+    rb"([0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}) "
+    rb"([0-9a-f]{64}) ([0-9a-f]{64})"
 )
 _NATIVE_RENDERER_STAGE_MARKER_PATTERN = re.compile(
-    rb"OPENEVO_DESKTOP_RENDERER_STAGE_V1 ([a-z_]{1,64})"
+    rb"OPENEVO_DESKTOP_RENDERER_STAGE_V2 ([a-z_]{1,64})"
 )
 _NATIVE_STARTUP_FAILURE_MARKER_PATTERN = re.compile(
     rb"OPENEVO_DESKTOP_STARTUP_FAILURE_V1 "
@@ -704,7 +710,10 @@ def _parse_native_host_observation(
             if (
                 matched is None
                 or active_process is None
-                or matched.group(1).decode("ascii") != EXPECTED_DESKTOP_OPENAPI_SHA256
+                or matched.group(1).decode("ascii") != EXPECTED_DESKTOP_RELEASE_VERSION
+                or matched.group(2).decode("ascii") != EXPECTED_DESKTOP_OPENAPI_SHA256
+                or matched.group(3).decode("ascii")
+                != EXPECTED_DESKTOP_EVENT_SCHEMA_SHA256
             ):
                 raise SmokeFailure("Native host renderer marker is malformed")
             renderer_ready = True
@@ -1249,7 +1258,13 @@ def smoke_bundle(
         try:
             process = subprocess.Popen(
                 [str(executable)],
-                cwd=app.parent,
+                # LaunchServices does not start an app with the directory that
+                # contains its own bundle as the working directory. On macOS,
+                # doing so can leave WKWebView's Tauri invoke reply pending
+                # after the native command has completed. Use the stable
+                # in-bundle Contents directory to exercise the installed-app
+                # startup path instead of that synthetic launch condition.
+                cwd=app / "Contents",
                 env=environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
@@ -1289,7 +1304,7 @@ def smoke_bundle(
                 if native_observation.startup_failure is not None:
                     observed_startup_failure = native_observation.startup_failure
                 if sys.platform == "darwin":
-                    if process.poll() is None:
+                    if process.poll() is None and native_observation.renderer_ready:
                         evidence, observed_groups, candidate_stage = _macos_native_evidence(
                             process.pid,
                             executable,
@@ -1309,6 +1324,17 @@ def smoke_bundle(
                                 deadline=deadline,
                             )
                             break
+                        readiness_stage = _advance_readiness_stage(
+                            readiness_stage,
+                            observed_readiness_stages,
+                            candidate_stage,
+                        )
+                    elif process.poll() is None:
+                        candidate_stage = (
+                            "native_marker_absent"
+                            if native_observation.active_process is None
+                            else "renderer_ack_absent"
+                        )
                         readiness_stage = _advance_readiness_stage(
                             readiness_stage,
                             observed_readiness_stages,

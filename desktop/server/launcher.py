@@ -5,6 +5,8 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Annotated, Callable
 from dataclasses import dataclass, field
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -30,8 +32,9 @@ from desktop.sidecar.native_workspace import (
     NativeWorkspaceArchiveError,
     prepare_native_workspace,
 )
-from desktop.sidecar.release_app import create_release_desktop_local_api_app
-from desktop.sidecar.release_provider import NATIVE_SIDECAR_PROTOCOL
+from desktop.sidecar.release_app import (
+    create_packaged_release_desktop_local_api_v2_app,
+)
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     SystemOpenSshHostTrust,
@@ -55,6 +58,10 @@ NATIVE_SESSION_HEADER = "X-OpenEvo-Desktop-Session"
 _NATIVE_SESSION_HEADER_BYTES = NATIVE_SESSION_HEADER.lower().encode("ascii")
 NATIVE_HANDOFF_HEADER = "X-OpenEvo-Native-Handoff"
 _NATIVE_HANDOFF_HEADER_BYTES = NATIVE_HANDOFF_HEADER.lower().encode("ascii")
+NATIVE_CHALLENGE_HEADER = "X-OpenEvo-Native-Challenge"
+_NATIVE_CHALLENGE_HEADER_BYTES = NATIVE_CHALLENGE_HEADER.lower().encode("ascii")
+NATIVE_SIDECAR_PROTOCOL = "openevo-native-sidecar-v2"
+_NATIVE_HEALTH_ROUTE = "/openevo-native/health"
 _NATIVE_SESSION_PROBE_ROUTE = "/openevo-native/session"
 _NATIVE_WORKSPACE_IMPORT_ROUTE = "/openevo-native/workspace-imports"
 _NATIVE_WORKSPACE_CANCEL_ROUTE = "/openevo-native/workspace-imports/cancel"
@@ -65,26 +72,25 @@ _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
 _PACKAGED_STARTUP_PHASES = frozenset(
     {
         "bundled_core_assets",
-        "contract_app",
-        "core_adapter",
-        "core_assets",
-        "core_bridge",
-        "core_bridge_store",
-        "core_runtime",
-        "credential_reset",
-        "event_broker",
+        "contract_app_v2",
+        "core_adapter_v2",
+        "core_bridge_v2",
+        "core_bridge_store_v2",
+        "core_runtime_v2",
+        "event_broker_v2",
         "listener",
         "native_frame",
         "native_routes",
-        "provider_store",
-        "release_provider",
-        "release_routes",
-        "remote_lifecycle",
+        "provider_store_v2",
+        "restart_reconciliation_v2",
+        "release_provider_v2",
+        "remote_lifecycle_v2",
+        "ssh_catalog_v2",
         "static_app",
         "server",
         "server_import",
         "shutdown",
-        "workspace_store",
+        "workspace_store_v2",
     }
 )
 _PACKAGED_STARTUP_CODES = frozenset(
@@ -156,7 +162,7 @@ _NativeText = Annotated[
 class _NativeWorkspaceImportRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
-    schema_version: Literal["1"]
+    schema_version: Literal["2"]
     kind: Literal["native_folder_snapshot"]
     action_id: Annotated[
         str,
@@ -185,7 +191,7 @@ class _NativeWorkspaceImportRequest(BaseModel):
 class _NativeWorkspaceImportResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     source: ProjectSourceV1
     lease_token: Annotated[
         str,
@@ -196,7 +202,7 @@ class _NativeWorkspaceImportResponse(BaseModel):
 class _NativeWorkspaceDiscardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
-    schema_version: Literal["1"]
+    schema_version: Literal["2"]
     action_id: Annotated[
         str,
         StringConstraints(
@@ -218,7 +224,7 @@ class _NativeWorkspaceDiscardRequest(BaseModel):
 class _NativeWorkspaceCancelRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
-    schema_version: Literal["1"]
+    schema_version: Literal["2"]
     action_id: Annotated[
         str,
         StringConstraints(
@@ -435,7 +441,7 @@ def _create_app(
         ):
             raise ValueError("packaged askpass helper identity is incomplete")
         if packaged_askpass_helper_path is not None:
-            startup_phase = "remote_lifecycle"
+            startup_phase = "remote_lifecycle_v2"
             assert packaged_askpass_helper_sha256 is not None
             assert packaged_askpass_helper_byte_size is not None
             askpass_helper = AskpassHelperAuthority.open(
@@ -450,12 +456,14 @@ def _create_app(
                 home=home,
                 inherited_environment=os.environ,
             )
-        app = create_release_desktop_local_api_app(
+        if askpass_helper is None or host_trust is None:
+            startup_phase = "remote_lifecycle_v2"
+        app = create_packaged_release_desktop_local_api_v2_app(
             state_root=state_root,
             session_token=native_frame.session_token,
             instance_id=native_frame.instance_id,
-            readiness_key=native_frame.readiness_key,
             source_commit=source_commit,
+            build_version="0.1.9",
             build_channel=build_channel,
             core_assets_root=core_assets_root,
             release_assets_root=release_assets_root,
@@ -477,6 +485,33 @@ def _create_app(
     expected_handoff_token = native_frame.handoff_token.encode("ascii")
     workspace_import_store = app.state.desktop_release_provider.workspace_import_store
     workspace_operations = _NativeWorkspaceOperations()
+
+    @app.get(
+        _NATIVE_HEALTH_ROUTE,
+        include_in_schema=False,
+    )
+    def native_health(request: Request) -> Response:
+        challenge = _native_challenge(request)
+        if challenge is None:
+            return Response(status_code=403)
+        domain = (
+            f"{NATIVE_SIDECAR_PROTOCOL}\0{native_frame.instance_id}\0{challenge}"
+        ).encode("ascii")
+        proof = hmac.new(
+            native_frame.readiness_key,
+            domain,
+            hashlib.sha256,
+        ).hexdigest()
+        return JSONResponse(
+            status_code=200,
+            content={
+                "service": "openevo-sidecar",
+                "status": "ok",
+                "protocol": NATIVE_SIDECAR_PROTOCOL,
+                "instance_id": native_frame.instance_id,
+                "instance_proof": proof,
+            },
+        )
 
     @app.get(
         _NATIVE_SESSION_PROBE_ROUTE,
@@ -647,6 +682,23 @@ def _native_credential_matches(
     return len(candidates) == 1 and matches
 
 
+def _native_challenge(request: Request) -> str | None:
+    candidates = [
+        value
+        for name, value in request.scope["headers"]
+        if name == _NATIVE_CHALLENGE_HEADER_BYTES
+    ]
+    if len(candidates) != 1:
+        return None
+    try:
+        challenge = candidates[0].decode("ascii", errors="strict")
+    except UnicodeDecodeError:
+        return None
+    if re.fullmatch(r"[0-9a-f]{64}", challenge) is None:
+        return None
+    return challenge
+
+
 async def _read_bounded_native_body(request: Request, *, max_bytes: int) -> bytes:
     payload = bytearray()
     async for chunk in request.stream():
@@ -795,6 +847,7 @@ def main(
     )
     parser.add_argument("--listener-fd", type=int, required=True)
     parser.add_argument("--native-instance-stdin", action="store_true", required=True)
+    parser.add_argument("--core-assets-root", type=Path, default=None)
     parser.add_argument("--release-assets-root", type=Path, default=None)
     parser.add_argument(
         "--ssh-askpass-helper-path",
@@ -802,6 +855,15 @@ def main(
         required=(
             packaged_source_commit is not None and packaged_askpass_helper_sha256 is not None
         ),
+    )
+    parser.add_argument(
+        "--ssh-askpass-helper-sha256",
+        default=packaged_askpass_helper_sha256,
+    )
+    parser.add_argument(
+        "--ssh-askpass-helper-byte-size",
+        type=int,
+        default=packaged_askpass_helper_byte_size,
     )
     if packaged_source_commit is None:
         parser.add_argument("--source-commit", required=True)
@@ -840,14 +902,19 @@ def main(
         native_frame=native_frame,
         source_commit=source_commit,
         build_channel=build_channel,
+        core_assets_root=args.core_assets_root,
         release_assets_root=args.release_assets_root,
         packaged_askpass_helper_path=(
             args.ssh_askpass_helper_path
-            if packaged_source_commit is not None
+            if args.ssh_askpass_helper_path is not None
             else packaged_askpass_helper_path
         ),
-        packaged_askpass_helper_sha256=packaged_askpass_helper_sha256,
-        packaged_askpass_helper_byte_size=packaged_askpass_helper_byte_size,
+        packaged_askpass_helper_sha256=(
+            args.ssh_askpass_helper_sha256
+        ),
+        packaged_askpass_helper_byte_size=(
+            args.ssh_askpass_helper_byte_size
+        ),
     )
     listener: socket.socket | None = None
     try:

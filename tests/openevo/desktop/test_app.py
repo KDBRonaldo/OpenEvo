@@ -75,6 +75,19 @@ def _static_root(tmp_path: Path) -> Path:
     return root
 
 
+def _v2_launcher_resources(tmp_path: Path) -> dict[str, object]:
+    helper = tmp_path / "openevo-ssh-askpass"
+    helper.write_bytes(b"#!/bin/sh\nexit 1\n")
+    helper.chmod(0o755)
+    payload = helper.read_bytes()
+    return {
+        "core_assets_root": tmp_path / "deferred-core-assets",
+        "packaged_askpass_helper_path": helper,
+        "packaged_askpass_helper_sha256": hashlib.sha256(payload).hexdigest(),
+        "packaged_askpass_helper_byte_size": len(payload),
+    }
+
+
 def test_resolve_desktop_static_root_accepts_override(tmp_path: Path) -> None:
     root = _static_root(tmp_path)
 
@@ -287,6 +300,7 @@ def test_create_app_launcher_uses_new_darwin_state_namespace_when_preview_is_dam
             ),
             source_commit="89baeb26",
             build_channel="test",
+            **_v2_launcher_resources(tmp_path),
         )
         with TestClient(app) as client:
             assert client.get("/openevo").status_code == 200
@@ -302,7 +316,7 @@ def test_create_app_launcher_uses_new_darwin_state_namespace_when_preview_is_dam
         / "org.openevo.desktop"
         / desktop_launcher.DESKTOP_STATE_DIRECTORY
     )
-    assert (state_root / "provider.sqlite3").is_file()
+    assert (state_root / "provider-v2" / "provider-v2.sqlite3").is_file()
     assert preview_database.read_text(encoding="utf-8") == "corrupt preview state"
     assert preview_state.stat().st_mode == preview_state_mode
     assert sorted(entry.name for entry in preview_state.iterdir()) == [
@@ -360,7 +374,7 @@ def test_native_workspace_authority_request_is_repr_and_error_safe() -> None:
     token_canary = "ab" * 32
     request = desktop_launcher._NativeWorkspaceImportRequest.model_validate(
         {
-            "schema_version": "1",
+            "schema_version": "2",
             "kind": "native_folder_snapshot",
             "action_id": "native-source-action-safe-0001",
             "selected_path": path_canary,
@@ -378,7 +392,7 @@ def test_native_workspace_authority_request_is_repr_and_error_safe() -> None:
     with pytest.raises(Exception) as exc_info:
         desktop_launcher._NativeWorkspaceImportRequest.model_validate(
             {
-                "schema_version": "1",
+                "schema_version": "2",
                 "kind": "native_folder_snapshot",
                 "action_id": "native-source-action-safe-0002",
                 "selected_path": path_canary,
@@ -425,7 +439,7 @@ def test_launcher_accepts_native_frame_at_rust_byte_limit(
         b'"readiness_key":"' + b"5a" * 32 + b'"}\n',
         _native_instance_frame() + b"extra",
         _native_instance_frame() + _native_instance_frame(),
-        _native_instance_frame(protocol="openevo-native-sidecar-v2"),
+        _native_instance_frame(protocol="openevo-native-sidecar-v1"),
         _native_instance_frame(instance_id="1A" * 16),
         _native_instance_frame(readiness_key="5a" * 31),
         _native_instance_frame(session_token="7c" * 31),
@@ -456,6 +470,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
     instance_id = "1a" * 16
     secret = bytes.fromhex("5a" * 32)
     session_token = "7c" * 32
+    resources = _v2_launcher_resources(tmp_path)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -472,10 +487,18 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
             "89baeb26",
             "--build-channel",
             "test",
+            "--core-assets-root",
+            str(resources["core_assets_root"]),
+            "--ssh-askpass-helper-path",
+            str(resources["packaged_askpass_helper_path"]),
+            "--ssh-askpass-helper-sha256",
+            str(resources["packaged_askpass_helper_sha256"]),
+            "--ssh-askpass-helper-byte-size",
+            str(resources["packaged_askpass_helper_byte_size"]),
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         pass_fds=(listener.fileno(),),
         start_new_session=True,
     )
@@ -499,7 +522,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
             try:
                 connection.request(
                     "GET",
-                    "/health",
+                    "/openevo-native/health",
                     headers={"X-OpenEvo-Native-Challenge": challenge},
                 )
                 response = connection.getresponse()
@@ -511,7 +534,11 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
             finally:
                 connection.close()
 
-        assert process.poll() is None
+        assert process.poll() is None, (
+            process.stderr.read().decode("utf-8", errors="replace")
+            if process.stderr is not None
+            else "sidecar exited without diagnostics"
+        )
         assert payload == {
             "service": "openevo-sidecar",
             "status": "ok",
@@ -530,18 +557,25 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
         connection.request("GET", "/version")
         version_response = connection.getresponse()
         assert version_response.status == 200
-        assert json.loads(version_response.read()) == {
-            "schema_version": "1",
-            "api_name": "openevo-desktop-local-api",
-            "preferred_major": 1,
-            "supported_majors": [1],
-            "openapi_sha256": "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb",
-            "build_version": "0.1.8",
-            "source_commit": "89baeb26",
-            "build_channel": "test",
-            "provider_kind": "desktop_sidecar",
-            "feature_flags": ["remote_profiles"],
-        }
+        version = json.loads(version_response.read())
+        assert version["schema_version"] == "2"
+        assert version["preferred_major"] == version["mutation_major"] == 2
+        assert version["supported_majors"] == [2]
+        assert version["openapi_sha256"] == (
+            "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
+        )
+        assert version["event_schema_sha256"] == (
+            "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
+        )
+        assert version["release_version"] == "0.1.9"
+        assert version["source_commit"] == "89baeb26"
+        assert version["build_channel"] == "test"
+        assert version["provider_kind"] == "desktop_sidecar"
+        assert version["mutation_compatible"] is False
+        client_features = version["feature_flags"]
+        assert client_features
+        assert client_features == sorted(set(client_features))
+        assert len(version["build_id"]) == len(version["feature_set_sha256"]) == 64
         connection.close()
 
         connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
@@ -695,18 +729,25 @@ def test_create_app_launcher_accepts_config_root_override(tmp_path: Path) -> Non
         ),
         source_commit="89baeb26",
         build_channel="test",
+        **_v2_launcher_resources(tmp_path),
     )
     with TestClient(app) as client:
         authenticated = client.get(
-            "/desktop/v1/state",
+            "/desktop/v2/state",
             headers={desktop_launcher.NATIVE_SESSION_HEADER: "7c" * 32},
         )
         assert authenticated.status_code == 200
-        assert client.get("/desktop/v1/state").status_code == 401
+        assert client.get("/desktop/v2/state").status_code == 401
+        assert client.get("/desktop/v1/state").status_code == 404
         assert client.get("/openevo-api/backend/status").status_code == 404
 
     assert (config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY).is_dir()
-    assert (config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "provider.sqlite3").is_file()
+    assert (
+        config_root
+        / desktop_launcher.DESKTOP_STATE_DIRECTORY
+        / "provider-v2"
+        / "provider-v2.sqlite3"
+    ).is_file()
 
 
 def test_release_removes_native_credential_route_and_rejects_native_authentication(
@@ -727,17 +768,22 @@ def test_release_removes_native_credential_route_and_rejects_native_authenticati
         ),
         source_commit="89baeb26",
         build_channel="test",
+        **_v2_launcher_resources(tmp_path),
     )
 
     with TestClient(app) as client:
         rejected = client.post(
-            "/desktop/v1/profiles",
-            headers={**session_headers, "Idempotency-Key": "native-password-profile-0001"},
+            "/desktop/v2/profiles",
+            headers={
+                **session_headers,
+                "X-OpenEvo-Resource-Generation": "1",
+                "Idempotency-Key": "native-password-profile-0001",
+            },
             json={
-                "name": "Password server",
-                "host": "compute.example.org",
-                "port": 22,
-                "user": "researcher",
+                "schema_version": "2",
+                "display_name": "Password server",
+                "connection_authority": "system_openssh",
+                "ssh_host_alias": "compute.example.org",
                 "authentication_kind": "native_password",
             },
         )
@@ -773,9 +819,10 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
         ),
         source_commit="89baeb26",
         build_channel="test",
+        **_v2_launcher_resources(tmp_path),
     )
     request = {
-        "schema_version": "1",
+        "schema_version": "2",
         "kind": "native_folder_snapshot",
         "action_id": "native-source-action-0001",
         "selected_path": str(source_root.resolve()),
@@ -837,36 +884,32 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
         assert "selected_path" not in imported.text
         assert "/openevo-native/workspace-imports" not in client.get("/openapi.json").text
 
-        profile = client.post(
-            "/desktop/v1/profiles",
-            headers={**session_headers, "Idempotency-Key": "create-profile-action-0001"},
-            json={
-                "name": "Research server",
-                "host": "compute.example.org",
-                "port": 22,
-                "user": "researcher",
-            },
+        reselected_payload = reselected.json()
+        bound_project_id = project_id_for_native_import(
+            imported.json()["source"]["import_ref"]["import_id"]
         )
-        assert profile.status_code == 201
-        project = client.post(
-            "/desktop/v1/projects",
-            headers={**session_headers, "Idempotency-Key": "create-project-action-0001"},
-            json={
-                "name": "Native research project",
-                "profile_id": profile.json()["profile_id"],
-                "task": {"title": "Analyse", "objective": "Analyse the imported results."},
-                "source": source,
-                "execution": {
-                    "mode": "codex_subscription_transcript",
-                    "codex_model": "gpt-5.3-codex-spark",
-                },
-                "evolution": {"targets": {}},
-            },
+        discard = {
+            "schema_version": "2",
+            "action_id": "native-source-action-0002",
+            "import_ref": reselected_payload["source"]["import_ref"],
+            "lease_token": reselected_payload["lease_token"],
+            "project_id": bound_project_id,
+        }
+        assert (
+            client.post(
+                "/openevo-native/workspace-imports/discard",
+                headers=handoff_headers,
+                json={**discard, "project_id": "another-project"},
+            ).status_code
+            == 409
         )
-
-        assert project.status_code == 201
-        assert project.json()["project_id"] == project_id_for_native_import(
-            source["import_ref"]["import_id"]
+        assert (
+            client.post(
+                "/openevo-native/workspace-imports/discard",
+                headers=handoff_headers,
+                json=discard,
+            ).status_code
+            == 204
         )
 
 
@@ -897,24 +940,26 @@ def test_create_app_launcher_rejects_invalid_source_commit(
         )
 
 
-def test_release_create_app_reports_last_fixed_startup_phase(
+def test_release_create_app_uses_v2_and_reports_last_fixed_startup_phase(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     canary = "Traceback /Users/private token=secret"
 
-    def fail_release_app(**kwargs: object) -> FastAPI:
+    def fail_release_v2_app(**kwargs: object) -> FastAPI:
         startup_phase = kwargs["startup_phase"]
         assert callable(startup_phase)
         assert kwargs["close_on_shutdown"] is False
-        startup_phase("core_bridge_store")
+        assert "readiness_key" not in kwargs
+        startup_phase("core_bridge_store_v2")
         raise RuntimeError(canary)
 
     monkeypatch.setattr(
         desktop_launcher,
-        "create_release_desktop_local_api_app",
-        fail_release_app,
+        "create_packaged_release_desktop_local_api_v2_app",
+        fail_release_v2_app,
     )
+    assert not hasattr(desktop_launcher, "create_release_desktop_local_api_app")
 
     with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
         create_app(
@@ -931,7 +976,7 @@ def test_release_create_app_reports_last_fixed_startup_phase(
             core_assets_root=tmp_path / "core-assets",
         )
 
-    assert exc_info.value.code == "core_bridge_store_failed"
+    assert exc_info.value.code == "core_bridge_store_v2_failed"
     assert canary not in str(exc_info.value)
     assert canary not in repr(exc_info.value)
 
@@ -949,7 +994,7 @@ def test_non_release_create_app_keeps_asgi_shutdown_ownership(
 
     monkeypatch.setattr(
         desktop_launcher,
-        "create_release_desktop_local_api_app",
+        "create_packaged_release_desktop_local_api_v2_app",
         create_release_app,
     )
     monkeypatch.setattr(
@@ -1026,6 +1071,78 @@ def test_packaged_launcher_reports_server_import_phase(
 
     assert exc_info.value.code == "server_import_failed"
     assert canary not in str(exc_info.value)
+
+
+def test_packaged_launcher_prefers_native_final_askpass_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _ClosingProvider()
+    app = _app_with_provider(provider)
+    captured: dict[str, object] = {}
+    listener = SimpleNamespace(
+        set_inheritable=lambda _value: None,
+        setblocking=lambda _value: None,
+        close=lambda: None,
+    )
+
+    class FakeServer:
+        started = True
+
+        def __init__(self, _config: object) -> None:
+            pass
+
+        def run(self, *, sockets: list[object]) -> None:
+            assert sockets == [listener]
+
+    def capture_create_app(**kwargs: object) -> FastAPI:
+        captured.update(kwargs)
+        return app
+
+    monkeypatch.setitem(
+        sys.modules,
+        "uvicorn",
+        SimpleNamespace(
+            Config=lambda *_args, **_kwargs: object(),
+            Server=FakeServer,
+        ),
+    )
+    monkeypatch.setattr(desktop_launcher, "create_app", capture_create_app)
+    monkeypatch.setattr(
+        desktop_launcher,
+        "_read_native_instance_frame",
+        lambda: desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+    )
+    monkeypatch.setattr(desktop_launcher.socket, "socket", lambda **_: listener)
+
+    result = desktop_launcher.main(
+        [
+            "--listener-fd",
+            "3",
+            "--native-instance-stdin",
+            "--ssh-askpass-helper-path",
+            "/final/app/openevo-ssh-askpass",
+            "--ssh-askpass-helper-sha256",
+            "b" * 64,
+            "--ssh-askpass-helper-byte-size",
+            "588064",
+        ],
+        packaged_source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        packaged_askpass_helper_sha256="a" * 64,
+        packaged_askpass_helper_byte_size=588512,
+    )
+
+    assert result == 0
+    assert captured["packaged_askpass_helper_path"] == Path(
+        "/final/app/openevo-ssh-askpass"
+    )
+    assert captured["packaged_askpass_helper_sha256"] == "b" * 64
+    assert captured["packaged_askpass_helper_byte_size"] == 588064
+    assert provider.close_calls == 1
 
 
 class _ClosingProvider:
@@ -1215,7 +1332,7 @@ def test_release_static_app_failure_closes_started_provider(
     app = _app_with_provider(provider)
     monkeypatch.setattr(
         desktop_launcher,
-        "create_release_desktop_local_api_app",
+        "create_packaged_release_desktop_local_api_v2_app",
         lambda **_: app,
     )
     monkeypatch.setattr(
@@ -1252,7 +1369,7 @@ def test_release_native_route_failure_closes_started_provider(
     del provider.workspace_import_store
     monkeypatch.setattr(
         desktop_launcher,
-        "create_release_desktop_local_api_app",
+        "create_packaged_release_desktop_local_api_v2_app",
         lambda **_: app,
     )
 
