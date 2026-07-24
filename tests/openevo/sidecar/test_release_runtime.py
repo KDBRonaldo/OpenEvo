@@ -586,6 +586,7 @@ class _ProfileConnectorAdapterV2:
         self.health = health
         self.requests: list[httpx.Request] = []
         self.closed: list[str] = []
+        self.ensure_deadlines: list[float] = []
 
     def ensure_core(
         self,
@@ -595,6 +596,7 @@ class _ProfileConnectorAdapterV2:
         deadline: float,
     ) -> CoreHostAttachmentV2:
         assert deadline > time.monotonic()
+        self.ensure_deadlines.append(deadline)
         return CoreHostAttachmentV2(
             profile_id=profile_id,
             profile_connection_generation=profile_connection_generation,
@@ -659,6 +661,17 @@ def test_v2_profile_connector_negotiates_then_closes_its_temporary_tunnel() -> N
     assert "authorization" not in adapter.requests[1].headers
     assert adapter.requests[2].headers["authorization"] == f"Bearer {CORE_V2_TOKEN}"
     assert len(adapter.closed) == 1
+
+
+def test_v2_profile_connector_default_deadline_covers_managed_runtime_install() -> None:
+    adapter = _ProfileConnectorAdapterV2()
+    connector = release_runtime.DesktopCoreProfileConnectorV2(adapter)
+    before = time.monotonic()
+
+    connector.connect_profile("profile-1", 3)
+
+    assert len(adapter.ensure_deadlines) == 1
+    assert adapter.ensure_deadlines[0] - before >= 899.0
 
 
 def test_v2_profile_connector_refuses_degraded_daemon_readiness() -> None:
@@ -960,6 +973,7 @@ def test_release_app_composes_full_remote_feature_surface(tmp_path: Path) -> Non
         instance_id="1" * 32,
         readiness_key=b"r" * 32,
         source_commit=SOURCE_COMMIT,
+        build_version="0.1.8",
         build_channel="test",
         core_assets_root=assets,
     )

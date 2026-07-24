@@ -99,7 +99,9 @@ export const IF_MATCH_HEADER = "If-Match";
 export const LAST_EVENT_ID_HEADER = "Last-Event-ID";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS = 330_000;
+// The sidecar allows first-connect Daemon/runtime preparation to consume 15 minutes.
+// Keep a bounded HTTP margin so that its typed terminal error reaches the renderer.
+const REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS = 930_000;
 const MAX_RESPONSE_BYTES = 1_048_576;
 
 export type FetchLikeV2 = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;

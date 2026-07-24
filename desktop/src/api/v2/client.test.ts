@@ -180,6 +180,41 @@ describe("Desktop Local API v2 client", () => {
     }
   });
 
+  it("keeps first-connect bootstrap alive for the managed runtime install window", async () => {
+    vi.useFakeTimers();
+    try {
+      let observedSignal: AbortSignal | undefined;
+      const fetch = vi.fn<FetchLikeV2>((_input, init) => {
+        observedSignal = init?.signal ?? undefined;
+        return new Promise<Response>(() => undefined);
+      });
+      const client = createDesktopApiClientV2({
+        fetch,
+        bootstrap: async () => bootstrap(),
+        contract,
+        requestTimeoutMs: 25,
+      });
+
+      const pending = client.connectProfile("profile-lab", {
+        schema_version: "2",
+        expected_connection_generation: 4,
+      }, {
+        resourceGeneration: 4,
+        ifMatch: `"${"b".repeat(64)}"`,
+        idempotencyKey: "connect-profile-runtime-window-0001",
+      });
+      void pending.catch(() => undefined);
+      await vi.advanceTimersByTimeAsync(900_000);
+
+      expect(observedSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(observedSignal?.aborted).toBe(true);
+      await expect(pending).rejects.toThrow("Desktop Local API request timed out");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("retains the short bounded deadline for ordinary Local API reads", async () => {
     vi.useFakeTimers();
     try {

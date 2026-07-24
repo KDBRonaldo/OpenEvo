@@ -11,6 +11,7 @@ import pytest
 
 from desktop.sidecar.askpass_broker import AskpassPromptObservation
 from desktop.sidecar.contracts.v2 import models as local_v2
+from desktop.sidecar.core_bridge_v2 import DesktopCoreBridgeErrorV2
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
@@ -192,6 +193,7 @@ class _CoreConnector:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
         self.version = _core_version()
+        self.failure: DesktopCoreBridgeErrorV2 | None = None
 
     def connect_profile(
         self,
@@ -199,6 +201,8 @@ class _CoreConnector:
         profile_connection_generation: int,
     ) -> core_v2.VersionResponseV2:
         self.calls.append((profile_id, profile_connection_generation))
+        if self.failure is not None:
+            raise self.failure
         return self.version
 
     def close(self) -> None:
@@ -561,6 +565,61 @@ def test_profile_connect_uses_literal_alias_and_exact_generation(
         assert stale.status_code == 412
         assert stale.json()["code"] == "profile_generation_changed"
         assert lifecycle.calls == [("connect", "gpu-lab", 2)]
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_profile_connect_preserves_typed_daemon_bootstrap_failure(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, connector = _provider(tmp_path)
+    connector.failure = DesktopCoreBridgeErrorV2(
+        504,
+        local_v2.DesktopErrorV2(
+            code="daemon_bootstrap_timeout",
+            summary="The OpenEvo Daemon operation exceeded its deadline.",
+            retryable=True,
+            action="retry",
+            affected_resource_id=None,
+        ),
+    )
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        response = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        profile["connection_generation"]
+                    ),
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-profile-daemon-timeout-01",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": profile["connection_generation"],
+            },
+        )
+
+        assert response.status_code == 504, response.text
+        assert response.json() == {
+            "schema_version": "2",
+            "code": "daemon_bootstrap_timeout",
+            "summary": "The OpenEvo Daemon operation exceeded its deadline.",
+            "retryable": True,
+            "action": "retry",
+            "affected_resource_id": profile["profile_id"],
+        }
+        failed = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert failed["connection_state"] == "failed"
+        assert failed["failure"]["code"] == "daemon_bootstrap_timeout"
+        assert lifecycle.active is None
     finally:
         client.close()
         provider.close()

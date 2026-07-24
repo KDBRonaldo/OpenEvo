@@ -269,7 +269,7 @@ class DesktopCoreProfileConnectorV2:
         self,
         adapter: _DeferredCoreSshBridgeAdapterV2 | DesktopCoreSshBridgeAdapterV2,
         *,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = _RELEASE_ACTIVATION_TIMEOUT_SECONDS,
     ) -> None:
         if any(
             not callable(getattr(adapter, method, None))

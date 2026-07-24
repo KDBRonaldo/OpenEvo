@@ -20,7 +20,10 @@ from pydantic import BaseModel
 from desktop.sidecar.askpass_broker import AskpassPromptObservation
 from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar.contracts.v2 import models as local_v2
-from desktop.sidecar.core_bridge_v2 import CoreProjectMappingV2
+from desktop.sidecar.core_bridge_v2 import (
+    CoreProjectMappingV2,
+    DesktopCoreBridgeErrorV2,
+)
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
 from desktop.sidecar.release_capabilities import (
@@ -682,6 +685,8 @@ class DesktopReleaseProviderV2:
             )
             self._publish_profile(failed)
             raise
+        except DesktopCoreBridgeErrorV2 as exc:
+            raise self._fail_profile_core_connect(started, exc) from None
         except Exception:
             raise self._fail_profile_connect(
                 started,
@@ -797,6 +802,8 @@ class DesktopReleaseProviderV2:
             )
             self._publish_profile(failed)
             raise
+        except DesktopCoreBridgeErrorV2 as exc:
+            raise self._fail_profile_core_connect(started, exc) from None
         except Exception:
             raise self._fail_profile_connect(
                 started,
@@ -1845,6 +1852,31 @@ class DesktopReleaseProviderV2:
         )
         self._publish_profile(failed)
         return DesktopReleaseProviderV2Error(503, error)
+
+    def _fail_profile_core_connect(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        failure: DesktopCoreBridgeErrorV2,
+    ) -> DesktopReleaseProviderV2Error:
+        error = failure.error
+        if error.affected_resource_id not in {None, profile.profile_id}:
+            return self._fail_profile_connect(
+                profile,
+                "core_connection_failed",
+                abort_transport=True,
+            )
+        if error.affected_resource_id is None:
+            error = error.model_copy(
+                update={"affected_resource_id": profile.profile_id}
+            )
+        self._abort_profile_transport(profile)
+        failed = self._store.fail_profile_connection(
+            profile.profile_id,
+            connection_generation=profile.connection_generation,
+            failure=error,
+        )
+        self._publish_profile(failed)
+        return DesktopReleaseProviderV2Error(failure.status_code, error)
 
     def _abort_profile_transport(
         self,
