@@ -106,6 +106,9 @@ because `ssh evolab` previously worked.
 As of this handoff, the remote container has the required first-release profile:
 
 - Linux `x86_64` in a Docker user container;
+- an SSH account that may resolve to UID 0 inside that existing user container, as
+  permitted by the canonical `docker_user_container_v1` boundary; this does not
+  permit bare-host root SSH or additional privilege elevation;
 - a working Docker CLI and mounted Docker Engine socket;
 - Codex installed and an existing subscription authentication file under the
   remote account;

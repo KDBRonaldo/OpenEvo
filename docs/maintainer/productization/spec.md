@@ -599,7 +599,11 @@ not optional polish.
 One remote operating-system user has one OpenEvo Daemon. Projects are resources
 inside that Daemon, not separate daemon installations.
 
-The Daemon runs without root privileges and owns:
+The Daemon runs as the exact SSH account and never performs privilege elevation. For
+`docker_user_container_v1`, that account MAY be UID 0 inside an already provisioned
+Docker user container. This allowance does not make bare-host root SSH, privileged
+container setup, `sudo`, host-namespace entry, or host infrastructure mutation a
+supported path. Within that fixed account/container boundary, the Daemon owns:
 
 - the versioned control API;
 - project, task, run, event, and revision state;
