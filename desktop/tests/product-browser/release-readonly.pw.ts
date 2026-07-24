@@ -7,16 +7,17 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 
 const DESKTOP_ENDPOINT = "http://127.0.0.1:43117";
 const DESKTOP_SESSION_TOKEN = "release-readonly-session-token-000000000001";
-const OPENAPI_SHA256 = "26ee1e2b6b25f3297c5c09544a9a10ce95baae233ac4b3de2dc0f72cc32ad3cb";
+const OPENAPI_SHA256 = "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
+const EVENT_SCHEMA_SHA256 = "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
+const FEATURE_SET_SHA256 = "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
 const FEATURE_FLAGS = [
-  "remote_profiles",
-  "project_validation",
-  "operation_events",
-  "run_observability",
-  "artifact_inspection",
-  "service_control",
-  "diagnostics",
-  "maintenance",
+  "core_control_v2",
+  "daemon_bundle_v2",
+  "event_replay_v2",
+  "host_key_review",
+  "native_askpass",
+  "system_openssh_profiles",
+  "task_admission_v2",
 ] as const;
 const DESKTOP_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 const EXPECTED_PROJECTS = new Set([
@@ -60,10 +61,7 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
     "data-provider-kind",
     "desktop_sidecar",
   );
-  await expect(page.locator(".product-shell")).toHaveAttribute(
-    "data-system-maintenance-available",
-    "true",
-  );
+  await expect(page.locator(".product-shell")).toHaveAttribute("data-api-version", "2");
   await expect(page.getByText("Demo", { exact: true }).first()).toBeVisible();
   await expect(page.getByText("Demo data · 12 observations", { exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("contract_simulator");
@@ -74,9 +72,12 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   await expect(addRemoteWorkspace).toBeVisible();
   await expect(addRemoteWorkspace).toHaveClass(/primary-button/);
   await addRemoteWorkspace.click();
-  await expect(page.getByRole("dialog", { name: "Server connection" })).toBeVisible();
-  await page.getByRole("button", { name: "Close connection settings", exact: true }).click();
-  await expect(page.getByRole("dialog", { name: "Server connection" })).toBeHidden();
+  const remoteDialog = page.getByRole("dialog", { name: "Configured SSH host" });
+  await expect(remoteDialog).toBeVisible();
+  await expect(remoteDialog.locator("select")).toHaveValue("gpu-lab");
+  await expect(remoteDialog).not.toContainText(/server address|user name|private key|password/i);
+  await page.getByRole("button", { name: "Close remote workspace setup", exact: true }).click();
+  await expect(remoteDialog).toBeHidden();
   const projectSelector = page.getByLabel("Project", { exact: true });
   await expect(projectSelector.locator("option")).toHaveCount(2);
   await projectSelector.selectOption({ label: "[Demo] Protein Stability Evidence Review" });
@@ -174,9 +175,10 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   expect(externalNetworkCalls).toEqual([]);
   expect(sidecarObservation.httpCalls).toEqual(expect.arrayContaining([
     { method: "GET", path: "/version", authenticated: false },
-    { method: "GET", path: "/desktop/v1/state", authenticated: true },
-    { method: "GET", path: "/desktop/v1/profiles?limit=100", authenticated: true },
-    { method: "GET", path: "/desktop/v1/projects?limit=100", authenticated: true },
+    { method: "GET", path: "/desktop/v2/state", authenticated: true },
+    { method: "GET", path: "/desktop/v2/ssh-hosts", authenticated: true },
+    { method: "GET", path: "/desktop/v2/profiles?limit=100", authenticated: true },
+    { method: "GET", path: "/desktop/v2/events", authenticated: true },
   ]));
   expect(sidecarObservation.httpCalls.every(({ method }) => method === "GET")).toBe(true);
   expect(connectedObservation.nativeCalls.some(({ command }) => command === "start_sidecar")).toBe(true);
@@ -184,7 +186,6 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   expect(connectedObservation.nativeCalls.every(({ command }) => [
     "start_sidecar",
     "stop_sidecar",
-    "read_run_retry_recovery",
     "renderer_bootstrap_stage",
     "renderer_ready",
   ].includes(command))).toBe(true);
@@ -312,13 +313,11 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
         invoke: async (command: string, args: Record<string, unknown> = {}) => {
           observation.nativeCalls.push({ command, args });
           if (command === "stop_sidecar") return null;
-          if (command === "read_run_retry_recovery") return null;
           if (command === "renderer_bootstrap_stage") {
             const allowedStages = new Set([
               "bootstrap_context_validated",
               "bootstrap_context_failed",
               "local_api_version_verified",
-              "retry_recovery_ready",
               "provider_adapter_ready",
               "provider_created",
               "provider_create_failed",
@@ -331,7 +330,11 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
             return null;
           }
           if (command === "renderer_ready") {
-            if (args.openapiSha256 !== contract.openapiSha256) {
+            if (
+              args.openapiSha256 !== contract.openapiSha256
+              || args.eventSchemaSha256 !== contract.eventSchemaSha256
+              || args.releaseVersion !== "0.1.9"
+            ) {
               observation.unexpectedCalls.push("renderer_ready digest");
               throw new Error("Renderer readiness digest mismatch");
             }
@@ -342,14 +345,23 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
               throw new Error("Native sidecar readiness failed");
             }
             return {
-              schema_version: "1",
+              schema_version: "2",
               endpoint: contract.endpoint,
               session_token: contract.sessionToken,
               negotiated_contract: {
-                major: 1,
+                major: 2,
+                mutation_major: 2,
                 openapi_sha256: contract.openapiSha256,
+                event_schema_sha256: contract.eventSchemaSha256,
+                release_version: "0.1.9",
+                build_id: "a".repeat(64),
+                source_commit: "abcdef1",
                 provider_kind: "desktop_sidecar",
+                build_channel: "release",
                 feature_flags: contract.featureFlags,
+                feature_set_sha256: contract.featureSetSha256,
+                required_core_api_major: 2,
+                mutation_compatible: true,
               },
             };
           }
@@ -362,6 +374,8 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
     endpoint: DESKTOP_ENDPOINT,
     sessionToken: DESKTOP_SESSION_TOKEN,
     openapiSha256: OPENAPI_SHA256,
+    eventSchemaSha256: EVENT_SCHEMA_SHA256,
+    featureSetSha256: FEATURE_SET_SHA256,
     featureFlags: [...FEATURE_FLAGS],
   });
 }
@@ -385,36 +399,42 @@ async function installReleaseSidecarContract(
         return rejectUnexpectedRoute(route, observation, "authenticated /version");
       }
       return json(route, {
-        schema_version: "1",
+        schema_version: "2",
         api_name: "openevo-desktop-local-api",
-        preferred_major: 1,
-        supported_majors: [1],
+        preferred_major: 2,
+        supported_majors: [2],
+        mutation_major: 2,
         openapi_sha256: OPENAPI_SHA256,
-        build_version: "0.1.2",
-        source_commit: "abcdef12",
+        event_schema_sha256: EVENT_SCHEMA_SHA256,
+        release_version: "0.1.9",
+        build_id: "a".repeat(64),
+        source_commit: "abcdef1",
         build_channel: "release",
         provider_kind: "desktop_sidecar",
         feature_flags: [...FEATURE_FLAGS],
+        feature_set_sha256: FEATURE_SET_SHA256,
+        required_core_api_major: 2,
+        mutation_compatible: true,
       });
     }
     if (!authenticated) {
       return rejectUnexpectedRoute(route, observation, `unauthenticated ${path}`);
     }
-    if (path === "/desktop/v1/state") {
+    if (path === "/desktop/v2/state") {
       return json(route, disconnectedDesktopState());
     }
-    if (
-      path === "/desktop/v1/profiles?limit=100"
-      || path === "/desktop/v1/projects?limit=100"
-    ) {
+    if (path === "/desktop/v2/ssh-hosts") {
+      return json(route, configuredSshHosts());
+    }
+    if (path === "/desktop/v2/profiles?limit=100") {
       return json(route, {
-        schema_version: "1",
+        schema_version: "2",
         items: [],
         next_cursor: null,
         has_more: false,
       });
     }
-    if (path === "/desktop/v1/events") {
+    if (path === "/desktop/v2/events") {
       return route.fulfill({
         status: 200,
         contentType: "text/event-stream",
@@ -427,44 +447,27 @@ async function installReleaseSidecarContract(
 
 function disconnectedDesktopState() {
   return {
-    schema_version: "1",
-    observed_at: "2026-07-19T12:00:00Z",
-    contract: {
-      selected_major: 1,
-      desktop_openapi_sha256: OPENAPI_SHA256,
-      core_openapi_sha256: null,
-      compatible: true,
-    },
-    execution_mode_capabilities: {
-      schema_version: "1",
-      modes: [
-        {
-          mode: "codex_subscription_transcript",
-          display_name: "Subscription",
-          support_state: "supported",
-          reason_code: null,
-          message: "Available in this OpenEvo Desktop release.",
-        },
-        {
-          mode: "self-deployed",
-          display_name: "Self-deployed",
-          support_state: "unavailable",
-          reason_code: "self_deployed_release_unavailable",
-          message: "Self-deployed execution is unavailable in this release.",
-        },
-      ],
-    },
-    core: {
-      state: "disconnected",
-      profile_id: null,
-      active_tunnel: false,
-      operation_id: null,
-      host_key_review: null,
-      core: null,
-      failure: null,
-    },
-    active_project: null,
-    pending_operation_ids: [],
+    schema_version: "2",
+    profiles: [],
+    active_profile_id: null,
+    active_project_id: null,
+    last_event_id: null,
+    updated_at: "2026-07-19T12:00:00Z",
+  };
+}
+
+function configuredSshHosts() {
+  return {
+    schema_version: "2",
+    catalog_generation: 1,
+    hosts: [{
+      schema_version: "2",
+      ssh_host_alias: "gpu-lab",
+      availability: "selectable",
+      source_kind: "literal_host",
+    }],
+    warnings: [],
+    scanned_at: "2026-07-19T12:00:00Z",
   };
 }
 

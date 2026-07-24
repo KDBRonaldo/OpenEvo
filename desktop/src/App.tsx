@@ -20,6 +20,10 @@ import {
   DesktopApiError,
   DesktopContractError,
 } from "./api/v1/client";
+import {
+  DesktopApiErrorV2,
+  DesktopContractErrorV2,
+} from "./api/v2/client";
 import { Dashboard } from "./routes/Dashboard";
 import { TasksList } from "./routes/TasksList";
 import { TaskDetail } from "./routes/TaskDetail";
@@ -29,6 +33,7 @@ import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { OpenEvoMark } from "./components/OpenEvoMark";
 import { DesktopProductApp } from "./product/DesktopProductApp";
+import { DesktopProductAppV2 } from "./product/DesktopProductAppV2";
 import { SampleScientificProjectView } from "./product/ScientificProjectSample";
 import {
   SAMPLE_SCIENTIFIC_PROJECT,
@@ -37,6 +42,10 @@ import {
   type SampleScientificProjectId,
 } from "./product/scientificProjectSampleData";
 import type { DesktopProductProvider } from "./product/provider";
+import {
+  isDesktopProductProviderV2,
+  type DesktopProductProviderV2,
+} from "./product/providerV2";
 import {
   createReleaseDesktopProductProvider,
   reportReleaseDesktopBootstrapStage,
@@ -53,6 +62,8 @@ import {
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
+
+type DesktopProductProviderAny = DesktopProductProvider | DesktopProductProviderV2;
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -174,7 +185,7 @@ export function OpenEvoDesktopOnlyShell({
   openConnectionSettings = false,
   onConnectionSettingsOpened,
 }: {
-  provider?: DesktopProductProvider;
+  provider?: DesktopProductProviderAny;
   onInitialSnapshotFailed?: (error: unknown) => void;
   onReady?: () => void;
   openConnectionSettings?: boolean;
@@ -185,20 +196,30 @@ export function OpenEvoDesktopOnlyShell({
       <Route
         path="*"
         element={(
-          <DesktopProductApp
-            provider={provider}
-            onInitialSnapshotFailed={onInitialSnapshotFailed}
-            onReady={onReady}
-            openConnectionSettings={openConnectionSettings}
-            onConnectionSettingsOpened={onConnectionSettingsOpened}
-          />
+          provider && isDesktopProductProviderV2(provider) ? (
+            <DesktopProductAppV2
+              provider={provider}
+              onInitialSnapshotFailed={onInitialSnapshotFailed}
+              onReady={onReady}
+              openConnectionSettings={openConnectionSettings}
+              onConnectionSettingsOpened={onConnectionSettingsOpened}
+            />
+          ) : (
+            <DesktopProductApp
+              provider={provider}
+              onInitialSnapshotFailed={onInitialSnapshotFailed}
+              onReady={onReady}
+              openConnectionSettings={openConnectionSettings}
+              onConnectionSettingsOpened={onConnectionSettingsOpened}
+            />
+          )
         )}
       />
     </Routes>
   );
 }
 
-export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly?: boolean; productProvider?: DesktopProductProvider }) {
+export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly?: boolean; productProvider?: DesktopProductProviderAny }) {
   return desktopOnly ? <OpenEvoDesktopOnlyShell provider={productProvider} /> : <SharedDashboardShell />;
 }
 
@@ -206,10 +227,10 @@ type ReleaseDesktopStartupState =
   | { readonly status: "loading"; readonly retrying: boolean }
   | {
       readonly status: "committing";
-      readonly provider: DesktopProductProvider;
+      readonly provider: DesktopProductProviderAny;
       readonly generation: number;
     }
-  | { readonly status: "ready"; readonly provider: DesktopProductProvider }
+  | { readonly status: "ready"; readonly provider: DesktopProductProviderAny }
   | {
       readonly status: "failed";
       readonly stage: "bootstrap" | "readiness";
@@ -246,7 +267,7 @@ function safeNativeHostFailure(error: unknown): ReleaseDesktopStartupFailure | n
 }
 
 function safeStartupFailure(error: unknown): ReleaseDesktopStartupFailure {
-  if (error instanceof DesktopApiError) {
+  if (error instanceof DesktopApiError || error instanceof DesktopApiErrorV2) {
     return {
       message: "The local OpenEvo Desktop service reported a startup error.",
       nextAction: error.apiError.retryable
@@ -254,7 +275,9 @@ function safeStartupFailure(error: unknown): ReleaseDesktopStartupFailure {
         : "Restart OpenEvo Desktop. If the problem continues, install the latest version.",
     };
   }
-  if (error instanceof DesktopContractError || error instanceof ContractVersionUnsupportedError) {
+  if (error instanceof DesktopContractError
+    || error instanceof ContractVersionUnsupportedError
+    || error instanceof DesktopContractErrorV2) {
     return {
       message: error.message,
       nextAction: "Retry startup. If the problem continues, update OpenEvo Desktop.",
@@ -544,7 +567,7 @@ export function ReleaseDesktopProductShell({
   reportStage = reportReleaseDesktopBootstrapStage,
   reportReady = reportReleaseDesktopReady,
 }: {
-  createProvider?: () => Promise<DesktopProductProvider>;
+  createProvider?: () => Promise<DesktopProductProviderAny>;
   stopProvider?: () => Promise<void>;
   reportStage?: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void;
   reportReady?: () => Promise<void>;
@@ -589,7 +612,7 @@ export function ReleaseDesktopProductShell({
         // credential from the Tauri host.
         await stopProvider();
         if (generation.current !== requestGeneration) return;
-        let provider: DesktopProductProvider;
+        let provider: DesktopProductProviderAny;
         try {
           provider = await createProvider();
         } catch (error) {
@@ -623,7 +646,7 @@ export function ReleaseDesktopProductShell({
 
   const reportCommittedProduct = useCallback((
     committingGeneration: number,
-    provider: DesktopProductProvider,
+    provider: DesktopProductProviderAny,
   ) => {
     if (readinessGeneration.current === committingGeneration) return;
     readinessGeneration.current = committingGeneration;

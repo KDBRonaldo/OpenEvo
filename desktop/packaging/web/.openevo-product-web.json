@@ -1,16 +1,16 @@
 {
   "schema_version": "1",
-  "build_digest": "a687f075461d493654b0aef63e4fbc5271c523c7011416b0c19276953eb12983",
+  "build_digest": "b2235e05c193030869b272b75fc7d7c5d24962d97c04b03219c85c47ca581e79",
   "files": [
     {
-      "path": "assets/index-CVEbJZtS.js",
-      "sha256": "024906bdac1ccd2cf8cc77de5b8bb5e976738073f884c35b4195364b8edf6657",
-      "byte_size": 575061
+      "path": "assets/index-Cnn3sAAH.css",
+      "sha256": "226cbcb5bcc842414b83bacd258b9d51c929f9200177707ea88ffb88a49e44e4",
+      "byte_size": 79469
     },
     {
-      "path": "assets/index-DFBuDlR9.css",
-      "sha256": "eac98257d8a45f6cf3b9c9830ae53ecd72fb96f283d0a49d2384875543af5f81",
-      "byte_size": 71816
+      "path": "assets/index-Dz77ynUe.js",
+      "sha256": "9b2b7116f1cc6eed75c3265c8e9e9c9320c24d6e347710dffb763f50e6a24ae5",
+      "byte_size": 627263
     },
     {
       "path": "assets/openevo-favicon-o9ipb8cw.svg",
@@ -19,7 +19,7 @@
     },
     {
       "path": "index.html",
-      "sha256": "d5422961139614af2ddb20ee5cc38fbb8e1e85e60bf3fb3bf28f8eace0435207",
+      "sha256": "fde8475a0ad6861d20cc3fdf1ecc08e99b00378ac5208d95de333275b939aad4",
       "byte_size": 524
     }
   ]
