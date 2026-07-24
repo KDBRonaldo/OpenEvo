@@ -620,6 +620,43 @@ def test_explicit_context_artifact_ids_remain_a_strict_allowlist(
     assert empty_response.selection.artifact_ids == ()
 
 
+def test_explicit_context_artifact_ids_preserve_revision_order(
+    artifact_root: Path,
+    executable_registry,
+) -> None:
+    memory = _memory(artifact_root, "memory-explicit", "remember", 0.9)
+    skill = _skill(artifact_root, "skill-explicit", 0.8)
+    agent_system = _agent_system(
+        artifact_root,
+        "agent-system-explicit",
+        "Apply the evolved procedure.",
+        0.7,
+    )
+    requested_order = (
+        "agent-system-explicit",
+        "skill-explicit",
+        "memory-explicit",
+    )
+    payload = _request().model_dump(mode="json")
+    payload["metadata"]["evolution"] = {"context_artifact_ids": list(requested_order)}
+    Request, Resolver = _projection_types()
+
+    response = Resolver(artifact_root, executable_registry).resolve(
+        Request.model_validate(payload),
+        [memory, skill, agent_system],
+        context_id="ctx-explicit-revision-order",
+    )
+
+    assert response.selection.artifact_ids == requested_order
+    assert {
+        projection.target_id: projection.artifact_ids for projection in response.projections
+    } == {
+        "agent_system": ("agent-system-explicit",),
+        "skill_bundle": ("skill-explicit",),
+        "text_memory": ("memory-explicit",),
+    }
+
+
 @pytest.mark.parametrize(
     "auth_mode",
     ["subscription", "chatgpt_subscription", "claude_subscription"],

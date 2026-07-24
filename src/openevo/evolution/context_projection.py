@@ -20,7 +20,7 @@ from openevo.evolution.context import (
     artifact_matches,
     artifact_scores,
     request_auth_mode,
-    requested_context_artifact_ids,
+    requested_context_artifact_order,
     sort_candidates,
 )
 from openevo.evolution.framework.builtins import (
@@ -495,7 +495,8 @@ class ContextProjectionResolver:
         agent_harness = request.agent.harness
         if agent_harness != request.execution_profile.harness_id:
             raise ValueError("context execution profile does not match agent harness")
-        requested_ids = requested_context_artifact_ids(compatibility_facts)
+        requested_order = requested_context_artifact_order(compatibility_facts)
+        requested_ids = None if requested_order is None else set(requested_order)
         compatible_rows: list[dict[str, object]] = []
         pre_skipped_rows: list[dict[str, object]] = []
         pre_skipped_reasons: dict[str, str] = {}
@@ -546,7 +547,15 @@ class ContextProjectionResolver:
                 pre_skipped_reasons[artifact_id] = "metadata_policy_rejected"
                 continue
             compatible_rows.append(candidate)
-        ranked_rows = sort_candidates(compatible_rows)
+        if requested_order is None:
+            ranked_rows = sort_candidates(compatible_rows)
+        else:
+            compatible_by_id = {str(row["artifact_id"]): row for row in compatible_rows}
+            ranked_rows = [
+                compatible_by_id[artifact_id]
+                for artifact_id in requested_order
+                if artifact_id in compatible_by_id
+            ]
         pairs: list[tuple[TargetHandlerInput, TargetHandlerOutput]] = []
         skipped_reasons = dict(pre_skipped_reasons)
         targets = sorted(
