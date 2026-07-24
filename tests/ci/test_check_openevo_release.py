@@ -3609,6 +3609,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
             "minWidth": 760,
             "minHeight": 600,
             "incognito": True,
+            "backgroundThrottling": "disabled",
         }
     ]
     assert config["build"]["beforeBuildCommand"] == "npm run build:openevo"
