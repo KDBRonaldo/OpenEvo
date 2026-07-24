@@ -5,6 +5,7 @@ import hashlib
 import os
 from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -386,3 +387,88 @@ def test_legacy_database_replacement_during_scan_is_detected_without_import(
         assert v2.list_profiles() == ()
     finally:
         v2.close()
+
+
+def test_legacy_binding_accepts_sqlite_canonical_managed_path(tmp_path: Path) -> None:
+    root = tmp_path / "state-v2"
+    _build_legacy_state(root)
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    database_fd = os.open(
+        "provider.sqlite3",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=root_fd,
+    )
+    try:
+        root_stat = os.fstat(root_fd)
+        database_stat = os.fstat(database_fd)
+        lock_stat = os.stat(
+            "provider.lock",
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        LegacyV1Importer(root)._verify_binding(
+            root_fd,
+            root_identity=(root_stat.st_dev, root_stat.st_ino),
+            database_identity=(database_stat.st_dev, database_stat.st_ino),
+            lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+            database_descriptor=database_fd,
+            sqlite_path=str(root / "provider.sqlite3"),
+        )
+    finally:
+        os.close(database_fd)
+        os.close(root_fd)
+
+
+def test_legacy_binding_rejects_managed_path_on_different_device(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "state-v2"
+    _build_legacy_state(root)
+    root_fd = os.open(
+        root,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    )
+    database_fd = os.open(
+        "provider.sqlite3",
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=root_fd,
+    )
+    real_stat = os.stat
+    managed_path = str(root / "provider.sqlite3")
+
+    def spoof_managed_path_device(path, *args, **kwargs):
+        observed = real_stat(path, *args, **kwargs)
+        if path == managed_path and kwargs.get("follow_symlinks") is False:
+            return SimpleNamespace(
+                st_dev=observed.st_dev + 1,
+                st_ino=observed.st_ino,
+                st_size=observed.st_size,
+                st_mode=observed.st_mode,
+            )
+        return observed
+
+    try:
+        root_stat = os.fstat(root_fd)
+        database_stat = os.fstat(database_fd)
+        lock_stat = os.stat(
+            "provider.lock",
+            dir_fd=root_fd,
+            follow_symlinks=False,
+        )
+        monkeypatch.setattr(legacy_module.os, "stat", spoof_managed_path_device)
+        with pytest.raises(legacy_module._LegacyUnavailable, match="legacy_store_replaced"):
+            LegacyV1Importer(root)._verify_binding(
+                root_fd,
+                root_identity=(root_stat.st_dev, root_stat.st_ino),
+                database_identity=(database_stat.st_dev, database_stat.st_ino),
+                lock_identity=(lock_stat.st_dev, lock_stat.st_ino),
+                database_descriptor=database_fd,
+                sqlite_path=managed_path,
+            )
+    finally:
+        os.close(database_fd)
+        os.close(root_fd)

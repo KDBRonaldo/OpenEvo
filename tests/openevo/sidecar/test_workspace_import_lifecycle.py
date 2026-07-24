@@ -11,12 +11,10 @@ import pytest
 from desktop.server import launcher as desktop_launcher
 from desktop.sidecar import native_workspace as native_workspace_module
 from desktop.sidecar import workspace_imports as workspace_imports_module
-from desktop.sidecar.workspace_imports import WorkspaceImportIntegrityError
 
 
 SESSION_TOKEN = "7c" * 32
 HANDOFF_TOKEN = "8d" * 32
-SESSION_HEADERS = {desktop_launcher.NATIVE_SESSION_HEADER: SESSION_TOKEN}
 HANDOFF_HEADERS = {desktop_launcher.NATIVE_HANDOFF_HEADER: HANDOFF_TOKEN}
 
 
@@ -36,6 +34,11 @@ def _static_root(root: Path) -> Path:
 
 
 def _app(config_root: Path, static_root: Path):
+    config_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    helper_path = config_root / "openevo-ssh-askpass"
+    helper_bytes = b"#!/bin/sh\nexit 1\n"
+    helper_path.write_bytes(helper_bytes)
+    helper_path.chmod(0o755)
     return desktop_launcher.create_app(
         static_root=static_root,
         desktop_config_root=config_root,
@@ -47,37 +50,11 @@ def _app(config_root: Path, static_root: Path):
         ),
         source_commit="89baeb26",
         build_channel="test",
+        core_assets_root=config_root / "deferred-core-assets",
+        packaged_askpass_helper_path=helper_path,
+        packaged_askpass_helper_sha256=hashlib.sha256(helper_bytes).hexdigest(),
+        packaged_askpass_helper_byte_size=len(helper_bytes),
     )
-
-
-def _create_profile(client: TestClient) -> dict[str, object]:
-    response = client.post(
-        "/desktop/v1/profiles",
-        headers={**SESSION_HEADERS, "Idempotency-Key": "profile-lifecycle-0001"},
-        json={
-            "name": "Research server",
-            "host": "compute.example.org",
-            "port": 22,
-            "user": "researcher",
-        },
-    )
-    assert response.status_code == 201
-    return response.json()
-
-
-def _import_source(
-    client: TestClient,
-    source_root: Path,
-    *,
-    action_id: str,
-    project_id: str | None = None,
-) -> dict[str, object]:
-    return _import_pending(
-        client,
-        source_root,
-        action_id=action_id,
-        project_id=project_id,
-    )["source"]
 
 
 def _import_pending(
@@ -95,10 +72,10 @@ def _import_pending(
         project_id=project_id,
         cancellation_token=cancellation_token,
     )
-    assert response.status_code == 201
+    assert response.status_code == 201, response.text
     payload = response.json()
     assert set(payload) == {"schema_version", "source", "lease_token"}
-    assert payload["schema_version"] == "1"
+    assert payload["schema_version"] == "2"
     assert isinstance(payload["source"], dict)
     assert isinstance(payload["lease_token"], str)
     return payload
@@ -114,7 +91,7 @@ def _import_response(
 ) -> HttpResponse:
     status = source_root.stat()
     request: dict[str, object] = {
-        "schema_version": "1",
+        "schema_version": "2",
         "kind": "native_folder_snapshot",
         "action_id": action_id,
         "selected_path": str(source_root.resolve()),
@@ -140,11 +117,10 @@ def _discard_pending(
 ) -> HttpResponse:
     source = pending["source"]
     assert isinstance(source, dict)
-    import_ref = source["import_ref"]
     request: dict[str, object] = {
-        "schema_version": "1",
+        "schema_version": "2",
         "action_id": action_id,
-        "import_ref": import_ref,
+        "import_ref": source["import_ref"],
         "lease_token": pending["lease_token"],
     }
     if project_id is not None:
@@ -166,49 +142,28 @@ def _cancel_import(
         "/openevo-native/workspace-imports/cancel",
         headers=HANDOFF_HEADERS,
         json={
-            "schema_version": "1",
+            "schema_version": "2",
             "action_id": action_id,
             "cancellation_token": cancellation_token or _cancellation_token(action_id),
         },
     )
 
 
-def _create_project(
-    client: TestClient,
-    profile_id: str,
-    source: dict[str, object],
-    *,
-    idempotency_key: str = "project-lifecycle-0001",
-    name: str = "Protein design",
-) -> dict[str, object]:
-    response = client.post(
-        "/desktop/v1/projects",
-        headers={**SESSION_HEADERS, "Idempotency-Key": idempotency_key},
-        json={
-            "name": name,
-            "profile_id": profile_id,
-            "task": {"title": "Design", "objective": "Improve held-out stability."},
-            "source": source,
-            "execution": {
-                "mode": "codex_subscription_transcript",
-                "codex_model": "gpt-5.3-codex-spark",
-            },
-            "evolution": {"targets": {}},
-        },
-    )
-    assert response.status_code == 201
-    return response.json()
+def _workspace_import_root(config_root: Path) -> Path:
+    return config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports-v2"
 
 
-def _import_directory(config_root: Path, source: dict[str, object]) -> Path:
+def _import_directory(config_root: Path, pending: dict[str, object]) -> Path:
+    source = pending["source"]
+    assert isinstance(source, dict)
     import_ref = source["import_ref"]
     assert isinstance(import_ref, dict)
     import_id = import_ref["import_id"]
     assert isinstance(import_id, str)
-    return config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports" / import_id
+    return _workspace_import_root(config_root) / import_id
 
 
-def test_picker_discard_and_failed_save_remove_pending_imports(tmp_path: Path) -> None:
+def test_picker_pending_import_requires_exact_explicit_discard(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     static_root = _static_root(tmp_path / "static")
     source_root = tmp_path / "research"
@@ -216,36 +171,22 @@ def test_picker_discard_and_failed_save_remove_pending_imports(tmp_path: Path) -
     (source_root / "notes.txt").write_text("observation", encoding="utf-8")
 
     with TestClient(_app(config_root, static_root)) as client:
-        action_id = "native-source-failed-save-0001"
+        action_id = "native-source-explicit-discard-0001"
         pending = _import_pending(client, source_root, action_id=action_id)
-        source = pending["source"]
-        assert isinstance(source, dict)
-        import_directory = _import_directory(config_root, source)
-        failed = client.post(
-            "/desktop/v1/projects",
-            headers={**SESSION_HEADERS, "Idempotency-Key": "failed-project-save-0001"},
-            json={
-                "name": "Missing profile",
-                "profile_id": "profile-does-not-exist",
-                "task": {"title": "Design", "objective": "Cannot commit."},
-                "source": source,
-                "execution": {
-                    "mode": "codex_subscription_transcript",
-                    "codex_model": "gpt-5.3-codex-spark",
-                },
-                "evolution": {"targets": {}},
-            },
-        )
-        assert failed.status_code >= 400
+        import_directory = _import_directory(config_root, pending)
         assert import_directory.is_dir()
 
-        discarded = _discard_pending(client, pending, action_id=action_id)
-        assert discarded.status_code == 204
+        wrong_lease = dict(pending)
+        wrong_lease["lease_token"] = "0" * 64
+        assert _discard_pending(client, wrong_lease, action_id=action_id).status_code == 409
+        assert import_directory.is_dir()
+
+        assert _discard_pending(client, pending, action_id=action_id).status_code == 204
         assert not import_directory.exists()
         assert _discard_pending(client, pending, action_id=action_id).status_code == 204
 
 
-def test_identical_archives_have_project_bound_authority_and_replay_after_restart(
+def test_identical_archives_have_action_bound_authority_and_replay_after_restart(
     tmp_path: Path,
 ) -> None:
     config_root = tmp_path / "config"
@@ -258,7 +199,6 @@ def test_identical_archives_have_project_bound_authority_and_replay_after_restar
     second_action = "native-identical-empty-project-b-0001"
 
     with TestClient(_app(config_root, static_root)) as client:
-        profile = _create_profile(client)
         first_pending = _import_pending(client, first_root, action_id=first_action)
         second_pending = _import_pending(client, second_root, action_id=second_action)
         first_source = first_pending["source"]
@@ -270,66 +210,32 @@ def test_identical_archives_have_project_bound_authority_and_replay_after_restar
             == second_source["import_ref"]["content_sha256"]
         )
         assert first_source["import_ref"]["import_id"] != second_source["import_ref"]["import_id"]
-        first_project = _create_project(
-            client,
-            str(profile["profile_id"]),
-            first_source,
-            idempotency_key="identical-empty-project-a-0001",
-            name="First empty project",
-        )
-        second_project = _create_project(
-            client,
-            str(profile["profile_id"]),
-            second_source,
-            idempotency_key="identical-empty-project-b-0001",
-            name="Second empty project",
-        )
-        assert first_project["project_id"] != second_project["project_id"]
 
     with TestClient(_app(config_root, static_root)) as restarted:
-        replay_pending = _import_pending(restarted, first_root, action_id=first_action)
-        assert replay_pending["source"] == first_source
-        replayed_project = _create_project(
-            restarted,
-            str(profile["profile_id"]),
-            first_source,
-            idempotency_key="identical-empty-project-a-0001",
-            name="First empty project",
-        )
-        assert replayed_project == first_project
+        assert _import_pending(restarted, first_root, action_id=first_action) == first_pending
 
-        first_status = first_root.stat()
-        owner_conflict = restarted.post(
-            "/openevo-native/workspace-imports",
-            headers=HANDOFF_HEADERS,
-            json={
-                "schema_version": "1",
-                "kind": "native_folder_snapshot",
-                "action_id": first_action,
-                "selected_path": str(first_root.resolve()),
-                "selected_device": first_status.st_dev,
-                "selected_inode": first_status.st_ino,
-                "cancellation_token": _cancellation_token(first_action),
-                "project_id": second_project["project_id"],
-            },
+        owner_conflict = _import_response(
+            restarted,
+            first_root,
+            action_id=first_action,
+            project_id="project-owned-by-another-action",
         )
         assert owner_conflict.status_code == 409
 
         (first_root / "changed.txt").write_text("changed", encoding="utf-8")
-        changed_content = restarted.post(
-            "/openevo-native/workspace-imports",
-            headers=HANDOFF_HEADERS,
-            json={
-                "schema_version": "1",
-                "kind": "native_folder_snapshot",
-                "action_id": first_action,
-                "selected_path": str(first_root.resolve()),
-                "selected_device": first_status.st_dev,
-                "selected_inode": first_status.st_ino,
-                "cancellation_token": _cancellation_token(first_action),
-            },
+        changed_content = _import_response(
+            restarted,
+            first_root,
+            action_id=first_action,
         )
         assert changed_content.status_code == 409
+
+        assert (
+            _discard_pending(restarted, first_pending, action_id=first_action).status_code == 204
+        )
+        assert (
+            _discard_pending(restarted, second_pending, action_id=second_action).status_code == 204
+        )
 
 
 def test_native_import_cancel_stops_archive_work_and_rejects_stale_identity(
@@ -387,8 +293,7 @@ def test_native_import_cancel_stops_archive_work_and_rejects_stale_identity(
     assert len(responses) == 1
     assert responses[0].status_code == 409
     assert responses[0].json()["code"] == "workspace_import_cancelled"
-    import_root = config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports"
-    assert list(import_root.iterdir()) == []
+    assert list(_workspace_import_root(config_root).iterdir()) == []
 
 
 def test_native_import_cancel_before_begin_is_identity_bound_and_fail_closed(
@@ -419,8 +324,7 @@ def test_native_import_cancel_before_begin_is_identity_bound_and_fail_closed(
         pending = _import_pending(client, source_root, action_id=stale_action)
         assert _discard_pending(client, pending, action_id=stale_action).status_code == 204
 
-    import_root = config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports"
-    assert list(import_root.iterdir()) == []
+    assert list(_workspace_import_root(config_root).iterdir()) == []
 
 
 def test_cancel_after_atomic_publication_discards_the_recoverable_lease(
@@ -458,307 +362,60 @@ def test_cancel_after_atomic_publication_discards_the_recoverable_lease(
     assert len(responses) == 1
     assert responses[0].status_code == 409
     assert responses[0].json()["code"] == "workspace_import_cancelled"
-    import_root = config_root / desktop_launcher.DESKTOP_STATE_DIRECTORY / "workspace-imports"
-    assert list(import_root.iterdir()) == []
+    assert list(_workspace_import_root(config_root).iterdir()) == []
 
 
-def test_discard_rereads_references_after_a_concurrent_project_commit(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config_root = tmp_path / "config"
-    static_root = _static_root(tmp_path / "static")
-    source_root = tmp_path / "research"
-    source_root.mkdir()
-    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
-    app = _app(config_root, static_root)
-
-    with TestClient(app) as client:
-        profile = _create_profile(client)
-        action_id = "native-source-concurrent-commit-0001"
-        pending = _import_pending(client, source_root, action_id=action_id)
-        source = pending["source"]
-        assert isinstance(source, dict)
-        import_directory = _import_directory(config_root, source)
-        provider = app.state.desktop_release_provider
-        original_adopt = provider._adopt_project_source
-        commit_durable = threading.Event()
-        allow_adopt = threading.Event()
-
-        def delayed_adopt(source_to_adopt, *, project_id: str) -> None:
-            commit_durable.set()
-            assert allow_adopt.wait(timeout=5)
-            original_adopt(source_to_adopt, project_id=project_id)
-
-        monkeypatch.setattr(provider, "_adopt_project_source", delayed_adopt)
-        create_responses: list[HttpResponse] = []
-        discard_responses: list[HttpResponse] = []
-
-        creator = threading.Thread(
-            target=lambda: create_responses.append(
-                _create_project(client, str(profile["profile_id"]), source)
-            )
-        )
-        creator.start()
-        assert commit_durable.wait(timeout=5)
-        discarder = threading.Thread(
-            target=lambda: discard_responses.append(
-                _discard_pending(client, pending, action_id=action_id)
-            )
-        )
-        discarder.start()
-        assert not allow_adopt.wait(timeout=0.1)
-        allow_adopt.set()
-        creator.join(timeout=5)
-        discarder.join(timeout=5)
-
-        assert not creator.is_alive()
-        assert not discarder.is_alive()
-        assert len(create_responses) == 1
-        assert len(discard_responses) == 1
-        assert discard_responses[0].status_code == 204
-        assert import_directory.is_dir()
-
-
-def test_project_source_replacement_and_delete_release_committed_imports(
+def test_v2_restart_retains_valid_pending_and_discards_corrupt_pending(
     tmp_path: Path,
 ) -> None:
     config_root = tmp_path / "config"
     static_root = _static_root(tmp_path / "static")
-    source_root = tmp_path / "research"
-    source_root.mkdir()
-    (source_root / "results.csv").write_text("sample,value\na,4\n", encoding="utf-8")
+    valid_root = tmp_path / "valid-research"
+    corrupt_root = tmp_path / "corrupt-research"
+    valid_root.mkdir()
+    corrupt_root.mkdir()
+    (valid_root / "notes.txt").write_text("retain", encoding="utf-8")
+    (corrupt_root / "notes.txt").write_text("recover", encoding="utf-8")
+    valid_action = "native-valid-restart-import-0001"
+    corrupt_action = "native-corrupt-restart-import-0001"
 
     with TestClient(_app(config_root, static_root)) as client:
-        profile = _create_profile(client)
-        source = _import_source(
-            client,
-            source_root,
-            action_id="native-source-lifecycle-0001",
-        )
-        project = _create_project(client, str(profile["profile_id"]), source)
-        import_directory = _import_directory(config_root, source)
-        assert import_directory.is_dir()
+        valid_pending = _import_pending(client, valid_root, action_id=valid_action)
+        corrupt_pending = _import_pending(client, corrupt_root, action_id=corrupt_action)
 
-        replaced = client.patch(
-            f"/desktop/v1/projects/{project['project_id']}",
-            headers={**SESSION_HEADERS, "If-Match": str(project["etag"])},
-            json={"source": {"kind": "scratch", "display_name": "New workspace"}},
-        )
-        assert replaced.status_code == 200
-        assert not import_directory.exists()
-
-        second_source = _import_source(
-            client,
-            source_root,
-            action_id="native-source-lifecycle-0002",
-            project_id=str(project["project_id"]),
-        )
-        second_directory = _import_directory(config_root, second_source)
-        restored = client.patch(
-            f"/desktop/v1/projects/{project['project_id']}",
-            headers={**SESSION_HEADERS, "If-Match": str(replaced.json()["etag"])},
-            json={"source": second_source},
-        )
-        assert restored.status_code == 200
-        assert second_directory.is_dir()
-
-        deleted = client.delete(
-            f"/desktop/v1/projects/{project['project_id']}",
-            headers={**SESSION_HEADERS, "If-Match": str(restored.json()["etag"])},
-        )
-        assert deleted.status_code == 204
-        assert not second_directory.exists()
-
-
-def test_project_source_display_name_change_retains_same_import_ref(tmp_path: Path) -> None:
-    config_root = tmp_path / "config"
-    static_root = _static_root(tmp_path / "static")
-    source_root = tmp_path / "research"
-    source_root.mkdir()
-    (source_root / "results.csv").write_text("sample,value\na,4\n", encoding="utf-8")
-
-    with TestClient(_app(config_root, static_root)) as client:
-        profile = _create_profile(client)
-        source = _import_source(
-            client,
-            source_root,
-            action_id="native-source-display-name-0001",
-        )
-        project = _create_project(client, str(profile["profile_id"]), source)
-        import_directory = _import_directory(config_root, source)
-        renamed_source = dict(source)
-        renamed_source["display_name"] = "Renamed research workspace"
-
-        renamed = client.patch(
-            f"/desktop/v1/projects/{project['project_id']}",
-            headers={**SESSION_HEADERS, "If-Match": str(project["etag"])},
-            json={"source": renamed_source},
-        )
-
-        assert renamed.status_code == 200
-        assert renamed.json()["source"] == renamed_source
-        assert import_directory.is_dir()
-
-
-def test_post_commit_cleanup_rechecks_references_against_concurrent_patch(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config_root = tmp_path / "config"
-    static_root = _static_root(tmp_path / "static")
-    source_root = tmp_path / "research"
-    source_root.mkdir()
-    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
-    app = _app(config_root, static_root)
-
-    with TestClient(app) as client:
-        profile = _create_profile(client)
-        source = _import_source(
-            client,
-            source_root,
-            action_id="native-source-concurrent-patch-0001",
-        )
-        project = _create_project(client, str(profile["profile_id"]), source)
-        import_directory = _import_directory(config_root, source)
-        provider = app.state.desktop_release_provider
-        original_release = provider._release_project_source
-        cleanup_entered = threading.Event()
-        continue_cleanup = threading.Event()
-
-        def delayed_release(source_to_release, *, project_id: str) -> None:
-            if source_to_release.kind == "native_folder_snapshot":
-                cleanup_entered.set()
-                assert continue_cleanup.wait(timeout=5)
-            original_release(source_to_release, project_id=project_id)
-
-        monkeypatch.setattr(provider, "_release_project_source", delayed_release)
-        responses: list[HttpResponse] = []
-
-        def replace_with_scratch() -> None:
-            responses.append(
-                client.patch(
-                    f"/desktop/v1/projects/{project['project_id']}",
-                    headers={**SESSION_HEADERS, "If-Match": str(project["etag"])},
-                    json={"source": {"kind": "scratch", "display_name": "Temporary"}},
-                )
-            )
-
-        worker = threading.Thread(target=replace_with_scratch)
-        worker.start()
-        try:
-            assert cleanup_entered.wait(timeout=5)
-            interim = client.get(
-                f"/desktop/v1/projects/{project['project_id']}",
-                headers=SESSION_HEADERS,
-            )
-            assert interim.status_code == 200
-            restored = client.patch(
-                f"/desktop/v1/projects/{project['project_id']}",
-                headers={**SESSION_HEADERS, "If-Match": str(interim.json()["etag"])},
-                json={"source": source},
-            )
-            assert restored.status_code == 200
-        finally:
-            continue_cleanup.set()
-            worker.join(timeout=5)
-
-        assert not worker.is_alive()
-        assert len(responses) == 1
-        assert responses[0].status_code == 200
-        assert import_directory.is_dir()
-        current = client.get(
-            f"/desktop/v1/projects/{project['project_id']}",
-            headers=SESSION_HEADERS,
-        )
-        assert current.status_code == 200
-        assert current.json()["source"] == source
-
-
-def test_startup_reconciliation_discards_orphans_and_retains_project_sources(
-    tmp_path: Path,
-) -> None:
-    config_root = tmp_path / "config"
-    static_root = _static_root(tmp_path / "static")
-    source_root = tmp_path / "research"
-    source_root.mkdir()
-    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
-
-    with TestClient(_app(config_root, static_root)) as client:
-        profile = _create_profile(client)
-        retained_pending = _import_pending(
-            client,
-            source_root,
-            action_id="native-source-retained-0001",
-        )
-        retained = retained_pending["source"]
-        assert isinstance(retained, dict)
-        project = _create_project(client, str(profile["profile_id"]), retained)
-        (source_root / "new-observation.txt").write_text("changed", encoding="utf-8")
-        orphan = _import_source(
-            client,
-            source_root,
-            action_id="native-source-orphaned-0001",
-            project_id=str(project["project_id"]),
-        )
-        retained_directory = _import_directory(config_root, retained)
-        orphan_directory = _import_directory(config_root, orphan)
-        assert retained_directory.is_dir()
-        assert orphan_directory.is_dir()
-
-    with TestClient(_app(config_root, static_root)) as client:
-        fetched = client.get(
-            f"/desktop/v1/projects/{project['project_id']}",
-            headers=SESSION_HEADERS,
-        )
-        assert fetched.status_code == 200
-        assert fetched.json()["source"] == retained
-        assert (
-            _discard_pending(
-                client,
-                retained_pending,
-                action_id="native-source-retained-0001",
-            ).status_code
-            == 204
-        )
-        assert retained_directory.is_dir()
-        assert not orphan_directory.exists()
-
-
-def test_startup_preserves_corrupt_referenced_import_and_fails_closed(tmp_path: Path) -> None:
-    config_root = tmp_path / "config"
-    static_root = _static_root(tmp_path / "static")
-    source_root = tmp_path / "research"
-    source_root.mkdir()
-    (source_root / "notes.txt").write_text("observation", encoding="utf-8")
-
-    with TestClient(_app(config_root, static_root)) as client:
-        profile = _create_profile(client)
-        source = _import_source(
-            client,
-            source_root,
-            action_id="native-source-corrupt-startup-0001",
-        )
-        project = _create_project(client, str(profile["profile_id"]), source)
-        import_directory = _import_directory(config_root, source)
-        (source_root / "later.txt").write_text("unreferenced", encoding="utf-8")
-        orphan = _import_source(
-            client,
-            source_root,
-            action_id="native-source-corrupt-orphan-0001",
-            project_id=str(project["project_id"]),
-        )
-        orphan_directory = _import_directory(config_root, orphan)
-
-    archive = import_directory / "archive.tar"
+    valid_directory = _import_directory(config_root, valid_pending)
+    corrupt_directory = _import_directory(config_root, corrupt_pending)
+    archive = corrupt_directory / "archive.tar"
     with archive.open("r+b") as stream:
         stream.seek(0)
         stream.write(b"X")
         stream.flush()
 
-    with pytest.raises(WorkspaceImportIntegrityError, match="referenced workspace import"):
-        _app(config_root, static_root)
+    with TestClient(_app(config_root, static_root)) as restarted:
+        assert valid_directory.is_dir()
+        assert not corrupt_directory.exists()
+        assert _import_pending(restarted, valid_root, action_id=valid_action) == valid_pending
+        recovered = _import_pending(
+            restarted,
+            corrupt_root,
+            action_id=corrupt_action,
+        )
+        assert recovered == corrupt_pending
+        assert (
+            _discard_pending(
+                restarted,
+                valid_pending,
+                action_id=valid_action,
+            ).status_code
+            == 204
+        )
+        assert (
+            _discard_pending(
+                restarted,
+                recovered,
+                action_id=corrupt_action,
+            ).status_code
+            == 204
+        )
 
-    assert import_directory.is_dir()
-    assert archive.is_file()
-    assert orphan_directory.is_dir()
+    assert list(_workspace_import_root(config_root).iterdir()) == []

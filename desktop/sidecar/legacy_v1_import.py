@@ -360,17 +360,25 @@ class LegacyV1Importer:
             or (current_lock.st_dev, current_lock.st_ino) != lock_identity
         ):
             raise _LegacyUnavailable("legacy_store_replaced")
-        expected_sqlite_path = f"/dev/fd/{database_descriptor}"
-        if sqlite_path != expected_sqlite_path:
+        descriptor_path = f"/dev/fd/{database_descriptor}"
+        managed_path = str(self._root / legacy_store.DATABASE_FILENAME)
+        if sqlite_path == descriptor_path:
+            follow_sqlite_path = True
+            require_opened_device = False
+        elif sqlite_path == managed_path:
+            follow_sqlite_path = False
+            require_opened_device = True
+        else:
             raise _LegacyUnavailable("legacy_store_replaced")
         try:
             held_database = os.fstat(database_descriptor)
-            opened = os.stat(sqlite_path, follow_symlinks=False)
+            opened = os.stat(sqlite_path, follow_symlinks=follow_sqlite_path)
         except OSError as exc:
             raise _LegacyUnavailable("legacy_store_replaced") from exc
         if (
             (held_database.st_dev, held_database.st_ino) != database_identity
             or opened.st_ino != held_database.st_ino
+            or (require_opened_device and opened.st_dev != held_database.st_dev)
             or opened.st_size != held_database.st_size
             or not stat.S_ISREG(opened.st_mode)
         ):

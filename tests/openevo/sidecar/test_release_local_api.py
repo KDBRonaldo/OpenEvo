@@ -45,7 +45,6 @@ from desktop.sidecar.remote_lifecycle import (
     RemoteLifecycleSnapshot,
     RemoteLifecycleSupersededError,
 )
-from openevo import __version__ as OPENEVO_VERSION
 from openevo.backend.contracts.v2.snapshots import (
     events_schema_sha256 as core_events_schema_sha256,
     openapi_sha256 as core_openapi_sha256,
@@ -212,6 +211,7 @@ def _app(
         instance_id=INSTANCE_ID,
         readiness_key=READINESS_KEY,
         source_commit=SOURCE_COMMIT,
+        build_version="0.1.8",
         build_channel="test",
         clock=clock,
         remote_lifecycle=cast(DesktopRemoteLifecycle | None, remote_lifecycle),
@@ -431,6 +431,7 @@ def test_release_app_marks_state_store_before_provider_store_failure(
             instance_id=INSTANCE_ID,
             readiness_key=READINESS_KEY,
             source_commit=SOURCE_COMMIT,
+            build_version="0.1.8",
             build_channel="release",
             startup_phase=phases.append,
         )
@@ -504,6 +505,7 @@ def test_release_local_api_allows_only_packaged_tauri_cors_origins(tmp_path: Pat
         "last-event-id",
         "pragma",
         "x-openevo-desktop-session",
+        "x-openevo-resource-generation",
     }
     assert {
         value.strip() for value in preflight.headers["access-control-allow-methods"].split(",")
@@ -1269,7 +1271,7 @@ def test_release_discovery_health_and_desktop_session_auth(
             "preferred_major": 1,
             "supported_majors": [1],
             "openapi_sha256": DESKTOP_OPENAPI_SHA256,
-            "build_version": OPENEVO_VERSION,
+            "build_version": "0.1.8",
             "source_commit": SOURCE_COMMIT,
             "build_channel": "test",
             "provider_kind": "desktop_sidecar",

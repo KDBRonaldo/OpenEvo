@@ -327,7 +327,14 @@ async def test_compatibility_download_accounts_write_unlink_byte_churn(
 
     budget = RuntimeReadbackBudget()
 
-    with pytest.raises(RuntimePathSecurityError, match="byte budget"):
+    # The inotify consumer can either observe enough close-write evidence to
+    # exhaust the byte budget or observe the subsequent unlink first under
+    # scheduler pressure. The latter is an equally closed security outcome:
+    # the implementation refuses work whose byte cost became unobservable.
+    with pytest.raises(
+        RuntimePathSecurityError,
+        match="(byte budget|byte work became unobservable)",
+    ):
         await _compatibility_readback(ChurningRuntime(), tmp_path, budget=budget)
 
     assert budget.files_consumed >= budget.max_files

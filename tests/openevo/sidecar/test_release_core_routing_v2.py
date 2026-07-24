@@ -1168,6 +1168,80 @@ def test_native_project_streams_verified_private_import_to_core_v2_only(
         workspace_store.close()
 
 
+def test_native_project_retry_releases_import_after_remote_finalize(
+    tmp_path: Path,
+) -> None:
+    action_id = "routing-native-workspace-retry-0001"
+    import_id = native_import_id_for_action(action_id)
+    archive = b"\0" * 1024
+    import_ref = WorkspaceImportRefV1(
+        import_id=import_id,
+        content_sha256=hashlib.sha256(archive).hexdigest(),
+        byte_size=len(archive),
+        entry_count=0,
+        extracted_byte_size=0,
+    )
+    workspace_store = WorkspaceImportStore(tmp_path / "workspace-imports")
+    archive_path = tmp_path / "workspace.tar"
+    archive_path.write_bytes(archive)
+    ownership = ownership_for_native_import(
+        import_ref,
+        project_id=project_id_for_native_import(import_id),
+    )
+    with archive_path.open("rb") as stream:
+        workspace_store.ingest_pending(
+            stream,
+            ownership=ownership,
+            import_id=import_id,
+        )
+    provider, store, _lifecycle, bridge = _provider(
+        tmp_path,
+        workspace_import_store=workspace_store,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        profile = _connected_profile(client)
+        request = _project_create(profile)
+        request["config"]["workspace"] = {
+            "kind": "native_folder_snapshot",
+            "display_name": "Selected workspace",
+        }
+        headers = _headers(
+            **{
+                "X-OpenEvo-Resource-Generation": str(
+                    profile["connection_generation"]
+                ),
+                "Idempotency-Key": action_id,
+            }
+        )
+        bridge.fail_reads = True
+
+        failed = client.post("/desktop/v2/projects", headers=headers, json=request)
+
+        assert failed.status_code == 503, failed.text
+        assert failed.json()["code"] == "core_temporarily_unavailable"
+        assert workspace_store.inspect(import_id).pending
+
+        bridge.fail_reads = False
+        retried = client.post("/desktop/v2/projects", headers=headers, json=request)
+
+        assert retried.status_code == 201, retried.text
+        assert retried.json()["state"] == "ready"
+        with pytest.raises(WorkspaceImportNotFoundError):
+            workspace_store.inspect(import_id)
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+        workspace_store.close()
+
+
 def test_active_project_business_surface_routes_to_core_v2_without_ssh(
     tmp_path: Path,
 ) -> None:

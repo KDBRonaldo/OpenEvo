@@ -1196,6 +1196,7 @@ def test_release_app_credential_reset_failure_closes_store(
             instance_id="1a" * 16,
             readiness_key=bytes.fromhex("5a" * 32),
             source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_version="0.1.8",
             build_channel="test",
         )
 
@@ -1255,6 +1256,7 @@ def test_release_app_route_registration_failure_closes_provider(
             instance_id="1a" * 16,
             readiness_key=bytes.fromhex("5a" * 32),
             source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+            build_version="0.1.8",
             build_channel="test",
             remote_lifecycle=SimpleNamespace(close=lambda: None),
         )
@@ -1313,6 +1315,7 @@ def test_release_app_can_delegate_shutdown_ownership(
         instance_id="1a" * 16,
         readiness_key=bytes.fromhex("5a" * 32),
         source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=SimpleNamespace(close=lambda: None),
         close_on_shutdown=False,

@@ -1032,6 +1032,7 @@ def test_release_app_maps_expired_event_cursor_to_reset_response(tmp_path: Path)
         instance_id="9" * 32,
         readiness_key=b"u" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         event_broker=DesktopEventBrokerV1(),
@@ -1057,6 +1058,7 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         instance_id="1" * 32,
         readiness_key=b"r" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,
@@ -1091,6 +1093,7 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         instance_id="2" * 32,
         readiness_key=b"s" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=failing_bridge,
@@ -1112,6 +1115,7 @@ def test_release_app_serves_bridge_results_and_preserves_typed_errors(tmp_path: 
         instance_id="3" * 32,
         readiness_key=b"t" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=client_failing_bridge,
@@ -1202,6 +1206,7 @@ def test_release_app_publishes_recovery_and_diagnostic_routes_with_session_auth(
         instance_id="7" * 32,
         readiness_key=b"w" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,
@@ -1306,6 +1311,7 @@ def test_release_app_retry_body_is_closed_and_forwarded(tmp_path: Path) -> None:
         instance_id="4" * 32,
         readiness_key=b"v" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,
@@ -1350,6 +1356,7 @@ def test_release_app_retry_unknown_outcome_uses_the_stable_ambiguous_code(
         instance_id="5" * 32,
         readiness_key=b"w" * 32,
         source_commit="1234567",
+        build_version="0.1.8",
         build_channel="test",
         remote_lifecycle=_Lifecycle(),  # type: ignore[arg-type]
         core_bridge=bridge,

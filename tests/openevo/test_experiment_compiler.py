@@ -915,7 +915,7 @@ def test_evolution_job_payloads_include_ordered_methods_and_reflector_llm() -> N
         "resolved_method": "agent_system_history_reflector",
         "prior_dataset_artifact_ids": ["dataset_artifact_0"],
     }
-    assert all(job["config"]["promoted"] is True for job in jobs)
+    assert all("promoted" not in job["config"] for job in jobs)
     assert all("base_model" not in job["config"]["compatibility"] for job in jobs)
     assert jobs[2]["config"]["reflector_llm"] == {
         "provider": "codex_cli",
