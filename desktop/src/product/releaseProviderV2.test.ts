@@ -130,6 +130,36 @@ describe("v0.1.9 release provider", () => {
     ]);
   });
 
+  it("recovers bootstrap context when the long native start reply never settles", async () => {
+    const fetch = vi.fn<FetchLikeV2>().mockResolvedValue(new Response(JSON.stringify(version()), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const neverSettles = new Promise<never>(() => {});
+    invokeMock.mockImplementation((command?: string) => {
+      if (command === "start_sidecar") return neverSettles;
+      if (command === "sidecar_bootstrap_context") return Promise.resolve(bootstrap());
+      return Promise.resolve(undefined);
+    });
+
+    const result = await Promise.race([
+      createReleaseDesktopProductProvider({ fetch, reportStage: vi.fn() }),
+      new Promise<"timed_out">((resolve) => setTimeout(() => resolve("timed_out"), 1_000)),
+    ]);
+
+    expect(result).not.toBe("timed_out");
+    expect(result).toMatchObject({
+      apiVersion: 2,
+      providerKind: "desktop_sidecar",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("start_sidecar");
+    expect(invokeMock).toHaveBeenCalledWith("sidecar_bootstrap_context");
+    expect(invokeMock.mock.calls.map(([command]) => command)).toEqual([
+      "start_sidecar",
+      "sidecar_bootstrap_context",
+    ]);
+  });
+
   it("fails closed on a v1 bootstrap without calling the Local API", async () => {
     const fetch = vi.fn<FetchLikeV2>();
 

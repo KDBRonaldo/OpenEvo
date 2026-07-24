@@ -5501,6 +5501,34 @@ fn host_status_inner_with<C: ProcessControl>(
     }
 }
 
+fn sidecar_bootstrap_context_inner(
+    state: &DesktopHostState,
+) -> HostResult<DesktopBootstrapContextV2> {
+    if state.shutdown_requested.load(Ordering::Acquire) {
+        return Err(NativeHostError::new(
+            "sidecar_host_shutting_down",
+            "OpenEvo Desktop is shutting down its native sidecar host.",
+        ));
+    }
+    let status = host_status_inner(state)?;
+    match status.state.as_str() {
+        "starting" => return Err(sidecar_start_in_progress_error()),
+        "cleanup_pending" => return Err(sidecar_stop_error()),
+        "running" => {}
+        _ if state.startup_in_progress.load(Ordering::Acquire) => {
+            return Err(sidecar_start_in_progress_error());
+        }
+        _ => return Err(sidecar_state_error()),
+    }
+
+    let sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
+    let managed = sidecar.as_ref().ok_or_else(sidecar_state_error)?;
+    if managed.lifecycle != ManagedLifecycle::Running || managed.child.is_none() {
+        return Err(sidecar_state_error());
+    }
+    managed.bootstrap_context()
+}
+
 fn ensure_running_sidecar_monitor(
     state: &DesktopHostState,
     expected_context: &DesktopBootstrapContextV2,
@@ -6594,6 +6622,13 @@ fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStat
     host_status_inner(&state)
 }
 
+#[tauri::command]
+fn sidecar_bootstrap_context(
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<DesktopBootstrapContextV2> {
+    sidecar_bootstrap_context_inner(&state)
+}
+
 #[tauri::command(rename_all = "camelCase")]
 fn read_run_retry_recovery(
     app: tauri::AppHandle,
@@ -7434,6 +7469,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             host_status,
+            sidecar_bootstrap_context,
             read_run_retry_recovery,
             write_run_retry_recovery,
             get_desktop_log_tail,
@@ -7998,6 +8034,29 @@ mod tests {
         for forbidden in ["endpoint", "session_token", "pid", "port", "url", "command"] {
             assert!(status.get(forbidden).is_none());
         }
+    }
+
+    #[test]
+    fn bootstrap_context_observer_waits_for_a_published_running_sidecar() {
+        let state = DesktopHostState::default();
+        state.startup_in_progress.store(true, Ordering::Release);
+
+        let error = expect_host_error(sidecar_bootstrap_context_inner(&state));
+        assert_eq!(error.code, "sidecar_start_in_progress");
+
+        state.startup_in_progress.store(false, Ordering::Release);
+        let (managed, private_root, _listener_port) = managed_test_sidecar();
+        let expected = serde_json::to_value(managed.bootstrap_context().unwrap()).unwrap();
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        let observed = serde_json::to_value(
+            sidecar_bootstrap_context_inner(&state).expect("running bootstrap context"),
+        )
+        .unwrap();
+        assert_eq!(observed, expected);
+
+        stop_sidecar_inner(&state).unwrap();
+        assert!(!private_root.exists());
     }
 
     #[test]

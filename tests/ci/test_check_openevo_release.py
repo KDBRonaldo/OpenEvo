@@ -3674,6 +3674,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         in bundle_smoke
     )
     assert "fn host_status(" in main
+    assert "fn sidecar_bootstrap_context(" in main
     assert "fn start_sidecar(" in main
     assert "fn stop_sidecar(" in main
     assert "fn create_ssh_tunnel(" not in main
