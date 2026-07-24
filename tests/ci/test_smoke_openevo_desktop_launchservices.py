@@ -12,13 +12,25 @@ import pytest
 
 
 SCRIPT_PATH = (
-    Path(__file__).resolve().parents[2]
-    / "scripts/ci/smoke_openevo_desktop_launchservices.py"
+    Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_launchservices.py"
 )
+RELEASE_OPENAPI_SHA256 = "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
+RELEASE_EVENT_SCHEMA_SHA256 = "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
+RELEASE_FEATURE_FLAGS = [
+    "core_control_v2",
+    "daemon_bundle_v2",
+    "event_replay_v2",
+    "host_key_review",
+    "native_askpass",
+    "system_openssh_profiles",
+    "task_admission_v2",
+]
 
 
 def _load_module():
-    spec = importlib.util.spec_from_file_location("smoke_openevo_desktop_launchservices", SCRIPT_PATH)
+    spec = importlib.util.spec_from_file_location(
+        "smoke_openevo_desktop_launchservices", SCRIPT_PATH
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -28,6 +40,34 @@ def _load_module():
 
 def _row(module, pid: int, parent: int, birth: str = "Mon Jan  2 03:04:05 2023"):
     return module.ProcessRow(module.ProcessIdentity(pid, birth), parent, "/ignored")
+
+
+def _version_payload() -> dict[str, object]:
+    return {
+        "schema_version": "2",
+        "api_name": "openevo-desktop-local-api",
+        "preferred_major": 2,
+        "supported_majors": [2],
+        "mutation_major": 2,
+        "openapi_sha256": RELEASE_OPENAPI_SHA256,
+        "event_schema_sha256": RELEASE_EVENT_SCHEMA_SHA256,
+        "release_version": "0.1.9",
+        "build_id": "a" * 64,
+        "source_commit": "b" * 40,
+        "build_channel": "release",
+        "provider_kind": "desktop_sidecar",
+        "feature_flags": RELEASE_FEATURE_FLAGS,
+        "feature_set_sha256": hashlib.sha256(
+            json.dumps(
+                RELEASE_FEATURE_FLAGS,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest(),
+        "required_core_api_major": 2,
+        "mutation_compatible": True,
+    }
 
 
 def test_parse_ps_rows_keeps_birth_identity_and_rejects_partial_rows() -> None:
@@ -125,29 +165,32 @@ def test_app_roots_uses_exact_process_paths_not_command_text(tmp_path: Path) -> 
             return str(executable) if pid == candidate.identity.pid else "/usr/bin/unrelated"
 
     system = System()
-    assert smoke._app_roots(system, [candidate, unrelated], executable) == {
-        candidate.identity
-    }
+    assert smoke._app_roots(system, [candidate, unrelated], executable) == {candidate.identity}
     assert system.probed == [candidate.identity.pid, unrelated.identity.pid]
+
+
+def test_validate_version_accepts_closed_v2_release() -> None:
+    smoke = _load_module()
+
+    smoke.validate_version(_version_payload(), "0.1.9")
 
 
 def test_validate_version_rejects_malformed_release_provider() -> None:
     smoke = _load_module()
-    payload = {
-        "schema_version": "1",
-        "api_name": "openevo-desktop-local-api",
-        "preferred_major": 1,
-        "supported_majors": [1],
-        "openapi_sha256": "a" * 64,
-        "build_version": "0.1.7",
-        "source_commit": "b" * 40,
-        "build_channel": "release",
-        "provider_kind": "test_provider",
-        "feature_flags": [],
-    }
+    payload = _version_payload()
+    payload["provider_kind"] = "test_provider"
 
     with pytest.raises(smoke.SmokeFailure, match="expected release provider"):
-        smoke.validate_version(payload, "0.1.7")
+        smoke.validate_version(payload, "0.1.9")
+
+
+def test_validate_version_rejects_unbound_feature_set() -> None:
+    smoke = _load_module()
+    payload = _version_payload()
+    payload["feature_set_sha256"] = "c" * 64
+
+    with pytest.raises(smoke.SmokeFailure, match="malformed"):
+        smoke.validate_version(payload, "0.1.9")
 
 
 def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) -> None:
@@ -256,7 +299,9 @@ def test_launchservices_rejects_open_v2_startup_envelopes(tmp_path: Path) -> Non
     assert smoke._startup_failure_since(log_root, 0) is None
 
 
-def test_smoke_times_out_when_no_owned_sidecar_appears(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_smoke_times_out_when_no_owned_sidecar_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     smoke = _load_module()
     app, executable = _app_bundle(tmp_path)
     monkeypatch.setattr(smoke.sys, "platform", "darwin")
@@ -293,7 +338,9 @@ def test_smoke_times_out_when_no_owned_sidecar_appears(tmp_path: Path, monkeypat
         )
 
 
-def test_cleanup_signals_only_observed_identity_not_pid_reuse(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cleanup_signals_only_observed_identity_not_pid_reuse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     smoke = _load_module()
     original = smoke.ProcessIdentity(40, "Mon Jan  2 03:04:05 2023")
     reused = _row(smoke, 40, 1, "Tue Jan  3 03:04:05 2023")
@@ -312,7 +359,9 @@ def test_cleanup_signals_only_observed_identity_not_pid_reuse(monkeypatch: pytes
     assert signalled == []
 
 
-def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_successful_smoke_writes_closed_non_sensitive_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     smoke = _load_module()
     app, executable = _app_bundle(tmp_path)
     sidecar = executable.parent / "openevo-desktop-sidecar"
@@ -327,12 +376,7 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, m
     monkeypatch.setattr(smoke.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
 
-    version = {
-        "schema_version": "1", "api_name": "openevo-desktop-local-api", "preferred_major": 1,
-        "supported_majors": [1], "openapi_sha256": "a" * 64, "build_version": "0.1.7",
-        "source_commit": "b" * 40, "build_channel": "release", "provider_kind": "desktop_sidecar",
-        "feature_flags": [],
-    }
+    version = _version_payload()
 
     class System:
         launched = False
@@ -365,11 +409,11 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, m
             return True
 
     evidence_path = tmp_path / "evidence.json"
-    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.7-aarch64.dmg"
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.9-aarch64.dmg"
     source_dmg.write_bytes(b"candidate dmg")
     evidence = smoke.smoke_launchservices(
         app,
-        expected_version="0.1.7",
+        expected_version="0.1.9",
         timeout_seconds=2,
         evidence_out=evidence_path,
         source_dmg=source_dmg,
@@ -377,10 +421,19 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(tmp_path: Path, m
     )
     assert evidence == json.loads(evidence_path.read_text())
     assert set(evidence) == {
-        "architecture", "binary_sha256", "build_version", "cleanup", "launch_origin", "os_major",
-        "process_image_bound", "quarantine_present_before_allow",
-        "quarantine_removed_before_launch", "schema_version", "sidecar_ready",
-        "source_dmg", "version_verified",
+        "architecture",
+        "binary_sha256",
+        "build_version",
+        "cleanup",
+        "launch_origin",
+        "os_major",
+        "process_image_bound",
+        "quarantine_present_before_allow",
+        "quarantine_removed_before_launch",
+        "schema_version",
+        "sidecar_ready",
+        "source_dmg",
+        "version_verified",
     }
     assert evidence["cleanup"]["authority_limited_to_observed_tree"] is True
     assert evidence["quarantine_present_before_allow"] is True
@@ -413,18 +466,7 @@ def test_smoke_retries_owned_listener_until_version_is_ready(
     monkeypatch.setattr(smoke.platform, "mac_ver", lambda: ("15.5", (15, 5, 0), ""))
     monkeypatch.setattr(smoke.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(smoke.time, "sleep", lambda _seconds: None)
-    version = {
-        "schema_version": "1",
-        "api_name": "openevo-desktop-local-api",
-        "preferred_major": 1,
-        "supported_majors": [1],
-        "openapi_sha256": "a" * 64,
-        "build_version": "0.1.7",
-        "source_commit": "b" * 40,
-        "build_channel": "release",
-        "provider_kind": "desktop_sidecar",
-        "feature_flags": [],
-    }
+    version = _version_payload()
 
     class System:
         launched = False
@@ -457,11 +499,11 @@ def test_smoke_retries_owned_listener_until_version_is_ready(
             return True
 
     system = System()
-    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.7-aarch64.dmg"
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.9-aarch64.dmg"
     source_dmg.write_bytes(b"candidate dmg")
     smoke.smoke_launchservices(
         app,
-        expected_version="0.1.7",
+        expected_version="0.1.9",
         timeout_seconds=2,
         evidence_out=tmp_path / "evidence.json",
         source_dmg=source_dmg,

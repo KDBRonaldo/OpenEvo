@@ -22,6 +22,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 APP_NAME_SUFFIX = ".app"
 SIDECAR_BASENAME = "openevo-desktop-sidecar"
 EVIDENCE_SCHEMA_VERSION = 1
@@ -111,13 +112,66 @@ _DESKTOP_DURATION_BUCKETS = {
     "under_60s",
     "at_least_60s",
 }
-_LOADER_FAILURE_EVENT_CODE = (
-    "embedded_python_loader_python_shared_library_validation_failed"
-)
+_LOADER_FAILURE_EVENT_CODE = "embedded_python_loader_python_shared_library_validation_failed"
 _LOADER_FAILURE = (
     "embedded_python_loader",
     "python_shared_library_validation_failed",
 )
+
+
+def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
+    path = REPOSITORY_ROOT / "desktop" / "release-contract.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Desktop release contract is unavailable") from exc
+    if type(payload) is not dict or set(payload) != {
+        "accepted_openapi_digests",
+        "allowed_provider_kinds",
+        "required_feature_flags",
+        "schema_version",
+        "v019",
+    }:
+        raise RuntimeError("Desktop release contract does not use the closed schema")
+    policy = payload.get("v019")
+    digests = policy.get("accepted_desktop_openapi_digests") if type(policy) is dict else None
+    event_digests = (
+        policy.get("accepted_desktop_event_schema_digests") if type(policy) is dict else None
+    )
+    provider_kinds = policy.get("allowed_provider_kinds") if type(policy) is dict else None
+    feature_flags = policy.get("required_desktop_feature_flags") if type(policy) is dict else None
+    release_version = policy.get("release_version") if type(policy) is dict else None
+    if (
+        payload.get("schema_version") != "1"
+        or type(digests) is not list
+        or len(digests) != 1
+        or type(digests[0]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", digests[0]) is None
+        or type(event_digests) is not list
+        or len(event_digests) != 1
+        or type(event_digests[0]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", event_digests[0]) is None
+        or release_version != "0.1.9"
+        or provider_kinds != ["desktop_sidecar"]
+        or type(feature_flags) is not list
+        or not feature_flags
+        or any(
+            type(feature) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", feature) is None
+            for feature in feature_flags
+        )
+        or feature_flags != sorted(set(feature_flags))
+    ):
+        raise RuntimeError("Desktop release contract is invalid")
+    return digests[0], event_digests[0], release_version, tuple(feature_flags)
+
+
+(
+    EXPECTED_DESKTOP_OPENAPI_SHA256,
+    EXPECTED_DESKTOP_EVENT_SCHEMA_SHA256,
+    EXPECTED_DESKTOP_RELEASE_VERSION,
+    REQUIRED_DESKTOP_FEATURE_FLAGS,
+) = _load_release_contract()
 
 
 class SmokeFailure(RuntimeError):
@@ -286,10 +340,7 @@ def _valid_desktop_log_sequence(events: list[dict[str, object]]) -> bool:
                 previous_ordinal != ordinal
                 or previous_sequence >= attempt_sequence
                 or previous_version != product_version
-                or (
-                    previous_commit is not None
-                    and previous_commit != source_commit
-                )
+                or (previous_commit is not None and previous_commit != source_commit)
             ):
                 return False
             source_commit = previous_commit if source_commit is None else source_commit
@@ -347,11 +398,11 @@ def _startup_log_events(log_root: Path) -> tuple[dict[str, object], ...]:
                 final = os.fstat(stream.fileno())
         except OSError:
             return ()
-        if (
-            len(payload) > DESKTOP_LOG_MAX_FILE_BYTES
-            or (final.st_dev, final.st_ino, final.st_size)
-            != (metadata.st_dev, metadata.st_ino, metadata.st_size)
-        ):
+        if len(payload) > DESKTOP_LOG_MAX_FILE_BYTES or (
+            final.st_dev,
+            final.st_ino,
+            final.st_size,
+        ) != (metadata.st_dev, metadata.st_ino, metadata.st_size):
             return ()
         if payload and not payload.endswith(b"\n"):
             boundary = payload.rfind(b"\n")
@@ -367,10 +418,7 @@ def _startup_log_events(log_root: Path) -> tuple[dict[str, object], ...]:
                 return ()
             if type(event) is not dict:
                 return ()
-            if not (
-                _closed_desktop_log_v1_event(event)
-                or _closed_desktop_log_v2_event(event)
-            ):
+            if not (_closed_desktop_log_v1_event(event) or _closed_desktop_log_v2_event(event)):
                 return ()
             events.append(event)
     events.sort(key=lambda event: int(event["sequence"]))
@@ -491,45 +539,84 @@ def validate_version(payload: object, expected_version: str) -> None:
         "api_name",
         "preferred_major",
         "supported_majors",
+        "mutation_major",
         "openapi_sha256",
-        "build_version",
+        "event_schema_sha256",
+        "release_version",
+        "build_id",
         "source_commit",
         "build_channel",
         "provider_kind",
         "feature_flags",
+        "feature_set_sha256",
+        "required_core_api_major",
+        "mutation_compatible",
     }
     if type(payload) is not dict or set(payload) != required:
         raise SmokeFailure("sidecar /version does not use the closed release schema")
     if (
-        payload["schema_version"] != "1"
+        payload["schema_version"] != "2"
         or payload["api_name"] != "openevo-desktop-local-api"
-        or payload["build_version"] != expected_version
+        or payload["release_version"] != expected_version
+        or expected_version != EXPECTED_DESKTOP_RELEASE_VERSION
         or payload["build_channel"] != "release"
         or payload["provider_kind"] != "desktop_sidecar"
+        or payload["openapi_sha256"] != EXPECTED_DESKTOP_OPENAPI_SHA256
+        or payload["event_schema_sha256"] != EXPECTED_DESKTOP_EVENT_SCHEMA_SHA256
+        or payload["feature_flags"] != list(REQUIRED_DESKTOP_FEATURE_FLAGS)
+        or payload["required_core_api_major"] != 2
+        or payload["mutation_compatible"] is not True
     ):
         raise SmokeFailure("sidecar /version does not identify the expected release provider")
     preferred = payload["preferred_major"]
     supported = payload["supported_majors"]
+    mutation = payload["mutation_major"]
+    feature_flags = payload["feature_flags"]
+    encoded_features = json.dumps(
+        feature_flags,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     if (
         type(preferred) is not int
-        or isinstance(preferred, bool)
-        or not 1 <= preferred <= 255
+        or preferred != 2
         or type(supported) is not list
-        or not supported
-        or any(type(item) is not int or isinstance(item, bool) or not 1 <= item <= 255 for item in supported)
-        or len(set(supported)) != len(supported)
-        or preferred not in supported
+        or len(supported) != 1
+        or type(supported[0]) is not int
+        or supported[0] != 2
+        or type(mutation) is not int
+        or mutation != 2
+        or type(payload["required_core_api_major"]) is not int
+        or payload["required_core_api_major"] != 2
         or type(payload["openapi_sha256"]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", payload["openapi_sha256"]) is None
+        or type(payload["event_schema_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["event_schema_sha256"]) is None
+        or type(payload["release_version"]) is not str
+        or _VERSION.fullmatch(payload["release_version"]) is None
+        or type(payload["build_id"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["build_id"]) is None
         or type(payload["source_commit"]) is not str
-        or re.fullmatch(r"[0-9a-f]{40}", payload["source_commit"]) is None
-        or type(payload["feature_flags"]) is not list
-        or any(type(item) is not str or not item or len(item) > 128 for item in payload["feature_flags"])
+        or re.fullmatch(r"[0-9a-f]{7,64}", payload["source_commit"]) is None
+        or type(feature_flags) is not list
+        or not feature_flags
+        or any(
+            type(item) is not str
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", item) is None
+            for item in feature_flags
+        )
+        or feature_flags != sorted(set(feature_flags))
+        or type(payload["feature_set_sha256"]) is not str
+        or re.fullmatch(r"[0-9a-f]{64}", payload["feature_set_sha256"]) is None
+        or hashlib.sha256(encoded_features).hexdigest() != payload["feature_set_sha256"]
     ):
         raise SmokeFailure("sidecar /version is malformed")
 
 
-def descendants(rows: Iterable[ProcessRow], roots: Iterable[ProcessIdentity]) -> set[ProcessIdentity]:
+def descendants(
+    rows: Iterable[ProcessRow], roots: Iterable[ProcessIdentity]
+) -> set[ProcessIdentity]:
     """Return the current tree below exact process identities, never PID-only roots."""
     inventory = list(rows)
     current = {row.identity for row in inventory}
@@ -566,7 +653,9 @@ class DarwinSystem:
         except (AttributeError, OSError) as exc:
             raise SmokeFailure("macOS process identity service is unavailable") from exc
 
-    def command(self, arguments: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS) -> subprocess.CompletedProcess[str]:
+    def command(
+        self, arguments: list[str], timeout: float = COMMAND_TIMEOUT_SECONDS
+    ) -> subprocess.CompletedProcess[str]:
         try:
             return subprocess.run(
                 arguments,
@@ -596,8 +685,14 @@ class DarwinSystem:
     def listener_rows(self, identity: ProcessIdentity) -> list[Listener]:
         result = self.command(
             [
-                "/usr/sbin/lsof", "-nP", "-a", "-p", str(identity.pid), "-iTCP",
-                "-sTCP:LISTEN", "-FftnT",
+                "/usr/sbin/lsof",
+                "-nP",
+                "-a",
+                "-p",
+                str(identity.pid),
+                "-iTCP",
+                "-sTCP:LISTEN",
+                "-FftnT",
             ]
         )
         if result.returncode != 0:
@@ -611,7 +706,10 @@ class DarwinSystem:
         result = self.command(["/usr/bin/xattr", "-dr", "com.apple.quarantine", str(app)])
         if result.returncode != 0:
             raise SmokeFailure("could not allow the quarantined app for LaunchServices")
-        if self.command(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(app)]).returncode == 0:
+        if (
+            self.command(["/usr/bin/xattr", "-p", "com.apple.quarantine", str(app)]).returncode
+            == 0
+        ):
             raise SmokeFailure("could not allow the quarantined app for LaunchServices")
 
     def launch(self, app: Path) -> None:
@@ -655,7 +753,11 @@ class DarwinSystem:
 
 
 def _app_executable(app: Path) -> Path:
-    if not app.is_absolute() or app.name == APP_NAME_SUFFIX or not app.name.endswith(APP_NAME_SUFFIX):
+    if (
+        not app.is_absolute()
+        or app.name == APP_NAME_SUFFIX
+        or not app.name.endswith(APP_NAME_SUFFIX)
+    ):
         raise SmokeFailure("the app argument must be an exact absolute .app path")
     if app.is_symlink() or not app.is_dir():
         raise SmokeFailure("the app argument must name a real app bundle")
@@ -684,7 +786,9 @@ def _app_executable(app: Path) -> Path:
     return executable.resolve(strict=True)
 
 
-def _app_roots(system: DarwinSystem, rows: list[ProcessRow], executable: Path) -> set[ProcessIdentity]:
+def _app_roots(
+    system: DarwinSystem, rows: list[ProcessRow], executable: Path
+) -> set[ProcessIdentity]:
     expected = str(executable)
     roots: set[ProcessIdentity] = set()
     for row in rows:
@@ -711,7 +815,11 @@ def _sidecar_tree(
 
 
 def _single_listener(system: DarwinSystem, sidecar_tree: set[ProcessIdentity]) -> Listener | None:
-    listeners = [listener for identity in sorted(sidecar_tree) for listener in system.listener_rows(identity)]
+    listeners = [
+        listener
+        for identity in sorted(sidecar_tree)
+        for listener in system.listener_rows(identity)
+    ]
     ports = {listener.port for listener in listeners}
     if len(ports) > 1:
         raise SmokeFailure("multiple loopback listeners were owned by this sidecar tree")
@@ -835,7 +943,9 @@ def _evidence(
 
 def _write_evidence(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def _system_startup_checkpoint(system: object) -> int | None:
