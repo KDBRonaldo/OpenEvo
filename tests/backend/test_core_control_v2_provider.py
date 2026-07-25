@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+import hashlib
+import multiprocessing
+from multiprocessing.connection import Connection
 from pathlib import Path
 import sqlite3
 import threading
 
 import pytest
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from fastapi.testclient import TestClient
 
 from openevo.backend.contracts.v2.app import (
+    CoreControlHTTPErrorV2,
     _iter_api_routes,
     create_core_control_v2_contract_app,
 )
@@ -27,6 +32,7 @@ from openevo.backend.contracts.v2.store import (
 from openevo.backend.contracts.v2.models import (
     EffectiveExecutionSnapshotRefV2,
     EvolutionRevisionRefV2,
+    OperationV2,
     ProjectCreateV2,
     ProjectHeadRefV2,
     RuntimeContextSnapshotRefV2,
@@ -35,7 +41,12 @@ from openevo.backend.contracts.v2.models import (
     WorkspaceSnapshotRefV2,
     project_config_sha256_for,
 )
+from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
+from openevo.backend.science_successor import (
+    ScienceSuccessorCleanupContextV2,
+    ScienceSuccessorCleanupReceiptV2,
+)
 from openevo.backend.science_run_store import ScienceProjectAdmissionAuthorityV2
 from tests.framework_testkit import verified_builtin_registry
 from tests.backend.test_science_successor_v2 import (
@@ -50,6 +61,24 @@ from tests.backend.test_science_successor_v2 import (
 
 _TOKEN = "core-v2-test-bearer"
 _RUNTIME_CONTRACT_SHA256 = "d" * 64
+
+
+def _hold_catalog_action_fence(
+    root: str,
+    channel: Connection,
+) -> None:
+    store = CoreControlStoreV2(root)
+    try:
+        channel.send("attempting")
+        with store.action_execution_fence(
+            coordination_scope="cross-process-test",
+        ):
+            channel.send("acquired")
+            if not channel.poll(5) or channel.recv() != "release":
+                raise RuntimeError("action-fence test process was not released")
+    finally:
+        store.close()
+        channel.close()
 
 
 def _project_config() -> ScienceProjectConfigV2:
@@ -170,9 +199,7 @@ def _request(authority: ScienceProjectAdmissionAuthorityV2) -> TaskSubmitRequest
         project_id=authority.project_id,
         expected_project_admission_etag=authority.project_etag,
         expected_project_head_id=authority.active_project_head.project_head_id,
-        expected_project_head_manifest_sha256=(
-            authority.active_project_head.manifest_sha256
-        ),
+        expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
         expected_project_config_sha256=authority.project_config_sha256,
     )
 
@@ -198,9 +225,7 @@ class _Runtime:
             runtime_contract_sha256=_RUNTIME_CONTRACT_SHA256,
             clock=self.clock,
         )
-        self.authority = _authority(
-            registry_sha256=self.registry.snapshot.registry_digest
-        )
+        self.authority = _authority(registry_sha256=self.registry.snapshot.registry_digest)
         self.provider.publish_project_admission_authority(
             display_name="Provider project",
             config=_project_config(),
@@ -255,9 +280,7 @@ def test_provider_negotiates_exact_v2_authority_and_authenticates(
     unauthorized = runtime.client.get("/v2/system/status")
     assert unauthorized.status_code == 401
     assert unauthorized.json()["code"] == "core_bearer_invalid"
-    assert runtime.client.get(
-        "/v2/system/status", headers=runtime.headers
-    ).status_code == 200
+    assert runtime.client.get("/v2/system/status", headers=runtime.headers).status_code == 200
     assert runtime.provider.operation_ids == frozenset(
         route.operation_id
         for route in _iter_api_routes(runtime.app.routes)
@@ -328,9 +351,7 @@ def test_project_task_attempt_context_and_events_are_authoritative(
     )
     assert submit.status_code == 202
     task = submit.json()
-    assert task["admission"]["predecessor_project_head"]["project_head_id"] == (
-        "project-head-0"
-    )
+    assert task["admission"]["predecessor_project_head"]["project_head_id"] == ("project-head-0")
     replay = runtime.client.post(
         "/v2/tasks",
         headers={**runtime.headers, "Idempotency-Key": "submit-1"},
@@ -343,17 +364,11 @@ def test_project_task_attempt_context_and_events_are_authoritative(
     fetched = runtime.client.get(f"/v2/tasks/{task_id}", headers=runtime.headers)
     assert fetched.status_code == 200
     assert fetched.headers["etag"] == task["etag"]
-    admission = runtime.client.get(
-        f"/v2/tasks/{task_id}/admission", headers=runtime.headers
-    )
+    admission = runtime.client.get(f"/v2/tasks/{task_id}/admission", headers=runtime.headers)
     assert admission.json() == task["admission"]
-    context = runtime.client.get(
-        f"/v2/tasks/{task_id}/context", headers=runtime.headers
-    )
+    context = runtime.client.get(f"/v2/tasks/{task_id}/context", headers=runtime.headers)
     assert context.status_code == 200
-    assert context.json()["project_head"] == task["admission"][
-        "predecessor_project_head"
-    ]
+    assert context.json()["project_head"] == task["admission"]["predecessor_project_head"]
 
     first = task["attempts"][0]
     append = runtime.client.post(
@@ -369,22 +384,16 @@ def test_project_task_attempt_context_and_events_are_authoritative(
     )
     assert append.status_code == 202
     assert append.json()["ordinal"] == 2
-    attempts = runtime.client.get(
-        f"/v2/tasks/{task_id}/attempts", headers=runtime.headers
-    )
+    attempts = runtime.client.get(f"/v2/tasks/{task_id}/attempts", headers=runtime.headers)
     assert [item["ordinal"] for item in attempts.json()["items"]] == [1, 2]
 
-    timeline = runtime.client.get(
-        f"/v2/tasks/{task_id}/timeline", headers=runtime.headers
-    )
+    timeline = runtime.client.get(f"/v2/tasks/{task_id}/timeline", headers=runtime.headers)
     assert [item["event_type"] for item in timeline.json()["items"]] == [
         "task_admitted",
         "attempt_appended",
         "attempt_appended",
     ]
-    events = runtime.provider.invoke(
-        "streamCoreEventsV2", {"last_event_id": None}
-    )
+    events = runtime.provider.invoke("streamCoreEventsV2", {"last_event_id": None})
     assert isinstance(events, StreamingResponse)
 
     async def first_two_frames() -> tuple[bytes, bytes]:
@@ -434,9 +443,7 @@ def test_event_reconnect_rejects_unknown_cursor_without_fallback(
     )
     retained = runtime.owner.list_events()
     event_id = retained[-1].event_id
-    resumed = runtime.provider.invoke(
-        "streamCoreEventsV2", {"last_event_id": event_id}
-    )
+    resumed = runtime.provider.invoke("streamCoreEventsV2", {"last_event_id": event_id})
     assert isinstance(resumed, StreamingResponse)
 
     expired = runtime.client.get(
@@ -508,9 +515,10 @@ def test_task_close_uses_etag_and_durable_idempotent_operation(
     )
     assert operation.status_code == 200
     assert operation.json() == closed.json()
-    assert runtime.client.get(
-        f"/v2/tasks/{task_id}", headers=runtime.headers
-    ).json()["state"] == "closed"
+    assert (
+        runtime.client.get(f"/v2/tasks/{task_id}", headers=runtime.headers).json()["state"]
+        == "closed"
+    )
 
     different_action = runtime.client.post(
         f"/v2/tasks/{task_id}/close",
@@ -523,6 +531,17 @@ def test_task_close_uses_etag_and_durable_idempotent_operation(
     )
     assert different_action.status_code == 412
     assert different_action.json()["code"] == "task_etag_changed"
+    different_action_replay = runtime.client.post(
+        f"/v2/tasks/{task_id}/close",
+        headers={
+            **runtime.headers,
+            "Idempotency-Key": "close-task-different-action",
+            "If-Match": task["etag"],
+        },
+        json=action,
+    )
+    assert different_action_replay.status_code == 412
+    assert different_action_replay.json()["code"] == different_action.json()["code"]
 
     reused = runtime.client.post(
         f"/v2/tasks/{task_id}/close",
@@ -594,13 +613,9 @@ def test_task_close_uses_etag_and_durable_idempotent_operation(
         runtime_contract_sha256=_RUNTIME_CONTRACT_SHA256,
         clock=_Clock(),
     )
-    restarted_client = TestClient(
-        create_core_control_v2_contract_app(restarted_provider)
-    )
+    restarted_client = TestClient(create_core_control_v2_contract_app(restarted_provider))
     try:
-        recovered = restarted_client.get(
-            f"/v2/operations/{operation_id}", headers=runtime.headers
-        )
+        recovered = restarted_client.get(f"/v2/operations/{operation_id}", headers=runtime.headers)
         assert recovered.status_code == 200
         assert recovered.json() == closed.json()
     finally:
@@ -626,9 +641,7 @@ def test_project_create_idempotency_etag_and_cursor_are_closed(
     assert created.json()["active_project_head"] is None
     assert created.json()["admission_etag"] is None
     assert created.json()["config"] == request["config"]
-    assert created.json()["project_config_sha256"] == project_config_sha256_for(
-        _project_config()
-    )
+    assert created.json()["project_config_sha256"] == project_config_sha256_for(_project_config())
     assert created.headers["etag"] == created.json()["etag"]
 
     replay = runtime.client.post(
@@ -646,9 +659,7 @@ def test_project_create_idempotency_etag_and_cursor_are_closed(
     assert conflict.status_code == 409
     assert conflict.json()["code"] == "project_idempotency_key_reused"
 
-    first_page = runtime.client.get(
-        "/v2/projects?limit=1&direction=asc", headers=runtime.headers
-    )
+    first_page = runtime.client.get("/v2/projects?limit=1&direction=asc", headers=runtime.headers)
     assert first_page.status_code == 200
     assert first_page.json()["has_more"] is True
     cursor = first_page.json()["next_cursor"]
@@ -677,25 +688,19 @@ def test_project_resource_etag_binds_the_complete_admission_authority(
         active_project_head=runtime.authority.active_project_head,
         project_config_sha256=runtime.authority.project_config_sha256,
         workspace_snapshot=_workspace(runtime.authority.project_id, "9"),
-        normalized_evolution_intent_sha256=(
-            runtime.authority.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(runtime.authority.normalized_evolution_intent_sha256),
     )
     runtime.provider.publish_project_admission_authority(
         display_name="Provider project",
         config=_project_config(),
         authority=updated_authority,
-        expected_project_head_id=(
-            runtime.authority.active_project_head.project_head_id
-        ),
+        expected_project_head_id=(runtime.authority.active_project_head.project_head_id),
     )
 
     after = runtime.client.get("/v2/projects/project-1", headers=runtime.headers)
     assert after.status_code == 200
     assert after.json()["active_project_head"] == before.json()["active_project_head"]
-    assert after.json()["project_config_sha256"] == before.json()[
-        "project_config_sha256"
-    ]
+    assert after.json()["project_config_sha256"] == before.json()["project_config_sha256"]
     assert after.json()["admission_etag"] != before.json()["admission_etag"]
     assert after.headers["etag"] != before.headers["etag"]
 
@@ -744,9 +749,7 @@ def test_provider_exposes_only_authoritative_services_and_fails_closed_elsewhere
         params={"execution_mode": "codex_subscription_transcript"},
     )
     assert capabilities.status_code == 200
-    assert capabilities.json()["registry_digest"] == (
-        runtime.registry.snapshot.registry_digest
-    )
+    assert capabilities.json()["registry_digest"] == (runtime.registry.snapshot.registry_digest)
     assert capabilities.json()["evaluated_profile"]["execution_mode"] == "subscription"
 
     validation = runtime.client.post(
@@ -835,9 +838,7 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
     client = TestClient(create_core_control_v2_contract_app(provider))
     headers = {"Authorization": f"Bearer {_TOKEN}"}
     try:
-        assert "atomic_successor_v2" not in client.get("/version").json()[
-            "feature_flags"
-        ]
+        assert "atomic_successor_v2" not in client.get("/version").json()["feature_flags"]
         admitted = client.post(
             "/v2/tasks",
             headers={**headers, "Idempotency-Key": "successor-task"},
@@ -859,9 +860,7 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
         )
         assert fetched.status_code == 200
         assert fetched.json()["state"] == "committed"
-        active = client.get(
-            f"/v2/projects/{authority.project_id}/heads/active", headers=headers
-        )
+        active = client.get(f"/v2/projects/{authority.project_id}/heads/active", headers=headers)
         assert active.json()["generation"] == 1
         assert active.json()["project_head_id"] == (
             transition.transition.successor_project_head.project_head_id
@@ -926,13 +925,14 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
         runtime_contract_sha256="b" * 64,
         clock=_Clock(),
     )
-    restarted_client = TestClient(
-        create_core_control_v2_contract_app(restarted_provider)
-    )
+    restarted_client = TestClient(create_core_control_v2_contract_app(restarted_provider))
     try:
-        assert restarted_client.get(
-            f"/v2/projects/{authority.project_id}/heads/active", headers=headers
-        ).json()["generation"] == 1
+        assert (
+            restarted_client.get(
+                f"/v2/projects/{authority.project_id}/heads/active", headers=headers
+            ).json()["generation"]
+            == 1
+        )
         replay = restarted_provider.invoke(
             "streamCoreEventsV2",
             {"last_event_id": last_event_id},
@@ -941,6 +941,912 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
     finally:
         restarted_client.close()
         restarted_provider.close()
+
+
+@pytest.mark.parametrize(
+    ("action", "expected_transition_state", "expected_task_state"),
+    [
+        ("retry", "committed", "completed"),
+        ("abandon", "cancelled", "completed"),
+    ],
+)
+def test_failed_successor_actions_are_authoritative_and_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+    expected_transition_state: str,
+    expected_task_state: str,
+) -> None:
+    root = tmp_path / action
+    clock = _Clock()
+    registry = verified_builtin_registry(root / "registry")
+    authority = _successor_authority(
+        _successor_head(registry_sha256=registry.snapshot.registry_digest)
+    )
+    preparer = _SuccessorPreparer(fail_phase="materializing")
+    owner = CoreScienceTaskOwnerV2(
+        state_root=root,
+        clock=clock,
+        successor_preparer=preparer,
+    )
+    store = CoreControlStoreV2(root / "core-control-v2")
+    provider = CoreControlProviderV2(
+        store,
+        task_owner=owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    provider.publish_project_admission_authority(
+        display_name="Recoverable successor project",
+        config=_successor_project_config(),
+        authority=authority,
+    )
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    try:
+        admitted = client.post(
+            "/v2/tasks",
+            headers={**headers, "Idempotency-Key": f"{action}-task"},
+            json=_successor_request(authority).model_dump(mode="json"),
+        )
+        task = owner.invoke(
+            "getCoreTaskV2",
+            {"task_id": admitted.json()["task_id"]},
+        )
+        with pytest.raises(CoreTaskControlError):
+            owner.run_successor_transition(
+                task.task_id,
+                accepted_attempt_id=task.attempts[0].attempt_id,
+                plan=_successor_plan(task),
+            )
+        failed = owner.get_successor_transition_for_task(task.task_id)
+        preparer.fail_phase = None
+        request = {
+            "schema_version": "2",
+            "expected_project_head_id": (authority.active_project_head.project_head_id),
+        }
+        action_headers = {
+            **headers,
+            "Idempotency-Key": f"{action}-failed-successor",
+        }
+        original_commit_action = store.commit_action
+        fail_commit = True
+
+        def fail_first_action_commit(**kwargs: object):
+            nonlocal fail_commit
+            if fail_commit:
+                fail_commit = False
+                raise CoreControlStoreV2Error("injected action commit failure")
+            return original_commit_action(**kwargs)
+
+        stale = client.post(
+            f"/v2/transitions/{failed.transition.successor_transition_id}/{action}",
+            headers={
+                **headers,
+                "Idempotency-Key": f"{action}-stale-head",
+            },
+            json={
+                "schema_version": "2",
+                "expected_project_head_id": "another-project-head",
+            },
+        )
+        assert stale.status_code == 412
+        assert (
+            owner.get_successor_transition(failed.transition.successor_transition_id).state
+            == "failed"
+        )
+
+        monkeypatch.setattr(store, "commit_action", fail_first_action_commit)
+        interrupted = client.post(
+            f"/v2/transitions/{failed.transition.successor_transition_id}/{action}",
+            headers=action_headers,
+            json=request,
+        )
+        assert interrupted.status_code == 503
+        assert interrupted.json()["code"] == "project_catalog_unavailable"
+        assert (
+            owner.get_successor_transition(failed.transition.successor_transition_id).state
+            == expected_transition_state
+        )
+
+        response = client.post(
+            f"/v2/transitions/{failed.transition.successor_transition_id}/{action}",
+            headers=action_headers,
+            json=request,
+        )
+        replay = client.post(
+            f"/v2/transitions/{failed.transition.successor_transition_id}/{action}",
+            headers=action_headers,
+            json=request,
+        )
+
+        assert response.status_code == 202
+        assert replay.status_code == 202
+        assert replay.json() == response.json()
+        assert response.json()["kind"] == f"transition_{action}"
+        assert response.json()["status"] == "succeeded"
+        assert (
+            owner.get_successor_transition(failed.transition.successor_transition_id).state
+            == expected_transition_state
+        )
+        assert (
+            owner.invoke(
+                "getCoreTaskV2",
+                {"task_id": task.task_id},
+            ).state
+            == expected_task_state
+        )
+        if action == "abandon":
+            losing_headers = {
+                **headers,
+                "Idempotency-Key": "abandon-losing-action",
+            }
+            losing_path = f"/v2/transitions/{failed.transition.successor_transition_id}/abandon"
+            losing = client.post(
+                losing_path,
+                headers=losing_headers,
+                json=request,
+            )
+            losing_replay = client.post(
+                losing_path,
+                headers=losing_headers,
+                json=request,
+            )
+            assert losing.status_code == 409
+            assert losing_replay.status_code == 409
+            assert losing_replay.json()["code"] == losing.json()["code"]
+
+        conflict = client.post(
+            f"/v2/transitions/{failed.transition.successor_transition_id}/{action}",
+            headers=action_headers,
+            json={
+                "schema_version": "2",
+                "expected_project_head_id": "another-project-head",
+            },
+        )
+        assert conflict.status_code == 409
+    finally:
+        client.close()
+        provider.close()
+
+
+def test_abandon_action_replay_finishes_durable_cleanup_before_success(
+    tmp_path: Path,
+) -> None:
+    class _CleanupFailsOnce(_SuccessorPreparer):
+        def __init__(self) -> None:
+            super().__init__(
+                fail_phase="materializing",
+                workspace_seed="9",
+            )
+            self.discard_attempts = 0
+
+        def discard_transition_outputs(
+            self,
+            context: ScienceSuccessorCleanupContextV2,
+        ) -> ScienceSuccessorCleanupReceiptV2:
+            self._enter("discarding_outputs")
+            self.discard_attempts += 1
+            if self.discard_attempts == 1:
+                raise RuntimeError("transport failed before durable discard")
+            return ScienceSuccessorCleanupReceiptV2(
+                successor_transition_id=(context.transition.transition.successor_transition_id),
+            )
+
+    clock = _Clock()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    authority = _successor_authority(
+        _successor_head(registry_sha256=(registry.snapshot.registry_digest))
+    )
+    preparer = _CleanupFailsOnce()
+    owner = CoreScienceTaskOwnerV2(
+        state_root=tmp_path,
+        clock=clock,
+        successor_preparer=preparer,
+    )
+    store = CoreControlStoreV2(tmp_path / "core-control-v2")
+    provider = CoreControlProviderV2(
+        store,
+        task_owner=owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    provider.publish_project_admission_authority(
+        display_name="Cleanup-fenced successor project",
+        config=_successor_project_config(),
+        authority=authority,
+    )
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    try:
+        admitted = client.post(
+            "/v2/tasks",
+            headers={
+                **headers,
+                "Idempotency-Key": "cleanup-fenced-task",
+            },
+            json=_successor_request(authority).model_dump(mode="json"),
+        )
+        assert admitted.status_code == 202
+        task = owner.invoke(
+            "getCoreTaskV2",
+            {"task_id": admitted.json()["task_id"]},
+        )
+        with pytest.raises(CoreTaskControlError):
+            owner.run_successor_transition(
+                task.task_id,
+                accepted_attempt_id=(task.attempts[0].attempt_id),
+                plan=_successor_plan(task),
+            )
+        failed = owner.get_successor_transition_for_task(task.task_id)
+        transition_id = failed.transition.successor_transition_id
+        request = {
+            "schema_version": "2",
+            "expected_project_head_id": (authority.active_project_head.project_head_id),
+        }
+        action_headers = {
+            **headers,
+            "Idempotency-Key": ("cleanup-fenced-abandon"),
+        }
+        path = f"/v2/transitions/{transition_id}/abandon"
+
+        interrupted = client.post(
+            path,
+            headers=action_headers,
+            json=request,
+        )
+        assert interrupted.status_code == 503
+        assert interrupted.json()["code"] == "task_owner_unavailable"
+        assert preparer.discard_attempts == 1
+        blocked = owner.project_admission_authority(authority.project_id)
+        assert blocked.blockers
+        blocked_submit = client.post(
+            "/v2/tasks",
+            headers={
+                **headers,
+                "Idempotency-Key": ("blocked-before-cleanup"),
+            },
+            json=_successor_request(blocked).model_dump(mode="json"),
+        )
+        assert blocked_submit.status_code == 409
+        assert blocked_submit.json()["code"] == "project_not_ready"
+
+        completed = client.post(
+            path,
+            headers=action_headers,
+            json=request,
+        )
+        replay = client.post(
+            path,
+            headers=action_headers,
+            json=request,
+        )
+        assert completed.status_code == 202
+        assert replay.status_code == 202
+        assert replay.json() == completed.json()
+        assert completed.json()["status"] == "succeeded"
+        assert preparer.discard_attempts == 2
+        ready = owner.project_admission_authority(authority.project_id)
+        assert ready.blockers == ()
+    finally:
+        client.close()
+        provider.close()
+
+
+def test_retry_action_replay_recovers_an_interrupted_reserved_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _Clock()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    authority = _successor_authority(
+        _successor_head(
+            registry_sha256=registry.snapshot.registry_digest,
+        )
+    )
+    preparer = _SuccessorPreparer(
+        fail_phase="materializing",
+    )
+    owner = CoreScienceTaskOwnerV2(
+        state_root=tmp_path,
+        clock=clock,
+        successor_preparer=preparer,
+    )
+    store = CoreControlStoreV2(tmp_path / "core-control-v2")
+    provider = CoreControlProviderV2(
+        store,
+        task_owner=owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    provider.publish_project_admission_authority(
+        display_name="Interrupted retry project",
+        config=_successor_project_config(),
+        authority=authority,
+    )
+    task = provider.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": _successor_request(authority),
+            "idempotency_key": "interrupted-retry-task",
+        },
+    )
+    with pytest.raises(CoreTaskControlError):
+        owner.run_successor_transition(
+            task.task_id,
+            accepted_attempt_id=task.attempts[0].attempt_id,
+            plan=_successor_plan(task),
+        )
+    transition_id = owner.get_successor_transition_for_task(
+        task.task_id
+    ).transition.successor_transition_id
+    preparer.fail_phase = None
+    arguments = {
+        "successor_transition_id": transition_id,
+        "request": {
+            "schema_version": "2",
+            "expected_project_head_id": (authority.active_project_head.project_head_id),
+        },
+        "idempotency_key": "interrupted-retry-action",
+    }
+    original_retry = owner.retry_successor_transition
+
+    def crash_after_retry_reservation(
+        successor_transition_id: str,
+        *,
+        expected_project_head_id: str,
+        retry_request_id: str,
+        allow_in_progress_recovery: bool = False,
+    ):
+        resumed = owner._ledger.retry_successor_transition(
+            successor_transition_id,
+            expected_project_head_id=expected_project_head_id,
+            retry_request_id=retry_request_id,
+            now=clock(),
+            allow_in_progress_recovery=(allow_in_progress_recovery),
+        )
+        assert resumed.state in {
+            "pending",
+            "running_methods",
+        }
+        raise SystemExit("simulated crash after retry reservation")
+
+    monkeypatch.setattr(
+        owner,
+        "retry_successor_transition",
+        crash_after_retry_reservation,
+    )
+    with pytest.raises(SystemExit):
+        provider.invoke(
+            "retryCoreSuccessorTransitionV2",
+            arguments,
+        )
+    monkeypatch.setattr(
+        owner,
+        "retry_successor_transition",
+        original_retry,
+    )
+    assert owner.get_successor_transition(transition_id).state in {"pending", "running_methods"}
+    reserved_attempts = owner.successor_transition_attempts(transition_id)
+    assert len(reserved_attempts) == 2
+    reserved_retry_attempt_id = reserved_attempts[-1].transition_attempt_id
+    provider.close()
+
+    restarted_owner = CoreScienceTaskOwnerV2(
+        state_root=tmp_path,
+        clock=clock,
+        successor_preparer=_SuccessorPreparer(),
+    )
+    interrupted = restarted_owner.get_successor_transition(transition_id)
+    assert interrupted.state == "failed"
+    assert interrupted.error is not None
+    assert interrupted.error.code == "successor_transition_interrupted"
+    restarted_store = CoreControlStoreV2(tmp_path / "core-control-v2")
+    restarted_provider = CoreControlProviderV2(
+        restarted_store,
+        task_owner=restarted_owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    try:
+        response = restarted_provider.invoke(
+            "retryCoreSuccessorTransitionV2",
+            arguments,
+        )
+        assert isinstance(response, Response)
+        operation = OperationV2.model_validate_json(response.body)
+        assert operation.status == "succeeded"
+        assert restarted_owner.get_successor_transition(transition_id).state == "committed"
+        completed_attempts = restarted_owner.successor_transition_attempts(transition_id)
+        assert len(completed_attempts) == 2
+        assert completed_attempts[-1].transition_attempt_id == reserved_retry_attempt_id
+        assert completed_attempts[-1].state == "committed"
+        replay = restarted_provider.invoke(
+            "retryCoreSuccessorTransitionV2",
+            arguments,
+        )
+        assert isinstance(replay, Response)
+        assert replay.body == response.body
+    finally:
+        restarted_provider.close()
+
+
+def test_failed_retry_action_exact_replay_does_not_commit_success(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    authority = _successor_authority(
+        _successor_head(
+            registry_sha256=registry.snapshot.registry_digest,
+        )
+    )
+    preparer = _SuccessorPreparer(
+        fail_phase="materializing",
+    )
+    owner = CoreScienceTaskOwnerV2(
+        state_root=tmp_path,
+        clock=clock,
+        successor_preparer=preparer,
+    )
+    store = CoreControlStoreV2(tmp_path / "core-control-v2")
+    provider = CoreControlProviderV2(
+        store,
+        task_owner=owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    provider.publish_project_admission_authority(
+        display_name="Failed retry replay project",
+        config=_successor_project_config(),
+        authority=authority,
+    )
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    try:
+        admitted = client.post(
+            "/v2/tasks",
+            headers={
+                **headers,
+                "Idempotency-Key": "failed-retry-task",
+            },
+            json=_successor_request(authority).model_dump(mode="json"),
+        )
+        task = owner.invoke(
+            "getCoreTaskV2",
+            {"task_id": admitted.json()["task_id"]},
+        )
+        with pytest.raises(CoreTaskControlError):
+            owner.run_successor_transition(
+                task.task_id,
+                accepted_attempt_id=(task.attempts[0].attempt_id),
+                plan=_successor_plan(task),
+            )
+        transition_id = owner.get_successor_transition_for_task(
+            task.task_id
+        ).transition.successor_transition_id
+        path = f"/v2/transitions/{transition_id}/retry"
+        action_headers = {
+            **headers,
+            "Idempotency-Key": "failed-retry-action",
+        }
+        request = {
+            "schema_version": "2",
+            "expected_project_head_id": (authority.active_project_head.project_head_id),
+        }
+        first = client.post(
+            path,
+            headers=action_headers,
+            json=request,
+        )
+        replay = client.post(
+            path,
+            headers=action_headers,
+            json=request,
+        )
+        assert first.status_code == 503
+        assert replay.status_code == 503
+        assert first.json()["code"] == "successor_transition_failed"
+        assert replay.json()["code"] == first.json()["code"]
+        assert owner.get_successor_transition(transition_id).state == "failed"
+        assert len(owner.successor_transition_attempts(transition_id)) == 2
+    finally:
+        client.close()
+        provider.close()
+
+
+def test_losing_retry_key_cannot_adopt_another_keys_commit(
+    tmp_path: Path,
+) -> None:
+    clock = _Clock()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    authority = _successor_authority(
+        _successor_head(
+            registry_sha256=registry.snapshot.registry_digest,
+        )
+    )
+    preparer = _SuccessorPreparer(
+        fail_phase="materializing",
+    )
+    owner = CoreScienceTaskOwnerV2(
+        state_root=tmp_path,
+        clock=clock,
+        successor_preparer=preparer,
+    )
+    store = CoreControlStoreV2(tmp_path / "core-control-v2")
+    provider = CoreControlProviderV2(
+        store,
+        task_owner=owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    provider.publish_project_admission_authority(
+        display_name="Competing retry project",
+        config=_successor_project_config(),
+        authority=authority,
+    )
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    try:
+        admitted = client.post(
+            "/v2/tasks",
+            headers={
+                **headers,
+                "Idempotency-Key": "competing-retry-task",
+            },
+            json=_successor_request(authority).model_dump(mode="json"),
+        )
+        task = owner.invoke(
+            "getCoreTaskV2",
+            {"task_id": admitted.json()["task_id"]},
+        )
+        with pytest.raises(CoreTaskControlError):
+            owner.run_successor_transition(
+                task.task_id,
+                accepted_attempt_id=(task.attempts[0].attempt_id),
+                plan=_successor_plan(task),
+            )
+        transition_id = owner.get_successor_transition_for_task(
+            task.task_id
+        ).transition.successor_transition_id
+        preparer.fail_phase = None
+        path = f"/v2/transitions/{transition_id}/retry"
+        request = {
+            "schema_version": "2",
+            "expected_project_head_id": (authority.active_project_head.project_head_id),
+        }
+        winner = client.post(
+            path,
+            headers={
+                **headers,
+                "Idempotency-Key": "winner-retry",
+            },
+            json=request,
+        )
+        assert winner.status_code == 202
+        assert owner.get_successor_transition(transition_id).state == "committed"
+
+        loser_headers = {
+            **headers,
+            "Idempotency-Key": "loser-retry",
+        }
+        first_loser = client.post(
+            path,
+            headers=loser_headers,
+            json=request,
+        )
+        replayed_loser = client.post(
+            path,
+            headers=loser_headers,
+            json=request,
+        )
+        assert first_loser.status_code == 409
+        assert replayed_loser.status_code == 409
+        assert first_loser.json()["code"] == "task_terminal"
+        assert replayed_loser.json()["code"] == first_loser.json()["code"]
+        assert len(owner.successor_transition_attempts(transition_id)) == 2
+    finally:
+        client.close()
+        provider.close()
+
+
+@pytest.mark.parametrize(
+    ("contender_action", "contender_key"),
+    [
+        ("retry", "serialized-retry"),
+        ("abandon", "serialized-abandon"),
+    ],
+)
+def test_transition_actions_are_serialized_across_provider_instances(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contender_action: str,
+    contender_key: str,
+) -> None:
+    root = tmp_path / contender_action
+    clock = _Clock()
+    registry = verified_builtin_registry(root / "registry")
+    authority = _successor_authority(
+        _successor_head(
+            registry_sha256=registry.snapshot.registry_digest,
+        )
+    )
+    first_preparer = _SuccessorPreparer(
+        fail_phase="materializing",
+    )
+    first_owner = CoreScienceTaskOwnerV2(
+        state_root=root,
+        clock=clock,
+        successor_preparer=first_preparer,
+    )
+    first_store = CoreControlStoreV2(
+        root / "core-control-v2",
+    )
+    first_provider = CoreControlProviderV2(
+        first_store,
+        task_owner=first_owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    first_provider.publish_project_admission_authority(
+        display_name="Serialized successor project",
+        config=_successor_project_config(),
+        authority=authority,
+    )
+    admitted = first_provider.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": _successor_request(authority),
+            "idempotency_key": (f"serialized-{contender_action}-task"),
+        },
+    )
+    task = first_owner.invoke(
+        "getCoreTaskV2",
+        {"task_id": admitted.task_id},
+    )
+    with pytest.raises(CoreTaskControlError):
+        first_owner.run_successor_transition(
+            task.task_id,
+            accepted_attempt_id=task.attempts[0].attempt_id,
+            plan=_successor_plan(task),
+        )
+    failed = first_owner.get_successor_transition_for_task(task.task_id)
+    transition_id = failed.transition.successor_transition_id
+    first_preparer.fail_phase = None
+
+    second_owner = CoreScienceTaskOwnerV2(
+        state_root=root,
+        clock=clock,
+        successor_preparer=_SuccessorPreparer(),
+    )
+    second_store = CoreControlStoreV2(
+        root / "core-control-v2",
+    )
+    second_provider = CoreControlProviderV2(
+        second_store,
+        task_owner=second_owner,
+        executable_registry=registry,
+        bearer_token=_TOKEN,
+        release_version="0.1.9",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256="b" * 64,
+        clock=clock,
+    )
+    first_reserved = threading.Event()
+    release_first = threading.Event()
+    contender_began = threading.Event()
+    original_first_begin = first_store.begin_action
+    original_second_begin = second_store.begin_action
+
+    def pause_after_first_reservation(**kwargs: object):
+        reservation = original_first_begin(**kwargs)
+        first_reserved.set()
+        assert release_first.wait(timeout=5)
+        return reservation
+
+    def observe_contender_reservation(**kwargs: object):
+        contender_began.set()
+        return original_second_begin(**kwargs)
+
+    monkeypatch.setattr(
+        first_store,
+        "begin_action",
+        pause_after_first_reservation,
+    )
+    monkeypatch.setattr(
+        second_store,
+        "begin_action",
+        observe_contender_reservation,
+    )
+    request = {
+        "schema_version": "2",
+        "expected_project_head_id": (authority.active_project_head.project_head_id),
+    }
+    first_arguments = {
+        "successor_transition_id": transition_id,
+        "request": request,
+        "idempotency_key": "serialized-retry",
+    }
+    contender_arguments = {
+        "successor_transition_id": transition_id,
+        "request": request,
+        "idempotency_key": contender_key,
+    }
+    contender_operation = (
+        "retryCoreSuccessorTransitionV2"
+        if contender_action == "retry"
+        else "abandonCoreSuccessorTransitionV2"
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first_future = pool.submit(
+                first_provider.invoke,
+                "retryCoreSuccessorTransitionV2",
+                first_arguments,
+            )
+            assert first_reserved.wait(timeout=5)
+            contender_future = pool.submit(
+                second_provider.invoke,
+                contender_operation,
+                contender_arguments,
+            )
+            try:
+                assert not contender_began.wait(timeout=0.25)
+            finally:
+                release_first.set()
+            first_response = first_future.result(timeout=5)
+            assert isinstance(first_response, Response)
+            if contender_action == "retry":
+                contender_response = contender_future.result(timeout=5)
+                assert isinstance(contender_response, Response)
+                assert contender_response.body == first_response.body
+            else:
+                with pytest.raises(CoreControlHTTPErrorV2) as exc_info:
+                    contender_future.result(timeout=5)
+                assert exc_info.value.status_code == 409
+        assert first_owner.get_successor_transition(transition_id).state == "committed"
+    finally:
+        release_first.set()
+        second_provider.close()
+        first_provider.close()
+
+
+def test_action_execution_fence_serializes_separate_processes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "cross-process-catalog"
+    store = CoreControlStoreV2(root)
+    process_context = multiprocessing.get_context("spawn")
+    parent_channel, child_channel = process_context.Pipe()
+    process = process_context.Process(
+        target=_hold_catalog_action_fence,
+        args=(str(root), child_channel),
+    )
+    try:
+        with store.action_execution_fence(
+            coordination_scope="cross-process-test",
+        ):
+            process.start()
+            child_channel.close()
+            assert parent_channel.poll(5)
+            assert parent_channel.recv() == "attempting"
+            assert not parent_channel.poll(0.25)
+        assert parent_channel.poll(5)
+        assert parent_channel.recv() == "acquired"
+        parent_channel.send("release")
+        process.join(timeout=5)
+        assert process.exitcode == 0
+    finally:
+        if process.is_alive():
+            parent_channel.send("release")
+            process.join(timeout=5)
+        parent_channel.close()
+        child_channel.close()
+        store.close()
+
+
+def test_action_execution_fence_is_released_after_process_crash(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "crashed-action-fence"
+    store = CoreControlStoreV2(root)
+    process_context = multiprocessing.get_context("spawn")
+    parent_channel, child_channel = process_context.Pipe()
+    process = process_context.Process(
+        target=_hold_catalog_action_fence,
+        args=(str(root), child_channel),
+    )
+    try:
+        process.start()
+        child_channel.close()
+        assert parent_channel.poll(5)
+        assert parent_channel.recv() == "attempting"
+        assert parent_channel.poll(5)
+        assert parent_channel.recv() == "acquired"
+        process.terminate()
+        process.join(timeout=5)
+        assert not process.is_alive()
+        with store.action_execution_fence(
+            coordination_scope="cross-process-test",
+        ):
+            pass
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+        parent_channel.close()
+        child_channel.close()
+        store.close()
+
+
+@pytest.mark.parametrize("corruption", ["mode", "symlink"])
+def test_action_execution_fence_rejects_lock_file_corruption(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    root = tmp_path / corruption
+    store = CoreControlStoreV2(root)
+    scope = "corrupt-action-fence"
+    with store.action_execution_fence(
+        coordination_scope=scope,
+    ):
+        pass
+    scope_sha256 = hashlib.sha256(scope.encode("utf-8")).hexdigest()
+    lock_path = root / f"action-execution-{scope_sha256}.lock"
+    if corruption == "mode":
+        lock_path.chmod(0o644)
+    else:
+        lock_path.unlink()
+        replacement = root / "replacement.lock"
+        replacement.touch(mode=0o600)
+        lock_path.symlink_to(replacement)
+    try:
+        with pytest.raises(
+            CoreControlStoreV2Error,
+            match="action execution lock",
+        ):
+            with store.action_execution_fence(
+                coordination_scope=scope,
+            ):
+                pass
+    finally:
+        store.close()
 
 
 def test_provider_rejects_registry_drift_and_schema_snapshot_drift(

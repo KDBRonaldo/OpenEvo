@@ -159,9 +159,7 @@ class CoreControlProviderV2:
         except UnicodeEncodeError as exc:
             raise ValueError("Core v2 bearer token must be ASCII") from exc
         if not token_bytes or any(value <= 32 or value == 127 for value in token_bytes):
-            raise ValueError(
-                "Core v2 bearer token must be non-empty and contain no whitespace"
-            )
+            raise ValueError("Core v2 bearer token must be non-empty and contain no whitespace")
         self.store = store
         self._task_owner = task_owner
         self._registry = require_verified_executable_registry(executable_registry)
@@ -194,16 +192,8 @@ class CoreControlProviderV2:
         feature_flags = sorted(
             [
                 *_BASE_FEATURE_FLAGS,
-                *(
-                    ["atomic_successor_v2"]
-                    if task_owner.production_ready
-                    else []
-                ),
-                *(
-                    ["task_execution_v2"]
-                    if task_owner.execution_available
-                    else []
-                ),
+                *(["atomic_successor_v2"] if task_owner.production_ready else []),
+                *(["task_execution_v2"] if task_owner.execution_available else []),
                 *(
                     ["project_genesis_v2", "workspace_snapshots_v2"]
                     if project_authority is not None
@@ -259,9 +249,7 @@ class CoreControlProviderV2:
             runtime_contract_sha256=self._runtime_contract_sha256,
             mutation_compatible=True,
         )
-        self._handlers: dict[
-            str, Callable[[Mapping[str, object]], object]
-        ] = {
+        self._handlers: dict[str, Callable[[Mapping[str, object]], object]] = {
             "discoverCoreContractVersionV2": self._version_response,
             "discoverCoreHealthV2": self._health,
             "getCoreSystemStatusV2": self._system_status,
@@ -299,6 +287,13 @@ class CoreControlProviderV2:
                     "putCoreWorkspaceUploadChunkV2": self._put_workspace_chunk,
                     "updateCoreProjectV2": self._update_project,
                     "validateCoreProjectV2": self._validate_project,
+                }
+            )
+        if task_owner.successor_available:
+            self._handlers.update(
+                {
+                    "abandonCoreSuccessorTransitionV2": (self._abandon_transition),
+                    "retryCoreSuccessorTransitionV2": self._retry_transition,
                 }
             )
         self._all_operation_ids = frozenset(
@@ -345,15 +340,12 @@ class CoreControlProviderV2:
         head = authority.active_project_head
         if (
             authority.project_id != head.project_id
-            or authority.project_config_sha256
-            != m.project_config_sha256_for(config)
+            or authority.project_config_sha256 != m.project_config_sha256_for(config)
             or head.registry_sha256 != self._registry_sha256
             or head.runtime_context_snapshot.runtime_contract_sha256
             != self._runtime_contract_sha256
         ):
-            raise ValueError(
-                "project admission authority does not match negotiated Core digests"
-            )
+            raise ValueError("project admission authority does not match negotiated Core digests")
         self.store.upsert_authoritative_project(
             project_id=authority.project_id,
             display_name=display_name,
@@ -628,9 +620,7 @@ class CoreControlProviderV2:
 
     def _get_project(self, arguments: Mapping[str, object]) -> Response:
         _keys(arguments, "project_id")
-        project = self._project_model(
-            self.store.get_project(_string(arguments["project_id"]))
-        )
+        project = self._project_model(self.store.get_project(_string(arguments["project_id"])))
         return JSONResponse(
             content=project.model_dump(mode="json"),
             headers={"ETag": project.etag},
@@ -663,16 +653,15 @@ class CoreControlProviderV2:
             state = (
                 "transitioning"
                 if authority.blockers
-                else "not_ready" if negotiated_digest_drift else "ready"
+                else "not_ready"
+                if negotiated_digest_drift
+                else "ready"
             )
             if authority.blockers:
-                transitions = self._task_owner.list_successor_transitions(
-                    record.project_id
-                )
+                transitions = self._task_owner.list_successor_transitions(record.project_id)
                 if (
                     transitions
-                    and max(transitions, key=lambda item: item.created_at).state
-                    == "failed"
+                    and max(transitions, key=lambda item: item.created_at).state == "failed"
                 ):
                     state = "needs_attention"
         if self._project_authority is not None:
@@ -713,11 +702,10 @@ class CoreControlProviderV2:
         current_record = self.store.get_project(project_id)
         current = self._project_model(current_record)
         head = current.active_project_head
-        if (
-            request.expected_project_head_id
-            != (None if head is None else head.project_head_id)
-            or request.expected_project_head_manifest_sha256
-            != (None if head is None else head.manifest_sha256)
+        if request.expected_project_head_id != (
+            None if head is None else head.project_head_id
+        ) or request.expected_project_head_manifest_sha256 != (
+            None if head is None else head.manifest_sha256
         ):
             raise ProjectAuthorityConflictV2("project head changed")
         if request.config != current_record.config:
@@ -912,9 +900,7 @@ class CoreControlProviderV2:
             has_more=has_more,
         )
 
-    def _get_active_project_head(
-        self, arguments: Mapping[str, object]
-    ) -> m.ProjectHeadRefV2:
+    def _get_active_project_head(self, arguments: Mapping[str, object]) -> m.ProjectHeadRefV2:
         _keys(arguments, "project_id")
         project_id = _string(arguments["project_id"])
         self.store.get_project(project_id)
@@ -922,13 +908,9 @@ class CoreControlProviderV2:
 
     def _get_project_head(self, arguments: Mapping[str, object]) -> m.ProjectHeadRefV2:
         _keys(arguments, "project_head_id")
-        return self._task_owner.get_project_head(
-            _string(arguments["project_head_id"])
-        )
+        return self._task_owner.get_project_head(_string(arguments["project_head_id"]))
 
-    def _list_transitions(
-        self, arguments: Mapping[str, object]
-    ) -> m.SuccessorTransitionPageV2:
+    def _list_transitions(self, arguments: Mapping[str, object]) -> m.SuccessorTransitionPageV2:
         _keys(arguments, "project_id", "limit", "after", "direction")
         project_id = _string(arguments["project_id"])
         transitions = self._task_owner.list_successor_transitions(project_id)
@@ -958,6 +940,131 @@ class CoreControlProviderV2:
         return self._task_owner.get_successor_transition(
             _string(arguments["successor_transition_id"])
         )
+
+    def _retry_transition(self, arguments: Mapping[str, object]) -> Response:
+        return self._transition_action(arguments, action="retry")
+
+    def _abandon_transition(self, arguments: Mapping[str, object]) -> Response:
+        return self._transition_action(arguments, action="abandon")
+
+    def _transition_action(
+        self,
+        arguments: Mapping[str, object],
+        *,
+        action: Literal["retry", "abandon"],
+    ) -> Response:
+        _keys(
+            arguments,
+            "successor_transition_id",
+            "request",
+            "idempotency_key",
+        )
+        transition_id = _string(arguments["successor_transition_id"])
+        request = _model(m.ActionRequestV2, arguments["request"])
+        idempotency_key = _string(arguments["idempotency_key"])
+        action_scope = f"transition-{action}:{transition_id}"
+        request_json = _canonical_action_request(
+            {
+                "action": f"transition_{action}",
+                "request": request.model_dump(mode="json"),
+                "successor_transition_id": transition_id,
+            }
+        )
+        operation_seed = hashlib.sha256(
+            action_scope.encode("utf-8")
+            + b"\0"
+            + idempotency_key.encode("utf-8")
+            + b"\0"
+            + request_json
+        ).hexdigest()
+        with (
+            self._lock,
+            self.store.action_execution_fence(
+                coordination_scope=f"transition:{transition_id}",
+            ),
+        ):
+            try:
+                reservation = self.store.begin_action(
+                    action_scope=action_scope,
+                    idempotency_key=idempotency_key,
+                    request_json=request_json,
+                )
+            except ProjectIdempotencyConflictV2 as exc:
+                raise _http_error(
+                    409,
+                    code="transition_idempotency_key_reused",
+                    message=("The idempotency key was used for another transition action."),
+                    category="transition",
+                    retryable=False,
+                    repair_action="user_action_required",
+                ) from exc
+            if reservation.operation is not None:
+                return _operation_response(
+                    reservation.operation,
+                    status_code=202,
+                )
+            if action == "retry":
+                transition = self._task_owner.retry_successor_transition(
+                    transition_id,
+                    expected_project_head_id=request.expected_project_head_id,
+                    retry_request_id=(f"transition-retry-{operation_seed[:32]}"),
+                    allow_in_progress_recovery=reservation.resumed,
+                )
+            else:
+                transition = self._task_owner.abandon_successor_transition(
+                    transition_id,
+                    expected_project_head_id=request.expected_project_head_id,
+                    abandon_request_id=(f"transition-abandon-{operation_seed[:32]}"),
+                    allow_cancelled_recovery=reservation.resumed,
+                )
+            if action == "retry" and transition.state not in {
+                "pending",
+                "running_methods",
+                "committed",
+            }:
+                raise CoreTaskControlError(
+                    (
+                        transition.error.code
+                        if transition.error is not None
+                        else "successor_transition_failed"
+                    ),
+                    "Core did not accept the successor transition retry.",
+                    http_status=503,
+                    retryable=(
+                        transition.error.retryable if transition.error is not None else True
+                    ),
+                )
+            if action == "abandon" and transition.state != "cancelled":
+                raise CoreTaskControlError(
+                    "successor_transition_abandon_failed",
+                    "Core did not complete successor transition abandonment.",
+                    http_status=503,
+                    retryable=True,
+                )
+            provisional = m.OperationV2(
+                operation_id=f"operation-{operation_seed[:32]}",
+                kind=f"transition_{action}",
+                status="succeeded",
+                progress_completed=1,
+                progress_total=1,
+                error=None,
+                created_at=transition.updated_at,
+                updated_at=transition.updated_at,
+                etag=f'"{"0" * 64}"',
+            )
+            operation = m.OperationV2.model_validate(
+                {
+                    **provisional.model_dump(mode="python"),
+                    "etag": operation_etag_for(provisional),
+                }
+            )
+            committed = self.store.commit_action(
+                action_scope=action_scope,
+                idempotency_key=idempotency_key,
+                request_json=request_json,
+                operation=operation,
+            )
+            return _operation_response(committed, status_code=202)
 
     def _submit_task(self, arguments: Mapping[str, object]) -> m.TaskV2:
         _keys(arguments, "request", "idempotency_key")
@@ -1008,9 +1115,7 @@ class CoreControlProviderV2:
 
     def _get_task(self, arguments: Mapping[str, object]) -> Response:
         _keys(arguments, "task_id")
-        task = self._task_owner.invoke(
-            "getCoreTaskV2", {"task_id": _string(arguments["task_id"])}
-        )
+        task = self._task_owner.invoke("getCoreTaskV2", {"task_id": _string(arguments["task_id"])})
         if not isinstance(task, m.TaskV2):
             raise RuntimeError("v2 Task owner returned the wrong Task type")
         return JSONResponse(
@@ -1028,9 +1133,7 @@ class CoreControlProviderV2:
     def _list_task_attempts(self, arguments: Mapping[str, object]) -> m.AttemptPageV2:
         _keys(arguments, "task_id", "limit", "after")
         task_id = _string(arguments["task_id"])
-        attempts = self._task_owner.invoke(
-            "listCoreTaskAttemptsV2", {"task_id": task_id}
-        )
+        attempts = self._task_owner.invoke("listCoreTaskAttemptsV2", {"task_id": task_id})
         if not isinstance(attempts, list):
             raise RuntimeError("v2 Task owner returned the wrong Attempt inventory")
         selected, next_cursor, has_more = _page_items(
@@ -1110,7 +1213,19 @@ class CoreControlProviderV2:
                 "if_match": if_match,
             }
         )
-        with self._lock:
+        operation_seed = hashlib.sha256(
+            action_scope.encode("utf-8")
+            + b"\0"
+            + idempotency_key.encode("utf-8")
+            + b"\0"
+            + request_json
+        ).hexdigest()
+        with (
+            self._lock,
+            self.store.action_execution_fence(
+                coordination_scope=f"task:{task_id}",
+            ),
+        ):
             try:
                 reservation = self.store.begin_action(
                     action_scope=action_scope,
@@ -1131,16 +1246,10 @@ class CoreControlProviderV2:
             closed = self._task_owner.close_task(
                 task_id,
                 request,
+                close_request_id=(f"task-close-{operation_seed[:32]}"),
                 expected_etag=if_match,
                 allow_closed_recovery=reservation.resumed,
             )
-            operation_seed = hashlib.sha256(
-                action_scope.encode("utf-8")
-                + b"\0"
-                + idempotency_key.encode("utf-8")
-                + b"\0"
-                + request_json
-            ).hexdigest()
             provisional = m.OperationV2(
                 operation_id=f"operation-{operation_seed[:32]}",
                 kind="task_close",
@@ -1395,9 +1504,7 @@ def _sse_bytes(event: m.EventEnvelopeV2) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     )
-    return (
-        f"id: {event.event_id}\nevent: {event.event_type}\ndata: {data}\n\n"
-    ).encode("utf-8")
+    return (f"id: {event.event_id}\nevent: {event.event_type}\ndata: {data}\n\n").encode("utf-8")
 
 
 def _keys(arguments: Mapping[str, object], *required: str) -> None:
@@ -1448,9 +1555,7 @@ def _digest(value: str, *, label: str) -> str:
 def _timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise TypeError("Core v2 timestamp requires an aware datetime")
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
-        "+00:00", "Z"
-    )
+    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
 
 
 def _require_exact_schema_snapshots() -> None:

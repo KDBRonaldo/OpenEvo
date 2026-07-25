@@ -390,6 +390,45 @@ def _response(
     )
 
 
+def test_selected_sealed_artifact_requires_exact_transition_authority(
+    tmp_path: Path,
+) -> None:
+    request = _request()
+    response = _response(request, _inline_projection())
+    payload = tmp_path / "artifact-a.txt"
+    payload.write_text("sealed", encoding="utf-8")
+    row = _row("artifact-a", payload)
+    row["state"] = "sealed"
+    row["sealed_owner_transition_id"] = "successor-transition-exact"
+
+    with pytest.raises(
+        ValueError,
+        match="sealed transition authority",
+    ):
+        ContextMaterializer._selected_rows(response, [row])
+
+    selected = ContextMaterializer._selected_rows(
+        response,
+        [row],
+        sealed_artifact_authority={
+            "artifact-a": "successor-transition-exact",
+        },
+    )
+    assert selected == {"artifact-a": row}
+
+    with pytest.raises(
+        ValueError,
+        match="sealed transition authority",
+    ):
+        ContextMaterializer._selected_rows(
+            response,
+            [row],
+            sealed_artifact_authority={
+                "artifact-a": "successor-transition-other",
+            },
+        )
+
+
 def test_materializer_requires_verified_registry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1672,6 +1711,80 @@ def test_receipt_bound_discard_does_not_trust_entry_replaced_on_entry(
     replacement = contexts / receipt.materialized_context.context_id
     assert (replacement / "sentinel.txt").read_text(encoding="utf-8") == "replacement"
     assert (contexts / "moved-receipt-context" / "manifest.json").is_file()
+
+
+def test_persisted_discard_receipt_preserves_entry_replaced_after_db_validation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifacts = tmp_path / "artifacts"
+    contexts = tmp_path / "contexts"
+    artifacts.mkdir()
+    source = artifacts / "source.txt"
+    source.write_text("source", encoding="utf-8")
+    materializer = _materializer(artifacts, contexts)
+    request = _request()
+    publication = materializer.materialize_for_publication(
+        request,
+        _response(
+            request,
+            _inline_projection(),
+            context_id="ctx-persisted-discard",
+        ),
+        (_row("artifact-a", source),),
+    )
+    root_descriptor = os.open(
+        contexts,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+    )
+    try:
+        receipt = materializer.prepare_persisted_discard(
+            publication.materialized_context,
+            materialization_root_descriptor=root_descriptor,
+        )
+        with pytest.raises(TypeError, match="ephemeral|persist"):
+            pickle.dumps(receipt)
+
+        def replace_before_discard(
+            discard_root_descriptor: int,
+            context_id: str,
+        ) -> None:
+            os.rename(
+                context_id,
+                "moved-persisted-context",
+                src_dir_fd=discard_root_descriptor,
+                dst_dir_fd=discard_root_descriptor,
+            )
+            replacement = contexts / context_id
+            replacement.mkdir()
+            (replacement / "sentinel.txt").write_text(
+                "replacement",
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(
+            context_materialization,
+            "_before_materialized_context_discard",
+            replace_before_discard,
+        )
+        assert (
+            materializer.discard_persisted(
+                receipt,
+                materialization_root_descriptor=root_descriptor,
+            )
+            == "mismatch"
+        )
+    finally:
+        os.close(root_descriptor)
+
+    preserved = list(contexts.glob(".openevo-preserved-*"))
+    assert len(preserved) == 1
+    assert (
+        preserved[0] / "sentinel.txt"
+    ).read_text(encoding="utf-8") == "replacement"
+    assert (
+        contexts / "moved-persisted-context" / "manifest.json"
+    ).is_file()
 
 
 def test_receipt_bound_discard_quarantines_original_without_path_deletion(

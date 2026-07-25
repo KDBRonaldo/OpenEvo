@@ -132,6 +132,44 @@ def _binding(context: MaterializedContext) -> RuntimeContextBindingV2:
     )
 
 
+def _inherited_binding(context: MaterializedContext) -> RuntimeContextBindingV2:
+    direct = _binding(context)
+    head = direct.project_head
+    inherited_head = ProjectHeadRefV2(
+        project_head_id="project-head-abandon",
+        project_id=head.project_id,
+        generation=head.generation + 1,
+        predecessor_project_head_id=head.project_head_id,
+        workspace_snapshot=WorkspaceSnapshotRefV2(
+            workspace_snapshot_id="workspace-abandon",
+            project_id=head.project_id,
+            manifest_sha256="a" * 64,
+            entry_count=2,
+            byte_size=16,
+        ),
+        evolution_revision=head.evolution_revision,
+        runtime_context_snapshot=head.runtime_context_snapshot,
+        effective_execution_snapshot=head.effective_execution_snapshot,
+        registry_sha256=head.registry_sha256,
+        manifest_sha256="b" * 64,
+    )
+    return RuntimeContextBindingV2(
+        source="materialized_inherited",
+        project_head=inherited_head,
+        service_generation_sha256=direct.service_generation_sha256,
+        framework_lock_sha256=direct.framework_lock_sha256,
+        successor_transition_id=direct.successor_transition_id,
+        source_predecessor_project_head_id=(
+            direct.source_predecessor_project_head_id
+        ),
+        materialized_context_id=direct.materialized_context_id,
+        materialized_context_manifest_sha256=(
+            direct.materialized_context_manifest_sha256
+        ),
+        selected_artifact_ids=direct.selected_artifact_ids,
+    )
+
+
 def _genesis_binding(registry_sha256: str) -> RuntimeContextBindingV2:
     project_id = "project-runtime-context"
     evolution = EvolutionRevisionRefV2(
@@ -256,6 +294,31 @@ async def test_gateway_stages_exact_committed_materialization_without_v1_fallbac
         f"{context.instruction}\n\nTask:\nDo the next task."
     )
     assert str(binding.model_dump(mode="json")).find("file://") == -1
+
+
+@pytest.mark.asyncio
+async def test_gateway_stages_exact_materialization_inherited_by_abandon() -> None:
+    memory = b"Remember it.\n"
+    context = _context(memory)
+    binding = _inherited_binding(context)
+    evolution = _Evolution(context, memory)
+    runtime = _Runtime()
+
+    staged = await _stage_materialized_runtime_context(
+        runtime=runtime,
+        evolution_client=evolution,
+        binding=binding,
+        instruction="Do the task after abandoning evolution.",
+        target_dir="/openevo/session/evolution",
+        base_model="gpt-5.5",
+    )
+
+    assert evolution.blob_calls == [(context.context_id, "blob-memory")]
+    assert runtime.uploads["/openevo/session/evolution/memory.md"] == memory
+    assert staged.injection_plan is not None
+    assert staged.injection_plan.effective_instruction.endswith(
+        "Do the task after abandoning evolution."
+    )
 
 
 @pytest.mark.asyncio

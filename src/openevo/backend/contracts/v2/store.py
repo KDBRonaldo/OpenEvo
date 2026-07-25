@@ -12,6 +12,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import fcntl
 import hashlib
 import json
 import os
@@ -144,7 +145,7 @@ class ProjectAuthorityDocumentV2:
 
 
 class CoreControlStoreV2:
-    """Private, single-process SQLite owner for the v2 project catalog."""
+    """Private SQLite owner for the v2 project catalog."""
 
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).expanduser().absolute()
@@ -166,6 +167,44 @@ class CoreControlStoreV2:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+
+    @contextmanager
+    def action_execution_fence(
+        self,
+        *,
+        coordination_scope: str,
+    ) -> Iterator[None]:
+        """Serialize a durable action through owner mutation and catalog commit."""
+
+        coordination_scope = _action_scope(coordination_scope)
+        scope_sha256 = hashlib.sha256(coordination_scope.encode("utf-8")).hexdigest()
+        lock_path = self.root / f"action-execution-{scope_sha256}.lock"
+        with self._lock:
+            if self._closed:
+                raise CoreControlStoreV2Error("v2 catalog store is closed")
+            lock_fd = self._open_action_execution_lock(lock_path)
+            try:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                except OSError as exc:
+                    raise CoreControlStoreV2Error(
+                        "v2 action execution lock is unavailable"
+                    ) from exc
+                self._verify_action_execution_lock(
+                    lock_fd,
+                    lock_path,
+                )
+                yield
+                self._verify_action_execution_lock(
+                    lock_fd,
+                    lock_path,
+                )
+            finally:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(lock_fd)
 
     def create_project(
         self,
@@ -190,9 +229,7 @@ class CoreControlStoreV2:
                     prior["request_sha256"] != request_sha256
                     or bytes(prior["request_json"]) != request_json
                 ):
-                    raise ProjectIdempotencyConflictV2(
-                        "v2 project idempotency key was reused"
-                    )
+                    raise ProjectIdempotencyConflictV2("v2 project idempotency key was reused")
                 return _load_project(connection, str(prior["project_id"])), True
             if int(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0]) >= (
                 _MAX_PROJECTS
@@ -244,9 +281,10 @@ class CoreControlStoreV2:
                 (project_id,),
             ).fetchone()
             if row is None:
-                if int(
-                    connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
-                ) >= _MAX_PROJECTS:
+                if (
+                    int(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0])
+                    >= _MAX_PROJECTS
+                ):
                     raise ProjectConflictV2("v2 project catalog capacity is exhausted")
                 connection.execute(
                     "INSERT INTO projects(project_id, display_name, "
@@ -321,24 +359,18 @@ class CoreControlStoreV2:
                 return _load_project(connection, project_id), True
             current = _load_project(connection, project_id)
             if if_match != current_etag:
-                raise ProjectPreconditionFailedV2(
-                    "v2 project resource ETag changed"
-                )
+                raise ProjectPreconditionFailedV2("v2 project resource ETag changed")
+            if request.expected_project_config_sha256 != current.project_config_sha256:
+                raise ProjectPreconditionFailedV2("v2 project config changed")
             if (
-                request.expected_project_config_sha256
-                != current.project_config_sha256
+                int(
+                    connection.execute("SELECT COUNT(*) FROM project_update_requests").fetchone()[
+                        0
+                    ]
+                )
+                >= _MAX_OPERATIONS
             ):
-                raise ProjectPreconditionFailedV2(
-                    "v2 project config changed"
-                )
-            if int(
-                connection.execute(
-                    "SELECT COUNT(*) FROM project_update_requests"
-                ).fetchone()[0]
-            ) >= _MAX_OPERATIONS:
-                raise ProjectConflictV2(
-                    "v2 project update request capacity is exhausted"
-                )
+                raise ProjectConflictV2("v2 project update request capacity is exhausted")
             config_json = canonical_contract_bytes(request.config)
             config_sha256 = m.project_config_sha256_for(request.config)
             connection.execute(
@@ -381,14 +413,15 @@ class CoreControlStoreV2:
                 (project_id, idempotency_key),
             ).fetchone()
             if row is None:
-                if int(
-                    connection.execute(
-                        "SELECT COUNT(*) FROM project_validation_requests"
-                    ).fetchone()[0]
-                ) >= _MAX_OPERATIONS:
-                    raise ProjectConflictV2(
-                        "v2 project validation capacity is exhausted"
+                if (
+                    int(
+                        connection.execute(
+                            "SELECT COUNT(*) FROM project_validation_requests"
+                        ).fetchone()[0]
                     )
+                    >= _MAX_OPERATIONS
+                ):
+                    raise ProjectConflictV2("v2 project validation capacity is exhausted")
                 connection.execute(
                     "INSERT INTO project_validation_requests(project_id, "
                     "idempotency_key, request_sha256, request_json, response_json) "
@@ -433,9 +466,7 @@ class CoreControlStoreV2:
                 (project_id, idempotency_key),
             ).fetchone()
             if row is None:
-                raise CoreControlStoreV2Error(
-                    "v2 project validation reservation is missing"
-                )
+                raise CoreControlStoreV2Error("v2 project validation reservation is missing")
             _require_same_validation_request(
                 row,
                 request_sha256=request_sha256,
@@ -489,14 +520,11 @@ class CoreControlStoreV2:
     def list_project_authority_documents(self) -> list[ProjectAuthorityDocumentV2]:
         with self._lock, self._reader() as connection:
             rows = connection.execute(
-                "SELECT project_id FROM project_authority_records "
-                "ORDER BY project_id LIMIT ?",
+                "SELECT project_id FROM project_authority_records ORDER BY project_id LIMIT ?",
                 (_MAX_PROJECTS + 1,),
             ).fetchall()
             if len(rows) > _MAX_PROJECTS:
-                raise CoreControlStoreV2Error(
-                    "v2 project authority inventory exceeds its bound"
-                )
+                raise CoreControlStoreV2Error("v2 project authority inventory exceeds its bound")
             return [
                 _load_project_authority_document(
                     connection,
@@ -530,9 +558,7 @@ class CoreControlStoreV2:
             )
             if current is None:
                 if expected_record_sha256 is not None:
-                    raise ProjectConflictV2(
-                        "v2 project authority record does not exist"
-                    )
+                    raise ProjectConflictV2("v2 project authority record does not exist")
                 connection.execute(
                     "INSERT INTO project_authority_records(project_id, "
                     "record_sha256, record_json, resource_version) "
@@ -546,9 +572,7 @@ class CoreControlStoreV2:
                     expected_record_sha256 is None
                     or current.record_sha256 != expected_record_sha256
                 ):
-                    raise ProjectConflictV2(
-                        "v2 project authority record changed"
-                    )
+                    raise ProjectConflictV2("v2 project authority record changed")
                 connection.execute(
                     "UPDATE project_authority_records SET record_sha256 = ?, "
                     "record_json = ?, resource_version = resource_version + 1 "
@@ -561,9 +585,7 @@ class CoreControlStoreV2:
                 required=True,
             )
             if loaded is None:  # pragma: no cover - required=True is authoritative
-                raise CoreControlStoreV2Error(
-                    "v2 project authority record publication failed"
-                )
+                raise CoreControlStoreV2Error("v2 project authority record publication failed")
             return loaded
 
     def begin_action(
@@ -588,9 +610,7 @@ class CoreControlStoreV2:
                     prior["request_sha256"] != request_sha256
                     or bytes(prior["request_json"]) != request_json
                 ):
-                    raise ProjectIdempotencyConflictV2(
-                        "v2 action idempotency key was reused"
-                    )
+                    raise ProjectIdempotencyConflictV2("v2 action idempotency key was reused")
                 operation_id = prior["operation_id"]
                 return ActionReservationV2(
                     operation=(
@@ -600,9 +620,10 @@ class CoreControlStoreV2:
                     ),
                     resumed=True,
                 )
-            if int(
-                connection.execute("SELECT COUNT(*) FROM action_requests").fetchone()[0]
-            ) >= _MAX_OPERATIONS:
+            if (
+                int(connection.execute("SELECT COUNT(*) FROM action_requests").fetchone()[0])
+                >= _MAX_OPERATIONS
+            ):
                 raise ProjectConflictV2("v2 action request capacity is exhausted")
             connection.execute(
                 "INSERT INTO action_requests(action_scope, idempotency_key, "
@@ -636,15 +657,11 @@ class CoreControlStoreV2:
                 row["request_sha256"] != request_sha256
                 or bytes(row["request_json"]) != request_json
             ):
-                raise ProjectIdempotencyConflictV2(
-                    "v2 action idempotency key was reused"
-                )
+                raise ProjectIdempotencyConflictV2("v2 action idempotency key was reused")
             if row["operation_id"] is not None:
                 existing = _load_operation(connection, str(row["operation_id"]))
                 if existing != operation:
-                    raise CoreControlStoreV2Error(
-                        "v2 action replay produced another operation"
-                    )
+                    raise CoreControlStoreV2Error("v2 action replay produced another operation")
                 return existing
             if int(connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0]) >= (
                 _MAX_OPERATIONS
@@ -674,9 +691,53 @@ class CoreControlStoreV2:
             or metadata.st_uid != os.geteuid()
             or stat.S_IMODE(metadata.st_mode) != 0o700
         ):
-            raise CoreControlStoreV2Error(
-                "v2 catalog root must be a private owned directory"
+            raise CoreControlStoreV2Error("v2 catalog root must be a private owned directory")
+
+    def _open_action_execution_lock(
+        self,
+        lock_path: Path,
+    ) -> int:
+        flags = os.O_RDWR | os.O_CREAT
+        flags |= getattr(os, "O_CLOEXEC", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            lock_fd = os.open(
+                lock_path,
+                flags,
+                0o600,
             )
+        except OSError as exc:
+            raise CoreControlStoreV2Error("v2 action execution lock is unavailable") from exc
+        try:
+            self._verify_action_execution_lock(
+                lock_fd,
+                lock_path,
+            )
+        except BaseException:
+            os.close(lock_fd)
+            raise
+        return lock_fd
+
+    def _verify_action_execution_lock(
+        self,
+        lock_fd: int,
+        lock_path: Path,
+    ) -> None:
+        try:
+            held = os.fstat(lock_fd)
+            named = lock_path.stat(follow_symlinks=False)
+        except OSError as exc:
+            raise CoreControlStoreV2Error("v2 action execution lock is unavailable") from exc
+        if (
+            not stat.S_ISREG(held.st_mode)
+            or held.st_uid != os.geteuid()
+            or held.st_nlink != 1
+            or stat.S_IMODE(held.st_mode) != 0o600
+            or not stat.S_ISREG(named.st_mode)
+            or named.st_dev != held.st_dev
+            or named.st_ino != held.st_ino
+        ):
+            raise CoreControlStoreV2Error("v2 action execution lock is not a private regular file")
 
     def _verify_database(self) -> None:
         metadata = self.database.stat(follow_symlinks=False)
@@ -686,9 +747,7 @@ class CoreControlStoreV2:
             or metadata.st_nlink != 1
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
-            raise CoreControlStoreV2Error(
-                "v2 catalog database is not a private regular file"
-            )
+            raise CoreControlStoreV2Error("v2 catalog database is not a private regular file")
         with self._reader() as connection:
             if _schema_rows(connection) != _expected_schema_rows():
                 raise CoreControlStoreV2Error("v2 catalog schema is not exact")
@@ -696,9 +755,7 @@ class CoreControlStoreV2:
             if len(quick_check) != 1 or tuple(quick_check[0]) != ("ok",):
                 raise CoreControlStoreV2Error("v2 catalog database integrity failed")
             if connection.execute("PRAGMA foreign_key_check").fetchone() is not None:
-                raise CoreControlStoreV2Error(
-                    "v2 catalog foreign-key integrity failed"
-                )
+                raise CoreControlStoreV2Error("v2 catalog foreign-key integrity failed")
             identity = connection.execute(
                 "SELECT schema_version FROM metadata WHERE singleton = 1"
             ).fetchone()
@@ -717,9 +774,7 @@ class CoreControlStoreV2:
                 "FROM project_create_requests"
             ).fetchall()
             if len(requests) > _MAX_PROJECTS:
-                raise CoreControlStoreV2Error(
-                    "v2 project idempotency inventory exceeds its bound"
-                )
+                raise CoreControlStoreV2Error("v2 project idempotency inventory exceeds its bound")
             for row in requests:
                 request_json = bytes(row["request_json"])
                 try:
@@ -735,10 +790,8 @@ class CoreControlStoreV2:
                         "persisted v2 project request is invalid"
                     ) from exc
                 if (
-                    _idempotency_key(str(row["idempotency_key"]))
-                    != row["idempotency_key"]
-                    or hashlib.sha256(request_json).hexdigest()
-                    != row["request_sha256"]
+                    _idempotency_key(str(row["idempotency_key"])) != row["idempotency_key"]
+                    or hashlib.sha256(request_json).hexdigest() != row["request_sha256"]
                 ):
                     raise CoreControlStoreV2Error(
                         "persisted v2 project request digest is inconsistent"
@@ -758,12 +811,9 @@ class CoreControlStoreV2:
                 try:
                     _parse_project_update_request(payload)
                     inconsistent = (
-                        _resource_id(str(row["project_id"]), label="project")
-                        != row["project_id"]
-                        or _idempotency_key(str(row["idempotency_key"]))
-                        != row["idempotency_key"]
-                        or hashlib.sha256(payload).hexdigest()
-                        != row["request_sha256"]
+                        _resource_id(str(row["project_id"]), label="project") != row["project_id"]
+                        or _idempotency_key(str(row["idempotency_key"])) != row["idempotency_key"]
+                        or hashlib.sha256(payload).hexdigest() != row["request_sha256"]
                     )
                 except (TypeError, ValueError) as exc:
                     raise CoreControlStoreV2Error(
@@ -780,9 +830,7 @@ class CoreControlStoreV2:
                 (_MAX_OPERATIONS + 1,),
             ).fetchall()
             if len(validation_requests) > _MAX_OPERATIONS:
-                raise CoreControlStoreV2Error(
-                    "v2 project validation inventory exceeds its bound"
-                )
+                raise CoreControlStoreV2Error("v2 project validation inventory exceeds its bound")
             for row in validation_requests:
                 request_json = bytes(row["request_json"])
                 try:
@@ -795,11 +843,9 @@ class CoreControlStoreV2:
                         "persisted v2 project validation request is invalid"
                     ) from exc
                 if (
-                    _idempotency_key(str(row["idempotency_key"]))
-                    != row["idempotency_key"]
+                    _idempotency_key(str(row["idempotency_key"])) != row["idempotency_key"]
                     or canonical_contract_bytes(request) != request_json
-                    or hashlib.sha256(request_json).hexdigest()
-                    != row["request_sha256"]
+                    or hashlib.sha256(request_json).hexdigest() != row["request_sha256"]
                 ):
                     raise CoreControlStoreV2Error(
                         "persisted v2 project validation request is inconsistent"
@@ -816,9 +862,7 @@ class CoreControlStoreV2:
                 (_MAX_PROJECTS + 1,),
             ).fetchall()
             if len(authority_rows) > _MAX_PROJECTS:
-                raise CoreControlStoreV2Error(
-                    "v2 project authority inventory exceeds its bound"
-                )
+                raise CoreControlStoreV2Error("v2 project authority inventory exceeds its bound")
             for row in authority_rows:
                 _load_project_authority_document(
                     connection,
@@ -840,39 +884,28 @@ class CoreControlStoreV2:
                 "WHERE action_requests.operation_id IS NULL LIMIT 1"
             ).fetchone()
             if orphan_operation is not None:
-                raise CoreControlStoreV2Error(
-                    "persisted v2 operation has no action authority"
-                )
+                raise CoreControlStoreV2Error("persisted v2 operation has no action authority")
             action_rows = connection.execute(
                 "SELECT action_scope, idempotency_key, request_sha256, request_json, "
                 "operation_id FROM action_requests LIMIT ?",
                 (_MAX_OPERATIONS + 1,),
             ).fetchall()
             if len(action_rows) > _MAX_OPERATIONS:
-                raise CoreControlStoreV2Error(
-                    "v2 action request inventory exceeds its bound"
-                )
+                raise CoreControlStoreV2Error("v2 action request inventory exceeds its bound")
             for row in action_rows:
                 try:
-                    request_json = _canonical_json_document(
-                        bytes(row["request_json"])
-                    )
+                    request_json = _canonical_json_document(bytes(row["request_json"]))
                     inconsistent = (
-                        _action_scope(str(row["action_scope"]))
-                        != row["action_scope"]
-                        or _idempotency_key(str(row["idempotency_key"]))
-                        != row["idempotency_key"]
-                        or hashlib.sha256(request_json).hexdigest()
-                        != row["request_sha256"]
+                        _action_scope(str(row["action_scope"])) != row["action_scope"]
+                        or _idempotency_key(str(row["idempotency_key"])) != row["idempotency_key"]
+                        or hashlib.sha256(request_json).hexdigest() != row["request_sha256"]
                     )
                 except (TypeError, ValueError) as exc:
                     raise CoreControlStoreV2Error(
                         "persisted v2 action request is inconsistent"
                     ) from exc
                 if inconsistent:
-                    raise CoreControlStoreV2Error(
-                        "persisted v2 action request is inconsistent"
-                    )
+                    raise CoreControlStoreV2Error("persisted v2 action request is inconsistent")
                 if row["operation_id"] is not None:
                     _load_operation(connection, str(row["operation_id"]))
 
@@ -910,9 +943,7 @@ class CoreControlStoreV2:
         return connection
 
 
-def _load_project(
-    connection: sqlite3.Connection, project_id: str
-) -> ProjectRecordV2:
+def _load_project(connection: sqlite3.Connection, project_id: str) -> ProjectRecordV2:
     row = connection.execute(
         "SELECT project_id, display_name, project_config_sha256, project_config_json, "
         "created_at, updated_at, resource_version FROM projects WHERE project_id = ?",
@@ -946,8 +977,7 @@ def _load_project(
         not 1 <= len(loaded.display_name) <= 128
         or loaded.resource_version < 1
         or canonical_contract_bytes(loaded.config) != config_json
-        or m.project_config_sha256_for(loaded.config)
-        != loaded.project_config_sha256
+        or m.project_config_sha256_for(loaded.config) != loaded.project_config_sha256
     ):
         raise CoreControlStoreV2Error("persisted v2 project is invalid")
     return loaded
@@ -966,9 +996,7 @@ def _load_project_authority_document(
     ).fetchone()
     if row is None:
         if required:
-            raise CoreControlStoreV2Error(
-                "persisted v2 project authority record is missing"
-            )
+            raise CoreControlStoreV2Error("persisted v2 project authority record is missing")
         return None
     try:
         record_json = _canonical_project_authority_document(bytes(row["record_json"]))
@@ -982,18 +1010,13 @@ def _load_project_authority_document(
             resource_version=int(row["resource_version"]),
         )
     except (TypeError, ValueError) as exc:
-        raise CoreControlStoreV2Error(
-            "persisted v2 project authority record is invalid"
-        ) from exc
+        raise CoreControlStoreV2Error("persisted v2 project authority record is invalid") from exc
     if (
         document.project_id != project_id
         or document.resource_version < 1
-        or hashlib.sha256(document.record_json).hexdigest()
-        != document.record_sha256
+        or hashlib.sha256(document.record_json).hexdigest() != document.record_sha256
     ):
-        raise CoreControlStoreV2Error(
-            "persisted v2 project authority record is inconsistent"
-        )
+        raise CoreControlStoreV2Error("persisted v2 project authority record is inconsistent")
     _load_project(connection, document.project_id)
     return document
 
@@ -1045,13 +1068,8 @@ def _require_same_validation_request(
     request_sha256: str,
     request_json: bytes,
 ) -> None:
-    if (
-        row["request_sha256"] != request_sha256
-        or bytes(row["request_json"]) != request_json
-    ):
-        raise ProjectIdempotencyConflictV2(
-            "v2 project validation idempotency key was reused"
-        )
+    if row["request_sha256"] != request_sha256 or bytes(row["request_json"]) != request_json:
+        raise ProjectIdempotencyConflictV2("v2 project validation idempotency key was reused")
 
 
 def _load_project_validation_response(
@@ -1065,13 +1083,8 @@ def _load_project_validation_response(
         raise CoreControlStoreV2Error(
             "persisted v2 project validation response is invalid"
         ) from exc
-    if (
-        response.project_id != project_id
-        or canonical_contract_bytes(response) != payload
-    ):
-        raise CoreControlStoreV2Error(
-            "persisted v2 project validation response is inconsistent"
-        )
+    if response.project_id != project_id or canonical_contract_bytes(response) != payload:
+        raise CoreControlStoreV2Error("persisted v2 project validation response is inconsistent")
     return response
 
 
@@ -1141,10 +1154,7 @@ def _canonical_json_document(payload: bytes) -> bytes:
 
 
 def _canonical_project_authority_document(payload: bytes) -> bytes:
-    if (
-        type(payload) is not bytes
-        or not 1 <= len(payload) <= _MAX_PROJECT_AUTHORITY_BYTES
-    ):
+    if type(payload) is not bytes or not 1 <= len(payload) <= _MAX_PROJECT_AUTHORITY_BYTES:
         raise ValueError("v2 project authority document is invalid")
     try:
         value = json.loads(payload.decode("utf-8", errors="strict"))
@@ -1222,9 +1232,7 @@ def project_etag_payload(
         "display_name": record.display_name,
         "project_config_sha256": record.project_config_sha256,
         "active_project_head": (
-            None
-            if active_project_head is None
-            else active_project_head.model_dump(mode="json")
+            None if active_project_head is None else active_project_head.model_dump(mode="json")
         ),
         "admission_etag": admission_etag,
         "state": state,

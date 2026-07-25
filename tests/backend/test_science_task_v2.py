@@ -97,6 +97,32 @@ def _head(project_id: str = "project-1", *, seed: str = "2") -> ProjectHeadRefV2
     )
 
 
+def _unowned_successor_head(
+    predecessor: ProjectHeadRefV2,
+) -> ProjectHeadRefV2:
+    return ProjectHeadRefV2(
+        project_head_id="project-head-unowned",
+        project_id=predecessor.project_id,
+        generation=predecessor.generation + 1,
+        predecessor_project_head_id=(
+            predecessor.project_head_id
+        ),
+        workspace_snapshot=_workspace(
+            predecessor.project_id,
+            "f",
+        ),
+        evolution_revision=predecessor.evolution_revision,
+        runtime_context_snapshot=(
+            predecessor.runtime_context_snapshot
+        ),
+        effective_execution_snapshot=(
+            predecessor.effective_execution_snapshot
+        ),
+        registry_sha256=predecessor.registry_sha256,
+        manifest_sha256="f" * 64,
+    )
+
+
 def _authority(
     *,
     blockers: tuple[ScienceProjectReadinessBlockerV2, ...] = (),
@@ -122,9 +148,7 @@ def _request(
         "project_id": authority.project_id,
         "expected_project_admission_etag": authority.project_etag,
         "expected_project_head_id": authority.active_project_head.project_head_id,
-        "expected_project_head_manifest_sha256": (
-            authority.active_project_head.manifest_sha256
-        ),
+        "expected_project_head_manifest_sha256": (authority.active_project_head.manifest_sha256),
         "expected_project_config_sha256": authority.project_config_sha256,
     }
     payload.update(changes)
@@ -138,7 +162,6 @@ def _owner(tmp_path: Path) -> CoreScienceTaskOwnerV2:
 @pytest.mark.parametrize(
     "blocker",
     [
-        ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,
         ScienceProjectReadinessBlockerV2.SETTINGS_TRANSITION,
         ScienceProjectReadinessBlockerV2.CONTEXT_REBIND,
         ScienceProjectReadinessBlockerV2.WORKSPACE_PUBLICATION,
@@ -164,6 +187,155 @@ def test_unresolved_project_state_creates_no_task_admission_or_attempt(
         assert owner.ownership_counts() == (0, 0, 0)
     finally:
         owner.close()
+
+
+def test_successor_transition_blocker_requires_store_owned_transition(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    authority = _authority(
+        blockers=(ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,),
+    )
+    try:
+        with pytest.raises(CoreTaskControlError) as rejected:
+            owner.publish_project_admission_authority(authority)
+        assert rejected.value.code == "task_precondition_failed"
+        assert owner.ownership_counts() == (0, 0, 0)
+    finally:
+        owner.close()
+
+
+def test_restart_rejects_orphaned_successor_transition_blocker(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    authority = _authority()
+    owner.publish_project_admission_authority(authority)
+    owner.close()
+
+    blocked = ScienceProjectAdmissionAuthorityV2(
+        project_id=authority.project_id,
+        active_project_head=authority.active_project_head,
+        project_config_sha256=authority.project_config_sha256,
+        workspace_snapshot=authority.workspace_snapshot,
+        normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
+        blockers=(ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,),
+    )
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE project_admission_authorities SET authority_json = ? WHERE project_id = ?",
+            (
+                task_store_module._v2_authority_bytes(blocked),
+                authority.project_id,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="successor readiness blocker",
+    ):
+        _owner(tmp_path)
+
+
+def test_project_authority_publisher_cannot_advance_active_head(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    authority = _authority()
+    owner.publish_project_admission_authority(authority)
+    forged_head = _unowned_successor_head(
+        authority.active_project_head
+    )
+    forged_authority = ScienceProjectAdmissionAuthorityV2(
+        project_id=authority.project_id,
+        active_project_head=forged_head,
+        project_config_sha256=authority.project_config_sha256,
+        workspace_snapshot=forged_head.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            authority.normalized_evolution_intent_sha256
+        ),
+    )
+    try:
+        with pytest.raises(CoreTaskControlError) as rejected:
+            owner.publish_project_admission_authority(
+                forged_authority,
+                expected_project_head_id=(
+                    authority.active_project_head
+                    .project_head_id
+                ),
+            )
+        assert rejected.value.code == "task_precondition_failed"
+        assert (
+            owner.project_admission_authority(
+                authority.project_id
+            )
+            == authority
+        )
+    finally:
+        owner.close()
+
+
+def test_restart_rejects_non_genesis_head_without_successor_receipt(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    authority = _authority()
+    owner.publish_project_admission_authority(authority)
+    owner.close()
+
+    forged_head = _unowned_successor_head(
+        authority.active_project_head
+    )
+    forged_authority = ScienceProjectAdmissionAuthorityV2(
+        project_id=authority.project_id,
+        active_project_head=forged_head,
+        project_config_sha256=authority.project_config_sha256,
+        workspace_snapshot=forged_head.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            authority.normalized_evolution_intent_sha256
+        ),
+    )
+    database = (
+        tmp_path
+        / "science-tasks-v2"
+        / "science-tasks-v2.sqlite3"
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO project_heads("
+            "project_head_id, project_id, generation, "
+            "predecessor_project_head_id, manifest_sha256, "
+            "head_json) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                forged_head.project_head_id,
+                forged_head.project_id,
+                forged_head.generation,
+                forged_head.predecessor_project_head_id,
+                forged_head.manifest_sha256,
+                task_store_module._v2_model_bytes(
+                    forged_head
+                ),
+            ),
+        )
+        connection.execute(
+            "UPDATE project_admission_authorities "
+            "SET authority_json = ? WHERE project_id = ?",
+            (
+                task_store_module._v2_authority_bytes(
+                    forged_authority
+                ),
+                authority.project_id,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="project head.*successor receipt",
+    ):
+        _owner(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -237,13 +409,8 @@ def test_submission_atomically_pins_the_complete_project_head_and_first_attempt(
             task.admission.normalized_evolution_intent_sha256
             == authority.normalized_evolution_intent_sha256
         )
-        assert (
-            task.admission.registry_sha256
-            == authority.active_project_head.registry_sha256
-        )
-        assert task.admission.admission_sha256 == task_admission_sha256_for(
-            task.admission
-        )
+        assert task.admission.registry_sha256 == authority.active_project_head.registry_sha256
+        assert task.admission.admission_sha256 == task_admission_sha256_for(task.admission)
         assert len(task.attempts) == 1
         assert task.attempts[0].ordinal == 1
         assert task.attempts[0].admission_sha256 == task.admission.admission_sha256
@@ -377,14 +544,17 @@ def test_infrastructure_retry_appends_attempt_without_changing_any_pin(
         )
         assert owner.ownership_counts() == (1, 1, 2)
 
-        assert owner.invoke(
-            "appendCoreTaskAttemptV2",
-            {
-                "task_id": task.task_id,
-                "request": append,
-                "idempotency_key": "retry-2",
-            },
-        ) == second
+        assert (
+            owner.invoke(
+                "appendCoreTaskAttemptV2",
+                {
+                    "task_id": task.task_id,
+                    "request": append,
+                    "idempotency_key": "retry-2",
+                },
+            )
+            == second
+        )
         assert owner.ownership_counts() == (1, 1, 2)
 
         with pytest.raises(CoreTaskControlError) as reused:
@@ -437,6 +607,7 @@ def test_closed_task_cannot_be_mutated_or_retried_and_survives_restart(
             task_admission_id=task.admission.task_admission_id,
             admission_sha256=task.admission.admission_sha256,
         ),
+        close_request_id="close-task-direct",
     )
     assert closed.state == "closed"
     owner.close()
@@ -463,6 +634,288 @@ def test_closed_task_cannot_be_mutated_or_retried_and_survives_restart(
         assert restarted.ownership_counts() == (1, 1, 1)
     finally:
         restarted.close()
+
+
+def test_restart_rejects_deleted_task_close_receipt(
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(authority)
+    task = owner.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": _request(authority),
+            "idempotency_key": "submit-delete-close-receipt",
+        },
+    )
+    owner.close_task(
+        task.task_id,
+        TaskActionRequestV2(
+            task_admission_id=task.admission.task_admission_id,
+            admission_sha256=task.admission.admission_sha256,
+        ),
+        close_request_id="close-before-receipt-delete",
+    )
+    owner.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "DELETE FROM task_close_receipts WHERE task_id = ?",
+            (task.task_id,),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="close authority receipt",
+    ):
+        _owner(tmp_path)
+
+
+def test_restart_rejects_cross_bound_task_close_receipt(
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(authority)
+    first = owner.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": _request(authority),
+            "idempotency_key": "submit-close-cross-bind-1",
+        },
+    )
+    owner.close_task(
+        first.task_id,
+        TaskActionRequestV2(
+            task_admission_id=(first.admission.task_admission_id),
+            admission_sha256=first.admission.admission_sha256,
+        ),
+        close_request_id="close-cross-bind-1",
+    )
+    second = owner.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": _request(authority),
+            "idempotency_key": "submit-close-cross-bind-2",
+        },
+    )
+    owner.close_task(
+        second.task_id,
+        TaskActionRequestV2(
+            task_admission_id=(second.admission.task_admission_id),
+            admission_sha256=(second.admission.admission_sha256),
+        ),
+        close_request_id="close-cross-bind-2",
+    )
+    owner.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE task_close_receipts SET "
+            "task_admission_id = ?, admission_sha256 = ? "
+            "WHERE task_id = ?",
+            (
+                second.admission.task_admission_id,
+                second.admission.admission_sha256,
+                first.task_id,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="close receipt has no exact closed authority",
+    ):
+        _owner(tmp_path)
+
+
+def test_legacy_closed_task_migrates_to_unattributed_exemption(
+    tmp_path: Path,
+) -> None:
+    authority = _authority()
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(authority)
+    task = owner.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": _request(authority),
+            "idempotency_key": "submit-legacy-close",
+        },
+    )
+    request = TaskActionRequestV2(
+        task_admission_id=task.admission.task_admission_id,
+        admission_sha256=task.admission.admission_sha256,
+    )
+    owner.close_task(
+        task.task_id,
+        request,
+        close_request_id="close-before-legacy-downgrade",
+    )
+    owner.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        for table in (
+            "task_close_receipts",
+            "legacy_task_close_exemptions",
+            "successor_abandon_receipts",
+            "legacy_successor_abandon_exemptions",
+            "action_receipt_migrations",
+        ):
+            connection.execute(f"DROP TABLE {table}")
+        connection.commit()
+
+    migrated = _owner(tmp_path)
+    try:
+        with sqlite3.connect(database) as connection:
+            exemption = connection.execute(
+                "SELECT task_admission_id, admission_sha256 "
+                "FROM legacy_task_close_exemptions "
+                "WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+        assert exemption == (
+            task.admission.task_admission_id,
+            task.admission.admission_sha256,
+        )
+        with pytest.raises(CoreTaskControlError) as replay:
+            migrated.close_task(
+                task.task_id,
+                request,
+                close_request_id=("close-before-legacy-downgrade"),
+                allow_closed_recovery=True,
+            )
+        assert replay.value.code == "task_terminal"
+    finally:
+        migrated.close()
+
+
+def test_action_receipt_schema_migration_serializes_startup(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "concurrent-receipt-migration"
+    barrier = threading.Barrier(2)
+
+    def start_store() -> None:
+        barrier.wait()
+        store = task_store_module.ScienceTaskStoreV2(root)
+        store.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(start_store) for _ in range(2)]
+        for future in futures:
+            future.result(timeout=10)
+
+    reopened = task_store_module.ScienceTaskStoreV2(root)
+    reopened.close()
+
+
+def test_action_receipt_schema_migration_rolls_back_as_one_unit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "interrupted-receipt-migration"
+    root.mkdir(mode=0o700)
+    original = task_store_module._migrate_v2_action_receipt_authority
+
+    def interrupt_after_migration(
+        connection: sqlite3.Connection,
+        *,
+        schema_preexisting: bool,
+    ) -> None:
+        original(
+            connection,
+            schema_preexisting=schema_preexisting,
+        )
+        raise SystemExit("simulated receipt migration crash")
+
+    monkeypatch.setattr(
+        task_store_module,
+        "_migrate_v2_action_receipt_authority",
+        interrupt_after_migration,
+    )
+    with pytest.raises(
+        SystemExit,
+        match="receipt migration crash",
+    ):
+        task_store_module.ScienceTaskStoreV2(root)
+
+    database = root / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        names = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            ).fetchall()
+        }
+    assert not names.intersection(task_store_module._V2_ACTION_RECEIPT_SCHEMA_TABLES)
+
+    monkeypatch.setattr(
+        task_store_module,
+        "_migrate_v2_action_receipt_authority",
+        original,
+    )
+    recovered = task_store_module.ScienceTaskStoreV2(root)
+    recovered.close()
+
+
+def test_restart_rejects_partial_action_receipt_schema(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "partial-receipt-schema"
+    root.mkdir(mode=0o700)
+    database = root / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE action_receipt_migrations ("
+            "singleton INTEGER PRIMARY KEY, "
+            "migration_version INTEGER NOT NULL)"
+        )
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="only partially present",
+    ):
+        task_store_module.ScienceTaskStoreV2(root)
+
+
+def test_restart_rejects_action_receipt_schema_near_match(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    owner.close()
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE INDEX receipt_near_match ON task_close_receipts(expected_etag)")
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="schema fingerprint",
+    ):
+        _owner(tmp_path)
+
+
+def test_restart_rejects_deleted_action_receipt_migration_marker(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    owner.close()
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.execute("DELETE FROM action_receipt_migrations")
+        connection.commit()
+
+    with pytest.raises(
+        ScienceTaskStoreV2Error,
+        match="migration authority",
+    ):
+        _owner(tmp_path)
 
 
 def test_v1_and_v2_run_control_operations_are_disjoint() -> None:
@@ -576,6 +1029,7 @@ def test_v2_task_timeline_outlives_the_bounded_sse_replay_window(
                 task_admission_id=first.admission.task_admission_id,
                 admission_sha256=first.admission.admission_sha256,
             ),
+            close_request_id="close-timeline-first",
         )
         second = owner.invoke(
             "submitCoreTaskV2",

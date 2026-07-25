@@ -12,7 +12,7 @@ from openevo.evolution.models import (
     ArtifactResponse,
     ContextResolveRequest,
     ContextResolveResponse,
-    DatasetCreateRequest,
+    DatasetCreateHttpRequest,
     DatasetCreateResponse,
     EventIngestRequest,
     EventIngestResponse,
@@ -38,8 +38,15 @@ from openevo.evolution.models import (
 )
 from openevo.evolution.context_materialization import MaterializedContext
 from openevo.evolution.context_projection import ContextProjectionResolveRequest
-from openevo.evolution.planned_jobs import PlanBoundJobCreateRequest
-from openevo.evolution.store import EvolutionStore
+from openevo.evolution.planned_jobs import (
+    PlanBoundJobCreateRequest,
+    PlanBoundJobRetryRequest,
+)
+from openevo.evolution.store import (
+    DatasetIntegrityError,
+    DatasetNotFoundError,
+    EvolutionStore,
+)
 from openevo.evolution.framework.builtins import (
     VerifiedExecutableRegistry,
     require_verified_executable_registry,
@@ -227,6 +234,21 @@ def create_app(
                 detail="materialized context caller mismatch",
             )
 
+    def require_core_control_caller(request: Request) -> None:
+        if internal_identity is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Core control transport is disabled",
+            )
+        if (
+            request.headers.get(INTERNAL_SERVICE_HEADER)
+            != "core-control"
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Core control caller mismatch",
+            )
+
     @app.post(
         "/v1/internal/materialized-contexts",
         response_model=MaterializedContext,
@@ -295,11 +317,24 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/v1/datasets", response_model=DatasetCreateResponse)
-    def create_dataset(request: DatasetCreateRequest) -> DatasetCreateResponse:
+    def create_dataset(
+        request: DatasetCreateHttpRequest,
+    ) -> DatasetCreateResponse:
         try:
             return store.create_dataset(request)
+        except DatasetIntegrityError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/v1/datasets/{dataset_id}", response_model=DatasetCreateResponse)
+    def get_dataset(dataset_id: str) -> DatasetCreateResponse:
+        try:
+            return store.get_dataset(dataset_id)
+        except DatasetNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except DatasetIntegrityError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/v1/reviews", response_model=ReviewRequestResponse)
     def create_review(request: ReviewRequestCreateRequest) -> ReviewRequestResponse:
@@ -445,6 +480,28 @@ def create_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    @app.post(
+        "/v1/planned-jobs/{job_id}/retry",
+        response_model=JobCreateResponse,
+    )
+    def retry_plan_bound_job(
+        job_id: str,
+        request: PlanBoundJobRetryRequest,
+    ) -> JobCreateResponse:
+        if effective_snapshot is None:
+            raise HTTPException(
+                status_code=503,
+                detail="plan-bound execution requires an active verified registry",
+            )
+        try:
+            return store.retry_plan_bound_job(
+                job_id,
+                request,
+                snapshot=effective_snapshot,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/v1/jobs/claim", response_model=WorkerClaimResponse)
     def claim_job(request: WorkerClaimRequest) -> WorkerClaimResponse:
         return store.claim_job(request)
@@ -471,10 +528,52 @@ def create_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/v1/internal/jobs/{job_id}")
-    def get_internal_job_result(job_id: str) -> dict[str, object]:
+    def get_internal_job_result(
+        job_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        require_core_control_caller(request)
         try:
             return store.get_internal_job_result(job_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail="job not found") from exc
+
+    @app.get(
+        "/v1/internal/successor-transitions/{successor_transition_id}"
+        "/artifacts/{artifact_id}",
+        response_model=ArtifactResponse,
+    )
+    def get_internal_successor_artifact(
+        successor_transition_id: str,
+        artifact_id: str,
+        request: Request,
+    ) -> ArtifactResponse:
+        require_core_control_caller(request)
+        try:
+            return store.get_internal_successor_artifact(
+                successor_transition_id,
+                artifact_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail="successor transition artifact not found",
+            ) from exc
+
+    @app.post(
+        "/v1/internal/successor-transitions/{successor_transition_id}"
+        "/discard"
+    )
+    def discard_successor_transition_outputs(
+        successor_transition_id: str,
+        request: Request,
+    ) -> dict[str, object]:
+        require_core_control_caller(request)
+        try:
+            return store.discard_successor_transition_outputs(
+                successor_transition_id
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     return app

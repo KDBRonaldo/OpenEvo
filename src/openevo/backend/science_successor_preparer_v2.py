@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import math
+import re
 import threading
 from typing import Any, Iterator, Protocol
 
@@ -25,6 +26,8 @@ from openevo.backend.science_execution_v2 import (
 from openevo.backend.science_successor import (
     AcceptedWorkspaceResultV2,
     ScienceMethodOutputV2,
+    ScienceSuccessorCleanupContextV2,
+    ScienceSuccessorCleanupReceiptV2,
     ScienceSuccessorPreparationContextV2,
     SealedTranscriptDatasetV2,
     SuccessorMaterializationV2,
@@ -56,7 +59,15 @@ from openevo.evolution.models import (
     JobState,
 )
 from openevo.evolution.planned_jobs import PlanBoundJobCreateRequest
-from openevo.experiments.clients import EvolutionClientProtocol, EvolutionHttpClient
+from openevo.evolution.revisions import (
+    AtomicEvolutionAbandonManifestV2,
+    AtomicSuccessorManifestV2,
+    SuccessorArtifactContributionV2,
+)
+from openevo.experiments.clients import (
+    EvolutionClientProtocol,
+    EvolutionHttpClient,
+)
 from openevo.experiments.compiler import (
     CompiledEvolutionMethodSpec,
     CompiledExperiment,
@@ -75,7 +86,41 @@ _CONTEXT_ARTIFACT_TYPES = (
 
 
 class ScienceSuccessorPreparationV2Error(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+def _successor_dataset_idempotency_key(
+    context: ScienceSuccessorPreparationContextV2,
+    record: ScienceAttemptExecutionRecordV2,
+) -> str:
+    if record.receipt is None or record.evidence is None:
+        raise ScienceSuccessorPreparationV2Error(
+            "captured Attempt is missing dataset source evidence"
+        )
+    identity = canonical_digest(
+        {
+            "schema_version": "1",
+            "project_id": context.task.project_id,
+            "task_id": context.task.task_id,
+            "task_admission_id": (
+                context.task.admission.task_admission_id
+            ),
+            "accepted_attempt_id": context.accepted_attempt.attempt_id,
+            "rollout_task_id": record.receipt.rollout_task_id,
+            "session_id": record.receipt.session_id,
+            "session_result_sha256": (
+                record.evidence.session_result_sha256
+            ),
+        }
+    )
+    return f"science-successor-dataset-{identity}"
 
 
 class _ProjectCatalogV2(Protocol):
@@ -204,7 +249,10 @@ class ProductionScienceSuccessorPreparerV2:
 
     def _require_running(self) -> None:
         if self._stop.is_set():
-            raise ScienceSuccessorPreparationV2Error("successor preparation is stopping")
+            raise ScienceSuccessorPreparationV2Error(
+                "successor preparation is stopping",
+                retryable=True,
+            )
 
     def seal_dataset(
         self,
@@ -213,18 +261,31 @@ class ProductionScienceSuccessorPreparerV2:
         self._require_running()
         record, result, project = self._authority(context)
         assert record.evidence is not None
+        assert record.receipt is not None
+        dataset_name = (
+            f"{context.task.project_id}:{context.task.task_id}:"
+            f"{context.accepted_attempt.attempt_id}"
+        )
+        idempotency_key = _successor_dataset_idempotency_key(
+            context,
+            record,
+        )
         with self._evolution(context, record, project) as (_binding, client):
             raw = client.create_dataset(
                 {
-                    "name": (
-                        f"{context.task.project_id}:{context.task.task_id}:"
-                        f"{context.accepted_attempt.attempt_id}"
-                    ),
+                    "idempotency_key": idempotency_key,
+                    "name": dataset_name,
                     "purpose": "openevo_science_successor_v2",
                     "query": {
+                        "source": "openevo",
                         "event_types": ["openevo.session_completed"],
                         "status": ["COMPLETED"],
                         "policy_version": record.evidence.policy_version,
+                        "source_event_id": (
+                            f"session:{record.receipt.session_id}"
+                        ),
+                        "task_id": record.receipt.rollout_task_id,
+                        "session_id": record.receipt.session_id,
                     },
                     "limits": {
                         "max_events": 1,
@@ -233,25 +294,142 @@ class ProductionScienceSuccessorPreparerV2:
                 }
             )
             dataset = DatasetCreateResponse.model_validate(raw)
-            if (
-                dataset.event_count != 1
-                or dataset.trace_count != record.evidence.transcript_record_count
-                or dataset.trace_count != len(result.trajectory.traces)
-            ):
-                raise ScienceSuccessorPreparationV2Error(
-                    "sealed transcript dataset does not exactly cover the captured result"
-                )
             artifact = ArtifactResponse.model_validate(client.get_artifact(dataset.artifact_id))
         self._require_running()
+        return self._sealed_dataset_receipt(
+            context,
+            dataset=dataset,
+            artifact=artifact,
+            expected_name=dataset_name,
+            expected_idempotency_key=idempotency_key,
+            expected_record=record,
+            expected_record_count=record.evidence.transcript_record_count,
+            captured_trace_count=len(result.trajectory.traces),
+        )
+
+    def recover_dataset(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        *,
+        dataset_id: str,
+        manifest_sha256: str,
+    ) -> SealedTranscriptDatasetV2:
+        self._require_running()
+        record, result, project = self._authority(context)
+        assert record.evidence is not None
+        dataset_name = (
+            f"{context.task.project_id}:{context.task.task_id}:"
+            f"{context.accepted_attempt.attempt_id}"
+        )
+        idempotency_key = _successor_dataset_idempotency_key(
+            context,
+            record,
+        )
+        with self._evolution(context, record, project) as (_binding, client):
+            dataset = DatasetCreateResponse.model_validate(client.get_dataset(dataset_id))
+            artifact = ArtifactResponse.model_validate(client.get_artifact(dataset.artifact_id))
+        self._require_running()
+        receipt = self._sealed_dataset_receipt(
+            context,
+            dataset=dataset,
+            artifact=artifact,
+            expected_name=dataset_name,
+            expected_idempotency_key=idempotency_key,
+            expected_record=record,
+            expected_record_count=record.evidence.transcript_record_count,
+            captured_trace_count=len(result.trajectory.traces),
+        )
+        if receipt.dataset_id != dataset_id or receipt.manifest_sha256 != manifest_sha256:
+            raise ScienceSuccessorPreparationV2Error(
+                "recovered transcript dataset differs from the transition journal"
+            )
+        return receipt
+
+    def _sealed_dataset_receipt(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        *,
+        dataset: DatasetCreateResponse,
+        artifact: ArtifactResponse,
+        expected_name: str,
+        expected_idempotency_key: str,
+        expected_record: ScienceAttemptExecutionRecordV2,
+        expected_record_count: int,
+        captured_trace_count: int,
+    ) -> SealedTranscriptDatasetV2:
+        assert expected_record.receipt is not None
+        assert expected_record.evidence is not None
+        receipt = expected_record.receipt
+        evidence = expected_record.evidence
         manifest = artifact.manifest
+        event_ids = manifest.get("event_ids")
+        source_event_evidence = manifest.get("source_event_evidence")
+        expected_query = {
+            "source": "openevo",
+            "event_types": ["openevo.session_completed"],
+            "status": ["COMPLETED"],
+            "reward_min": None,
+            "policy_version": evidence.policy_version,
+            "task_tags": [],
+            "source_event_id": f"session:{receipt.session_id}",
+            "task_id": receipt.rollout_task_id,
+            "session_id": receipt.session_id,
+        }
+        expected_query = {
+            key: value
+            for key, value in expected_query.items()
+            if value is not None
+        }
         if (
-            artifact.artifact_id != dataset.artifact_id
+            dataset.event_count != 1
+            or dataset.trace_count != expected_record_count
+            or dataset.trace_count != captured_trace_count
+            or artifact.artifact_id != dataset.artifact_id
             or artifact.type is not ArtifactType.DATASET
             or artifact.state is not ArtifactState.ACTIVE
             or artifact.promoted is not True
+            or artifact.name != expected_name
+            or artifact.compatibility
+            != {"purpose": "openevo_science_successor_v2"}
             or manifest.get("dataset_id") != dataset.dataset_id
+            or manifest.get("name") != expected_name
+            or manifest.get("purpose")
+            != "openevo_science_successor_v2"
+            or manifest.get("query") != expected_query
+            or manifest.get("limits")
+            != {
+                "max_events": 1,
+                "max_traces": expected_record_count,
+            }
+            or not isinstance(event_ids, list)
+            or len(event_ids) != 1
+            or not isinstance(event_ids[0], str)
+            or not event_ids[0]
             or manifest.get("event_count") != 1
             or manifest.get("trace_count") != dataset.trace_count
+            or manifest.get("records_path") != "records.jsonl"
+            or not isinstance(manifest.get("records_uri"), str)
+            or not manifest["records_uri"]
+            or type(manifest.get("records_byte_size")) is not int
+            or manifest["records_byte_size"] < 0
+            or not isinstance(manifest.get("records_sha256"), str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                manifest["records_sha256"],
+            )
+            is None
+            or manifest.get("create_identity")
+            != expected_idempotency_key
+            or source_event_evidence
+            != {
+                "event_id": event_ids[0],
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
+                "source_event_id": f"session:{receipt.session_id}",
+                "task_id": receipt.rollout_task_id,
+                "session_id": receipt.session_id,
+                "session_result_sha256": evidence.session_result_sha256,
+            }
         ):
             raise ScienceSuccessorPreparationV2Error(
                 "dataset artifact differs from the sealed transcript authority"
@@ -290,7 +468,11 @@ class ProductionScienceSuccessorPreparerV2:
                 binding=binding,
                 record=record,
             )
-            prior_context = self._prior_context_artifacts(context, client)
+            (
+                prior_context,
+                _prior_composition,
+                prior_owner_by_target,
+            ) = self._prior_context_artifacts(context, client)
             compiled_task = compiled.tasks[0]
             legacy_payloads = compiled_task.evolution_job_payloads_for_round(
                 0,
@@ -303,6 +485,18 @@ class ProductionScienceSuccessorPreparerV2:
                     client,
                     spec=spec,
                     legacy_payload=legacy_payload,
+                    transition_attempt_id=(
+                        context.transition_attempt.transition_attempt_id
+                    ),
+                    transition_attempt_ordinal=(
+                        context.transition_attempt.ordinal
+                    ),
+                    successor_transition_id=(
+                        context.transition.transition.successor_transition_id
+                    ),
+                    predecessor_successor_transition_id=(
+                        prior_owner_by_target.get(spec.target_id)
+                    ),
                 )
                 for spec, legacy_payload in zip(
                     methods,
@@ -319,6 +513,7 @@ class ProductionScienceSuccessorPreparerV2:
         outputs: tuple[ScienceMethodOutputV2, ...],
     ) -> ValidatedScienceOutputsV2:
         self._require_running()
+        record, _result, project = self._authority(context)
         expected = tuple(
             (item.target_id, item.method_id, item.output_artifact_type)
             for item in context.plan.enabled_methods
@@ -328,10 +523,67 @@ class ProductionScienceSuccessorPreparerV2:
             raise ScienceSuccessorPreparationV2Error(
                 "method outputs do not exactly cover the successor plan"
             )
+        with self._evolution(
+            context,
+            record,
+            project,
+        ) as (_binding, client):
+            (
+                _prior_context,
+                inherited,
+                _prior_owner_by_target,
+            ) = self._prior_context_artifacts(context, client)
+        composition_by_target = {
+            item.target_id: item
+            for item in inherited
+        }
+        transition_id = (
+            context.transition.transition.successor_transition_id
+        )
+        for output in outputs:
+            composition_by_target[output.target_id] = (
+                SuccessorArtifactContributionV2(
+                    target_id=output.target_id,
+                    artifact_id=output.artifact_id,
+                    artifact_type=output.artifact_type,
+                    owner_successor_transition_id=transition_id,
+                    origin="produced",
+                )
+            )
+        composition = tuple(
+            composition_by_target[target_id]
+            for target_id in sorted(composition_by_target)
+        )
+        if not context.plan.enabled_methods:
+            predecessor_revision = (
+                context.task.admission.predecessor_project_head.evolution_revision
+            )
+            return ValidatedScienceOutputsV2(
+                project_id=context.task.project_id,
+                successor_transition_id=transition_id,
+                predecessor_project_head_id=(
+                    context.task.admission.predecessor_project_head.project_head_id
+                ),
+                dataset=dataset,
+                outputs=outputs,
+                composition=composition,
+                evolution_revision=predecessor_revision,
+            )
         manifest = {
-            "artifacts": [item.model_dump(mode="json") for item in outputs],
+            "artifacts": [
+                item.model_dump(mode="json")
+                for item in composition
+            ],
             "dataset": dataset.model_dump(mode="json"),
             "evolution_revision_contract_version": "2",
+            "method_outputs": [
+                item.model_dump(mode="json") for item in outputs
+            ],
+            "predecessor_evolution_revision": (
+                context.task.admission.predecessor_project_head.evolution_revision.model_dump(
+                    mode="json"
+                )
+            ),
             "predecessor_project_head_id": (
                 context.task.admission.predecessor_project_head.project_head_id
             ),
@@ -343,7 +595,7 @@ class ProductionScienceSuccessorPreparerV2:
             evolution_revision_id=f"evolution-{digest}",
             project_id=context.task.project_id,
             manifest_sha256=digest,
-            artifact_count=len(outputs),
+            artifact_count=len(composition),
         )
         return ValidatedScienceOutputsV2(
             project_id=context.task.project_id,
@@ -353,6 +605,7 @@ class ProductionScienceSuccessorPreparerV2:
             ),
             dataset=dataset,
             outputs=outputs,
+            composition=composition,
             evolution_revision=revision,
         )
 
@@ -362,9 +615,20 @@ class ProductionScienceSuccessorPreparerV2:
         validated: ValidatedScienceOutputsV2,
     ) -> SuccessorMaterializationV2:
         self._require_running()
+        if not context.plan.enabled_methods:
+            return self._inherited_materialization(
+                context,
+                validated,
+            )
         record, _result, project = self._authority(context)
         assert record.evidence is not None
-        output_ids = tuple(item.artifact_id for item in validated.outputs)
+        output_ids = tuple(
+            item.artifact_id for item in validated.composition
+        )
+        owner_transition_ids = tuple(
+            item.owner_successor_transition_id
+            for item in validated.composition
+        )
         with self._evolution(context, record, project) as (_binding, client):
             request = ContextProjectionResolveRequest(
                 task_id=context.task.task_id,
@@ -386,7 +650,12 @@ class ProductionScienceSuccessorPreparerV2:
                         f"{context.accepted_attempt.attempt_id}:"
                         f"{context.task.task_id}"
                     ],
-                    "evolution": {"context_artifact_ids": output_ids},
+                    "evolution": {
+                        "context_artifact_ids": output_ids,
+                        "context_artifact_owner_transition_ids": (
+                            owner_transition_ids
+                        ),
+                    },
                 },
                 execution_profile=execution_profile_for_release_mode(
                     project.config.execution.mode
@@ -453,6 +722,156 @@ class ProductionScienceSuccessorPreparerV2:
             materialized_context_id=materialized.context_id,
             materialized_context_manifest_sha256=materialized_sha256,
             runtime_context_snapshot=runtime,
+        )
+
+    def _inherited_materialization(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        validated: ValidatedScienceOutputsV2,
+    ) -> SuccessorMaterializationV2:
+        predecessor = (
+            context.task.admission.predecessor_project_head
+        )
+        artifact_ids = tuple(
+            item.artifact_id for item in validated.composition
+        )
+        if (
+            validated.outputs
+            or any(
+                item.origin != "inherited"
+                for item in validated.composition
+            )
+            or validated.evolution_revision
+            != predecessor.evolution_revision
+            or len(artifact_ids)
+            != predecessor.evolution_revision.artifact_count
+        ):
+            raise ScienceSuccessorPreparationV2Error(
+                "no-evolution successor changed predecessor evolution authority"
+            )
+        commit = self._ledger.successor_commit_for_project_head(
+            predecessor.project_head_id
+        )
+        runtime_source: str
+        source_transition_id: str | None
+        source_predecessor_id: str | None
+        materialized_context_id: str | None
+        materialized_manifest_sha256: str | None
+        if commit is None:
+            if (
+                predecessor.generation != 0
+                or predecessor.evolution_revision.artifact_count != 0
+                or artifact_ids
+            ):
+                raise ScienceSuccessorPreparationV2Error(
+                    "no-evolution successor lacks exact predecessor receipt"
+                )
+            runtime_source = "empty_inherited"
+            source_transition_id = None
+            source_predecessor_id = None
+            materialized_context_id = None
+            materialized_manifest_sha256 = None
+        else:
+            manifest = commit.manifest
+            if (
+                manifest.method_artifact_ids != artifact_ids
+                or (
+                    manifest.artifacts
+                    and tuple(
+                        (
+                            item.target_id,
+                            item.artifact_id,
+                            item.artifact_type,
+                            item.owner_successor_transition_id,
+                        )
+                        for item in manifest.artifacts
+                    )
+                    != tuple(
+                        (
+                            item.target_id,
+                            item.artifact_id,
+                            item.artifact_type,
+                            item.owner_successor_transition_id,
+                        )
+                        for item in validated.composition
+                    )
+                )
+            ):
+                raise ScienceSuccessorPreparationV2Error(
+                    "no-evolution successor artifact receipt changed"
+                )
+            if type(manifest) is AtomicSuccessorManifestV2:
+                if (
+                    manifest.runtime_context_source
+                    == "materialized_new"
+                ):
+                    runtime_source = "materialized_inherited"
+                    source_transition_id = (
+                        manifest.successor_transition_id
+                    )
+                    source_predecessor_id = (
+                        manifest.predecessor_project_head_id
+                    )
+                    materialized_context_id = (
+                        manifest.materialized_context_id
+                    )
+                    materialized_manifest_sha256 = (
+                        manifest.materialized_context_manifest_sha256
+                    )
+                else:
+                    runtime_source = manifest.runtime_context_source
+                    source_transition_id = (
+                        manifest.materialized_source_successor_transition_id
+                    )
+                    source_predecessor_id = (
+                        manifest.materialized_source_predecessor_project_head_id
+                    )
+                    materialized_context_id = (
+                        manifest.materialized_context_id
+                    )
+                    materialized_manifest_sha256 = (
+                        manifest.materialized_context_manifest_sha256
+                    )
+            elif type(manifest) is AtomicEvolutionAbandonManifestV2:
+                runtime_source = manifest.runtime_context_source
+                source_transition_id = (
+                    manifest.materialized_source_successor_transition_id
+                )
+                source_predecessor_id = (
+                    manifest.materialized_source_predecessor_project_head_id
+                )
+                materialized_context_id = (
+                    manifest.materialized_context_id
+                )
+                materialized_manifest_sha256 = (
+                    manifest.materialized_context_manifest_sha256
+                )
+            else:  # pragma: no cover - closed receipt union
+                raise ScienceSuccessorPreparationV2Error(
+                    "no-evolution successor receipt type is unsupported"
+                )
+        return SuccessorMaterializationV2(
+            project_id=context.task.project_id,
+            successor_transition_id=(
+                context.transition.transition.successor_transition_id
+            ),
+            predecessor_project_head_id=(
+                predecessor.project_head_id
+            ),
+            runtime_context_source=runtime_source,
+            materialized_source_successor_transition_id=(
+                source_transition_id
+            ),
+            materialized_source_predecessor_project_head_id=(
+                source_predecessor_id
+            ),
+            materialized_context_id=materialized_context_id,
+            materialized_context_manifest_sha256=(
+                materialized_manifest_sha256
+            ),
+            runtime_context_snapshot=(
+                predecessor.runtime_context_snapshot
+            ),
         )
 
     def capture_workspace_result(
@@ -555,12 +974,95 @@ class ProductionScienceSuccessorPreparerV2:
             workspace_snapshot=snapshot,
         )
 
+    def discard_transition_outputs(
+        self,
+        context: ScienceSuccessorCleanupContextV2,
+    ) -> ScienceSuccessorCleanupReceiptV2:
+        """Discard non-active outputs after the Core has committed abandon."""
+
+        self._require_running()
+        record, _result, project = self._cleanup_authority(
+            context
+        )
+        transition_id = (
+            context.transition.transition.successor_transition_id
+        )
+        with self._evolution(context, record, project) as (_binding, client):
+            raw = client.discard_successor_transition_outputs(
+                transition_id
+            )
+        self._require_running()
+        discarded = (
+            raw.get("discarded_artifact_ids")
+            if type(raw) is dict
+            else None
+        )
+        discarded_contexts = (
+            raw.get("discarded_materialized_context_ids")
+            if type(raw) is dict
+            else None
+        )
+        if (
+            type(raw) is not dict
+            or set(raw) != {
+                "successor_transition_id",
+                "discarded_artifact_ids",
+                "discarded_materialized_context_ids",
+            }
+            or raw.get("successor_transition_id") != transition_id
+            or not isinstance(discarded, list)
+            or not isinstance(discarded_contexts, list)
+            or any(
+                not isinstance(artifact_id, str) or not artifact_id
+                for artifact_id in discarded
+            )
+            or any(
+                not isinstance(context_id, str) or not context_id
+                for context_id in discarded_contexts
+            )
+            or len(discarded) != len(set(discarded))
+            or len(discarded_contexts)
+            != len(set(discarded_contexts))
+        ):
+            raise ScienceSuccessorPreparationV2Error(
+                "discard receipt differs from the requested transition"
+            )
+        try:
+            return ScienceSuccessorCleanupReceiptV2(
+                successor_transition_id=transition_id,
+                discarded_artifact_ids=tuple(discarded),
+                discarded_materialized_context_ids=tuple(
+                    discarded_contexts
+                ),
+            )
+        except ValueError as exc:
+            raise ScienceSuccessorPreparationV2Error(
+                "discard receipt differs from the requested transition"
+            ) from exc
+
     def _authority(
         self,
         context: ScienceSuccessorPreparationContextV2,
     ) -> tuple[ScienceAttemptExecutionRecordV2, Any, ProjectRecordV2]:
         if type(context) is not ScienceSuccessorPreparationContextV2:
             raise TypeError("v2 successor preparation requires its exact context")
+        return self._validated_authority(context)
+
+    def _cleanup_authority(
+        self,
+        context: ScienceSuccessorCleanupContextV2,
+    ) -> tuple[ScienceAttemptExecutionRecordV2, Any, ProjectRecordV2]:
+        if type(context) is not ScienceSuccessorCleanupContextV2:
+            raise TypeError(
+                "v2 successor cleanup requires its exact context"
+            )
+        return self._validated_authority(context)
+
+    def _validated_authority(
+        self,
+        context: ScienceSuccessorPreparationContextV2
+        | ScienceSuccessorCleanupContextV2,
+    ) -> tuple[ScienceAttemptExecutionRecordV2, Any, ProjectRecordV2]:
         record = self._ledger.get_attempt_execution(
             context.task.task_id,
             context.accepted_attempt.attempt_id,
@@ -587,7 +1089,8 @@ class ProductionScienceSuccessorPreparerV2:
     @contextmanager
     def _evolution(
         self,
-        context: ScienceSuccessorPreparationContextV2,
+        context: ScienceSuccessorPreparationContextV2
+        | ScienceSuccessorCleanupContextV2,
         record: ScienceAttemptExecutionRecordV2,
         project: ProjectRecordV2,
     ) -> Iterator[tuple[ServiceRunBinding, EvolutionClientProtocol]]:
@@ -685,30 +1188,133 @@ class ProductionScienceSuccessorPreparerV2:
         self,
         context: ScienceSuccessorPreparationContextV2,
         client: EvolutionClientProtocol,
-    ) -> dict[str, list[str]]:
+    ) -> tuple[
+        dict[str, list[str]],
+        tuple[SuccessorArtifactContributionV2, ...],
+        dict[str, str],
+    ]:
         result = {key: [] for key in _CONTEXT_ARTIFACT_TYPES}
         predecessor_id = context.task.admission.predecessor_project_head.project_head_id
         result["dataset"] = list(self._ledger.prior_dataset_artifact_ids_for_head(predecessor_id))
         commit = self._ledger.successor_commit_for_project_head(predecessor_id)
         if commit is None:
-            return result
-        for artifact_id in commit.manifest.method_artifact_ids:
-            artifact = ArtifactResponse.model_validate(client.get_artifact(artifact_id))
+            return result, (), {}
+        manifest = commit.manifest
+        if type(manifest) not in {
+            AtomicSuccessorManifestV2,
+            AtomicEvolutionAbandonManifestV2,
+        }:  # pragma: no cover - closed receipt union
+            raise ScienceSuccessorPreparationV2Error(
+                "predecessor context has an unsupported commit receipt"
+            )
+        stored_contributions = manifest.artifacts
+        if stored_contributions and tuple(
+            item.artifact_id for item in stored_contributions
+        ) != manifest.method_artifact_ids:
+            raise ScienceSuccessorPreparationV2Error(
+                "predecessor artifact composition differs from its receipt"
+            )
+        if type(manifest) is AtomicSuccessorManifestV2:
+            legacy_owner = manifest.successor_transition_id
+        else:
+            legacy_owner = (
+                manifest.materialized_source_successor_transition_id
+            )
+        contributions: list[SuccessorArtifactContributionV2] = []
+        owner_by_target: dict[str, str] = {}
+        for index, artifact_id in enumerate(
+            manifest.method_artifact_ids
+        ):
+            stored = (
+                None
+                if not stored_contributions
+                else stored_contributions[index]
+            )
+            owner_transition_id = (
+                legacy_owner
+                if stored is None
+                else stored.owner_successor_transition_id
+            )
+            if owner_transition_id is None:
+                raise ScienceSuccessorPreparationV2Error(
+                    "predecessor context has no artifact owner transition"
+                )
+            artifact = ArtifactResponse.model_validate(
+                client.get_internal_successor_artifact(
+                    owner_transition_id,
+                    artifact_id,
+                )
+            )
             artifact_type = str(artifact.type)
+            if stored is None:
+                candidate_targets = tuple(
+                    target.id
+                    for target in self._registry.snapshot.targets.values()
+                    if target.artifact_type == artifact_type
+                )
+                if len(candidate_targets) != 1:
+                    raise ScienceSuccessorPreparationV2Error(
+                        "legacy predecessor artifact has ambiguous target ownership"
+                    )
+                target_id = candidate_targets[0]
+            else:
+                target_id = stored.target_id
+                target = self._registry.snapshot.targets.get(
+                    target_id
+                )
+                if (
+                    stored.artifact_id != artifact_id
+                    or stored.artifact_type != artifact_type
+                    or target is None
+                    or target.artifact_type != artifact_type
+                ):
+                    raise ScienceSuccessorPreparationV2Error(
+                        "predecessor artifact differs from its typed contribution"
+                    )
             if (
                 artifact.artifact_id != artifact_id
-                or artifact.state is not ArtifactState.ACTIVE
+                or artifact.state
+                not in {
+                    ArtifactState.ACTIVE,
+                    ArtifactState.SEALED,
+                }
                 or artifact.promoted is not True
                 or artifact_type not in result
                 or artifact_type == "dataset"
+                or target_id in owner_by_target
             ):
                 raise ScienceSuccessorPreparationV2Error(
                     "predecessor context contains a non-target artifact"
                 )
             result[artifact_type].append(artifact.artifact_id)
+            owner_by_target[target_id] = owner_transition_id
+            contributions.append(
+                SuccessorArtifactContributionV2(
+                    target_id=target_id,
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                    owner_successor_transition_id=(
+                        owner_transition_id
+                    ),
+                    origin="inherited",
+                )
+            )
         for values in result.values():
             values.sort()
-        return result
+        ordered = tuple(
+            sorted(
+                contributions,
+                key=lambda item: item.target_id,
+            )
+        )
+        if (
+            len(ordered)
+            != context.task.admission.predecessor_project_head.evolution_revision.artifact_count
+        ):
+            raise ScienceSuccessorPreparationV2Error(
+                "predecessor artifact composition is incomplete"
+            )
+        return result, ordered, owner_by_target
 
     def _run_one_method(
         self,
@@ -716,12 +1322,67 @@ class ProductionScienceSuccessorPreparerV2:
         *,
         spec: CompiledEvolutionMethodSpec,
         legacy_payload: dict[str, Any],
+        transition_attempt_id: str,
+        transition_attempt_ordinal: int,
+        successor_transition_id: str,
+        predecessor_successor_transition_id: str | None,
     ) -> ScienceMethodOutputV2:
         self._require_running()
-        request = _plan_bound_request(spec, legacy_payload)
+        request = _plan_bound_request(
+            spec,
+            legacy_payload,
+            successor_transition_id=successor_transition_id,
+            predecessor_successor_transition_id=(
+                predecessor_successor_transition_id
+            ),
+        )
         created = JobCreateResponse.model_validate(
             client.create_plan_bound_job(request.model_dump(mode="json"))
         )
+        if created.state in {
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.EXPIRED,
+        }:
+            observed = client.get_internal_job_result(created.job_id)
+            if (
+                not isinstance(observed, Mapping)
+                or observed.get("job_id") != created.job_id
+                or observed.get("state") != created.state.value
+                or type(observed.get("retryable")) is not bool
+            ):
+                raise ScienceSuccessorPreparationV2Error(
+                    "initial managed evolution terminal authority is invalid"
+                )
+            if observed["retryable"] is not True:
+                raise ScienceSuccessorPreparationV2Error(
+                    "initial managed evolution job failed deterministically",
+                    retryable=False,
+                )
+            if transition_attempt_ordinal < 2:
+                raise ScienceSuccessorPreparationV2Error(
+                    "initial managed evolution job was already terminal",
+                    retryable=True,
+                )
+            created = JobCreateResponse.model_validate(
+                client.retry_plan_bound_job(
+                    created.job_id,
+                    {
+                        "retry_request_id": transition_attempt_id,
+                        "plan_id": request.plan.plan_id,
+                        "target_id": request.target_id,
+                    },
+                )
+            )
+            if created.state in {
+                JobState.FAILED,
+                JobState.CANCELLED,
+                JobState.EXPIRED,
+            }:
+                raise ScienceSuccessorPreparationV2Error(
+                    "managed evolution job retry did not requeue",
+                    retryable=True,
+                )
         terminal: Mapping[str, Any] | None = None
         for poll_index in range(self._max_poll_attempts):
             if poll_index and self._stop.wait(self._poll_interval):
@@ -741,14 +1402,26 @@ class ProductionScienceSuccessorPreparerV2:
                 JobState.CANCELLED.value,
                 JobState.EXPIRED.value,
             }:
+                retryable = observed.get("retryable")
+                if type(retryable) is not bool:
+                    raise ScienceSuccessorPreparationV2Error(
+                        "managed evolution failure classification is invalid"
+                    )
                 raise ScienceSuccessorPreparationV2Error(
-                    "managed evolution method did not succeed"
+                    "managed evolution method did not succeed",
+                    retryable=retryable,
                 )
         if terminal is None:
             raise ScienceSuccessorPreparationV2Error(
-                "managed evolution method did not reach a terminal result"
+                "managed evolution method did not reach a terminal result",
+                retryable=True,
             )
-        if terminal.get("job_id") != created.job_id or terminal.get("error") is not None:
+        if (
+            terminal.get("job_id") != created.job_id
+            or terminal.get("error") is not None
+            or terminal.get("successor_transition_id")
+            != successor_transition_id
+        ):
             raise ScienceSuccessorPreparationV2Error(
                 "managed evolution terminal identity is invalid"
             )
@@ -794,17 +1467,6 @@ class ProductionScienceSuccessorPreparerV2:
             raise ScienceSuccessorPreparationV2Error(
                 "managed evolution target output evidence is invalid"
             )
-        authoritative = ArtifactResponse.model_validate(client.get_artifact(artifact_id))
-        if (
-            authoritative.artifact_id != artifact_id
-            or str(authoritative.type) != spec.artifact_type
-            or authoritative.state is not ArtifactState.ACTIVE
-            or authoritative.promoted is not True
-            or authoritative.manifest != output.get("manifest")
-        ):
-            raise ScienceSuccessorPreparationV2Error(
-                "managed evolution artifact changed after job completion"
-            )
         return ScienceMethodOutputV2(
             target_id=spec.target_id,
             method_id=spec.method,
@@ -819,6 +1481,9 @@ class ProductionScienceSuccessorPreparerV2:
 def _plan_bound_request(
     spec: CompiledEvolutionMethodSpec,
     legacy_payload: Mapping[str, Any],
+    *,
+    successor_transition_id: str,
+    predecessor_successor_transition_id: str | None,
 ) -> PlanBoundJobCreateRequest:
     config = legacy_payload.get("config")
     bindings = legacy_payload.get("input_bindings")
@@ -836,6 +1501,10 @@ def _plan_bound_request(
         target_id=spec.target_id,
         job_type=spec.method,
         input_bindings=tuple(bindings),
+        successor_transition_id=successor_transition_id,
+        predecessor_successor_transition_id=(
+            predecessor_successor_transition_id
+        ),
         core_config=core_config,
         priority=100,
     )

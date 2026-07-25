@@ -83,6 +83,69 @@ def test_materialized_blob_transport_rejects_oversize_before_read(
     )
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "core_status"),
+    [
+        ("GET", "/v1/internal/jobs/job-missing", 404),
+        (
+            "GET",
+            "/v1/internal/successor-transitions/"
+            "successor-missing/artifacts/artifact-missing",
+            404,
+        ),
+        (
+            "POST",
+            "/v1/internal/successor-transitions/"
+            "successor-missing/discard",
+            200,
+        ),
+    ],
+)
+def test_core_control_routes_reject_other_authenticated_services(
+    tmp_path,
+    method: str,
+    path: str,
+    core_status: int,
+) -> None:
+    credential = "core-control-route-fence-test-credential"
+    server_identity = InternalServiceIdentity(
+        service_id="evolution-backend",
+        generation_digest="1" * 64,
+        registry_digest="2" * 64,
+        framework_lock_digest="3" * 64,
+        credential=credential,
+    )
+    core_identity = InternalServiceIdentity(
+        service_id="core-control",
+        generation_digest=server_identity.generation_digest,
+        registry_digest=server_identity.registry_digest,
+        framework_lock_digest=(
+            server_identity.framework_lock_digest
+        ),
+        credential=credential,
+    )
+    app = create_app(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+        internal_identity=server_identity,
+    )
+
+    with TestClient(app) as client:
+        wrong_caller = client.request(
+            method,
+            path,
+            headers=server_identity.request_headers(),
+        )
+        core_caller = client.request(
+            method,
+            path,
+            headers=core_identity.request_headers(),
+        )
+
+    assert wrong_caller.status_code == 403
+    assert core_caller.status_code == core_status
+
+
 def test_post_event_ingests_once(tmp_path):
     app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
     payload = {
@@ -637,6 +700,7 @@ def test_create_dataset_route(tmp_path):
         dataset_response = client.post(
             "/v1/datasets",
             json={
+                "idempotency_key": "route-dataset",
                 "name": "route_dataset",
                 "purpose": "skill_distillation",
                 "query": {
@@ -651,7 +715,7 @@ def test_create_dataset_route(tmp_path):
     assert event_response.status_code == 200
     assert dataset_response.status_code == 200
     body = dataset_response.json()
-    assert body["dataset_id"].startswith("ds_")
+    assert body["dataset_id"].startswith("ds-")
     assert body["artifact_id"].startswith("art_")
     assert body["event_count"] == 1
     assert body["trace_count"] == 2
@@ -671,7 +735,151 @@ def test_create_dataset_route(tmp_path):
     assert dataset_row["artifact_id"] == body["artifact_id"]
     assert artifact_row is not None
     assert artifact_row["type"] == "dataset"
-    assert artifact_row["uri"] == Path(dataset_row["manifest_path"]).as_uri()
+    assert artifact_row["uri"] == Path(
+        dataset_row["manifest_path"]
+    ).as_uri()
+
+
+def test_dataset_route_openapi_requires_idempotency_key(tmp_path):
+    app = create_app(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    schema = app.openapi()
+    request_schema = schema["components"]["schemas"][
+        "DatasetCreateHttpRequest"
+    ]
+
+    assert "idempotency_key" in request_schema["required"]
+
+
+def test_get_dataset_route_recovers_the_exact_sealed_dataset(tmp_path):
+    app = create_app(db_path=tmp_path / "evolution.db", artifact_root=tmp_path / "artifacts")
+
+    with TestClient(app) as client:
+        event_response = client.post(
+            "/v1/events",
+            json={
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
+                "source_event_id": "session:dataset-recovery-route",
+                "status": "COMPLETED",
+                "payload": {"session_result": {"trajectory": {"traces": [{"reward": 1.0}]}}},
+            },
+        )
+        created = client.post(
+            "/v1/datasets",
+            json={
+                "idempotency_key": "recoverable-dataset-route",
+                "name": "recoverable_dataset",
+                "purpose": "openevo_science_successor_v2",
+                "query": {
+                    "event_types": ["openevo.session_completed"],
+                    "status": ["COMPLETED"],
+                },
+            },
+        )
+        recovered = client.get(f"/v1/datasets/{created.json()['dataset_id']}")
+        missing = client.get("/v1/datasets/ds_missing")
+
+    assert event_response.status_code == 200
+    assert created.status_code == 200
+    assert recovered.status_code == 200
+    assert recovered.json() == created.json()
+    assert missing.status_code == 404
+
+
+def test_get_dataset_integrity_failure_is_not_reported_as_missing(tmp_path):
+    app = create_app(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    with TestClient(app) as client:
+        client.post(
+            "/v1/events",
+            json={
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
+                "source_event_id": "session:dataset-integrity-route",
+                "status": "COMPLETED",
+                "payload": {
+                    "session_result": {
+                        "trajectory": {"traces": [{"reward": 1.0}]}
+                    }
+                },
+            },
+        )
+        created = client.post(
+            "/v1/datasets",
+            json={
+                "idempotency_key": "integrity-dataset-route",
+                "name": "integrity_dataset",
+                "purpose": "openevo_science_successor_v2",
+                "query": {
+                    "event_types": ["openevo.session_completed"],
+                    "status": ["COMPLETED"],
+                },
+            },
+        )
+        dataset_id = created.json()["dataset_id"]
+        with app.state.store.connect() as connection:
+            connection.execute(
+                "DELETE FROM dataset_events WHERE dataset_id = ?",
+                (dataset_id,),
+            )
+            connection.commit()
+        corrupted = client.get(f"/v1/datasets/{dataset_id}")
+
+    assert created.status_code == 200
+    assert corrupted.status_code == 409
+
+
+def test_create_dataset_integrity_failure_is_not_reported_as_validation(
+    tmp_path,
+):
+    app = create_app(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    request = {
+        "idempotency_key": "dataset-integrity-create-route",
+        "name": "integrity dataset replay",
+        "purpose": "openevo_science_successor_v2",
+        "query": {
+            "source": "openevo",
+            "source_event_id": "session:dataset-integrity-create-route",
+        },
+        "limits": {"max_events": 1, "max_traces": 1},
+    }
+
+    with TestClient(app) as client:
+        client.post(
+            "/v1/events",
+            json={
+                "source": "openevo",
+                "event_type": "openevo.session_completed",
+                "source_event_id": "session:dataset-integrity-create-route",
+                "status": "COMPLETED",
+                "payload": {
+                    "session_result": {
+                        "trajectory": {"traces": [{"reward": 1.0}]}
+                    }
+                },
+            },
+        )
+        created = client.post("/v1/datasets", json=request)
+        with app.state.store.connect() as connection:
+            connection.execute(
+                "DELETE FROM dataset_events WHERE dataset_id = ?",
+                (created.json()["dataset_id"],),
+            )
+            connection.commit()
+        corrupted_replay = client.post("/v1/datasets", json=request)
+
+    assert created.status_code == 200
+    assert corrupted_replay.status_code == 409
 
 
 def test_create_dataset_route_rejects_task_tags_without_writes(tmp_path):
@@ -691,6 +899,7 @@ def test_create_dataset_route_rejects_task_tags_without_writes(tmp_path):
         dataset_response = client.post(
             "/v1/datasets",
             json={
+                "idempotency_key": "tagged-route-dataset",
                 "name": "tagged_route_dataset",
                 "purpose": "skill_distillation",
                 "query": {"task_tags": ["calculator"]},
@@ -719,6 +928,37 @@ def test_create_dataset_route_uses_sync_handler(tmp_path):
     route = next(route for route in app.routes if getattr(route, "path", None) == "/v1/datasets")
 
     assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
+def test_create_dataset_route_requires_idempotency_key(tmp_path):
+    app = create_app(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/datasets",
+            json={
+                "name": "unsafe unjournaled dataset",
+                "purpose": "skill_distillation",
+            },
+        )
+
+    assert response.status_code == 422
+    assert any(
+        detail["loc"] == ["body", "idempotency_key"]
+        and detail["type"] == "missing"
+        for detail in response.json()["detail"]
+    )
+    with app.state.store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM datasets").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM dataset_create_requests"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_job_route_claim_heartbeat_and_complete(tmp_path):
@@ -811,6 +1051,7 @@ def test_backend_event_dataset_job_context_flow(tmp_path):
         dataset_response = client.post(
             "/v1/datasets",
             json={
+                "idempotency_key": "calculator-policy-1",
                 "name": "calculator_policy_1",
                 "purpose": "text_memory_mining",
                 "query": {

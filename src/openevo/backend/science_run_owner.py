@@ -33,8 +33,11 @@ from openevo.backend.science_execution_v2 import (
 from openevo.backend.science_successor import (
     AcceptedWorkspaceResultV2,
     ScienceMethodOutputV2,
+    ScienceSuccessorCleanupContextV2,
+    ScienceSuccessorCleanupReceiptV2,
     ScienceSuccessorPlanV2,
     ScienceSuccessorPreparationContextV2,
+    ScienceSuccessorTransitionAttemptV2,
     SealedTranscriptDatasetV2,
     SuccessorMaterializationV2,
     ValidatedScienceOutputsV2,
@@ -76,6 +79,7 @@ from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
 from openevo.evolution.framework.execution import ResolvedMethodInputBinding
 from openevo.evolution.runtime_injection import build_runtime_injection_plan
 from openevo.evolution.revisions import (
+    AtomicEvolutionAbandonManifestV2,
     AtomicSuccessorCommitV2,
     AtomicSuccessorManifestV2,
     atomic_successor_manifest_sha256,
@@ -147,6 +151,14 @@ class ScienceSuccessorPreparerV2(Protocol):
         context: ScienceSuccessorPreparationContextV2,
     ) -> SealedTranscriptDatasetV2: ...
 
+    def recover_dataset(
+        self,
+        context: ScienceSuccessorPreparationContextV2,
+        *,
+        dataset_id: str,
+        manifest_sha256: str,
+    ) -> SealedTranscriptDatasetV2: ...
+
     def run_methods(
         self,
         context: ScienceSuccessorPreparationContextV2,
@@ -170,6 +182,11 @@ class ScienceSuccessorPreparerV2(Protocol):
         self,
         context: ScienceSuccessorPreparationContextV2,
     ) -> AcceptedWorkspaceResultV2: ...
+
+    def discard_transition_outputs(
+        self,
+        context: ScienceSuccessorCleanupContextV2,
+    ) -> ScienceSuccessorCleanupReceiptV2: ...
 
 
 class ScienceAttemptRunnerV2(Protocol):
@@ -233,6 +250,7 @@ class CoreScienceTaskOwnerV2:
             raise TypeError("v2 Task owner requires an Attempt executor")
         self._ledger.recover_interrupted_attempts(now=self._clock())
         self._recover_interrupted_successor_transitions()
+        self._recover_abandoned_successor_cleanups()
         self._recovery_complete = True
         self._worker: threading.Thread | None = None
         if self._attempt_executor is not None:
@@ -369,6 +387,20 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="getCoreSuccessorCommitV2")
 
+    def successor_transition_attempts(
+        self,
+        successor_transition_id: str,
+    ) -> list[ScienceSuccessorTransitionAttemptV2]:
+        try:
+            return self._ledger.successor_transition_attempts(
+                successor_transition_id,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="getCoreSuccessorTransitionAttemptsV2",
+            )
+
     def run_successor_transition(
         self,
         task_id: str,
@@ -394,29 +426,248 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="startCoreSuccessorTransitionV2")
 
-        transition_id = transition.transition.successor_transition_id
+        return self._execute_successor_transition(
+            transition.transition.successor_transition_id,
+            plan=plan,
+            dataset_event=None,
+        )
+
+    def retry_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        expected_project_head_id: str,
+        retry_request_id: str,
+        allow_in_progress_recovery: bool = False,
+    ) -> m2.SuccessorTransitionV2:
+        if self._successor_preparer is None:
+            raise CoreTaskControlError(
+                "successor_preparer_unavailable",
+                "Core has no verified science successor preparer.",
+                http_status=503,
+                retryable=False,
+            )
         try:
-            context = self._advance_successor_phase(
-                transition_id,
-                state="sealing_dataset",
+            transition = self._ledger.retry_successor_transition(
+                successor_transition_id,
+                expected_project_head_id=expected_project_head_id,
+                retry_request_id=retry_request_id,
+                now=self._clock(),
+                allow_in_progress_recovery=allow_in_progress_recovery,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="retryCoreSuccessorTransitionV2",
+            )
+        if transition.state == "committed":
+            return transition
+        if transition.state not in {"pending", "running_methods"}:
+            return transition
+        if self._worker is None:
+            return self._resume_successor_transition(successor_transition_id)
+        with self._condition:
+            self._condition.notify_all()
+        return transition
+
+    def abandon_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        expected_project_head_id: str,
+        abandon_request_id: str,
+        allow_cancelled_recovery: bool = False,
+    ) -> m2.SuccessorTransitionV2:
+        preparer = self._successor_preparer
+        if preparer is None:
+            raise CoreTaskControlError(
+                "successor_preparer_unavailable",
+                "Core has no verified science successor preparer.",
+                http_status=503,
+                retryable=False,
+            )
+        if allow_cancelled_recovery:
+            observed = self._ledger.get_successor_transition(
+                successor_transition_id,
+            )
+            if observed.state == "cancelled":
+                try:
+                    abandoned = self._ledger.abandon_successor_transition(
+                        successor_transition_id,
+                        expected_project_head_id=expected_project_head_id,
+                        abandon_request_id=abandon_request_id,
+                        expected_transition_attempt_id=None,
+                        successor=None,
+                        commit=None,
+                        now=self._clock(),
+                        allow_cancelled_recovery=True,
+                    )
+                    if self._ledger.successor_cleanup_receipt(successor_transition_id) is None:
+                        try:
+                            self._complete_successor_cleanup(successor_transition_id)
+                        except Exception as cleanup_exc:
+                            logger.error(
+                                "v2 abandoned successor %s retained outputs during recovery [%s]",
+                                successor_transition_id,
+                                type(cleanup_exc).__name__,
+                            )
+                            raise ScienceTaskStoreV2Error(
+                                "abandoned successor cleanup did not reach durable authority"
+                            ) from cleanup_exc
+                    return abandoned
+                except Exception as exc:
+                    _raise_v2_owner_error(
+                        exc,
+                        operation_id="abandonCoreSuccessorTransitionV2",
+                    )
+        try:
+            transition, plan = self._ledger.successor_abandon_evidence(
+                successor_transition_id,
+            )
+            context = self._successor_context(
+                transition.transition.successor_transition_id,
                 plan=plan,
             )
-            dataset = _validate_sealed_successor_dataset(
-                preparer.seal_dataset(context),
+            workspace = _validate_accepted_workspace_result(
+                preparer.capture_workspace_result(context),
                 context=context,
             )
-            self._ledger.record_dataset_sealed(
-                transition_id,
-                dataset_id=dataset.dataset_id,
-                dataset_sha256=dataset.manifest_sha256,
+            predecessor = transition.transition.predecessor_project_head
+            inherited_commit = self._ledger.successor_commit_for_project_head(
+                predecessor.project_head_id,
+            )
+            successor = _build_v2_abandoned_successor_project_head(
+                context=context,
+                workspace=workspace,
+            )
+            manifest = _build_atomic_evolution_abandon_manifest(
+                context=context,
+                workspace=workspace,
+                successor=successor,
+                inherited_commit=inherited_commit,
+            )
+            commit = AtomicSuccessorCommitV2(
+                manifest_sha256=atomic_successor_manifest_sha256(manifest),
+                manifest=manifest,
+            )
+            abandoned = self._ledger.abandon_successor_transition(
+                successor_transition_id,
+                expected_project_head_id=expected_project_head_id,
+                abandon_request_id=abandon_request_id,
+                expected_transition_attempt_id=(context.transition_attempt.transition_attempt_id),
+                successor=successor,
+                commit=commit,
                 now=self._clock(),
+                allow_cancelled_recovery=allow_cancelled_recovery,
+            )
+            try:
+                self._complete_successor_cleanup(successor_transition_id)
+            except Exception as cleanup_exc:
+                logger.error(
+                    "v2 abandoned successor %s retained outputs [%s]",
+                    successor_transition_id,
+                    type(cleanup_exc).__name__,
+                )
+                raise ScienceTaskStoreV2Error(
+                    "abandoned successor cleanup did not reach durable authority"
+                ) from cleanup_exc
+            return abandoned
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="abandonCoreSuccessorTransitionV2",
             )
 
-            context = self._advance_successor_phase(
-                transition_id,
-                state="running_methods",
-                plan=plan,
+    def _resume_successor_transition(
+        self,
+        successor_transition_id: str,
+    ) -> m2.SuccessorTransitionV2:
+        try:
+            _transition, plan, dataset_event = self._ledger.successor_retry_evidence(
+                successor_transition_id,
             )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="retryCoreSuccessorTransitionV2",
+            )
+        return self._execute_successor_transition(
+            successor_transition_id,
+            plan=plan,
+            dataset_event=dataset_event,
+        )
+
+    def _execute_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        plan: ScienceSuccessorPlanV2,
+        dataset_event: m2.DatasetSealedEventV2 | None,
+    ) -> m2.SuccessorTransitionV2:
+        preparer = self._successor_preparer
+        if preparer is None:
+            raise CoreTaskControlError(
+                "successor_preparer_unavailable",
+                "Core has no verified science successor preparer.",
+                http_status=503,
+                retryable=False,
+            )
+        transition_id = successor_transition_id
+        transition_attempt = self._ledger.current_successor_transition_attempt(
+            transition_id,
+        )
+        if transition_attempt.state != "running":
+            raise CoreTaskControlError(
+                "successor_transition_attempt_not_running",
+                "Core successor execution attempt is no longer current.",
+                http_status=409,
+                retryable=False,
+            )
+        try:
+            if dataset_event is None:
+                context = self._advance_successor_phase(
+                    transition_id,
+                    transition_attempt=transition_attempt,
+                    state="sealing_dataset",
+                    plan=plan,
+                )
+                dataset = _validate_sealed_successor_dataset(
+                    preparer.seal_dataset(context),
+                    context=context,
+                )
+                self._ledger.record_dataset_sealed(
+                    transition_id,
+                    expected_transition_attempt_id=(transition_attempt.transition_attempt_id),
+                    dataset_id=dataset.dataset_id,
+                    dataset_sha256=dataset.manifest_sha256,
+                    now=self._clock(),
+                )
+                context = self._advance_successor_phase(
+                    transition_id,
+                    transition_attempt=transition_attempt,
+                    state="running_methods",
+                    plan=plan,
+                )
+            else:
+                context = self._successor_context(
+                    transition_id,
+                    transition_attempt=transition_attempt,
+                    plan=plan,
+                )
+                dataset = _validate_sealed_successor_dataset(
+                    preparer.recover_dataset(
+                        context,
+                        dataset_id=dataset_event.dataset_id,
+                        manifest_sha256=dataset_event.dataset_sha256,
+                    ),
+                    context=context,
+                )
+                if (
+                    dataset.dataset_id != dataset_event.dataset_id
+                    or dataset.manifest_sha256 != dataset_event.dataset_sha256
+                ):
+                    raise ValueError("recovered successor dataset differs from its journal")
+
             outputs = _validate_successor_method_outputs(
                 preparer.run_methods(context, dataset),
                 plan=plan,
@@ -424,6 +675,7 @@ class CoreScienceTaskOwnerV2:
 
             context = self._advance_successor_phase(
                 transition_id,
+                transition_attempt=transition_attempt,
                 state="validating",
                 plan=plan,
             )
@@ -436,6 +688,7 @@ class CoreScienceTaskOwnerV2:
 
             context = self._advance_successor_phase(
                 transition_id,
+                transition_attempt=transition_attempt,
                 state="materializing",
                 plan=plan,
             )
@@ -451,6 +704,7 @@ class CoreScienceTaskOwnerV2:
 
             context = self._advance_successor_phase(
                 transition_id,
+                transition_attempt=transition_attempt,
                 state="committing",
                 plan=plan,
             )
@@ -475,6 +729,7 @@ class CoreScienceTaskOwnerV2:
             )
             return self._ledger.commit_successor_transition(
                 transition_id,
+                expected_transition_attempt_id=(transition_attempt.transition_attempt_id),
                 successor=successor,
                 commit=commit,
                 now=self._clock(),
@@ -485,13 +740,16 @@ class CoreScienceTaskOwnerV2:
                 transition_id,
                 type(exc).__name__,
             )
+            retryable = _successor_transition_failure_is_retryable(exc)
             error = _successor_transition_api_error(
                 code="successor_transition_failed",
                 message="Core could not prepare and atomically commit the successor state.",
+                retryable=retryable,
             )
             try:
                 self._ledger.fail_successor_transition(
                     transition_id,
+                    expected_transition_attempt_id=(transition_attempt.transition_attempt_id),
                     error=error,
                     now=self._clock(),
                 )
@@ -506,20 +764,18 @@ class CoreScienceTaskOwnerV2:
                 "successor_transition_failed",
                 "Core preserved the failed successor transition without advancing the project head.",
                 http_status=503,
-                retryable=False,
+                retryable=retryable,
             ) from exc
 
-    def _advance_successor_phase(
+    def _successor_context(
         self,
         successor_transition_id: str,
         *,
-        state: str,
+        transition_attempt: ScienceSuccessorTransitionAttemptV2 | None = None,
         plan: ScienceSuccessorPlanV2,
     ) -> ScienceSuccessorPreparationContextV2:
-        transition = self._ledger.advance_successor_transition(
+        transition = self._ledger.get_successor_transition(
             successor_transition_id,
-            state=state,
-            now=self._clock(),
         )
         admission = transition.transition.task_admission
         attempt = transition.transition.accepted_attempt
@@ -528,32 +784,112 @@ class CoreScienceTaskOwnerV2:
                 "run-result successor transition lost its Task ownership"
             )
         task = self._ledger.get_task(admission.task_id)
+        if transition_attempt is None:
+            transition_attempt = self._ledger.current_successor_transition_attempt(
+                successor_transition_id,
+            )
         return ScienceSuccessorPreparationContextV2(
             task=task,
             accepted_attempt=attempt,
             transition=transition,
+            transition_attempt=transition_attempt,
+            plan=plan,
+        )
+
+    def _successor_cleanup_context(
+        self,
+        successor_transition_id: str,
+        *,
+        plan: ScienceSuccessorPlanV2,
+    ) -> ScienceSuccessorCleanupContextV2:
+        transition = self._ledger.get_successor_transition(
+            successor_transition_id,
+        )
+        admission = transition.transition.task_admission
+        attempt = transition.transition.accepted_attempt
+        if admission is None or attempt is None:
+            raise ScienceTaskStoreV2Error("abandoned successor cleanup lost its Task ownership")
+        return ScienceSuccessorCleanupContextV2(
+            task=self._ledger.get_task(admission.task_id),
+            accepted_attempt=attempt,
+            transition=transition,
+            transition_attempt=(
+                self._ledger.current_successor_transition_attempt(successor_transition_id)
+            ),
+            plan=plan,
+        )
+
+    def _advance_successor_phase(
+        self,
+        successor_transition_id: str,
+        *,
+        transition_attempt: ScienceSuccessorTransitionAttemptV2,
+        state: str,
+        plan: ScienceSuccessorPlanV2,
+    ) -> ScienceSuccessorPreparationContextV2:
+        transition = self._ledger.advance_successor_transition(
+            successor_transition_id,
+            expected_transition_attempt_id=(transition_attempt.transition_attempt_id),
+            state=state,
+            now=self._clock(),
+        )
+        return self._successor_context(
+            transition.transition.successor_transition_id,
+            transition_attempt=transition_attempt,
             plan=plan,
         )
 
     def _recover_interrupted_successor_transitions(self) -> None:
         for transition_id in self._ledger.nonterminal_successor_transition_ids():
+            transition_attempt = self._ledger.current_successor_transition_attempt(
+                transition_id,
+            )
             self._ledger.fail_successor_transition(
                 transition_id,
+                expected_transition_attempt_id=(transition_attempt.transition_attempt_id),
                 error=_successor_transition_api_error(
                     code="successor_transition_interrupted",
                     message=(
                         "Core restarted before the successor transition committed; "
                         "the predecessor remains active."
                     ),
+                    retryable=True,
                 ),
                 now=self._clock(),
             )
+
+    def _complete_successor_cleanup(
+        self,
+        successor_transition_id: str,
+    ) -> ScienceSuccessorCleanupReceiptV2:
+        preparer = self._successor_preparer
+        if preparer is None:
+            raise ScienceTaskStoreV2Error("abandoned successor cleanup has no verified preparer")
+        _transition, plan = self._ledger.successor_cleanup_evidence(successor_transition_id)
+        context = self._successor_cleanup_context(
+            successor_transition_id,
+            plan=plan,
+        )
+        receipt = preparer.discard_transition_outputs(context)
+        if (
+            type(receipt) is not ScienceSuccessorCleanupReceiptV2
+            or receipt.successor_transition_id != successor_transition_id
+        ):
+            raise ScienceTaskStoreV2Error(
+                "abandoned successor cleanup returned an invalid receipt"
+            )
+        return self._ledger.record_successor_cleanup(receipt)
+
+    def _recover_abandoned_successor_cleanups(self) -> None:
+        for transition_id in self._ledger.pending_successor_cleanup_ids():
+            self._complete_successor_cleanup(transition_id)
 
     def close_task(
         self,
         task_id: str,
         request: m2.TaskActionRequestV2,
         *,
+        close_request_id: str,
         expected_etag: str | None = None,
         allow_closed_recovery: bool = False,
     ) -> m2.TaskV2:
@@ -561,6 +897,7 @@ class CoreScienceTaskOwnerV2:
             return self._ledger.close_task(
                 task_id,
                 request,
+                close_request_id=close_request_id,
                 now=self._clock(),
                 expected_etag=expected_etag,
                 allow_closed_recovery=allow_closed_recovery,
@@ -737,6 +1074,8 @@ class CoreScienceTaskOwnerV2:
                 if self._closed:
                     return
             try:
+                if self._process_one_resumable_successor():
+                    continue
                 if self._process_one_captured_successor():
                     continue
                 if self._process_one_unstarted_attempt():
@@ -753,6 +1092,15 @@ class CoreScienceTaskOwnerV2:
                     if self._closed:
                         return
                 self._condition.wait(timeout=1.0)
+
+    def _process_one_resumable_successor(self) -> bool:
+        if self._successor_preparer is None:
+            return False
+        transition_ids = self._ledger.resumable_successor_transition_ids()
+        if not transition_ids:
+            return False
+        self._resume_successor_transition(transition_ids[0])
+        return True
 
     def _process_one_captured_successor(self) -> bool:
         if self._successor_preparer is None:
@@ -923,16 +1271,30 @@ def _validate_successor_materialization_receipt(
     materialized = SuccessorMaterializationV2.model_validate(value.model_dump(mode="python"))
     runtime = materialized.runtime_context_snapshot
     evolution = validated.evolution_revision
-    if (
+    common_invalid = (
         materialized.project_id != context.task.project_id
         or materialized.successor_transition_id
         != context.transition.transition.successor_transition_id
         or materialized.predecessor_project_head_id
         != context.task.admission.predecessor_project_head.project_head_id
-        or runtime.evolution_revision_id != evolution.evolution_revision_id
-        or runtime.evolution_revision_manifest_sha256 != evolution.manifest_sha256
         or runtime.registry_sha256 != context.task.admission.registry_sha256
-    ):
+    )
+    predecessor = context.task.admission.predecessor_project_head
+    if not context.plan.enabled_methods:
+        invalid = (
+            common_invalid
+            or materialized.runtime_context_source == "materialized_new"
+            or runtime != predecessor.runtime_context_snapshot
+            or evolution != predecessor.evolution_revision
+        )
+    else:
+        invalid = (
+            common_invalid
+            or materialized.runtime_context_source != "materialized_new"
+            or runtime.evolution_revision_id != evolution.evolution_revision_id
+            or runtime.evolution_revision_manifest_sha256 != evolution.manifest_sha256
+        )
+    if invalid:
         raise ValueError("successor materialization does not bind validated outputs")
     return materialized
 
@@ -1039,25 +1401,207 @@ def _build_atomic_successor_manifest(
         dataset_id=dataset.dataset_id,
         dataset_artifact_id=dataset.artifact_id,
         dataset_manifest_sha256=dataset.manifest_sha256,
+        runtime_context_source=materialized.runtime_context_source,
+        materialized_source_successor_transition_id=(
+            materialized.materialized_source_successor_transition_id
+        ),
+        materialized_source_predecessor_project_head_id=(
+            materialized.materialized_source_predecessor_project_head_id
+        ),
         materialized_context_id=materialized.materialized_context_id,
         materialized_context_manifest_sha256=(materialized.materialized_context_manifest_sha256),
-        method_artifact_ids=tuple(item.artifact_id for item in outputs),
+        method_artifact_ids=tuple(item.artifact_id for item in validated.composition),
+        artifacts=validated.composition,
     )
 
 
-def _successor_transition_api_error(*, code: str, message: str) -> m2.ApiErrorV2:
+def _build_v2_abandoned_successor_project_head(
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    workspace: AcceptedWorkspaceResultV2,
+) -> m2.ProjectHeadRefV2:
+    predecessor = context.task.admission.predecessor_project_head
+    composition = {
+        "effective_execution_snapshot": (
+            predecessor.effective_execution_snapshot.model_dump(mode="json")
+        ),
+        "evolution_revision": predecessor.evolution_revision.model_dump(mode="json"),
+        "generation": predecessor.generation + 1,
+        "predecessor_project_head_id": predecessor.project_head_id,
+        "project_id": context.task.project_id,
+        "registry_sha256": predecessor.registry_sha256,
+        "runtime_context_snapshot": (predecessor.runtime_context_snapshot.model_dump(mode="json")),
+        "successor_transition_id": (context.transition.transition.successor_transition_id),
+        "transition_outcome": "evolution_abandoned",
+        "workspace_snapshot": workspace.workspace_snapshot.model_dump(mode="json"),
+    }
+    payload = json.dumps(
+        composition,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    manifest_sha256 = hashlib.sha256(payload).hexdigest()
+    return m2.ProjectHeadRefV2(
+        project_head_id=f"project-head-{manifest_sha256}",
+        project_id=context.task.project_id,
+        generation=predecessor.generation + 1,
+        predecessor_project_head_id=predecessor.project_head_id,
+        workspace_snapshot=workspace.workspace_snapshot,
+        evolution_revision=predecessor.evolution_revision,
+        runtime_context_snapshot=predecessor.runtime_context_snapshot,
+        effective_execution_snapshot=predecessor.effective_execution_snapshot,
+        registry_sha256=predecessor.registry_sha256,
+        manifest_sha256=manifest_sha256,
+    )
+
+
+def _build_atomic_evolution_abandon_manifest(
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    workspace: AcceptedWorkspaceResultV2,
+    successor: m2.ProjectHeadRefV2,
+    inherited_commit: AtomicSuccessorCommitV2 | None,
+) -> AtomicEvolutionAbandonManifestV2:
+    predecessor = context.task.admission.predecessor_project_head
+    if predecessor.generation == 0:
+        if inherited_commit is not None:
+            raise ValueError("genesis predecessor unexpectedly has a publication receipt")
+        runtime_context_source = "empty_inherited"
+        materialized_source_successor_transition_id = None
+        materialized_source_predecessor_project_head_id = None
+        materialized_context_id = None
+        materialized_context_manifest_sha256 = None
+        method_artifact_ids: tuple[str, ...] = ()
+        artifacts = ()
+    else:
+        if type(inherited_commit) is not AtomicSuccessorCommitV2:
+            raise ValueError("non-genesis predecessor lacks its publication receipt")
+        inherited = inherited_commit.manifest
+        if type(inherited) is AtomicSuccessorManifestV2:
+            if inherited.runtime_context_source == "materialized_new":
+                runtime_context_source = "materialized_inherited"
+                materialized_source_successor_transition_id = inherited.successor_transition_id
+                materialized_source_predecessor_project_head_id = (
+                    inherited.predecessor_project_head_id
+                )
+                materialized_context_id = inherited.materialized_context_id
+                materialized_context_manifest_sha256 = (
+                    inherited.materialized_context_manifest_sha256
+                )
+            else:
+                runtime_context_source = inherited.runtime_context_source
+                materialized_source_successor_transition_id = (
+                    inherited.materialized_source_successor_transition_id
+                )
+                materialized_source_predecessor_project_head_id = (
+                    inherited.materialized_source_predecessor_project_head_id
+                )
+                materialized_context_id = inherited.materialized_context_id
+                materialized_context_manifest_sha256 = (
+                    inherited.materialized_context_manifest_sha256
+                )
+            method_artifact_ids = inherited.method_artifact_ids
+            artifacts = tuple(
+                item.model_copy(update={"origin": "inherited"}) for item in inherited.artifacts
+            )
+        elif type(inherited) is AtomicEvolutionAbandonManifestV2:
+            runtime_context_source = inherited.runtime_context_source
+            materialized_source_successor_transition_id = (
+                inherited.materialized_source_successor_transition_id
+            )
+            materialized_source_predecessor_project_head_id = (
+                inherited.materialized_source_predecessor_project_head_id
+            )
+            materialized_context_id = inherited.materialized_context_id
+            materialized_context_manifest_sha256 = inherited.materialized_context_manifest_sha256
+            method_artifact_ids = inherited.method_artifact_ids
+            artifacts = tuple(
+                item.model_copy(update={"origin": "inherited"}) for item in inherited.artifacts
+            )
+        else:
+            raise ValueError("predecessor has an unsupported publication receipt")
+    execution = successor.effective_execution_snapshot
+    return AtomicEvolutionAbandonManifestV2(
+        project_id=context.task.project_id,
+        successor_transition_id=(context.transition.transition.successor_transition_id),
+        task_id=context.task.task_id,
+        task_admission_id=context.task.admission.task_admission_id,
+        admission_sha256=context.task.admission.admission_sha256,
+        accepted_attempt_id=context.accepted_attempt.attempt_id,
+        predecessor_project_head_id=predecessor.project_head_id,
+        predecessor_generation=predecessor.generation,
+        predecessor_manifest_sha256=predecessor.manifest_sha256,
+        successor_project_head_id=successor.project_head_id,
+        successor_generation=successor.generation,
+        successor_manifest_sha256=successor.manifest_sha256,
+        workspace_snapshot_id=workspace.workspace_snapshot.workspace_snapshot_id,
+        workspace_manifest_sha256=workspace.workspace_snapshot.manifest_sha256,
+        evolution_revision_id=successor.evolution_revision.evolution_revision_id,
+        evolution_revision_manifest_sha256=(successor.evolution_revision.manifest_sha256),
+        runtime_context_snapshot_id=(
+            successor.runtime_context_snapshot.runtime_context_snapshot_id
+        ),
+        runtime_context_manifest_sha256=(successor.runtime_context_snapshot.manifest_sha256),
+        effective_execution_snapshot_id=(execution.effective_execution_snapshot_id),
+        effective_execution_snapshot_sha256=execution.snapshot_sha256,
+        registry_sha256=successor.registry_sha256,
+        normalized_evolution_intent_sha256=(
+            context.task.admission.normalized_evolution_intent_sha256
+        ),
+        runtime_context_source=runtime_context_source,
+        materialized_source_successor_transition_id=(materialized_source_successor_transition_id),
+        materialized_source_predecessor_project_head_id=(
+            materialized_source_predecessor_project_head_id
+        ),
+        materialized_context_id=materialized_context_id,
+        materialized_context_manifest_sha256=(materialized_context_manifest_sha256),
+        method_artifact_ids=method_artifact_ids,
+        artifacts=artifacts,
+    )
+
+
+def _successor_transition_failure_is_retryable(exc: Exception) -> bool:
+    declared = getattr(exc, "retryable", None)
+    if type(declared) is bool:
+        return declared
+    if isinstance(
+        exc,
+        (
+            TypeError,
+            ValueError,
+            ScienceTaskStoreV2Error,
+        ),
+    ):
+        return False
+    return True
+
+
+def _successor_transition_api_error(
+    *,
+    code: str,
+    message: str,
+    retryable: bool = False,
+) -> m2.ApiErrorV2:
+    repair_action = "retry" if retryable else "repair"
+    next_action = (
+        "Retry the preserved successor transition; the predecessor remains active."
+        if retryable
+        else (
+            "Inspect remote diagnostics and repair the preserved transition before "
+            "submitting another Task."
+        )
+    )
     return m2.ApiErrorV2(
         request_id=f"successor-error-{secrets.token_hex(12)}",
         code=code,
         http_status=503,
         message=message,
         category="transition",
-        retryable=False,
-        repair_action="repair",
-        next_action=(
-            "Inspect remote diagnostics and repair the preserved transition before "
-            "submitting another Task."
-        ),
+        retryable=retryable,
+        repair_action=repair_action,
+        next_action=next_action,
     )
 
 

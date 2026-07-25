@@ -527,6 +527,27 @@ class _AtomicSuccessorContract(_Contract):
     )
 
 
+class SuccessorArtifactContributionV2(_AtomicSuccessorContract):
+    """One ordered target contribution in a committed Evolution Revision."""
+
+    target_id: str
+    artifact_id: str
+    artifact_type: Literal[
+        "text_memory",
+        "skill_bundle",
+        "agent_system",
+        "parametric_memory",
+    ]
+    owner_successor_transition_id: str
+    origin: Literal["produced", "inherited"]
+
+    _ids = field_validator(
+        "target_id",
+        "artifact_id",
+        "owner_successor_transition_id",
+    )(_stable_id)
+
+
 class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
     """Closed receipt for one fully prepared adjacent science successor."""
 
@@ -556,9 +577,36 @@ class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
     dataset_id: str
     dataset_artifact_id: str
     dataset_manifest_sha256: str
-    materialized_context_id: str
-    materialized_context_manifest_sha256: str
+    runtime_context_source: Literal[
+        "materialized_new",
+        "materialized_inherited",
+        "empty_inherited",
+    ] = Field(
+        default="materialized_new",
+        exclude_if=lambda value: value == "materialized_new",
+    )
+    materialized_source_successor_transition_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    materialized_source_predecessor_project_head_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    materialized_context_id: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
+    materialized_context_manifest_sha256: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+    )
     method_artifact_ids: tuple[str, ...] = Field(default=(), max_length=128)
+    artifacts: tuple[SuccessorArtifactContributionV2, ...] = Field(
+        default=(),
+        max_length=128,
+        exclude_if=lambda value: not value,
+    )
 
     _ids = field_validator(
         "project_id",
@@ -574,7 +622,6 @@ class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
         "effective_execution_snapshot_id",
         "dataset_id",
         "dataset_artifact_id",
-        "materialized_context_id",
     )(_stable_id)
     _digests = field_validator(
         "admission_sha256",
@@ -587,7 +634,6 @@ class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
         "registry_sha256",
         "normalized_evolution_intent_sha256",
         "dataset_manifest_sha256",
-        "materialized_context_manifest_sha256",
     )(_digest)
     _generations = field_validator(
         "predecessor_generation",
@@ -600,27 +646,246 @@ class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
     def _ordered_method_artifacts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
         return _ordered_stable_ids(value, label="method artifact IDs")
 
+    @field_validator(
+        "materialized_source_successor_transition_id",
+        "materialized_source_predecessor_project_head_id",
+        "materialized_context_id",
+    )
+    @classmethod
+    def _optional_materialized_ids(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _stable_id(value)
+
+    @field_validator("materialized_context_manifest_sha256")
+    @classmethod
+    def _optional_materialized_digest(
+        cls,
+        value: str | None,
+    ) -> str | None:
+        return None if value is None else _digest(value)
+
     @model_validator(mode="after")
     def _adjacent_successor(self) -> AtomicSuccessorManifestV2:
         if self.successor_generation != self.predecessor_generation + 1:
             raise ValueError("atomic successor generation must be adjacent")
         if self.successor_project_head_id == self.predecessor_project_head_id:
             raise ValueError("atomic successor must have a new project-head identity")
+        inherited_fields = (
+            self.materialized_source_successor_transition_id,
+            self.materialized_source_predecessor_project_head_id,
+        )
+        materialized_fields = (
+            self.materialized_context_id,
+            self.materialized_context_manifest_sha256,
+        )
+        if self.runtime_context_source == "materialized_new":
+            if (
+                any(value is not None for value in inherited_fields)
+                or any(value is None for value in materialized_fields)
+            ):
+                raise ValueError(
+                    "atomic successor new materialization is incomplete"
+                )
+        elif self.runtime_context_source == "materialized_inherited":
+            if any(
+                value is None
+                for value in (*inherited_fields, *materialized_fields)
+            ):
+                raise ValueError(
+                    "atomic successor inherited materialization is incomplete"
+                )
+        elif (
+            any(
+                value is not None
+                for value in (*inherited_fields, *materialized_fields)
+            )
+            or self.method_artifact_ids
+        ):
+            raise ValueError(
+                "atomic successor empty runtime exposes materialization"
+            )
+        if self.artifacts:
+            target_ids = tuple(item.target_id for item in self.artifacts)
+            artifact_ids = tuple(
+                item.artifact_id for item in self.artifacts
+            )
+            if (
+                target_ids != tuple(sorted(target_ids))
+                or len(target_ids) != len(set(target_ids))
+                or artifact_ids != self.method_artifact_ids
+                or any(
+                    item.origin == "produced"
+                    and item.owner_successor_transition_id
+                    != self.successor_transition_id
+                    or item.origin == "inherited"
+                    and item.owner_successor_transition_id
+                    == self.successor_transition_id
+                    for item in self.artifacts
+                )
+            ):
+                raise ValueError(
+                    "atomic successor artifact composition is invalid"
+                )
         if len(canonical_json(self).encode("utf-8")) > MAX_REVISION_MANIFEST_BYTES:
             raise ValueError("atomic successor manifest exceeds the byte limit")
         return self
 
 
-def atomic_successor_manifest_sha256(manifest: AtomicSuccessorManifestV2) -> str:
-    if type(manifest) is not AtomicSuccessorManifestV2:
-        raise TypeError("atomic successor digest requires AtomicSuccessorManifestV2")
+class AtomicEvolutionAbandonManifestV2(_AtomicSuccessorContract):
+    """Closed receipt for advancing only the accepted workspace result."""
+
+    atomic_evolution_abandon_contract_version: Literal["2"] = "2"
+    project_id: str
+    successor_transition_id: str
+    task_id: str
+    task_admission_id: str
+    admission_sha256: str
+    accepted_attempt_id: str
+    predecessor_project_head_id: str
+    predecessor_generation: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    predecessor_manifest_sha256: str
+    successor_project_head_id: str
+    successor_generation: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    successor_manifest_sha256: str
+    workspace_snapshot_id: str
+    workspace_manifest_sha256: str
+    evolution_revision_id: str
+    evolution_revision_manifest_sha256: str
+    runtime_context_snapshot_id: str
+    runtime_context_manifest_sha256: str
+    effective_execution_snapshot_id: str
+    effective_execution_snapshot_sha256: str
+    registry_sha256: str
+    normalized_evolution_intent_sha256: str
+    runtime_context_source: Literal[
+        "empty_inherited",
+        "materialized_inherited",
+    ]
+    materialized_source_successor_transition_id: str | None = None
+    materialized_source_predecessor_project_head_id: str | None = None
+    materialized_context_id: str | None = None
+    materialized_context_manifest_sha256: str | None = None
+    method_artifact_ids: tuple[str, ...] = Field(default=(), max_length=128)
+    artifacts: tuple[SuccessorArtifactContributionV2, ...] = Field(
+        default=(),
+        max_length=128,
+        exclude_if=lambda value: not value,
+    )
+
+    _ids = field_validator(
+        "project_id",
+        "successor_transition_id",
+        "task_id",
+        "task_admission_id",
+        "accepted_attempt_id",
+        "predecessor_project_head_id",
+        "successor_project_head_id",
+        "workspace_snapshot_id",
+        "evolution_revision_id",
+        "runtime_context_snapshot_id",
+        "effective_execution_snapshot_id",
+    )(_stable_id)
+    _digests = field_validator(
+        "admission_sha256",
+        "predecessor_manifest_sha256",
+        "successor_manifest_sha256",
+        "workspace_manifest_sha256",
+        "evolution_revision_manifest_sha256",
+        "runtime_context_manifest_sha256",
+        "effective_execution_snapshot_sha256",
+        "registry_sha256",
+        "normalized_evolution_intent_sha256",
+    )(_digest)
+    _generations = field_validator(
+        "predecessor_generation",
+        "successor_generation",
+        mode="before",
+    )(_strict_integer)
+
+    @field_validator(
+        "materialized_source_successor_transition_id",
+        "materialized_source_predecessor_project_head_id",
+        "materialized_context_id",
+    )
+    @classmethod
+    def _optional_ids(cls, value: str | None) -> str | None:
+        return None if value is None else _stable_id(value)
+
+    @field_validator("materialized_context_manifest_sha256")
+    @classmethod
+    def _optional_digest(cls, value: str | None) -> str | None:
+        return None if value is None else _digest(value)
+
+    @field_validator("method_artifact_ids")
+    @classmethod
+    def _ordered_method_artifacts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        return _ordered_stable_ids(value, label="method artifact IDs")
+
+    @model_validator(mode="after")
+    def _abandon_closure(self) -> AtomicEvolutionAbandonManifestV2:
+        if self.successor_generation != self.predecessor_generation + 1:
+            raise ValueError("atomic evolution abandon generation must be adjacent")
+        if self.successor_project_head_id == self.predecessor_project_head_id:
+            raise ValueError("atomic evolution abandon must publish a new project head")
+        materialized_fields = (
+            self.materialized_source_successor_transition_id,
+            self.materialized_source_predecessor_project_head_id,
+            self.materialized_context_id,
+            self.materialized_context_manifest_sha256,
+        )
+        if self.runtime_context_source == "empty_inherited":
+            if any(value is not None for value in materialized_fields):
+                raise ValueError("empty inherited runtime context exposes materialization")
+            if self.method_artifact_ids:
+                raise ValueError("empty inherited runtime context exposes artifacts")
+        elif any(value is None for value in materialized_fields):
+            raise ValueError("materialized inherited runtime context is incomplete")
+        if self.artifacts:
+            target_ids = tuple(item.target_id for item in self.artifacts)
+            artifact_ids = tuple(
+                item.artifact_id for item in self.artifacts
+            )
+            if (
+                target_ids != tuple(sorted(target_ids))
+                or len(target_ids) != len(set(target_ids))
+                or artifact_ids != self.method_artifact_ids
+                or any(
+                    item.origin != "inherited"
+                    or item.owner_successor_transition_id
+                    == self.successor_transition_id
+                    for item in self.artifacts
+                )
+            ):
+                raise ValueError(
+                    "evolution abandon artifact composition is invalid"
+                )
+        if len(canonical_json(self).encode("utf-8")) > MAX_REVISION_MANIFEST_BYTES:
+            raise ValueError("atomic evolution abandon manifest exceeds the byte limit")
+        return self
+
+
+AtomicSuccessorReceiptManifestV2 = (
+    AtomicSuccessorManifestV2 | AtomicEvolutionAbandonManifestV2
+)
+
+
+def atomic_successor_manifest_sha256(
+    manifest: AtomicSuccessorReceiptManifestV2,
+) -> str:
+    if type(manifest) not in {
+        AtomicSuccessorManifestV2,
+        AtomicEvolutionAbandonManifestV2,
+    }:
+        raise TypeError("atomic successor digest requires a closed v2 receipt")
     return canonical_digest(manifest)
 
 
 class AtomicSuccessorCommitV2(_AtomicSuccessorContract):
     atomic_successor_commit_contract_version: Literal["2"] = "2"
     manifest_sha256: str
-    manifest: AtomicSuccessorManifestV2
+    manifest: AtomicSuccessorReceiptManifestV2
 
     _digest = field_validator("manifest_sha256")(_digest)
 
@@ -844,7 +1109,9 @@ __all__ = [
     "AdmissionQueueReason",
     "AdmissionStatus",
     "AtomicSuccessorCommitV2",
+    "AtomicEvolutionAbandonManifestV2",
     "AtomicSuccessorManifestV2",
+    "AtomicSuccessorReceiptManifestV2",
     "ContentAddressedSnapshotRef",
     "ExecutionModelIdentity",
     "ExecutionRuntimeIdentity",
@@ -866,6 +1133,7 @@ __all__ = [
     "RevisionManifestV1",
     "RevisionNotFoundError",
     "RevisionRecord",
+    "SuccessorArtifactContributionV2",
     "TaskAdmissionConflictError",
     "TaskAdmissionIntent",
     "TaskAdmissionRecord",

@@ -270,6 +270,21 @@ class ContextPublicationReceipt:
         raise TypeError("context publication receipts are ephemeral and cannot be persisted")
 
 
+@dataclass(frozen=True, slots=True)
+class PersistedContextDiscardReceipt:
+    """Ephemeral capability binding a DB-authorized bundle to its observed inode."""
+
+    context_id: str
+    canonical_manifest_bytes: bytes
+    context_directory_identity: _PrivateFileIdentity
+    _issuer: object
+
+    def __reduce_ex__(self, _protocol: int):
+        raise TypeError(
+            "persisted context discard receipts are ephemeral and cannot be persisted"
+        )
+
+
 def _private_file_identity(value: os.stat_result) -> _PrivateFileIdentity:
     return _PrivateFileIdentity(
         device=value.st_dev,
@@ -610,6 +625,7 @@ class ContextMaterializer:
         promoted_rows: Sequence[Mapping[str, object]],
         *,
         materialization_root_descriptor: int,
+        sealed_artifact_authority: Mapping[str, str] | None = None,
     ) -> MaterializedContext:
         """Compatibility API returning only the published context model."""
 
@@ -618,6 +634,7 @@ class ContextMaterializer:
             response,
             promoted_rows,
             materialization_root_descriptor=materialization_root_descriptor,
+            sealed_artifact_authority=sealed_artifact_authority,
         ).materialized_context
 
     def materialize_for_publication(
@@ -627,11 +644,53 @@ class ContextMaterializer:
         promoted_rows: Sequence[Mapping[str, object]],
         *,
         materialization_root_descriptor: int,
+        sealed_artifact_authority: Mapping[str, str] | None = None,
     ) -> ContextPublicationReceipt:
         """Publish a bundle and return its ephemeral precommit capability."""
 
         self._validate_projection_pair(request, response)
-        row_by_id = self._selected_rows(response, promoted_rows)
+        if sealed_artifact_authority:
+            evolution = request.metadata.evolution
+            artifact_ids = (
+                None
+                if evolution is None
+                else evolution.context_artifact_ids
+            )
+            owner_ids = (
+                None
+                if evolution is None
+                else (
+                    evolution.context_artifact_owner_transition_ids
+                )
+            )
+            if request.successor_transition_id is None:
+                raise ValueError(
+                    "sealed artifact authority requires a successor transition"
+                )
+            if owner_ids is None:
+                declared_authority = {
+                    artifact_id: request.successor_transition_id
+                    for artifact_id in artifact_ids or ()
+                }
+            else:
+                assert artifact_ids is not None
+                declared_authority = dict(
+                    zip(artifact_ids, owner_ids, strict=True)
+                )
+            if any(
+                declared_authority.get(artifact_id)
+                != transition_id
+                for artifact_id, transition_id
+                in sealed_artifact_authority.items()
+            ):
+                raise ValueError(
+                    "sealed artifact authority does not match the successor request"
+                )
+        row_by_id = self._selected_rows(
+            response,
+            promoted_rows,
+            sealed_artifact_authority=sealed_artifact_authority,
+        )
         needed_ids = {
             payload.source_artifact_id
             for projection in response.projections
@@ -761,6 +820,75 @@ class ContextMaterializer:
             blobs_identity=None,
             blob_identities=None,
             label="persisted",
+        )
+
+    def prepare_persisted_discard(
+        self,
+        expected_manifest: MaterializedContext,
+        *,
+        materialization_root_descriptor: int,
+    ) -> PersistedContextDiscardReceipt:
+        """Bind one DB-authorized bundle to the exact inode observed before DB commit."""
+
+        manifest = MaterializedContext.model_validate(expected_manifest)
+        manifest_bytes = canonical_json(manifest).encode("utf-8")
+        if len(manifest_bytes) > MAX_CONTEXT_MANIFEST_BYTES:
+            raise ValueError(
+                "persisted materialized context manifest exceeds its byte limit"
+            )
+        root_descriptor = materialization_root_descriptor
+        self._require_materialization_root_descriptor(root_descriptor)
+        context_descriptor = self._open_directory_at(
+            root_descriptor,
+            manifest.context_id,
+            label="persisted context discard",
+        )
+        try:
+            context_identity = _private_file_identity(
+                os.fstat(context_descriptor)
+            )
+            self._verify_context_bundle(
+                root_descriptor,
+                manifest,
+                manifest_bytes,
+                context_identity=context_identity,
+                blobs_identity=None,
+                blob_identities=None,
+                label="persisted discard",
+            )
+            return PersistedContextDiscardReceipt(
+                context_id=manifest.context_id,
+                canonical_manifest_bytes=manifest_bytes,
+                context_directory_identity=context_identity,
+                _issuer=self._publication_issuer,
+            )
+        finally:
+            os.close(context_descriptor)
+
+    def discard_persisted(
+        self,
+        receipt: PersistedContextDiscardReceipt,
+        *,
+        materialization_root_descriptor: int,
+    ) -> MaterializedEntryRemovalResult:
+        """Quarantine only the persisted bundle inode bound before its DB row was removed."""
+
+        if not isinstance(receipt, PersistedContextDiscardReceipt):
+            raise TypeError("persisted context discard receipt is invalid")
+        if receipt._issuer is not self._publication_issuer:
+            raise ValueError(
+                "persisted context discard receipt was not issued by this materializer"
+            )
+        root_descriptor = materialization_root_descriptor
+        self._require_materialization_root_descriptor(root_descriptor)
+        _before_materialized_context_discard(
+            root_descriptor,
+            receipt.context_id,
+        )
+        return _remove_materialized_entry_if_identity(
+            root_descriptor,
+            receipt.context_id,
+            receipt.context_directory_identity,
         )
 
     def _require_publication_receipt(self, receipt: ContextPublicationReceipt) -> None:
@@ -1106,21 +1234,52 @@ class ContextMaterializer:
         cls,
         response: ContextProjectionResolveResponse,
         rows: Sequence[Mapping[str, object]],
+        *,
+        sealed_artifact_authority: Mapping[str, str] | None = None,
     ) -> dict[str, Mapping[str, object]]:
         selected = set(response.selection.artifact_ids)
+        sealed_authority = dict(sealed_artifact_authority or {})
+        if any(
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or not isinstance(transition_id, str)
+            or not transition_id
+            for artifact_id, transition_id in sealed_authority.items()
+        ):
+            raise ValueError("sealed artifact transition authority is invalid")
         result: dict[str, Mapping[str, object]] = {}
+        observed_sealed: dict[str, str] = {}
         for row in rows:
             artifact_id = row.get("artifact_id")
             if not isinstance(artifact_id, str) or artifact_id not in selected:
                 continue
             if artifact_id in result:
                 raise ValueError("promoted artifact rows contain duplicate selected IDs")
-            if row.get("promoted") not in (True, 1) or str(row.get("state") or "") not in {
-                "active",
-                "experimental",
-            }:
+            state = str(row.get("state") or "")
+            if row.get("promoted") not in (True, 1):
                 raise ValueError("selected artifact is no longer promoted and active")
+            if state == "sealed":
+                owner_transition_id = row.get(
+                    "sealed_owner_transition_id"
+                )
+                if (
+                    not isinstance(owner_transition_id, str)
+                    or sealed_authority.get(artifact_id)
+                    != owner_transition_id
+                ):
+                    raise ValueError(
+                        "selected artifact has no exact sealed transition authority"
+                    )
+                observed_sealed[artifact_id] = owner_transition_id
+            elif state not in {"active", "experimental"}:
+                raise ValueError(
+                    "selected artifact is no longer promoted and active"
+                )
             result[artifact_id] = row
+        if observed_sealed != sealed_authority:
+            raise ValueError(
+                "selected artifact has no exact sealed transition authority"
+            )
         missing = selected.difference(result)
         if missing:
             raise ValueError("promoted artifact rows do not cover context selection")
@@ -1856,4 +2015,5 @@ __all__ = [
     "MaterializedBlobStream",
     "MaterializedContext",
     "MaterializedEnvironmentBinding",
+    "PersistedContextDiscardReceipt",
 ]

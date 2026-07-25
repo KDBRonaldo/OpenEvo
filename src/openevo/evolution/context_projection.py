@@ -204,8 +204,18 @@ class ContextProjectionEvolutionMetadata(_ProjectionContract):
         default=None,
         max_length=128,
     )
+    context_artifact_owner_transition_ids: tuple[str, ...] | None = (
+        Field(
+            default=None,
+            max_length=128,
+        )
+    )
 
-    @field_validator("context_artifact_ids", mode="before")
+    @field_validator(
+        "context_artifact_ids",
+        "context_artifact_owner_transition_ids",
+        mode="before",
+    )
     @classmethod
     def _json_array(cls, value: object) -> object:
         return tuple(value) if isinstance(value, list) else value
@@ -226,6 +236,33 @@ class ContextProjectionEvolutionMetadata(_ProjectionContract):
             )
             for value in values
         )
+
+    @field_validator("context_artifact_owner_transition_ids")
+    @classmethod
+    def _bounded_owner_transitions(
+        cls,
+        values: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if values is None:
+            return None
+        return tuple(_stable_id(value) for value in values)
+
+    @model_validator(mode="after")
+    def _parallel_artifact_authority(
+        self,
+    ) -> ContextProjectionEvolutionMetadata:
+        if (
+            self.context_artifact_owner_transition_ids is not None
+            and (
+                self.context_artifact_ids is None
+                or len(self.context_artifact_owner_transition_ids)
+                != len(self.context_artifact_ids)
+            )
+        ):
+            raise ValueError(
+                "context artifact owner transitions must align with artifact IDs"
+            )
+        return self
 
 
 class ContextProjectionMetadata(_ProjectionContract):
@@ -478,11 +515,70 @@ class ContextProjectionResolver:
         promoted_rows: Sequence[Mapping[str, object]],
         *,
         context_id: str,
+        sealed_artifact_authority: Mapping[str, str] | None = None,
     ) -> ContextProjectionResolveResponse:
         snapshot = self._registry.snapshot
         unknown_limits = set(request.target_limits).difference(snapshot.targets)
         if unknown_limits:
             raise ValueError("context projection limits reference unknown targets")
+        sealed_authority = dict(sealed_artifact_authority or {})
+        if any(
+            not isinstance(artifact_id, str)
+            or not artifact_id
+            or not isinstance(transition_id, str)
+            or not transition_id
+            for artifact_id, transition_id in sealed_authority.items()
+        ):
+            raise ValueError("sealed artifact transition authority is invalid")
+        if sealed_authority:
+            evolution = request.metadata.evolution
+            artifact_ids = (
+                None
+                if evolution is None
+                else evolution.context_artifact_ids
+            )
+            owner_ids = (
+                None
+                if evolution is None
+                else (
+                    evolution.context_artifact_owner_transition_ids
+                )
+            )
+            if request.successor_transition_id is None:
+                raise ValueError(
+                    "sealed artifact authority requires a successor transition"
+                )
+            if owner_ids is None:
+                declared_authority = {
+                    artifact_id: request.successor_transition_id
+                    for artifact_id in artifact_ids or ()
+                }
+            else:
+                assert artifact_ids is not None
+                declared_authority = dict(
+                    zip(artifact_ids, owner_ids, strict=True)
+                )
+            if any(
+                declared_authority.get(artifact_id)
+                != transition_id
+                for artifact_id, transition_id
+                in sealed_authority.items()
+            ):
+                raise ValueError(
+                    "sealed artifact authority does not match the successor request"
+                )
+        observed_sealed = {
+            str(row.get("artifact_id") or ""): str(
+                row.get("sealed_owner_transition_id") or ""
+            )
+            for row in promoted_rows
+            if str(row.get("state") or "") == "sealed"
+        }
+        if sealed_authority != observed_sealed:
+            if sealed_authority or observed_sealed:
+                raise ValueError(
+                    "sealed artifact rows lack exact transition authority"
+                )
 
         compatibility_facts = request.compatibility_facts()
         auth_mode = request_auth_mode(compatibility_facts)
@@ -501,10 +597,16 @@ class ContextProjectionResolver:
         pre_skipped_rows: list[dict[str, object]] = []
         pre_skipped_reasons: dict[str, str] = {}
         for row in promoted_rows:
-            if row.get("promoted") not in (True, 1) or str(row.get("state") or "") not in {
+            state = str(row.get("state") or "")
+            if row.get("promoted") not in (True, 1) or state not in {
                 "active",
                 "experimental",
+                "sealed",
             }:
+                continue
+            if state == "sealed" and sealed_authority.get(
+                str(row.get("artifact_id") or "")
+            ) != row.get("sealed_owner_transition_id"):
                 continue
             if (
                 requested_ids is not None

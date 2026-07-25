@@ -7,7 +7,11 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from openevo.backend.contracts.v2 import models as m2
-from openevo.evolution.revisions import AtomicSuccessorCommitV2
+from openevo.evolution.revisions import (
+    AtomicEvolutionAbandonManifestV2,
+    AtomicSuccessorCommitV2,
+    AtomicSuccessorManifestV2,
+)
 
 
 _ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
@@ -18,7 +22,12 @@ class RuntimeContextBindingV2(m2.ContractModel):
     """Opaque Core-to-Gateway binding with no artifact or host path."""
 
     runtime_context_binding_contract_version: Literal["2"] = "2"
-    source: Literal["empty_genesis", "materialized_successor"]
+    source: Literal[
+        "empty_genesis",
+        "empty_inherited",
+        "materialized_successor",
+        "materialized_inherited",
+    ]
     project_head: m2.ProjectHeadRefV2
     service_generation_sha256: str = Field(pattern=_SHA256_PATTERN)
     framework_lock_sha256: str = Field(pattern=_SHA256_PATTERN)
@@ -80,16 +89,34 @@ class RuntimeContextBindingV2(m2.ContractModel):
                 or any(value is not None for value in successor_fields)
             ):
                 raise ValueError("empty runtime context is not an exact genesis")
-        elif (
-            head.generation < 1
-            or head.predecessor_project_head_id is None
-            or any(value is None for value in successor_fields)
-            or self.source_predecessor_project_head_id
-            != head.predecessor_project_head_id
-            or len(self.selected_artifact_ids)
-            != head.evolution_revision.artifact_count
-        ):
-            raise ValueError("materialized runtime context has an incomplete successor closure")
+        elif self.source == "empty_inherited":
+            if (
+                head.generation < 1
+                or head.predecessor_project_head_id is None
+                or head.evolution_revision.artifact_count != 0
+                or self.selected_artifact_ids
+                or any(value is not None for value in successor_fields)
+            ):
+                raise ValueError("empty inherited runtime context is inconsistent")
+        else:
+            if (
+                head.generation < 1
+                or head.predecessor_project_head_id is None
+                or any(value is None for value in successor_fields)
+                or len(self.selected_artifact_ids)
+                != head.evolution_revision.artifact_count
+            ):
+                raise ValueError(
+                    "materialized runtime context has an incomplete successor closure"
+                )
+            if (
+                self.source == "materialized_successor"
+                and self.source_predecessor_project_head_id
+                != head.predecessor_project_head_id
+            ):
+                raise ValueError(
+                    "materialized successor context differs from its predecessor"
+                )
         return self
 
 
@@ -132,10 +159,64 @@ def runtime_context_binding_for_head(
         or manifest.runtime_context_manifest_sha256
         != head.runtime_context_snapshot.manifest_sha256
         or manifest.registry_sha256 != head.registry_sha256
-        or len(manifest.method_artifact_ids)
-        != head.evolution_revision.artifact_count
     ):
         raise ValueError("atomic successor receipt differs from the active project head")
+    if len(manifest.method_artifact_ids) != head.evolution_revision.artifact_count:
+        raise ValueError("atomic successor receipt has a different artifact set")
+    if type(manifest) is AtomicEvolutionAbandonManifestV2:
+        if manifest.evolution_revision_id != head.evolution_revision.evolution_revision_id:
+            raise ValueError("evolution abandon receipt differs from the inherited revision")
+        if manifest.runtime_context_source == "empty_inherited":
+            return RuntimeContextBindingV2(
+                source="empty_inherited",
+                project_head=head,
+                service_generation_sha256=service_generation_sha256,
+                framework_lock_sha256=framework_lock_sha256,
+            )
+        return RuntimeContextBindingV2(
+            source="materialized_inherited",
+            project_head=head,
+            service_generation_sha256=service_generation_sha256,
+            framework_lock_sha256=framework_lock_sha256,
+            successor_transition_id=(
+                manifest.materialized_source_successor_transition_id
+            ),
+            source_predecessor_project_head_id=(
+                manifest.materialized_source_predecessor_project_head_id
+            ),
+            materialized_context_id=manifest.materialized_context_id,
+            materialized_context_manifest_sha256=(
+                manifest.materialized_context_manifest_sha256
+            ),
+            selected_artifact_ids=manifest.method_artifact_ids,
+        )
+    if type(manifest) is not AtomicSuccessorManifestV2:
+        raise ValueError("atomic successor receipt has an unsupported manifest")
+    if manifest.runtime_context_source == "empty_inherited":
+        return RuntimeContextBindingV2(
+            source="empty_inherited",
+            project_head=head,
+            service_generation_sha256=service_generation_sha256,
+            framework_lock_sha256=framework_lock_sha256,
+        )
+    if manifest.runtime_context_source == "materialized_inherited":
+        return RuntimeContextBindingV2(
+            source="materialized_inherited",
+            project_head=head,
+            service_generation_sha256=service_generation_sha256,
+            framework_lock_sha256=framework_lock_sha256,
+            successor_transition_id=(
+                manifest.materialized_source_successor_transition_id
+            ),
+            source_predecessor_project_head_id=(
+                manifest.materialized_source_predecessor_project_head_id
+            ),
+            materialized_context_id=manifest.materialized_context_id,
+            materialized_context_manifest_sha256=(
+                manifest.materialized_context_manifest_sha256
+            ),
+            selected_artifact_ids=manifest.method_artifact_ids,
+        )
     return RuntimeContextBindingV2(
         source="materialized_successor",
         project_head=head,

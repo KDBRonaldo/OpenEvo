@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from . import promotion, runner
-from .clients import EvolutionHttpClient, RolloutHttpClient
+from .clients import (
+    EvolutionHttpClient,
+    EvolutionHttpStatusError,
+    RolloutHttpClient,
+)
 from .compiler import (
     CompiledEvolutionMethodSpec,
     CompiledExperiment,
@@ -21,6 +25,7 @@ __all__ = [
     "CompiledTask",
     "ExperimentConfig",
     "EvolutionHttpClient",
+    "EvolutionHttpStatusError",
     "RolloutHttpClient",
     "ProjectEvolutionValidationError",
     "compile_experiment",

@@ -65,7 +65,8 @@ _SPAWN_LOCK_NAME = "spawn.lock"
 _SERVICE_GENERATION_HEADER = "X-OpenEvo-Core-Generation"
 _RELEASE_IDENTITY_HEADER = "X-OpenEvo-Core-Release-Identity"
 _PROCESS_GROUP_LIFECYCLE_COMPATIBILITY = 3
-V2_DAEMON_LIFECYCLE_COMPATIBILITY = 11
+_PRODUCTION_V2_LIFECYCLE_COMPATIBILITY = 10
+V2_DAEMON_LIFECYCLE_COMPATIBILITY = 12
 _ONEFILE_LAUNCHER_CLEANUP_SECONDS = 10.0
 _ORPHANED_SERVICE_CHILDREN_GUARD = threading.Lock()
 _ORPHANED_SERVICE_CHILDREN: dict[int, subprocess.Popen[bytes]] = {}
@@ -1493,14 +1494,14 @@ def _identity_requires_production_v2(
 ) -> bool:
     return (
         identity is not None
-        and identity.lifecycle_compatibility >= V2_DAEMON_LIFECYCLE_COMPATIBILITY
+        and identity.lifecycle_compatibility >= _PRODUCTION_V2_LIFECYCLE_COMPATIBILITY
     )
 
 
 def _ledger_requires_production_v2(ledger: dict[str, Any]) -> bool:
     return bool(
         _is_exact_daemon_ledger(ledger)
-        and ledger["lifecycle_compatibility"] >= V2_DAEMON_LIFECYCLE_COMPATIBILITY
+        and ledger["lifecycle_compatibility"] >= _PRODUCTION_V2_LIFECYCLE_COMPATIBILITY
     )
 
 
@@ -1630,8 +1631,7 @@ def authenticate_core_service_endpoint(
         endpoint=endpoint,
     )
     is_v2 = isinstance(version, dict) and (
-        version.get("preferred_major") == 2
-        or version.get("provider_kind") == "openevo_daemon"
+        version.get("preferred_major") == 2 or version.get("provider_kind") == "openevo_daemon"
     )
     if require_production_v2 and not is_v2:
         raise CoreServiceError(
@@ -1717,10 +1717,7 @@ def authenticate_core_service_endpoint(
             or not isinstance(version.get("openapi_sha256"), str)
             or re.fullmatch(r"[0-9a-f]{64}", version["openapi_sha256"]) is None
             or not isinstance(version.get("build_version"), str)
-            or re.fullmatch(
-                r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version["build_version"]
-            )
-            is None
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}", version["build_version"]) is None
             or not isinstance(status, dict)
             or status.get("registry_status") != "verified"
             or status.get("registry_digest") != registry_digest

@@ -266,6 +266,7 @@ def test_release_composition_executes_two_sessions_recovers_events_and_reconnect
         gateway_sessions,
     )
     evolution = _Evolution(registry.snapshot.registry_digest)
+    evolution.rollout = rollout
     monkeypatch.setattr(
         science_execution_v2,
         "RolloutHttpClient",

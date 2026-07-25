@@ -39,6 +39,7 @@ from openevo.evolution.context_materialization import (
     ContextMaterializer,
     MaterializedBlobLease,
     MaterializedContext,
+    PersistedContextDiscardReceipt,
     _PRESERVED_ENTRY_PREFIX,
     _PrivateFileIdentity,
     _private_file_identity,
@@ -95,6 +96,7 @@ from openevo.evolution.models import (
 )
 from openevo.evolution.planned_jobs import (
     PlanBoundJobCreateRequest,
+    PlanBoundJobRetryRequest,
     materialize_plan_bound_job,
     validate_plan_against_snapshot,
 )
@@ -174,6 +176,26 @@ CREATE TABLE IF NOT EXISTS datasets (
     trace_count INTEGER NOT NULL,
     artifact_id TEXT
 );
+CREATE TABLE IF NOT EXISTS dataset_create_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_json TEXT NOT NULL,
+    dataset_id TEXT NOT NULL UNIQUE,
+    response_json TEXT,
+    recovery_file_count INTEGER CHECK(
+        recovery_file_count IS NULL OR (
+            typeof(recovery_file_count) = 'integer'
+            AND recovery_file_count >= 0
+        )
+    ),
+    recovery_byte_size INTEGER CHECK(
+        recovery_byte_size IS NULL OR (
+            typeof(recovery_byte_size) = 'integer'
+            AND recovery_byte_size >= 0
+        )
+    ),
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dataset_events (
     dataset_id TEXT NOT NULL,
     event_id TEXT NOT NULL,
@@ -210,6 +232,31 @@ CREATE TABLE IF NOT EXISTS jobs (
     error TEXT,
     attempt_count INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS plan_bound_job_retry_requests (
+    job_id TEXT NOT NULL,
+    retry_request_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    claim_attempt_before INTEGER NOT NULL CHECK (claim_attempt_before >= 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(job_id, retry_request_id),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE RESTRICT
+);
+CREATE TABLE IF NOT EXISTS plan_bound_job_transition_bindings (
+    job_id TEXT PRIMARY KEY,
+    successor_transition_id TEXT NOT NULL,
+    predecessor_successor_transition_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_plan_bound_job_transition_successor
+ON plan_bound_job_transition_bindings(successor_transition_id, job_id);
+CREATE TABLE IF NOT EXISTS successor_transition_discards (
+    successor_transition_id TEXT PRIMARY KEY,
+    receipt_sha256 TEXT NOT NULL CHECK(length(receipt_sha256) = 64),
+    receipt_json TEXT NOT NULL,
+    discarded_at TEXT NOT NULL
+) STRICT;
 CREATE TABLE IF NOT EXISTS artifacts (
     artifact_id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
@@ -410,6 +457,32 @@ WHERE query_decision_id IS NOT NULL;
 MAX_ARTIFACT_ID_ATTEMPTS = 10
 MAX_INTERNAL_JOB_OUTPUTS = MAX_HANDLER_ARTIFACTS
 MAX_INTERNAL_JOB_RESULT_BYTES = 4 * 1024 * 1024
+MAX_PLAN_BOUND_JOB_RETRY_REQUESTS = 100_000
+MAX_PLAN_BOUND_JOB_TRANSITION_BINDINGS = 100_000
+MAX_PLAN_BOUND_JOB_TRANSITION_BINDING_BYTES = 64 * 1024 * 1024
+MAX_SUCCESSOR_TRANSITION_DISCARDS = 100_000
+MAX_SUCCESSOR_TRANSITION_DISCARD_RECEIPT_BYTES = 128 * 1024
+MAX_SUCCESSOR_TRANSITION_DISCARD_AGGREGATE_BYTES = 256 * 1024 * 1024
+MAX_DATASET_CREATE_REQUESTS = 100_000
+MAX_DATASET_CREATE_REQUEST_BYTES = 1024 * 1024
+MAX_DATASET_CREATE_RESPONSE_BYTES = 16 * 1024
+MAX_DATASET_CREATE_RECOVERY_BYTES = 128 * 1024 * 1024
+MAX_DATASET_EVENT_PAYLOAD_BYTES = 64 * 1024 * 1024
+MAX_DATASET_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_DATASET_RECORDS_BYTES = 128 * 1024 * 1024
+MAX_DATASET_ARTIFACT_MANIFEST_BYTES = 8 * 1024 * 1024
+MAX_DATASET_MATERIALIZATION_BYTES = 256 * 1024 * 1024
+MAX_DATASET_VERIFICATION_BYTES = 256 * 1024 * 1024
+MAX_DATASET_STARTUP_RECOVERY_BYTES = 512 * 1024 * 1024
+MAX_DATASET_READ_FILES = 1_000_000
+
+
+class DatasetNotFoundError(ValueError):
+    """The requested sealed dataset does not exist."""
+
+
+class DatasetIntegrityError(ValueError):
+    """Persisted dataset authorities do not form one exact sealed closure."""
 
 
 class _InternalJobOutput(TypedDict):
@@ -431,7 +504,9 @@ class _InternalJobResult(TypedDict):
     artifact_ids: list[str]
     error: str | None
     job_id: str
+    retryable: bool | None
     state: str
+    successor_transition_id: str | None
     outputs: NotRequired[list[_InternalJobOutput]]
 
 
@@ -543,6 +618,29 @@ class _RecoveryBudget:
             raise RevisionIntegrityError(f"{self.label} exceeds the aggregate byte limit")
 
 
+@dataclass(slots=True)
+class _DatasetReadBudget:
+    label: str
+    max_files: int
+    max_bytes: int
+    files: int = 0
+    bytes: int = 0
+
+    def consume(self, byte_size: int, *, max_file_bytes: int) -> None:
+        if type(byte_size) is not int or byte_size < 0:
+            raise DatasetIntegrityError(f"{self.label} has an invalid file size")
+        self.files += 1
+        self.bytes += byte_size
+        if byte_size > max_file_bytes:
+            raise DatasetIntegrityError(f"{self.label} exceeds the file byte limit")
+        if self.files > self.max_files:
+            raise DatasetIntegrityError(f"{self.label} exceeds the file count limit")
+        if self.bytes > self.max_bytes:
+            raise DatasetIntegrityError(
+                f"{self.label} exceeds the aggregate byte limit"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class _GuardedTextSpec:
     column: str
@@ -568,6 +666,7 @@ class _MaterializationRecoveryIdentity:
     capture_mode: str
     artifact_ids: tuple[str, ...]
     adapter_set_digest: str
+    successor_transition_id: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -750,8 +849,7 @@ def _read_guarded_materialized_context_row(
         for index, spec in enumerate(specs)
     )
     row = conn.execute(
-        f"SELECT {', '.join(selections)} FROM context_materializations "
-        "WHERE context_id = ?",
+        f"SELECT {', '.join(selections)} FROM context_materializations WHERE context_id = ?",
         (context_id,),
     ).fetchone()
     if row is None:
@@ -782,6 +880,48 @@ def _read_guarded_materialized_context_row(
         lengths=tuple(lengths),
         label="materialized context transport",
     )
+
+
+def _read_guarded_materialized_context_rows(
+    conn: sqlite3.Connection,
+    *,
+    label: str,
+) -> list[sqlite3.Row]:
+    specs = (
+        _GuardedTextSpec("context_id", "context_id", 256),
+        _GuardedTextSpec("registry_digest", "registry_digest", 64),
+        _GuardedTextSpec("request_digest", "request_digest", 64),
+        _GuardedTextSpec(
+            "manifest_json",
+            "manifest_json",
+            MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+        ),
+    )
+    plans = _scan_guarded_row_plans(
+        conn,
+        from_sql="context_materializations",
+        key_spec=specs[0],
+        text_specs=specs,
+        order_by_sql="context_id",
+        budget=_RecoveryBudget(
+            label=label,
+            max_rows=MAX_CONTEXT_MATERIALIZATION_RECOVERY_ROWS,
+            max_bytes=MAX_CONTEXT_MATERIALIZATION_RECOVERY_BYTES,
+            max_row_bytes=MAX_CONTEXT_MATERIALIZATION_ROW_BYTES,
+        ),
+    )
+    return [
+        _fetch_guarded_row(
+            conn,
+            from_sql="context_materializations",
+            where_sql="context_id = ?",
+            key=plan.key,
+            text_specs=specs,
+            lengths=plan.lengths,
+            label=label,
+        )
+        for plan in plans
+    ]
 
 
 def _read_guarded_store_identity_row(conn: sqlite3.Connection) -> sqlite3.Row:
@@ -1008,6 +1148,41 @@ def _json_dumps(value: Any, *, indent: int | None = None) -> str:
     return json.dumps(value, indent=indent, sort_keys=True, allow_nan=False)
 
 
+def _dataset_create_request_json(request: DatasetCreateRequest) -> str:
+    encoded = json.dumps(
+        request.model_dump(mode="json", exclude_none=True),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > MAX_DATASET_CREATE_REQUEST_BYTES:
+        raise ValueError("dataset create request exceeds its byte limit")
+    return encoded
+
+
+def _dataset_create_response_json(response: DatasetCreateResponse) -> str:
+    encoded = json.dumps(
+        response.model_dump(mode="json"),
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if len(encoded.encode("utf-8")) > MAX_DATASET_CREATE_RESPONSE_BYTES:
+        raise ValueError("dataset create response exceeds its byte limit")
+    return encoded
+
+
+def _dataset_id_for_idempotency_key(idempotency_key: str) -> str:
+    return (
+        "ds-"
+        + hashlib.sha256(
+            f"openevo-dataset\0{idempotency_key}".encode("utf-8")
+        ).hexdigest()
+    )
+
+
 def _canonical_json_hash(payload: dict[str, Any]) -> str:
     return "sha256:" + hashlib.sha256(_json_dumps(payload).encode("utf-8")).hexdigest()
 
@@ -1055,26 +1230,655 @@ def _strict_sqlite_integer(value: object, *, label: str) -> int:
     return value
 
 
+_SUCCESSOR_TRANSITION_ID_RE = re.compile(
+    r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}"
+)
+_MAX_DISCARDED_MATERIALIZED_CONTEXTS = 100
+
+
+def _successor_transition_discard_receipt(
+    successor_transition_id: str,
+    *,
+    artifact_ids: list[str],
+    materialized_context_ids: list[str],
+) -> dict[str, object]:
+    if (
+        _SUCCESSOR_TRANSITION_ID_RE.fullmatch(
+            successor_transition_id
+        )
+        is None
+    ):
+        raise ValueError("successor transition identity is invalid")
+    for values, maximum, label in (
+        (
+            artifact_ids,
+            MAX_INTERNAL_JOB_OUTPUTS,
+            "discarded artifact",
+        ),
+        (
+            materialized_context_ids,
+            _MAX_DISCARDED_MATERIALIZED_CONTEXTS,
+            "discarded materialized context",
+        ),
+    ):
+        if (
+            len(values) > maximum
+            or any(
+                not isinstance(value, str)
+                or _SUCCESSOR_TRANSITION_ID_RE.fullmatch(
+                    value
+                )
+                is None
+                for value in values
+            )
+        ):
+            raise ValueError(
+                f"{label} inventory is invalid"
+            )
+        if (
+            values != sorted(values)
+            or len(values) != len(set(values))
+        ):
+            raise ValueError(
+                f"{label} inventory is invalid"
+            )
+    return {
+        "successor_transition_id": successor_transition_id,
+        "discarded_artifact_ids": artifact_ids,
+        "discarded_materialized_context_ids": (
+            materialized_context_ids
+        ),
+    }
+
+
+def _successor_transition_discard_receipt_json(
+    receipt: dict[str, object],
+) -> str:
+    encoded = json.dumps(
+        receipt,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    if (
+        len(encoded.encode("utf-8"))
+        > MAX_SUCCESSOR_TRANSITION_DISCARD_RECEIPT_BYTES
+    ):
+        raise ValueError(
+            "successor transition discard receipt exceeds its byte bound"
+        )
+    return encoded
+
+
+def _load_successor_transition_discard(
+    conn: sqlite3.Connection,
+    successor_transition_id: str,
+) -> dict[str, object] | None:
+    size_row = conn.execute(
+        "SELECT typeof(receipt_json) AS receipt_type, "
+        "length(CAST(receipt_json AS BLOB)) AS receipt_bytes, "
+        "typeof(receipt_sha256) AS sha_type, "
+        "length(CAST(receipt_sha256 AS BLOB)) AS sha_bytes, "
+        "typeof(discarded_at) AS discarded_at_type, "
+        "length(CAST(discarded_at AS BLOB)) AS discarded_at_bytes "
+        "FROM successor_transition_discards "
+        "WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if size_row is None:
+        return None
+    if (
+        size_row["receipt_type"] != "text"
+        or type(size_row["receipt_bytes"]) is not int
+        or not 1
+        <= int(size_row["receipt_bytes"])
+        <= MAX_SUCCESSOR_TRANSITION_DISCARD_RECEIPT_BYTES
+        or size_row["sha_type"] != "text"
+        or size_row["sha_bytes"] != 64
+        or size_row["discarded_at_type"] != "text"
+        or type(size_row["discarded_at_bytes"]) is not int
+        or not 1 <= int(size_row["discarded_at_bytes"]) <= 64
+    ):
+        raise ValueError(
+            "successor transition discard receipt is malformed"
+        )
+    row = conn.execute(
+        "SELECT CASE WHEN typeof(receipt_json) = 'text' "
+        "AND length(CAST(receipt_json AS BLOB)) = ? "
+        "THEN receipt_json END AS receipt_json, "
+        "CASE WHEN typeof(receipt_sha256) = 'text' "
+        "AND length(CAST(receipt_sha256 AS BLOB)) = 64 "
+        "THEN receipt_sha256 END AS receipt_sha256, "
+        "CASE WHEN typeof(discarded_at) = 'text' "
+        "AND length(CAST(discarded_at AS BLOB)) = ? "
+        "THEN discarded_at END AS discarded_at "
+        "FROM successor_transition_discards "
+        "WHERE successor_transition_id = ?",
+        (
+            int(size_row["receipt_bytes"]),
+            int(size_row["discarded_at_bytes"]),
+            successor_transition_id,
+        ),
+    ).fetchone()
+    if (
+        row is None
+        or not isinstance(row["receipt_json"], str)
+        or not isinstance(row["receipt_sha256"], str)
+        or not isinstance(row["discarded_at"], str)
+        or len(row["receipt_json"].encode("utf-8"))
+        != int(size_row["receipt_bytes"])
+    ):
+        raise ValueError(
+            "successor transition discard receipt changed during read"
+        )
+    try:
+        raw = json.loads(row["receipt_json"])
+        _parse_canonical_utc_iso(
+            row["discarded_at"],
+            label="successor transition discard timestamp",
+        )
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            "successor transition discard receipt is invalid"
+        ) from exc
+    if (
+        type(raw) is not dict
+        or set(raw) != {
+            "successor_transition_id",
+            "discarded_artifact_ids",
+            "discarded_materialized_context_ids",
+        }
+        or raw.get("successor_transition_id")
+        != successor_transition_id
+        or type(raw.get("discarded_artifact_ids")) is not list
+        or type(raw.get("discarded_materialized_context_ids"))
+        is not list
+    ):
+        raise ValueError(
+            "successor transition discard receipt is invalid"
+        )
+    receipt = _successor_transition_discard_receipt(
+        successor_transition_id,
+        artifact_ids=list(raw["discarded_artifact_ids"]),
+        materialized_context_ids=list(
+            raw["discarded_materialized_context_ids"]
+        ),
+    )
+    canonical = _successor_transition_discard_receipt_json(
+        receipt
+    )
+    if (
+        canonical != row["receipt_json"]
+        or hashlib.sha256(
+            canonical.encode("utf-8")
+        ).hexdigest()
+        != row["receipt_sha256"]
+    ):
+        raise ValueError(
+            "successor transition discard receipt is inconsistent"
+        )
+    return receipt
+
+
+def _require_successor_transition_not_discarded(
+    conn: sqlite3.Connection,
+    successor_transition_id: str | None,
+) -> None:
+    if (
+        successor_transition_id is not None
+        and conn.execute(
+            "SELECT 1 FROM successor_transition_discards "
+            "WHERE successor_transition_id = ?",
+            (successor_transition_id,),
+        ).fetchone()
+        is not None
+    ):
+        raise ValueError("successor transition was discarded")
+
+
+def _bounded_regular_file_bytes(
+    path: Path,
+    *,
+    budget: _DatasetReadBudget,
+    max_file_bytes: int,
+    label: str,
+) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except FileNotFoundError as exc:
+        raise DatasetIntegrityError(f"{label} is missing: {path}") from exc
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{label} could not be opened safely: {path}") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+        ):
+            raise DatasetIntegrityError(f"{label} is not an owned private file: {path}")
+        budget.consume(int(before.st_size), max_file_bytes=max_file_bytes)
+        chunks: list[bytes] = []
+        remaining = int(before.st_size)
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                raise DatasetIntegrityError(f"{label} changed while being read: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise DatasetIntegrityError(f"{label} grew while being read: {path}")
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_uid,
+            before.st_nlink,
+            before.st_size,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_uid,
+            after.st_nlink,
+            after.st_size,
+        ):
+            raise DatasetIntegrityError(f"{label} identity changed while being read: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+def _entry_stat(
+    directory_descriptor: int,
+    name: str,
+) -> os.stat_result | None:
+    try:
+        return os.stat(
+            name,
+            dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _dataset_file_identity(
+    entry: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int, int, int]:
+    return (
+        int(entry.st_dev),
+        int(entry.st_ino),
+        int(entry.st_mode),
+        int(entry.st_uid),
+        int(entry.st_gid),
+        int(entry.st_nlink),
+        int(entry.st_size),
+        int(entry.st_mtime_ns),
+        int(entry.st_ctime_ns),
+    )
+
+
+def _dataset_file_stable_identity(
+    entry: os.stat_result,
+) -> tuple[int, int, int, int, int, int, int]:
+    return (
+        int(entry.st_dev),
+        int(entry.st_ino),
+        int(entry.st_uid),
+        int(entry.st_gid),
+        int(entry.st_nlink),
+        int(entry.st_size),
+        int(entry.st_mtime_ns),
+    )
+
+
+def _require_legacy_dataset_mode_candidate(
+    entry: os.stat_result,
+    *,
+    max_file_bytes: int,
+    label: str,
+) -> int:
+    permissions = stat.S_IMODE(entry.st_mode)
+    if not stat.S_ISREG(entry.st_mode):
+        raise DatasetIntegrityError(f"{label} is not a regular file")
+    if entry.st_uid != os.geteuid():
+        raise DatasetIntegrityError(f"{label} is not owned by the effective user")
+    if entry.st_nlink != 1:
+        raise DatasetIntegrityError(f"{label} is not link-count-one")
+    if permissions & 0o7000:
+        raise DatasetIntegrityError(f"{label} has special permission bits")
+    if permissions & 0o111:
+        raise DatasetIntegrityError(f"{label} has executable permission bits")
+    if permissions & 0o600 != 0o600:
+        raise DatasetIntegrityError(f"{label} is not owner-readable and writable")
+    if permissions & 0o022:
+        raise DatasetIntegrityError(f"{label} is group/other writable")
+    if entry.st_size < 0 or entry.st_size > max_file_bytes:
+        raise DatasetIntegrityError(f"{label} exceeds its byte limit")
+    return permissions
+
+
+def _require_dataset_file_path_identity(
+    directory_descriptor: int,
+    name: str,
+    expected: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    observed = _entry_stat(directory_descriptor, name)
+    if (
+        observed is None
+        or _dataset_file_identity(observed)
+        != _dataset_file_identity(expected)
+    ):
+        raise DatasetIntegrityError(f"{label} identity changed")
+
+
+def _before_legacy_dataset_fchmod(
+    directory_descriptor: int,
+    dataset_id: str,
+    name: str,
+    descriptor: int,
+) -> None:
+    """Private no-op hook for deterministic dataset migration race tests."""
+
+    del directory_descriptor, dataset_id, name, descriptor
+
+
+def _migrate_legacy_dataset_file_mode(
+    directory_descriptor: int,
+    *,
+    dataset_id: str,
+    name: str,
+    max_file_bytes: int,
+) -> bool:
+    label = f"legacy dataset {dataset_id!r} file {name!r}"
+    path_entry = _entry_stat(directory_descriptor, name)
+    if path_entry is None:
+        raise DatasetIntegrityError(f"{label} is missing")
+    path_permissions = _require_legacy_dataset_mode_candidate(
+        path_entry,
+        max_file_bytes=max_file_bytes,
+        label=label,
+    )
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(
+            name,
+            flags,
+            dir_fd=directory_descriptor,
+        )
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{label} could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        opened_permissions = _require_legacy_dataset_mode_candidate(
+            opened,
+            max_file_bytes=max_file_bytes,
+            label=label,
+        )
+        if (
+            _dataset_file_identity(opened)
+            != _dataset_file_identity(path_entry)
+            or opened_permissions != path_permissions
+        ):
+            raise DatasetIntegrityError(f"{label} changed before it was opened")
+        _require_dataset_file_path_identity(
+            directory_descriptor,
+            name,
+            opened,
+            label=label,
+        )
+        if opened_permissions == 0o600:
+            return False
+        _before_legacy_dataset_fchmod(
+            directory_descriptor,
+            dataset_id,
+            name,
+            descriptor,
+        )
+        before_chmod = os.fstat(descriptor)
+        before_permissions = _require_legacy_dataset_mode_candidate(
+            before_chmod,
+            max_file_bytes=max_file_bytes,
+            label=label,
+        )
+        if (
+            _dataset_file_identity(before_chmod)
+            != _dataset_file_identity(opened)
+            or before_permissions != opened_permissions
+        ):
+            raise DatasetIntegrityError(f"{label} changed before chmod")
+        _require_dataset_file_path_identity(
+            directory_descriptor,
+            name,
+            before_chmod,
+            label=label,
+        )
+        os.fchmod(descriptor, 0o600)
+        os.fsync(descriptor)
+        migrated = os.fstat(descriptor)
+        if (
+            stat.S_IMODE(migrated.st_mode) != 0o600
+            or _dataset_file_stable_identity(migrated)
+            != _dataset_file_stable_identity(opened)
+        ):
+            raise DatasetIntegrityError(f"{label} changed during migration")
+        _require_dataset_file_path_identity(
+            directory_descriptor,
+            name,
+            migrated,
+            label=label,
+        )
+        return True
+    finally:
+        os.close(descriptor)
+
+
+def _require_owned_regular_entry(
+    entry: os.stat_result,
+    *,
+    label: str,
+    allowed_link_counts: set[int],
+) -> None:
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_uid != os.geteuid()
+        or entry.st_nlink not in allowed_link_counts
+    ):
+        raise DatasetIntegrityError(f"{label} is not an owned regular file")
+
+
+def _unlink_entry_if_identity(
+    directory_descriptor: int,
+    name: str,
+    identity: os.stat_result,
+    *,
+    label: str,
+) -> None:
+    current = _entry_stat(directory_descriptor, name)
+    if current is None:
+        return
+    if (
+        current.st_dev,
+        current.st_ino,
+        current.st_mode,
+        current.st_uid,
+        current.st_nlink,
+    ) != (
+        identity.st_dev,
+        identity.st_ino,
+        identity.st_mode,
+        identity.st_uid,
+        identity.st_nlink,
+    ):
+        raise DatasetIntegrityError(f"{label} identity changed before cleanup")
+    os.unlink(name, dir_fd=directory_descriptor)
+
+
+def _write_bytes_strict_exclusive(
+    files: ArtifactFileStore,
+    path: Path,
+    payload: bytes,
+) -> Path:
+    path = Path(os.path.abspath(path))
+    try:
+        path.relative_to(files.root)
+    except ValueError as exc:
+        raise ValueError(f"path escapes artifact root: {path}") from exc
+    path.parent.mkdir(parents=True, exist_ok=True)
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    directory_descriptor = os.open(path.parent, directory_flags)
+    target_name = path.name
+    pending_name = f".{target_name}.pending"
+    pending_identity: os.stat_result | None = None
+    target_linked = False
+    try:
+        if _entry_stat(directory_descriptor, target_name) is not None:
+            raise FileExistsError(path)
+        pending = _entry_stat(directory_descriptor, pending_name)
+        if pending is not None:
+            _require_owned_regular_entry(
+                pending,
+                label="staged dataset file",
+                allowed_link_counts={1},
+            )
+            _unlink_entry_if_identity(
+                directory_descriptor,
+                pending_name,
+                pending,
+                label="staged dataset file",
+            )
+            os.fsync(directory_descriptor)
+        descriptor = os.open(
+            pending_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise OSError("staged dataset file write made no progress")
+                offset += written
+            os.fsync(descriptor)
+            pending_identity = os.fstat(descriptor)
+            _require_owned_regular_entry(
+                pending_identity,
+                label="staged dataset file",
+                allowed_link_counts={1},
+            )
+            if int(pending_identity.st_size) != len(payload):
+                raise DatasetIntegrityError("staged dataset file size is inconsistent")
+        finally:
+            os.close(descriptor)
+        os.link(
+            pending_name,
+            target_name,
+            src_dir_fd=directory_descriptor,
+            dst_dir_fd=directory_descriptor,
+            follow_symlinks=False,
+        )
+        target_linked = True
+        os.fsync(directory_descriptor)
+        linked_pending = _entry_stat(directory_descriptor, pending_name)
+        linked_target = _entry_stat(directory_descriptor, target_name)
+        if (
+            linked_pending is None
+            or linked_target is None
+            or linked_pending.st_dev != linked_target.st_dev
+            or linked_pending.st_ino != linked_target.st_ino
+            or linked_pending.st_nlink != 2
+            or linked_target.st_nlink != 2
+        ):
+            raise DatasetIntegrityError("dataset file publication identity is inconsistent")
+        _unlink_entry_if_identity(
+            directory_descriptor,
+            pending_name,
+            linked_pending,
+            label="staged dataset file",
+        )
+        os.fsync(directory_descriptor)
+    except BaseException:
+        if target_linked:
+            try:
+                linked_pending = _entry_stat(
+                    directory_descriptor,
+                    pending_name,
+                )
+                linked_target = _entry_stat(
+                    directory_descriptor,
+                    target_name,
+                )
+                if (
+                    linked_pending is None
+                    or linked_target is None
+                    or linked_pending.st_dev != linked_target.st_dev
+                    or linked_pending.st_ino != linked_target.st_ino
+                    or linked_pending.st_nlink != 2
+                    or linked_target.st_nlink != 2
+                ):
+                    raise DatasetIntegrityError(
+                        "failed dataset publication could not be fenced"
+                    )
+                _unlink_entry_if_identity(
+                    directory_descriptor,
+                    pending_name,
+                    linked_pending,
+                    label="staged dataset file",
+                )
+                remaining_target = _entry_stat(
+                    directory_descriptor,
+                    target_name,
+                )
+                assert remaining_target is not None
+                _unlink_entry_if_identity(
+                    directory_descriptor,
+                    target_name,
+                    remaining_target,
+                    label="failed dataset publication",
+                )
+                os.fsync(directory_descriptor)
+            except (OSError, DatasetIntegrityError):
+                pass
+        elif pending_identity is not None:
+            try:
+                _unlink_entry_if_identity(
+                    directory_descriptor,
+                    pending_name,
+                    pending_identity,
+                    label="staged dataset file",
+                )
+                os.fsync(directory_descriptor)
+            except (OSError, DatasetIntegrityError):
+                pass
+        raise
+    finally:
+        os.close(directory_descriptor)
+    return path
+
+
 def _write_json_strict_exclusive(
     files: ArtifactFileStore,
     path: Path,
     payload: dict[str, Any],
 ) -> Path:
-    path = path.resolve()
-    if files.root != path and files.root not in path.parents:
-        raise ValueError(f"path escapes artifact root: {path}")
     serialized = _json_dumps(payload, indent=2)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        with path.open("x", encoding="utf-8") as handle:
-            handle.write(serialized)
-    except FileExistsError:
-        raise
-    except Exception:
-        if path.exists():
-            path.unlink(missing_ok=True)
-        raise
-    return path
+    return _write_bytes_strict_exclusive(
+        files,
+        path,
+        serialized.encode("utf-8"),
+    )
 
 
 def _context_snapshot_bytes(
@@ -1095,22 +1899,131 @@ def _write_jsonl_strict_exclusive(
     path: Path,
     records: list[dict[str, Any]],
 ) -> Path:
-    path = path.resolve()
-    if files.root != path and files.root not in path.parents:
-        raise ValueError(f"path escapes artifact root: {path}")
+    return _write_bytes_strict_exclusive(
+        files,
+        path,
+        _dataset_records_bytes(records),
+    )
+
+
+def _dataset_records_bytes(records: list[dict[str, Any]]) -> bytes:
+    return "".join(
+        f"{_json_dumps(record)}\n"
+        for record in records
+    ).encode("utf-8")
+
+
+def _reconcile_dataset_pending_file(path: Path) -> bool:
     path.parent.mkdir(parents=True, exist_ok=True)
+    directory_descriptor = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+    )
+    target_name = path.name
+    pending_name = f".{target_name}.pending"
     try:
-        with path.open("x", encoding="utf-8") as handle:
-            for record in records:
-                handle.write(_json_dumps(record))
-                handle.write("\n")
-    except FileExistsError:
-        raise
-    except Exception:
-        if path.exists():
-            path.unlink(missing_ok=True)
-        raise
-    return path
+        target = _entry_stat(directory_descriptor, target_name)
+        pending = _entry_stat(directory_descriptor, pending_name)
+        if target is None:
+            if pending is not None:
+                _require_owned_regular_entry(
+                    pending,
+                    label="staged dataset file",
+                    allowed_link_counts={1},
+                )
+            return False
+        _require_owned_regular_entry(
+            target,
+            label="published dataset file",
+            allowed_link_counts={1, 2},
+        )
+        if pending is not None:
+            _require_owned_regular_entry(
+                pending,
+                label="staged dataset file",
+                allowed_link_counts={1, 2},
+            )
+            if target.st_nlink == 2:
+                if (
+                    pending.st_nlink != 2
+                    or pending.st_dev != target.st_dev
+                    or pending.st_ino != target.st_ino
+                ):
+                    raise DatasetIntegrityError(
+                        "dataset file publication links are inconsistent"
+                    )
+            elif pending.st_nlink != 1 or (
+                pending.st_dev == target.st_dev
+                and pending.st_ino == target.st_ino
+            ):
+                raise DatasetIntegrityError(
+                    "dataset staged file inventory is inconsistent"
+                )
+            _unlink_entry_if_identity(
+                directory_descriptor,
+                pending_name,
+                pending,
+                label="staged dataset file",
+            )
+            os.fsync(directory_descriptor)
+            target = _entry_stat(directory_descriptor, target_name)
+            assert target is not None
+        _require_owned_regular_entry(
+            target,
+            label="published dataset file",
+            allowed_link_counts={1},
+        )
+        return True
+    finally:
+        os.close(directory_descriptor)
+
+
+def _ensure_dataset_json_file(
+    files: ArtifactFileStore,
+    path: Path,
+    payload: dict[str, Any],
+    *,
+    budget: _DatasetReadBudget,
+    max_file_bytes: int,
+    label: str,
+) -> None:
+    expected = _json_dumps(payload, indent=2).encode("utf-8")
+    if not _reconcile_dataset_pending_file(path):
+        _write_json_strict_exclusive(files, path, payload)
+        if not _reconcile_dataset_pending_file(path):
+            raise DatasetIntegrityError(f"{label} publication is missing")
+    actual = _bounded_regular_file_bytes(
+        path,
+        budget=budget,
+        max_file_bytes=max_file_bytes,
+        label=label,
+    )
+    if actual != expected:
+        raise DatasetIntegrityError(f"{label} differs from its exact authority")
+
+
+def _ensure_dataset_jsonl_file(
+    files: ArtifactFileStore,
+    path: Path,
+    records: list[dict[str, Any]],
+    *,
+    budget: _DatasetReadBudget,
+    max_file_bytes: int,
+    label: str,
+) -> None:
+    expected = _dataset_records_bytes(records)
+    if not _reconcile_dataset_pending_file(path):
+        _write_jsonl_strict_exclusive(files, path, records)
+        if not _reconcile_dataset_pending_file(path):
+            raise DatasetIntegrityError(f"{label} publication is missing")
+    actual = _bounded_regular_file_bytes(
+        path,
+        budget=budget,
+        max_file_bytes=max_file_bytes,
+        label=label,
+    )
+    if actual != expected:
+        raise DatasetIntegrityError(f"{label} differs from its exact authority")
 
 
 def _normalize_feedback_payload(
@@ -1677,6 +2590,17 @@ _ACTIVE_FEEDBACK_STATUSES = (
 
 
 @dataclass(frozen=True, slots=True)
+class _ValidatedPlanBoundJobIdentity:
+    plan: EvolutionPlan
+    selection: ResolvedEvolutionSelection
+    envelope: MethodExecutionEnvelope
+    input_artifact_ids: tuple[str, ...]
+    output_artifact_types: tuple[str, ...]
+    successor_transition_id: str | None
+    predecessor_successor_transition_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class _ValidatedPlanBoundJob:
     plan: EvolutionPlan
     selection: ResolvedEvolutionSelection
@@ -1684,6 +2608,85 @@ class _ValidatedPlanBoundJob:
     input_artifact_ids: tuple[str, ...]
     input_artifacts: tuple[WorkerClaimInputArtifact, ...]
     output_artifact_types: tuple[str, ...]
+    successor_transition_id: str | None
+    predecessor_successor_transition_id: str | None
+
+
+def _store_owned_execution_lineage(
+    *,
+    job_id: str,
+    validated: (
+        _ValidatedPlanBoundJob
+        | _ValidatedPlanBoundJobIdentity
+    ),
+) -> dict[str, Any]:
+    lineage: dict[str, Any] = {
+        "job_id": job_id,
+        "plan_id": validated.plan.plan_id,
+        "plan_digest": validated.envelope.plan_digest,
+        "target_id": validated.selection.target_id,
+        "method_id": validated.selection.method_id,
+        "method_identity_digest": (
+            validated.selection.method_identity_digest
+        ),
+        "execution_envelope_digest": canonical_digest(
+            validated.envelope
+        ),
+        "registry_snapshot_digest": (
+            validated.plan.registry_snapshot_digest
+        ),
+        "input_bindings": [
+            binding.model_dump(mode="json")
+            for binding in validated.envelope.input_bindings
+        ],
+        "declared_output_artifact_types": list(
+            validated.output_artifact_types
+        ),
+    }
+    if validated.successor_transition_id is not None:
+        lineage["successor_transition_id"] = (
+            validated.successor_transition_id
+        )
+    return lineage
+
+
+def _require_sealed_transition_artifact_authority(
+    artifact: sqlite3.Row,
+    *,
+    job_id: str,
+    validated: (
+        _ValidatedPlanBoundJob
+        | _ValidatedPlanBoundJobIdentity
+    ),
+) -> None:
+    expected_lineage = _store_owned_execution_lineage(
+        job_id=job_id,
+        validated=validated,
+    )
+    try:
+        lineage = _internal_job_output_object(
+            artifact,
+            "lineage_json",
+            "lineage",
+        )
+    except ValueError as exc:
+        raise ValueError(
+            "sealed transition artifact authority is invalid"
+        ) from exc
+    execution = lineage.get("openevo_execution")
+    if (
+        validated.successor_transition_id is None
+        or artifact["state"] != str(ArtifactState.SEALED)
+        or artifact["staging_job_id"] != job_id
+        or artifact["type"]
+        not in validated.output_artifact_types
+        or not isinstance(execution, dict)
+        or execution != expected_lineage
+        or _json_dumps(lineage) != artifact["lineage_json"]
+    ):
+        raise ValueError(
+            "sealed transition artifact authority is invalid"
+        )
 
 
 def _require_review_transition(
@@ -1781,6 +2784,11 @@ class EvolutionStore:
             registry_snapshot = verified_registry.snapshot
         self.db_path = Path(db_path)
         self.files = ArtifactFileStore(artifact_root)
+        self._dataset_materialization_root = self.files.root / "datasets"
+        self._dataset_materialization_lock = get_materialization_root_lock(
+            self._dataset_materialization_root
+        )
+        self._dataset_recovery_accounting_migration = False
         self._context_materialization_root = self.files.root / "context_materializations"
         self._context_materialization_lock = get_materialization_root_lock(
             self._context_materialization_root
@@ -1788,6 +2796,7 @@ class EvolutionStore:
         self._bound_store_id: str | None = None
         self._artifact_root_binding_identity: tuple[int, int, int, int, int] | None = None
         self._materialization_root_binding_identity: tuple[int, int, int, int, int] | None = None
+        self._dataset_root_binding_identity: tuple[int, int, int, int, int] | None = None
         self._registry_snapshot = registry_snapshot
         self._executable_registry = verified_registry
         self._context_projection_resolver = (
@@ -1817,7 +2826,10 @@ class EvolutionStore:
         self.files.initialize()
         orphan_manifest_paths: list[Path] = []
         orphan_materializations: list[_OrphanMaterialization] = []
-        with self._locked_context_materialization_root() as materialization_root_fd:
+        with (
+            self._locked_context_materialization_root() as materialization_root_fd,
+            self._locked_dataset_materialization_root() as dataset_root_fd,
+        ):
             with self.connect() as conn:
                 store_id, artifact_root_identity = self._ensure_store_identity(
                     conn,
@@ -1828,13 +2840,39 @@ class EvolutionStore:
                 self._materialization_root_binding_identity = _directory_binding_identity(
                     os.fstat(materialization_root_fd)
                 )
+                self._dataset_root_binding_identity = (
+                    _directory_binding_identity(
+                        os.fstat(dataset_root_fd)
+                    )
+                )
                 self._verify_bound_materialization_root(materialization_root_fd)
+                self._verify_bound_dataset_root(dataset_root_fd)
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     self._verify_bound_store_identity(conn)
                     self._install_base_schema(conn)
                     self._ensure_schema(conn)
+                    self._verify_plan_bound_job_retry_requests(conn)
+                    self._verify_plan_bound_job_transition_bindings(conn)
+                    dataset_recovery_budget = _DatasetReadBudget(
+                        label="dataset startup recovery",
+                        max_files=MAX_DATASET_READ_FILES,
+                        max_bytes=MAX_DATASET_STARTUP_RECOVERY_BYTES,
+                    )
+                    self._verify_dataset_create_requests(
+                        conn,
+                        recovery_budget=dataset_recovery_budget,
+                    )
+                    self._verify_unjournaled_datasets(
+                        conn,
+                        recovery_budget=dataset_recovery_budget,
+                    )
+                    self._migrate_legacy_dataset_file_modes(
+                        conn,
+                        dataset_root_fd,
+                    )
+                    self._verify_bound_dataset_root(dataset_root_fd)
                     self._verify_bound_store_identity(conn)
                     expected_context_snapshots = self._expected_context_snapshot_bytes(conn)
                     with self._opened_bound_artifact_root() as artifact_root_fd:
@@ -1855,6 +2893,10 @@ class EvolutionStore:
                     materialized_contexts = self._verify_referenced_context_materializations(
                         conn,
                         materialization_root_fd,
+                    )
+                    self._verify_successor_transition_discards(
+                        conn,
+                        materialized_contexts,
                     )
                     execution_snapshots = self._verify_execution_snapshots(conn)
                     self._verify_revision_ledger(
@@ -1904,6 +2946,140 @@ class EvolutionStore:
             yield descriptor
             if self._bound_store_id is not None:
                 self._verify_bound_materialization_root(descriptor)
+
+    @contextmanager
+    def _locked_dataset_materialization_root(self) -> Iterator[int]:
+        try:
+            with self._dataset_materialization_lock.locked() as descriptor:
+                opened = os.fstat(descriptor)
+                if (
+                    not stat.S_ISDIR(opened.st_mode)
+                    or opened.st_uid != os.geteuid()
+                ):
+                    raise DatasetIntegrityError(
+                        "dataset materialization root must be an owned directory"
+                    )
+                if self._bound_store_id is not None:
+                    self._verify_bound_dataset_root(descriptor)
+                yield descriptor
+                if self._bound_store_id is not None:
+                    self._verify_bound_dataset_root(descriptor)
+        except OSError as exc:
+            raise DatasetIntegrityError(
+                "dataset materialization root could not be opened safely"
+            ) from exc
+
+    def _migrate_legacy_dataset_file_modes(
+        self,
+        conn: sqlite3.Connection,
+        dataset_root_descriptor: int,
+    ) -> None:
+        max_rows = MAX_DATASET_CREATE_REQUESTS * 2
+        rows = conn.execute(
+            "SELECT dataset_id, manifest_path FROM datasets "
+            "WHERE artifact_id IS NOT NULL "
+            "ORDER BY dataset_id LIMIT ?",
+            (max_rows + 1,),
+        ).fetchall()
+        if len(rows) > max_rows:
+            raise DatasetIntegrityError(
+                "sealed dataset mode migration exceeds its recovery bound"
+            )
+        for row in rows:
+            dataset_id = str(row["dataset_id"])
+            if (
+                re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,127}", dataset_id)
+                is None
+            ):
+                raise DatasetIntegrityError(
+                    "sealed dataset mode migration has an invalid dataset ID"
+                )
+            expected_manifest_path = self.files.dataset_manifest_path(
+                dataset_id
+            )
+            if row["manifest_path"] != str(expected_manifest_path):
+                raise DatasetIntegrityError(
+                    f"sealed dataset path is inconsistent: {dataset_id}"
+                )
+            directory_label = f"legacy dataset directory {dataset_id!r}"
+            path_entry = _entry_stat(
+                dataset_root_descriptor,
+                dataset_id,
+            )
+            if path_entry is None:
+                raise DatasetIntegrityError(
+                    f"{directory_label} is missing"
+                )
+            permissions = stat.S_IMODE(path_entry.st_mode)
+            if (
+                not stat.S_ISDIR(path_entry.st_mode)
+                or path_entry.st_uid != os.geteuid()
+                or permissions & 0o7000
+                or permissions & 0o022
+                or permissions & 0o700 != 0o700
+            ):
+                raise DatasetIntegrityError(
+                    f"{directory_label} is not an owned safe directory"
+                )
+            try:
+                directory_descriptor = os.open(
+                    dataset_id,
+                    os.O_RDONLY
+                    | os.O_CLOEXEC
+                    | os.O_NOFOLLOW
+                    | os.O_NONBLOCK
+                    | os.O_DIRECTORY,
+                    dir_fd=dataset_root_descriptor,
+                )
+            except OSError as exc:
+                raise DatasetIntegrityError(
+                    f"{directory_label} could not be opened safely"
+                ) from exc
+            try:
+                opened = os.fstat(directory_descriptor)
+                if (
+                    _dataset_file_identity(opened)
+                    != _dataset_file_identity(path_entry)
+                ):
+                    raise DatasetIntegrityError(
+                        f"{directory_label} changed before it was opened"
+                    )
+                _require_dataset_file_path_identity(
+                    dataset_root_descriptor,
+                    dataset_id,
+                    opened,
+                    label=directory_label,
+                )
+                _migrate_legacy_dataset_file_mode(
+                    directory_descriptor,
+                    dataset_id=dataset_id,
+                    name=expected_manifest_path.name,
+                    max_file_bytes=MAX_DATASET_MANIFEST_BYTES,
+                )
+                _migrate_legacy_dataset_file_mode(
+                    directory_descriptor,
+                    dataset_id=dataset_id,
+                    name="records.jsonl",
+                    max_file_bytes=MAX_DATASET_RECORDS_BYTES,
+                )
+                os.fsync(directory_descriptor)
+                after = os.fstat(directory_descriptor)
+                if (
+                    _dataset_file_identity(after)
+                    != _dataset_file_identity(opened)
+                ):
+                    raise DatasetIntegrityError(
+                        f"{directory_label} changed during migration"
+                    )
+                _require_dataset_file_path_identity(
+                    dataset_root_descriptor,
+                    dataset_id,
+                    after,
+                    label=directory_label,
+                )
+            finally:
+                os.close(directory_descriptor)
+        os.fsync(dataset_root_descriptor)
 
     def _ensure_store_identity(
         self,
@@ -2136,6 +3312,63 @@ class EvolutionStore:
                 raise ValueError("evolution store root identity marker changed")
         except OSError as exc:
             raise ValueError("evolution store root binding could not be verified") from exc
+        finally:
+            if artifact_root_descriptor is not None:
+                os.close(artifact_root_descriptor)
+
+    def _verify_bound_dataset_root(self, descriptor: int) -> None:
+        expected_artifact_root = self._artifact_root_binding_identity
+        expected_dataset_root = self._dataset_root_binding_identity
+        if (
+            self._bound_store_id is None
+            or expected_artifact_root is None
+            or expected_dataset_root is None
+        ):
+            raise DatasetIntegrityError(
+                "evolution store identity has not been initialized"
+            )
+        artifact_root_descriptor: int | None = None
+        try:
+            artifact_root_descriptor = os.open(
+                self.files.root,
+                os.O_RDONLY
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW
+                | os.O_DIRECTORY,
+            )
+            self._verify_bound_artifact_root_descriptor(
+                artifact_root_descriptor
+            )
+            opened = os.fstat(descriptor)
+            child = os.stat(
+                "datasets",
+                dir_fd=artifact_root_descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                _directory_binding_identity(opened)
+                != expected_dataset_root
+                or _directory_binding_identity(child)
+                != expected_dataset_root
+            ):
+                raise DatasetIntegrityError(
+                    "dataset materialization root binding changed"
+                )
+            permissions = stat.S_IMODE(opened.st_mode)
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or opened.st_uid != os.geteuid()
+                or permissions & 0o7000
+                or permissions & 0o022
+                or permissions & 0o700 != 0o700
+            ):
+                raise DatasetIntegrityError(
+                    "dataset materialization root is not an owned safe directory"
+                )
+        except OSError as exc:
+            raise DatasetIntegrityError(
+                "dataset materialization root binding could not be verified"
+            ) from exc
         finally:
             if artifact_root_descriptor is not None:
                 os.close(artifact_root_descriptor)
@@ -2423,6 +3656,9 @@ class EvolutionStore:
                 capture_mode=str(request.execution_profile.capture_mode),
                 artifact_ids=manifest.selection.artifact_ids,
                 adapter_set_digest=canonical_digest(manifest.adapter_merge_spec.adapters),
+                successor_transition_id=(
+                    manifest.successor_transition_id
+                ),
             )
         return verified
 
@@ -2846,6 +4082,39 @@ class EvolutionStore:
             )
 
     def _ensure_schema(self, conn: sqlite3.Connection) -> None:
+        dataset_request_columns = {
+            str(row["name"])
+            for row in conn.execute(
+                "PRAGMA table_info(dataset_create_requests)"
+            ).fetchall()
+        }
+        recovery_columns = {
+            "recovery_file_count",
+            "recovery_byte_size",
+        }
+        present_recovery_columns = (
+            dataset_request_columns & recovery_columns
+        )
+        if present_recovery_columns and present_recovery_columns != recovery_columns:
+            raise ValueError(
+                "dataset recovery accounting schema is incomplete"
+            )
+        if not present_recovery_columns:
+            conn.execute(
+                "ALTER TABLE dataset_create_requests ADD COLUMN "
+                "recovery_file_count INTEGER CHECK("
+                "recovery_file_count IS NULL OR ("
+                "typeof(recovery_file_count) = 'integer' "
+                "AND recovery_file_count >= 0))"
+            )
+            conn.execute(
+                "ALTER TABLE dataset_create_requests ADD COLUMN "
+                "recovery_byte_size INTEGER CHECK("
+                "recovery_byte_size IS NULL OR ("
+                "typeof(recovery_byte_size) = 'integer' "
+                "AND recovery_byte_size >= 0))"
+            )
+            self._dataset_recovery_accounting_migration = True
         artifact_columns = {
             str(row["name"]) for row in conn.execute("PRAGMA table_info(artifacts)").fetchall()
         }
@@ -2952,6 +4221,771 @@ class EvolutionStore:
                 COALESCE(consumed_in_job_id, '')
             )
             """
+        )
+
+    @staticmethod
+    def _verify_plan_bound_job_retry_requests(
+        conn: sqlite3.Connection,
+    ) -> None:
+        rows = conn.execute(
+            "SELECT retry.job_id, retry.retry_request_id, retry.plan_id, "
+            "retry.target_id, retry.claim_attempt_before, retry.created_at, "
+            "jobs.plan_id AS job_plan_id, jobs.target_id AS job_target_id, "
+            "jobs.attempt_count "
+            "FROM plan_bound_job_retry_requests AS retry "
+            "JOIN jobs ON jobs.job_id = retry.job_id "
+            "ORDER BY retry.job_id, retry.retry_request_id LIMIT ?",
+            (MAX_PLAN_BOUND_JOB_RETRY_REQUESTS + 1,),
+        ).fetchall()
+        if len(rows) > MAX_PLAN_BOUND_JOB_RETRY_REQUESTS:
+            raise ValueError("plan-bound job retry receipt inventory exceeds its bound")
+        for row in rows:
+            request = PlanBoundJobRetryRequest(
+                retry_request_id=str(row["retry_request_id"]),
+                plan_id=str(row["plan_id"]),
+                target_id=str(row["target_id"]),
+            )
+            try:
+                datetime.fromisoformat(
+                    str(row["created_at"]).replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "plan-bound job retry receipt timestamp is invalid"
+                ) from exc
+            if (
+                request.plan_id != row["job_plan_id"]
+                or request.target_id != row["job_target_id"]
+                or type(row["claim_attempt_before"]) is not int
+                or type(row["attempt_count"]) is not int
+                or not 0
+                <= int(row["claim_attempt_before"])
+                <= int(row["attempt_count"])
+            ):
+                raise ValueError(
+                    "plan-bound job retry receipt differs from job authority"
+                )
+
+    @staticmethod
+    def _verify_plan_bound_job_transition_bindings(
+        conn: sqlite3.Connection,
+    ) -> None:
+        inventory = conn.execute(
+            """
+            SELECT COUNT(*) AS row_count,
+                   COALESCE(SUM(
+                       length(CAST(job_id AS BLOB))
+                       + length(CAST(successor_transition_id AS BLOB))
+                       + COALESCE(length(CAST(
+                           predecessor_successor_transition_id AS BLOB
+                         )), 0)
+                       + length(CAST(created_at AS BLOB))
+                   ), 0) AS total_bytes,
+                   COALESCE(MAX(length(CAST(job_id AS BLOB))), 0)
+                     AS max_job_id_bytes,
+                   COALESCE(MAX(length(CAST(
+                       successor_transition_id AS BLOB
+                     ))), 0) AS max_successor_id_bytes,
+                   COALESCE(MAX(COALESCE(length(CAST(
+                       predecessor_successor_transition_id AS BLOB
+                     )), 0)), 0) AS max_predecessor_id_bytes,
+                   COALESCE(MAX(length(CAST(created_at AS BLOB))), 0)
+                     AS max_created_at_bytes
+            FROM plan_bound_job_transition_bindings
+            """
+        ).fetchone()
+        assert inventory is not None
+        if (
+            int(inventory["row_count"])
+            > MAX_PLAN_BOUND_JOB_TRANSITION_BINDINGS
+            or int(inventory["total_bytes"])
+            > MAX_PLAN_BOUND_JOB_TRANSITION_BINDING_BYTES
+            or int(inventory["max_job_id_bytes"]) > 256
+            or int(inventory["max_successor_id_bytes"]) > 256
+            or int(inventory["max_predecessor_id_bytes"]) > 256
+            or int(inventory["max_created_at_bytes"]) > 64
+        ):
+            raise ValueError(
+                "plan-bound transition binding inventory exceeds its bounds"
+            )
+        rows = conn.execute(
+            """
+            SELECT binding.job_id, binding.successor_transition_id,
+                   binding.predecessor_successor_transition_id,
+                   binding.created_at, jobs.plan_id
+            FROM plan_bound_job_transition_bindings AS binding
+            JOIN jobs ON jobs.job_id = binding.job_id
+            WHERE length(CAST(binding.job_id AS BLOB))
+                    BETWEEN 1 AND 256
+              AND length(CAST(
+                    binding.successor_transition_id AS BLOB
+                  )) BETWEEN 1 AND 256
+              AND (
+                    binding.predecessor_successor_transition_id IS NULL
+                    OR length(CAST(
+                        binding.predecessor_successor_transition_id AS BLOB
+                      )) BETWEEN 1 AND 256
+                  )
+              AND length(CAST(binding.created_at AS BLOB))
+                    BETWEEN 1 AND 64
+            ORDER BY binding.job_id
+            LIMIT ?
+            """,
+            (MAX_PLAN_BOUND_JOB_TRANSITION_BINDINGS + 1,),
+        ).fetchall()
+        if len(rows) != int(inventory["row_count"]):
+            raise ValueError(
+                "plan-bound transition binding inventory is malformed"
+            )
+        stable_id = re.compile(
+            r"^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$"
+        )
+        for row in rows:
+            predecessor = row[
+                "predecessor_successor_transition_id"
+            ]
+            try:
+                created_at = datetime.fromisoformat(
+                    str(row["created_at"]).replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "plan-bound transition binding timestamp is invalid"
+                ) from exc
+            if (
+                row["plan_id"] is None
+                or stable_id.fullmatch(str(row["job_id"])) is None
+                or stable_id.fullmatch(
+                    str(row["successor_transition_id"])
+                )
+                is None
+                or (
+                    predecessor is not None
+                    and stable_id.fullmatch(str(predecessor)) is None
+                )
+                or created_at.tzinfo is None
+            ):
+                raise ValueError(
+                    "plan-bound transition binding differs from job authority"
+                )
+
+        invalid_sealed = conn.execute(
+            """
+            SELECT 1
+            FROM artifacts
+            LEFT JOIN plan_bound_job_transition_bindings AS binding
+              ON binding.job_id = artifacts.staging_job_id
+            LEFT JOIN jobs
+              ON jobs.job_id = artifacts.staging_job_id
+            LEFT JOIN evolution_plans AS plans
+              ON plans.plan_id = jobs.plan_id
+            WHERE artifacts.state = ?
+              AND (
+                    artifacts.staging_job_id IS NULL
+                    OR binding.job_id IS NULL
+                    OR jobs.state != ?
+                    OR jobs.plan_id IS NULL
+                    OR jobs.target_id IS NULL
+                    OR plans.plan_id IS NULL
+                    OR json_valid(plans.plan_json) != 1
+                    OR (
+                      SELECT COUNT(*)
+                      FROM json_each(
+                        CASE
+                          WHEN json_valid(plans.plan_json) = 1
+                          THEN plans.plan_json
+                          ELSE '{"selections":[]}'
+                        END,
+                        '$.selections'
+                      ) AS selection
+                      WHERE json_extract(
+                              selection.value,
+                              '$.target_id'
+                            ) = jobs.target_id
+                        AND json_extract(
+                              selection.value,
+                              '$.method_id'
+                            ) = jobs.method
+                    ) != 1
+                    OR NOT EXISTS (
+                      SELECT 1
+                      FROM json_each(
+                        CASE
+                          WHEN json_valid(
+                            jobs.declared_output_artifact_types_json
+                          ) = 1
+                          THEN
+                            jobs.declared_output_artifact_types_json
+                          ELSE '[]'
+                        END
+                      ) AS declared_type
+                      WHERE declared_type.type = 'text'
+                        AND declared_type.value = artifacts.type
+                    )
+                    OR CASE
+                      WHEN json_valid(artifacts.lineage_json) != 1
+                        OR json_valid(
+                             jobs.execution_envelope_json
+                           ) != 1
+                        OR json_valid(
+                             jobs.declared_output_artifact_types_json
+                           ) != 1
+                      THEN 1
+                      WHEN json_type(
+                             artifacts.lineage_json,
+                             '$.openevo_execution'
+                           ) != 'object'
+                      THEN 1
+                      ELSE json_extract(
+                        artifacts.lineage_json,
+                        '$.openevo_execution'
+                      ) IS NOT json_object(
+                        'declared_output_artifact_types',
+                        json(
+                          jobs.declared_output_artifact_types_json
+                        ),
+                        'execution_envelope_digest',
+                        jobs.execution_envelope_digest,
+                        'input_bindings',
+                        json_extract(
+                          jobs.execution_envelope_json,
+                          '$.input_bindings'
+                        ),
+                        'job_id',
+                        artifacts.staging_job_id,
+                        'method_id',
+                        jobs.method,
+                        'method_identity_digest',
+                        jobs.method_identity_digest,
+                        'plan_digest',
+                        plans.plan_digest,
+                        'plan_id',
+                        jobs.plan_id,
+                        'registry_snapshot_digest',
+                        plans.registry_snapshot_digest,
+                        'successor_transition_id',
+                        binding.successor_transition_id,
+                        'target_id',
+                        jobs.target_id
+                      )
+                    END
+                  )
+            LIMIT 1
+            """,
+            (
+                str(ArtifactState.SEALED),
+                str(JobState.SUCCEEDED),
+            ),
+        ).fetchone()
+        if invalid_sealed is not None:
+            raise ValueError(
+                "sealed transition artifact authority is invalid"
+            )
+        leaked_bound_output = conn.execute(
+            """
+            SELECT 1
+            FROM artifacts
+            JOIN plan_bound_job_transition_bindings AS binding
+              ON json_extract(
+                   artifacts.lineage_json,
+                   '$.openevo_execution.job_id'
+                 ) = binding.job_id
+            JOIN jobs ON jobs.job_id = binding.job_id
+            WHERE jobs.state = ?
+              AND artifacts.state != ?
+            LIMIT 1
+            """,
+            (
+                str(JobState.SUCCEEDED),
+                str(ArtifactState.SEALED),
+            ),
+        ).fetchone()
+        if leaked_bound_output is not None:
+            raise ValueError(
+                "transition-bound job output escaped its sealed lifecycle"
+            )
+
+    @staticmethod
+    def _verify_successor_transition_discards(
+        conn: sqlite3.Connection,
+        materialized_contexts: dict[
+            str,
+            _MaterializationRecoveryIdentity,
+        ],
+    ) -> None:
+        inventory = conn.execute(
+            "SELECT COUNT(*) AS row_count, "
+            "COALESCE(SUM("
+            "length(CAST(successor_transition_id AS BLOB)) + "
+            "length(CAST(receipt_sha256 AS BLOB)) + "
+            "length(CAST(receipt_json AS BLOB)) + "
+            "length(CAST(discarded_at AS BLOB))"
+            "), 0) AS total_bytes, "
+            "COALESCE(MAX(length(CAST("
+            "successor_transition_id AS BLOB))), 0) "
+            "AS max_transition_id_bytes, "
+            "COALESCE(MAX(length(CAST(receipt_sha256 AS BLOB))), 0) "
+            "AS max_sha_bytes, "
+            "COALESCE(MAX(length(CAST(receipt_json AS BLOB))), 0) "
+            "AS max_receipt_bytes, "
+            "COALESCE(MAX(length(CAST(discarded_at AS BLOB))), 0) "
+            "AS max_discarded_at_bytes "
+            "FROM successor_transition_discards"
+        ).fetchone()
+        assert inventory is not None
+        if (
+            int(inventory["row_count"])
+            > MAX_SUCCESSOR_TRANSITION_DISCARDS
+            or int(inventory["total_bytes"])
+            > MAX_SUCCESSOR_TRANSITION_DISCARD_AGGREGATE_BYTES
+            or int(inventory["max_transition_id_bytes"]) > 256
+            or int(inventory["max_sha_bytes"]) > 64
+            or int(inventory["max_receipt_bytes"])
+            > MAX_SUCCESSOR_TRANSITION_DISCARD_RECEIPT_BYTES
+            or int(inventory["max_discarded_at_bytes"]) > 64
+        ):
+            raise ValueError(
+                "successor transition discard inventory exceeds "
+                "its bounds"
+            )
+        rows = conn.execute(
+            "SELECT CASE WHEN "
+            "typeof(successor_transition_id) = 'text' "
+            "AND length(CAST(successor_transition_id AS BLOB)) "
+            "BETWEEN 1 AND 256 THEN successor_transition_id END "
+            "AS successor_transition_id "
+            "FROM successor_transition_discards "
+            "ORDER BY successor_transition_id LIMIT ?",
+            (MAX_SUCCESSOR_TRANSITION_DISCARDS + 1,),
+        ).fetchall()
+        if len(rows) != int(inventory["row_count"]):
+            raise ValueError(
+                "successor transition discard inventory is malformed"
+            )
+        transition_ids: set[str] = set()
+        for row in rows:
+            transition_id = row["successor_transition_id"]
+            if (
+                not isinstance(transition_id, str)
+                or _SUCCESSOR_TRANSITION_ID_RE.fullmatch(
+                    transition_id
+                )
+                is None
+                or _load_successor_transition_discard(
+                    conn,
+                    transition_id,
+                )
+                is None
+            ):
+                raise ValueError(
+                    "successor transition discard inventory is invalid"
+                )
+            transition_ids.add(transition_id)
+        if any(
+            identity.successor_transition_id in transition_ids
+            for identity in materialized_contexts.values()
+        ):
+            raise ValueError(
+                "discarded successor transition retained a "
+                "materialized context"
+            )
+        active_job = conn.execute(
+            "SELECT 1 FROM jobs "
+            "JOIN plan_bound_job_transition_bindings AS binding "
+            "ON binding.job_id = jobs.job_id "
+            "JOIN successor_transition_discards AS discard "
+            "ON discard.successor_transition_id = "
+            "binding.successor_transition_id "
+            "WHERE jobs.state IN (?, ?, ?) LIMIT 1",
+            (
+                str(JobState.PENDING),
+                str(JobState.CLAIMED),
+                str(JobState.RUNNING),
+            ),
+        ).fetchone()
+        if active_job is not None:
+            raise ValueError(
+                "discarded successor transition retained active work"
+            )
+        retained_output = conn.execute(
+            "SELECT 1 FROM artifacts "
+            "JOIN plan_bound_job_transition_bindings AS binding "
+            "ON binding.job_id = artifacts.staging_job_id "
+            "JOIN successor_transition_discards AS discard "
+            "ON discard.successor_transition_id = "
+            "binding.successor_transition_id LIMIT 1"
+        ).fetchone()
+        if retained_output is not None:
+            raise ValueError(
+                "discarded successor transition retained output"
+            )
+        cancelled_lease = conn.execute(
+            "SELECT 1 FROM jobs "
+            "JOIN plan_bound_job_transition_bindings AS binding "
+            "ON binding.job_id = jobs.job_id "
+            "JOIN successor_transition_discards AS discard "
+            "ON discard.successor_transition_id = "
+            "binding.successor_transition_id "
+            "WHERE jobs.state = ? AND ("
+            "jobs.claimed_by IS NOT NULL "
+            "OR jobs.lease_id IS NOT NULL "
+            "OR jobs.lease_expires_at IS NOT NULL "
+            "OR jobs.lease_duration_seconds IS NOT NULL"
+            ") LIMIT 1",
+            (str(JobState.CANCELLED),),
+        ).fetchone()
+        if cancelled_lease is not None:
+            raise ValueError(
+                "discarded successor transition retained a lease"
+            )
+
+    def _verify_dataset_create_requests(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        recovery_budget: _DatasetReadBudget,
+    ) -> None:
+        inventory = conn.execute(
+            "SELECT COUNT(*) AS row_count, "
+            "COALESCE(SUM("
+            "length(CAST(idempotency_key AS BLOB)) + "
+            "length(CAST(request_sha256 AS BLOB)) + "
+            "length(CAST(request_json AS BLOB)) + "
+            "length(CAST(dataset_id AS BLOB)) + "
+            "COALESCE(length(CAST(response_json AS BLOB)), 0) + "
+            "length(CAST(created_at AS BLOB))"
+            "), 0) AS total_bytes, "
+            "COALESCE(MAX(length(CAST(idempotency_key AS BLOB))), 0) "
+            "AS max_idempotency_key_bytes, "
+            "COALESCE(MAX(length(CAST(request_sha256 AS BLOB))), 0) "
+            "AS max_request_sha256_bytes, "
+            "COALESCE(MAX(length(CAST(request_json AS BLOB))), 0) "
+            "AS max_request_bytes, "
+            "COALESCE(MAX(length(CAST(dataset_id AS BLOB))), 0) "
+            "AS max_dataset_id_bytes, "
+            "COALESCE(MAX(COALESCE(length(CAST(response_json AS BLOB)), 0)), 0) "
+            "AS max_response_bytes, "
+            "COALESCE(MAX(length(CAST(created_at AS BLOB))), 0) "
+            "AS max_created_at_bytes, "
+            "COALESCE(SUM(CASE "
+            "WHEN recovery_file_count IS NULL THEN 0 "
+            "WHEN typeof(recovery_file_count) = 'integer' "
+            "AND recovery_file_count >= 0 THEN recovery_file_count "
+            "ELSE ? END), 0) AS recovery_file_count, "
+            "COALESCE(SUM(CASE "
+            "WHEN recovery_byte_size IS NULL THEN 0 "
+            "WHEN typeof(recovery_byte_size) = 'integer' "
+            "AND recovery_byte_size >= 0 THEN recovery_byte_size "
+            "ELSE ? END), 0) AS recovery_byte_size "
+            "FROM dataset_create_requests"
+            ,
+            (
+                MAX_DATASET_READ_FILES + 1,
+                MAX_DATASET_STARTUP_RECOVERY_BYTES + 1,
+            ),
+        ).fetchone()
+        assert inventory is not None
+        if (
+            int(inventory["recovery_file_count"])
+            > MAX_DATASET_READ_FILES
+        ):
+            raise ValueError(
+                "dataset startup recovery exceeds the file count limit"
+            )
+        if (
+            int(inventory["recovery_byte_size"])
+            > MAX_DATASET_STARTUP_RECOVERY_BYTES
+        ):
+            raise ValueError(
+                "dataset startup recovery exceeds the aggregate byte limit"
+            )
+        if (
+            int(inventory["row_count"]) > MAX_DATASET_CREATE_REQUESTS
+            or int(inventory["total_bytes"]) > MAX_DATASET_CREATE_RECOVERY_BYTES
+            or int(inventory["max_idempotency_key_bytes"]) > 128
+            or int(inventory["max_request_sha256_bytes"]) != (
+                0 if int(inventory["row_count"]) == 0 else 64
+            )
+            or int(inventory["max_request_bytes"])
+            > MAX_DATASET_CREATE_REQUEST_BYTES
+            or int(inventory["max_dataset_id_bytes"]) > 67
+            or int(inventory["max_response_bytes"])
+            > MAX_DATASET_CREATE_RESPONSE_BYTES
+            or int(inventory["max_created_at_bytes"]) > 64
+        ):
+            raise ValueError(
+                "dataset create request inventory exceeds its recovery bounds"
+            )
+        rows = conn.execute(
+            "SELECT idempotency_key, request_sha256, request_json, dataset_id, "
+            "response_json, recovery_file_count, recovery_byte_size, created_at "
+            "FROM dataset_create_requests "
+            "WHERE length(CAST(idempotency_key AS BLOB)) BETWEEN 1 AND 128 "
+            "AND length(CAST(request_sha256 AS BLOB)) = 64 "
+            "AND length(CAST(request_json AS BLOB)) "
+            "BETWEEN 1 AND ? "
+            "AND length(CAST(dataset_id AS BLOB)) BETWEEN 1 AND 67 "
+            "AND COALESCE(length(CAST(response_json AS BLOB)), 0) <= ? "
+            "AND length(CAST(created_at AS BLOB)) BETWEEN 1 AND 64 "
+            "ORDER BY idempotency_key LIMIT ?",
+            (
+                MAX_DATASET_CREATE_REQUEST_BYTES,
+                MAX_DATASET_CREATE_RESPONSE_BYTES,
+                MAX_DATASET_CREATE_REQUESTS + 1,
+            ),
+        ).fetchall()
+        if len(rows) != int(inventory["row_count"]):
+            raise ValueError("dataset create request inventory is malformed")
+        for row in rows:
+            idempotency_key = str(row["idempotency_key"])
+            request_json = str(row["request_json"])
+            request_sha256 = hashlib.sha256(
+                request_json.encode("utf-8")
+            ).hexdigest()
+            try:
+                request = DatasetCreateRequest.model_validate_json(request_json)
+                created_at = datetime.fromisoformat(
+                    str(row["created_at"]).replace("Z", "+00:00")
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "dataset create request receipt is invalid"
+                ) from exc
+            if created_at.tzinfo is None:
+                raise ValueError(
+                    "dataset create request receipt timestamp is invalid"
+                )
+            dataset_id = _dataset_id_for_idempotency_key(idempotency_key)
+            if (
+                request.idempotency_key != idempotency_key
+                or _dataset_create_request_json(request) != request_json
+                or row["request_sha256"] != request_sha256
+                or row["dataset_id"] != dataset_id
+            ):
+                raise ValueError(
+                    "dataset create request receipt differs from its identity"
+                )
+            recovery_file_count = row["recovery_file_count"]
+            recovery_byte_size = row["recovery_byte_size"]
+            if (
+                (recovery_file_count is None)
+                != (recovery_byte_size is None)
+                or (
+                    recovery_file_count is not None
+                    and (
+                        type(recovery_file_count) is not int
+                        or int(recovery_file_count) < 0
+                        or type(recovery_byte_size) is not int
+                        or int(recovery_byte_size) < 0
+                    )
+                )
+            ):
+                raise ValueError(
+                    "dataset recovery accounting is malformed"
+                )
+            response_json = row["response_json"]
+            pending = conn.execute(
+                "SELECT * FROM datasets WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchone()
+            has_sealed_authority = (
+                pending is not None
+                and pending["artifact_id"] is not None
+            )
+            reconciled_candidate = False
+            files_before = recovery_budget.files
+            bytes_before = recovery_budget.bytes
+            authority_response: DatasetCreateResponse | None = None
+            if response_json is None:
+                if not has_sealed_authority:
+                    if pending is not None:
+                        authority_response = (
+                            self._reconcile_pending_dataset_artifact_candidate(
+                                conn,
+                                dataset_row=pending,
+                                budget=recovery_budget,
+                            )
+                        )
+                        reconciled_candidate = authority_response is not None
+                        has_sealed_authority = reconciled_candidate
+                    if not has_sealed_authority:
+                        if recovery_file_count is not None:
+                            raise ValueError(
+                                "pending dataset has sealed recovery accounting"
+                            )
+                        continue
+                expected_response = None
+            else:
+                try:
+                    expected_response = (
+                        DatasetCreateResponse.model_validate_json(
+                            str(response_json)
+                        )
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "dataset create request response is invalid"
+                    ) from exc
+                if (
+                    _dataset_create_response_json(expected_response)
+                    != response_json
+                    or expected_response.dataset_id != dataset_id
+                ):
+                    raise ValueError(
+                        "dataset create request response differs from dataset authority"
+                    )
+            if authority_response is None:
+                authority_response = self._get_dataset_from_connection(
+                    conn,
+                    dataset_id,
+                    budget=recovery_budget,
+                )
+            actual_file_count = recovery_budget.files - files_before
+            actual_byte_size = recovery_budget.bytes - bytes_before
+            if recovery_file_count is None:
+                if (
+                    not self._dataset_recovery_accounting_migration
+                    and not reconciled_candidate
+                ):
+                    raise ValueError(
+                        "sealed dataset recovery accounting is missing"
+                    )
+                updated = conn.execute(
+                    "UPDATE dataset_create_requests "
+                    "SET recovery_file_count = ?, recovery_byte_size = ? "
+                    "WHERE idempotency_key = ? "
+                    "AND recovery_file_count IS NULL "
+                    "AND recovery_byte_size IS NULL",
+                    (
+                        actual_file_count,
+                        actual_byte_size,
+                        idempotency_key,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(
+                        "dataset recovery accounting migration lost its fence"
+                    )
+                recovery_file_count = actual_file_count
+                recovery_byte_size = actual_byte_size
+            if expected_response is None:
+                sealed_response_json = _dataset_create_response_json(
+                    authority_response
+                )
+                updated = conn.execute(
+                    "UPDATE dataset_create_requests SET response_json = ? "
+                    "WHERE idempotency_key = ? AND response_json IS NULL",
+                    (
+                        sealed_response_json,
+                        idempotency_key,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(
+                        "dataset response recovery lost its fence"
+                    )
+                expected_response = authority_response
+            if (
+                recovery_file_count != actual_file_count
+                or recovery_byte_size != actual_byte_size
+                or authority_response != expected_response
+            ):
+                raise ValueError(
+                    "dataset create request response differs from dataset authority"
+                )
+
+    def _verify_unjournaled_datasets(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        recovery_budget: _DatasetReadBudget,
+    ) -> None:
+        rows = conn.execute(
+            "SELECT datasets.* FROM datasets "
+            "LEFT JOIN dataset_create_requests "
+            "ON dataset_create_requests.dataset_id = datasets.dataset_id "
+            "WHERE dataset_create_requests.dataset_id IS NULL "
+            "ORDER BY datasets.dataset_id LIMIT ?",
+            (MAX_DATASET_CREATE_REQUESTS + 1,),
+        ).fetchall()
+        if len(rows) > MAX_DATASET_CREATE_REQUESTS:
+            raise DatasetIntegrityError(
+                "unjournaled dataset inventory exceeds its recovery bound"
+            )
+        for row in rows:
+            dataset_id = str(row["dataset_id"])
+            if row["artifact_id"] is None:
+                recovered = self._reconcile_pending_dataset_artifact_candidate(
+                    conn,
+                    dataset_row=row,
+                    budget=recovery_budget,
+                )
+                if recovered is None:
+                    raise DatasetIntegrityError(
+                        f"unjournaled dataset is incomplete: {dataset_id}"
+                    )
+                continue
+            self._get_dataset_from_connection(
+                conn,
+                dataset_id,
+                budget=recovery_budget,
+            )
+
+    def _reconcile_pending_dataset_artifact_candidate(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        dataset_row: sqlite3.Row,
+        budget: _DatasetReadBudget,
+    ) -> DatasetCreateResponse | None:
+        dataset_id = str(dataset_row["dataset_id"])
+        if dataset_row["artifact_id"] is not None:
+            raise DatasetIntegrityError(
+                "pending dataset candidate is already bound"
+            )
+        candidates = self._dataset_artifact_candidate_rows(
+            conn,
+            dataset_id=dataset_id,
+            manifest_path=Path(str(dataset_row["manifest_path"])),
+        )
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise DatasetIntegrityError(
+                "pending dataset has multiple artifact candidates"
+            )
+        manifest, _records, _events = (
+            self._validate_dataset_storage_from_connection(
+                conn,
+                dataset_row,
+                budget=budget,
+            )
+        )
+        candidate = candidates[0]
+        self._validate_dataset_artifact_row(
+            candidate,
+            dataset_row=dataset_row,
+            manifest=manifest,
+            budget=budget,
+        )
+        artifact_id = str(candidate["artifact_id"])
+        updated = conn.execute(
+            "UPDATE datasets SET artifact_id = ? "
+            "WHERE dataset_id = ? AND artifact_id IS NULL",
+            (
+                artifact_id,
+                dataset_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise DatasetIntegrityError(
+                "pending dataset artifact recovery lost its fence"
+            )
+        return DatasetCreateResponse(
+            dataset_id=dataset_id,
+            artifact_id=artifact_id,
+            event_count=int(dataset_row["event_count"]),
+            trace_count=int(dataset_row["trace_count"]),
         )
 
     def create_review_request(
@@ -3853,6 +5887,9 @@ class EvolutionStore:
                     if manifest_created:
                         try:
                             manifest_path.unlink(missing_ok=True)
+                            manifest_path.with_name(
+                                f".{manifest_path.name}.pending"
+                            ).unlink(missing_ok=True)
                         except OSError:
                             pass
                     raise
@@ -3874,12 +5911,534 @@ class EvolutionStore:
     def get_artifact(self, artifact_id: str) -> ArtifactResponse:
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT * FROM artifacts WHERE artifact_id = ? AND state != ?",
-                (artifact_id, str(ArtifactState.STAGED)),
+                """
+                SELECT * FROM artifacts
+                WHERE artifact_id = ? AND state NOT IN (?, ?)
+                """,
+                (
+                    artifact_id,
+                    str(ArtifactState.STAGED),
+                    str(ArtifactState.SEALED),
+                ),
             ).fetchone()
         if row is None:
             raise ValueError(f"unknown artifact: {artifact_id}")
         return _artifact_response_from_row(row)
+
+    def get_internal_successor_artifact(
+        self,
+        successor_transition_id: str,
+        artifact_id: str,
+    ) -> ArtifactResponse:
+        """Read one exact head-owned output without making it fallback-eligible."""
+
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                _require_successor_transition_not_discarded(
+                    conn,
+                    successor_transition_id,
+                )
+                row = conn.execute(
+                    "SELECT * FROM artifacts "
+                    "WHERE artifact_id = ?",
+                    (artifact_id,),
+                ).fetchone()
+                if (
+                    row is None
+                    or row["state"]
+                    != str(ArtifactState.SEALED)
+                    or not isinstance(
+                        row["staging_job_id"],
+                        str,
+                    )
+                ):
+                    raise ValueError(
+                        "sealed transition artifact authority is invalid"
+                    )
+                job_id = str(row["staging_job_id"])
+                job_row = conn.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                binding = conn.execute(
+                    "SELECT successor_transition_id "
+                    "FROM plan_bound_job_transition_bindings "
+                    "WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if (
+                    job_row is None
+                    or job_row["state"]
+                    != str(JobState.SUCCEEDED)
+                    or binding is None
+                    or binding["successor_transition_id"]
+                    != successor_transition_id
+                ):
+                    raise ValueError(
+                        "sealed transition artifact authority is invalid"
+                    )
+                validated = (
+                    self._validate_plan_bound_job_contract(
+                        conn,
+                        job_row,
+                    )
+                )
+                if (
+                    validated.successor_transition_id
+                    != successor_transition_id
+                ):
+                    raise ValueError(
+                        "sealed transition artifact authority is invalid"
+                    )
+                _require_sealed_transition_artifact_authority(
+                    row,
+                    job_id=job_id,
+                    validated=validated,
+                )
+                conn.commit()
+            except BaseException:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return _artifact_response_from_row(row)
+
+    def discard_successor_transition_outputs(
+        self,
+        successor_transition_id: str,
+    ) -> dict[str, object]:
+        """Idempotently remove non-active outputs after abandon/supersession."""
+
+        if (
+            not isinstance(successor_transition_id, str)
+            or re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}",
+                successor_transition_id,
+            )
+            is None
+        ):
+            raise ValueError("successor transition identity is invalid")
+        if self._bound_store_id is None:
+            raise ValueError("evolution store identity has not been initialized")
+
+        manifest_paths: list[Path] = []
+        artifact_ids: list[str] = []
+        materialized_context_ids: list[str] = []
+        discard_receipts: list[PersistedContextDiscardReceipt] = []
+        orphan_materializations: list[_OrphanMaterialization] = []
+        expected_context_snapshots: dict[str, bytes] = {}
+        persisted_receipt: dict[str, object] | None = None
+        materializer = self._context_materializer
+        with self._locked_context_materialization_root() as materialization_root_fd:
+            with self.connect() as conn:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    self._verify_bound_store_identity(conn)
+                    self._verify_bound_materialization_root(
+                        materialization_root_fd
+                    )
+                    orphan_materializations = (
+                        self._orphan_context_materializations(
+                            conn,
+                            materialization_root_fd,
+                        )
+                    )
+                    self._verify_referenced_context_materializations(
+                        conn,
+                        materialization_root_fd,
+                    )
+                    materializations = [
+                        self._materialized_context_from_row(row)
+                        for row in _read_guarded_materialized_context_rows(
+                            conn,
+                            label=(
+                                "successor transition materialization "
+                                "discard"
+                            ),
+                        )
+                    ]
+                    selected_materializations = [
+                        manifest
+                        for manifest in materializations
+                        if manifest.successor_transition_id
+                        == successor_transition_id
+                    ]
+                    existing_receipt = (
+                        _load_successor_transition_discard(
+                            conn,
+                            successor_transition_id,
+                        )
+                    )
+                    bound_job_rows = conn.execute(
+                        "SELECT jobs.job_id, jobs.state "
+                        "FROM jobs JOIN "
+                        "plan_bound_job_transition_bindings AS binding "
+                        "ON binding.job_id = jobs.job_id "
+                        "WHERE binding.successor_transition_id = ? "
+                        "ORDER BY jobs.job_id LIMIT ?",
+                        (
+                            successor_transition_id,
+                            (
+                                MAX_PLAN_BOUND_JOB_TRANSITION_BINDINGS
+                                + 1
+                            ),
+                        ),
+                    ).fetchall()
+                    if (
+                        len(bound_job_rows)
+                        > MAX_PLAN_BOUND_JOB_TRANSITION_BINDINGS
+                    ):
+                        raise ValueError(
+                            "transition job inventory exceeds its bound"
+                        )
+                    retained_output = conn.execute(
+                        "SELECT 1 FROM artifacts JOIN "
+                        "plan_bound_job_transition_bindings AS binding "
+                        "ON binding.job_id = artifacts.staging_job_id "
+                        "WHERE binding.successor_transition_id = ? "
+                        "LIMIT 1",
+                        (successor_transition_id,),
+                    ).fetchone()
+                    active_job_ids = [
+                        str(row["job_id"])
+                        for row in bound_job_rows
+                        if str(row["state"])
+                        in {
+                            str(JobState.PENDING),
+                            str(JobState.CLAIMED),
+                            str(JobState.RUNNING),
+                        }
+                    ]
+                    if existing_receipt is not None:
+                        if (
+                            selected_materializations
+                            or retained_output is not None
+                            or active_job_ids
+                        ):
+                            raise ValueError(
+                                "discarded successor transition "
+                                "regained output authority"
+                            )
+                        persisted_receipt = existing_receipt
+                        selected_materializations = []
+                        bound_job_rows = []
+                        active_job_ids = []
+                    if selected_materializations and materializer is None:
+                        raise ValueError(
+                            "transition materialization discard requires "
+                            "a verified executable registry"
+                        )
+                    for manifest in selected_materializations:
+                        if manifest.predecessor_project_head_id is None:
+                            raise ValueError(
+                                "transition materialization lost its "
+                                "predecessor authority"
+                            )
+                        if (
+                            conn.execute(
+                                "SELECT 1 FROM revisions "
+                                "WHERE context_id = ? LIMIT 1",
+                                (manifest.context_id,),
+                            ).fetchone()
+                            is not None
+                        ):
+                            raise ValueError(
+                                "transition materialization was already "
+                                "consumed"
+                            )
+                        assert materializer is not None
+                        discard_receipts.append(
+                            materializer.prepare_persisted_discard(
+                                manifest,
+                                materialization_root_descriptor=(
+                                    materialization_root_fd
+                                ),
+                            )
+                        )
+                        materialized_context_ids.append(
+                            manifest.context_id
+                        )
+
+                    for row in bound_job_rows:
+                        manifest_paths.extend(
+                            self._delete_staged_artifacts_for_job(
+                                conn,
+                                str(row["job_id"]),
+                            )
+                        )
+                    if active_job_ids:
+                        placeholders = ",".join(
+                            "?" for _ in active_job_ids
+                        )
+                        cancelled = conn.execute(
+                            f"UPDATE jobs SET state = ?, "
+                            f"updated_at = ?, error = ?, "
+                            f"claimed_by = NULL, lease_id = NULL, "
+                            f"lease_expires_at = NULL, "
+                            f"lease_duration_seconds = NULL "
+                            f"WHERE job_id IN ({placeholders}) "
+                            f"AND state IN (?, ?, ?)",
+                            (
+                                str(JobState.CANCELLED),
+                                utc_now_iso(),
+                                (
+                                    "successor transition outputs "
+                                    "were discarded"
+                                ),
+                                *active_job_ids,
+                                str(JobState.PENDING),
+                                str(JobState.CLAIMED),
+                                str(JobState.RUNNING),
+                            ),
+                        )
+                        if cancelled.rowcount != len(active_job_ids):
+                            raise ValueError(
+                                "transition job lifecycle changed "
+                                "during discard"
+                            )
+                    rows = conn.execute(
+                        """
+                        SELECT artifacts.artifact_id,
+                               artifacts.manifest_path
+                        FROM artifacts
+                        JOIN plan_bound_job_transition_bindings AS binding
+                          ON binding.job_id = artifacts.staging_job_id
+                        JOIN jobs
+                          ON jobs.job_id = artifacts.staging_job_id
+                        WHERE binding.successor_transition_id = ?
+                          AND artifacts.state = ?
+                          AND jobs.state = ?
+                        ORDER BY artifacts.artifact_id
+                        LIMIT ?
+                        """,
+                        (
+                            successor_transition_id,
+                            str(ArtifactState.SEALED),
+                            str(JobState.SUCCEEDED),
+                            MAX_INTERNAL_JOB_OUTPUTS + 1,
+                        ),
+                    ).fetchall()
+                    if len(rows) > MAX_INTERNAL_JOB_OUTPUTS:
+                        raise ValueError(
+                            "transition output inventory exceeds its bound"
+                        )
+                    artifact_ids = [
+                        str(row["artifact_id"])
+                        for row in rows
+                    ]
+                    if artifact_ids:
+                        placeholders = ",".join(
+                            "?" for _ in artifact_ids
+                        )
+                        downstream = conn.execute(
+                            f"""
+                            SELECT 1
+                            FROM artifact_lineage
+                            WHERE parent_artifact_id IN ({placeholders})
+                            LIMIT 1
+                            """,
+                            artifact_ids,
+                        ).fetchone()
+                        if downstream is not None:
+                            raise ValueError(
+                                "transition output was already consumed"
+                            )
+                        conn.execute(
+                            f"""
+                            DELETE FROM artifact_lineage
+                            WHERE child_artifact_id IN ({placeholders})
+                            """,
+                            artifact_ids,
+                        )
+                        deleted = conn.execute(
+                            f"""
+                            DELETE FROM artifacts
+                            WHERE artifact_id IN ({placeholders})
+                              AND state = ?
+                            """,
+                            (
+                                *artifact_ids,
+                                str(ArtifactState.SEALED),
+                            ),
+                        )
+                        if deleted.rowcount != len(artifact_ids):
+                            raise ValueError(
+                                "transition output lifecycle changed "
+                                "during discard"
+                            )
+                        manifest_paths = [
+                            *manifest_paths,
+                            *(
+                                Path(str(row["manifest_path"]))
+                                for row in rows
+                            ),
+                        ]
+                    if materialized_context_ids:
+                        placeholders = ",".join(
+                            "?" for _ in materialized_context_ids
+                        )
+                        deleted_contexts = conn.execute(
+                            f"DELETE FROM contexts "
+                            f"WHERE context_id IN ({placeholders})",
+                            materialized_context_ids,
+                        )
+                        if (
+                            deleted_contexts.rowcount
+                            != len(materialized_context_ids)
+                        ):
+                            raise ValueError(
+                                "transition materialization lifecycle "
+                                "changed during discard"
+                            )
+                    if (
+                        conn.execute(
+                            "SELECT 1 FROM artifacts JOIN "
+                            "plan_bound_job_transition_bindings "
+                            "AS binding ON binding.job_id = "
+                            "artifacts.staging_job_id "
+                            "WHERE binding.successor_transition_id = ? "
+                            "LIMIT 1",
+                            (successor_transition_id,),
+                        ).fetchone()
+                        is not None
+                    ):
+                        raise ValueError(
+                            "transition output lifecycle is invalid "
+                            "during discard"
+                        )
+                    if existing_receipt is None:
+                        persisted_receipt = (
+                            _successor_transition_discard_receipt(
+                                successor_transition_id,
+                                artifact_ids=artifact_ids,
+                                materialized_context_ids=(
+                                    materialized_context_ids
+                                ),
+                            )
+                        )
+                        receipt_json = (
+                            _successor_transition_discard_receipt_json(
+                                persisted_receipt
+                            )
+                        )
+                        discarded_at = utc_now_iso()
+                        inventory = conn.execute(
+                            "SELECT COUNT(*) AS row_count, "
+                            "COALESCE(SUM("
+                            "length(CAST(successor_transition_id AS BLOB)) "
+                            "+ length(CAST(receipt_sha256 AS BLOB)) "
+                            "+ length(CAST(receipt_json AS BLOB)) "
+                            "+ length(CAST(discarded_at AS BLOB))"
+                            "), 0) AS total_bytes "
+                            "FROM successor_transition_discards"
+                        ).fetchone()
+                        assert inventory is not None
+                        added_bytes = (
+                            len(
+                                successor_transition_id.encode(
+                                    "utf-8"
+                                )
+                            )
+                            + 64
+                            + len(receipt_json.encode("utf-8"))
+                            + len(discarded_at.encode("utf-8"))
+                        )
+                        if (
+                            int(inventory["row_count"])
+                            >= MAX_SUCCESSOR_TRANSITION_DISCARDS
+                            or int(inventory["total_bytes"])
+                            + added_bytes
+                            > (
+                                MAX_SUCCESSOR_TRANSITION_DISCARD_AGGREGATE_BYTES
+                            )
+                        ):
+                            raise ValueError(
+                                "successor transition discard capacity "
+                                "is exhausted"
+                            )
+                        conn.execute(
+                            "INSERT INTO "
+                            "successor_transition_discards("
+                            "successor_transition_id, "
+                            "receipt_sha256, receipt_json, discarded_at"
+                            ") VALUES (?, ?, ?, ?)",
+                            (
+                                successor_transition_id,
+                                hashlib.sha256(
+                                    receipt_json.encode("utf-8")
+                                ).hexdigest(),
+                                receipt_json,
+                                discarded_at,
+                            ),
+                        )
+                        if (
+                            _load_successor_transition_discard(
+                                conn,
+                                successor_transition_id,
+                            )
+                            != persisted_receipt
+                        ):
+                            raise ValueError(
+                                "successor transition discard receipt "
+                                "changed during commit"
+                            )
+                    expected_context_snapshots = (
+                        self._expected_context_snapshot_bytes(conn)
+                    )
+                    manifest_paths.extend(
+                        self._orphan_managed_artifact_manifests(
+                            conn
+                        )
+                    )
+                    self._verify_bound_store_identity(conn)
+                    self._verify_bound_materialization_root(
+                        materialization_root_fd
+                    )
+                    conn.commit()
+                except BaseException:
+                    try:
+                        conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    raise
+
+            if materializer is not None:
+                for receipt in discard_receipts:
+                    result = materializer.discard_persisted(
+                        receipt,
+                        materialization_root_descriptor=(
+                            materialization_root_fd
+                        ),
+                    )
+                    if result == "mismatch":
+                        raise ValueError(
+                            "transition materialization identity changed "
+                            "during discard"
+                        )
+            self._remove_orphan_context_materializations(
+                orphan_materializations,
+                materialization_root_fd,
+            )
+            with self._opened_bound_artifact_root() as artifact_root_fd:
+                reconcile_context_snapshots(
+                    artifact_root_fd,
+                    expected_context_snapshots,
+                )
+            self._verify_bound_materialization_root(
+                materialization_root_fd
+            )
+            with self.connect() as conn:
+                self._verify_bound_store_identity(conn)
+        self._unlink_artifact_manifests(
+            list(dict.fromkeys(manifest_paths))
+        )
+        if persisted_receipt is None:
+            raise ValueError(
+                "successor transition discard receipt was not committed"
+            )
+        return persisted_receipt
 
     def update_artifact_promotion(
         self,
@@ -3891,8 +6450,15 @@ class EvolutionStore:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT * FROM artifacts WHERE artifact_id = ? AND state != ?",
-                    (artifact_id, str(ArtifactState.STAGED)),
+                    """
+                    SELECT * FROM artifacts
+                    WHERE artifact_id = ? AND state NOT IN (?, ?)
+                    """,
+                    (
+                        artifact_id,
+                        str(ArtifactState.STAGED),
+                        str(ArtifactState.SEALED),
+                    ),
                 ).fetchone()
                 if row is None:
                     raise ValueError(f"unknown artifact: {artifact_id}")
@@ -4100,6 +6666,139 @@ class EvolutionStore:
             raise ValueError("requested context artifact is unavailable")
         return [values[artifact_id] for artifact_id in artifact_ids]
 
+    def _successor_transition_artifact_rows(
+        self,
+        successor_transition_id: str,
+        artifact_ids: tuple[str, ...],
+        *,
+        artifact_types: set[str],
+        owner_transition_ids: tuple[str, ...] | None = None,
+    ) -> list[dict[str, object]]:
+        if (
+            not artifact_ids
+            or len(artifact_ids) > MAX_CONTEXT_PROJECTION_CANDIDATES
+            or len(artifact_ids) != len(set(artifact_ids))
+            or any(
+                not artifact_id
+                or len(artifact_id.encode("utf-8")) > 256
+                for artifact_id in artifact_ids
+            )
+        ):
+            raise ValueError(
+                "successor context artifact inventory is invalid"
+            )
+        if owner_transition_ids is None:
+            owner_transition_ids = tuple(
+                successor_transition_id for _ in artifact_ids
+            )
+        if (
+            len(owner_transition_ids) != len(artifact_ids)
+            or any(
+                not transition_id
+                or len(transition_id.encode("utf-8")) > 256
+                for transition_id in owner_transition_ids
+            )
+        ):
+            raise ValueError(
+                "successor context artifact authority is invalid"
+            )
+        expected_owners = dict(
+            zip(artifact_ids, owner_transition_ids, strict=True)
+        )
+        ordered_types = tuple(sorted(artifact_types))
+        if not ordered_types:
+            raise ValueError(
+                "successor context has no executable artifact types"
+            )
+        artifact_placeholders = ", ".join("?" for _ in artifact_ids)
+        type_placeholders = ", ".join("?" for _ in ordered_types)
+        with self.connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT artifacts.artifact_id, artifacts.type,
+                       artifacts.name, artifacts.state,
+                       artifacts.created_at, artifacts.uri,
+                       artifacts.manifest_json,
+                       artifacts.compatibility_json,
+                       artifacts.scores_json, artifacts.promoted,
+                       binding.successor_transition_id
+                         AS sealed_owner_transition_id
+                FROM artifacts
+                LEFT JOIN plan_bound_job_transition_bindings AS binding
+                  ON binding.job_id = artifacts.staging_job_id
+                LEFT JOIN jobs
+                  ON jobs.job_id = artifacts.staging_job_id
+                WHERE artifacts.artifact_id IN ({artifact_placeholders})
+                  AND artifacts.type IN ({type_placeholders})
+                  AND artifacts.promoted = 1
+                  AND (
+                    (
+                      artifacts.state = ?
+                      AND jobs.state = ?
+                    )
+                    OR artifacts.state IN (?, ?)
+                  )
+                  AND artifacts.uri LIKE 'file:%'
+                  AND length(CAST(artifacts.uri AS BLOB)) <= ?
+                  AND length(CAST(artifacts.name AS BLOB)) <= ?
+                  AND artifacts.manifest_json IS NOT NULL
+                  AND artifacts.manifest_json <> ''
+                  AND length(
+                        CAST(artifacts.manifest_json AS BLOB)
+                      ) <= ?
+                  AND json_valid(artifacts.manifest_json) = 1
+                  AND substr(
+                        ltrim(artifacts.manifest_json), 1, 1
+                      ) = '{{'
+                  AND length(
+                        CAST(artifacts.compatibility_json AS BLOB)
+                      ) <= ?
+                  AND json_valid(artifacts.compatibility_json) = 1
+                  AND substr(
+                        ltrim(artifacts.compatibility_json), 1, 1
+                      ) = '{{'
+                  AND length(
+                        CAST(artifacts.scores_json AS BLOB)
+                      ) <= ?
+                  AND json_valid(artifacts.scores_json) = 1
+                  AND substr(
+                        ltrim(artifacts.scores_json), 1, 1
+                      ) = '{{'
+                """,  # noqa: S608 - placeholders bind both closed inventories.
+                (
+                    *artifact_ids,
+                    *ordered_types,
+                    str(ArtifactState.SEALED),
+                    str(JobState.SUCCEEDED),
+                    str(ArtifactState.ACTIVE),
+                    str(ArtifactState.EXPERIMENTAL),
+                    MAX_CONTEXT_ARTIFACT_URI_BYTES,
+                    MAX_CONTEXT_ARTIFACT_NAME_BYTES,
+                    MAX_CONTRACT_JSON_BYTES,
+                    MAX_ARTIFACT_ROUTING_JSON_BYTES,
+                    MAX_ARTIFACT_ROUTING_JSON_BYTES,
+                ),
+            ).fetchall()
+        values = {
+            str(row["artifact_id"]): dict(row)
+            for row in rows
+        }
+        if set(values) != set(artifact_ids):
+            raise ValueError(
+                "successor context artifact is unavailable"
+            )
+        for artifact_id, row in values.items():
+            state = str(row["state"])
+            if (
+                state == str(ArtifactState.SEALED)
+                and row.get("sealed_owner_transition_id")
+                != expected_owners[artifact_id]
+            ):
+                raise ValueError(
+                    "successor context artifact is unavailable"
+                )
+        return [values[artifact_id] for artifact_id in artifact_ids]
+
     def resolve_context_projections(
         self,
         request: ContextProjectionResolveRequest,
@@ -4151,17 +6850,56 @@ class EvolutionStore:
         if resolver is None or materializer is None or registry is None:
             raise ValueError("materialized context requires a verified executable registry")
         requested_artifact_ids = requested_context_artifact_ids(request.compatibility_facts())
-        rows = self._promoted_artifact_rows(
-            maximum=MAX_CONTEXT_PROJECTION_CANDIDATES,
-            artifact_types={target.artifact_type for target in registry.snapshot.targets.values()},
-            artifact_ids=requested_artifact_ids,
-        )
+        artifact_types = {
+            target.artifact_type
+            for target in registry.snapshot.targets.values()
+        }
+        sealed_artifact_authority: dict[str, str] | None = None
+        if request.successor_transition_id is not None:
+            with self.connect() as conn:
+                _require_successor_transition_not_discarded(
+                    conn,
+                    request.successor_transition_id,
+                )
+            evolution = request.metadata.evolution
+            ordered_artifact_ids = (
+                None
+                if evolution is None
+                else evolution.context_artifact_ids
+            )
+            if ordered_artifact_ids is None:
+                raise ValueError(
+                    "successor materialization requires exact artifacts"
+                )
+            owner_transition_ids = (
+                evolution.context_artifact_owner_transition_ids
+            )
+            rows = self._successor_transition_artifact_rows(
+                request.successor_transition_id,
+                ordered_artifact_ids,
+                artifact_types=artifact_types,
+                owner_transition_ids=owner_transition_ids,
+            )
+            sealed_artifact_authority = {
+                str(row["artifact_id"]): str(
+                    row["sealed_owner_transition_id"]
+                )
+                for row in rows
+                if str(row["state"]) == str(ArtifactState.SEALED)
+            }
+        else:
+            rows = self._promoted_artifact_rows(
+                maximum=MAX_CONTEXT_PROJECTION_CANDIDATES,
+                artifact_types=artifact_types,
+                artifact_ids=requested_artifact_ids,
+            )
         for _ in range(MAX_CONTEXT_ID_ATTEMPTS):
             context_id = new_id("ctx")
             response = resolver.resolve(
                 request,
                 rows,
                 context_id=context_id,
+                sealed_artifact_authority=sealed_artifact_authority,
             )
             with self._locked_context_materialization_root() as materialization_root_fd:
                 with self.connect() as conn:
@@ -4172,6 +6910,9 @@ class EvolutionStore:
                         response,
                         rows,
                         materialization_root_descriptor=materialization_root_fd,
+                        sealed_artifact_authority=(
+                            sealed_artifact_authority
+                        ),
                     )
                 except ValueError as exc:
                     if str(exc) == "materialized context already exists":
@@ -4271,15 +7012,12 @@ class EvolutionStore:
 
         if (
             not isinstance(context_id, str)
-            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", context_id)
-            is None
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}", context_id) is None
         ):
             raise ValueError("materialized context identity is invalid")
         materializer = self._context_materializer
         if materializer is None:
-            raise ValueError(
-                "materialized context access requires a verified executable registry"
-            )
+            raise ValueError("materialized context access requires a verified executable registry")
         if self._bound_store_id is None:
             raise ValueError("evolution store identity has not been initialized")
         with self._locked_context_materialization_root() as materialization_root_fd:
@@ -4587,6 +7325,9 @@ class EvolutionStore:
             capture_mode=str(request.execution_profile.capture_mode),
             artifact_ids=materialized.selection.artifact_ids,
             adapter_set_digest=canonical_digest(materialized.adapter_merge_spec.adapters),
+            successor_transition_id=(
+                materialized.successor_transition_id
+            ),
         )
         return binding
 
@@ -6016,6 +8757,11 @@ class EvolutionStore:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     self._verify_bound_store_identity(conn)
+                    if materialization is not None:
+                        _require_successor_transition_not_discarded(
+                            conn,
+                            materialization.successor_transition_id,
+                        )
                     existing = conn.execute(
                         "SELECT 1 FROM contexts WHERE context_id = ?",
                         (context_id,),
@@ -6113,12 +8859,19 @@ class EvolutionStore:
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                _require_successor_transition_not_discarded(
+                    conn,
+                    request.successor_transition_id,
+                )
                 artifacts_by_binding = {
                     binding_id: [
                         WorkerClaimInputArtifact.model_validate(artifact)
                         for artifact in self._worker_claim_input_artifacts_from_connection(
                             conn,
                             artifact_ids,
+                            sealed_successor_transition_id=(
+                                request.predecessor_successor_transition_id
+                            ),
                         )
                     ]
                     for binding_id, artifact_ids in artifact_ids_by_binding.items()
@@ -6194,6 +8947,15 @@ class EvolutionStore:
                     }
                     if any(existing_job[key] != value for key, value in expected.items()):
                         raise ValueError("plan target is already bound to a different job request")
+                    self._bind_plan_bound_job_transition(
+                        conn,
+                        job_id=str(existing_job["job_id"]),
+                        successor_transition_id=request.successor_transition_id,
+                        predecessor_successor_transition_id=(
+                            request.predecessor_successor_transition_id
+                        ),
+                        created_at=now,
+                    )
                     conn.commit()
                     return JobCreateResponse(
                         job_id=str(existing_job["job_id"]),
@@ -6229,6 +8991,15 @@ class EvolutionStore:
                         0,
                     ),
                 )
+                self._bind_plan_bound_job_transition(
+                    conn,
+                    job_id=job_id,
+                    successor_transition_id=request.successor_transition_id,
+                    predecessor_successor_transition_id=(
+                        request.predecessor_successor_transition_id
+                    ),
+                    created_at=now,
+                )
                 conn.commit()
             except Exception:
                 try:
@@ -6237,6 +9008,245 @@ class EvolutionStore:
                     pass
                 raise
         return JobCreateResponse(job_id=job_id, state=JobState.PENDING)
+
+    def _bind_plan_bound_job_transition(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        job_id: str,
+        successor_transition_id: str | None,
+        predecessor_successor_transition_id: str | None,
+        created_at: str,
+    ) -> None:
+        _require_successor_transition_not_discarded(
+            conn,
+            successor_transition_id,
+        )
+        existing = conn.execute(
+            """
+            SELECT successor_transition_id, predecessor_successor_transition_id
+            FROM plan_bound_job_transition_bindings
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        expected = (
+            successor_transition_id,
+            predecessor_successor_transition_id,
+        )
+        if existing is not None:
+            observed = (
+                existing["successor_transition_id"],
+                existing["predecessor_successor_transition_id"],
+            )
+            if observed != expected:
+                raise ValueError(
+                    "plan target is already bound to a different successor transition"
+                )
+            return
+        if successor_transition_id is None:
+            return
+        conn.execute(
+            """
+            INSERT INTO plan_bound_job_transition_bindings (
+                job_id, successor_transition_id,
+                predecessor_successor_transition_id, created_at
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                successor_transition_id,
+                predecessor_successor_transition_id,
+                created_at,
+            ),
+        )
+
+        # v0.1.9 may attach an exact pre-upgrade job that already completed.
+        # Move only that job's unconsumed outputs behind the transition gate.
+        output_rows = conn.execute(
+            """
+            SELECT artifact_id, state
+            FROM artifacts
+            WHERE json_extract(
+                lineage_json,
+                '$.openevo_execution.job_id'
+            ) = ?
+            """,
+            (job_id,),
+        ).fetchall()
+        output_ids = [str(row["artifact_id"]) for row in output_rows]
+        unexpected = [
+            str(row["artifact_id"])
+            for row in output_rows
+            if row["state"]
+            not in {
+                str(ArtifactState.ACTIVE),
+                str(ArtifactState.SEALED),
+            }
+        ]
+        if unexpected:
+            raise ValueError(
+                "legacy transition job has an invalid output lifecycle"
+            )
+        if output_ids:
+            placeholders = ",".join("?" for _ in output_ids)
+            downstream = conn.execute(
+                f"""
+                SELECT 1
+                FROM artifact_lineage
+                WHERE parent_artifact_id IN ({placeholders})
+                LIMIT 1
+                """,
+                output_ids,
+            ).fetchone()
+            if downstream is not None:
+                raise ValueError(
+                    "legacy transition job output was already consumed"
+                )
+            conn.execute(
+                f"""
+                UPDATE artifacts
+                SET state = ?, staging_job_id = ?
+                WHERE artifact_id IN ({placeholders})
+                """,
+                (
+                    str(ArtifactState.SEALED),
+                    job_id,
+                    *output_ids,
+                ),
+            )
+
+    def retry_plan_bound_job(
+        self,
+        job_id: str,
+        request: PlanBoundJobRetryRequest,
+        *,
+        snapshot: RegistrySnapshot,
+    ) -> JobCreateResponse:
+        """Requeue one exact failed plan-bound job after full authority validation."""
+
+        self._bind_registry_snapshot(snapshot)
+        manifest_paths: list[Path] = []
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT * FROM jobs WHERE job_id = ?",
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"unknown job: {job_id}")
+                validated = self._validate_plan_bound_job_contract(
+                    conn,
+                    row,
+                )
+                _require_successor_transition_not_discarded(
+                    conn,
+                    validated.successor_transition_id,
+                )
+                if (
+                    row["plan_id"] != request.plan_id
+                    or row["target_id"] != request.target_id
+                ):
+                    raise ValueError(
+                        "plan-bound retry differs from the persisted job authority"
+                    )
+                state = JobState(str(row["state"]))
+                prior = conn.execute(
+                    "SELECT plan_id, target_id, claim_attempt_before "
+                    "FROM plan_bound_job_retry_requests "
+                    "WHERE job_id = ? AND retry_request_id = ?",
+                    (job_id, request.retry_request_id),
+                ).fetchone()
+                if prior is not None:
+                    if (
+                        prior["plan_id"] != request.plan_id
+                        or prior["target_id"] != request.target_id
+                        or type(prior["claim_attempt_before"]) is not int
+                        or not 0
+                        <= int(prior["claim_attempt_before"])
+                        <= int(row["attempt_count"])
+                    ):
+                        raise ValueError(
+                            "plan-bound retry receipt differs from job authority"
+                        )
+                    conn.commit()
+                    return JobCreateResponse(job_id=job_id, state=state)
+                if state in {
+                    JobState.CANCELLED,
+                    JobState.EXPIRED,
+                }:
+                    if any(
+                        row[field] is not None
+                        for field in (
+                            "claimed_by",
+                            "lease_id",
+                            "lease_expires_at",
+                            "lease_duration_seconds",
+                        )
+                    ):
+                        raise ValueError(
+                            "terminal plan-bound job retains an active lease"
+                        )
+                    if int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM plan_bound_job_retry_requests"
+                        ).fetchone()[0]
+                    ) >= MAX_PLAN_BOUND_JOB_RETRY_REQUESTS:
+                        raise ValueError(
+                            "plan-bound job retry receipt capacity is exhausted"
+                        )
+                    conn.execute(
+                        "INSERT INTO plan_bound_job_retry_requests("
+                        "job_id, retry_request_id, plan_id, target_id, "
+                        "claim_attempt_before, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            job_id,
+                            request.retry_request_id,
+                            request.plan_id,
+                            request.target_id,
+                            int(row["attempt_count"]),
+                            utc_now_iso(),
+                        ),
+                    )
+                    manifest_paths = self._delete_staged_artifacts_for_job(
+                        conn,
+                        job_id,
+                    )
+                    cursor = conn.execute(
+                        "UPDATE jobs SET state = ?, updated_at = ?, error = NULL "
+                        "WHERE job_id = ? AND state = ?",
+                        (
+                            str(JobState.PENDING),
+                            utc_now_iso(),
+                            job_id,
+                            str(state),
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ValueError(
+                            "plan-bound retry authority changed before requeue"
+                        )
+                    state = JobState.PENDING
+                elif state is JobState.FAILED:
+                    raise ValueError(
+                        "non-retryable plan-bound job requires a replacement plan"
+                    )
+                else:
+                    raise ValueError(
+                        "new plan-bound retry requires a terminal failed job"
+                    )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        self._unlink_artifact_manifests(manifest_paths)
+        return JobCreateResponse(job_id=job_id, state=state)
 
     def create_job(self, request: JobCreateRequest) -> JobCreateResponse:
         raw_payload = request.model_dump(mode="python")
@@ -6283,32 +9293,109 @@ class EvolutionStore:
                 raise
         return JobCreateResponse(job_id=job_id, state=JobState.PENDING)
 
+    def _require_sealed_input_artifact_authority(
+        self,
+        conn: sqlite3.Connection,
+        artifact: sqlite3.Row,
+        *,
+        successor_transition_id: str | None,
+    ) -> None:
+        if artifact["state"] != str(ArtifactState.SEALED):
+            return
+        staging_job_id = artifact["staging_job_id"]
+        if (
+            successor_transition_id is None
+            or not isinstance(staging_job_id, str)
+        ):
+            raise ValueError(
+                "sealed transition artifact authority is invalid"
+            )
+        job_row = conn.execute(
+            "SELECT * FROM jobs WHERE job_id = ?",
+            (staging_job_id,),
+        ).fetchone()
+        binding = conn.execute(
+            "SELECT successor_transition_id "
+            "FROM plan_bound_job_transition_bindings "
+            "WHERE job_id = ?",
+            (staging_job_id,),
+        ).fetchone()
+        if (
+            job_row is None
+            or job_row["state"] != str(JobState.SUCCEEDED)
+            or binding is None
+            or binding["successor_transition_id"]
+            != successor_transition_id
+        ):
+            raise ValueError(
+                "sealed transition artifact authority is invalid"
+            )
+        validated = self._validate_plan_bound_job_identity(
+            conn,
+            job_row,
+        )
+        if (
+            validated.successor_transition_id
+            != successor_transition_id
+        ):
+            raise ValueError(
+                "sealed transition artifact authority is invalid"
+            )
+        _require_sealed_transition_artifact_authority(
+            artifact,
+            job_id=staging_job_id,
+            validated=validated,
+        )
+
     def _validate_input_artifacts_exist(
         self,
         conn: sqlite3.Connection,
         artifact_ids: list[str],
+        *,
+        sealed_successor_transition_id: str | None = None,
     ) -> None:
         unique_ids = list(dict.fromkeys(artifact_ids))
         if not unique_ids:
             return
         rows = conn.execute(
-            "SELECT artifact_id FROM artifacts WHERE state != ? AND artifact_id IN (%s)"
-            % ",".join("?" for _ in unique_ids),
-            (str(ArtifactState.STAGED), *unique_ids),
+            "SELECT * FROM artifacts "
+            "WHERE artifact_id IN (%s)"
+            % ",".join("?" for _ in unique_ids),  # noqa: S608
+            unique_ids,
         ).fetchall()
-        existing_ids = {str(row["artifact_id"]) for row in rows}
+        values = {
+            str(row["artifact_id"]): row
+            for row in rows
+            if row["state"] != str(ArtifactState.STAGED)
+        }
         missing_ids = [
-            artifact_id for artifact_id in unique_ids if artifact_id not in existing_ids
+            artifact_id
+            for artifact_id in unique_ids
+            if artifact_id not in values
         ]
         if missing_ids:
             label = "artifact_id" if len(missing_ids) == 1 else "artifact_ids"
             raise ValueError(f"unknown input {label}: {', '.join(missing_ids)}")
+        for artifact_id in unique_ids:
+            try:
+                self._require_sealed_input_artifact_authority(
+                    conn,
+                    values[artifact_id],
+                    successor_transition_id=(
+                        sealed_successor_transition_id
+                    ),
+                )
+            except ValueError as exc:
+                raise ValueError(
+                    "unknown artifact: sealed transition artifact "
+                    "authority is invalid"
+                ) from exc
 
-    def _validate_plan_bound_job_contract(
+    def _validate_plan_bound_job_identity(
         self,
         conn: sqlite3.Connection,
         row: sqlite3.Row,
-    ) -> _ValidatedPlanBoundJob:
+    ) -> _ValidatedPlanBoundJobIdentity:
         plan_id = row["plan_id"]
         if not isinstance(plan_id, str) or not plan_id:
             raise ValueError("plan-bound job is missing plan identity")
@@ -6368,26 +9455,34 @@ class EvolutionStore:
         config = json.loads(str(row["config_json"]))
         if not isinstance(config, dict) or envelope.legacy_flat_config() != config:
             raise ValueError("plan-bound job config does not match its execution envelope")
+        transition_binding = conn.execute(
+            """
+            SELECT successor_transition_id, predecessor_successor_transition_id
+            FROM plan_bound_job_transition_bindings
+            WHERE job_id = ?
+            """,
+            (str(row["job_id"]),),
+        ).fetchone()
+        successor_transition_id = (
+            None
+            if transition_binding is None
+            else str(transition_binding["successor_transition_id"])
+        )
+        predecessor_successor_transition_id = (
+            None
+            if transition_binding is None
+            or transition_binding["predecessor_successor_transition_id"]
+            is None
+            else str(
+                transition_binding["predecessor_successor_transition_id"]
+            )
+        )
         input_artifact_ids = json.loads(str(row["input_artifact_ids_json"]))
         if not isinstance(input_artifact_ids, list) or any(
             not isinstance(artifact_id, str) or not artifact_id
             for artifact_id in input_artifact_ids
-        ):
+        ) or tuple(input_artifact_ids) != envelope.input_artifact_ids():
             raise ValueError("job input artifact IDs are invalid")
-        input_artifacts = tuple(
-            WorkerClaimInputArtifact.model_validate(artifact)
-            for artifact in self._worker_claim_input_artifacts_from_connection(
-                conn,
-                input_artifact_ids,
-            )
-        )
-        if (
-            len(input_artifacts) != len(input_artifact_ids)
-            or tuple(input_artifact_ids) != envelope.input_artifact_ids()
-            or tuple(worker_input_artifact_digest(artifact) for artifact in input_artifacts)
-            != envelope.input_artifact_digests()
-        ):
-            raise ValueError("plan-bound job input artifact snapshots are invalid")
 
         output_types = json.loads(str(row["declared_output_artifact_types_json"]))
         if (
@@ -6397,13 +9492,66 @@ class EvolutionStore:
             or tuple(output_types) != descriptor.output_artifact_types
         ):
             raise ValueError("plan-bound job output artifact types are invalid")
-        return _ValidatedPlanBoundJob(
+        return _ValidatedPlanBoundJobIdentity(
             plan=plan,
             selection=selection,
             envelope=envelope,
             input_artifact_ids=tuple(input_artifact_ids),
-            input_artifacts=input_artifacts,
             output_artifact_types=tuple(output_types),
+            successor_transition_id=successor_transition_id,
+            predecessor_successor_transition_id=(
+                predecessor_successor_transition_id
+            ),
+        )
+
+    def _validate_plan_bound_job_contract(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+    ) -> _ValidatedPlanBoundJob:
+        identity = self._validate_plan_bound_job_identity(
+            conn,
+            row,
+        )
+        input_artifacts = tuple(
+            WorkerClaimInputArtifact.model_validate(artifact)
+            for artifact in self._worker_claim_input_artifacts_from_connection(
+                conn,
+                list(identity.input_artifact_ids),
+                sealed_successor_transition_id=(
+                    identity.predecessor_successor_transition_id
+                ),
+            )
+        )
+        if (
+            len(input_artifacts)
+            != len(identity.input_artifact_ids)
+            or identity.input_artifact_ids
+            != identity.envelope.input_artifact_ids()
+            or tuple(
+                worker_input_artifact_digest(artifact)
+                for artifact in input_artifacts
+            )
+            != identity.envelope.input_artifact_digests()
+        ):
+            raise ValueError(
+                "plan-bound job input artifact snapshots are invalid"
+            )
+        return _ValidatedPlanBoundJob(
+            plan=identity.plan,
+            selection=identity.selection,
+            envelope=identity.envelope,
+            input_artifact_ids=identity.input_artifact_ids,
+            input_artifacts=input_artifacts,
+            output_artifact_types=(
+                identity.output_artifact_types
+            ),
+            successor_transition_id=(
+                identity.successor_transition_id
+            ),
+            predecessor_successor_transition_id=(
+                identity.predecessor_successor_transition_id
+            ),
         )
 
     def claim_job(self, request: WorkerClaimRequest) -> WorkerClaimResponse:
@@ -6411,6 +9559,15 @@ class EvolutionStore:
         lease_expires_at = _utc_dt_to_iso(now_dt + timedelta(seconds=request.lease_seconds))
         base_where = "state = ?"
         base_params: list[object] = [str(JobState.PENDING)]
+        base_where += (
+            " AND NOT EXISTS ("
+            "SELECT 1 FROM "
+            "plan_bound_job_transition_bindings AS binding "
+            "JOIN successor_transition_discards AS discard "
+            "ON discard.successor_transition_id = "
+            "binding.successor_transition_id "
+            "WHERE binding.job_id = jobs.job_id)"
+        )
         if request.capabilities:
             base_where += f" AND job_type IN ({','.join('?' for _ in request.capabilities)})"
             base_params.extend(request.capabilities)
@@ -6846,21 +10003,128 @@ class EvolutionStore:
         self,
         conn: sqlite3.Connection,
         artifact_ids: list[str],
+        *,
+        sealed_successor_transition_id: str | None = None,
     ) -> list[dict[str, Any]]:
         artifacts: list[dict[str, Any]] = []
         for artifact_id in artifact_ids:
             artifact = conn.execute(
-                "SELECT artifact_id, type, uri, name FROM artifacts "
-                "WHERE artifact_id = ? AND state != ?",
-                (artifact_id, str(ArtifactState.STAGED)),
+                """
+                SELECT artifacts.*
+                FROM artifacts
+                WHERE artifacts.artifact_id = ?
+                  AND artifacts.state != ?
+                """,
+                (
+                    artifact_id,
+                    str(ArtifactState.STAGED),
+                ),
             ).fetchone()
             if artifact is not None:
+                try:
+                    self._require_sealed_input_artifact_authority(
+                        conn,
+                        artifact,
+                        successor_transition_id=(
+                            sealed_successor_transition_id
+                        ),
+                    )
+                except ValueError as exc:
+                    raise ValueError(
+                        "unknown artifact: sealed transition artifact "
+                        "authority is invalid"
+                    ) from exc
+                manifest_sha256: str | None = None
+                records_byte_size: int | None = None
+                records_sha256: str | None = None
+                manifest_json = artifact["manifest_json"]
+                if isinstance(manifest_json, str) and manifest_json:
+                    try:
+                        artifact_manifest = json.loads(manifest_json)
+                    except ValueError as exc:
+                        raise ValueError(
+                            "input artifact manifest is invalid"
+                        ) from exc
+                    if (
+                        not isinstance(artifact_manifest, dict)
+                        or _json_dumps(artifact_manifest)
+                        != manifest_json
+                    ):
+                        raise ValueError(
+                            "input artifact manifest is not canonical"
+                        )
+                    manifest_sha256 = canonical_digest(
+                        artifact_manifest
+                    )
+                if artifact["type"] == str(ArtifactType.DATASET):
+                    dataset_rows = conn.execute(
+                        "SELECT dataset_id FROM datasets "
+                        "WHERE artifact_id = ? LIMIT 2",
+                        (artifact_id,),
+                    ).fetchall()
+                    if len(dataset_rows) > 1:
+                        raise DatasetIntegrityError(
+                            "dataset artifact has multiple dataset authorities"
+                        )
+                    if dataset_rows:
+                        response = self._get_dataset_from_connection(
+                            conn,
+                            str(dataset_rows[0]["dataset_id"]),
+                        )
+                        if response.artifact_id != artifact_id:
+                            raise DatasetIntegrityError(
+                                "dataset artifact authority is inconsistent"
+                            )
+                        if not isinstance(artifact_manifest, dict):
+                            raise DatasetIntegrityError(
+                                "dataset artifact manifest is unavailable"
+                            )
+                        manifest_path = self.files.dataset_manifest_path(
+                            str(dataset_rows[0]["dataset_id"])
+                        )
+                        records_path = manifest_path.with_name("records.jsonl")
+                        records_byte_size_value = artifact_manifest.get(
+                            "records_byte_size"
+                        )
+                        records_sha256_value = artifact_manifest.get(
+                            "records_sha256"
+                        )
+                        if (
+                            type(records_byte_size_value) is int
+                            and isinstance(records_sha256_value, str)
+                            and re.fullmatch(
+                                r"[0-9a-f]{64}",
+                                records_sha256_value,
+                            )
+                            is not None
+                        ):
+                            records_byte_size = records_byte_size_value
+                            records_sha256 = records_sha256_value
+                        else:
+                            receipt_budget = _DatasetReadBudget(
+                                label="legacy dataset worker receipt",
+                                max_files=1,
+                                max_bytes=MAX_DATASET_RECORDS_BYTES,
+                            )
+                            records_bytes = _bounded_regular_file_bytes(
+                                records_path,
+                                budget=receipt_budget,
+                                max_file_bytes=MAX_DATASET_RECORDS_BYTES,
+                                label="legacy dataset records",
+                            )
+                            records_byte_size = len(records_bytes)
+                            records_sha256 = hashlib.sha256(
+                                records_bytes
+                            ).hexdigest()
                 artifacts.append(
                     {
                         "artifact_id": artifact["artifact_id"],
                         "type": artifact["type"],
                         "uri": artifact["uri"],
                         "name": artifact["name"],
+                        "manifest_sha256": manifest_sha256,
+                        "records_byte_size": records_byte_size,
+                        "records_sha256": records_sha256,
                     }
                 )
         return artifacts
@@ -6946,6 +10210,7 @@ class EvolutionStore:
         force_unpromoted_outputs = False
         store_owned_execution_lineage: dict[str, Any] | None = None
         planned_job = False
+        successor_transition_id: str | None = None
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
@@ -6957,7 +10222,13 @@ class EvolutionStore:
                 if job_row["plan_id"] is not None:
                     planned_job = True
                     validated = self._validate_plan_bound_job_contract(conn, job_row)
-                    envelope = validated.envelope
+                    successor_transition_id = (
+                        validated.successor_transition_id
+                    )
+                    _require_successor_transition_not_discarded(
+                        conn,
+                        successor_transition_id,
+                    )
                     declared_output_types = validated.output_artifact_types
                     unexpected_output_types = sorted(
                         {
@@ -6971,20 +10242,12 @@ class EvolutionStore:
                             "plan-bound job returned undeclared artifact type(s): "
                             + ", ".join(unexpected_output_types)
                         )
-                    store_owned_execution_lineage = {
-                        "job_id": job_id,
-                        "plan_id": validated.plan.plan_id,
-                        "plan_digest": validated.envelope.plan_digest,
-                        "target_id": validated.selection.target_id,
-                        "method_id": validated.selection.method_id,
-                        "method_identity_digest": (validated.selection.method_identity_digest),
-                        "execution_envelope_digest": canonical_digest(envelope),
-                        "registry_snapshot_digest": (validated.plan.registry_snapshot_digest),
-                        "input_bindings": [
-                            binding.model_dump(mode="json") for binding in envelope.input_bindings
-                        ],
-                        "declared_output_artifact_types": list(declared_output_types),
-                    }
+                    store_owned_execution_lineage = (
+                        _store_owned_execution_lineage(
+                            job_id=job_id,
+                            validated=validated,
+                        )
+                    )
                 conn.rollback()
             except Exception:
                 try:
@@ -7029,13 +10292,32 @@ class EvolutionStore:
                             conn,
                             job_row,
                         )
+                        if (
+                            final_validation.successor_transition_id
+                            != successor_transition_id
+                        ):
+                            raise ValueError(
+                                "job successor transition identity changed during completion"
+                            )
+                        _require_successor_transition_not_discarded(
+                            conn,
+                            successor_transition_id,
+                        )
                         input_artifact_ids = list(final_validation.input_artifact_ids)
                     else:
                         input_artifact_ids = json.loads(str(job_row["input_artifact_ids_json"]))
                         if not isinstance(input_artifact_ids, list):
                             raise ValueError("job input artifact IDs are invalid")
                     unique_input_artifact_ids = list(dict.fromkeys(input_artifact_ids))
-                    self._validate_input_artifacts_exist(conn, unique_input_artifact_ids)
+                    self._validate_input_artifacts_exist(
+                        conn,
+                        unique_input_artifact_ids,
+                        sealed_successor_transition_id=(
+                            final_validation.predecessor_successor_transition_id
+                            if planned_job
+                            else None
+                        ),
+                    )
                     stale_manifest_paths = self._delete_staged_artifacts_for_job(
                         conn,
                         job_id,
@@ -7057,12 +10339,21 @@ class EvolutionStore:
                         published = conn.execute(
                             f"""
                             UPDATE artifacts
-                            SET state = ?, staging_job_id = NULL
+                            SET state = ?, staging_job_id = ?
                             WHERE state = ? AND staging_job_id = ?
                               AND artifact_id IN ({placeholders})
                             """,
                             (
-                                str(ArtifactState.ACTIVE),
+                                str(
+                                    ArtifactState.SEALED
+                                    if successor_transition_id is not None
+                                    else ArtifactState.ACTIVE
+                                ),
+                                (
+                                    job_id
+                                    if successor_transition_id is not None
+                                    else None
+                                ),
                                 str(ArtifactState.STAGED),
                                 job_id,
                                 *registered_artifact_ids,
@@ -7070,14 +10361,15 @@ class EvolutionStore:
                         )
                         if published.rowcount != len(registered_artifact_ids):
                             raise ValueError("job output artifacts are not staged for publish")
-                    method = str(job_row["method"])
-                    for artifact in registered_artifacts:
-                        self._materialize_feedback_applications_for_artifact(
-                            conn,
-                            artifact=artifact,
-                            job_id=job_id,
-                            method=method,
-                        )
+                    if successor_transition_id is None:
+                        method = str(job_row["method"])
+                        for artifact in registered_artifacts:
+                            self._materialize_feedback_applications_for_artifact(
+                                conn,
+                                artifact=artifact,
+                                job_id=job_id,
+                                method=method,
+                            )
                     conn.execute(
                         """
                         UPDATE jobs
@@ -7136,28 +10428,98 @@ class EvolutionStore:
                 ).fetchone()
                 if row is None:
                     raise ValueError(f"unknown job: {job_id}")
+                transition_binding = conn.execute(
+                    """
+                    SELECT successor_transition_id
+                    FROM plan_bound_job_transition_bindings
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                successor_transition_id = (
+                    None
+                    if transition_binding is None
+                    else str(
+                        transition_binding["successor_transition_id"]
+                    )
+                )
                 artifacts = []
                 if row["state"] == str(JobState.SUCCEEDED):
-                    artifacts = conn.execute(
-                        """
-                        SELECT artifact_id, type, name, created_at, uri,
-                               manifest_json, lineage_json, compatibility_json,
-                               scores_json, promoted
-                        FROM artifacts
-                        WHERE state = ?
-                          AND json_extract(
-                                lineage_json,
-                                '$.openevo_execution.job_id'
-                              ) = ?
-                        ORDER BY created_at ASC, artifact_id ASC
-                        LIMIT ?
-                        """,
-                        (
-                            str(ArtifactState.ACTIVE),
-                            job_id,
-                            MAX_INTERNAL_JOB_OUTPUTS + 1,
-                        ),
-                    ).fetchall()
+                    if successor_transition_id is None:
+                        artifacts = conn.execute(
+                            """
+                            SELECT artifact_id, type, name, state,
+                                   created_at, uri, manifest_json,
+                                   lineage_json, compatibility_json,
+                                   scores_json, promoted,
+                                   staging_job_id
+                            FROM artifacts
+                            WHERE state = ?
+                              AND json_extract(
+                                    lineage_json,
+                                    '$.openevo_execution.job_id'
+                                  ) = ?
+                            ORDER BY created_at ASC, artifact_id ASC
+                            LIMIT ?
+                            """,
+                            (
+                                str(ArtifactState.ACTIVE),
+                                job_id,
+                                MAX_INTERNAL_JOB_OUTPUTS + 1,
+                            ),
+                        ).fetchall()
+                    else:
+                        job_authority = conn.execute(
+                            "SELECT * FROM jobs WHERE job_id = ?",
+                            (job_id,),
+                        ).fetchone()
+                        if job_authority is None:
+                            raise ValueError(
+                                "sealed transition artifact authority is invalid"
+                            )
+                        validated = (
+                            self._validate_plan_bound_job_contract(
+                                conn,
+                                job_authority,
+                            )
+                        )
+                        candidates = conn.execute(
+                            """
+                            SELECT artifact_id, type, name, state,
+                                   created_at, uri, manifest_json,
+                                   lineage_json, compatibility_json,
+                                   scores_json, promoted,
+                                   staging_job_id
+                            FROM artifacts
+                            WHERE state = ?
+                              AND (
+                                staging_job_id = ?
+                                OR CASE
+                                  WHEN json_valid(lineage_json) = 1
+                                  THEN json_extract(
+                                    lineage_json,
+                                    '$.openevo_execution.job_id'
+                                  ) = ?
+                                  ELSE 0
+                                END
+                              )
+                            ORDER BY created_at ASC, artifact_id ASC
+                            LIMIT ?
+                            """,
+                            (
+                                str(ArtifactState.SEALED),
+                                job_id,
+                                job_id,
+                                MAX_INTERNAL_JOB_OUTPUTS + 1,
+                            ),
+                        ).fetchall()
+                        for artifact in candidates:
+                            _require_sealed_transition_artifact_authority(
+                                artifact,
+                                job_id=job_id,
+                                validated=validated,
+                            )
+                        artifacts = candidates
                 conn.commit()
             except BaseException:
                 try:
@@ -7171,7 +10533,19 @@ class EvolutionStore:
             "artifact_ids": [],
             "error": "evolution_job_failed" if row["error"] is not None else None,
             "job_id": str(row["job_id"]),
+            "retryable": (
+                False
+                if row["state"] == str(JobState.FAILED)
+                else True
+                if row["state"]
+                in {
+                    str(JobState.CANCELLED),
+                    str(JobState.EXPIRED),
+                }
+                else None
+            ),
             "state": str(row["state"]),
+            "successor_transition_id": successor_transition_id,
         }
         if row["state"] != str(JobState.SUCCEEDED):
             return result
@@ -7445,19 +10819,54 @@ class EvolutionStore:
         if request.query.policy_version:
             clauses.append("policy_version = ?")
             params.append(request.query.policy_version)
+        if request.query.source:
+            clauses.append("source = ?")
+            params.append(request.query.source)
+        if request.query.source_event_id:
+            clauses.append("source_event_id = ?")
+            params.append(request.query.source_event_id)
+        if request.query.task_id:
+            clauses.append("task_id = ?")
+            params.append(request.query.task_id)
+        if request.query.session_id:
+            clauses.append("session_id = ?")
+            params.append(request.query.session_id)
         where = " AND ".join(clauses) if clauses else "1 = 1"
         return conn.execute(
             f"SELECT * FROM events WHERE {where} ORDER BY ingested_at, event_id LIMIT ?",
             (*params, request.limits.max_events),
         ).fetchall()
 
-    def _read_event_payload_file(self, row: dict[str, Any]) -> dict[str, Any]:
+    def _read_event_payload_file(
+        self,
+        row: dict[str, Any],
+        *,
+        budget: _DatasetReadBudget | None = None,
+    ) -> dict[str, Any]:
         event_id = str(row["event_id"])
         payload_path = Path(str(row["payload_path"]))
+        if payload_path != self.files.event_payload_path(event_id):
+            raise DatasetIntegrityError(
+                f"event {event_id} payload path differs from its authority"
+            )
+        if budget is None:
+            budget = _DatasetReadBudget(
+                label=f"event {event_id} payload",
+                max_files=1,
+                max_bytes=MAX_DATASET_EVENT_PAYLOAD_BYTES,
+            )
         try:
-            payload_text = payload_path.read_text(encoding="utf-8")
-        except FileNotFoundError as exc:
-            raise ValueError(f"event {event_id} payload file is missing: {payload_path}") from exc
+            payload_bytes = _bounded_regular_file_bytes(
+                payload_path,
+                budget=budget,
+                max_file_bytes=MAX_DATASET_EVENT_PAYLOAD_BYTES,
+                label=f"event {event_id} payload file",
+            )
+            payload_text = payload_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ValueError(
+                f"event {event_id} payload file is not valid UTF-8: {payload_path}"
+            ) from exc
         try:
             payload = json.loads(payload_text)
         except json.JSONDecodeError as exc:
@@ -7467,6 +10876,14 @@ class EvolutionStore:
 
         if not isinstance(payload, dict):
             return {}
+        if payload_bytes != json.dumps(
+            payload,
+            indent=2,
+            sort_keys=True,
+        ).encode("utf-8"):
+            raise DatasetIntegrityError(
+                f"event {event_id} payload file is not canonical"
+            )
         return payload
 
     def _traces_from_event_payload(self, event_payload: dict[str, Any]) -> list[Any]:
@@ -7481,8 +10898,15 @@ class EvolutionStore:
             return []
         return traces
 
-    def _dataset_record_for_event_row(self, row: dict[str, Any]) -> dict[str, Any]:
-        payload = self._read_event_payload_file(row)
+    def _dataset_record_for_event_row(
+        self,
+        row: dict[str, Any],
+        *,
+        payload: dict[str, Any] | None = None,
+        budget: _DatasetReadBudget | None = None,
+    ) -> dict[str, Any]:
+        if payload is None:
+            payload = self._read_event_payload_file(row, budget=budget)
         event_payload = payload.get("payload")
         if not isinstance(event_payload, dict):
             event_payload = {}
@@ -7509,35 +10933,213 @@ class EvolutionStore:
             "payload": event_payload,
         }
 
+    def _source_event_evidence_for_event_row(
+        self,
+        row: dict[str, Any],
+        *,
+        payload: dict[str, Any] | None = None,
+        budget: _DatasetReadBudget | None = None,
+    ) -> dict[str, Any] | None:
+        if payload is None:
+            payload = self._read_event_payload_file(row, budget=budget)
+        event_payload = payload.get("payload")
+        if not isinstance(event_payload, dict):
+            return None
+        session_result = event_payload.get("session_result")
+        if not isinstance(session_result, dict):
+            return None
+        session_result_sha256 = hashlib.sha256(
+            json.dumps(
+                session_result,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return {
+            "event_id": row["event_id"],
+            "source": row["source"],
+            "event_type": row["event_type"],
+            "source_event_id": row["source_event_id"],
+            "task_id": row["task_id"],
+            "session_id": row["session_id"],
+            "session_result_sha256": session_result_sha256,
+        }
+
     def _trace_count_for_event_row(self, row: dict[str, Any]) -> int:
         return int(self._dataset_record_for_event_row(row)["trace_count"])
 
     def create_dataset(self, request: DatasetCreateRequest) -> DatasetCreateResponse:
+        with self._locked_dataset_materialization_root():
+            return self._create_dataset_locked(request)
+
+    def _create_dataset_locked(
+        self,
+        request: DatasetCreateRequest,
+    ) -> DatasetCreateResponse:
+        if request.idempotency_key is None:
+            return self._create_dataset_materialization(request)
+        request_json = _dataset_create_request_json(request)
+        request_sha256 = hashlib.sha256(
+            request_json.encode("utf-8")
+        ).hexdigest()
+        dataset_id = _dataset_id_for_idempotency_key(
+            request.idempotency_key
+        )
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                prior = conn.execute(
+                    "SELECT request_sha256, request_json, dataset_id, "
+                    "response_json FROM dataset_create_requests "
+                    "WHERE idempotency_key = ?",
+                    (request.idempotency_key,),
+                ).fetchone()
+                if prior is None:
+                    if int(
+                        conn.execute(
+                            "SELECT COUNT(*) FROM dataset_create_requests"
+                        ).fetchone()[0]
+                    ) >= MAX_DATASET_CREATE_REQUESTS:
+                        raise ValueError(
+                            "dataset create request capacity is exhausted"
+                        )
+                    conn.execute(
+                        "INSERT INTO dataset_create_requests("
+                        "idempotency_key, request_sha256, request_json, "
+                        "dataset_id, response_json, created_at) "
+                        "VALUES (?, ?, ?, ?, NULL, ?)",
+                        (
+                            request.idempotency_key,
+                            request_sha256,
+                            request_json,
+                            dataset_id,
+                            utc_now_iso(),
+                        ),
+                    )
+                    response_json = None
+                else:
+                    if (
+                        prior["request_sha256"] != request_sha256
+                        or prior["request_json"] != request_json
+                        or prior["dataset_id"] != dataset_id
+                    ):
+                        raise ValueError(
+                            "dataset idempotency key is bound to another request"
+                        )
+                    response_json = prior["response_json"]
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        if response_json is not None:
+            response = DatasetCreateResponse.model_validate_json(
+                str(response_json)
+            )
+            if self.get_dataset(response.dataset_id) != response:
+                raise ValueError(
+                    "dataset create response differs from dataset authority"
+                )
+            return response
+        response = self._create_dataset_materialization(
+            request,
+            reserved_dataset_id=dataset_id,
+        )
+        response_json = _dataset_create_response_json(response)
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                cursor = conn.execute(
+                    "UPDATE dataset_create_requests SET response_json = ? "
+                    "WHERE idempotency_key = ? AND request_sha256 = ? "
+                    "AND request_json = ? AND dataset_id = ? "
+                    "AND recovery_file_count IS NOT NULL "
+                    "AND recovery_byte_size IS NOT NULL "
+                    "AND response_json IS NULL",
+                    (
+                        response_json,
+                        request.idempotency_key,
+                        request_sha256,
+                        request_json,
+                        dataset_id,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    prior = conn.execute(
+                        "SELECT response_json FROM dataset_create_requests "
+                        "WHERE idempotency_key = ?",
+                        (request.idempotency_key,),
+                    ).fetchone()
+                    if prior is None or prior["response_json"] != response_json:
+                        raise ValueError(
+                            "dataset create request authority changed before commit"
+                        )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+        return response
+
+    def _create_dataset_materialization(
+        self,
+        request: DatasetCreateRequest,
+        *,
+        reserved_dataset_id: str | None = None,
+    ) -> DatasetCreateResponse:
         raw_payload = request.model_dump(mode="python")
         _validate_finite_floats(raw_payload["query"], "query")
         _validate_finite_floats(raw_payload["limits"], "limits")
         if request.query.task_tags:
             raise ValueError("query.task_tags is not supported until events store task tags")
 
-        request_payload = request.model_dump(mode="json")
+        request_payload = request.model_dump(mode="json", exclude_none=True)
+        request_payload.pop("idempotency_key", None)
         query_json = _json_dumps(request_payload["query"])
 
         with self.connect() as conn:
             rows = [dict(row) for row in self._event_rows_for_dataset(conn, request)]
 
+        materialization_budget = _DatasetReadBudget(
+            label="dataset materialization",
+            max_files=MAX_DATASET_READ_FILES,
+            max_bytes=MAX_DATASET_MATERIALIZATION_BYTES,
+        )
         event_ids: list[str] = []
         dataset_records: list[dict[str, Any]] = []
+        source_event_evidence: list[dict[str, Any] | None] = []
         trace_count = 0
         for row in rows:
             if trace_count >= request.limits.max_traces:
                 break
-            record = self._dataset_record_for_event_row(row)
+            payload = self._read_event_payload_file(
+                row,
+                budget=materialization_budget,
+            )
+            evidence = self._source_event_evidence_for_event_row(
+                row,
+                payload=payload,
+            )
+            record = self._dataset_record_for_event_row(
+                row,
+                payload=payload,
+            )
             trace_count += int(record["trace_count"])
             event_ids.append(str(record["event_id"]))
             dataset_records.append(record)
+            source_event_evidence.append(evidence)
+        records_bytes = _dataset_records_bytes(dataset_records)
+        records_sha256 = hashlib.sha256(records_bytes).hexdigest()
 
-        for _ in range(MAX_DATASET_ID_ATTEMPTS):
-            dataset_id = new_id("ds")
+        attempts = 1 if reserved_dataset_id is not None else MAX_DATASET_ID_ATTEMPTS
+        for _ in range(attempts):
+            dataset_id = reserved_dataset_id or new_id("ds")
             created_at = utc_now_iso()
             manifest_path = self.files.dataset_manifest_path(dataset_id)
             records_path = manifest_path.with_name("records.jsonl")
@@ -7552,19 +11154,47 @@ class EvolutionStore:
                 "trace_count": trace_count,
                 "records_path": records_path.name,
                 "records_uri": records_path.as_uri(),
+                "records_byte_size": len(records_bytes),
+                "records_sha256": records_sha256,
             }
+            if request.idempotency_key is not None:
+                manifest["create_identity"] = request.idempotency_key
+            if (
+                request.idempotency_key is not None
+                and len(source_event_evidence) == 1
+                and source_event_evidence[0] is not None
+            ):
+                manifest["source_event_evidence"] = source_event_evidence[0]
             _validate_finite_floats(manifest, "manifest")
 
-            manifest_created = False
-            records_created = False
             with self.connect() as conn:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     existing = conn.execute(
-                        "SELECT 1 FROM datasets WHERE dataset_id = ?",
+                        "SELECT * FROM datasets WHERE dataset_id = ?",
                         (dataset_id,),
                     ).fetchone()
-                    if existing is not None or manifest_path.exists() or records_path.exists():
+                    if existing is not None and reserved_dataset_id is not None:
+                        conn.rollback()
+                        return self._resume_dataset_materialization(
+                            request=request,
+                            dataset_id=dataset_id,
+                            manifest=manifest,
+                            dataset_records=dataset_records,
+                        )
+                    if existing is not None:
+                        conn.rollback()
+                        continue
+                    if reserved_dataset_id is None and (
+                        manifest_path.exists()
+                        or records_path.exists()
+                        or manifest_path.with_name(
+                            f".{manifest_path.name}.pending"
+                        ).exists()
+                        or records_path.with_name(
+                            f".{records_path.name}.pending"
+                        ).exists()
+                    ):
                         conn.rollback()
                         continue
                     conn.execute(
@@ -7592,33 +11222,27 @@ class EvolutionStore:
                         "INSERT INTO dataset_events (dataset_id, event_id) VALUES (?, ?)",
                         [(dataset_id, event_id) for event_id in event_ids],
                     )
-                    try:
-                        _write_json_strict_exclusive(self.files, manifest_path, manifest)
-                        manifest_created = True
-                        _write_jsonl_strict_exclusive(self.files, records_path, dataset_records)
-                        records_created = True
-                    except FileExistsError:
-                        conn.rollback()
-                        if manifest_created:
-                            manifest_path.unlink(missing_ok=True)
-                        continue
                     conn.commit()
                 except Exception:
                     try:
                         conn.rollback()
                     except sqlite3.Error:
                         pass
-                    if records_created:
-                        try:
-                            records_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                    if manifest_created:
-                        try:
-                            manifest_path.unlink(missing_ok=True)
-                        except OSError:
-                            pass
                     raise
+
+            try:
+                self._ensure_dataset_materialization_files(
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    dataset_records=dataset_records,
+                )
+            except Exception:
+                if reserved_dataset_id is None:
+                    self._cleanup_dataset_create_failure(
+                        dataset_id,
+                        manifest_path,
+                    )
+                raise
 
             try:
                 artifact = self.register_artifact(
@@ -7634,7 +11258,11 @@ class EvolutionStore:
                     )
                 )
             except Exception:
-                self._cleanup_dataset_create_failure(dataset_id, manifest_path)
+                if reserved_dataset_id is None:
+                    self._cleanup_dataset_create_failure(
+                        dataset_id,
+                        manifest_path,
+                    )
                 raise
 
             try:
@@ -7647,22 +11275,710 @@ class EvolutionStore:
                 )
                 raise
 
-            return DatasetCreateResponse(
-                dataset_id=dataset_id,
-                artifact_id=artifact.artifact_id,
-                event_count=len(event_ids),
-                trace_count=trace_count,
-            )
+            return self.get_dataset(dataset_id)
         raise RuntimeError("could not allocate unique dataset id")
 
+    def _ensure_dataset_materialization_files(
+        self,
+        *,
+        manifest_path: Path,
+        manifest: dict[str, Any],
+        dataset_records: list[dict[str, Any]],
+    ) -> None:
+        budget = _DatasetReadBudget(
+            label="dataset materialization publication",
+            max_files=2,
+            max_bytes=MAX_DATASET_MATERIALIZATION_BYTES,
+        )
+        _ensure_dataset_json_file(
+            self.files,
+            manifest_path,
+            manifest,
+            budget=budget,
+            max_file_bytes=MAX_DATASET_MANIFEST_BYTES,
+            label="dataset manifest",
+        )
+        _ensure_dataset_jsonl_file(
+            self.files,
+            manifest_path.with_name("records.jsonl"),
+            dataset_records,
+            budget=budget,
+            max_file_bytes=MAX_DATASET_RECORDS_BYTES,
+            label="dataset records",
+        )
+
+    def _resume_dataset_materialization(
+        self,
+        *,
+        request: DatasetCreateRequest,
+        dataset_id: str,
+        manifest: dict[str, Any],
+        dataset_records: list[dict[str, Any]],
+    ) -> DatasetCreateResponse:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM datasets WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchone()
+        if row is None:
+            raise DatasetIntegrityError(
+                "reserved dataset authority disappeared"
+            )
+        self._validate_dataset_resume_row(
+            row,
+            request=request,
+            manifest=manifest,
+        )
+        self._ensure_dataset_materialization_files(
+            manifest_path=Path(str(row["manifest_path"])),
+            manifest=manifest,
+            dataset_records=dataset_records,
+        )
+        verification_budget = _DatasetReadBudget(
+            label="dataset retry verification",
+            max_files=MAX_DATASET_READ_FILES,
+            max_bytes=MAX_DATASET_VERIFICATION_BYTES,
+        )
+        with self.connect() as conn:
+            persisted_manifest, persisted_records, _event_rows = (
+                self._validate_dataset_storage_from_connection(
+                    conn,
+                    row,
+                    budget=verification_budget,
+                )
+            )
+            candidate_rows = self._dataset_artifact_candidate_rows(
+                conn,
+                dataset_id=dataset_id,
+                manifest_path=Path(str(row["manifest_path"])),
+            )
+        if (
+            persisted_manifest != manifest
+            or persisted_records != dataset_records
+        ):
+            raise DatasetIntegrityError(
+                "reserved dataset differs from its idempotent request"
+            )
+        artifact_id = (
+            None if row["artifact_id"] is None else str(row["artifact_id"])
+        )
+        if len(candidate_rows) > 1:
+            raise DatasetIntegrityError(
+                "reserved dataset has multiple active artifact candidates"
+            )
+        candidate_ids: list[str] = []
+        if candidate_rows:
+            candidate = candidate_rows[0]
+            self._validate_dataset_artifact_row(
+                candidate,
+                dataset_row=row,
+                manifest=persisted_manifest,
+                budget=verification_budget,
+            )
+            candidate_ids.append(str(candidate["artifact_id"]))
+        if artifact_id is not None:
+            if candidate_ids != [artifact_id]:
+                raise DatasetIntegrityError(
+                    "reserved dataset artifact inventory is inconsistent"
+                )
+            return self.get_dataset(dataset_id)
+        if candidate_ids:
+            artifact_id = candidate_ids[0]
+        else:
+            manifest_path = Path(str(row["manifest_path"]))
+            artifact = self.register_artifact(
+                ArtifactRegisterRequest(
+                    type=ArtifactType.DATASET,
+                    name=request.name,
+                    uri=manifest_path.as_uri(),
+                    manifest=manifest,
+                    lineage={"event_ids": manifest["event_ids"]},
+                    compatibility={"purpose": request.purpose},
+                    tags=[request.purpose],
+                    promoted=True,
+                )
+            )
+            artifact_id = artifact.artifact_id
+        self._backfill_dataset_artifact_id(dataset_id, artifact_id)
+        return self.get_dataset(dataset_id)
+
+    def _validate_dataset_resume_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        request: DatasetCreateRequest,
+        manifest: dict[str, Any],
+    ) -> None:
+        dataset_id = str(row["dataset_id"])
+        request_payload = request.model_dump(
+            mode="json",
+            exclude_none=True,
+        )
+        request_payload.pop("idempotency_key", None)
+        manifest_path = self.files.dataset_manifest_path(dataset_id)
+        if (
+            row["name"] != request_payload["name"]
+            or row["purpose"] != request_payload["purpose"]
+            or row["state"] != "active"
+            or row["query_json"] != _json_dumps(request_payload["query"])
+            or row["manifest_path"] != str(manifest_path)
+            or type(row["event_count"]) is not int
+            or int(row["event_count"]) != manifest["event_count"]
+            or type(row["trace_count"]) is not int
+            or int(row["trace_count"]) != manifest["trace_count"]
+        ):
+            raise DatasetIntegrityError(
+                "reserved dataset row differs from its idempotent request"
+            )
+        with self.connect() as conn:
+            membership = conn.execute(
+                "SELECT event_id FROM dataset_events WHERE dataset_id = ? "
+                "ORDER BY event_id",
+                (dataset_id,),
+            ).fetchall()
+        if [str(item["event_id"]) for item in membership] != sorted(
+            manifest["event_ids"]
+        ):
+            raise DatasetIntegrityError(
+                "reserved dataset membership differs from its idempotent request"
+            )
+
+    def get_dataset(self, dataset_id: str) -> DatasetCreateResponse:
+        if not isinstance(dataset_id, str) or not dataset_id:
+            raise DatasetNotFoundError("dataset ID is invalid")
+        with self.connect() as conn:
+            try:
+                conn.execute("BEGIN")
+                response = self._get_dataset_from_connection(conn, dataset_id)
+                conn.commit()
+                return response
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def _get_dataset_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        dataset_id: str,
+        *,
+        budget: _DatasetReadBudget | None = None,
+    ) -> DatasetCreateResponse:
+        if budget is None:
+            budget = _DatasetReadBudget(
+                label="dataset verification",
+                max_files=MAX_DATASET_READ_FILES,
+                max_bytes=MAX_DATASET_VERIFICATION_BYTES,
+            )
+        row = conn.execute(
+            "SELECT * FROM datasets WHERE dataset_id = ?",
+            (dataset_id,),
+        ).fetchone()
+        if row is None or row["artifact_id"] is None:
+            raise DatasetNotFoundError(f"unknown dataset: {dataset_id}")
+        manifest, _records, _event_rows = (
+            self._validate_dataset_storage_from_connection(
+                conn,
+                row,
+                budget=budget,
+            )
+        )
+        artifact_id = str(row["artifact_id"])
+        candidates = self._dataset_artifact_candidate_rows(
+            conn,
+            dataset_id=dataset_id,
+            manifest_path=Path(str(row["manifest_path"])),
+        )
+        if (
+            len(candidates) != 1
+            or str(candidates[0]["artifact_id"]) != artifact_id
+        ):
+            raise DatasetIntegrityError(
+                f"dataset artifact inventory is inconsistent: {dataset_id}"
+            )
+        self._validate_dataset_artifact_row(
+            candidates[0],
+            dataset_row=row,
+            manifest=manifest,
+            budget=budget,
+        )
+        return DatasetCreateResponse(
+            dataset_id=dataset_id,
+            artifact_id=artifact_id,
+            event_count=int(row["event_count"]),
+            trace_count=int(row["trace_count"]),
+        )
+
+    def _validate_dataset_storage_from_connection(
+        self,
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        budget: _DatasetReadBudget,
+    ) -> tuple[
+        dict[str, Any],
+        list[dict[str, Any]],
+        dict[str, sqlite3.Row],
+    ]:
+        dataset_id = str(row["dataset_id"])
+        manifest_path = Path(str(row["manifest_path"]))
+        expected_manifest_path = self.files.dataset_manifest_path(dataset_id)
+        if (
+            row["state"] != "active"
+            or manifest_path != expected_manifest_path
+            or type(row["event_count"]) is not int
+            or type(row["trace_count"]) is not int
+            or int(row["event_count"]) < 0
+            or int(row["trace_count"]) < 0
+        ):
+            raise DatasetIntegrityError(
+                f"dataset row is inconsistent: {dataset_id}"
+            )
+        try:
+            query = json.loads(str(row["query_json"]))
+            manifest_bytes = _bounded_regular_file_bytes(
+                manifest_path,
+                budget=budget,
+                max_file_bytes=MAX_DATASET_MANIFEST_BYTES,
+                label="dataset manifest",
+            )
+            manifest = json.loads(manifest_bytes.decode("utf-8"))
+        except DatasetIntegrityError:
+            raise
+        except (OSError, TypeError, UnicodeDecodeError, ValueError) as exc:
+            raise DatasetIntegrityError(
+                f"dataset manifest is invalid: {dataset_id}"
+            ) from exc
+        if not isinstance(query, dict) or not isinstance(manifest, dict):
+            raise DatasetIntegrityError(
+                f"dataset manifest is invalid: {dataset_id}"
+            )
+        if manifest_bytes != _json_dumps(
+            manifest,
+            indent=2,
+        ).encode("utf-8"):
+            raise DatasetIntegrityError(
+                f"dataset manifest is not canonical: {dataset_id}"
+            )
+        try:
+            normalized_request = DatasetCreateRequest(
+                name=str(row["name"]),
+                purpose=str(row["purpose"]),
+                query=query,
+                limits=manifest.get("limits"),
+            )
+        except ValueError as exc:
+            raise DatasetIntegrityError(
+                f"dataset manifest contract is invalid: {dataset_id}"
+            ) from exc
+        normalized = normalized_request.model_dump(
+            mode="json",
+        )
+        normalized.pop("idempotency_key", None)
+        allowed_query_keys = {
+            "source",
+            "event_types",
+            "status",
+            "reward_min",
+            "policy_version",
+            "task_tags",
+            "source_event_id",
+            "task_id",
+            "session_id",
+        }
+        if (
+            not set(query).issubset(allowed_query_keys)
+            or any(
+                normalized["query"].get(key) != value
+                for key, value in query.items()
+            )
+            or _json_dumps(query) != row["query_json"]
+            or normalized["limits"] != manifest.get("limits")
+        ):
+            raise DatasetIntegrityError(
+                f"dataset query authority is inconsistent: {dataset_id}"
+            )
+        allowed_manifest_keys = {
+            "dataset_id",
+            "name",
+            "purpose",
+            "query",
+            "limits",
+            "event_ids",
+            "event_count",
+            "trace_count",
+            "records_path",
+            "records_uri",
+            "records_byte_size",
+            "records_sha256",
+            "create_identity",
+            "source_event_evidence",
+        }
+        event_ids = manifest.get("event_ids")
+        records_path = manifest_path.with_name("records.jsonl")
+        records_byte_size = manifest.get("records_byte_size")
+        records_sha256 = manifest.get("records_sha256")
+        records_receipt_present = (
+            records_byte_size is not None
+            and records_sha256 is not None
+        )
+        records_receipt_absent = (
+            "records_byte_size" not in manifest
+            and "records_sha256" not in manifest
+        )
+        has_create_receipt = (
+            conn.execute(
+                "SELECT 1 FROM dataset_create_requests "
+                "WHERE dataset_id = ? LIMIT 1",
+                (dataset_id,),
+            ).fetchone()
+            is not None
+        )
+        legacy_unjournaled_manifest = (
+            records_receipt_absent
+            and not has_create_receipt
+            and "create_identity" not in manifest
+        )
+        if (
+            not set(manifest).issubset(allowed_manifest_keys)
+            or not isinstance(event_ids, list)
+            or not all(isinstance(item, str) and item for item in event_ids)
+            or len(event_ids) != len(set(event_ids))
+            or manifest.get("dataset_id") != dataset_id
+            or manifest.get("name") != row["name"]
+            or manifest.get("purpose") != row["purpose"]
+            or manifest.get("query") != query
+            or manifest.get("event_count") != int(row["event_count"])
+            or manifest.get("trace_count") != int(row["trace_count"])
+            or len(event_ids) != int(row["event_count"])
+            or manifest.get("records_path") != records_path.name
+            or manifest.get("records_uri") != records_path.as_uri()
+            or (
+                not legacy_unjournaled_manifest
+                and (
+                    not records_receipt_present
+                    or type(records_byte_size) is not int
+                    or int(records_byte_size) < 0
+                    or not isinstance(records_sha256, str)
+                    or re.fullmatch(
+                        r"[0-9a-f]{64}",
+                        records_sha256,
+                    )
+                    is None
+                )
+            )
+        ):
+            raise DatasetIntegrityError(
+                f"dataset manifest differs from its row: {dataset_id}"
+            )
+        membership_rows = conn.execute(
+            "SELECT event_id FROM dataset_events WHERE dataset_id = ? "
+            "ORDER BY event_id",
+            (dataset_id,),
+        ).fetchall()
+        membership_ids = [str(item["event_id"]) for item in membership_rows]
+        if sorted(event_ids) != membership_ids:
+            raise DatasetIntegrityError(
+                f"dataset event membership is inconsistent: {dataset_id}"
+            )
+        event_rows = conn.execute(
+            "SELECT events.* FROM dataset_events "
+            "JOIN events ON events.event_id = dataset_events.event_id "
+            "WHERE dataset_events.dataset_id = ?",
+            (dataset_id,),
+        ).fetchall()
+        event_by_id = {
+            str(event["event_id"]): event
+            for event in event_rows
+        }
+        if set(event_by_id) != set(event_ids):
+            raise DatasetIntegrityError(
+                f"dataset source event authority is inconsistent: {dataset_id}"
+            )
+        try:
+            records_bytes = _bounded_regular_file_bytes(
+                records_path,
+                budget=budget,
+                max_file_bytes=MAX_DATASET_RECORDS_BYTES,
+                label="dataset records",
+            )
+            records = [
+                json.loads(line)
+                for line in records_bytes.decode("utf-8").splitlines()
+                if line.strip()
+            ]
+        except DatasetIntegrityError:
+            raise
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise DatasetIntegrityError(
+                f"dataset records are invalid: {dataset_id}"
+            ) from exc
+        if (
+            len(records) != len(event_ids)
+            or not all(isinstance(record, dict) for record in records)
+            or records_bytes
+            != "".join(
+                f"{_json_dumps(record)}\n"
+                for record in records
+            ).encode("utf-8")
+            or (
+                records_receipt_present
+                and (
+                    records_byte_size != len(records_bytes)
+                    or records_sha256
+                    != hashlib.sha256(records_bytes).hexdigest()
+                )
+            )
+            or [
+                str(record.get("event_id"))
+                for record in records
+            ]
+            != event_ids
+        ):
+            raise DatasetIntegrityError(
+                f"dataset records differ from event membership: {dataset_id}"
+            )
+        trace_count = 0
+        event_columns = (
+            "event_id",
+            "source",
+            "event_type",
+            "source_event_id",
+            "created_at",
+            "ingested_at",
+            "task_id",
+            "session_id",
+            "policy_version",
+            "rollout_step",
+            "agent_harness",
+            "agent_model",
+            "base_model",
+            "status",
+            "reward",
+        )
+        source_evidence: dict[str, dict[str, Any] | None] = {}
+        for record in records:
+            source_row = event_by_id[str(record["event_id"])]
+            source_row_dict = dict(source_row)
+            payload = self._read_event_payload_file(
+                source_row_dict,
+                budget=budget,
+            )
+            source_evidence[str(record["event_id"])] = (
+                self._source_event_evidence_for_event_row(
+                    source_row_dict,
+                    payload=payload,
+                )
+            )
+            expected_record = self._dataset_record_for_event_row(
+                source_row_dict,
+                payload=payload,
+            )
+            traces = expected_record["traces"]
+            if record != expected_record or any(
+                record.get(column) != source_row[column]
+                for column in event_columns
+            ):
+                raise DatasetIntegrityError(
+                    f"dataset record authority is inconsistent: {dataset_id}"
+                )
+            trace_count += len(traces)
+        if trace_count != int(row["trace_count"]):
+            raise DatasetIntegrityError(
+                f"dataset trace count is inconsistent: {dataset_id}"
+            )
+        evidence = manifest.get("source_event_evidence")
+        if evidence is not None:
+            if (
+                len(event_ids) != 1
+                or evidence != source_evidence[event_ids[0]]
+            ):
+                raise DatasetIntegrityError(
+                    f"dataset source evidence is inconsistent: {dataset_id}"
+                )
+        return manifest, records, event_by_id
+
+    def _dataset_artifact_candidate_rows(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        dataset_id: str,
+        manifest_path: Path,
+    ) -> list[sqlite3.Row]:
+        return conn.execute(
+            "SELECT * FROM artifacts WHERE type = ? AND state != ? "
+            "AND (uri = ? OR (json_valid(manifest_json) = 1 "
+            "AND json_extract(manifest_json, '$.dataset_id') = ?)) "
+            "ORDER BY artifact_id LIMIT 2",
+            (
+                str(ArtifactType.DATASET),
+                str(ArtifactState.STAGED),
+                manifest_path.as_uri(),
+                dataset_id,
+            ),
+        ).fetchall()
+
+    def _validate_dataset_artifact_row(
+        self,
+        artifact_row: sqlite3.Row,
+        *,
+        dataset_row: sqlite3.Row,
+        manifest: dict[str, Any],
+        budget: _DatasetReadBudget,
+    ) -> None:
+        dataset_id = str(dataset_row["dataset_id"])
+        artifact_id = str(artifact_row["artifact_id"])
+        manifest_path = Path(str(dataset_row["manifest_path"]))
+        artifact_manifest_path = Path(str(artifact_row["manifest_path"]))
+        lineage = {"event_ids": manifest["event_ids"]}
+        compatibility = {"purpose": str(dataset_row["purpose"])}
+        expected_wrapper = {
+            "artifact_id": artifact_id,
+            "type": str(ArtifactType.DATASET),
+            "name": str(dataset_row["name"]),
+            "uri": manifest_path.as_uri(),
+            "manifest": manifest,
+            "lineage": lineage,
+            "compatibility": compatibility,
+            "scores": {},
+            "tags": [str(dataset_row["purpose"])],
+            "promoted": True,
+        }
+        try:
+            artifact_wrapper_bytes = _bounded_regular_file_bytes(
+                artifact_manifest_path,
+                budget=budget,
+                max_file_bytes=MAX_DATASET_ARTIFACT_MANIFEST_BYTES,
+                label="dataset artifact manifest",
+            )
+            artifact_wrapper = json.loads(
+                artifact_wrapper_bytes.decode("utf-8")
+            )
+        except DatasetIntegrityError:
+            raise
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            raise DatasetIntegrityError(
+                f"dataset artifact manifest is invalid: {dataset_id}"
+            ) from exc
+        if (
+            artifact_row["type"] != str(ArtifactType.DATASET)
+            or artifact_row["state"] != str(ArtifactState.ACTIVE)
+            or artifact_row["name"] != dataset_row["name"]
+            or int(artifact_row["version"]) != 1
+            or artifact_row["uri"] != manifest_path.as_uri()
+            or artifact_manifest_path
+            != self.files.artifact_manifest_path(
+                str(ArtifactType.DATASET),
+                artifact_id,
+            )
+            or artifact_row["manifest_json"] != _json_dumps(manifest)
+            or artifact_row["lineage_json"] != _json_dumps(lineage)
+            or artifact_row["compatibility_json"]
+            != _json_dumps(compatibility)
+            or artifact_row["scores_json"] != _json_dumps({})
+            or artifact_row["tags_json"]
+            != _json_dumps([str(dataset_row["purpose"])])
+            or artifact_row["promoted"] != 1
+            or artifact_row["staging_job_id"] is not None
+            or artifact_wrapper != expected_wrapper
+            or artifact_wrapper_bytes
+            != _json_dumps(
+                artifact_wrapper,
+                indent=2,
+            ).encode("utf-8")
+        ):
+            raise DatasetIntegrityError(
+                f"dataset artifact differs from dataset authority: {dataset_id}"
+            )
+
     def _backfill_dataset_artifact_id(self, dataset_id: str, artifact_id: str) -> None:
+        budget = _DatasetReadBudget(
+            label="dataset recovery admission",
+            max_files=MAX_DATASET_READ_FILES,
+            max_bytes=MAX_DATASET_VERIFICATION_BYTES,
+        )
         with self.connect() as conn:
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                conn.execute(
-                    "UPDATE datasets SET artifact_id = ? WHERE dataset_id = ?",
-                    (artifact_id, dataset_id),
+                cursor = conn.execute(
+                    "UPDATE datasets SET artifact_id = ? "
+                    "WHERE dataset_id = ? "
+                    "AND (artifact_id IS NULL OR artifact_id = ?)",
+                    (artifact_id, dataset_id, artifact_id),
                 )
+                if cursor.rowcount != 1:
+                    raise DatasetIntegrityError(
+                        "dataset already binds a different artifact"
+                    )
+                self._get_dataset_from_connection(
+                    conn,
+                    dataset_id,
+                    budget=budget,
+                )
+                request_row = conn.execute(
+                    "SELECT idempotency_key, recovery_file_count, "
+                    "recovery_byte_size FROM dataset_create_requests "
+                    "WHERE dataset_id = ?",
+                    (dataset_id,),
+                ).fetchone()
+                if request_row is not None:
+                    recovery_file_count = request_row[
+                        "recovery_file_count"
+                    ]
+                    recovery_byte_size = request_row[
+                        "recovery_byte_size"
+                    ]
+                    if (
+                        (recovery_file_count is None)
+                        != (recovery_byte_size is None)
+                    ):
+                        raise DatasetIntegrityError(
+                            "dataset recovery accounting is incomplete"
+                        )
+                    if recovery_file_count is None:
+                        totals = conn.execute(
+                            "SELECT "
+                            "COALESCE(SUM(recovery_file_count), 0), "
+                            "COALESCE(SUM(recovery_byte_size), 0) "
+                            "FROM dataset_create_requests"
+                        ).fetchone()
+                        if (
+                            int(totals[0]) + budget.files
+                            > MAX_DATASET_READ_FILES
+                            or int(totals[1]) + budget.bytes
+                            > MAX_DATASET_STARTUP_RECOVERY_BYTES
+                        ):
+                            raise DatasetIntegrityError(
+                                "dataset startup recovery capacity is exhausted"
+                            )
+                        updated = conn.execute(
+                            "UPDATE dataset_create_requests "
+                            "SET recovery_file_count = ?, "
+                            "recovery_byte_size = ? "
+                            "WHERE idempotency_key = ? "
+                            "AND recovery_file_count IS NULL "
+                            "AND recovery_byte_size IS NULL",
+                            (
+                                budget.files,
+                                budget.bytes,
+                                request_row["idempotency_key"],
+                            ),
+                        )
+                        if updated.rowcount != 1:
+                            raise DatasetIntegrityError(
+                                "dataset recovery admission lost its fence"
+                            )
+                    elif (
+                        type(recovery_file_count) is not int
+                        or type(recovery_byte_size) is not int
+                        or recovery_file_count != budget.files
+                        or recovery_byte_size != budget.bytes
+                    ):
+                        raise DatasetIntegrityError(
+                            "dataset recovery accounting differs from authority"
+                        )
                 conn.commit()
             except Exception:
                 try:
@@ -7679,35 +11995,120 @@ class EvolutionStore:
         artifact_id: str | None = None,
     ) -> None:
         artifact_manifest_path: Path | None = None
+        artifact_deleted = False
+        dataset_deleted = False
         with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            if artifact_id is not None:
-                artifact_manifest_path = self.files.artifact_manifest_path(
-                    str(ArtifactType.DATASET),
-                    artifact_id,
-                )
-                artifact_row = conn.execute(
-                    "SELECT manifest_path FROM artifacts WHERE artifact_id = ?",
-                    (artifact_id,),
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                dataset_row = conn.execute(
+                    "SELECT artifact_id, manifest_path FROM datasets "
+                    "WHERE dataset_id = ?",
+                    (dataset_id,),
                 ).fetchone()
-                if artifact_row is not None:
-                    artifact_manifest_path = Path(str(artifact_row["manifest_path"]))
-                conn.execute(
-                    """
-                    DELETE FROM artifact_lineage
-                    WHERE parent_artifact_id = ? OR child_artifact_id = ?
-                    """,
-                    (artifact_id, artifact_id),
+                if (
+                    dataset_row is not None
+                    and dataset_row["manifest_path"] != str(dataset_manifest_path)
+                ):
+                    raise DatasetIntegrityError(
+                        "dataset cleanup target differs from dataset authority"
+                    )
+                authoritative_artifact_id = (
+                    None
+                    if dataset_row is None
+                    or dataset_row["artifact_id"] is None
+                    else str(dataset_row["artifact_id"])
                 )
-                conn.execute("DELETE FROM artifacts WHERE artifact_id = ?", (artifact_id,))
-            conn.execute("DELETE FROM dataset_events WHERE dataset_id = ?", (dataset_id,))
-            conn.execute("DELETE FROM datasets WHERE dataset_id = ?", (dataset_id,))
-            conn.commit()
+                if (
+                    artifact_id is not None
+                    and authoritative_artifact_id != artifact_id
+                ):
+                    artifact_row = conn.execute(
+                        "SELECT type, uri, manifest_path FROM artifacts "
+                        "WHERE artifact_id = ?",
+                        (artifact_id,),
+                    ).fetchone()
+                    referenced = conn.execute(
+                        "SELECT 1 FROM datasets WHERE artifact_id = ? LIMIT 1",
+                        (artifact_id,),
+                    ).fetchone()
+                    if artifact_row is not None:
+                        expected_artifact_manifest_path = (
+                            self.files.artifact_manifest_path(
+                                str(ArtifactType.DATASET),
+                                artifact_id,
+                            )
+                        )
+                        if (
+                            artifact_row["type"] != str(ArtifactType.DATASET)
+                            or artifact_row["uri"]
+                            != dataset_manifest_path.as_uri()
+                            or artifact_row["manifest_path"]
+                            != str(expected_artifact_manifest_path)
+                            or referenced is not None
+                        ):
+                            raise DatasetIntegrityError(
+                                "dataset cleanup artifact is not an unbound candidate"
+                            )
+                        artifact_manifest_path = Path(
+                            str(artifact_row["manifest_path"])
+                        )
+                        conn.execute(
+                            "DELETE FROM artifact_lineage "
+                            "WHERE parent_artifact_id = ? "
+                            "OR child_artifact_id = ?",
+                            (artifact_id, artifact_id),
+                        )
+                        deleted = conn.execute(
+                            "DELETE FROM artifacts WHERE artifact_id = ? "
+                            "AND type = ? AND uri = ?",
+                            (
+                                artifact_id,
+                                str(ArtifactType.DATASET),
+                                dataset_manifest_path.as_uri(),
+                            ),
+                        )
+                        artifact_deleted = deleted.rowcount == 1
+                if (
+                    dataset_row is not None
+                    and authoritative_artifact_id is None
+                ):
+                    conn.execute(
+                        "DELETE FROM dataset_events WHERE dataset_id = ?",
+                        (dataset_id,),
+                    )
+                    deleted = conn.execute(
+                        "DELETE FROM datasets WHERE dataset_id = ? "
+                        "AND artifact_id IS NULL",
+                        (dataset_id,),
+                    )
+                    dataset_deleted = deleted.rowcount == 1
+                    if not dataset_deleted:
+                        raise DatasetIntegrityError(
+                            "dataset cleanup lost its null-artifact fence"
+                        )
+                conn.commit()
+            except Exception:
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
 
-        dataset_manifest_path.unlink(missing_ok=True)
-        dataset_manifest_path.with_name("records.jsonl").unlink(missing_ok=True)
-        if artifact_manifest_path is not None:
+        if dataset_deleted:
+            dataset_manifest_path.unlink(missing_ok=True)
+            dataset_manifest_path.with_name("records.jsonl").unlink(missing_ok=True)
+            dataset_manifest_path.with_name(
+                f".{dataset_manifest_path.name}.pending"
+            ).unlink(missing_ok=True)
+            records_path = dataset_manifest_path.with_name("records.jsonl")
+            records_path.with_name(
+                f".{records_path.name}.pending"
+            ).unlink(missing_ok=True)
+        if artifact_deleted and artifact_manifest_path is not None:
             artifact_manifest_path.unlink(missing_ok=True)
+            artifact_manifest_path.with_name(
+                f".{artifact_manifest_path.name}.pending"
+            ).unlink(missing_ok=True)
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

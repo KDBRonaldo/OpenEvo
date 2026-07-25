@@ -5134,37 +5134,39 @@ def test_sync_store_work_does_not_block_health_on_the_asgi_event_loop(
     app = _app(tmp_path)
     store = app.state.core_control_provider.store
     original = store.list_projects
+    entered = threading.Event()
     release = threading.Event()
 
     def slow_list_projects(**kwargs):
-        release.wait(timeout=2)
+        entered.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("the health request did not release the slow store call")
         return original(**kwargs)
 
     monkeypatch.setattr(store, "list_projects", slow_list_projects)
 
-    async def exercise() -> float:
+    async def wait_for_listing_entry() -> None:
+        while not entered.is_set():
+            await asyncio.sleep(0)
+
+    async def exercise() -> None:
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            started = time.monotonic()
             listing = asyncio.create_task(client.get("/v1/projects", headers=AUTH))
-            await asyncio.sleep(0)
-            health = await client.get("/health")
-            elapsed = time.monotonic() - started
-            release.set()
-            listed = await listing
+            await asyncio.wait_for(wait_for_listing_entry(), timeout=2)
+            try:
+                health = await asyncio.wait_for(client.get("/health"), timeout=2)
+            finally:
+                release.set()
+            listed = await asyncio.wait_for(listing, timeout=2)
             assert health.status_code == 200
             assert listed.status_code == 200
-            return elapsed
 
-    timer = threading.Timer(0.75, release.set)
-    timer.start()
     try:
-        elapsed = asyncio.run(exercise())
+        asyncio.run(exercise())
     finally:
         release.set()
-        timer.cancel()
         app.state.core_control_provider.close()
-    assert elapsed < 0.5
 
 
 def test_default_provider_disables_all_maintenance_owner_routes(

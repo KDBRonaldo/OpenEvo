@@ -242,7 +242,7 @@ def test_evolution_internal_surface_fails_closed_and_registers_exact_worker(tmp_
         assert (
             client.get(
                 "/v1/internal/jobs/missing-job",
-                headers=identity.request_headers(),
+                headers=_identity("core-control").request_headers(),
             ).status_code
             == 404
         )

@@ -887,7 +887,7 @@ async def _stage_materialized_runtime_context(
     if type(binding) is not RuntimeContextBindingV2:
         binding = RuntimeContextBindingV2.model_validate(binding.model_dump(mode="python"))
     if (
-        binding.source != "materialized_successor"
+        binding.source not in {"materialized_successor", "materialized_inherited"}
         or binding.materialized_context_id is None
         or binding.materialized_context_manifest_sha256 is None
         or binding.successor_transition_id is None
@@ -3094,7 +3094,7 @@ class GatewayNodeManager:
                 head.runtime_context_snapshot.runtime_context_snapshot_id
             ),
         }
-        if binding.source == "empty_genesis":
+        if binding.source in {"empty_genesis", "empty_inherited"}:
             request.metadata["evolution"] = evolution_metadata
             session_registry = getattr(self, "session_registry", None)
             if session_registry is not None:

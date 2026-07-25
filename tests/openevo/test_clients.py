@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from openevo import experiments
 
 RolloutHttpClient = experiments.RolloutHttpClient
 EvolutionHttpClient = experiments.EvolutionHttpClient
+EvolutionHttpStatusError = experiments.EvolutionHttpStatusError
 
 
 def test_rollout_http_client_url_encodes_task_id_path_segment() -> None:
@@ -104,3 +106,31 @@ def test_internal_clients_attach_generation_bound_headers_to_every_request() -> 
         and item["x-openevo-internal-service"] == "core-control"
         for item in captured
     )
+
+
+@pytest.mark.parametrize(
+    ("status_code", "retryable"),
+    [
+        (409, False),
+        (422, False),
+        (429, True),
+        (503, True),
+    ],
+)
+def test_evolution_http_client_exposes_closed_retryability(
+    status_code: int,
+    retryable: bool,
+) -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code, json={"detail": "remote failure"})
+
+    client = EvolutionHttpClient(
+        "http://evolution.example",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(EvolutionHttpStatusError) as captured:
+        client.create_dataset({"name": "dataset"})
+
+    assert captured.value.status_code == status_code
+    assert captured.value.retryable is retryable

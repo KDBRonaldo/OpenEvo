@@ -912,7 +912,8 @@ def _validate_runtime_context_terminal_metadata(
     head = binding.project_head
     expected_evolution = {
         "context_id": binding.materialized_context_id,
-        "context_injected": binding.source == "materialized_successor",
+        "context_injected": binding.source
+        in {"materialized_successor", "materialized_inherited"},
         "context_source": binding.source,
         "runtime_context_snapshot_id": (head.runtime_context_snapshot.runtime_context_snapshot_id),
     }
@@ -929,7 +930,7 @@ def _validate_runtime_context_terminal_metadata(
             retryable=False,
         )
     receipt = evolution.get("runtime_injection_receipt")
-    if binding.source == "empty_genesis":
+    if binding.source in {"empty_genesis", "empty_inherited"}:
         if receipt is not None:
             raise ScienceAttemptExecutionV2Error(
                 "runtime_context_injection_unproven",

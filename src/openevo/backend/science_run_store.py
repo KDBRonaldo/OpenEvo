@@ -34,10 +34,18 @@ from openevo.backend.science_execution_v2 import (
     science_session_result_sha256,
 )
 from openevo.backend.science_successor import (
+    ScienceSuccessorCleanupReceiptV2,
     ScienceSuccessorPlanV2,
+    ScienceSuccessorTransitionAttemptV2,
     science_successor_plan_sha256,
 )
-from openevo.evolution.revisions import AtomicSuccessorCommitV2
+from openevo.evolution.revisions import (
+    AtomicEvolutionAbandonManifestV2,
+    AtomicSuccessorCommitV2,
+    AtomicSuccessorManifestV2,
+    SuccessorArtifactContributionV2,
+    atomic_successor_manifest_sha256,
+)
 from openevo.internal_auth import (
     GenerationBoundRunAdmissionCheck,
     RunAdmissionOperation,
@@ -143,6 +151,11 @@ CREATE TABLE IF NOT EXISTS metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_version INTEGER NOT NULL CHECK (schema_version = 2)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS action_receipt_migrations (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    migration_version INTEGER NOT NULL
+        CHECK (migration_version = 1)
+) STRICT;
 CREATE TABLE IF NOT EXISTS project_admission_authorities (
     project_id TEXT PRIMARY KEY,
     authority_json BLOB NOT NULL,
@@ -178,6 +191,30 @@ CREATE TABLE IF NOT EXISTS task_admissions (
     admission_sha256 TEXT NOT NULL UNIQUE CHECK (length(admission_sha256) = 64),
     admission_json BLOB NOT NULL,
     FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS task_close_receipts (
+    task_id TEXT PRIMARY KEY,
+    close_request_id TEXT NOT NULL UNIQUE
+        CHECK (length(close_request_id) BETWEEN 1 AND 128),
+    expected_etag TEXT
+        CHECK (expected_etag IS NULL OR length(expected_etag) = 66),
+    task_admission_id TEXT NOT NULL
+        CHECK (length(task_admission_id) BETWEEN 1 AND 128),
+    admission_sha256 TEXT NOT NULL
+        CHECK (length(admission_sha256) = 64),
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY(task_admission_id)
+        REFERENCES task_admissions(task_admission_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS legacy_task_close_exemptions (
+    task_id TEXT PRIMARY KEY,
+    task_admission_id TEXT NOT NULL UNIQUE
+        CHECK (length(task_admission_id) BETWEEN 1 AND 128),
+    admission_sha256 TEXT NOT NULL UNIQUE
+        CHECK (length(admission_sha256) = 64),
+    FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT,
+    FOREIGN KEY(task_admission_id)
+        REFERENCES task_admissions(task_admission_id) ON DELETE RESTRICT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS attempts (
     attempt_id TEXT PRIMARY KEY,
@@ -240,12 +277,68 @@ CREATE TABLE IF NOT EXISTS successor_transitions (
     resource_version INTEGER NOT NULL CHECK (resource_version >= 1),
     FOREIGN KEY(task_id) REFERENCES tasks(task_id) ON DELETE RESTRICT
 ) STRICT;
+CREATE TABLE IF NOT EXISTS successor_transition_attempts (
+    transition_attempt_id TEXT PRIMARY KEY,
+    successor_transition_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 1 AND 100),
+    retry_request_id TEXT NOT NULL,
+    attempt_json BLOB NOT NULL,
+    UNIQUE(successor_transition_id, ordinal),
+    UNIQUE(successor_transition_id, retry_request_id),
+    FOREIGN KEY(successor_transition_id)
+        REFERENCES successor_transitions(successor_transition_id) ON DELETE RESTRICT
+) STRICT;
 CREATE TABLE IF NOT EXISTS successor_commits (
     successor_transition_id TEXT PRIMARY KEY,
+    successor_project_head_id TEXT,
+    composition_semantics_version INTEGER
+        CHECK (composition_semantics_version IN (1, 2)),
+    legacy_manifest_sha256 TEXT
+        CHECK (
+            legacy_manifest_sha256 IS NULL
+            OR length(legacy_manifest_sha256) = 64
+        ),
     manifest_sha256 TEXT NOT NULL UNIQUE CHECK (length(manifest_sha256) = 64),
     commit_json BLOB NOT NULL,
     FOREIGN KEY(successor_transition_id)
         REFERENCES successor_transitions(successor_transition_id) ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS successor_cleanup_receipts (
+    successor_transition_id TEXT PRIMARY KEY,
+    receipt_sha256 TEXT NOT NULL
+        CHECK (length(receipt_sha256) = 64),
+    receipt_json BLOB NOT NULL,
+    FOREIGN KEY(successor_transition_id)
+        REFERENCES successor_transitions(successor_transition_id)
+        ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS successor_abandon_receipts (
+    successor_transition_id TEXT PRIMARY KEY,
+    abandon_request_id TEXT NOT NULL UNIQUE
+        CHECK (length(abandon_request_id) BETWEEN 1 AND 128),
+    expected_project_head_id TEXT NOT NULL
+        CHECK (length(expected_project_head_id) BETWEEN 1 AND 128),
+    transition_attempt_id TEXT NOT NULL UNIQUE
+        CHECK (length(transition_attempt_id) BETWEEN 1 AND 128),
+    FOREIGN KEY(successor_transition_id)
+        REFERENCES successor_transitions(successor_transition_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY(transition_attempt_id)
+        REFERENCES successor_transition_attempts(transition_attempt_id)
+        ON DELETE RESTRICT
+) STRICT;
+CREATE TABLE IF NOT EXISTS legacy_successor_abandon_exemptions (
+    successor_transition_id TEXT PRIMARY KEY,
+    expected_project_head_id TEXT NOT NULL
+        CHECK (length(expected_project_head_id) BETWEEN 1 AND 128),
+    transition_attempt_id TEXT NOT NULL UNIQUE
+        CHECK (length(transition_attempt_id) BETWEEN 1 AND 128),
+    FOREIGN KEY(successor_transition_id)
+        REFERENCES successor_transitions(successor_transition_id)
+        ON DELETE RESTRICT,
+    FOREIGN KEY(transition_attempt_id)
+        REFERENCES successor_transition_attempts(transition_attempt_id)
+        ON DELETE RESTRICT
 ) STRICT;
 CREATE TABLE IF NOT EXISTS events (
     sequence INTEGER PRIMARY KEY CHECK (sequence >= 1),
@@ -269,6 +362,17 @@ _MAX_V2_EVENT_ROWS = 100_000
 _MAX_V2_EVENTS_PER_TASK = 10_000
 _MAX_V2_RUN_ADMISSIONS = 100_000
 _MAX_V2_RUN_ADMISSIONS_PER_ATTEMPT = 4_096
+_MAX_V2_SUCCESSOR_ATTEMPTS_PER_TRANSITION = 100
+_MAX_V2_SUCCESSOR_COMMIT_AGGREGATE_BYTES = _MAX_V2_TASKS * _MAX_DOCUMENT_BYTES
+_V2_ACTION_RECEIPT_SCHEMA_TABLES = frozenset(
+    {
+        "action_receipt_migrations",
+        "task_close_receipts",
+        "legacy_task_close_exemptions",
+        "successor_abandon_receipts",
+        "legacy_successor_abandon_exemptions",
+    }
+)
 _V2_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z", re.ASCII)
 
 
@@ -396,6 +500,37 @@ class ScienceProjectAdmissionAuthorityV2:
     @property
     def project_etag(self) -> str:
         return _v2_authority_etag(self)
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskCloseReceiptV2:
+    task_id: str
+    close_request_id: str
+    expected_etag: str | None
+    task_admission_id: str
+    admission_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SuccessorAbandonReceiptV2:
+    successor_transition_id: str
+    abandon_request_id: str
+    expected_project_head_id: str
+    transition_attempt_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacyTaskCloseExemptionV2:
+    task_id: str
+    task_admission_id: str
+    admission_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class _LegacySuccessorAbandonExemptionV2:
+    successor_transition_id: str
+    expected_project_head_id: str
+    transition_attempt_id: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1404,13 +1539,28 @@ class ScienceTaskStoreV2:
         if self.database.exists() and self.database.is_symlink():
             raise ScienceTaskStoreV2Error("v2 science task database must not be a symlink")
         with self._reader() as connection:
-            connection.executescript(_V2_SCHEMA)
-            _migrate_v2_attempt_execution_results(connection)
-            connection.execute(
-                "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 2)"
-            )
-            _backfill_v2_project_heads(connection)
-            connection.commit()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                receipt_schema_preexisting = _v2_action_receipt_schema_preexisting(connection)
+                _execute_v2_schema(connection)
+                _migrate_v2_attempt_execution_results(connection)
+                _backfill_v2_successor_transition_attempts(connection)
+                connection.execute(
+                    "INSERT OR IGNORE INTO metadata(singleton, schema_version) VALUES (1, 2)"
+                )
+                _backfill_v2_project_heads(connection)
+                _migrate_v2_successor_commit_authority(connection)
+                _migrate_v2_action_receipt_authority(
+                    connection,
+                    schema_preexisting=(receipt_schema_preexisting),
+                )
+                connection.commit()
+            except BaseException:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+                raise
         os.chmod(self.database, 0o600)
         self._verify_database()
 
@@ -1437,6 +1587,10 @@ class ScienceTaskStoreV2:
                     raise ScienceTaskPreconditionFailedV2(
                         "v2 project admission authority does not exist"
                     )
+                if ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION in authority.blockers:
+                    raise ScienceTaskPreconditionFailedV2(
+                        "v2 successor readiness authority is store-owned"
+                    )
                 count = int(
                     connection.execute(
                         "SELECT COUNT(*) FROM project_admission_authorities"
@@ -1456,6 +1610,18 @@ class ScienceTaskStoreV2:
             current = _v2_authority_from_bytes(bytes(row["authority_json"]))
             if payload == bytes(row["authority_json"]):
                 return current
+            if (
+                authority.active_project_head
+                != current.active_project_head
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 active project head is store-owned"
+                )
+            successor_blocker = ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION
+            if successor_blocker in current.blockers or successor_blocker in authority.blockers:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor readiness authority is store-owned"
+                )
             if (
                 expected_project_head_id is None
                 or current.active_project_head.project_head_id != expected_project_head_id
@@ -1662,6 +1828,28 @@ class ScienceTaskStoreV2:
                     _v2_model_bytes(transition),
                 ),
             )
+            initial_attempt = ScienceSuccessorTransitionAttemptV2(
+                transition_attempt_id=f"successor-attempt-{secrets.token_hex(16)}",
+                successor_transition_id=transition_id,
+                ordinal=1,
+                retry_request_id="initial",
+                state="running",
+                error=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            connection.execute(
+                "INSERT INTO successor_transition_attempts("
+                "transition_attempt_id, successor_transition_id, ordinal, "
+                "retry_request_id, attempt_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    initial_attempt.transition_attempt_id,
+                    transition_id,
+                    initial_attempt.ordinal,
+                    initial_attempt.retry_request_id,
+                    _v2_model_bytes(initial_attempt),
+                ),
+            )
             connection.execute(
                 "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
                 "WHERE task_id = ?",
@@ -1692,12 +1880,17 @@ class ScienceTaskStoreV2:
         self,
         successor_transition_id: str,
         *,
+        expected_transition_attempt_id: str,
         state: str,
         now: datetime,
     ) -> m2.SuccessorTransitionV2:
         successor_transition_id = _v2_resource_id(
             successor_transition_id,
             label="successor transition",
+        )
+        expected_transition_attempt_id = _v2_resource_id(
+            expected_transition_attempt_id,
+            label="successor transition attempt",
         )
         phases = (
             "pending",
@@ -1713,6 +1906,12 @@ class ScienceTaskStoreV2:
             transition = _load_v2_successor_transition(
                 connection,
                 successor_transition_id,
+            )
+            _require_v2_successor_transition_attempt(
+                connection,
+                successor_transition_id=successor_transition_id,
+                expected_transition_attempt_id=(expected_transition_attempt_id),
+                expected_state="running",
             )
             current_index = phases.index(transition.state)
             next_index = phases.index(state)
@@ -1756,6 +1955,7 @@ class ScienceTaskStoreV2:
         self,
         successor_transition_id: str,
         *,
+        expected_transition_attempt_id: str,
         dataset_id: str,
         dataset_sha256: str,
         now: datetime,
@@ -1763,6 +1963,10 @@ class ScienceTaskStoreV2:
         successor_transition_id = _v2_resource_id(
             successor_transition_id,
             label="successor transition",
+        )
+        expected_transition_attempt_id = _v2_resource_id(
+            expected_transition_attempt_id,
+            label="successor transition attempt",
         )
         dataset_id = _v2_resource_id(dataset_id, label="dataset")
         if (
@@ -1774,6 +1978,12 @@ class ScienceTaskStoreV2:
             transition = _load_v2_successor_transition(
                 connection,
                 successor_transition_id,
+            )
+            transition_attempt = _require_v2_successor_transition_attempt(
+                connection,
+                successor_transition_id=successor_transition_id,
+                expected_transition_attempt_id=(expected_transition_attempt_id),
+                expected_state="running",
             )
             admission = transition.transition.task_admission
             attempt = transition.transition.accepted_attempt
@@ -1792,6 +2002,8 @@ class ScienceTaskStoreV2:
                     not isinstance(event, m2.DatasetSealedEventV2)
                     or event.dataset_id != dataset_id
                     or event.dataset_sha256 != dataset_sha256
+                    or transition_attempt.dataset_id != dataset_id
+                    or transition_attempt.dataset_sha256 != dataset_sha256
                 ):
                     raise ScienceTaskConflictV2("v2 Task already binds another sealed dataset")
                 return event
@@ -1812,18 +2024,33 @@ class ScienceTaskStoreV2:
             )
             if not isinstance(event, m2.DatasetSealedEventV2):
                 raise ScienceTaskStoreV2Error("v2 dataset event has the wrong type")
+            sealed_attempt = _replace_v2_successor_transition_attempt(
+                transition_attempt,
+                dataset_id=dataset_id,
+                dataset_sha256=dataset_sha256,
+                updated_at=_v2_timestamp(now),
+            )
+            _store_v2_successor_transition_attempt(
+                connection,
+                sealed_attempt,
+            )
             return event
 
     def fail_successor_transition(
         self,
         successor_transition_id: str,
         *,
+        expected_transition_attempt_id: str,
         error: m2.ApiErrorV2,
         now: datetime,
     ) -> m2.SuccessorTransitionV2:
         successor_transition_id = _v2_resource_id(
             successor_transition_id,
             label="successor transition",
+        )
+        expected_transition_attempt_id = _v2_resource_id(
+            expected_transition_attempt_id,
+            label="successor transition attempt",
         )
         error = _validate_v2_model(m2.ApiErrorV2, error)
         with self._lock, self._transaction() as connection:
@@ -1833,6 +2060,12 @@ class ScienceTaskStoreV2:
             )
             timestamp = _v2_successor_timestamp(transition, now)
             if transition.state == "failed":
+                _require_v2_successor_transition_attempt(
+                    connection,
+                    successor_transition_id=successor_transition_id,
+                    expected_transition_attempt_id=(expected_transition_attempt_id),
+                    expected_state="failed",
+                )
                 return transition
             if transition.state in {"committed", "cancelled", "superseded"}:
                 raise ScienceTaskTerminalV2("terminal v2 successor transition cannot be failed")
@@ -1842,8 +2075,20 @@ class ScienceTaskStoreV2:
             )
             if task.successor_transition != transition.transition:
                 raise ScienceTaskStoreV2Error("v2 Task and successor transition ownership differ")
+            active_attempt = _require_v2_successor_transition_attempt(
+                connection,
+                successor_transition_id=successor_transition_id,
+                expected_transition_attempt_id=(expected_transition_attempt_id),
+                expected_state="running",
+            )
             updated_transition = _replace_v2_successor_transition(
                 transition,
+                state="failed",
+                error=error,
+                updated_at=timestamp,
+            )
+            failed_attempt = _replace_v2_successor_transition_attempt(
+                active_attempt,
                 state="failed",
                 error=error,
                 updated_at=timestamp,
@@ -1864,6 +2109,10 @@ class ScienceTaskStoreV2:
                 "WHERE task_id = ?",
                 (_v2_model_bytes(updated_task), task.task_id),
             )
+            _store_v2_successor_transition_attempt(
+                connection,
+                failed_attempt,
+            )
             _append_v2_event(
                 connection,
                 model_type=m2.TransitionChangedEventV2,
@@ -1883,47 +2132,453 @@ class ScienceTaskStoreV2:
                 successor_transition_id,
             )
 
-    def commit_successor_transition(
+    def retry_successor_transition(
         self,
         successor_transition_id: str,
         *,
-        successor: m2.ProjectHeadRefV2,
-        commit: AtomicSuccessorCommitV2,
+        expected_project_head_id: str,
+        retry_request_id: str,
         now: datetime,
+        allow_in_progress_recovery: bool = False,
     ) -> m2.SuccessorTransitionV2:
         successor_transition_id = _v2_resource_id(
             successor_transition_id,
             label="successor transition",
         )
-        successor = _validate_v2_model(m2.ProjectHeadRefV2, successor)
-        commit = _validate_v2_model(AtomicSuccessorCommitV2, commit)
+        expected_project_head_id = _v2_resource_id(
+            expected_project_head_id,
+            label="expected project head",
+        )
+        retry_request_id = _v2_resource_id(
+            retry_request_id,
+            label="successor retry request",
+        )
         with self._lock, self._transaction() as connection:
             transition = _load_v2_successor_transition(
                 connection,
                 successor_transition_id,
             )
-            timestamp = _v2_successor_timestamp(transition, now)
-            if transition.state != "committing":
-                raise ScienceTaskPreconditionFailedV2(
-                    "v2 successor transition is not ready to commit"
-                )
             reference = transition.transition
-            if reference.task_admission is None or reference.accepted_attempt is None:
-                raise ScienceTaskStoreV2Error("v2 run-result transition lost its Task ownership")
-            task = _load_v2_task_closure(
-                connection,
-                reference.task_admission.task_id,
-            )
-            authority = _load_v2_project_authority(connection, task.project_id)
+            admission = reference.task_admission
             if (
-                task.state != "waiting_for_successor"
-                or task.authoritative_attempt_id != reference.accepted_attempt.attempt_id
+                admission is None
+                or expected_project_head_id != reference.predecessor_project_head.project_head_id
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor retry no longer matches its predecessor"
+                )
+            task = _load_v2_task_closure(connection, admission.task_id)
+            authority = _load_v2_project_authority(connection, reference.project_id)
+            attempts = _load_v2_successor_transition_attempts(
+                connection,
+                successor_transition_id,
+            )
+            matching_attempts = [
+                attempt for attempt in attempts if attempt.retry_request_id == retry_request_id
+            ]
+            if matching_attempts:
+                if len(matching_attempts) != 1 or matching_attempts[0] != attempts[-1]:
+                    raise ScienceTaskPreconditionFailedV2(
+                        "v2 successor retry request is no longer current"
+                    )
+                if transition.state == "committed":
+                    if reference.successor_project_head is None or task.state != "completed":
+                        raise ScienceTaskPreconditionFailedV2(
+                            "v2 successor retry completion authority changed"
+                        )
+                elif transition.state == "failed":
+                    if (
+                        task.state != "failed"
+                        or attempts[-1].state != "failed"
+                        or attempts[-1].error != transition.error
+                    ):
+                        raise ScienceTaskPreconditionFailedV2(
+                            "v2 successor retry failure authority changed"
+                        )
+                    if (
+                        allow_in_progress_recovery
+                        and transition.error is not None
+                        and transition.error.code == "successor_transition_interrupted"
+                    ):
+                        if (
+                            transition.error.retryable is not True
+                            or task.successor_transition != reference
+                            or authority.active_project_head != reference.predecessor_project_head
+                            or authority.blockers
+                            != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                        ):
+                            raise ScienceTaskPreconditionFailedV2(
+                                "v2 interrupted successor retry authority changed"
+                            )
+                        dataset_event = _load_v2_dataset_event_for_task(
+                            connection,
+                            task.task_id,
+                        )
+                        expected_dataset_id = (
+                            None if dataset_event is None else dataset_event.dataset_id
+                        )
+                        expected_dataset_sha256 = (
+                            None if dataset_event is None else dataset_event.dataset_sha256
+                        )
+                        current_attempt = attempts[-1]
+                        if (
+                            current_attempt.dataset_id != expected_dataset_id
+                            or current_attempt.dataset_sha256 != expected_dataset_sha256
+                            or current_attempt.commit_manifest_sha256 is not None
+                        ):
+                            raise ScienceTaskStoreV2Error(
+                                "v2 interrupted successor retry dataset authority changed"
+                            )
+                        resumed_state = "pending" if dataset_event is None else "running_methods"
+                        resumed_progress = 0 if dataset_event is None else 2
+                        timestamp = _v2_successor_timestamp(
+                            transition,
+                            now,
+                        )
+                        resumed_transition = _replace_v2_successor_transition(
+                            transition,
+                            state=resumed_state,
+                            progress_completed=(resumed_progress),
+                            error=None,
+                            updated_at=timestamp,
+                        )
+                        resumed_task = _replace_v2_task(
+                            task,
+                            state="waiting_for_successor",
+                            updated_at=timestamp,
+                        )
+                        resumed_attempt = _replace_v2_successor_transition_attempt(
+                            current_attempt,
+                            state="running",
+                            error=None,
+                            updated_at=timestamp,
+                        )
+                        connection.execute(
+                            "UPDATE successor_transitions SET "
+                            "transition_json = ?, resource_version = "
+                            "resource_version + 1 WHERE "
+                            "successor_transition_id = ?",
+                            (
+                                _v2_model_bytes(resumed_transition),
+                                successor_transition_id,
+                            ),
+                        )
+                        connection.execute(
+                            "UPDATE tasks SET task_json = ?, "
+                            "resource_version = resource_version + 1 "
+                            "WHERE task_id = ?",
+                            (
+                                _v2_model_bytes(resumed_task),
+                                task.task_id,
+                            ),
+                        )
+                        _store_v2_successor_transition_attempt(
+                            connection,
+                            resumed_attempt,
+                        )
+                        _append_v2_event(
+                            connection,
+                            model_type=(m2.TransitionChangedEventV2),
+                            event_type="transition_changed",
+                            project_id=reference.project_id,
+                            task_id=task.task_id,
+                            occurred_at=timestamp,
+                            payload={
+                                "transition": reference,
+                                "state": resumed_transition.state,
+                                "progress_completed": (resumed_transition.progress_completed),
+                                "progress_total": (resumed_transition.progress_total),
+                            },
+                        )
+                        return _load_v2_successor_transition(
+                            connection,
+                            successor_transition_id,
+                        )
+                elif (
+                    authority.active_project_head != reference.predecessor_project_head
+                    or authority.blockers
+                    != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                    or task.state != "waiting_for_successor"
+                    or attempts[-1].state != "running"
+                ):
+                    raise ScienceTaskPreconditionFailedV2("v2 successor retry authority changed")
+                return transition
+            if transition.state != "failed":
+                raise ScienceTaskTerminalV2("v2 successor transition is not failed")
+            if (
+                transition.error is None
+                or transition.error.retryable is not True
+                or not attempts
+                or attempts[-1].state != "failed"
+                or attempts[-1].error != transition.error
+            ):
+                raise ScienceTaskTerminalV2("v2 successor transition failure is not retryable")
+            if (
+                task.state != "failed"
                 or task.successor_transition != reference
                 or authority.active_project_head != reference.predecessor_project_head
                 or authority.blockers != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
             ):
-                raise ScienceTaskPreconditionFailedV2("v2 successor commit authority changed")
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 failed successor retry authority changed"
+                )
+            dataset_event = _load_v2_dataset_event_for_task(
+                connection,
+                task.task_id,
+            )
+            resumed_state = "pending" if dataset_event is None else "running_methods"
+            resumed_progress = 0 if dataset_event is None else 2
+            timestamp = _v2_successor_timestamp(transition, now)
+            if len(attempts) >= _MAX_V2_SUCCESSOR_ATTEMPTS_PER_TRANSITION:
+                raise ScienceTaskConflictV2(
+                    "v2 successor transition attempt capacity is exhausted"
+                )
+            retry_attempt = ScienceSuccessorTransitionAttemptV2(
+                transition_attempt_id=(f"successor-attempt-{secrets.token_hex(16)}"),
+                successor_transition_id=successor_transition_id,
+                ordinal=len(attempts) + 1,
+                retry_request_id=retry_request_id,
+                state="running",
+                error=None,
+                dataset_id=(None if dataset_event is None else dataset_event.dataset_id),
+                dataset_sha256=(None if dataset_event is None else dataset_event.dataset_sha256),
+                commit_manifest_sha256=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+            )
+            resumed_transition = _replace_v2_successor_transition(
+                transition,
+                state=resumed_state,
+                progress_completed=resumed_progress,
+                error=None,
+                updated_at=timestamp,
+            )
+            resumed_task = _replace_v2_task(
+                task,
+                state="waiting_for_successor",
+                updated_at=timestamp,
+            )
+            connection.execute(
+                "UPDATE successor_transitions SET transition_json = ?, "
+                "resource_version = resource_version + 1 "
+                "WHERE successor_transition_id = ?",
+                (_v2_model_bytes(resumed_transition), successor_transition_id),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(resumed_task), task.task_id),
+            )
+            connection.execute(
+                "INSERT INTO successor_transition_attempts("
+                "transition_attempt_id, successor_transition_id, ordinal, "
+                "retry_request_id, attempt_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    retry_attempt.transition_attempt_id,
+                    successor_transition_id,
+                    retry_attempt.ordinal,
+                    retry_attempt.retry_request_id,
+                    _v2_model_bytes(retry_attempt),
+                ),
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.TransitionChangedEventV2,
+                event_type="transition_changed",
+                project_id=reference.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "transition": reference,
+                    "state": resumed_transition.state,
+                    "progress_completed": resumed_transition.progress_completed,
+                    "progress_total": resumed_transition.progress_total,
+                },
+            )
+            return _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+
+    def abandon_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        expected_project_head_id: str,
+        abandon_request_id: str,
+        expected_transition_attempt_id: str | None,
+        successor: m2.ProjectHeadRefV2 | None,
+        commit: AtomicSuccessorCommitV2 | None,
+        now: datetime,
+        allow_cancelled_recovery: bool = False,
+    ) -> m2.SuccessorTransitionV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        expected_project_head_id = _v2_resource_id(
+            expected_project_head_id,
+            label="expected project head",
+        )
+        abandon_request_id = _v2_resource_id(
+            abandon_request_id,
+            label="successor abandon request",
+        )
+        if expected_transition_attempt_id is not None:
+            expected_transition_attempt_id = _v2_resource_id(
+                expected_transition_attempt_id,
+                label="successor transition attempt",
+            )
+        if (successor is None) != (commit is None):
+            raise ValueError("v2 evolution abandon successor receipt is incomplete")
+        if successor is not None:
+            successor = _validate_v2_model(m2.ProjectHeadRefV2, successor)
+        if commit is not None:
+            commit = _validate_v2_model(AtomicSuccessorCommitV2, commit)
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            reference = transition.transition
+            admission = reference.task_admission
+            if (
+                admission is None
+                or expected_project_head_id != reference.predecessor_project_head.project_head_id
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor abandonment no longer matches its predecessor"
+                )
+            task = _load_v2_task_closure(connection, admission.task_id)
+            authority = _load_v2_project_authority(connection, reference.project_id)
+            abandon_receipt = _load_v2_successor_abandon_receipt(
+                connection,
+                successor_transition_id,
+            )
+            legacy_abandon = _load_v2_legacy_successor_abandon_exemption(
+                connection,
+                successor_transition_id,
+            )
+            if abandon_receipt is not None and legacy_abandon is not None:
+                raise ScienceTaskStoreV2Error("v2 successor exposes conflicting abandon authority")
+            if legacy_abandon is not None:
+                legacy_attempts = _load_v2_successor_transition_attempts(
+                    connection,
+                    successor_transition_id,
+                )
+                if (
+                    transition.state != "cancelled"
+                    or legacy_abandon.expected_project_head_id
+                    != reference.predecessor_project_head.project_head_id
+                    or legacy_attempts[-1].transition_attempt_id
+                    != legacy_abandon.transition_attempt_id
+                    or legacy_attempts[-1].state != "failed"
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "legacy v2 successor abandon authority is inconsistent"
+                    )
+            if transition.state == "cancelled" and allow_cancelled_recovery:
+                if (
+                    abandon_receipt is None
+                    or abandon_receipt.abandon_request_id != abandon_request_id
+                    or abandon_receipt.expected_project_head_id != expected_project_head_id
+                ):
+                    raise ScienceTaskTerminalV2(
+                        "cancelled v2 successor belongs to another abandon action"
+                    )
+                _require_v2_successor_transition_attempt(
+                    connection,
+                    successor_transition_id=(successor_transition_id),
+                    expected_transition_attempt_id=(abandon_receipt.transition_attempt_id),
+                    expected_state="failed",
+                )
+                cleanup_receipt = _load_v2_successor_cleanup_receipt(
+                    connection,
+                    successor_transition_id,
+                )
+                expected_blockers = (
+                    (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                    if cleanup_receipt is None
+                    else ()
+                )
+                if (
+                    task.state != "completed"
+                    or reference.successor_project_head is None
+                    or authority.active_project_head != reference.successor_project_head
+                    or authority.blockers != expected_blockers
+                ):
+                    raise ScienceTaskPreconditionFailedV2(
+                        "v2 successor abandonment authority changed"
+                    )
+                existing = _load_v2_successor_commit(
+                    connection,
+                    successor_transition_id,
+                )
+                if type(existing.manifest) is not AtomicEvolutionAbandonManifestV2:
+                    raise ScienceTaskStoreV2Error(
+                        "cancelled v2 successor has the wrong publication receipt"
+                    )
+                return transition
+            if abandon_receipt is not None:
+                raise ScienceTaskStoreV2Error(
+                    "non-cancelled v2 successor exposes an abandon receipt"
+                )
+            if expected_transition_attempt_id is None:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 evolution abandon lacks its failed attempt fence"
+                )
+            failed_attempt = _require_v2_successor_transition_attempt(
+                connection,
+                successor_transition_id=successor_transition_id,
+                expected_transition_attempt_id=(expected_transition_attempt_id),
+                expected_state="failed",
+            )
+            if (
+                transition.state != "failed"
+                or task.state != "failed"
+                or task.successor_transition != reference
+                or authority.active_project_head != reference.predecessor_project_head
+                or authority.blockers != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+            ):
+                raise ScienceTaskTerminalV2("v2 successor transition cannot be abandoned")
+            if successor is None or commit is None:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 evolution abandon lacks its accepted workspace publication"
+                )
+            if type(commit.manifest) is not AtomicEvolutionAbandonManifestV2:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 evolution abandon has the wrong atomic receipt"
+                )
+            timestamp = _v2_successor_timestamp(transition, now)
+            abandoned_reference = m2.SuccessorTransitionRefV2.model_validate(
+                {
+                    **reference.model_dump(mode="python"),
+                    "successor_project_head": successor,
+                }
+            )
+            cancelled_transition = _replace_v2_successor_transition(
+                transition,
+                transition=abandoned_reference,
+                state="cancelled",
+                error=None,
+                updated_at=timestamp,
+            )
+            completed_task = _replace_v2_task(
+                task,
+                successor_transition=abandoned_reference,
+                state="completed",
+                updated_at=timestamp,
+            )
+            next_authority = ScienceProjectAdmissionAuthorityV2(
+                project_id=authority.project_id,
+                active_project_head=successor,
+                project_config_sha256=authority.project_config_sha256,
+                workspace_snapshot=successor.workspace_snapshot,
+                normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
+                blockers=(ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,),
+            )
             _validate_v2_successor_commit_closure(
+                connection=connection,
                 task=task,
                 transition=transition,
                 successor=successor,
@@ -1943,10 +2598,364 @@ class ScienceTaskStoreV2:
             _store_v2_project_head(connection, successor)
             connection.execute(
                 "INSERT INTO successor_commits("
-                "successor_transition_id, manifest_sha256, commit_json) "
-                "VALUES (?, ?, ?)",
+                "successor_transition_id, successor_project_head_id, "
+                "composition_semantics_version, legacy_manifest_sha256, "
+                "manifest_sha256, commit_json) "
+                "VALUES (?, ?, 2, NULL, ?, ?)",
                 (
                     successor_transition_id,
+                    successor.project_head_id,
+                    commit.manifest_sha256,
+                    _v2_model_bytes(commit),
+                ),
+            )
+            connection.execute(
+                "UPDATE successor_transitions SET transition_json = ?, "
+                "resource_version = resource_version + 1 "
+                "WHERE successor_transition_id = ?",
+                (_v2_model_bytes(cancelled_transition), successor_transition_id),
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, closed = 1, "
+                "resource_version = resource_version + 1 WHERE task_id = ?",
+                (_v2_model_bytes(completed_task), task.task_id),
+            )
+            connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(next_authority), authority.project_id),
+            )
+            connection.execute(
+                "INSERT INTO successor_abandon_receipts("
+                "successor_transition_id, abandon_request_id, "
+                "expected_project_head_id, transition_attempt_id"
+                ") VALUES (?, ?, ?, ?)",
+                (
+                    successor_transition_id,
+                    abandon_request_id,
+                    expected_project_head_id,
+                    failed_attempt.transition_attempt_id,
+                ),
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.ProjectHeadActivatedEventV2,
+                event_type="project_head_activated",
+                project_id=successor.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "successor_transition_id": successor_transition_id,
+                    "project_head": successor,
+                },
+            )
+            _append_v2_event(
+                connection,
+                model_type=m2.TransitionChangedEventV2,
+                event_type="transition_changed",
+                project_id=reference.project_id,
+                task_id=task.task_id,
+                occurred_at=timestamp,
+                payload={
+                    "transition": abandoned_reference,
+                    "state": cancelled_transition.state,
+                    "progress_completed": cancelled_transition.progress_completed,
+                    "progress_total": cancelled_transition.progress_total,
+                },
+            )
+            return _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+
+    def successor_abandon_evidence(
+        self,
+        successor_transition_id: str,
+    ) -> tuple[m2.SuccessorTransitionV2, ScienceSuccessorPlanV2]:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            if transition.state != "failed":
+                raise ScienceTaskTerminalV2("v2 successor transition is not ready to abandon")
+            row = connection.execute(
+                "SELECT plan_sha256, plan_json FROM successor_transitions "
+                "WHERE successor_transition_id = ?",
+                (successor_transition_id,),
+            ).fetchone()
+            if row is None:
+                raise ScienceTaskNotFoundV2("v2 successor transition was not found")
+            plan = _v2_model_from_bytes(
+                ScienceSuccessorPlanV2,
+                bytes(row["plan_json"]),
+            )
+            if science_successor_plan_sha256(plan) != row["plan_sha256"]:
+                raise ScienceTaskStoreV2Error("persisted v2 successor plan digest is inconsistent")
+            return transition, plan
+
+    def successor_cleanup_evidence(
+        self,
+        successor_transition_id: str,
+    ) -> tuple[m2.SuccessorTransitionV2, ScienceSuccessorPlanV2]:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            if transition.state != "cancelled":
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor transition has no abandoned cleanup authority"
+                )
+            row = connection.execute(
+                "SELECT plan_sha256 FROM successor_transitions WHERE successor_transition_id = ?",
+                (successor_transition_id,),
+            ).fetchone()
+            plan_payload = _load_guarded_v2_blob(
+                connection,
+                table="successor_transitions",
+                key_column="successor_transition_id",
+                key=successor_transition_id,
+                blob_column="plan_json",
+                label="cancelled v2 successor plan",
+            )
+            if row is None or plan_payload is None:
+                raise ScienceTaskNotFoundV2("v2 successor transition was not found")
+            plan = _v2_model_from_bytes(
+                ScienceSuccessorPlanV2,
+                plan_payload,
+            )
+            if science_successor_plan_sha256(plan) != row["plan_sha256"]:
+                raise ScienceTaskStoreV2Error(
+                    "persisted cancelled v2 successor plan digest is inconsistent"
+                )
+            return transition, plan
+
+    def successor_cleanup_receipt(
+        self,
+        successor_transition_id: str,
+    ) -> ScienceSuccessorCleanupReceiptV2 | None:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            return _load_v2_successor_cleanup_receipt(
+                connection,
+                successor_transition_id,
+            )
+
+    def pending_successor_cleanup_ids(self) -> list[str]:
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT successor_transition_id FROM "
+                "successor_transitions ORDER BY successor_transition_id "
+                "LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor transition inventory exceeds its bound"
+                )
+            pending: list[str] = []
+            for row in rows:
+                transition_id = str(row["successor_transition_id"])
+                transition = _load_v2_successor_transition(
+                    connection,
+                    transition_id,
+                )
+                receipt = _load_v2_successor_cleanup_receipt(
+                    connection,
+                    transition_id,
+                )
+                if transition.state == "cancelled":
+                    if receipt is None:
+                        pending.append(transition_id)
+                elif receipt is not None:
+                    raise ScienceTaskStoreV2Error(
+                        "non-cancelled v2 successor exposes a cleanup receipt"
+                    )
+            return pending
+
+    def record_successor_cleanup(
+        self,
+        receipt: ScienceSuccessorCleanupReceiptV2,
+    ) -> ScienceSuccessorCleanupReceiptV2:
+        receipt = _validate_v2_model(
+            ScienceSuccessorCleanupReceiptV2,
+            receipt,
+        )
+        payload = _v2_model_bytes(receipt)
+        payload_sha256 = hashlib.sha256(payload).hexdigest()
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                receipt.successor_transition_id,
+            )
+            if transition.state != "cancelled":
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor cleanup requires a cancelled transition"
+                )
+            existing = _load_v2_successor_cleanup_receipt(
+                connection,
+                receipt.successor_transition_id,
+            )
+            if existing is not None:
+                if existing != receipt:
+                    raise ScienceTaskPreconditionFailedV2(
+                        "v2 successor cleanup receipt is immutable"
+                    )
+                return existing
+            successor = transition.transition.successor_project_head
+            if successor is None:
+                raise ScienceTaskStoreV2Error("cancelled v2 successor has no published head")
+            authority = _load_v2_project_authority(
+                connection,
+                transition.transition.project_id,
+            )
+            if authority.active_project_head != successor or authority.blockers != (
+                ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor cleanup no longer owns readiness"
+                )
+            connection.execute(
+                "INSERT INTO successor_cleanup_receipts("
+                "successor_transition_id, receipt_sha256, receipt_json"
+                ") VALUES (?, ?, ?)",
+                (
+                    receipt.successor_transition_id,
+                    payload_sha256,
+                    payload,
+                ),
+            )
+            ready_authority = ScienceProjectAdmissionAuthorityV2(
+                project_id=authority.project_id,
+                active_project_head=authority.active_project_head,
+                project_config_sha256=(authority.project_config_sha256),
+                workspace_snapshot=(authority.workspace_snapshot),
+                normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
+                blockers=(),
+            )
+            updated = connection.execute(
+                "UPDATE project_admission_authorities "
+                "SET authority_json = ?, "
+                "resource_version = resource_version + 1 "
+                "WHERE project_id = ?",
+                (
+                    _v2_authority_bytes(ready_authority),
+                    authority.project_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor cleanup lost project readiness authority"
+                )
+            stored = _load_v2_successor_cleanup_receipt(
+                connection,
+                receipt.successor_transition_id,
+            )
+            if stored != receipt:
+                raise ScienceTaskStoreV2Error("v2 successor cleanup receipt changed during commit")
+            if (
+                _load_v2_project_authority(
+                    connection,
+                    authority.project_id,
+                )
+                != ready_authority
+            ):
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor cleanup readiness changed during commit"
+                )
+            return stored
+
+    def commit_successor_transition(
+        self,
+        successor_transition_id: str,
+        *,
+        expected_transition_attempt_id: str,
+        successor: m2.ProjectHeadRefV2,
+        commit: AtomicSuccessorCommitV2,
+        now: datetime,
+    ) -> m2.SuccessorTransitionV2:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        expected_transition_attempt_id = _v2_resource_id(
+            expected_transition_attempt_id,
+            label="successor transition attempt",
+        )
+        successor = _validate_v2_model(m2.ProjectHeadRefV2, successor)
+        commit = _validate_v2_model(AtomicSuccessorCommitV2, commit)
+        with self._lock, self._transaction() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            timestamp = _v2_successor_timestamp(transition, now)
+            if transition.state != "committing":
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor transition is not ready to commit"
+                )
+            active_attempt = _require_v2_successor_transition_attempt(
+                connection,
+                successor_transition_id=successor_transition_id,
+                expected_transition_attempt_id=(expected_transition_attempt_id),
+                expected_state="running",
+            )
+            reference = transition.transition
+            if reference.task_admission is None or reference.accepted_attempt is None:
+                raise ScienceTaskStoreV2Error("v2 run-result transition lost its Task ownership")
+            task = _load_v2_task_closure(
+                connection,
+                reference.task_admission.task_id,
+            )
+            authority = _load_v2_project_authority(connection, task.project_id)
+            if (
+                task.state != "waiting_for_successor"
+                or task.authoritative_attempt_id != reference.accepted_attempt.attempt_id
+                or task.successor_transition != reference
+                or authority.active_project_head != reference.predecessor_project_head
+                or authority.blockers != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+            ):
+                raise ScienceTaskPreconditionFailedV2("v2 successor commit authority changed")
+            _validate_v2_successor_commit_closure(
+                connection=connection,
+                task=task,
+                transition=transition,
+                successor=successor,
+                commit=commit,
+            )
+            if (
+                int(connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0])
+                >= _MAX_V2_PROJECT_HEADS
+            ):
+                raise ScienceTaskConflictV2("v2 project-head capacity is exhausted")
+
+            _before_v2_successor_commit(
+                successor_transition_id,
+                successor,
+                commit,
+            )
+            _store_v2_project_head(connection, successor)
+            connection.execute(
+                "INSERT INTO successor_commits("
+                "successor_transition_id, successor_project_head_id, "
+                "composition_semantics_version, legacy_manifest_sha256, "
+                "manifest_sha256, commit_json) "
+                "VALUES (?, ?, 2, NULL, ?, ?)",
+                (
+                    successor_transition_id,
+                    successor.project_head_id,
                     commit.manifest_sha256,
                     _v2_model_bytes(commit),
                 ),
@@ -1963,6 +2972,12 @@ class ScienceTaskStoreV2:
                 state="committed",
                 progress_completed=transition.progress_total,
                 error=None,
+                updated_at=timestamp,
+            )
+            committed_attempt = _replace_v2_successor_transition_attempt(
+                active_attempt,
+                state="committed",
+                commit_manifest_sha256=commit.manifest_sha256,
                 updated_at=timestamp,
             )
             completed_task = _replace_v2_task(
@@ -1989,6 +3004,10 @@ class ScienceTaskStoreV2:
                 "UPDATE tasks SET task_json = ?, closed = 1, "
                 "resource_version = resource_version + 1 WHERE task_id = ?",
                 (_v2_model_bytes(completed_task), task.task_id),
+            )
+            _store_v2_successor_transition_attempt(
+                connection,
+                committed_attempt,
             )
             connection.execute(
                 "UPDATE project_admission_authorities SET authority_json = ?, "
@@ -2064,6 +3083,72 @@ class ScienceTaskStoreV2:
                 successor_transition_id,
             )
 
+    def successor_transition_attempts(
+        self,
+        successor_transition_id: str,
+    ) -> list[ScienceSuccessorTransitionAttemptV2]:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            return _load_v2_successor_transition_attempts(
+                connection,
+                successor_transition_id,
+            )
+
+    def current_successor_transition_attempt(
+        self,
+        successor_transition_id: str,
+    ) -> ScienceSuccessorTransitionAttemptV2:
+        return self.successor_transition_attempts(successor_transition_id)[-1]
+
+    def successor_retry_evidence(
+        self,
+        successor_transition_id: str,
+    ) -> tuple[
+        m2.SuccessorTransitionV2,
+        ScienceSuccessorPlanV2,
+        m2.DatasetSealedEventV2 | None,
+    ]:
+        successor_transition_id = _v2_resource_id(
+            successor_transition_id,
+            label="successor transition",
+        )
+        with self._lock, self._reader() as connection:
+            transition = _load_v2_successor_transition(
+                connection,
+                successor_transition_id,
+            )
+            if transition.state not in {"pending", "running_methods"}:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 successor transition is not ready to resume"
+                )
+            row = connection.execute(
+                "SELECT task_id, plan_sha256, plan_json "
+                "FROM successor_transitions WHERE successor_transition_id = ?",
+                (successor_transition_id,),
+            ).fetchone()
+            if row is None:
+                raise ScienceTaskNotFoundV2("v2 successor transition was not found")
+            plan = _v2_model_from_bytes(
+                ScienceSuccessorPlanV2,
+                bytes(row["plan_json"]),
+            )
+            if science_successor_plan_sha256(plan) != row["plan_sha256"]:
+                raise ScienceTaskStoreV2Error("persisted v2 successor plan digest is inconsistent")
+            dataset_event = _load_v2_dataset_event_for_task(
+                connection,
+                str(row["task_id"]),
+            )
+            if (transition.state == "pending") != (dataset_event is None):
+                raise ScienceTaskStoreV2Error("v2 successor resume checkpoint is inconsistent")
+            return transition, plan, dataset_event
+
     def list_successor_transitions(
         self,
         project_id: str,
@@ -2124,16 +3209,23 @@ class ScienceTaskStoreV2:
                 (successor_transition_id,),
             ).fetchone()
             if row is None:
-                if transition.state == "committed":
+                if transition.state in {"committed", "cancelled"}:
                     raise ScienceTaskStoreV2Error(
-                        "committed v2 successor transition has no commit receipt"
+                        "published v2 successor transition has no commit receipt"
                     )
                 return None
             commit = _v2_model_from_bytes(
                 AtomicSuccessorCommitV2,
                 bytes(row["commit_json"]),
             )
-            if row["manifest_sha256"] != commit.manifest_sha256 or transition.state != "committed":
+            valid_terminal = (
+                transition.state == "committed"
+                and type(commit.manifest) is AtomicSuccessorManifestV2
+            ) or (
+                transition.state == "cancelled"
+                and type(commit.manifest) is AtomicEvolutionAbandonManifestV2
+            )
+            if row["manifest_sha256"] != commit.manifest_sha256 or not valid_terminal:
                 raise ScienceTaskStoreV2Error("v2 successor commit row is inconsistent")
             return commit
 
@@ -2145,44 +3237,10 @@ class ScienceTaskStoreV2:
 
         project_head_id = _v2_resource_id(project_head_id, label="project head")
         with self._lock, self._reader() as connection:
-            head = _load_v2_project_head(connection, project_head_id)
-            rows = connection.execute(
-                "SELECT successor_transition_id, manifest_sha256, commit_json "
-                "FROM successor_commits ORDER BY successor_transition_id LIMIT ?",
-                (_MAX_V2_TASKS + 1,),
-            ).fetchall()
-            if len(rows) > _MAX_V2_TASKS:
-                raise ScienceTaskStoreV2Error("v2 successor commit inventory exceeds its bound")
-            matches: list[AtomicSuccessorCommitV2] = []
-            for row in rows:
-                commit = _v2_model_from_bytes(
-                    AtomicSuccessorCommitV2,
-                    bytes(row["commit_json"]),
-                )
-                if row["manifest_sha256"] != commit.manifest_sha256:
-                    raise ScienceTaskStoreV2Error("v2 successor commit digest is inconsistent")
-                if commit.manifest.successor_project_head_id == project_head_id:
-                    matches.append(commit)
-            if not matches:
-                if head.generation != 0:
-                    raise ScienceTaskStoreV2Error(
-                        "non-genesis v2 project head has no atomic successor receipt"
-                    )
-                return None
-            if len(matches) != 1:
-                raise ScienceTaskStoreV2Error(
-                    "v2 project head has multiple atomic successor receipts"
-                )
-            commit = matches[0]
-            if (
-                commit.manifest.project_id != head.project_id
-                or commit.manifest.successor_generation != head.generation
-                or commit.manifest.successor_manifest_sha256 != head.manifest_sha256
-            ):
-                raise ScienceTaskStoreV2Error(
-                    "v2 project head and atomic successor receipt differ"
-                )
-            return commit
+            return _load_v2_successor_commit_for_project_head(
+                connection,
+                project_head_id,
+            )
 
     def prior_dataset_artifact_ids_for_head(
         self,
@@ -2200,7 +3258,7 @@ class ScienceTaskStoreV2:
             seen_heads.add(current_id)
             head = self.get_project_head(current_id)
             commit = self.successor_commit_for_project_head(current_id)
-            if commit is not None:
+            if commit is not None and type(commit.manifest) is AtomicSuccessorManifestV2:
                 dataset_ids.append(commit.manifest.dataset_artifact_id)
             current_id = head.predecessor_project_head_id
         values = tuple(sorted(dataset_ids))
@@ -2222,6 +3280,22 @@ class ScienceTaskStoreV2:
                     bytes(row["transition_json"]),
                 )
                 if transition.state not in terminal:
+                    result.append(str(row["successor_transition_id"]))
+            return result
+
+    def resumable_successor_transition_ids(self) -> list[str]:
+        with self._lock, self._reader() as connection:
+            rows = connection.execute(
+                "SELECT successor_transition_id, transition_json "
+                "FROM successor_transitions ORDER BY successor_transition_id"
+            ).fetchall()
+            result: list[str] = []
+            for row in rows:
+                transition = _v2_model_from_bytes(
+                    m2.SuccessorTransitionV2,
+                    bytes(row["transition_json"]),
+                )
+                if transition.state in {"pending", "running_methods"}:
                     result.append(str(row["successor_transition_id"]))
             return result
 
@@ -3023,11 +4097,16 @@ class ScienceTaskStoreV2:
         task_id: str,
         request: m2.TaskActionRequestV2,
         *,
+        close_request_id: str,
         now: datetime,
         expected_etag: str | None = None,
         allow_closed_recovery: bool = False,
     ) -> m2.TaskV2:
         task_id = _v2_resource_id(task_id, label="task")
+        close_request_id = _v2_resource_id(
+            close_request_id,
+            label="Task close request",
+        )
         request = _validate_v2_model(m2.TaskActionRequestV2, request)
         if (
             expected_etag is not None
@@ -3038,6 +4117,27 @@ class ScienceTaskStoreV2:
             raise TypeError("v2 Task close recovery flag must be exact bool")
         with self._lock, self._transaction() as connection:
             task = _load_v2_task_closure(connection, task_id)
+            receipt = _load_v2_task_close_receipt(
+                connection,
+                task_id,
+            )
+            legacy_close = _load_v2_legacy_task_close_exemption(
+                connection,
+                task_id,
+            )
+            if receipt is not None and legacy_close is not None:
+                raise ScienceTaskStoreV2Error("v2 Task exposes conflicting close authority")
+            if receipt is not None and (
+                receipt.task_admission_id != task.admission.task_admission_id
+                or receipt.admission_sha256 != task.admission.admission_sha256
+            ):
+                raise ScienceTaskStoreV2Error("v2 Task close authority is inconsistent")
+            if legacy_close is not None and (
+                task.state != "closed"
+                or legacy_close.task_admission_id != task.admission.task_admission_id
+                or legacy_close.admission_sha256 != task.admission.admission_sha256
+            ):
+                raise ScienceTaskStoreV2Error("legacy v2 Task close authority is inconsistent")
             if (
                 request.task_admission_id != task.admission.task_admission_id
                 or request.admission_sha256 != task.admission.admission_sha256
@@ -3045,11 +4145,22 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskPreconditionFailedV2(
                     "v2 Task close does not bind the immutable admission"
                 )
-            if expected_etag is not None and task.etag != expected_etag:
-                if not (allow_closed_recovery and task.state == "closed"):
-                    raise ScienceTaskETagChangedV2("v2 Task ETag changed")
             if task.state == "closed":
-                return task
+                if allow_closed_recovery and receipt == _TaskCloseReceiptV2(
+                    task_id=task.task_id,
+                    close_request_id=close_request_id,
+                    expected_etag=expected_etag,
+                    task_admission_id=(request.task_admission_id),
+                    admission_sha256=(request.admission_sha256),
+                ):
+                    return task
+                if expected_etag is not None and task.etag != expected_etag:
+                    raise ScienceTaskETagChangedV2("v2 Task ETag changed")
+                raise ScienceTaskTerminalV2("closed v2 Task belongs to another close action")
+            if receipt is not None or legacy_close is not None:
+                raise ScienceTaskStoreV2Error("non-closed v2 Task exposes a close receipt")
+            if expected_etag is not None and task.etag != expected_etag:
+                raise ScienceTaskETagChangedV2("v2 Task ETag changed")
             if task.authoritative_attempt_id is not None or task.successor_transition is not None:
                 raise ScienceTaskTerminalV2(
                     "authoritative v2 Task ownership cannot be closed or rewritten"
@@ -3063,6 +4174,19 @@ class ScienceTaskStoreV2:
                 "UPDATE tasks SET task_json = ?, closed = 1, "
                 "resource_version = resource_version + 1 WHERE task_id = ?",
                 (_v2_model_bytes(updated), task.task_id),
+            )
+            connection.execute(
+                "INSERT INTO task_close_receipts("
+                "task_id, close_request_id, expected_etag, "
+                "task_admission_id, admission_sha256"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    task.task_id,
+                    close_request_id,
+                    expected_etag,
+                    request.task_admission_id,
+                    request.admission_sha256,
+                ),
             )
             return _load_v2_task_closure(connection, task.task_id)
 
@@ -3190,6 +4314,17 @@ class ScienceTaskStoreV2:
             ).fetchone()
             if row is None or int(row["schema_version"]) != 2:
                 raise ScienceTaskStoreV2Error("v2 science task schema identity is invalid")
+            if not _v2_action_receipt_schema_preexisting(connection):
+                raise ScienceTaskStoreV2Error("v2 action receipt authority schema is missing")
+            receipt_migration_rows = connection.execute(
+                "SELECT singleton, migration_version FROM action_receipt_migrations LIMIT 2"
+            ).fetchall()
+            if (
+                len(receipt_migration_rows) != 1
+                or int(receipt_migration_rows[0]["singleton"]) != 1
+                or int(receipt_migration_rows[0]["migration_version"]) != 1
+            ):
+                raise ScienceTaskStoreV2Error("v2 action receipt migration authority is invalid")
             authorities = connection.execute(
                 "SELECT project_id, authority_json FROM project_admission_authorities "
                 "ORDER BY project_id LIMIT ?",
@@ -3237,6 +4372,24 @@ class ScienceTaskStoreV2:
                     for item in head_rows
                 ]
                 _validate_v2_project_head_chain(heads)
+                for head in heads:
+                    commit = (
+                        _load_v2_successor_commit_for_project_head(
+                            connection,
+                            head.project_head_id,
+                        )
+                    )
+                    if (
+                        head.generation == 0
+                        and commit is not None
+                    ) or (
+                        head.generation > 0
+                        and commit is None
+                    ):
+                        raise ScienceTaskStoreV2Error(
+                            "v2 project head lacks exact "
+                            "successor receipt authority"
+                        )
                 if not heads or heads[-1] != authority.active_project_head:
                     raise ScienceTaskStoreV2Error(
                         "v2 project authority is not the project-head tip"
@@ -3248,7 +4401,77 @@ class ScienceTaskStoreV2:
             if len(tasks) > _MAX_V2_TASKS:
                 raise ScienceTaskStoreV2Error("v2 Task inventory exceeds its bound")
             for task_row in tasks:
-                _load_v2_task_closure(connection, str(task_row["task_id"]))
+                task = _load_v2_task_closure(
+                    connection,
+                    str(task_row["task_id"]),
+                )
+                close_receipt = _load_v2_task_close_receipt(
+                    connection,
+                    task.task_id,
+                )
+                legacy_close = _load_v2_legacy_task_close_exemption(
+                    connection,
+                    task.task_id,
+                )
+                if task.state == "closed":
+                    if (close_receipt is None) == (legacy_close is None):
+                        raise ScienceTaskStoreV2Error(
+                            "closed v2 Task lacks exactly one close authority receipt"
+                        )
+                elif close_receipt is not None or legacy_close is not None:
+                    raise ScienceTaskStoreV2Error("non-closed v2 Task exposes close authority")
+            close_receipt_rows = connection.execute(
+                "SELECT task_id FROM task_close_receipts ORDER BY task_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(close_receipt_rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error("v2 Task close receipt inventory exceeds its bound")
+            for close_receipt_row in close_receipt_rows:
+                task_id = str(close_receipt_row["task_id"])
+                receipt = _load_v2_task_close_receipt(
+                    connection,
+                    task_id,
+                )
+                task = _load_v2_task_closure(
+                    connection,
+                    task_id,
+                )
+                if (
+                    receipt is None
+                    or task.state != "closed"
+                    or receipt.task_admission_id != task.admission.task_admission_id
+                    or receipt.admission_sha256 != task.admission.admission_sha256
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "v2 Task close receipt has no exact closed authority"
+                    )
+            legacy_close_rows = connection.execute(
+                "SELECT task_id FROM legacy_task_close_exemptions ORDER BY task_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(legacy_close_rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "legacy v2 Task close exemption inventory exceeds its bound"
+                )
+            for legacy_close_row in legacy_close_rows:
+                task_id = str(legacy_close_row["task_id"])
+                exemption = _load_v2_legacy_task_close_exemption(
+                    connection,
+                    task_id,
+                )
+                task = _load_v2_task_closure(
+                    connection,
+                    task_id,
+                )
+                if (
+                    exemption is None
+                    or task.state != "closed"
+                    or exemption.task_admission_id != task.admission.task_admission_id
+                    or exemption.admission_sha256 != task.admission.admission_sha256
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "legacy v2 Task close exemption has no exact closed authority"
+                    )
             execution_rows = connection.execute(
                 "SELECT attempt_id FROM attempt_executions ORDER BY attempt_id LIMIT ?",
                 (_MAX_V2_TASKS * 100 + 1,),
@@ -3307,11 +4530,212 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskStoreV2Error(
                     "v2 successor transition inventory exceeds its bound"
                 )
+            successor_blocked_projects: set[str] = set()
             for transition_row in transition_rows:
-                _load_v2_successor_transition(
+                transition_id = str(transition_row["successor_transition_id"])
+                transition = _load_v2_successor_transition(
                     connection,
-                    str(transition_row["successor_transition_id"]),
+                    transition_id,
                 )
+                cleanup_receipt = _load_v2_successor_cleanup_receipt(
+                    connection,
+                    transition_id,
+                )
+                abandon_receipt = _load_v2_successor_abandon_receipt(
+                    connection,
+                    transition_id,
+                )
+                legacy_abandon = _load_v2_legacy_successor_abandon_exemption(
+                    connection,
+                    transition_id,
+                )
+                if transition.state == "cancelled":
+                    if (abandon_receipt is None) == (legacy_abandon is None):
+                        raise ScienceTaskStoreV2Error(
+                            "cancelled v2 successor lacks exactly one abandon authority receipt"
+                        )
+                elif abandon_receipt is not None or legacy_abandon is not None:
+                    raise ScienceTaskStoreV2Error(
+                        "non-cancelled v2 successor exposes abandon authority"
+                    )
+                if transition.state == "cancelled" and cleanup_receipt is None:
+                    successor = transition.transition.successor_project_head
+                    authority = _load_v2_project_authority(
+                        connection,
+                        transition.transition.project_id,
+                    )
+                    if (
+                        successor is None
+                        or authority.active_project_head != successor
+                        or authority.blockers
+                        != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                    ):
+                        raise ScienceTaskStoreV2Error(
+                            "pending v2 successor cleanup has no exact readiness blocker"
+                        )
+                elif transition.state != "cancelled" and cleanup_receipt is not None:
+                    raise ScienceTaskStoreV2Error(
+                        "non-cancelled v2 successor exposes a cleanup receipt"
+                    )
+                requires_successor_blocker = transition.state in {
+                    "pending",
+                    "sealing_dataset",
+                    "running_methods",
+                    "validating",
+                    "materializing",
+                    "committing",
+                    "failed",
+                } or (transition.state == "cancelled" and cleanup_receipt is None)
+                if requires_successor_blocker:
+                    reference = transition.transition
+                    task_admission = reference.task_admission
+                    if task_admission is None:
+                        raise ScienceTaskStoreV2Error(
+                            "v2 successor readiness blocker has no Task admission"
+                        )
+                    task = _load_v2_task_closure(
+                        connection,
+                        task_admission.task_id,
+                    )
+                    authority = _load_v2_project_authority(
+                        connection,
+                        reference.project_id,
+                    )
+                    expected_active_head = (
+                        reference.successor_project_head
+                        if transition.state == "cancelled"
+                        else reference.predecessor_project_head
+                    )
+                    expected_task_state = (
+                        "completed"
+                        if transition.state == "cancelled"
+                        else (
+                            "failed" if transition.state == "failed" else "waiting_for_successor"
+                        )
+                    )
+                    if (
+                        reference.project_id in successor_blocked_projects
+                        or expected_active_head is None
+                        or task.state != expected_task_state
+                        or authority.active_project_head != expected_active_head
+                        or authority.blockers
+                        != (ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,)
+                    ):
+                        raise ScienceTaskStoreV2Error(
+                            "v2 successor readiness blocker has no exact transition authority"
+                        )
+                    successor_blocked_projects.add(reference.project_id)
+            observed_successor_blocked_projects = {
+                str(authority_row["project_id"])
+                for authority_row in authorities
+                if (
+                    ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION
+                    in _v2_authority_from_bytes(bytes(authority_row["authority_json"])).blockers
+                )
+            }
+            if observed_successor_blocked_projects != successor_blocked_projects:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor readiness blocker has no exact transition authority"
+                )
+            cleanup_rows = connection.execute(
+                "SELECT successor_transition_id FROM "
+                "successor_cleanup_receipts "
+                "ORDER BY successor_transition_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(cleanup_rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor cleanup receipt inventory exceeds its bound"
+                )
+            for cleanup_row in cleanup_rows:
+                transition_id = str(cleanup_row["successor_transition_id"])
+                receipt = _load_v2_successor_cleanup_receipt(
+                    connection,
+                    transition_id,
+                )
+                transition = _load_v2_successor_transition(
+                    connection,
+                    transition_id,
+                )
+                if receipt is None or transition.state != "cancelled":
+                    raise ScienceTaskStoreV2Error(
+                        "v2 successor cleanup receipt has no exact cancelled authority"
+                    )
+            abandon_rows = connection.execute(
+                "SELECT successor_transition_id FROM "
+                "successor_abandon_receipts "
+                "ORDER BY successor_transition_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(abandon_rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor abandon receipt inventory exceeds its bound"
+                )
+            for abandon_row in abandon_rows:
+                transition_id = str(abandon_row["successor_transition_id"])
+                receipt = _load_v2_successor_abandon_receipt(
+                    connection,
+                    transition_id,
+                )
+                transition = _load_v2_successor_transition(
+                    connection,
+                    transition_id,
+                )
+                attempts = _load_v2_successor_transition_attempts(
+                    connection,
+                    transition_id,
+                )
+                commit = _load_v2_successor_commit(
+                    connection,
+                    transition_id,
+                )
+                if (
+                    receipt is None
+                    or transition.state != "cancelled"
+                    or type(commit.manifest) is not AtomicEvolutionAbandonManifestV2
+                    or receipt.expected_project_head_id
+                    != transition.transition.predecessor_project_head.project_head_id
+                    or attempts[-1].transition_attempt_id != receipt.transition_attempt_id
+                    or attempts[-1].state != "failed"
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "v2 successor abandon receipt has no exact cancelled authority"
+                    )
+            legacy_abandon_rows = connection.execute(
+                "SELECT successor_transition_id FROM "
+                "legacy_successor_abandon_exemptions "
+                "ORDER BY successor_transition_id LIMIT ?",
+                (_MAX_V2_TASKS + 1,),
+            ).fetchall()
+            if len(legacy_abandon_rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "legacy v2 successor abandon exemption inventory exceeds its bound"
+                )
+            for legacy_abandon_row in legacy_abandon_rows:
+                transition_id = str(legacy_abandon_row["successor_transition_id"])
+                exemption = _load_v2_legacy_successor_abandon_exemption(
+                    connection,
+                    transition_id,
+                )
+                transition = _load_v2_successor_transition(
+                    connection,
+                    transition_id,
+                )
+                attempts = _load_v2_successor_transition_attempts(
+                    connection,
+                    transition_id,
+                )
+                if (
+                    exemption is None
+                    or transition.state != "cancelled"
+                    or exemption.expected_project_head_id
+                    != transition.transition.predecessor_project_head.project_head_id
+                    or attempts[-1].transition_attempt_id != exemption.transition_attempt_id
+                    or attempts[-1].state != "failed"
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "legacy v2 successor abandon exemption has no exact cancelled authority"
+                    )
             append_rows = connection.execute(
                 "SELECT task_id, idempotency_key, request_sha256, request_json, "
                 "attempt_id "
@@ -3424,6 +4848,159 @@ class ScienceTaskStoreV2:
         return connection
 
 
+def _execute_v2_schema(connection: sqlite3.Connection) -> None:
+    statement = ""
+    for line in _V2_SCHEMA.splitlines(keepends=True):
+        statement += line
+        if not sqlite3.complete_statement(statement):
+            continue
+        sql = statement.strip()
+        if sql:
+            connection.execute(sql)
+        statement = ""
+    if statement.strip():
+        raise ScienceTaskStoreV2Error("v2 science task schema script is incomplete")
+
+
+def _v2_action_receipt_schema_rows(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[object, ...], ...]:
+    placeholders = ", ".join("?" for _ in _V2_ACTION_RECEIPT_SCHEMA_TABLES)
+    rows = connection.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_schema "
+        f"WHERE name IN ({placeholders}) "
+        f"OR tbl_name IN ({placeholders}) "
+        "ORDER BY type, name",
+        (
+            *sorted(_V2_ACTION_RECEIPT_SCHEMA_TABLES),
+            *sorted(_V2_ACTION_RECEIPT_SCHEMA_TABLES),
+        ),
+    ).fetchall()
+    return tuple(tuple(row) for row in rows)
+
+
+def _expected_v2_action_receipt_schema_rows() -> tuple[tuple[object, ...], ...]:
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(_V2_SCHEMA)
+        return _v2_action_receipt_schema_rows(connection)
+    finally:
+        connection.close()
+
+
+def _v2_action_receipt_schema_preexisting(
+    connection: sqlite3.Connection,
+) -> bool:
+    rows = _v2_action_receipt_schema_rows(connection)
+    present = {str(row[1]) for row in rows if row[0] == "table"}
+    if present and present != _V2_ACTION_RECEIPT_SCHEMA_TABLES:
+        raise ScienceTaskStoreV2Error(
+            "v2 action receipt authority schema is only partially present"
+        )
+    if present and rows != _expected_v2_action_receipt_schema_rows():
+        raise ScienceTaskStoreV2Error("v2 action receipt authority schema fingerprint is invalid")
+    return bool(present)
+
+
+def _migrate_v2_action_receipt_authority(
+    connection: sqlite3.Connection,
+    *,
+    schema_preexisting: bool,
+) -> None:
+    marker_rows = connection.execute(
+        "SELECT singleton, migration_version FROM action_receipt_migrations LIMIT 2"
+    ).fetchall()
+    if schema_preexisting:
+        if (
+            len(marker_rows) != 1
+            or int(marker_rows[0]["singleton"]) != 1
+            or int(marker_rows[0]["migration_version"]) != 1
+        ):
+            raise ScienceTaskStoreV2Error("v2 action receipt migration authority is invalid")
+        return
+    if marker_rows:
+        raise ScienceTaskStoreV2Error("new v2 action receipt schema exposes a migration marker")
+
+    task_rows = connection.execute(
+        "SELECT task_id FROM tasks WHERE closed = 1 ORDER BY task_id LIMIT ?",
+        (_MAX_V2_TASKS + 1,),
+    ).fetchall()
+    if len(task_rows) > _MAX_V2_TASKS:
+        raise ScienceTaskStoreV2Error("legacy v2 Task receipt migration exceeds its bound")
+    for task_row in task_rows:
+        task = _load_v2_task_closure(
+            connection,
+            str(task_row["task_id"]),
+        )
+        if task.state != "closed":
+            continue
+        if (
+            _load_v2_task_close_receipt(
+                connection,
+                task.task_id,
+            )
+            is not None
+        ):
+            raise ScienceTaskStoreV2Error("legacy v2 Task unexpectedly exposes a close receipt")
+        connection.execute(
+            "INSERT INTO legacy_task_close_exemptions("
+            "task_id, task_admission_id, admission_sha256"
+            ") VALUES (?, ?, ?)",
+            (
+                task.task_id,
+                task.admission.task_admission_id,
+                task.admission.admission_sha256,
+            ),
+        )
+
+    transition_rows = connection.execute(
+        "SELECT successor_transition_id FROM "
+        "successor_transitions ORDER BY "
+        "successor_transition_id LIMIT ?",
+        (_MAX_V2_TASKS + 1,),
+    ).fetchall()
+    if len(transition_rows) > _MAX_V2_TASKS:
+        raise ScienceTaskStoreV2Error("legacy v2 successor receipt migration exceeds its bound")
+    for transition_row in transition_rows:
+        transition_id = str(transition_row["successor_transition_id"])
+        transition = _load_v2_successor_transition(
+            connection,
+            transition_id,
+        )
+        if transition.state != "cancelled":
+            continue
+        if (
+            _load_v2_successor_abandon_receipt(
+                connection,
+                transition_id,
+            )
+            is not None
+        ):
+            raise ScienceTaskStoreV2Error(
+                "legacy v2 successor unexpectedly exposes an abandon receipt"
+            )
+        attempts = _load_v2_successor_transition_attempts(
+            connection,
+            transition_id,
+        )
+        connection.execute(
+            "INSERT INTO "
+            "legacy_successor_abandon_exemptions("
+            "successor_transition_id, "
+            "expected_project_head_id, transition_attempt_id"
+            ") VALUES (?, ?, ?)",
+            (
+                transition_id,
+                transition.transition.predecessor_project_head.project_head_id,
+                attempts[-1].transition_attempt_id,
+            ),
+        )
+
+    connection.execute(
+        "INSERT INTO action_receipt_migrations(singleton, migration_version) VALUES (1, 1)"
+    )
+
+
 def _migrate_v2_attempt_execution_results(connection: sqlite3.Connection) -> None:
     columns = {
         str(row["name"])
@@ -3439,6 +5016,110 @@ def _migrate_v2_attempt_execution_results(connection: sqlite3.Connection) -> Non
     connection.execute("ALTER TABLE attempt_executions ADD COLUMN session_result_json BLOB")
 
 
+def _backfill_v2_successor_transition_attempts(
+    connection: sqlite3.Connection,
+) -> None:
+    rows = connection.execute(
+        "SELECT successor_transition_id, transition_json "
+        "FROM successor_transitions ORDER BY successor_transition_id"
+    ).fetchall()
+    for row in rows:
+        transition_id = str(row["successor_transition_id"])
+        count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM successor_transition_attempts "
+                "WHERE successor_transition_id = ?",
+                (transition_id,),
+            ).fetchone()[0]
+        )
+        transition = _v2_model_from_bytes(
+            m2.SuccessorTransitionV2,
+            bytes(row["transition_json"]),
+        )
+        if not count:
+            digest = hashlib.sha256(f"{transition_id}\0initial".encode("utf-8")).hexdigest()
+            error = transition.error
+            if transition.state in {"failed", "cancelled", "superseded"}:
+                state = "failed"
+                if error is None:
+                    error = m2.ApiErrorV2(
+                        request_id=f"successor-error-{digest[:24]}",
+                        code="successor_transition_not_committed",
+                        http_status=503,
+                        message=("Core preserved a successor attempt that did not commit."),
+                        category="transition",
+                        retryable=False,
+                        repair_action="repair",
+                        next_action=("Inspect the preserved transition before continuing."),
+                    )
+            elif transition.state == "committed":
+                state = "committed"
+                error = None
+            else:
+                state = "running"
+                error = None
+            attempt = ScienceSuccessorTransitionAttemptV2(
+                transition_attempt_id=(f"successor-attempt-{digest[:32]}"),
+                successor_transition_id=transition_id,
+                ordinal=1,
+                retry_request_id="initial",
+                state=state,
+                error=error,
+                created_at=transition.created_at,
+                updated_at=transition.updated_at,
+            )
+            connection.execute(
+                "INSERT INTO successor_transition_attempts("
+                "transition_attempt_id, successor_transition_id, ordinal, "
+                "retry_request_id, attempt_json) VALUES (?, ?, ?, ?, ?)",
+                (
+                    attempt.transition_attempt_id,
+                    transition_id,
+                    attempt.ordinal,
+                    attempt.retry_request_id,
+                    _v2_model_bytes(attempt),
+                ),
+            )
+        attempts = _load_v2_successor_transition_attempts(
+            connection,
+            transition_id,
+        )
+        latest = attempts[-1]
+        admission = transition.transition.task_admission
+        dataset_event = (
+            None
+            if admission is None
+            else _load_v2_dataset_event_for_task_unchecked(
+                connection,
+                admission.task_id,
+            )
+        )
+        commit_row = connection.execute(
+            "SELECT manifest_sha256 FROM successor_commits WHERE successor_transition_id = ?",
+            (transition_id,),
+        ).fetchone()
+        changes: dict[str, object] = {}
+        if dataset_event is not None and latest.dataset_id is None:
+            changes.update(
+                dataset_id=dataset_event.dataset_id,
+                dataset_sha256=dataset_event.dataset_sha256,
+            )
+        if (
+            latest.state == "committed"
+            and commit_row is not None
+            and latest.commit_manifest_sha256 is None
+        ):
+            changes["commit_manifest_sha256"] = str(commit_row["manifest_sha256"])
+        if changes:
+            _store_v2_successor_transition_attempt(
+                connection,
+                _replace_v2_successor_transition_attempt(
+                    latest,
+                    **changes,
+                ),
+            )
+
+
 def _backfill_v2_project_heads(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         "SELECT authority_json FROM project_admission_authorities ORDER BY project_id"
@@ -3446,6 +5127,356 @@ def _backfill_v2_project_heads(connection: sqlite3.Connection) -> None:
     for row in rows:
         authority = _v2_authority_from_bytes(bytes(row["authority_json"]))
         _store_v2_project_head(connection, authority.active_project_head)
+
+
+def _load_guarded_v2_blob(
+    connection: sqlite3.Connection,
+    *,
+    table: str,
+    key_column: str,
+    key: str,
+    blob_column: str,
+    label: str,
+) -> bytes | None:
+    metadata = connection.execute(
+        f"SELECT length(CAST({blob_column} AS BLOB)) AS byte_size "
+        f"FROM {table} WHERE {key_column} = ?",
+        (key,),
+    ).fetchone()
+    if metadata is None:
+        return None
+    byte_size = int(metadata["byte_size"])
+    if byte_size <= 0 or byte_size > _MAX_DOCUMENT_BYTES:
+        raise ScienceTaskStoreV2Error(f"{label} exceeds its byte bound")
+    row = connection.execute(
+        f"SELECT CASE WHEN length(CAST({blob_column} AS BLOB)) = ? "
+        f"AND length(CAST({blob_column} AS BLOB)) <= ? "
+        f"THEN {blob_column} END AS payload FROM {table} "
+        f"WHERE {key_column} = ?",
+        (byte_size, _MAX_DOCUMENT_BYTES, key),
+    ).fetchone()
+    if row is None or row["payload"] is None:
+        raise ScienceTaskStoreV2Error(f"{label} changed during guarded read")
+    payload = bytes(row["payload"])
+    if len(payload) != byte_size:
+        raise ScienceTaskStoreV2Error(f"{label} byte length changed during guarded read")
+    return payload
+
+
+def _migrate_v2_successor_commit_authority(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute("PRAGMA table_info(successor_commits)").fetchall()
+    }
+    provenance_columns = {
+        "composition_semantics_version",
+        "legacy_manifest_sha256",
+    }
+    present_provenance = provenance_columns.intersection(columns)
+    if present_provenance and present_provenance != provenance_columns:
+        raise ScienceTaskStoreV2Error("v2 successor commit migration provenance is partial")
+    upgrading_legacy_schema = not present_provenance
+    if "successor_project_head_id" not in columns:
+        connection.execute(
+            "ALTER TABLE successor_commits ADD COLUMN successor_project_head_id TEXT"
+        )
+    if upgrading_legacy_schema:
+        connection.execute(
+            "ALTER TABLE successor_commits "
+            "ADD COLUMN composition_semantics_version INTEGER "
+            "CHECK (composition_semantics_version IN (1, 2))"
+        )
+        connection.execute(
+            "ALTER TABLE successor_commits "
+            "ADD COLUMN legacy_manifest_sha256 TEXT "
+            "CHECK (legacy_manifest_sha256 IS NULL OR "
+            "length(legacy_manifest_sha256) = 64)"
+        )
+    inventory = connection.execute(
+        "SELECT successor_transition_id, manifest_sha256, "
+        "successor_project_head_id, composition_semantics_version, "
+        "legacy_manifest_sha256, "
+        "length(CAST(commit_json AS BLOB)) AS byte_size "
+        "FROM successor_commits ORDER BY successor_transition_id LIMIT ?",
+        (_MAX_V2_TASKS + 1,),
+    ).fetchall()
+    if len(inventory) > _MAX_V2_TASKS:
+        raise ScienceTaskStoreV2Error("v2 successor commit inventory exceeds its bound")
+    aggregate_bytes = 0
+    ordered: list[
+        tuple[
+            str,
+            int,
+            str,
+            AtomicSuccessorCommitV2,
+            str | None,
+            int | None,
+            str | None,
+        ]
+    ] = []
+    for row in inventory:
+        byte_size = int(row["byte_size"])
+        aggregate_bytes += byte_size
+        if (
+            byte_size <= 0
+            or byte_size > _MAX_DOCUMENT_BYTES
+            or aggregate_bytes > _MAX_V2_SUCCESSOR_COMMIT_AGGREGATE_BYTES
+        ):
+            raise ScienceTaskStoreV2Error("v2 successor commit inventory exceeds its byte bound")
+        transition_id = str(row["successor_transition_id"])
+        payload = _load_guarded_v2_blob(
+            connection,
+            table="successor_commits",
+            key_column="successor_transition_id",
+            key=transition_id,
+            blob_column="commit_json",
+            label="v2 successor commit",
+        )
+        if payload is None:
+            raise ScienceTaskStoreV2Error("v2 successor commit disappeared during migration")
+        commit = _v2_model_from_bytes(
+            AtomicSuccessorCommitV2,
+            payload,
+        )
+        if (
+            commit.manifest_sha256 != row["manifest_sha256"]
+            or commit.manifest.successor_transition_id != transition_id
+        ):
+            raise ScienceTaskStoreV2Error("v2 successor commit row is inconsistent")
+        ordered.append(
+            (
+                commit.manifest.project_id,
+                commit.manifest.successor_generation,
+                transition_id,
+                commit,
+                (
+                    None
+                    if row["successor_project_head_id"] is None
+                    else str(row["successor_project_head_id"])
+                ),
+                (
+                    None
+                    if row["composition_semantics_version"] is None
+                    else int(row["composition_semantics_version"])
+                ),
+                (
+                    None
+                    if row["legacy_manifest_sha256"] is None
+                    else str(row["legacy_manifest_sha256"])
+                ),
+            )
+        )
+    ordered.sort(key=lambda item: (item[0], item[1], item[2]))
+    composition_by_head: dict[
+        str,
+        tuple[SuccessorArtifactContributionV2, ...],
+    ] = {}
+    for (
+        _project_id,
+        _generation,
+        transition_id,
+        commit,
+        indexed_head_id,
+        stored_semantics,
+        stored_legacy_manifest_sha256,
+    ) in ordered:
+        manifest = commit.manifest
+        if upgrading_legacy_schema:
+            semantics_version = (
+                1
+                if (
+                    type(manifest) is AtomicSuccessorManifestV2
+                    and manifest.runtime_context_source == "materialized_new"
+                    and not manifest.artifacts
+                )
+                else 2
+            )
+            legacy_manifest_sha256 = commit.manifest_sha256 if semantics_version == 1 else None
+        else:
+            semantics_version = stored_semantics
+            legacy_manifest_sha256 = stored_legacy_manifest_sha256
+            if (
+                semantics_version not in {1, 2}
+                or (
+                    semantics_version == 1
+                    and (
+                        legacy_manifest_sha256 is None
+                        or type(manifest) is not AtomicSuccessorManifestV2
+                    )
+                )
+                or (semantics_version == 2 and legacy_manifest_sha256 is not None)
+            ):
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor commit migration provenance is invalid"
+                )
+        successor_head = _load_v2_project_head(
+            connection,
+            manifest.successor_project_head_id,
+        )
+        predecessor_head = _load_v2_project_head(
+            connection,
+            manifest.predecessor_project_head_id,
+        )
+        if indexed_head_id is not None and indexed_head_id != manifest.successor_project_head_id:
+            raise ScienceTaskStoreV2Error("v2 successor commit project-head index is inconsistent")
+        predecessor_artifacts = composition_by_head.get(manifest.predecessor_project_head_id)
+        if predecessor_artifacts is None:
+            if (
+                predecessor_head.generation != 0
+                or predecessor_head.evolution_revision.artifact_count != 0
+            ):
+                raise ScienceTaskStoreV2Error(
+                    "v2 successor migration lacks predecessor composition"
+                )
+            predecessor_artifacts = ()
+        if len(predecessor_artifacts) != predecessor_head.evolution_revision.artifact_count:
+            raise ScienceTaskStoreV2Error("v2 predecessor artifact composition is incomplete")
+        artifacts = manifest.artifacts
+        if not artifacts and manifest.method_artifact_ids and semantics_version != 1:
+            raise ScienceTaskStoreV2Error("canonical v2 successor lost typed artifact provenance")
+        if not artifacts and manifest.method_artifact_ids and semantics_version == 1:
+            if type(manifest) is AtomicEvolutionAbandonManifestV2:
+                artifacts = tuple(
+                    item.model_copy(update={"origin": "inherited"})
+                    for item in predecessor_artifacts
+                )
+                if tuple(item.artifact_id for item in artifacts) != manifest.method_artifact_ids:
+                    raise ScienceTaskStoreV2Error("legacy evolution abandon artifacts changed")
+            else:
+                plan_payload = _load_guarded_v2_blob(
+                    connection,
+                    table="successor_transitions",
+                    key_column="successor_transition_id",
+                    key=transition_id,
+                    blob_column="plan_json",
+                    label="legacy v2 successor plan",
+                )
+                if plan_payload is None:
+                    raise ScienceTaskStoreV2Error("legacy v2 successor has no immutable plan")
+                plan = _v2_model_from_bytes(
+                    ScienceSuccessorPlanV2,
+                    plan_payload,
+                )
+                enabled = {item.target_id: item for item in plan.enabled_methods}
+                predecessor_by_target = {item.target_id: item for item in predecessor_artifacts}
+                full_targets = tuple(sorted(set(predecessor_by_target).union(enabled)))
+                if len(manifest.method_artifact_ids) == len(full_targets):
+                    target_ids = full_targets
+                elif len(manifest.method_artifact_ids) == len(enabled):
+                    target_ids = tuple(sorted(enabled))
+                else:
+                    raise ScienceTaskStoreV2Error("legacy v2 successor artifacts cannot be typed")
+                migrated_artifacts: list[SuccessorArtifactContributionV2] = []
+                for target_id, artifact_id in zip(
+                    target_ids,
+                    manifest.method_artifact_ids,
+                    strict=True,
+                ):
+                    method = enabled.get(target_id)
+                    if method is not None:
+                        migrated_artifacts.append(
+                            SuccessorArtifactContributionV2(
+                                target_id=target_id,
+                                artifact_id=artifact_id,
+                                artifact_type=(method.output_artifact_type),
+                                owner_successor_transition_id=(transition_id),
+                                origin="produced",
+                            )
+                        )
+                        continue
+                    inherited = predecessor_by_target.get(target_id)
+                    if inherited is None or inherited.artifact_id != artifact_id:
+                        raise ScienceTaskStoreV2Error("legacy inherited artifact identity changed")
+                    migrated_artifacts.append(inherited.model_copy(update={"origin": "inherited"}))
+                artifacts = tuple(migrated_artifacts)
+        if (
+            tuple(item.artifact_id for item in artifacts) != manifest.method_artifact_ids
+            or len(artifacts) != successor_head.evolution_revision.artifact_count
+        ):
+            raise ScienceTaskStoreV2Error("v2 successor artifact migration is incomplete")
+        migrated_manifest = type(manifest).model_validate(
+            manifest.model_copy(update={"artifacts": artifacts}).model_dump(mode="python")
+        )
+        if semantics_version == 1:
+            legacy_manifest = AtomicSuccessorManifestV2.model_validate(
+                migrated_manifest.model_copy(update={"artifacts": ()}).model_dump(mode="python")
+            )
+            if legacy_manifest_sha256 != atomic_successor_manifest_sha256(legacy_manifest):
+                raise ScienceTaskStoreV2Error("legacy v2 successor provenance digest differs")
+        migrated_commit = AtomicSuccessorCommitV2(
+            manifest_sha256=atomic_successor_manifest_sha256(migrated_manifest),
+            manifest=migrated_manifest,
+        )
+        if migrated_commit.manifest_sha256 != commit.manifest_sha256:
+            attempt_row = connection.execute(
+                "SELECT transition_attempt_id FROM "
+                "successor_transition_attempts "
+                "WHERE successor_transition_id = ? "
+                "ORDER BY ordinal DESC LIMIT 1",
+                (transition_id,),
+            ).fetchone()
+            if attempt_row is None:
+                raise ScienceTaskStoreV2Error("migrated v2 successor has no transition attempt")
+            attempt_id = str(attempt_row["transition_attempt_id"])
+            attempt_payload = _load_guarded_v2_blob(
+                connection,
+                table="successor_transition_attempts",
+                key_column="transition_attempt_id",
+                key=attempt_id,
+                blob_column="attempt_json",
+                label="legacy v2 successor attempt",
+            )
+            if attempt_payload is None:
+                raise ScienceTaskStoreV2Error("migrated v2 successor attempt disappeared")
+            attempt = _v2_model_from_bytes(
+                ScienceSuccessorTransitionAttemptV2,
+                attempt_payload,
+            )
+            if type(migrated_manifest) is AtomicSuccessorManifestV2:
+                if (
+                    attempt.state != "committed"
+                    or attempt.commit_manifest_sha256 != commit.manifest_sha256
+                ):
+                    raise ScienceTaskStoreV2Error("legacy v2 successor attempt receipt differs")
+            elif attempt.commit_manifest_sha256 is not None:
+                raise ScienceTaskStoreV2Error("legacy v2 abandon attempt exposes a commit receipt")
+        connection.execute(
+            "UPDATE successor_commits SET "
+            "successor_project_head_id = ?, "
+            "composition_semantics_version = ?, "
+            "legacy_manifest_sha256 = ?, manifest_sha256 = ?, "
+            "commit_json = ? WHERE successor_transition_id = ?",
+            (
+                migrated_manifest.successor_project_head_id,
+                semantics_version,
+                legacy_manifest_sha256,
+                migrated_commit.manifest_sha256,
+                _v2_model_bytes(migrated_commit),
+                transition_id,
+            ),
+        )
+        composition_by_head[migrated_manifest.successor_project_head_id] = (
+            migrated_manifest.artifacts
+        )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "successor_commits_project_head_idx "
+        "ON successor_commits(successor_project_head_id)"
+    )
+    if int(
+        connection.execute(
+            "SELECT COUNT(*) FROM successor_commits "
+            "WHERE successor_project_head_id IS NULL "
+            "OR composition_semantics_version IS NULL "
+            "OR (composition_semantics_version = 1 "
+            "AND legacy_manifest_sha256 IS NULL) "
+            "OR (composition_semantics_version = 2 "
+            "AND legacy_manifest_sha256 IS NOT NULL)"
+        ).fetchone()[0]
+    ):
+        raise ScienceTaskStoreV2Error("v2 successor commit project-head index is incomplete")
 
 
 def _load_v2_project_authority(
@@ -3603,20 +5634,33 @@ def _load_v2_successor_transition(
             "persisted v2 successor transition ownership is inconsistent"
         )
     commit_row = connection.execute(
-        "SELECT manifest_sha256, commit_json FROM successor_commits "
+        "SELECT composition_semantics_version, "
+        "legacy_manifest_sha256, manifest_sha256, commit_json "
+        "FROM successor_commits "
         "WHERE successor_transition_id = ?",
         (successor_transition_id,),
     ).fetchone()
-    if transition.state == "committed":
+    if transition.state in {"committed", "cancelled"}:
         if commit_row is None or reference.successor_project_head is None:
-            raise ScienceTaskStoreV2Error("committed v2 successor transition is incomplete")
+            raise ScienceTaskStoreV2Error("published v2 successor transition is incomplete")
         commit = _v2_model_from_bytes(
             AtomicSuccessorCommitV2,
             bytes(commit_row["commit_json"]),
         )
         if commit.manifest_sha256 != commit_row["manifest_sha256"]:
             raise ScienceTaskStoreV2Error("persisted v2 successor commit digest is inconsistent")
+        valid_receipt_kind = (
+            transition.state == "committed" and type(commit.manifest) is AtomicSuccessorManifestV2
+        ) or (
+            transition.state == "cancelled"
+            and type(commit.manifest) is AtomicEvolutionAbandonManifestV2
+        )
+        if not valid_receipt_kind:
+            raise ScienceTaskStoreV2Error(
+                "v2 successor terminal state and publication receipt differ"
+            )
         _validate_v2_successor_commit_closure(
+            connection=connection,
             task=task,
             transition=transition,
             successor=reference.successor_project_head,
@@ -3624,11 +5668,633 @@ def _load_v2_successor_transition(
         )
     elif commit_row is not None or reference.successor_project_head is not None:
         raise ScienceTaskStoreV2Error("noncommitted v2 successor transition exposes a successor")
+    attempts = _load_v2_successor_transition_attempts(
+        connection,
+        successor_transition_id,
+    )
+    latest = attempts[-1]
+    if any(attempt.state != "failed" for attempt in attempts[:-1]):
+        raise ScienceTaskStoreV2Error("v2 successor transition has a non-final terminal attempt")
+    if transition.state == "failed":
+        attempt_matches = latest.state == "failed" and latest.error == transition.error
+    elif transition.state == "committed":
+        attempt_matches = latest.state == "committed"
+    elif transition.state == "cancelled":
+        attempt_matches = latest.state == "failed"
+    else:
+        attempt_matches = latest.state == "running"
+    if not attempt_matches:
+        raise ScienceTaskStoreV2Error("v2 successor transition and latest attempt state differ")
+    dataset_event = _load_v2_dataset_event_for_task_unchecked(
+        connection,
+        str(row["task_id"]),
+    )
+    for transition_attempt in attempts:
+        if transition_attempt.dataset_id is None:
+            continue
+        if (
+            dataset_event is None
+            or transition_attempt.dataset_id != dataset_event.dataset_id
+            or transition_attempt.dataset_sha256 != dataset_event.dataset_sha256
+        ):
+            raise ScienceTaskStoreV2Error("v2 successor attempt dataset receipt is inconsistent")
+    if dataset_event is not None and (
+        latest.dataset_id != dataset_event.dataset_id
+        or latest.dataset_sha256 != dataset_event.dataset_sha256
+    ):
+        raise ScienceTaskStoreV2Error("latest v2 successor attempt lacks sealed dataset authority")
+    if transition.state == "committed":
+        assert commit_row is not None
+        semantics_version = _v2_successor_commit_semantics(
+            connection,
+            commit.manifest,
+        )
+        expected_attempt_receipt = (
+            str(commit_row["legacy_manifest_sha256"])
+            if semantics_version == 1
+            else str(commit_row["manifest_sha256"])
+        )
+        if latest.commit_manifest_sha256 != expected_attempt_receipt:
+            raise ScienceTaskStoreV2Error(
+                "committed v2 successor legacy provenance receipt is inconsistent"
+            )
+    elif latest.commit_manifest_sha256 is not None:
+        raise ScienceTaskStoreV2Error("noncommitted v2 successor attempt exposes a commit receipt")
     return transition
+
+
+def _load_v2_successor_transition_attempts(
+    connection: sqlite3.Connection,
+    successor_transition_id: str,
+) -> list[ScienceSuccessorTransitionAttemptV2]:
+    rows = connection.execute(
+        "SELECT transition_attempt_id, ordinal, retry_request_id, attempt_json "
+        "FROM successor_transition_attempts "
+        "WHERE successor_transition_id = ? ORDER BY ordinal LIMIT ?",
+        (
+            successor_transition_id,
+            _MAX_V2_SUCCESSOR_ATTEMPTS_PER_TRANSITION + 1,
+        ),
+    ).fetchall()
+    if not rows:
+        raise ScienceTaskStoreV2Error("v2 successor transition has no execution attempt")
+    if len(rows) > _MAX_V2_SUCCESSOR_ATTEMPTS_PER_TRANSITION:
+        raise ScienceTaskStoreV2Error(
+            "v2 successor transition attempt inventory exceeds its bound"
+        )
+    attempts = [
+        _v2_model_from_bytes(
+            ScienceSuccessorTransitionAttemptV2,
+            bytes(row["attempt_json"]),
+        )
+        for row in rows
+    ]
+    for expected_ordinal, (row, attempt) in enumerate(
+        zip(rows, attempts, strict=True),
+        start=1,
+    ):
+        if (
+            attempt.successor_transition_id != successor_transition_id
+            or attempt.transition_attempt_id != row["transition_attempt_id"]
+            or attempt.ordinal != expected_ordinal
+            or int(row["ordinal"]) != expected_ordinal
+            or attempt.retry_request_id != row["retry_request_id"]
+        ):
+            raise ScienceTaskStoreV2Error(
+                "persisted v2 successor transition attempt is inconsistent"
+            )
+    if attempts[0].retry_request_id != "initial":
+        raise ScienceTaskStoreV2Error(
+            "v2 successor transition lacks its initial execution attempt"
+        )
+    if len({attempt.retry_request_id for attempt in attempts}) != len(attempts):
+        raise ScienceTaskStoreV2Error("v2 successor transition reuses a retry request identity")
+    return attempts
+
+
+def _require_v2_successor_transition_attempt(
+    connection: sqlite3.Connection,
+    *,
+    successor_transition_id: str,
+    expected_transition_attempt_id: str,
+    expected_state: str,
+) -> ScienceSuccessorTransitionAttemptV2:
+    attempts = _load_v2_successor_transition_attempts(
+        connection,
+        successor_transition_id,
+    )
+    latest = attempts[-1]
+    if (
+        latest.transition_attempt_id != expected_transition_attempt_id
+        or latest.state != expected_state
+    ):
+        raise ScienceTaskPreconditionFailedV2("v2 successor transition execution attempt changed")
+    return latest
+
+
+def _replace_v2_successor_transition_attempt(
+    attempt: ScienceSuccessorTransitionAttemptV2,
+    **changes: object,
+) -> ScienceSuccessorTransitionAttemptV2:
+    data = attempt.model_dump(mode="python")
+    data.update(changes)
+    return ScienceSuccessorTransitionAttemptV2.model_validate(data)
+
+
+def _store_v2_successor_transition_attempt(
+    connection: sqlite3.Connection,
+    attempt: ScienceSuccessorTransitionAttemptV2,
+) -> None:
+    cursor = connection.execute(
+        "UPDATE successor_transition_attempts SET attempt_json = ? "
+        "WHERE transition_attempt_id = ? AND successor_transition_id = ? "
+        "AND ordinal = ? AND retry_request_id = ?",
+        (
+            _v2_model_bytes(attempt),
+            attempt.transition_attempt_id,
+            attempt.successor_transition_id,
+            attempt.ordinal,
+            attempt.retry_request_id,
+        ),
+    )
+    if cursor.rowcount != 1:
+        raise ScienceTaskStoreV2Error("v2 successor transition attempt identity changed")
+
+
+def _load_v2_successor_commit(
+    connection: sqlite3.Connection,
+    successor_transition_id: str,
+) -> AtomicSuccessorCommitV2:
+    row = connection.execute(
+        "SELECT manifest_sha256, successor_project_head_id "
+        "FROM successor_commits "
+        "WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if row is None:
+        raise ScienceTaskStoreV2Error("published v2 successor transition has no commit receipt")
+    payload = _load_guarded_v2_blob(
+        connection,
+        table="successor_commits",
+        key_column="successor_transition_id",
+        key=successor_transition_id,
+        blob_column="commit_json",
+        label="persisted v2 successor commit",
+    )
+    if payload is None:
+        raise ScienceTaskStoreV2Error("published v2 successor transition lost its commit receipt")
+    commit = _v2_model_from_bytes(
+        AtomicSuccessorCommitV2,
+        payload,
+    )
+    if (
+        row["manifest_sha256"] != commit.manifest_sha256
+        or row["successor_project_head_id"] != commit.manifest.successor_project_head_id
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 successor commit index is inconsistent")
+    return commit
+
+
+def _load_v2_successor_cleanup_receipt(
+    connection: sqlite3.Connection,
+    successor_transition_id: str,
+) -> ScienceSuccessorCleanupReceiptV2 | None:
+    row = connection.execute(
+        "SELECT receipt_sha256 FROM successor_cleanup_receipts WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    payload = _load_guarded_v2_blob(
+        connection,
+        table="successor_cleanup_receipts",
+        key_column="successor_transition_id",
+        key=successor_transition_id,
+        blob_column="receipt_json",
+        label="persisted v2 successor cleanup receipt",
+    )
+    if payload is None:
+        raise ScienceTaskStoreV2Error("v2 successor cleanup receipt disappeared")
+    receipt = _v2_model_from_bytes(
+        ScienceSuccessorCleanupReceiptV2,
+        payload,
+    )
+    if (
+        receipt.successor_transition_id != successor_transition_id
+        or hashlib.sha256(payload).hexdigest() != row["receipt_sha256"]
+    ):
+        raise ScienceTaskStoreV2Error("persisted v2 successor cleanup receipt is inconsistent")
+    return receipt
+
+
+def _load_v2_task_close_receipt(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> _TaskCloseReceiptV2 | None:
+    row = connection.execute(
+        "SELECT task_id, close_request_id, expected_etag, "
+        "task_admission_id, admission_sha256 "
+        "FROM task_close_receipts WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        expected_etag = row["expected_etag"]
+        if expected_etag is not None and (
+            not isinstance(expected_etag, str)
+            or re.fullmatch(
+                r'"[0-9a-f]{64}"',
+                expected_etag,
+                flags=re.ASCII,
+            )
+            is None
+        ):
+            raise ValueError("invalid expected ETag")
+        admission_sha256 = row["admission_sha256"]
+        if (
+            not isinstance(admission_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                admission_sha256,
+                flags=re.ASCII,
+            )
+            is None
+        ):
+            raise ValueError("invalid admission digest")
+        receipt = _TaskCloseReceiptV2(
+            task_id=_v2_resource_id(
+                row["task_id"],
+                label="Task close receipt task",
+            ),
+            close_request_id=_v2_resource_id(
+                row["close_request_id"],
+                label="Task close request",
+            ),
+            expected_etag=expected_etag,
+            task_admission_id=_v2_resource_id(
+                row["task_admission_id"],
+                label="Task close admission",
+            ),
+            admission_sha256=admission_sha256,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScienceTaskStoreV2Error("persisted v2 Task close receipt is invalid") from exc
+    if receipt.task_id != task_id:
+        raise ScienceTaskStoreV2Error("persisted v2 Task close receipt is inconsistent")
+    return receipt
+
+
+def _load_v2_successor_abandon_receipt(
+    connection: sqlite3.Connection,
+    successor_transition_id: str,
+) -> _SuccessorAbandonReceiptV2 | None:
+    row = connection.execute(
+        "SELECT successor_transition_id, abandon_request_id, "
+        "expected_project_head_id, transition_attempt_id "
+        "FROM successor_abandon_receipts "
+        "WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        receipt = _SuccessorAbandonReceiptV2(
+            successor_transition_id=_v2_resource_id(
+                row["successor_transition_id"],
+                label="successor abandon transition",
+            ),
+            abandon_request_id=_v2_resource_id(
+                row["abandon_request_id"],
+                label="successor abandon request",
+            ),
+            expected_project_head_id=_v2_resource_id(
+                row["expected_project_head_id"],
+                label="successor abandon project head",
+            ),
+            transition_attempt_id=_v2_resource_id(
+                row["transition_attempt_id"],
+                label="successor abandon attempt",
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScienceTaskStoreV2Error("persisted v2 successor abandon receipt is invalid") from exc
+    if receipt.successor_transition_id != successor_transition_id:
+        raise ScienceTaskStoreV2Error("persisted v2 successor abandon receipt is inconsistent")
+    return receipt
+
+
+def _load_v2_legacy_task_close_exemption(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> _LegacyTaskCloseExemptionV2 | None:
+    row = connection.execute(
+        "SELECT task_id, task_admission_id, admission_sha256 "
+        "FROM legacy_task_close_exemptions WHERE task_id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        admission_sha256 = row["admission_sha256"]
+        if (
+            not isinstance(admission_sha256, str)
+            or re.fullmatch(
+                r"[0-9a-f]{64}",
+                admission_sha256,
+                flags=re.ASCII,
+            )
+            is None
+        ):
+            raise ValueError("invalid admission digest")
+        exemption = _LegacyTaskCloseExemptionV2(
+            task_id=_v2_resource_id(
+                row["task_id"],
+                label="legacy Task close exemption",
+            ),
+            task_admission_id=_v2_resource_id(
+                row["task_admission_id"],
+                label="legacy Task close admission",
+            ),
+            admission_sha256=admission_sha256,
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScienceTaskStoreV2Error(
+            "persisted legacy v2 Task close exemption is invalid"
+        ) from exc
+    if exemption.task_id != task_id:
+        raise ScienceTaskStoreV2Error("persisted legacy v2 Task close exemption is inconsistent")
+    return exemption
+
+
+def _load_v2_legacy_successor_abandon_exemption(
+    connection: sqlite3.Connection,
+    successor_transition_id: str,
+) -> _LegacySuccessorAbandonExemptionV2 | None:
+    row = connection.execute(
+        "SELECT successor_transition_id, "
+        "expected_project_head_id, transition_attempt_id "
+        "FROM legacy_successor_abandon_exemptions "
+        "WHERE successor_transition_id = ?",
+        (successor_transition_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        exemption = _LegacySuccessorAbandonExemptionV2(
+            successor_transition_id=_v2_resource_id(
+                row["successor_transition_id"],
+                label="legacy successor abandon transition",
+            ),
+            expected_project_head_id=_v2_resource_id(
+                row["expected_project_head_id"],
+                label="legacy successor abandon project head",
+            ),
+            transition_attempt_id=_v2_resource_id(
+                row["transition_attempt_id"],
+                label="legacy successor abandon attempt",
+            ),
+        )
+    except (TypeError, ValueError) as exc:
+        raise ScienceTaskStoreV2Error(
+            "persisted legacy v2 successor abandon exemption is invalid"
+        ) from exc
+    if exemption.successor_transition_id != successor_transition_id:
+        raise ScienceTaskStoreV2Error(
+            "persisted legacy v2 successor abandon exemption is inconsistent"
+        )
+    return exemption
+
+
+def _load_v2_successor_commit_for_project_head(
+    connection: sqlite3.Connection,
+    project_head_id: str,
+) -> AtomicSuccessorCommitV2 | None:
+    head = _load_v2_project_head(connection, project_head_id)
+    row = connection.execute(
+        "SELECT successor_transition_id FROM successor_commits "
+        "WHERE successor_project_head_id = ?",
+        (project_head_id,),
+    ).fetchone()
+    if row is None:
+        if head.generation != 0:
+            raise ScienceTaskStoreV2Error(
+                "non-genesis v2 project head has no atomic successor receipt"
+            )
+        return None
+    commit = _load_v2_successor_commit(
+        connection,
+        str(row["successor_transition_id"]),
+    )
+    if (
+        commit.manifest.project_id != head.project_id
+        or commit.manifest.successor_project_head_id != project_head_id
+        or commit.manifest.successor_generation != head.generation
+        or commit.manifest.successor_manifest_sha256 != head.manifest_sha256
+    ):
+        raise ScienceTaskStoreV2Error("v2 project head and atomic successor receipt differ")
+    return commit
+
+
+def _v2_successor_commit_semantics(
+    connection: sqlite3.Connection,
+    manifest: AtomicSuccessorManifestV2 | AtomicEvolutionAbandonManifestV2,
+) -> int:
+    row = connection.execute(
+        "SELECT composition_semantics_version, "
+        "legacy_manifest_sha256 FROM successor_commits "
+        "WHERE successor_transition_id = ?",
+        (manifest.successor_transition_id,),
+    ).fetchone()
+    if row is None:
+        return 2
+    semantics_version = int(row["composition_semantics_version"])
+    legacy_sha256 = row["legacy_manifest_sha256"]
+    if semantics_version == 2:
+        if legacy_sha256 is not None:
+            raise ScienceTaskStoreV2Error("canonical v2 successor exposes legacy provenance")
+        return 2
+    if (
+        semantics_version != 1
+        or legacy_sha256 is None
+        or type(manifest) is not AtomicSuccessorManifestV2
+    ):
+        raise ScienceTaskStoreV2Error("legacy v2 successor provenance is invalid")
+    legacy_manifest = AtomicSuccessorManifestV2.model_validate(
+        manifest.model_copy(update={"artifacts": ()}).model_dump(mode="python")
+    )
+    if str(legacy_sha256) != atomic_successor_manifest_sha256(legacy_manifest):
+        raise ScienceTaskStoreV2Error("legacy v2 successor provenance digest is inconsistent")
+    return 1
+
+
+def _v2_typed_artifact_authority(
+    manifest: AtomicSuccessorManifestV2 | AtomicEvolutionAbandonManifestV2,
+    *,
+    expected_count: int,
+    label: str,
+) -> tuple[tuple[str, str, str, str], ...]:
+    artifacts = manifest.artifacts
+    artifact_ids = tuple(item.artifact_id for item in artifacts)
+    target_ids = tuple(item.target_id for item in artifacts)
+    if (
+        len(manifest.method_artifact_ids) != expected_count
+        or len(artifacts) != expected_count
+        or artifact_ids != manifest.method_artifact_ids
+        or target_ids != tuple(sorted(target_ids))
+        or len(target_ids) != len(set(target_ids))
+        or len(artifact_ids) != len(set(artifact_ids))
+    ):
+        raise ScienceTaskPreconditionFailedV2(f"{label} typed artifact composition is incomplete")
+    return tuple(
+        (
+            item.target_id,
+            item.artifact_id,
+            item.artifact_type,
+            item.owner_successor_transition_id,
+        )
+        for item in artifacts
+    )
+
+
+def _v2_predecessor_artifact_authority(
+    connection: sqlite3.Connection,
+    predecessor: m2.ProjectHeadRefV2,
+) -> tuple[
+    AtomicSuccessorCommitV2 | None,
+    tuple[tuple[str, str, str, str], ...],
+]:
+    predecessor_commit = _load_v2_successor_commit_for_project_head(
+        connection,
+        predecessor.project_head_id,
+    )
+    if predecessor_commit is None:
+        if predecessor.generation != 0 or predecessor.evolution_revision.artifact_count != 0:
+            raise ScienceTaskPreconditionFailedV2(
+                "successor predecessor lacks exact genesis artifact authority"
+            )
+        return None, ()
+    return (
+        predecessor_commit,
+        _v2_typed_artifact_authority(
+            predecessor_commit.manifest,
+            expected_count=(predecessor.evolution_revision.artifact_count),
+            label="predecessor",
+        ),
+    )
+
+
+def _v2_expected_inherited_runtime(
+    predecessor_commit: AtomicSuccessorCommitV2 | None,
+) -> tuple[str, str | None, str | None, str | None, str | None]:
+    if predecessor_commit is None:
+        return ("empty_inherited", None, None, None, None)
+    predecessor_manifest = predecessor_commit.manifest
+    if (
+        type(predecessor_manifest) is AtomicSuccessorManifestV2
+        and predecessor_manifest.runtime_context_source == "materialized_new"
+    ):
+        return (
+            "materialized_inherited",
+            predecessor_manifest.successor_transition_id,
+            predecessor_manifest.predecessor_project_head_id,
+            predecessor_manifest.materialized_context_id,
+            predecessor_manifest.materialized_context_manifest_sha256,
+        )
+    return (
+        predecessor_manifest.runtime_context_source,
+        predecessor_manifest.materialized_source_successor_transition_id,
+        predecessor_manifest.materialized_source_predecessor_project_head_id,
+        predecessor_manifest.materialized_context_id,
+        predecessor_manifest.materialized_context_manifest_sha256,
+    )
+
+
+def _validate_v2_inherited_runtime_authority(
+    connection: sqlite3.Connection,
+    *,
+    predecessor: m2.ProjectHeadRefV2,
+    expected_runtime: tuple[
+        str,
+        str | None,
+        str | None,
+        str | None,
+        str | None,
+    ],
+    expected_artifacts: tuple[tuple[str, str, str, str], ...],
+) -> None:
+    (
+        runtime_source,
+        source_transition_id,
+        source_predecessor_id,
+        context_id,
+        context_sha256,
+    ) = expected_runtime
+    if runtime_source == "empty_inherited":
+        if (
+            any(
+                value is not None
+                for value in (
+                    source_transition_id,
+                    source_predecessor_id,
+                    context_id,
+                    context_sha256,
+                )
+            )
+            or expected_artifacts
+            or predecessor.evolution_revision.artifact_count != 0
+        ):
+            raise ScienceTaskPreconditionFailedV2(
+                "empty inherited runtime authority is inconsistent"
+            )
+        return
+    if (
+        runtime_source != "materialized_inherited"
+        or source_transition_id is None
+        or source_predecessor_id is None
+        or context_id is None
+        or context_sha256 is None
+    ):
+        raise ScienceTaskPreconditionFailedV2("inherited runtime authority is incomplete")
+    source_commit = _load_v2_successor_commit(
+        connection,
+        source_transition_id,
+    )
+    source_manifest = source_commit.manifest
+    if type(source_manifest) is not AtomicSuccessorManifestV2:
+        raise ScienceTaskPreconditionFailedV2(
+            "inherited runtime source is not an evolved successor"
+        )
+    source_artifacts = _v2_typed_artifact_authority(
+        source_manifest,
+        expected_count=(predecessor.evolution_revision.artifact_count),
+        label="inherited runtime source",
+    )
+    if (
+        source_manifest.runtime_context_source != "materialized_new"
+        or source_manifest.successor_transition_id != source_transition_id
+        or source_manifest.predecessor_project_head_id != source_predecessor_id
+        or source_manifest.materialized_context_id != context_id
+        or source_manifest.materialized_context_manifest_sha256 != context_sha256
+        or source_manifest.evolution_revision_id
+        != predecessor.evolution_revision.evolution_revision_id
+        or source_manifest.evolution_revision_manifest_sha256
+        != predecessor.evolution_revision.manifest_sha256
+        or source_manifest.runtime_context_snapshot_id
+        != predecessor.runtime_context_snapshot.runtime_context_snapshot_id
+        or source_manifest.runtime_context_manifest_sha256
+        != predecessor.runtime_context_snapshot.manifest_sha256
+        or source_manifest.registry_sha256 != predecessor.registry_sha256
+        or source_artifacts != expected_artifacts
+    ):
+        raise ScienceTaskPreconditionFailedV2(
+            "inherited runtime authority differs from its exact source receipt"
+        )
 
 
 def _validate_v2_successor_commit_closure(
     *,
+    connection: sqlite3.Connection,
     task: m2.TaskV2,
     transition: m2.SuccessorTransitionV2,
     successor: m2.ProjectHeadRefV2,
@@ -3677,6 +6343,205 @@ def _validate_v2_successor_commit_closure(
         raise ScienceTaskPreconditionFailedV2(
             "atomic v2 successor receipt does not match its authoritative closure"
         )
+    plan_row = connection.execute(
+        "SELECT plan_json FROM successor_transitions WHERE successor_transition_id = ?",
+        (reference.successor_transition_id,),
+    ).fetchone()
+    if plan_row is None:
+        raise ScienceTaskPreconditionFailedV2("atomic v2 successor has no immutable plan")
+    plan = _v2_model_from_bytes(
+        ScienceSuccessorPlanV2,
+        bytes(plan_row["plan_json"]),
+    )
+    if (
+        plan.project_id != task.project_id
+        or plan.task_id != task.task_id
+        or plan.task_admission_id != admission.task_admission_id
+        or plan.admission_sha256 != admission.admission_sha256
+        or plan.accepted_attempt_id != attempt.attempt_id
+        or plan.predecessor_project_head_id != predecessor.project_head_id
+        or plan.normalized_evolution_intent_sha256 != admission.normalized_evolution_intent_sha256
+    ):
+        raise ScienceTaskPreconditionFailedV2(
+            "atomic v2 successor immutable plan has different authority"
+        )
+    (
+        predecessor_commit,
+        predecessor_artifacts,
+    ) = _v2_predecessor_artifact_authority(
+        connection,
+        predecessor,
+    )
+    semantics_version = _v2_successor_commit_semantics(
+        connection,
+        manifest,
+    )
+    if type(manifest) is AtomicSuccessorManifestV2:
+        if transition.state == "cancelled":
+            raise ScienceTaskPreconditionFailedV2(
+                "evolved v2 successor receipt cannot abandon evolution"
+            )
+        dataset_event = _load_v2_dataset_event_for_task_unchecked(
+            connection,
+            task.task_id,
+        )
+        if (
+            dataset_event is None
+            or dataset_event.attempt_id != attempt.attempt_id
+            or manifest.dataset_id != dataset_event.dataset_id
+            or manifest.dataset_manifest_sha256 != dataset_event.dataset_sha256
+        ):
+            raise ScienceTaskPreconditionFailedV2(
+                "atomic v2 successor receipt differs from sealed dataset authority"
+            )
+        observed_artifacts = _v2_typed_artifact_authority(
+            manifest,
+            expected_count=(successor.evolution_revision.artifact_count),
+            label="atomic successor",
+        )
+        if semantics_version == 1:
+            expected_produced = tuple(
+                (
+                    item.target_id,
+                    item.output_artifact_type,
+                )
+                for item in plan.enabled_methods
+            )
+            observed_produced = tuple(
+                (item.target_id, item.artifact_type) for item in manifest.artifacts
+            )
+            if (
+                manifest.runtime_context_source != "materialized_new"
+                or successor.registry_sha256 != predecessor.registry_sha256
+                or successor.runtime_context_snapshot.runtime_contract_sha256
+                != predecessor.runtime_context_snapshot.runtime_contract_sha256
+                or successor.evolution_revision.evolution_revision_id
+                == predecessor.evolution_revision.evolution_revision_id
+                or successor.evolution_revision.manifest_sha256
+                == predecessor.evolution_revision.manifest_sha256
+                or successor.runtime_context_snapshot.runtime_context_snapshot_id
+                == predecessor.runtime_context_snapshot.runtime_context_snapshot_id
+                or successor.runtime_context_snapshot.manifest_sha256
+                == predecessor.runtime_context_snapshot.manifest_sha256
+                or observed_produced != expected_produced
+                or any(
+                    item.origin != "produced"
+                    or item.owner_successor_transition_id != manifest.successor_transition_id
+                    for item in manifest.artifacts
+                )
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "legacy v2 successor differs from its preserved output authority"
+                )
+            return
+        if plan.enabled_methods:
+            enabled_targets = frozenset(item.target_id for item in plan.enabled_methods)
+            expected_produced = tuple(
+                (
+                    item.target_id,
+                    item.output_artifact_type,
+                )
+                for item in plan.enabled_methods
+            )
+            observed_produced = tuple(
+                (item.target_id, item.artifact_type)
+                for item in manifest.artifacts
+                if item.origin == "produced"
+            )
+            expected_inherited = tuple(
+                item for item in predecessor_artifacts if item[0] not in enabled_targets
+            )
+            observed_inherited = tuple(
+                (
+                    item.target_id,
+                    item.artifact_id,
+                    item.artifact_type,
+                    item.owner_successor_transition_id,
+                )
+                for item in manifest.artifacts
+                if item.origin == "inherited"
+            )
+            if (
+                manifest.runtime_context_source != "materialized_new"
+                or successor.registry_sha256 != predecessor.registry_sha256
+                or successor.runtime_context_snapshot.runtime_contract_sha256
+                != predecessor.runtime_context_snapshot.runtime_contract_sha256
+                or successor.evolution_revision.evolution_revision_id
+                == predecessor.evolution_revision.evolution_revision_id
+                or successor.evolution_revision.manifest_sha256
+                == predecessor.evolution_revision.manifest_sha256
+                or successor.runtime_context_snapshot.runtime_context_snapshot_id
+                == predecessor.runtime_context_snapshot.runtime_context_snapshot_id
+                or successor.runtime_context_snapshot.manifest_sha256
+                == predecessor.runtime_context_snapshot.manifest_sha256
+                or observed_produced != expected_produced
+                or observed_inherited != expected_inherited
+                or len(observed_artifacts) != len(expected_inherited) + len(expected_produced)
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "evolved v2 successor composition differs from its immutable plan"
+                )
+            return
+        expected_runtime = _v2_expected_inherited_runtime(predecessor_commit)
+        observed_runtime = (
+            manifest.runtime_context_source,
+            manifest.materialized_source_successor_transition_id,
+            manifest.materialized_source_predecessor_project_head_id,
+            manifest.materialized_context_id,
+            manifest.materialized_context_manifest_sha256,
+        )
+        if (
+            successor.evolution_revision != predecessor.evolution_revision
+            or successor.runtime_context_snapshot != predecessor.runtime_context_snapshot
+            or successor.registry_sha256 != predecessor.registry_sha256
+            or observed_runtime != expected_runtime
+            or observed_artifacts != predecessor_artifacts
+            or any(item.origin != "inherited" for item in manifest.artifacts)
+        ):
+            raise ScienceTaskPreconditionFailedV2(
+                "no-evolution successor changed inherited evolution authority"
+            )
+        _validate_v2_inherited_runtime_authority(
+            connection,
+            predecessor=predecessor,
+            expected_runtime=expected_runtime,
+            expected_artifacts=predecessor_artifacts,
+        )
+        return
+    if type(manifest) is not AtomicEvolutionAbandonManifestV2:
+        raise ScienceTaskPreconditionFailedV2(
+            "atomic v2 successor receipt has an unsupported type"
+        )
+    observed_artifacts = _v2_typed_artifact_authority(
+        manifest,
+        expected_count=(predecessor.evolution_revision.artifact_count),
+        label="evolution abandon",
+    )
+    expected_runtime = _v2_expected_inherited_runtime(predecessor_commit)
+    observed_runtime = (
+        manifest.runtime_context_source,
+        manifest.materialized_source_successor_transition_id,
+        manifest.materialized_source_predecessor_project_head_id,
+        manifest.materialized_context_id,
+        manifest.materialized_context_manifest_sha256,
+    )
+    if (
+        successor.evolution_revision != predecessor.evolution_revision
+        or successor.runtime_context_snapshot != predecessor.runtime_context_snapshot
+        or successor.registry_sha256 != predecessor.registry_sha256
+        or observed_runtime != expected_runtime
+        or observed_artifacts != predecessor_artifacts
+        or any(item.origin != "inherited" for item in manifest.artifacts)
+    ):
+        raise ScienceTaskPreconditionFailedV2(
+            "evolution abandon changed exact predecessor evolution authority"
+        )
+    _validate_v2_inherited_runtime_authority(
+        connection,
+        predecessor=predecessor,
+        expected_runtime=expected_runtime,
+        expected_artifacts=predecessor_artifacts,
+    )
 
 
 def _validate_v2_project_authority(
@@ -3865,6 +6730,46 @@ def _load_v2_event_bytes(payload: bytes | str) -> m2.EventEnvelopeV2:
     return event  # type: ignore[return-value]
 
 
+def _load_v2_dataset_event_for_task(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> m2.DatasetSealedEventV2 | None:
+    event = _load_v2_dataset_event_for_task_unchecked(
+        connection,
+        task_id,
+    )
+    if event is None:
+        return None
+    _validate_v2_event_authority(
+        connection,
+        event,
+        task_id,
+    )
+    return event
+
+
+def _load_v2_dataset_event_for_task_unchecked(
+    connection: sqlite3.Connection,
+    task_id: str,
+) -> m2.DatasetSealedEventV2 | None:
+    rows = connection.execute(
+        "SELECT task_id, event_json FROM events "
+        "WHERE task_id = ? AND event_type = 'dataset_sealed' "
+        "ORDER BY sequence LIMIT 2",
+        (task_id,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ScienceTaskStoreV2Error("v2 Task has multiple sealed dataset events")
+    if not rows:
+        return None
+    if rows[0]["task_id"] != task_id:
+        raise ScienceTaskStoreV2Error("v2 Task sealed dataset event ownership is inconsistent")
+    event = _load_v2_event_bytes(bytes(rows[0]["event_json"]))
+    if not isinstance(event, m2.DatasetSealedEventV2):
+        raise ScienceTaskStoreV2Error("v2 Task sealed dataset event has the wrong type")
+    return event
+
+
 def _load_and_validate_v2_event(
     connection: sqlite3.Connection,
     row: sqlite3.Row,
@@ -3899,7 +6804,10 @@ def _validate_v2_event_authority(
         valid = (
             event.task_id == task.task_id
             and event.task_admission_id == task.admission.task_admission_id
-            and any(attempt.attempt_id == event.attempt_id for attempt in task.attempts)
+            and event.attempt_id == task.authoritative_attempt_id
+            and task.successor_transition is not None
+            and task.successor_transition.accepted_attempt is not None
+            and event.attempt_id == task.successor_transition.accepted_attempt.attempt_id
         )
         if valid and task.successor_transition is not None:
             commit_row = connection.execute(
@@ -3911,10 +6819,11 @@ def _validate_v2_event_authority(
                     AtomicSuccessorCommitV2,
                     bytes(commit_row["commit_json"]),
                 )
-                valid = (
-                    commit.manifest.dataset_id == event.dataset_id
-                    and commit.manifest.dataset_manifest_sha256 == event.dataset_sha256
-                )
+                if type(commit.manifest) is AtomicSuccessorManifestV2:
+                    valid = (
+                        commit.manifest.dataset_id == event.dataset_id
+                        and commit.manifest.dataset_manifest_sha256 == event.dataset_sha256
+                    )
     elif isinstance(event, m2.TransitionChangedEventV2):
         current = _load_v2_successor_transition(
             connection,
@@ -3996,6 +6905,10 @@ def _load_and_validate_v2_task_event_history(
         connection,
         task.successor_transition.successor_transition_id,
     )
+    abandon_committed = (
+        transition.state == "cancelled"
+        and transition.transition.successor_project_head is not None
+    )
     if not remaining or not isinstance(remaining[0], m2.TransitionChangedEventV2):
         invalid()
     pending = remaining[0]
@@ -4019,20 +6932,51 @@ def _load_and_validate_v2_task_event_history(
     dataset_seen = False
     commit_stage = 0
     failed_seen = False
-    for offset, event in enumerate(remaining[1:], start=1):
-        if failed_seen:
+    cancelled_seen = False
+    for event in remaining[1:]:
+        if cancelled_seen:
             invalid()
         if isinstance(event, m2.TransitionChangedEventV2):
             if event.state == "failed":
                 if (
-                    offset != len(remaining) - 1
-                    or transition.state != "failed"
+                    failed_seen
+                    or phase_index == 6
                     or event.progress_completed != phase_index
                     or event.progress_total != 6
                 ):
                     invalid()
                 failed_seen = True
                 continue
+            if failed_seen:
+                if (
+                    event.state == "cancelled"
+                    and event.progress_completed == phase_index
+                    and event.progress_total == 6
+                    and abandon_committed
+                    and commit_stage == 4
+                ):
+                    failed_seen = False
+                    cancelled_seen = True
+                    continue
+                if (
+                    event.state == "pending"
+                    and not dataset_seen
+                    and event.progress_completed == 0
+                    and event.progress_total == 6
+                ):
+                    failed_seen = False
+                    phase_index = 0
+                    continue
+                if (
+                    event.state == "running_methods"
+                    and dataset_seen
+                    and event.progress_completed == 2
+                    and event.progress_total == 6
+                ):
+                    failed_seen = False
+                    phase_index = 2
+                    continue
+                invalid()
             if phase_index + 1 >= len(phases) or event.state != phases[phase_index + 1]:
                 invalid()
             if event.state == "running_methods" and not dataset_seen:
@@ -4059,6 +7003,9 @@ def _load_and_validate_v2_task_event_history(
             commit_stage = 2
             continue
         if isinstance(event, m2.ProjectHeadActivatedEventV2):
+            if failed_seen and abandon_committed and phase_index < 6 and commit_stage == 0:
+                commit_stage = 4
+                continue
             if phase_index != 5 or commit_stage != 2:
                 invalid()
             commit_stage = 3
@@ -4068,6 +7015,15 @@ def _load_and_validate_v2_task_event_history(
     if failed_seen:
         if transition.progress_completed != phase_index or commit_stage != 0:
             invalid()
+        if transition.state != "failed":
+            invalid()
+    elif cancelled_seen:
+        if (
+            transition.state != "cancelled"
+            or transition.progress_completed != phase_index
+            or commit_stage != 4
+        ):
+            invalid()
     elif (
         transition.state != phases[phase_index]
         or transition.progress_completed != phase_index
@@ -4076,7 +7032,10 @@ def _load_and_validate_v2_task_event_history(
         invalid()
     if phase_index >= 2 and not dataset_seen:
         invalid()
-    if phase_index == 6:
+    if cancelled_seen:
+        if commit_stage != 4:
+            invalid()
+    elif phase_index == 6:
         if commit_stage != 3:
             invalid()
     elif commit_stage != 0:
@@ -4375,8 +7334,14 @@ def _load_v2_task_closure(
             transition.transition != task.successor_transition
             or (task.state == "waiting_for_successor" and transition.state not in nonterminal)
             or (task.state == "failed" and transition.state != "failed")
-            or (task.state == "completed" and transition.state != "committed")
-            or task.state not in {"waiting_for_successor", "failed", "completed"}
+            or (task.state == "completed" and transition.state not in {"committed", "cancelled"})
+            or (
+                task.state == "completed"
+                and transition.state == "cancelled"
+                and transition.transition.successor_project_head is None
+            )
+            or task.state == "closed"
+            or task.state not in {"waiting_for_successor", "failed", "completed", "closed"}
         ):
             raise ScienceTaskStoreV2Error("persisted v2 Task successor state is inconsistent")
     return task

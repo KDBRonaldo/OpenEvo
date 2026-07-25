@@ -20,6 +20,7 @@ class ArtifactType(StrEnum):
 
 class ArtifactState(StrEnum):
     STAGED = "staged"
+    SEALED = "sealed"
     ACTIVE = "active"
     EXPERIMENTAL = "experimental"
     DEPRECATED = "deprecated"
@@ -157,11 +158,15 @@ class ArtifactPromotionUpdateRequest(BaseModel):
 
 
 class DatasetQuery(BaseModel):
+    source: str | None = Field(default=None, min_length=1, max_length=256)
     event_types: list[str] = Field(default_factory=list)
     status: list[str] = Field(default_factory=list)
     reward_min: float | None = None
     policy_version: str | None = None
     task_tags: list[str] = Field(default_factory=list)
+    source_event_id: str | None = Field(default=None, min_length=1, max_length=256)
+    task_id: str | None = Field(default=None, min_length=1, max_length=256)
+    session_id: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class DatasetLimits(BaseModel):
@@ -170,10 +175,24 @@ class DatasetLimits(BaseModel):
 
 
 class DatasetCreateRequest(BaseModel):
+    idempotency_key: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
     name: str = Field(min_length=1)
     purpose: str = Field(min_length=1)
     query: DatasetQuery = Field(default_factory=DatasetQuery)
     limits: DatasetLimits = Field(default_factory=DatasetLimits)
+
+
+class DatasetCreateHttpRequest(DatasetCreateRequest):
+    idempotency_key: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+    )
 
 
 class DatasetCreateResponse(BaseModel):
@@ -270,6 +289,23 @@ class WorkerClaimInputArtifact(BaseModel):
     type: ArtifactType | str
     uri: str
     name: str | None = None
+    manifest_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    records_byte_size: int | None = Field(default=None, ge=0)
+    records_sha256: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+
+    @model_validator(mode="after")
+    def _paired_dataset_records_identity(self) -> WorkerClaimInputArtifact:
+        if (self.records_byte_size is None) != (self.records_sha256 is None):
+            raise ValueError(
+                "dataset records byte size and digest must be supplied together"
+            )
+        return self
 
 
 class WorkerClaimedJob(BaseModel):

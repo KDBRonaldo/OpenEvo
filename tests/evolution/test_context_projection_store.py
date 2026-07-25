@@ -18,6 +18,7 @@ from openevo.evolution.context_projection import (
     ContextProjectionResolveRequest,
 )
 from openevo.evolution.framework import (
+    EvolutionTargetSelection,
     EvolutionExecutionProfile,
     RuntimeDestinationRoots,
     TargetConsumptionLimits,
@@ -27,6 +28,12 @@ from openevo.evolution.models import (
     ArtifactRegisterRequest,
     ArtifactType,
     ContextResolveRequest,
+    WorkerClaimRequest,
+    WorkerCompleteRequest,
+)
+from openevo.evolution.planned_jobs import (
+    PlanBoundJobCreateRequest,
+    PlannedInputBinding,
 )
 from openevo.evolution.server import create_app
 from openevo.evolution.store import EvolutionStore
@@ -216,6 +223,199 @@ def test_store_materializes_and_persists_registry_bound_context(tmp_path: Path) 
             response.blobs[0].blob_id,
         ):
             pass
+
+
+def test_successor_materialization_privately_consumes_only_exact_sealed_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed"
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=artifact_root,
+        executable_registry=registry,
+    )
+    store.initialize()
+    dataset = store.register_artifact(
+        ArtifactRegisterRequest(
+            type=ArtifactType.DATASET,
+            name="transition dataset",
+            uri=(artifact_root / "dataset.json").as_uri(),
+            promoted=True,
+        )
+    )
+    plan = registry.snapshot.compile_plan(
+        plan_id="successor-plan-1",
+        selections=(
+            EvolutionTargetSelection(
+                target_id="skill_bundle",
+                enabled=True,
+                method_id="skill_bundle_reflector",
+                config={
+                    "max_records": 13,
+                    "reflector_llm": {
+                        "provider": "codex_cli",
+                        "model": "gpt-5.1-codex-mini",
+                    },
+                },
+            ),
+        ),
+        profile=_request().execution_profile,
+    )
+    create = PlanBoundJobCreateRequest(
+        plan=plan,
+        target_id="skill_bundle",
+        job_type="skill_bundle_reflector",
+        input_bindings=(
+            PlannedInputBinding(
+                binding_id="current_dataset",
+                artifact_ids=(dataset.artifact_id,),
+            ),
+            PlannedInputBinding(
+                binding_id="prior_target_artifacts",
+                artifact_ids=(),
+            ),
+        ),
+        successor_transition_id="successor-transition-1",
+        core_config={"promoted": True},
+    )
+    job = store.create_plan_bound_job(
+        create,
+        snapshot=registry.snapshot,
+    )
+    selection = plan.selections[0]
+    claim = store.claim_job(
+        WorkerClaimRequest(
+            worker_id="verified-worker",
+            capabilities=[create.job_type],
+            method_capabilities=[selection.method_id],
+            method_identity_capabilities={
+                selection.method_id: (
+                    selection.method_identity_digest
+                )
+            },
+        )
+    )
+    assert claim.job is not None
+    skill = artifact_root / "payloads" / "skill"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "# Exact sealed skill\n",
+        encoding="utf-8",
+    )
+    completed = store.complete_job(
+        job.job_id,
+        WorkerCompleteRequest(
+            lease_id=claim.job.lease_id,
+            artifacts=[
+                ArtifactRegisterRequest(
+                    type=ArtifactType.SKILL_BUNDLE,
+                    name="exact sealed skill",
+                    uri=skill.as_uri(),
+                    manifest={},
+                    compatibility={"agent_harness": ["codex"]},
+                    promoted=True,
+                )
+            ],
+        ),
+    )
+    artifact_id = completed["artifact_ids"][0]
+    with pytest.raises(ValueError, match="unknown artifact"):
+        store.get_artifact(artifact_id)
+    generic = store.resolve_materialized_context(_request())
+    assert artifact_id not in generic.selection.artifact_ids
+
+    request_payload = _request().model_dump(mode="json")
+    request_payload.update(
+        {
+            "successor_transition_id": "successor-transition-1",
+            "predecessor_project_head_id": "project-head-genesis",
+        }
+    )
+    request_payload["metadata"]["evolution"] = {
+        "context_artifact_ids": [artifact_id]
+    }
+    exact_request = ContextProjectionResolveRequest.model_validate(
+        request_payload
+    )
+    exact = store.resolve_materialized_context(exact_request)
+    assert exact.successor_transition_id == "successor-transition-1"
+    assert exact.selection.artifact_ids == (artifact_id,)
+
+    wrong_payload = exact_request.model_dump(mode="json")
+    wrong_payload["successor_transition_id"] = (
+        "different-successor-transition"
+    )
+    with pytest.raises(ValueError, match="unavailable"):
+        store.resolve_materialized_context(
+            ContextProjectionResolveRequest.model_validate(
+                wrong_payload
+            )
+        )
+    expected_receipt = {
+        "successor_transition_id": "successor-transition-1",
+        "discarded_artifact_ids": [artifact_id],
+        "discarded_materialized_context_ids": [exact.context_id],
+    }
+    materializer = store._context_materializer
+    assert materializer is not None
+    original_discard = materializer.discard_persisted
+
+    def _interrupt_postcommit(*_args, **_kwargs):
+        raise RuntimeError("simulated postcommit cleanup interruption")
+
+    monkeypatch.setattr(
+        materializer,
+        "discard_persisted",
+        _interrupt_postcommit,
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="postcommit cleanup interruption",
+    ):
+        store.discard_successor_transition_outputs(
+            "successor-transition-1"
+        )
+    with store.connect() as connection:
+        durable_receipt = connection.execute(
+            "SELECT receipt_json FROM "
+            "successor_transition_discards "
+            "WHERE successor_transition_id = ?",
+            ("successor-transition-1",),
+        ).fetchone()
+        assert connection.execute(
+            "SELECT 1 FROM artifacts WHERE artifact_id = ?",
+            (artifact_id,),
+        ).fetchone() is None
+        assert connection.execute(
+            "SELECT 1 FROM context_materializations "
+            "WHERE context_id = ?",
+            (exact.context_id,),
+        ).fetchone() is None
+    assert durable_receipt is not None
+    assert json.loads(durable_receipt["receipt_json"]) == (
+        expected_receipt
+    )
+    monkeypatch.setattr(
+        materializer,
+        "discard_persisted",
+        original_discard,
+    )
+
+    receipt = store.discard_successor_transition_outputs(
+        "successor-transition-1"
+    )
+    assert receipt == expected_receipt
+    with pytest.raises(ValueError, match="not persisted"):
+        store.get_materialized_context(exact.context_id)
+    assert store.get_materialized_context(generic.context_id) == generic
+    assert not store.files.context_snapshot_path(exact.context_id).exists()
+    with pytest.raises(ValueError, match="discarded"):
+        store.resolve_materialized_context(exact_request)
+    assert store.discard_successor_transition_outputs(
+        "successor-transition-1"
+    ) == receipt
 
 
 def test_store_materializes_all_builtin_carriers_through_verified_registry(

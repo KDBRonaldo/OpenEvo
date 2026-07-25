@@ -13,6 +13,7 @@ from pydantic import Field, field_validator, model_validator
 
 from openevo.evolution.models import (
     ArtifactRegisterRequest,
+    ArtifactType,
     WorkerClaimInputArtifact,
     WorkerClaimedJob,
 )
@@ -106,7 +107,22 @@ class ResolvedMethodInputBinding(_Contract):
 
 
 def worker_input_artifact_digest(artifact: WorkerClaimInputArtifact) -> str:
-    return canonical_digest(artifact.model_dump(mode="json"))
+    # Keep the v1 envelope identity stable across the v0.1.9 addition of
+    # consumer-side file receipts. Artifact IDs bind immutable Store authority;
+    # the manifest/records receipts are reissued at claim and reverified by the
+    # method immediately before consumption.
+    return canonical_digest(
+        {
+            "artifact_id": artifact.artifact_id,
+            "type": (
+                artifact.type.value
+                if isinstance(artifact.type, ArtifactType)
+                else artifact.type
+            ),
+            "uri": artifact.uri,
+            "name": artifact.name,
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)

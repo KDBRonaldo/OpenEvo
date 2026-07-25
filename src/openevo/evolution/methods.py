@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -19,6 +21,7 @@ from openevo.evolution.agent_system import (
     DEFAULT_AGENT_SYSTEM_TARGET_PATH,
     normalize_agent_system_target_path,
 )
+from openevo.evolution.framework import canonical_digest
 from openevo.evolution.models import (
     ArtifactRegisterRequest,
     ArtifactType,
@@ -167,6 +170,8 @@ _EVOLUTION_FEEDBACK_LIKE_KEYS = {
     "suggested_changes",
     "validation_checks",
 }
+_MAX_DATASET_MANIFEST_BYTES = 4 * 1024 * 1024
+_MAX_DATASET_RECORDS_BYTES = 128 * 1024 * 1024
 
 
 class UnknownEvolutionMethodError(ValueError):
@@ -185,9 +190,7 @@ def text_memory(job: WorkerClaimedJob, artifact_root: Path) -> list[ArtifactRegi
     if dataset is None:
         raise ValueError("text_memory requires an input dataset artifact")
 
-    manifest_path = _file_uri_to_path(dataset.uri)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    records = _read_dataset_records(manifest_path, manifest)
+    manifest, records = _read_dataset_artifact(dataset)
 
     output_dir = artifact_root / "workers" / job.job_id / "text_memory"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -223,9 +226,7 @@ def text_memory_reflector(
     if dataset is None:
         raise ValueError("text_memory_reflector requires an input dataset artifact")
 
-    manifest_path = _file_uri_to_path(dataset.uri)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    records = _read_dataset_records(manifest_path, manifest)
+    manifest, records = _read_dataset_artifact(dataset)
     reflected_records = _reflection_records(
         records,
         max_records=_int_config(job.config.get("max_records"), 20),
@@ -344,10 +345,9 @@ def text_memory_expel_reflector(
     manifests: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     for dataset_artifact in dataset_artifacts:
-        manifest_path = _file_uri_to_path(dataset_artifact.uri)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest, dataset_records = _read_dataset_artifact(dataset_artifact)
         manifests.append(manifest)
-        records.extend(_read_dataset_records(manifest_path, manifest))
+        records.extend(dataset_records)
     source_dataset_artifact_ids = [artifact.artifact_id for artifact in dataset_artifacts]
     source_dataset_uris = [artifact.uri for artifact in dataset_artifacts]
     manifest = {
@@ -507,9 +507,7 @@ def skill_bundle_reflector(
     if dataset is None:
         raise ValueError("skill_bundle_reflector requires an input dataset artifact")
 
-    manifest_path = _file_uri_to_path(dataset.uri)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    records = _read_dataset_records(manifest_path, manifest)
+    manifest, records = _read_dataset_artifact(dataset)
     reflected_records = _reflection_records(
         records,
         max_records=_int_config(job.config.get("max_records"), 20),
@@ -662,9 +660,7 @@ def agent_system_reflector(
     if dataset is None:
         raise ValueError("agent_system_reflector requires an input dataset artifact")
 
-    manifest_path = _file_uri_to_path(dataset.uri)
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    records = _read_dataset_records(manifest_path, manifest)
+    manifest, records = _read_dataset_artifact(dataset)
     reflected_records = _reflection_records(
         records,
         max_records=_int_config(job.config.get("max_records"), 20),
@@ -1676,21 +1672,215 @@ def _first_input_artifact(
     return None
 
 
-def _read_dataset_records(manifest_path: Path, manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    records_uri = manifest.get("records_uri")
-    if isinstance(records_uri, str) and records_uri.startswith("file://"):
-        records_path = _file_uri_to_path(records_uri)
+def _read_dataset_artifact(
+    dataset: WorkerClaimInputArtifact,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    manifest_path = _file_uri_to_path(dataset.uri)
+    strict_snapshot = dataset.manifest_sha256 is not None
+    manifest_bytes = _read_bounded_dataset_file(
+        manifest_path,
+        max_bytes=_MAX_DATASET_MANIFEST_BYTES,
+        label="dataset manifest",
+        strict_mode=strict_snapshot,
+    )
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+        manifest = json.loads(manifest_text)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("dataset manifest is not valid UTF-8 JSON") from exc
+    if not isinstance(manifest, dict):
+        raise ValueError("dataset manifest must be a JSON object")
+
+    if strict_snapshot:
+        if manifest_path.name != "manifest.json":
+            raise ValueError("dataset manifest path is not canonical")
+        canonical_manifest_bytes = json.dumps(
+            manifest,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+        if manifest_bytes != canonical_manifest_bytes:
+            raise ValueError("dataset manifest bytes are not canonical")
+        if canonical_digest(manifest) != dataset.manifest_sha256:
+            raise ValueError("dataset manifest digest differs from the worker snapshot")
+        records_path = manifest_path.with_name("records.jsonl")
+        manifest_records_byte_size = manifest.get("records_byte_size")
+        manifest_records_sha256 = manifest.get("records_sha256")
+        records_byte_size = (
+            dataset.records_byte_size
+            if manifest_records_byte_size is None
+            else manifest_records_byte_size
+        )
+        records_sha256 = (
+            dataset.records_sha256
+            if manifest_records_sha256 is None
+            else manifest_records_sha256
+        )
+        if (
+            manifest.get("records_path") != records_path.name
+            or manifest.get("records_uri") != records_path.as_uri()
+            or type(records_byte_size) is not int
+            or not 0 <= records_byte_size <= _MAX_DATASET_RECORDS_BYTES
+            or not isinstance(records_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", records_sha256) is None
+            or (
+                dataset.records_byte_size is not None
+                and dataset.records_byte_size != records_byte_size
+            )
+            or (
+                dataset.records_sha256 is not None
+                and dataset.records_sha256 != records_sha256
+            )
+        ):
+            raise ValueError("dataset records authority is invalid")
     else:
-        records_path_value = manifest.get("records_path") or "records.jsonl"
-        records_path = manifest_path.parent / str(records_path_value)
+        records_path = _dataset_records_path(manifest_path, manifest)
+        records_byte_size = None
+        records_sha256 = None
+
+    records_bytes = _read_bounded_dataset_file(
+        records_path,
+        max_bytes=_MAX_DATASET_RECORDS_BYTES,
+        label="dataset records",
+        strict_mode=strict_snapshot,
+    )
+    if strict_snapshot and (
+        len(records_bytes) != records_byte_size
+        or hashlib.sha256(records_bytes).hexdigest() != records_sha256
+    ):
+        raise ValueError("dataset records differ from the worker snapshot")
 
     records: list[dict[str, Any]] = []
-    for line in records_path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
+    try:
+        records_text = records_bytes.decode("utf-8")
+        for line in records_text.splitlines():
+            if not line.strip():
+                continue
             record = json.loads(line)
-            if isinstance(record, dict):
-                records.append(record)
-    return records
+            if not isinstance(record, dict):
+                raise ValueError("dataset record must be a JSON object")
+            records.append(record)
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise ValueError("dataset records are not valid UTF-8 JSONL") from exc
+    if strict_snapshot:
+        canonical_records_bytes = "".join(
+            json.dumps(
+                record,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n"
+            for record in records
+        ).encode("utf-8")
+        if records_bytes != canonical_records_bytes:
+            raise ValueError("dataset records bytes are not canonical")
+    return manifest, records
+
+
+def _dataset_records_path(manifest_path: Path, manifest: dict[str, Any]) -> Path:
+    records_uri = manifest.get("records_uri")
+    if isinstance(records_uri, str) and records_uri.startswith("file://"):
+        return _file_uri_to_path(records_uri)
+    records_path_value = manifest.get("records_path") or "records.jsonl"
+    records_path = Path(str(records_path_value))
+    if records_path.is_absolute() or records_path.name != str(records_path_value):
+        raise ValueError("dataset records path is unsafe")
+    return manifest_path.parent / records_path
+
+
+def _read_bounded_dataset_file(
+    path: Path,
+    *,
+    max_bytes: int,
+    label: str,
+    strict_mode: bool,
+) -> bytes:
+    path = Path(os.path.abspath(path))
+    directory_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
+    directory_descriptor = os.open(path.parent, directory_flags)
+    try:
+        directory_before = os.fstat(directory_descriptor)
+        pathname_before = os.stat(path.parent, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(directory_before.st_mode)
+            or (directory_before.st_dev, directory_before.st_ino)
+            != (pathname_before.st_dev, pathname_before.st_ino)
+        ):
+            raise ValueError(f"{label} directory binding is invalid")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_descriptor,
+        )
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or before.st_size < 0
+                or before.st_size > max_bytes
+                or (
+                    strict_mode
+                    and stat.S_IMODE(before.st_mode) != 0o600
+                )
+            ):
+                raise ValueError(f"{label} is not a bounded owned regular file")
+            remaining = int(before.st_size)
+            chunks: list[bytes] = []
+            while remaining:
+                chunk = os.read(descriptor, min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError(f"{label} ended before its declared size")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            if os.read(descriptor, 1):
+                raise ValueError(f"{label} grew while being read")
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_mode,
+                after.st_uid,
+                after.st_nlink,
+                after.st_size,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_mode,
+                before.st_uid,
+                before.st_nlink,
+                before.st_size,
+            ):
+                raise ValueError(f"{label} identity changed while being read")
+        finally:
+            os.close(descriptor)
+        directory_after = os.fstat(directory_descriptor)
+        pathname_after = os.stat(path.parent, follow_symlinks=False)
+        if (
+            directory_after.st_dev,
+            directory_after.st_ino,
+            directory_after.st_mode,
+            directory_after.st_uid,
+        ) != (
+            directory_before.st_dev,
+            directory_before.st_ino,
+            directory_before.st_mode,
+            directory_before.st_uid,
+        ) or (
+            pathname_after.st_dev,
+            pathname_after.st_ino,
+        ) != (
+            directory_before.st_dev,
+            directory_before.st_ino,
+        ):
+            raise ValueError(f"{label} directory binding changed while being read")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ValueError(f"{label} cannot be read safely") from exc
+    finally:
+        os.close(directory_descriptor)
 
 
 def _write_parametric_memory_training_jsonl(
@@ -1701,11 +1891,9 @@ def _write_parametric_memory_training_jsonl(
 ) -> list[dict[str, Any]]:
     training_records: list[dict[str, Any]] = []
     for dataset in dataset_artifacts:
-        manifest_path = _file_uri_to_path(dataset.uri)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest, records = _read_dataset_artifact(dataset)
         if not isinstance(manifest, dict):
             continue
-        records = _read_dataset_records(manifest_path, manifest)
         for record in records:
             reward = _record_reward(record)
             if not _parametric_memory_record_is_training_source(
@@ -3174,9 +3362,7 @@ def _history_reflection_rounds(
 ) -> list[dict[str, Any]]:
     rounds: list[dict[str, Any]] = []
     for index, dataset in enumerate(dataset_artifacts, start=1):
-        manifest_path = _file_uri_to_path(dataset.uri)
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        records = _read_dataset_records(manifest_path, manifest)
+        manifest, records = _read_dataset_artifact(dataset)
         reflected_records = _reflection_records(
             records,
             max_records=max_records_per_round,

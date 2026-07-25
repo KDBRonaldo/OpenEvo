@@ -45,11 +45,17 @@ class PlanBoundJobCreateRequest(_Contract):
     target_id: str
     job_type: str = Field(min_length=1, max_length=512)
     input_bindings: tuple[PlannedInputBinding, ...]
+    successor_transition_id: str | None = None
+    predecessor_successor_transition_id: str | None = None
     core_config: dict[str, Any] = Field(default_factory=dict)
     priority: int = 100
 
     _target = field_validator("target_id")(_stable_id)
     _job_type = field_validator("job_type")(_text)
+    _transition_ids = field_validator(
+        "successor_transition_id",
+        "predecessor_successor_transition_id",
+    )(lambda value: None if value is None else _stable_id(value))
 
     @field_validator("core_config")
     @classmethod
@@ -71,6 +77,13 @@ class PlanBoundJobCreateRequest(_Contract):
         binding_ids = tuple(binding.binding_id for binding in self.input_bindings)
         if len(binding_ids) != len(set(binding_ids)):
             raise ValueError("planned input binding IDs must be unique")
+        if (
+            self.predecessor_successor_transition_id is not None
+            and self.successor_transition_id is None
+        ):
+            raise ValueError(
+                "predecessor transition authority requires a successor transition owner"
+            )
         return self
 
     def selection(self):
@@ -79,6 +92,20 @@ class PlanBoundJobCreateRequest(_Contract):
             for selection in self.plan.selections
             if selection.target_id == self.target_id
         )
+
+
+class PlanBoundJobRetryRequest(_Contract):
+    """Retry one exact terminal job without changing its immutable plan."""
+
+    retry_request_id: str
+    plan_id: str
+    target_id: str
+
+    _ids = field_validator(
+        "retry_request_id",
+        "plan_id",
+        "target_id",
+    )(_stable_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +193,7 @@ def materialize_plan_bound_job(
 __all__ = [
     "MaterializedPlanBoundJob",
     "PlanBoundJobCreateRequest",
+    "PlanBoundJobRetryRequest",
     "PlannedInputBinding",
     "materialize_plan_bound_job",
     "validate_plan_against_snapshot",

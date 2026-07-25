@@ -875,6 +875,74 @@ CREATE INDEX idx_task_admissions_active_revision
 ON task_admissions(pinned_revision_id) WHERE status = 'admitted';
 """
 
+_PLAN_BOUND_JOB_RETRY_REQUESTS_DDL = """
+CREATE TABLE plan_bound_job_retry_requests (
+    job_id TEXT NOT NULL,
+    retry_request_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    claim_attempt_before INTEGER NOT NULL CHECK (claim_attempt_before >= 0),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(job_id, retry_request_id),
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE RESTRICT
+);
+"""
+
+_PLAN_BOUND_JOB_TRANSITION_BINDINGS_DDL = """
+CREATE TABLE plan_bound_job_transition_bindings (
+    job_id TEXT PRIMARY KEY,
+    successor_transition_id TEXT NOT NULL,
+    predecessor_successor_transition_id TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(job_id) REFERENCES jobs(job_id) ON DELETE RESTRICT
+);
+CREATE INDEX idx_plan_bound_job_transition_successor
+ON plan_bound_job_transition_bindings(successor_transition_id, job_id);
+"""
+
+_SUCCESSOR_TRANSITION_DISCARDS_DDL = """
+CREATE TABLE successor_transition_discards (
+    successor_transition_id TEXT PRIMARY KEY,
+    receipt_sha256 TEXT NOT NULL CHECK(length(receipt_sha256) = 64),
+    receipt_json TEXT NOT NULL,
+    discarded_at TEXT NOT NULL
+) STRICT;
+"""
+
+_DATASET_CREATE_REQUESTS_V1_DDL = """
+CREATE TABLE dataset_create_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_json TEXT NOT NULL,
+    dataset_id TEXT NOT NULL UNIQUE,
+    response_json TEXT,
+    created_at TEXT NOT NULL
+);
+"""
+
+_DATASET_CREATE_REQUESTS_DDL = """
+CREATE TABLE dataset_create_requests (
+    idempotency_key TEXT PRIMARY KEY,
+    request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+    request_json TEXT NOT NULL,
+    dataset_id TEXT NOT NULL UNIQUE,
+    response_json TEXT,
+    recovery_file_count INTEGER CHECK(
+        recovery_file_count IS NULL OR (
+            typeof(recovery_file_count) = 'integer'
+            AND recovery_file_count >= 0
+        )
+    ),
+    recovery_byte_size INTEGER CHECK(
+        recovery_byte_size IS NULL OR (
+            typeof(recovery_byte_size) = 'integer'
+            AND recovery_byte_size >= 0
+        )
+    ),
+    created_at TEXT NOT NULL
+);
+"""
+
 _STORE_IDENTITY_DDL = """
 CREATE TABLE store_identity (
     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
@@ -1044,7 +1112,7 @@ _PRE_REVISION_CURRENT_SCHEMAS = (
     ),
 )
 
-_CURRENT_SCHEMAS = _PRE_REVISION_CURRENT_SCHEMAS + tuple(
+_REVISION_CURRENT_SCHEMAS = _PRE_REVISION_CURRENT_SCHEMAS + tuple(
     _KnownSchema(
         match=LegacySchemaMatch(
             kind="complete",
@@ -1053,6 +1121,76 @@ _CURRENT_SCHEMAS = _PRE_REVISION_CURRENT_SCHEMAS + tuple(
         ddl=known.ddl + _REVISION_LEDGER_DDL,
     )
     for known in _PRE_REVISION_CURRENT_SCHEMAS
+)
+
+_PLAN_BOUND_RETRY_CURRENT_SCHEMAS = tuple(
+    _KnownSchema(
+        match=LegacySchemaMatch(
+            kind="complete",
+            version=f"{known.match.version}-plan-bound-retry",
+        ),
+        ddl=known.ddl + _PLAN_BOUND_JOB_RETRY_REQUESTS_DDL,
+    )
+    for known in _REVISION_CURRENT_SCHEMAS
+)
+
+_DATASET_CREATE_V1_CURRENT_SCHEMAS = tuple(
+    _KnownSchema(
+        match=LegacySchemaMatch(
+            kind="complete",
+            version=f"{known.match.version}-dataset-create-requests-v1",
+        ),
+        ddl=known.ddl + _DATASET_CREATE_REQUESTS_V1_DDL,
+    )
+    for known in _PLAN_BOUND_RETRY_CURRENT_SCHEMAS
+)
+
+_DATASET_CREATE_CURRENT_SCHEMAS = tuple(
+    _KnownSchema(
+        match=LegacySchemaMatch(
+            kind="complete",
+            version=f"{known.match.version}-dataset-create-requests",
+        ),
+        ddl=known.ddl + _DATASET_CREATE_REQUESTS_DDL,
+    )
+    for known in _PLAN_BOUND_RETRY_CURRENT_SCHEMAS
+)
+
+_PLAN_BOUND_TRANSITION_CURRENT_SCHEMAS = tuple(
+    _KnownSchema(
+        match=LegacySchemaMatch(
+            kind="complete",
+            version=f"{known.match.version}-transition-bindings",
+        ),
+        ddl=known.ddl + _PLAN_BOUND_JOB_TRANSITION_BINDINGS_DDL,
+    )
+    for known in (
+        _PLAN_BOUND_RETRY_CURRENT_SCHEMAS
+        + _DATASET_CREATE_V1_CURRENT_SCHEMAS
+        + _DATASET_CREATE_CURRENT_SCHEMAS
+    )
+)
+
+_SUCCESSOR_TRANSITION_DISCARD_CURRENT_SCHEMAS = tuple(
+    _KnownSchema(
+        match=LegacySchemaMatch(
+            kind="complete",
+            version=(
+                f"{known.match.version}-successor-transition-discards"
+            ),
+        ),
+        ddl=known.ddl + _SUCCESSOR_TRANSITION_DISCARDS_DDL,
+    )
+    for known in _PLAN_BOUND_TRANSITION_CURRENT_SCHEMAS
+)
+
+_CURRENT_SCHEMAS = (
+    _REVISION_CURRENT_SCHEMAS
+    + _PLAN_BOUND_RETRY_CURRENT_SCHEMAS
+    + _DATASET_CREATE_V1_CURRENT_SCHEMAS
+    + _DATASET_CREATE_CURRENT_SCHEMAS
+    + _PLAN_BOUND_TRANSITION_CURRENT_SCHEMAS
+    + _SUCCESSOR_TRANSITION_DISCARD_CURRENT_SCHEMAS
 )
 
 

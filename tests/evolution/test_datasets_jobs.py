@@ -8,6 +8,7 @@ import math
 import os
 from pathlib import Path
 import sqlite3
+import threading
 
 import pytest
 
@@ -156,6 +157,10 @@ def test_create_dataset_filters_events(tmp_path):
         "trace_count": 1,
         "records_path": "records.jsonl",
         "records_uri": records_path.as_uri(),
+        "records_byte_size": records_path.stat().st_size,
+        "records_sha256": hashlib.sha256(
+            records_path.read_bytes()
+        ).hexdigest(),
     }
     records = [
         json.loads(line)
@@ -210,6 +215,626 @@ def test_create_dataset_filters_events(tmp_path):
     ]
     assert worker_records[0]["event_id"] == good_event.event_id
     assert worker_records[0]["traces"] == [{"reward": 1.0}]
+
+
+def test_dataset_create_is_exact_session_bound_and_response_loss_idempotent(
+    tmp_path,
+) -> None:
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    for suffix in ("older", "accepted"):
+        store.ingest_event(
+            EventIngestRequest(
+                source="openevo",
+                event_type="openevo.session_completed",
+                source_event_id=f"session:{suffix}",
+                task_id=f"task-{suffix}",
+                session_id=f"session-{suffix}",
+                status="COMPLETED",
+                policy_version="shared-policy",
+                payload={
+                        "session_result": {
+                            "task_id": f"task-{suffix}",
+                            "session_id": f"session-{suffix}",
+                            "metadata": (
+                                {"human_feedback": "retain source digest"}
+                                if suffix == "accepted"
+                                else {}
+                            ),
+                            "trajectory": {
+                            "traces": [{"response": suffix}],
+                        },
+                    }
+                },
+            )
+    )
+    store.ingest_event(
+        EventIngestRequest(
+            source="other-producer",
+            event_type="openevo.session_completed",
+            source_event_id="session:accepted",
+            task_id="task-accepted",
+            session_id="session-accepted",
+            status="COMPLETED",
+            policy_version="shared-policy",
+            payload={
+                "session_result": {
+                    "task_id": "task-accepted",
+                    "session_id": "session-accepted",
+                    "trajectory": {
+                        "traces": [{"response": "wrong producer"}],
+                    },
+                }
+            },
+        )
+    )
+    request = DatasetCreateRequest(
+        idempotency_key="successor-dataset-attempt-accepted",
+        name="accepted transcript",
+        purpose="openevo_science_successor_v2",
+        query={
+            "source": "openevo",
+            "event_types": ["openevo.session_completed"],
+            "status": ["COMPLETED"],
+            "policy_version": "shared-policy",
+            "source_event_id": "session:accepted",
+            "task_id": "task-accepted",
+            "session_id": "session-accepted",
+        },
+        limits={"max_events": 1, "max_traces": 1},
+    )
+
+    created = store.create_dataset(request)
+    with store.connect() as connection:
+        connection.execute(
+            "UPDATE dataset_create_requests SET response_json = NULL "
+            "WHERE idempotency_key = ?",
+            (request.idempotency_key,),
+        )
+        connection.commit()
+    recovered = store.create_dataset(request)
+
+    assert recovered == created
+    with store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM datasets").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM dataset_create_requests"
+            ).fetchone()[0]
+            == 1
+        )
+        row = connection.execute(
+            "SELECT manifest_path FROM datasets WHERE dataset_id = ?",
+            (created.dataset_id,),
+        ).fetchone()
+    manifest = json.loads(Path(row["manifest_path"]).read_text(encoding="utf-8"))
+    assert manifest["query"]["source"] == "openevo"
+    assert manifest["query"]["source_event_id"] == "session:accepted"
+    assert manifest["query"]["task_id"] == "task-accepted"
+    assert manifest["query"]["session_id"] == "session-accepted"
+    assert manifest["source_event_evidence"]["source_event_id"] == (
+        "session:accepted"
+    )
+    assert manifest["source_event_evidence"]["source"] == "openevo"
+    expected_result = {
+        "task_id": "task-accepted",
+        "session_id": "session-accepted",
+        "metadata": {"human_feedback": "retain source digest"},
+        "trajectory": {"traces": [{"response": "accepted"}]},
+    }
+    expected_sha256 = hashlib.sha256(
+        json.dumps(
+            expected_result,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    assert manifest["source_event_evidence"]["session_result_sha256"] == (
+        expected_sha256
+    )
+    with pytest.raises(ValueError, match="idempotency"):
+        store.create_dataset(
+            request.model_copy(update={"name": "different transcript"})
+        )
+
+
+def test_dataset_create_recovers_an_unjournaled_exact_active_artifact(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:recover-artifact",
+            task_id="task-recover-artifact",
+            session_id="recover-artifact",
+            status="COMPLETED",
+            policy_version="policy-recover-artifact",
+            payload={
+                "session_result": {
+                    "trajectory": {"traces": [{"response": "accepted"}]}
+                }
+            },
+        )
+    )
+    request = DatasetCreateRequest(
+        idempotency_key="successor-dataset-recover-artifact",
+        name="recover active artifact",
+        purpose="openevo_science_successor_v2",
+        query={
+            "source": "openevo",
+            "event_types": ["openevo.session_completed"],
+            "status": ["COMPLETED"],
+            "policy_version": "policy-recover-artifact",
+            "source_event_id": "session:recover-artifact",
+            "task_id": "task-recover-artifact",
+            "session_id": "recover-artifact",
+        },
+        limits={"max_events": 1, "max_traces": 1},
+    )
+    original_backfill = store._backfill_dataset_artifact_id
+
+    def interrupt_backfill(_dataset_id: str, _artifact_id: str) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        store,
+        "_backfill_dataset_artifact_id",
+        interrupt_backfill,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        store.create_dataset(request)
+    monkeypatch.setattr(
+        store,
+        "_backfill_dataset_artifact_id",
+        original_backfill,
+    )
+
+    with store.connect() as connection:
+        dataset_id = str(
+            connection.execute(
+                "SELECT dataset_id FROM dataset_create_requests "
+                "WHERE idempotency_key = ?",
+                (request.idempotency_key,),
+            ).fetchone()["dataset_id"]
+        )
+    restarted = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    restarted.initialize()
+    recovered = restarted.get_dataset(dataset_id)
+    assert restarted.create_dataset(request) == recovered
+
+    assert recovered.event_count == 1
+    assert recovered.trace_count == 1
+    with restarted.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM datasets").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE type = 'dataset'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_dataset_create_recovers_after_crash_between_dataset_file_publications(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:dataset-file-crash",
+            task_id="task-dataset-file-crash",
+            session_id="dataset-file-crash",
+            status="COMPLETED",
+            payload={
+                "session_result": {
+                    "trajectory": {
+                        "traces": [{"response": "recover exact publication"}]
+                    }
+                }
+            },
+        )
+    )
+    request = DatasetCreateRequest(
+        idempotency_key="successor-dataset-file-crash",
+        name="recover dataset files",
+        purpose="openevo_science_successor_v2",
+        query={
+            "source": "openevo",
+            "source_event_id": "session:dataset-file-crash",
+            "task_id": "task-dataset-file-crash",
+            "session_id": "dataset-file-crash",
+        },
+        limits={"max_events": 1, "max_traces": 1},
+    )
+    original_write_records = store_module._write_jsonl_strict_exclusive
+
+    def interrupt_records(*_args, **_kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        store_module,
+        "_write_jsonl_strict_exclusive",
+        interrupt_records,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        store.create_dataset(request)
+    monkeypatch.setattr(
+        store_module,
+        "_write_jsonl_strict_exclusive",
+        original_write_records,
+    )
+
+    restarted = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    restarted.initialize()
+    recovered = restarted.create_dataset(request)
+
+    assert recovered.event_count == 1
+    assert recovered.trace_count == 1
+    with restarted.connect() as connection:
+        row = connection.execute(
+            "SELECT artifact_id FROM datasets WHERE dataset_id = ?",
+            (recovered.dataset_id,),
+        ).fetchone()
+        assert row is not None
+        assert row["artifact_id"] == recovered.artifact_id
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE type = 'dataset'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_concurrent_exact_dataset_create_has_one_dataset_artifact(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    first_store = EvolutionStore(
+        db_path=database_path,
+        artifact_root=artifact_root,
+    )
+    first_store.initialize()
+    second_store = EvolutionStore(
+        db_path=database_path,
+        artifact_root=artifact_root,
+    )
+    second_store.initialize()
+    first_store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:concurrent-dataset",
+            task_id="task-concurrent-dataset",
+            session_id="concurrent-dataset",
+            status="COMPLETED",
+            payload={
+                "session_result": {
+                    "trajectory": {
+                        "traces": [{"response": "one exact artifact"}]
+                    }
+                }
+            },
+        )
+    )
+    request = DatasetCreateRequest(
+        idempotency_key="successor-dataset-concurrent",
+        name="concurrent exact dataset",
+        purpose="openevo_science_successor_v2",
+        query={
+            "source": "openevo",
+            "source_event_id": "session:concurrent-dataset",
+            "task_id": "task-concurrent-dataset",
+            "session_id": "concurrent-dataset",
+        },
+        limits={"max_events": 1, "max_traces": 1},
+    )
+    registration_count = 0
+    registration_guard = threading.Lock()
+    second_registration_entered = threading.Event()
+
+    def gated_register(store, original, artifact_request):
+        nonlocal registration_count
+        with registration_guard:
+            registration_count += 1
+            ordinal = registration_count
+            if ordinal == 2:
+                second_registration_entered.set()
+        if ordinal == 1:
+            second_registration_entered.wait(timeout=0.25)
+        return original(artifact_request)
+
+    first_register = first_store.register_artifact
+    second_register = second_store.register_artifact
+    monkeypatch.setattr(
+        first_store,
+        "register_artifact",
+        lambda artifact_request: gated_register(
+            first_store,
+            first_register,
+            artifact_request,
+        ),
+    )
+    monkeypatch.setattr(
+        second_store,
+        "register_artifact",
+        lambda artifact_request: gated_register(
+            second_store,
+            second_register,
+            artifact_request,
+        ),
+    )
+    results: list[object] = []
+
+    def create(store: EvolutionStore) -> None:
+        try:
+            results.append(store.create_dataset(request))
+        except BaseException as exc:
+            results.append(exc)
+
+    first_thread = threading.Thread(target=create, args=(first_store,))
+    second_thread = threading.Thread(target=create, args=(second_store,))
+    first_thread.start()
+    second_thread.start()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert len(results) == 2
+    assert all(not isinstance(result, BaseException) for result in results)
+    assert results[0] == results[1]
+    with first_store.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM datasets").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM artifacts WHERE type = 'dataset'"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_dataset_startup_recovery_enforces_monotonic_file_byte_budget(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(
+        db_path=database_path,
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:dataset-recovery-budget",
+            status="COMPLETED",
+            payload={
+                "session_result": {
+                    "trajectory": {
+                        "traces": [{"response": "bounded startup recovery"}]
+                    }
+                }
+            },
+        )
+    )
+    store.create_dataset(
+        DatasetCreateRequest(
+            idempotency_key="successor-dataset-recovery-budget",
+            name="bounded recovery dataset",
+            purpose="openevo_science_successor_v2",
+            query={
+                "source": "openevo",
+                "source_event_id": "session:dataset-recovery-budget",
+            },
+            limits={"max_events": 1, "max_traces": 1},
+        )
+    )
+    monkeypatch.setattr(
+        store_module,
+        "MAX_DATASET_STARTUP_RECOVERY_BYTES",
+        1,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="dataset startup recovery exceeds the aggregate byte limit",
+    ):
+        EvolutionStore(
+            db_path=database_path,
+            artifact_root=artifact_root,
+        ).initialize()
+
+
+def test_dataset_create_admission_cannot_ack_unrestartable_recovery_state(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    database_path = tmp_path / "evolution.db"
+    artifact_root = tmp_path / "artifacts"
+    store = EvolutionStore(
+        db_path=database_path,
+        artifact_root=artifact_root,
+    )
+    store.initialize()
+    store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:dataset-recovery-admission",
+            status="COMPLETED",
+            payload={
+                "session_result": {
+                    "trajectory": {
+                        "traces": [{"response": "durable recovery admission"}]
+                    }
+                }
+            },
+        )
+    )
+    first = store.create_dataset(
+        DatasetCreateRequest(
+            idempotency_key="successor-dataset-recovery-admission-a",
+            name="recovery admission a",
+            purpose="openevo_science_successor_v2",
+            query={
+                "source": "openevo",
+                "source_event_id": "session:dataset-recovery-admission",
+            },
+            limits={"max_events": 1, "max_traces": 1},
+        )
+    )
+    with store.connect() as connection:
+        admitted = connection.execute(
+            "SELECT recovery_byte_size, recovery_file_count "
+            "FROM dataset_create_requests WHERE dataset_id = ?",
+            (first.dataset_id,),
+        ).fetchone()
+    assert admitted["recovery_byte_size"] > 0
+    assert admitted["recovery_file_count"] == 4
+    monkeypatch.setattr(
+        store_module,
+        "MAX_DATASET_STARTUP_RECOVERY_BYTES",
+        admitted["recovery_byte_size"],
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="dataset startup recovery capacity is exhausted",
+    ):
+        store.create_dataset(
+            DatasetCreateRequest(
+                idempotency_key="successor-dataset-recovery-admission-b",
+                name="recovery admission b",
+                purpose="openevo_science_successor_v2",
+                query={
+                    "source": "openevo",
+                    "source_event_id": "session:dataset-recovery-admission",
+                },
+                limits={"max_events": 1, "max_traces": 1},
+            )
+        )
+
+    restarted = EvolutionStore(
+        db_path=database_path,
+        artifact_root=artifact_root,
+    )
+    restarted.initialize()
+    assert restarted.get_dataset(first.dataset_id) == first
+
+
+def test_dataset_create_request_inventory_fails_closed_on_forged_receipt(
+    tmp_path,
+) -> None:
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    with store.connect() as connection:
+        connection.execute(
+            "INSERT INTO dataset_create_requests("
+            "idempotency_key, request_sha256, request_json, dataset_id, "
+            "response_json, created_at) VALUES (?, ?, ?, ?, NULL, ?)",
+            (
+                "forged-dataset-request",
+                "0" * 64,
+                '{"idempotency_key":"forged-dataset-request"}',
+                "ds-forged",
+                "2026-07-25T00:00:00Z",
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError, match="dataset create request"):
+        EvolutionStore(
+            db_path=tmp_path / "evolution.db",
+            artifact_root=tmp_path / "artifacts",
+        ).initialize()
+
+
+def test_get_dataset_rejects_transcript_content_tampering(tmp_path) -> None:
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+    store.ingest_event(
+        EventIngestRequest(
+            source="openevo",
+            event_type="openevo.session_completed",
+            source_event_id="session:record-integrity",
+            task_id="task-record-integrity",
+            session_id="record-integrity",
+            status="COMPLETED",
+            payload={
+                "session_result": {
+                    "trajectory": {
+                        "traces": [{"response": "authoritative transcript"}]
+                    }
+                }
+            },
+        )
+    )
+    created = store.create_dataset(
+        DatasetCreateRequest(
+            name="record integrity",
+            purpose="openevo_science_successor_v2",
+            query={
+                "source": "openevo",
+                "event_types": ["openevo.session_completed"],
+                "source_event_id": "session:record-integrity",
+                "task_id": "task-record-integrity",
+                "session_id": "record-integrity",
+            },
+            limits={"max_events": 1, "max_traces": 1},
+        )
+    )
+    with store.connect() as connection:
+        row = connection.execute(
+            "SELECT manifest_path FROM datasets WHERE dataset_id = ?",
+            (created.dataset_id,),
+        ).fetchone()
+    records_path = Path(row["manifest_path"]).with_name("records.jsonl")
+    record = json.loads(records_path.read_text(encoding="utf-8"))
+    record["traces"][0]["response"] = "forged transcript"
+    records_path.write_text(
+        json.dumps(record, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        store_module.DatasetIntegrityError,
+        match="records differ from event membership",
+    ):
+        store.get_dataset(created.dataset_id)
 
 
 def test_create_dataset_excludes_non_openevo_session_event_identity(tmp_path):
@@ -1528,6 +2153,8 @@ def test_job_claim_heartbeat_and_complete(tmp_path):
         "artifact_ids": complete["artifact_ids"],
         "error": None,
         "job_id": job.job_id,
+        "retryable": None,
+        "successor_transition_id": None,
         "outputs": [
             {
                 "artifact_id": complete["artifact_ids"][0],
@@ -1638,7 +2265,9 @@ def test_internal_job_result_does_not_expose_worker_error_text_or_scan_payloads(
         "artifact_ids": [],
         "error": "evolution_job_failed",
         "job_id": job.job_id,
+        "retryable": False,
         "state": "failed",
+        "successor_transition_id": None,
     }
 
 
@@ -1919,7 +2548,9 @@ def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
         "artifact_ids": [],
         "error": None,
         "job_id": job.job_id,
+        "retryable": None,
         "state": "claimed",
+        "successor_transition_id": None,
     }
     assert statements[0] == "BEGIN"
     monkeypatch.setattr(store, "connect", original_connect)
@@ -1928,6 +2559,8 @@ def test_internal_job_result_reads_job_and_outputs_from_one_sqlite_snapshot(
         "artifact_ids": completed_artifact_ids,
         "error": None,
         "job_id": job.job_id,
+        "retryable": None,
+        "successor_transition_id": None,
         "outputs": [
             {
                 "artifact_id": completed_artifact_ids[0],
