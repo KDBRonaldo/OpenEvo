@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -17,6 +17,7 @@ from openevo.backend.contracts.v2 import models as m
 from openevo.backend.contracts.v2.store import (
     CoreControlStoreV2,
     ProjectAuthorityDocumentV2,
+    ProjectPreconditionFailedV2,
     ProjectRecordV2,
 )
 from openevo.backend.run_admission import (
@@ -26,7 +27,10 @@ from openevo.backend.run_admission import (
 )
 from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
-from openevo.backend.science_run_store import ScienceProjectAdmissionAuthorityV2
+from openevo.backend.science_run_store import (
+    ScienceProjectAdmissionAuthorityV2,
+    ScienceProjectReadinessBlockerV2,
+)
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.backend.workspace_store_v2 import (
     WorkspaceIntegrityErrorV2,
@@ -62,6 +66,10 @@ class ProjectAuthorityV2Error(RuntimeError):
 
 
 class ProjectAuthorityConflictV2(ProjectAuthorityV2Error):
+    pass
+
+
+class ProjectAuthoritySettingsTransitionRequiredV2(ProjectAuthorityV2Error):
     pass
 
 
@@ -101,6 +109,20 @@ def _after_science_authority_publish_before_catalog_commit(*_args: object) -> No
     """Test-only crash boundary after the atomic science-ledger publication."""
 
 
+def _after_project_config_prepare_before_science_publish(*_args: object) -> None:
+    """Test-only crash boundary after the catalog records a prepared update."""
+
+
+def _after_project_config_rebind_fence_before_catalog_prepare(*_args: object) -> None:
+    """Test-only crash boundary after durable Task admission fencing."""
+
+
+def _after_project_config_catalog_publish_before_rebind_release(
+    *_args: object,
+) -> None:
+    """Test-only crash boundary after catalog publication and before release."""
+
+
 class _ProjectAuthorityRecordV1(m.ContractModel):
     model_config = ConfigDict(
         extra="forbid",
@@ -130,6 +152,7 @@ class _ProjectAuthorityRecordV1(m.ContractModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     publication_state: Literal["draft", "prepared", "published"]
+    pending_project_head: m.ProjectHeadRefV2 | None = None
 
     @model_validator(mode="after")
     def _closed_state(self) -> _ProjectAuthorityRecordV1:
@@ -147,6 +170,11 @@ class _ProjectAuthorityRecordV1(m.ContractModel):
             value is None for value in prepared_values
         ):
             raise ValueError("a prepared project authority is incomplete")
+        if (
+            self.pending_project_head is not None
+            and self.publication_state != "prepared"
+        ):
+            raise ValueError("only a prepared authority may bind a pending head")
         if (
             self.workspace_snapshot is not None
             and self.workspace_snapshot.project_id != self.project_id
@@ -169,6 +197,13 @@ class _ProjectAuthorityRecordV1(m.ContractModel):
                 or effective.producer_id != self.execution_snapshot_producer_id
             ):
                 raise ValueError("project authority execution snapshot differs")
+        pending = self.pending_project_head
+        if pending is not None and (
+            pending.project_id != self.project_id
+            or head is None
+            or pending.generation < head.generation
+        ):
+            raise ValueError("pending project authority head is inconsistent")
         return self
 
 
@@ -213,8 +248,32 @@ class ProjectAuthorityV2:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
         for document in self._catalog.list_project_authority_documents():
-            record = self._catalog.get_project(document.project_id)
-            _load_authority_record(document, expected_project=record)
+            with self._catalog.action_execution_fence(
+                coordination_scope=_project_authority_scope(document.project_id),
+            ):
+                record = self._catalog.get_project(document.project_id)
+                current_document = self._catalog.get_project_authority_document(
+                    document.project_id
+                )
+                if current_document is None:
+                    raise ProjectAuthorityV2Error(
+                        "project authority document disappeared during recovery"
+                    )
+                authority_record = _load_authority_record(
+                    current_document,
+                    expected_project=record,
+                )
+                if authority_record.publication_state == "prepared":
+                    self._publish_prepared_authority(
+                        record,
+                        current_document,
+                        authority_record,
+                    )
+                elif authority_record.publication_state == "published":
+                    self._abort_orphaned_project_config_rebind(
+                        record,
+                        authority_record,
+                    )
 
     def close(self) -> None:
         self._workspaces.close()
@@ -247,6 +306,16 @@ class ProjectAuthorityV2:
     ) -> ScienceProjectAdmissionAuthorityV2 | None:
         project = _exact_project_record(project)
         self.validate_config(project.config)
+        with self._lock, self._catalog.action_execution_fence(
+            coordination_scope=_project_authority_scope(project.project_id),
+        ):
+            return self._ensure_project_locked(project)
+
+    def _ensure_project_locked(
+        self,
+        project: ProjectRecordV2,
+    ) -> ScienceProjectAdmissionAuthorityV2 | None:
+        project = _exact_project_record(project)
         with self._lock:
             document = self._catalog.get_project_authority_document(project.project_id)
             if document is None:
@@ -279,17 +348,18 @@ class ProjectAuthorityV2:
                 expected_project=project,
             )
             if authority_record.publication_state == "published":
+                self._abort_orphaned_project_config_rebind(
+                    project,
+                    authority_record,
+                )
                 authority = _science_authority(authority_record)
                 return self._require_published_authority(authority)
             if authority_record.publication_state == "prepared":
-                authority = _science_authority(authority_record)
-                published = self._published_authority_or_none(project.project_id)
-                if published is not None:
-                    if published != authority:
-                        raise ProjectAuthorityConflictV2(
-                            "science authority differs from prepared genesis"
-                        )
-                    return self._mark_published(document, authority_record, authority)
+                return self._publish_prepared_authority(
+                    project,
+                    document,
+                    authority_record,
+                )
             if authority_record.workspace_snapshot is None:
                 return None
             resolved = self._resolve_execution(
@@ -354,6 +424,372 @@ class ProjectAuthorityV2:
                 authority.active_project_head.project_head_id,
             )
             return self._mark_published(document, authority_record, authority)
+
+    def update_project_draft(
+        self,
+        project: ProjectRecordV2,
+        request: m.ProjectUpdateV2,
+        *,
+        if_match: str,
+        current_etag: str,
+        idempotency_key: str,
+        now: datetime,
+    ) -> tuple[ProjectRecordV2, bool]:
+        """Rebind next-Task text/evolution intent without changing the active head."""
+
+        project = _exact_project_record(project)
+        if type(request) is not m.ProjectUpdateV2:
+            raise TypeError("project update request has the wrong type")
+        request = m.ProjectUpdateV2.model_validate(
+            request.model_dump(mode="python")
+        )
+        self.validate_config(request.config)
+        with self._lock, self._catalog.action_execution_fence(
+            coordination_scope=_project_authority_scope(project.project_id),
+        ):
+            replay = self._catalog.project_update_replay(
+                project.project_id,
+                request,
+                if_match=if_match,
+                idempotency_key=idempotency_key,
+            )
+            if replay is not None:
+                self._ensure_project_locked(replay)
+                return replay, True
+            current_project = self._catalog.get_project(project.project_id)
+            if current_project.resource_version != project.resource_version:
+                raise ProjectPreconditionFailedV2(
+                    "v2 project resource ETag changed"
+                )
+            project = current_project
+            if request.config.execution != project.config.execution:
+                raise ProjectAuthoritySettingsTransitionRequiredV2(
+                    "execution settings require a settings-only successor"
+                )
+            if request.config.workspace != project.config.workspace:
+                raise ProjectAuthoritySettingsTransitionRequiredV2(
+                    "workspace settings require an atomic workspace successor"
+                )
+            document = self._catalog.get_project_authority_document(
+                project.project_id
+            )
+            if document is None:
+                raise ProjectAuthorityV2Error(
+                    "project authority document is unavailable"
+                )
+            authority_record = _load_authority_record(
+                document,
+                expected_project=project,
+            )
+            if authority_record.publication_state == "draft":
+                if (
+                    request.expected_project_head_id is not None
+                    or request.expected_project_head_manifest_sha256 is not None
+                ):
+                    raise ProjectAuthorityConflictV2(
+                        "project update head authority changed"
+                    )
+                desired_draft = authority_record.model_copy(
+                    update={
+                        "project_config_sha256": m.project_config_sha256_for(
+                            request.config
+                        ),
+                        "normalized_evolution_intent_sha256": (
+                            normalized_evolution_intent_sha256_for(request.config)
+                        ),
+                    }
+                )
+                updated, _document, replayed = (
+                    self._catalog.update_project_with_authority_document(
+                        project.project_id,
+                        request,
+                        if_match=if_match,
+                        current_etag=current_etag,
+                        expected_resource_version=project.resource_version,
+                        idempotency_key=idempotency_key,
+                        authority_record_json=(
+                            _authority_record_bytes(desired_draft)
+                        ),
+                        expected_authority_record_sha256=document.record_sha256,
+                        now=now,
+                    )
+                )
+                return updated, replayed
+            if authority_record.publication_state != "published":
+                self._publish_prepared_authority(project, document, authority_record)
+                document = self._catalog.get_project_authority_document(
+                    project.project_id
+                )
+                if document is None:
+                    raise ProjectAuthorityV2Error(
+                        "project authority document is unavailable"
+                    )
+                authority_record = _load_authority_record(
+                    document,
+                    expected_project=project,
+                )
+            self._abort_orphaned_project_config_rebind(
+                project,
+                authority_record,
+            )
+            current_authority = self._require_published_authority(
+                _science_authority(authority_record)
+            )
+            head = current_authority.active_project_head
+            if (
+                request.expected_project_head_id != head.project_head_id
+                or request.expected_project_head_manifest_sha256
+                != head.manifest_sha256
+            ):
+                raise ProjectAuthorityConflictV2(
+                    "project update head authority changed"
+                )
+            desired_record = authority_record.model_copy(
+                update={
+                    "project_config_sha256": m.project_config_sha256_for(
+                        request.config
+                    ),
+                    "normalized_evolution_intent_sha256": (
+                        normalized_evolution_intent_sha256_for(request.config)
+                    ),
+                    "publication_state": "prepared",
+                    "pending_project_head": head,
+                }
+            )
+            desired_authority = _prepared_science_authority(desired_record)
+            blocked = self._tasks.begin_project_admission_authority_rebind(
+                current_authority,
+            )
+            if blocked.blockers != (
+                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+            ):
+                raise ProjectAuthorityConflictV2(
+                    "science owner did not fence project configuration"
+                )
+            try:
+                _after_project_config_rebind_fence_before_catalog_prepare(
+                    project.project_id,
+                    head.project_head_id,
+                )
+                updated, prepared_document, replayed = (
+                    self._catalog.update_project_with_authority_document(
+                        project.project_id,
+                        request,
+                        if_match=if_match,
+                        current_etag=current_etag,
+                        expected_resource_version=project.resource_version,
+                        idempotency_key=idempotency_key,
+                        authority_record_json=(
+                            _authority_record_bytes(desired_record)
+                        ),
+                        expected_authority_record_sha256=document.record_sha256,
+                        now=now,
+                    )
+                )
+                if replayed:
+                    recovered = self._ensure_project_locked(updated)
+                    if recovered is None:
+                        raise ProjectAuthorityV2Error(
+                            "replayed project update is not ready"
+                        )
+                    return updated, True
+                _after_project_config_prepare_before_science_publish(
+                    project.project_id,
+                    head.project_head_id,
+                )
+                staged = (
+                    self._tasks.finish_project_admission_authority_rebind(
+                        desired_authority,
+                    )
+                )
+                expected_staged = replace(
+                    desired_authority,
+                    blockers=(
+                        ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+                    ),
+                )
+                if staged != desired_authority and staged != expected_staged:
+                    raise ProjectAuthorityConflictV2(
+                        "science owner staged another desired configuration"
+                    )
+                _after_science_authority_publish_before_catalog_commit(
+                    project.project_id,
+                    head.project_head_id,
+                )
+                prepared_record = _load_authority_record(
+                    prepared_document,
+                    expected_project=updated,
+                )
+                self._mark_published(
+                    prepared_document,
+                    prepared_record,
+                    desired_authority,
+                )
+                _after_project_config_catalog_publish_before_rebind_release(
+                    project.project_id,
+                    head.project_head_id,
+                )
+                released = (
+                    self._tasks.release_project_admission_authority_rebind(
+                        desired_authority,
+                    )
+                )
+                if released != desired_authority:
+                    raise ProjectAuthorityConflictV2(
+                        "science owner released another desired configuration"
+                    )
+                return updated, False
+            except Exception:
+                self._recover_project_config_rebind(project.project_id)
+                raise
+
+    def _publish_prepared_authority(
+        self,
+        project: ProjectRecordV2,
+        document: ProjectAuthorityDocumentV2,
+        authority_record: _ProjectAuthorityRecordV1,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        project = _exact_project_record(project)
+        authority_record = _load_authority_record(
+            document,
+            expected_project=project,
+        )
+        if authority_record.publication_state != "prepared":
+            raise ProjectAuthorityV2Error(
+                "project authority is not prepared for publication"
+            )
+        desired = _prepared_science_authority(authority_record)
+        published = self._published_authority_or_none(project.project_id)
+        if published is None:
+            if authority_record.pending_project_head is not None:
+                raise ProjectAuthorityConflictV2(
+                    "prepared config rebind has no prior science authority"
+                )
+            published = self._tasks.publish_project_admission_authority(
+                desired
+            )
+            if published != desired:
+                raise ProjectAuthorityConflictV2(
+                    "science authority differs from prepared genesis"
+                )
+            _after_science_authority_publish_before_catalog_commit(
+                project.project_id,
+                desired.active_project_head.project_head_id,
+            )
+            return self._mark_published(
+                document,
+                authority_record,
+                desired,
+            )
+        if authority_record.pending_project_head is None:
+            if published != desired:
+                raise ProjectAuthorityConflictV2(
+                    "science authority differs from prepared genesis"
+                )
+            return self._mark_published(
+                document,
+                authority_record,
+                desired,
+            )
+        if published.active_project_head != desired.active_project_head:
+            raise ProjectAuthorityConflictV2(
+                "science authority differs from prepared project head"
+            )
+        expected_staged = replace(
+            desired,
+            blockers=(ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,),
+        )
+        changed = False
+        if published != desired and published != expected_staged:
+            if published.blockers != (
+                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+            ):
+                published = (
+                    self._tasks.begin_project_admission_authority_rebind(
+                        published,
+                    )
+                )
+            changed = True
+        if published != desired:
+            already_staged = published == expected_staged
+            published = (
+                self._tasks.finish_project_admission_authority_rebind(
+                    desired,
+                )
+            )
+            changed = changed or not already_staged
+        if published != desired and published != expected_staged:
+            raise ProjectAuthorityConflictV2(
+                "science authority differs from staged project authority"
+            )
+        if changed:
+            _after_science_authority_publish_before_catalog_commit(
+                project.project_id,
+                desired.active_project_head.project_head_id,
+            )
+        self._mark_published(
+            document,
+            authority_record,
+            desired,
+        )
+        _after_project_config_catalog_publish_before_rebind_release(
+            project.project_id,
+            desired.active_project_head.project_head_id,
+        )
+        released = self._tasks.release_project_admission_authority_rebind(
+            desired,
+        )
+        if released != desired:
+            raise ProjectAuthorityConflictV2(
+                "science authority differs after config rebind release"
+            )
+        return released
+
+    def _abort_orphaned_project_config_rebind(
+        self,
+        project: ProjectRecordV2,
+        authority_record: _ProjectAuthorityRecordV1,
+    ) -> None:
+        if authority_record.publication_state != "published":
+            return
+        expected = _science_authority(authority_record)
+        published = self._require_published_authority(expected)
+        blocker = ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND
+        if blocker not in published.blockers:
+            return
+        desired = replace(published, blockers=())
+        ready = self._tasks.release_project_admission_authority_rebind(
+            desired,
+        )
+        if ready != desired or self._require_published_authority(expected) != ready:
+            raise ProjectAuthorityConflictV2(
+                "orphaned config rebind differs from the published catalog"
+            )
+
+    def _recover_project_config_rebind(self, project_id: str) -> None:
+        project = self._catalog.get_project(project_id)
+        document = self._catalog.get_project_authority_document(project_id)
+        if document is None:
+            raise ProjectAuthorityV2Error(
+                "project authority document disappeared during recovery"
+            )
+        authority_record = _load_authority_record(
+            document,
+            expected_project=project,
+        )
+        if authority_record.publication_state == "prepared":
+            self._publish_prepared_authority(
+                project,
+                document,
+                authority_record,
+            )
+        elif authority_record.publication_state == "published":
+            self._abort_orphaned_project_config_rebind(
+                project,
+                authority_record,
+            )
+        else:
+            self._tasks.abort_project_admission_authority_rebind(project_id)
 
     def adopt_workspace_snapshot(
         self,
@@ -817,7 +1253,12 @@ class ProjectAuthorityV2:
         record: _ProjectAuthorityRecordV1,
         authority: ScienceProjectAdmissionAuthorityV2,
     ) -> ScienceProjectAdmissionAuthorityV2:
-        published_record = record.model_copy(update={"publication_state": "published"})
+        published_record = record.model_copy(
+            update={
+                "publication_state": "published",
+                "pending_project_head": None,
+            }
+        )
         self._catalog.put_project_authority_document(
             project_id=record.project_id,
             record_json=_authority_record_bytes(published_record),
@@ -967,6 +1408,25 @@ def _science_authority(
     )
 
 
+def _prepared_science_authority(
+    record: _ProjectAuthorityRecordV1,
+) -> ScienceProjectAdmissionAuthorityV2:
+    if record.publication_state != "prepared":
+        raise ProjectAuthorityV2Error("project authority is not prepared")
+    head = record.pending_project_head or record.active_project_head
+    if head is None:
+        raise ProjectAuthorityV2Error("prepared project authority has no head")
+    return ScienceProjectAdmissionAuthorityV2(
+        project_id=record.project_id,
+        active_project_head=head,
+        project_config_sha256=record.project_config_sha256,
+        workspace_snapshot=head.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            record.normalized_evolution_intent_sha256
+        ),
+    )
+
+
 def _load_authority_record(
     document: ProjectAuthorityDocumentV2,
     *,
@@ -1017,8 +1477,11 @@ def _load_authority_record(
 
 
 def _authority_record_bytes(record: _ProjectAuthorityRecordV1) -> bytes:
+    payload = record.model_dump(mode="json")
+    if record.pending_project_head is None:
+        payload.pop("pending_project_head")
     return json.dumps(
-        record.model_dump(mode="json"),
+        payload,
         ensure_ascii=True,
         allow_nan=False,
         sort_keys=True,
@@ -1080,6 +1543,12 @@ def _digest(value: str, *, label: str) -> str:
     return value
 
 
+def _project_authority_scope(project_id: str) -> str:
+    if not isinstance(project_id, str) or not project_id:
+        raise ValueError("project authority scope requires a project ID")
+    return f"project-authority:{project_id}"
+
+
 def _timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise TypeError("project authority timestamp requires timezone information")
@@ -1110,6 +1579,7 @@ __all__ = [
     "ProjectAuthorityConflictV2",
     "ProjectAuthorityInvalidV2",
     "ProjectAuthorityReadinessV2",
+    "ProjectAuthoritySettingsTransitionRequiredV2",
     "ProjectAuthorityV2",
     "ProjectAuthorityV2Error",
     "ServiceBindingProviderV2",

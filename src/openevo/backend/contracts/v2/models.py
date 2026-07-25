@@ -253,6 +253,10 @@ class TaskAdmissionRefV2(ContractModel):
             raise ValueError("predecessor project head belongs to another project")
         if self.workspace_snapshot.project_id != self.project_id:
             raise ValueError("workspace snapshot belongs to another project")
+        if self.workspace_snapshot != self.predecessor_project_head.workspace_snapshot:
+            raise ValueError(
+                "workspace snapshot differs from the predecessor project head"
+            )
         if self.registry_sha256 != self.predecessor_project_head.registry_sha256:
             raise ValueError("admission registry digest differs from the predecessor head")
         if self.admission_sha256 != task_admission_sha256_for(self):

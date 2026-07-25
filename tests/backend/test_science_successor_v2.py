@@ -243,7 +243,7 @@ def _authority(head: ProjectHeadRefV2 | None = None) -> ScienceProjectAdmissionA
         project_id=head.project_id,
         active_project_head=head,
         project_config_sha256=project_config_sha256_for(_project_config()),
-        workspace_snapshot=_workspace(head.project_id, "7"),
+        workspace_snapshot=head.workspace_snapshot,
         normalized_evolution_intent_sha256="8" * 64,
     )
 

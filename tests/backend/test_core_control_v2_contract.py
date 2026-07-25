@@ -242,7 +242,7 @@ def _admission(
     workspace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     head = head or _head(project_id)
-    workspace = workspace or _workspace(project_id, "7")
+    workspace = workspace or head["workspace_snapshot"]
     payload = {
         "schema_version": "2",
         "task_admission_id": "admission-1",
@@ -634,6 +634,9 @@ def test_task_admission_and_attempt_bind_immutable_ownership() -> None:
 
     with pytest.raises(ValidationError, match="workspace snapshot belongs"):
         bad_admission = _admission(workspace=_workspace("project-2"))
+        _json_model(TaskAdmissionRefV2, bad_admission)
+    with pytest.raises(ValidationError, match="predecessor project head"):
+        bad_admission = _admission(workspace=_workspace("project-1", "f"))
         _json_model(TaskAdmissionRefV2, bad_admission)
     with pytest.raises(ValidationError, match="registry digest"):
         _json_model(

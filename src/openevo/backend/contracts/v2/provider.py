@@ -23,6 +23,7 @@ from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.project_authority_v2 import (
     ProjectAuthorityConflictV2,
     ProjectAuthorityInvalidV2,
+    ProjectAuthoritySettingsTransitionRequiredV2,
     ProjectAuthorityV2,
     ProjectAuthorityV2Error,
 )
@@ -89,6 +90,12 @@ RELEASE_DAEMON_FEATURE_FLAGS_V2 = tuple(
         ]
     )
 )
+
+
+def _after_project_update_join_read(*_args: object) -> None:
+    """Test-only race boundary after reading the public joined project ETag."""
+
+
 _PROJECT_OPERATIONS = frozenset(
     {
         "createCoreProjectV2",
@@ -441,6 +448,18 @@ class CoreControlProviderV2:
                 retryable=False,
                 repair_action="reconfigure",
             ) from exc
+        except ProjectAuthoritySettingsTransitionRequiredV2 as exc:
+            raise _http_error(
+                409,
+                code="project_update_requires_successor",
+                message=(
+                    "Changing execution or workspace settings requires an atomic "
+                    "successor transition."
+                ),
+                category="project",
+                retryable=False,
+                repair_action="repair",
+            ) from exc
         except ProjectAuthorityConflictV2 as exc:
             raise _http_error(
                 412,
@@ -701,32 +720,17 @@ class CoreControlProviderV2:
         authority.validate_config(request.config)
         current_record = self.store.get_project(project_id)
         current = self._project_model(current_record)
-        head = current.active_project_head
-        if request.expected_project_head_id != (
-            None if head is None else head.project_head_id
-        ) or request.expected_project_head_manifest_sha256 != (
-            None if head is None else head.manifest_sha256
-        ):
-            raise ProjectAuthorityConflictV2("project head changed")
-        if request.config != current_record.config:
-            raise _http_error(
-                409,
-                code="project_update_requires_successor",
-                message=(
-                    "Changing a pinned project configuration requires an atomic "
-                    "successor transition."
-                ),
-                category="project",
-                retryable=False,
-                repair_action="repair",
-            )
-        updated, _replayed = self.store.update_project(
-            project_id,
+        _after_project_update_join_read(project_id, current)
+        if_match = _string(arguments["if_match"])
+        idempotency_key = _string(arguments["idempotency_key"])
+        now = self._clock()
+        updated, _replayed = authority.update_project_draft(
+            current_record,
             request,
-            if_match=_string(arguments["if_match"]),
+            if_match=if_match,
             current_etag=current.etag,
-            idempotency_key=_string(arguments["idempotency_key"]),
-            now=self._clock(),
+            idempotency_key=idempotency_key,
+            now=now,
         )
         project = self._project_model(updated)
         return JSONResponse(

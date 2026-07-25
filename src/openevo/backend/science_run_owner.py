@@ -304,6 +304,62 @@ class CoreScienceTaskOwnerV2:
             and self._successor_preparer is not None
         )
 
+    def begin_project_admission_authority_rebind(
+        self,
+        expected: ScienceProjectAdmissionAuthorityV2,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        try:
+            return self._ledger.begin_project_admission_authority_rebind(
+                expected,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="updateCoreProjectAdmissionAuthorityV2",
+            )
+
+    def finish_project_admission_authority_rebind(
+        self,
+        desired: ScienceProjectAdmissionAuthorityV2,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        try:
+            return self._ledger.finish_project_admission_authority_rebind(
+                desired,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="updateCoreProjectAdmissionAuthorityV2",
+            )
+
+    def release_project_admission_authority_rebind(
+        self,
+        desired: ScienceProjectAdmissionAuthorityV2,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        try:
+            return self._ledger.release_project_admission_authority_rebind(
+                desired,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="updateCoreProjectAdmissionAuthorityV2",
+            )
+
+    def abort_project_admission_authority_rebind(
+        self,
+        project_id: str,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        try:
+            return self._ledger.abort_project_admission_authority_rebind(
+                project_id,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(
+                exc,
+                operation_id="updateCoreProjectAdmissionAuthorityV2",
+            )
+
     def publish_project_admission_authority(
         self,
         authority: ScienceProjectAdmissionAuthorityV2,

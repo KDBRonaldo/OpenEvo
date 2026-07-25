@@ -134,7 +134,7 @@ def _authority(
         project_id=head.project_id,
         active_project_head=head,
         project_config_sha256="7" * 64,
-        workspace_snapshot=workspace or _workspace(head.project_id, "8"),
+        workspace_snapshot=workspace or head.workspace_snapshot,
         normalized_evolution_intent_sha256="9" * 64,
         blockers=blockers,
     )
@@ -159,12 +159,22 @@ def _owner(tmp_path: Path) -> CoreScienceTaskOwnerV2:
     return CoreScienceTaskOwnerV2(state_root=tmp_path, clock=_Clock())
 
 
+def test_project_authority_workspace_must_match_its_active_head() -> None:
+    head = _head()
+    with pytest.raises(ValueError, match="workspace differs"):
+        _authority(
+            head=head,
+            workspace=_workspace(head.project_id, "f"),
+        )
+
+
 @pytest.mark.parametrize(
     "blocker",
     [
         ScienceProjectReadinessBlockerV2.SETTINGS_TRANSITION,
         ScienceProjectReadinessBlockerV2.CONTEXT_REBIND,
         ScienceProjectReadinessBlockerV2.WORKSPACE_PUBLICATION,
+        ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
     ],
 )
 def test_unresolved_project_state_creates_no_task_admission_or_attempt(
@@ -172,8 +182,13 @@ def test_unresolved_project_state_creates_no_task_admission_or_attempt(
     blocker: ScienceProjectReadinessBlockerV2,
 ) -> None:
     owner = _owner(tmp_path)
-    authority = _authority(blockers=(blocker,))
-    owner.publish_project_admission_authority(authority)
+    if blocker is ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND:
+        authority = _authority()
+        owner.publish_project_admission_authority(authority)
+        authority = owner.begin_project_admission_authority_rebind(authority)
+    else:
+        authority = _authority(blockers=(blocker,))
+        owner.publish_project_admission_authority(authority)
     try:
         with pytest.raises(CoreTaskControlError) as failure:
             owner.invoke(
@@ -189,18 +204,103 @@ def test_unresolved_project_state_creates_no_task_admission_or_attempt(
         owner.close()
 
 
-def test_successor_transition_blocker_requires_store_owned_transition(
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,
+        ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+    ],
+)
+def test_reserved_project_blocker_requires_store_owned_transition(
     tmp_path: Path,
+    blocker: ScienceProjectReadinessBlockerV2,
 ) -> None:
     owner = _owner(tmp_path)
     authority = _authority(
-        blockers=(ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,),
+        blockers=(blocker,),
     )
     try:
         with pytest.raises(CoreTaskControlError) as rejected:
             owner.publish_project_admission_authority(authority)
         assert rejected.value.code == "task_precondition_failed"
         assert owner.ownership_counts() == (0, 0, 0)
+    finally:
+        owner.close()
+
+
+def test_generic_authority_publisher_cannot_clear_project_config_rebind(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    authority = _authority()
+    owner.publish_project_admission_authority(authority)
+    blocked = owner.begin_project_admission_authority_rebind(authority)
+    assert blocked.blockers == (
+        ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+    )
+    try:
+        with pytest.raises(CoreTaskControlError) as rejected:
+            owner.publish_project_admission_authority(
+                authority,
+                expected_project_head_id=(
+                    authority.active_project_head.project_head_id
+                ),
+            )
+        assert rejected.value.code == "task_precondition_failed"
+        assert owner.project_admission_authority(authority.project_id) == blocked
+        assert owner.ownership_counts() == (0, 0, 0)
+    finally:
+        owner.close()
+
+
+def test_generic_authority_publisher_cannot_rollback_staged_or_released_config(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path)
+    original = _authority()
+    owner.publish_project_admission_authority(original)
+    desired = ScienceProjectAdmissionAuthorityV2(
+        project_id=original.project_id,
+        active_project_head=original.active_project_head,
+        project_config_sha256="a" * 64,
+        workspace_snapshot=original.workspace_snapshot,
+        normalized_evolution_intent_sha256="b" * 64,
+    )
+    owner.begin_project_admission_authority_rebind(original)
+    staged = owner.finish_project_admission_authority_rebind(desired)
+    assert staged == ScienceProjectAdmissionAuthorityV2(
+        project_id=desired.project_id,
+        active_project_head=desired.active_project_head,
+        project_config_sha256=desired.project_config_sha256,
+        workspace_snapshot=desired.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            desired.normalized_evolution_intent_sha256
+        ),
+        blockers=(
+            ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+        ),
+    )
+    try:
+        with pytest.raises(CoreTaskControlError) as staged_rollback:
+            owner.publish_project_admission_authority(
+                original,
+                expected_project_head_id=(
+                    original.active_project_head.project_head_id
+                ),
+            )
+        assert staged_rollback.value.code == "task_precondition_failed"
+        assert owner.project_admission_authority(original.project_id) == staged
+
+        assert owner.release_project_admission_authority_rebind(desired) == desired
+        with pytest.raises(CoreTaskControlError) as released_rollback:
+            owner.publish_project_admission_authority(
+                original,
+                expected_project_head_id=(
+                    original.active_project_head.project_head_id
+                ),
+            )
+        assert released_rollback.value.code == "task_precondition_failed"
+        assert owner.project_admission_authority(original.project_id) == desired
     finally:
         owner.close()
 

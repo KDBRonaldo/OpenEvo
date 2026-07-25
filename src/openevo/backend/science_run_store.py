@@ -5,7 +5,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 import hashlib
@@ -455,10 +455,19 @@ class ScienceEventCursorExpiredV2(ScienceTaskStoreV2Error):
 
 
 class ScienceProjectReadinessBlockerV2(StrEnum):
+    PROJECT_CONFIG_REBIND = "project_config_rebind"
     SUCCESSOR_TRANSITION = "successor_transition"
     SETTINGS_TRANSITION = "settings_transition"
     CONTEXT_REBIND = "context_rebind"
     WORKSPACE_PUBLICATION = "workspace_publication"
+
+
+_STORE_OWNED_PROJECT_READINESS_BLOCKERS = frozenset(
+    {
+        ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+        ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION,
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -489,6 +498,10 @@ class ScienceProjectAdmissionAuthorityV2:
         )
         if head.project_id != self.project_id or workspace.project_id != self.project_id:
             raise ValueError("v2 project admission authority crosses project identities")
+        if workspace != head.workspace_snapshot:
+            raise ValueError(
+                "v2 project admission authority workspace differs from its active head"
+            )
         if (
             not isinstance(self.blockers, tuple)
             or any(type(item) is not ScienceProjectReadinessBlockerV2 for item in self.blockers)
@@ -1568,6 +1581,190 @@ class ScienceTaskStoreV2:
         with self._lock:
             self._closed = True
 
+    def begin_project_admission_authority_rebind(
+        self,
+        expected: ScienceProjectAdmissionAuthorityV2,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        """Durably block Task admission before a cross-store config rebind."""
+
+        expected = _validate_v2_project_authority(expected)
+        if expected.blockers:
+            raise ScienceTaskProjectInFlightV2(
+                "project has another immutable transition in flight"
+            )
+        blocked = replace(
+            expected,
+            blockers=(ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,),
+        )
+        with self._lock, self._transaction() as connection:
+            current = _load_v2_project_authority(connection, expected.project_id)
+            if current == blocked:
+                return current
+            if current != expected:
+                if current.blockers:
+                    raise ScienceTaskProjectInFlightV2(
+                        "project has another immutable transition in flight"
+                    )
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 project admission authority changed"
+                )
+            open_task = connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
+                (expected.project_id,),
+            ).fetchone()
+            if open_task is not None:
+                raise ScienceTaskProjectInFlightV2(
+                    "project has an immutable v2 Task in flight"
+                )
+            updated = connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(blocked), expected.project_id),
+            )
+            if updated.rowcount != 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind lost project admission authority"
+                )
+            stored = _load_v2_project_authority(connection, expected.project_id)
+            if stored != blocked:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind blocker changed during commit"
+                )
+            return stored
+
+    def finish_project_admission_authority_rebind(
+        self,
+        desired: ScienceProjectAdmissionAuthorityV2,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        """Stage desired next-Task intent while retaining its durable blocker."""
+
+        desired = _validate_v2_project_authority(desired)
+        if desired.blockers:
+            raise ValueError("v2 desired config authority must be ready")
+        staged = replace(
+            desired,
+            blockers=(ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,),
+        )
+        with self._lock, self._transaction() as connection:
+            current = _load_v2_project_authority(connection, desired.project_id)
+            if current == desired or current == staged:
+                return current
+            if current.blockers != (
+                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 config rebind blocker changed"
+                )
+            if (
+                current.project_id != desired.project_id
+                or current.active_project_head != desired.active_project_head
+                or current.workspace_snapshot != desired.workspace_snapshot
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 config rebind active authority changed"
+                )
+            open_task = connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
+                (desired.project_id,),
+            ).fetchone()
+            if open_task is not None:
+                raise ScienceTaskProjectInFlightV2(
+                    "project has an immutable v2 Task in flight"
+                )
+            updated = connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(staged), desired.project_id),
+            )
+            if updated.rowcount != 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind lost project admission authority"
+                )
+            stored = _load_v2_project_authority(connection, desired.project_id)
+            if stored != staged:
+                raise ScienceTaskStoreV2Error(
+                    "v2 staged config authority changed during commit"
+                )
+            return stored
+
+    def release_project_admission_authority_rebind(
+        self,
+        desired: ScienceProjectAdmissionAuthorityV2,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        """Release only the exact catalog-published next-Task authority."""
+
+        desired = _validate_v2_project_authority(desired)
+        if desired.blockers:
+            raise ValueError("v2 desired config authority must be ready")
+        staged = replace(
+            desired,
+            blockers=(ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,),
+        )
+        with self._lock, self._transaction() as connection:
+            current = _load_v2_project_authority(connection, desired.project_id)
+            if current == desired:
+                return current
+            if current != staged:
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 staged config authority changed"
+                )
+            open_task = connection.execute(
+                "SELECT 1 FROM tasks WHERE project_id = ? AND closed = 0 LIMIT 1",
+                (desired.project_id,),
+            ).fetchone()
+            if open_task is not None:
+                raise ScienceTaskProjectInFlightV2(
+                    "project has an immutable v2 Task in flight"
+                )
+            updated = connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(desired), desired.project_id),
+            )
+            if updated.rowcount != 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind release lost project admission authority"
+                )
+            stored = _load_v2_project_authority(connection, desired.project_id)
+            if stored != desired:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind release changed during commit"
+                )
+            return stored
+
+    def abort_project_admission_authority_rebind(
+        self,
+        project_id: str,
+    ) -> ScienceProjectAdmissionAuthorityV2:
+        """Release an orphaned blocker when the catalog never prepared a rebind."""
+
+        project_id = _v2_resource_id(project_id, label="project")
+        with self._lock, self._transaction() as connection:
+            current = _load_v2_project_authority(connection, project_id)
+            blocker = ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND
+            if blocker not in current.blockers:
+                return current
+            if current.blockers != (blocker,):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 config rebind blocker is not exclusive"
+                )
+            ready = replace(current, blockers=())
+            updated = connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (_v2_authority_bytes(ready), project_id),
+            )
+            if updated.rowcount != 1:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind abort lost project admission authority"
+                )
+            stored = _load_v2_project_authority(connection, project_id)
+            if stored != ready:
+                raise ScienceTaskStoreV2Error(
+                    "v2 config rebind abort changed during commit"
+                )
+            return stored
+
     def publish_project_admission_authority(
         self,
         authority: ScienceProjectAdmissionAuthorityV2,
@@ -1587,9 +1784,11 @@ class ScienceTaskStoreV2:
                     raise ScienceTaskPreconditionFailedV2(
                         "v2 project admission authority does not exist"
                     )
-                if ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION in authority.blockers:
+                if _STORE_OWNED_PROJECT_READINESS_BLOCKERS.intersection(
+                    authority.blockers
+                ):
                     raise ScienceTaskPreconditionFailedV2(
-                        "v2 successor readiness authority is store-owned"
+                        "v2 project readiness authority is store-owned"
                     )
                 count = int(
                     connection.execute(
@@ -1617,10 +1816,26 @@ class ScienceTaskStoreV2:
                 raise ScienceTaskPreconditionFailedV2(
                     "v2 active project head is store-owned"
                 )
-            successor_blocker = ScienceProjectReadinessBlockerV2.SUCCESSOR_TRANSITION
-            if successor_blocker in current.blockers or successor_blocker in authority.blockers:
+            if (
+                authority.project_config_sha256
+                != current.project_config_sha256
+                or authority.normalized_evolution_intent_sha256
+                != current.normalized_evolution_intent_sha256
+                or authority.workspace_snapshot != current.workspace_snapshot
+            ):
                 raise ScienceTaskPreconditionFailedV2(
-                    "v2 successor readiness authority is store-owned"
+                    "v2 project admission identity is store-owned"
+                )
+            if (
+                _STORE_OWNED_PROJECT_READINESS_BLOCKERS.intersection(
+                    current.blockers
+                )
+                or _STORE_OWNED_PROJECT_READINESS_BLOCKERS.intersection(
+                    authority.blockers
+                )
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 project readiness authority is store-owned"
                 )
             if (
                 expected_project_head_id is None

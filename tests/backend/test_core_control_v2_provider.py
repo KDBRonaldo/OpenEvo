@@ -47,7 +47,10 @@ from openevo.backend.science_successor import (
     ScienceSuccessorCleanupContextV2,
     ScienceSuccessorCleanupReceiptV2,
 )
-from openevo.backend.science_run_store import ScienceProjectAdmissionAuthorityV2
+from openevo.backend.science_run_store import (
+    ScienceProjectAdmissionAuthorityV2,
+    ScienceProjectReadinessBlockerV2,
+)
 from tests.framework_testkit import verified_builtin_registry
 from tests.backend.test_science_successor_v2 import (
     _Preparer as _SuccessorPreparer,
@@ -179,7 +182,7 @@ def _authority(*, registry_sha256: str = "a" * 64) -> ScienceProjectAdmissionAut
         project_id=head.project_id,
         active_project_head=head,
         project_config_sha256=project_config_sha256_for(_project_config()),
-        workspace_snapshot=_workspace(head.project_id, "7"),
+        workspace_snapshot=head.workspace_snapshot,
         normalized_evolution_intent_sha256="8" * 64,
     )
 
@@ -189,7 +192,7 @@ def _authority_with_head(head: ProjectHeadRefV2) -> ScienceProjectAdmissionAutho
         project_id=head.project_id,
         active_project_head=head,
         project_config_sha256=project_config_sha256_for(_project_config()),
-        workspace_snapshot=_workspace(head.project_id, "7"),
+        workspace_snapshot=head.workspace_snapshot,
         normalized_evolution_intent_sha256="8" * 64,
     )
 
@@ -687,8 +690,9 @@ def test_project_resource_etag_binds_the_complete_admission_authority(
         project_id=runtime.authority.project_id,
         active_project_head=runtime.authority.active_project_head,
         project_config_sha256=runtime.authority.project_config_sha256,
-        workspace_snapshot=_workspace(runtime.authority.project_id, "9"),
+        workspace_snapshot=runtime.authority.workspace_snapshot,
         normalized_evolution_intent_sha256=(runtime.authority.normalized_evolution_intent_sha256),
+        blockers=(ScienceProjectReadinessBlockerV2.SETTINGS_TRANSITION,),
     )
     runtime.provider.publish_project_admission_authority(
         display_name="Provider project",

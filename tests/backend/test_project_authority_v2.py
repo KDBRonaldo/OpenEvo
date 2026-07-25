@@ -12,19 +12,29 @@ from fastapi.testclient import TestClient
 from openevo.backend.contracts.v2.app import create_core_control_v2_contract_app
 from openevo.backend.contracts.v2.models import (
     ProjectCreateV2,
+    ProjectUpdateV2,
     ProjectValidationRequestV2,
     ScienceProjectConfigV2,
+    TaskSubmitRequestV2,
     project_config_sha256_for,
 )
-from openevo.backend.contracts.v2.store import CoreControlStoreV2
+from openevo.backend.contracts.v2.store import (
+    CoreControlStoreV2,
+    ProjectPreconditionFailedV2,
+    project_etag_payload,
+)
 from openevo.backend.contracts.v2.provider import CoreControlProviderV2
+import openevo.backend.contracts.v2.provider as provider_module
 from openevo.backend.project_authority_v2 import (
     ProjectAuthorityInvalidV2,
     ProjectAuthorityV2,
     normalized_evolution_intent_sha256_for,
 )
 import openevo.backend.project_authority_v2 as authority_module
+from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
+import openevo.backend.science_run_store as task_store_module
+from openevo.backend.science_run_store import ScienceProjectReadinessBlockerV2
 from openevo.backend.service_supervisor import ServiceExecutionMode, ServiceRunBinding
 from openevo.backend.workspace_store_v2 import WorkspaceStoreV2
 from openevo.evolution.framework import canonical_digest
@@ -70,6 +80,18 @@ def _config(**execution_changes: object) -> ScienceProjectConfigV2:
             "evolution": {"targets": {}},
         }
     )
+
+
+def _skill_bundle_config() -> ScienceProjectConfigV2:
+    payload = _config().model_dump(mode="python")
+    payload["evolution"]["targets"] = {
+        "skill_bundle": {
+            "enabled": True,
+            "method": "skill_bundle_reflector",
+            "config": {},
+        }
+    }
+    return ScienceProjectConfigV2.model_validate(payload)
 
 
 def _binding(
@@ -691,8 +713,961 @@ def test_provider_project_update_is_etag_bound_idempotent_and_head_safe(
     )
     assert rejected.status_code == 409
     assert rejected.json()["code"] == "project_update_requires_successor"
+
+    authority = runtime.owner.project_admission_authority(created["project_id"])
+    successor = authority.active_project_head.model_copy(
+        update={
+            "project_head_id": "project-head-replay-successor",
+            "generation": 1,
+            "predecessor_project_head_id": (
+                authority.active_project_head.project_head_id
+            ),
+            "manifest_sha256": "b" * 64,
+        }
+    )
+    successor_authority = authority.__class__(
+        project_id=authority.project_id,
+        active_project_head=successor,
+        project_config_sha256=authority.project_config_sha256,
+        workspace_snapshot=successor.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            authority.normalized_evolution_intent_sha256
+        ),
+    )
+    database = (
+        tmp_path
+        / "science-tasks-v2"
+        / "science-tasks-v2.sqlite3"
+    )
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        task_store_module._store_v2_project_head(connection, successor)
+        connection.execute(
+            "UPDATE project_admission_authorities SET authority_json = ?, "
+            "resource_version = resource_version + 1 WHERE project_id = ?",
+            (
+                task_store_module._v2_authority_bytes(successor_authority),
+                created["project_id"],
+            ),
+        )
+        connection.commit()
+    replay_after_successor = client.patch(
+        f"/v2/projects/{created['project_id']}",
+        headers=headers,
+        json=update_request,
+    )
+    assert replay_after_successor.status_code == 200
+    assert replay_after_successor.json()["active_project_head"] == (
+        successor.model_dump(mode="json")
+    )
     client.close()
     provider.close()
+
+
+def test_display_update_rejects_a_concurrent_successor_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    provider = _provider(runtime)
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    auth = "Bearer project-authority-bearer"
+    created = client.post(
+        "/v2/projects",
+        headers={"Authorization": auth, "Idempotency-Key": "create-display-race"},
+        json={
+            "schema_version": "2",
+            "display_name": "Before successor race",
+            "config": _config().model_dump(mode="json"),
+        },
+    ).json()
+    genesis = runtime.owner.project_admission_authority(created["project_id"])
+    successor = genesis.active_project_head.model_copy(
+        update={
+            "project_head_id": "project-head-display-race-successor",
+            "generation": 1,
+            "predecessor_project_head_id": (
+                genesis.active_project_head.project_head_id
+            ),
+            "manifest_sha256": "e" * 64,
+        }
+    )
+    successor_authority = genesis.__class__(
+        project_id=genesis.project_id,
+        active_project_head=successor,
+        project_config_sha256=genesis.project_config_sha256,
+        workspace_snapshot=successor.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            genesis.normalized_evolution_intent_sha256
+        ),
+    )
+    raced = False
+
+    def publish_successor(*_args: object) -> None:
+        nonlocal raced
+        if raced:
+            return
+        raced = True
+        database = (
+            tmp_path
+            / "science-tasks-v2"
+            / "science-tasks-v2.sqlite3"
+        )
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            task_store_module._store_v2_project_head(connection, successor)
+            connection.execute(
+                "UPDATE project_admission_authorities SET authority_json = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (
+                    task_store_module._v2_authority_bytes(successor_authority),
+                    created["project_id"],
+                ),
+            )
+            connection.commit()
+
+    monkeypatch.setattr(
+        provider_module,
+        "_after_project_update_join_read",
+        publish_successor,
+    )
+    response = client.patch(
+        f"/v2/projects/{created['project_id']}",
+        headers={
+            "Authorization": auth,
+            "If-Match": created["etag"],
+            "Idempotency-Key": "display-race-update",
+        },
+        json={
+            "schema_version": "2",
+            "expected_project_head_id": created["active_project_head"][
+                "project_head_id"
+            ],
+            "expected_project_head_manifest_sha256": created[
+                "active_project_head"
+            ]["manifest_sha256"],
+            "expected_project_config_sha256": created["project_config_sha256"],
+            "display_name": "Must not cross successor",
+            "config": created["config"],
+        },
+    )
+    assert raced is True
+    assert response.status_code == 412
+    assert response.json()["code"] == "project_authority_changed"
+    assert runtime.catalog.get_project(created["project_id"]).display_name == (
+        "Before successor race"
+    )
+    client.close()
+    provider.close()
+
+
+def test_provider_project_update_rebinds_next_task_evolution_intent_without_new_head(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    provider = _provider(runtime)
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    auth = "Bearer project-authority-bearer"
+    created = client.post(
+        "/v2/projects",
+        headers={"Authorization": auth, "Idempotency-Key": "create-intent-update"},
+        json={
+            "schema_version": "2",
+            "display_name": "Evolution draft",
+            "config": _config().model_dump(mode="json"),
+        },
+    ).json()
+    changed_config = _skill_bundle_config().model_dump(mode="json")
+    update_request = {
+        "schema_version": "2",
+        "expected_project_head_id": created["active_project_head"][
+            "project_head_id"
+        ],
+        "expected_project_head_manifest_sha256": created["active_project_head"][
+            "manifest_sha256"
+        ],
+        "expected_project_config_sha256": created["project_config_sha256"],
+        "display_name": "Evolution enabled",
+        "config": changed_config,
+    }
+    headers = {
+        "Authorization": auth,
+        "If-Match": created["etag"],
+        "Idempotency-Key": "update-next-task-intent",
+    }
+    updated_response = client.patch(
+        f"/v2/projects/{created['project_id']}",
+        headers=headers,
+        json=update_request,
+    )
+    assert updated_response.status_code == 200, updated_response.text
+    updated = updated_response.json()
+    assert updated["config"] == changed_config
+    assert updated["project_config_sha256"] != created["project_config_sha256"]
+    assert updated["active_project_head"] == created["active_project_head"]
+    assert updated["admission_etag"] != created["admission_etag"]
+    assert updated["state"] == "ready"
+
+    authority = runtime.owner.project_admission_authority(created["project_id"])
+    assert authority.active_project_head == runtime.owner.active_project_head(
+        created["project_id"]
+    )
+    assert authority.project_config_sha256 == updated["project_config_sha256"]
+    assert authority.normalized_evolution_intent_sha256 == (
+        normalized_evolution_intent_sha256_for(
+            ScienceProjectConfigV2.model_validate(changed_config)
+        )
+    )
+
+    replay = client.patch(
+        f"/v2/projects/{created['project_id']}",
+        headers=headers,
+        json=update_request,
+    )
+    assert replay.status_code == 200
+    assert replay.json() == updated
+
+    submitted = client.post(
+        "/v2/tasks",
+        headers={
+            "Authorization": auth,
+            "Idempotency-Key": "submit-updated-intent",
+        },
+        json={
+            "schema_version": "2",
+            "project_id": updated["project_id"],
+            "expected_project_admission_etag": updated["admission_etag"],
+            "expected_project_head_id": updated["active_project_head"][
+                "project_head_id"
+            ],
+            "expected_project_head_manifest_sha256": updated[
+                "active_project_head"
+            ]["manifest_sha256"],
+            "expected_project_config_sha256": updated["project_config_sha256"],
+        },
+    )
+    assert submitted.status_code == 202, submitted.text
+    admission = submitted.json()["admission"]
+    assert admission["project_config_sha256"] == updated["project_config_sha256"]
+    assert admission["normalized_evolution_intent_sha256"] == (
+        authority.normalized_evolution_intent_sha256
+    )
+    client.close()
+    provider.close()
+
+
+def test_provider_project_update_rejects_an_open_task_without_partial_config(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    provider = _provider(runtime)
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    auth = "Bearer project-authority-bearer"
+    created = client.post(
+        "/v2/projects",
+        headers={"Authorization": auth, "Idempotency-Key": "create-open-task"},
+        json={
+            "schema_version": "2",
+            "display_name": "Immutable task project",
+            "config": _config().model_dump(mode="json"),
+        },
+    ).json()
+    submitted = client.post(
+        "/v2/tasks",
+        headers={
+            "Authorization": auth,
+            "Idempotency-Key": "submit-before-config-update",
+        },
+        json={
+            "schema_version": "2",
+            "project_id": created["project_id"],
+            "expected_project_admission_etag": created["admission_etag"],
+            "expected_project_head_id": created["active_project_head"][
+                "project_head_id"
+            ],
+            "expected_project_head_manifest_sha256": created[
+                "active_project_head"
+            ]["manifest_sha256"],
+            "expected_project_config_sha256": created["project_config_sha256"],
+        },
+    )
+    assert submitted.status_code == 202
+    original_authority = runtime.owner.project_admission_authority(
+        created["project_id"]
+    )
+    rejected = client.patch(
+        f"/v2/projects/{created['project_id']}",
+        headers={
+            "Authorization": auth,
+            "If-Match": created["etag"],
+            "Idempotency-Key": "update-during-open-task",
+        },
+        json={
+            "schema_version": "2",
+            "expected_project_head_id": created["active_project_head"][
+                "project_head_id"
+            ],
+            "expected_project_head_manifest_sha256": created[
+                "active_project_head"
+            ]["manifest_sha256"],
+            "expected_project_config_sha256": created["project_config_sha256"],
+            "display_name": "Must not persist",
+            "config": _skill_bundle_config().model_dump(mode="json"),
+        },
+    )
+    assert rejected.status_code == 409
+    assert rejected.json()["code"] == "task_project_in_flight"
+    persisted = runtime.catalog.get_project(created["project_id"])
+    assert persisted.display_name == "Immutable task project"
+    assert persisted.config == _config()
+    assert (
+        runtime.owner.project_admission_authority(created["project_id"])
+        == original_authority
+    )
+    client.close()
+    provider.close()
+
+
+def test_project_intent_update_rejects_a_concurrent_catalog_resource_version(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    authority = runtime.authority.ensure_project(record)
+    assert authority is not None
+    stale_etag = project_etag_payload(
+        record,
+        active_project_head=authority.active_project_head,
+        admission_etag=authority.project_etag,
+        state="ready",
+    )
+    display_update = ProjectUpdateV2(
+        expected_project_head_id=authority.active_project_head.project_head_id,
+        expected_project_head_manifest_sha256=(
+            authority.active_project_head.manifest_sha256
+        ),
+        expected_project_config_sha256=record.project_config_sha256,
+        display_name="Concurrent display update",
+        config=record.config,
+    )
+    concurrent_record, replayed = runtime.catalog.update_project(
+        record.project_id,
+        display_update,
+        if_match=stale_etag,
+        current_etag=stale_etag,
+        expected_resource_version=record.resource_version,
+        idempotency_key="concurrent-display-update",
+        now=runtime.clock(),
+    )
+    assert replayed is False
+
+    intent_update = display_update.model_copy(
+        update={
+            "display_name": "Must not overwrite concurrent display",
+            "config": _skill_bundle_config(),
+        }
+    )
+    with pytest.raises(ProjectPreconditionFailedV2):
+        runtime.authority.update_project_draft(
+            record,
+            intent_update,
+            if_match=stale_etag,
+            current_etag=stale_etag,
+            idempotency_key="stale-intent-update",
+            now=runtime.clock(),
+        )
+    persisted = runtime.catalog.get_project(record.project_id)
+    assert persisted == concurrent_record
+    assert runtime.owner.project_admission_authority(record.project_id) == authority
+    runtime.close()
+
+
+def test_project_intent_update_replays_before_validating_a_stale_snapshot(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    authority = runtime.authority.ensure_project(record)
+    assert authority is not None
+    request = ProjectUpdateV2(
+        expected_project_head_id=authority.active_project_head.project_head_id,
+        expected_project_head_manifest_sha256=(
+            authority.active_project_head.manifest_sha256
+        ),
+        expected_project_config_sha256=record.project_config_sha256,
+        display_name="Exact retry",
+        config=_skill_bundle_config(),
+    )
+    etag = project_etag_payload(
+        record,
+        active_project_head=authority.active_project_head,
+        admission_etag=authority.project_etag,
+        state="ready",
+    )
+    updated, replayed = runtime.authority.update_project_draft(
+        record,
+        request,
+        if_match=etag,
+        current_etag=etag,
+        idempotency_key="concurrent-exact-retry",
+        now=runtime.clock(),
+    )
+    assert replayed is False
+
+    exact, replayed = runtime.authority.update_project_draft(
+        record,
+        request,
+        if_match=etag,
+        current_etag=etag,
+        idempotency_key="concurrent-exact-retry",
+        now=runtime.clock(),
+    )
+    assert replayed is True
+    assert exact == updated
+
+    with pytest.raises(ProjectPreconditionFailedV2):
+        runtime.authority.update_project_draft(
+            record,
+            request,
+            if_match=etag,
+            current_etag=etag,
+            idempotency_key="stale-different-writer",
+            now=runtime.clock(),
+        )
+    runtime.close()
+
+
+def test_project_intent_update_reports_an_existing_transition_as_in_flight(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    provider = _provider(runtime)
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    auth = "Bearer project-authority-bearer"
+    created = client.post(
+        "/v2/projects",
+        headers={"Authorization": auth, "Idempotency-Key": "create-blocked-update"},
+        json={
+            "schema_version": "2",
+            "display_name": "Transitioning project",
+            "config": _config().model_dump(mode="json"),
+        },
+    ).json()
+    authority = runtime.owner.project_admission_authority(created["project_id"])
+    blocked = authority.__class__(
+        project_id=authority.project_id,
+        active_project_head=authority.active_project_head,
+        project_config_sha256=authority.project_config_sha256,
+        workspace_snapshot=authority.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            authority.normalized_evolution_intent_sha256
+        ),
+        blockers=(ScienceProjectReadinessBlockerV2.SETTINGS_TRANSITION,),
+    )
+    runtime.owner.publish_project_admission_authority(
+        blocked,
+        expected_project_head_id=(
+            authority.active_project_head.project_head_id
+        ),
+    )
+    response = client.patch(
+        f"/v2/projects/{created['project_id']}",
+        headers={
+            "Authorization": auth,
+            "If-Match": created["etag"],
+            "Idempotency-Key": "update-while-transitioning",
+        },
+        json={
+            "schema_version": "2",
+            "expected_project_head_id": created["active_project_head"][
+                "project_head_id"
+            ],
+            "expected_project_head_manifest_sha256": created[
+                "active_project_head"
+            ]["manifest_sha256"],
+            "expected_project_config_sha256": created["project_config_sha256"],
+            "display_name": "Must remain blocked",
+            "config": _skill_bundle_config().model_dump(mode="json"),
+        },
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "task_project_in_flight"
+    assert runtime.catalog.get_project(created["project_id"]).display_name == (
+        "Transitioning project"
+    )
+    client.close()
+    provider.close()
+
+
+def test_project_intent_fence_blocks_a_separate_owner_task_admission(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    authority = runtime.authority.ensure_project(record)
+    assert authority is not None
+    competing_owner = CoreScienceTaskOwnerV2(
+        state_root=tmp_path,
+        clock=runtime.clock,
+    )
+    admission_result: list[str] = []
+    request = TaskSubmitRequestV2(
+        project_id=record.project_id,
+        expected_project_admission_etag=authority.project_etag,
+        expected_project_head_id=authority.active_project_head.project_head_id,
+        expected_project_head_manifest_sha256=(
+            authority.active_project_head.manifest_sha256
+        ),
+        expected_project_config_sha256=record.project_config_sha256,
+    )
+
+    def attempt_competing_admission(*_args: object) -> None:
+        try:
+            competing_owner.invoke(
+                "submitCoreTaskV2",
+                {
+                    "request": request,
+                    "idempotency_key": "competing-task-admission",
+                },
+            )
+        except CoreTaskControlError as exc:
+            admission_result.append(exc.code)
+        else:
+            admission_result.append("admitted")
+
+    monkeypatch.setattr(
+        authority_module,
+        "_after_project_config_prepare_before_science_publish",
+        attempt_competing_admission,
+    )
+    update = ProjectUpdateV2(
+        expected_project_head_id=authority.active_project_head.project_head_id,
+        expected_project_head_manifest_sha256=(
+            authority.active_project_head.manifest_sha256
+        ),
+        expected_project_config_sha256=record.project_config_sha256,
+        display_name="Safely rebound",
+        config=_skill_bundle_config(),
+    )
+    try:
+        updated, replayed = runtime.authority.update_project_draft(
+            record,
+            update,
+            if_match=project_etag_payload(
+                record,
+                active_project_head=authority.active_project_head,
+                admission_etag=authority.project_etag,
+                state="ready",
+            ),
+            current_etag=project_etag_payload(
+                record,
+                active_project_head=authority.active_project_head,
+                admission_etag=authority.project_etag,
+                state="ready",
+            ),
+            idempotency_key="fenced-intent-update",
+            now=runtime.clock(),
+        )
+        assert replayed is False
+        assert updated.config == _skill_bundle_config()
+        assert admission_result == ["project_not_ready"]
+        assert competing_owner.ownership_counts() == (0, 0, 0)
+    finally:
+        competing_owner.close()
+        runtime.close()
+
+
+def test_project_intent_update_repairs_an_ordinary_cross_store_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    authority = runtime.authority.ensure_project(record)
+    assert authority is not None
+    request = ProjectUpdateV2(
+        expected_project_head_id=authority.active_project_head.project_head_id,
+        expected_project_head_manifest_sha256=(
+            authority.active_project_head.manifest_sha256
+        ),
+        expected_project_config_sha256=record.project_config_sha256,
+        display_name="Recovered ordinary failure",
+        config=_skill_bundle_config(),
+    )
+
+    def fail_once(*_args: object) -> None:
+        raise RuntimeError("simulated recoverable publication failure")
+
+    monkeypatch.setattr(
+        authority_module,
+        "_after_project_config_prepare_before_science_publish",
+        fail_once,
+    )
+    etag = project_etag_payload(
+        record,
+        active_project_head=authority.active_project_head,
+        admission_etag=authority.project_etag,
+        state="ready",
+    )
+    with pytest.raises(RuntimeError, match="simulated recoverable"):
+        runtime.authority.update_project_draft(
+            record,
+            request,
+            if_match=etag,
+            current_etag=etag,
+            idempotency_key="ordinary-failure-update",
+            now=runtime.clock(),
+        )
+
+    persisted = runtime.catalog.get_project(record.project_id)
+    published = runtime.owner.project_admission_authority(record.project_id)
+    assert persisted.config == _skill_bundle_config()
+    assert published.project_config_sha256 == persisted.project_config_sha256
+    assert published.normalized_evolution_intent_sha256 == (
+        normalized_evolution_intent_sha256_for(persisted.config)
+    )
+    assert published.blockers == ()
+    submitted = runtime.owner.invoke(
+        "submitCoreTaskV2",
+        {
+            "request": TaskSubmitRequestV2(
+                project_id=record.project_id,
+                expected_project_admission_etag=published.project_etag,
+                expected_project_head_id=(
+                    published.active_project_head.project_head_id
+                ),
+                expected_project_head_manifest_sha256=(
+                    published.active_project_head.manifest_sha256
+                ),
+                expected_project_config_sha256=(
+                    published.project_config_sha256
+                ),
+            ),
+            "idempotency_key": "submit-after-ordinary-recovery",
+        },
+    )
+    assert submitted.project_id == record.project_id
+    runtime.close()
+
+
+def test_project_intent_update_preserves_a_successor_project_head(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    genesis = runtime.authority.ensure_project(record)
+    assert genesis is not None
+    successor = genesis.active_project_head.model_copy(
+        update={
+            "project_head_id": "project-head-successor-test",
+            "generation": 1,
+            "predecessor_project_head_id": (
+                genesis.active_project_head.project_head_id
+            ),
+            "manifest_sha256": "f" * 64,
+        }
+    )
+    successor_authority = genesis.__class__(
+        project_id=genesis.project_id,
+        active_project_head=successor,
+        project_config_sha256=genesis.project_config_sha256,
+        workspace_snapshot=successor.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            genesis.normalized_evolution_intent_sha256
+        ),
+    )
+    database = (
+        tmp_path
+        / "science-tasks-v2"
+        / "science-tasks-v2.sqlite3"
+    )
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        task_store_module._store_v2_project_head(connection, successor)
+        connection.execute(
+            "UPDATE project_admission_authorities SET authority_json = ?, "
+            "resource_version = resource_version + 1 WHERE project_id = ?",
+            (
+                task_store_module._v2_authority_bytes(successor_authority),
+                record.project_id,
+            ),
+        )
+        connection.commit()
+
+    request = ProjectUpdateV2(
+        expected_project_head_id=successor.project_head_id,
+        expected_project_head_manifest_sha256=successor.manifest_sha256,
+        expected_project_config_sha256=record.project_config_sha256,
+        display_name="Successor intent update",
+        config=_skill_bundle_config(),
+    )
+    etag = project_etag_payload(
+        record,
+        active_project_head=successor,
+        admission_etag=successor_authority.project_etag,
+        state="ready",
+    )
+    updated, replayed = runtime.authority.update_project_draft(
+        record,
+        request,
+        if_match=etag,
+        current_etag=etag,
+        idempotency_key="successor-intent-update",
+        now=runtime.clock(),
+    )
+    assert replayed is False
+    published = runtime.owner.project_admission_authority(record.project_id)
+    assert updated.config == _skill_bundle_config()
+    assert published.active_project_head == successor
+    assert published.project_config_sha256 == updated.project_config_sha256
+    assert published.blockers == ()
+    runtime.close()
+
+
+@pytest.mark.parametrize(
+    "hook_name",
+    [
+        "_after_project_config_rebind_fence_before_catalog_prepare",
+        "_after_project_config_catalog_publish_before_rebind_release",
+    ],
+)
+def test_successor_project_intent_rebind_recovers_without_losing_the_active_head(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_name: str,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    genesis = runtime.authority.ensure_project(record)
+    assert genesis is not None
+    successor = genesis.active_project_head.model_copy(
+        update={
+            "project_head_id": "project-head-recovery-successor",
+            "generation": 1,
+            "predecessor_project_head_id": (
+                genesis.active_project_head.project_head_id
+            ),
+            "manifest_sha256": "c" * 64,
+        }
+    )
+    successor_authority = genesis.__class__(
+        project_id=genesis.project_id,
+        active_project_head=successor,
+        project_config_sha256=genesis.project_config_sha256,
+        workspace_snapshot=successor.workspace_snapshot,
+        normalized_evolution_intent_sha256=(
+            genesis.normalized_evolution_intent_sha256
+        ),
+    )
+    database = (
+        tmp_path
+        / "science-tasks-v2"
+        / "science-tasks-v2.sqlite3"
+    )
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        task_store_module._store_v2_project_head(connection, successor)
+        connection.execute(
+            "UPDATE project_admission_authorities SET authority_json = ?, "
+            "resource_version = resource_version + 1 WHERE project_id = ?",
+            (
+                task_store_module._v2_authority_bytes(successor_authority),
+                record.project_id,
+            ),
+        )
+        connection.commit()
+    request = ProjectUpdateV2(
+        expected_project_head_id=successor.project_head_id,
+        expected_project_head_manifest_sha256=successor.manifest_sha256,
+        expected_project_config_sha256=record.project_config_sha256,
+        display_name="Successor crash recovery",
+        config=_skill_bundle_config(),
+    )
+    etag = project_etag_payload(
+        record,
+        active_project_head=successor,
+        admission_etag=successor_authority.project_etag,
+        state="ready",
+    )
+
+    def crash(*_args: object) -> None:
+        raise SystemExit("simulated successor config-rebind crash")
+
+    monkeypatch.setattr(authority_module, hook_name, crash)
+    with pytest.raises(SystemExit, match="successor config-rebind"):
+        runtime.authority.update_project_draft(
+            record,
+            request,
+            if_match=etag,
+            current_etag=etag,
+            idempotency_key=f"successor-crash-{hook_name}",
+            now=runtime.clock(),
+        )
+    monkeypatch.setattr(authority_module, hook_name, lambda *_args: None)
+
+    catalog = CoreControlStoreV2(tmp_path / "catalog")
+    workspaces = WorkspaceStoreV2(tmp_path / "workspaces")
+    recovered = ProjectAuthorityV2(
+        catalog_store=catalog,
+        workspace_store=workspaces,
+        task_owner=runtime.owner,
+        executable_registry=runtime.registry,
+        service_binding_provider=runtime.services,
+        runtime_contract_sha256=_RUNTIME_CONTRACT_SHA256,
+        clock=runtime.clock,
+    )
+    try:
+        actual = runtime.owner.project_admission_authority(record.project_id)
+        assert actual.active_project_head == successor
+        assert actual.blockers == ()
+        if hook_name == (
+            "_after_project_config_catalog_publish_before_rebind_release"
+        ):
+            assert actual.project_config_sha256 == (
+                project_config_sha256_for(_skill_bundle_config())
+            )
+        else:
+            assert actual.project_config_sha256 == record.project_config_sha256
+    finally:
+        recovered.close()
+        catalog.close()
+        runtime.close()
+
+
+@pytest.mark.parametrize(
+    ("hook_name", "catalog_updated_before_restart", "ledger_updated_before_restart"),
+    [
+        (
+            "_after_project_config_rebind_fence_before_catalog_prepare",
+            False,
+            False,
+        ),
+        ("_after_project_config_prepare_before_science_publish", True, False),
+        ("_after_science_authority_publish_before_catalog_commit", True, True),
+        (
+            "_after_project_config_catalog_publish_before_rebind_release",
+            True,
+            True,
+        ),
+    ],
+)
+def test_project_intent_update_recovers_each_cross_store_crash_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_name: str,
+    catalog_updated_before_restart: bool,
+    ledger_updated_before_restart: bool,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    provider = _provider(runtime)
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    created = client.post(
+        "/v2/projects",
+        headers={
+            "Authorization": "Bearer project-authority-bearer",
+            "Idempotency-Key": "create-crash-update",
+        },
+        json={
+            "schema_version": "2",
+            "display_name": "Before crash update",
+            "config": _config().model_dump(mode="json"),
+        },
+    ).json()
+    client.close()
+    original_authority = runtime.owner.project_admission_authority(
+        created["project_id"]
+    )
+    request = ProjectUpdateV2(
+        expected_project_head_id=created["active_project_head"]["project_head_id"],
+        expected_project_head_manifest_sha256=created["active_project_head"][
+            "manifest_sha256"
+        ],
+        expected_project_config_sha256=created["project_config_sha256"],
+        display_name="Recovered evolution intent",
+        config=_skill_bundle_config(),
+    )
+
+    def crash(*_args: object) -> None:
+        raise SystemExit("simulated project intent publication crash")
+
+    monkeypatch.setattr(authority_module, hook_name, crash)
+    with pytest.raises(SystemExit, match="simulated project intent"):
+        runtime.authority.update_project_draft(
+            runtime.catalog.get_project(created["project_id"]),
+            request,
+            if_match=created["etag"],
+            current_etag=created["etag"],
+            idempotency_key="crash-update",
+            now=runtime.clock(),
+        )
+    prepared_project = runtime.catalog.get_project(created["project_id"])
+    expected_config = (
+        _skill_bundle_config()
+        if catalog_updated_before_restart
+        else _config()
+    )
+    assert prepared_project.config == expected_config
+    before_restart = runtime.owner.project_admission_authority(
+        created["project_id"]
+    )
+    if ledger_updated_before_restart:
+        assert before_restart.project_config_sha256 == (
+            prepared_project.project_config_sha256
+        )
+        assert before_restart.blockers == (
+            ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+        )
+    else:
+        assert before_restart == original_authority.__class__(
+            project_id=original_authority.project_id,
+            active_project_head=original_authority.active_project_head,
+            project_config_sha256=original_authority.project_config_sha256,
+            workspace_snapshot=original_authority.workspace_snapshot,
+            normalized_evolution_intent_sha256=(
+                original_authority.normalized_evolution_intent_sha256
+            ),
+            blockers=(
+                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
+            ),
+        )
+    provider.close()
+    monkeypatch.setattr(authority_module, hook_name, lambda *_args: None)
+
+    catalog = CoreControlStoreV2(tmp_path / "catalog")
+    workspaces = WorkspaceStoreV2(tmp_path / "workspaces")
+    owner = CoreScienceTaskOwnerV2(state_root=tmp_path, clock=runtime.clock)
+    recovered = ProjectAuthorityV2(
+        catalog_store=catalog,
+        workspace_store=workspaces,
+        task_owner=owner,
+        executable_registry=runtime.registry,
+        service_binding_provider=runtime.services,
+        runtime_contract_sha256=_RUNTIME_CONTRACT_SHA256,
+        clock=runtime.clock,
+    )
+    try:
+        recovered_project = catalog.get_project(created["project_id"])
+        recovered_authority = recovered.ensure_project(recovered_project)
+        assert recovered_authority is not None
+        assert recovered_project.config == expected_config
+        assert (
+            recovered_authority.active_project_head
+            == original_authority.active_project_head
+        )
+        assert recovered_authority.project_config_sha256 == (
+            recovered_project.project_config_sha256
+        )
+        assert recovered_authority.normalized_evolution_intent_sha256 == (
+            normalized_evolution_intent_sha256_for(expected_config)
+        )
+        assert owner.project_admission_authority(created["project_id"]) == (
+            recovered_authority
+        )
+    finally:
+        owner.close()
+        recovered.close()
+        catalog.close()
 
 
 def test_provider_runtime_drift_blocks_task_before_admission(tmp_path: Path) -> None:

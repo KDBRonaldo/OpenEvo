@@ -322,6 +322,7 @@ class CoreControlStoreV2:
         *,
         if_match: str,
         current_etag: str,
+        expected_resource_version: int,
         idempotency_key: str,
         now: datetime,
     ) -> tuple[ProjectRecordV2, bool]:
@@ -329,17 +330,9 @@ class CoreControlStoreV2:
         request = _exact_model(m.ProjectUpdateV2, request)
         if_match = _etag(if_match)
         current_etag = _etag(current_etag)
+        expected_resource_version = _resource_version(expected_resource_version)
         idempotency_key = _idempotency_key(idempotency_key)
-        request_json = json.dumps(
-            {
-                "if_match": if_match,
-                "request": request.model_dump(mode="json"),
-            },
-            ensure_ascii=True,
-            allow_nan=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
+        request_json = _project_update_request_bytes(request, if_match=if_match)
         request_sha256 = hashlib.sha256(request_json).hexdigest()
         timestamp = _timestamp(now)
         with self._lock, self._transaction() as connection:
@@ -358,7 +351,10 @@ class CoreControlStoreV2:
                     )
                 return _load_project(connection, project_id), True
             current = _load_project(connection, project_id)
-            if if_match != current_etag:
+            if (
+                if_match != current_etag
+                or current.resource_version != expected_resource_version
+            ):
                 raise ProjectPreconditionFailedV2("v2 project resource ETag changed")
             if request.expected_project_config_sha256 != current.project_config_sha256:
                 raise ProjectPreconditionFailedV2("v2 project config changed")
@@ -391,6 +387,165 @@ class CoreControlStoreV2:
                 (project_id, idempotency_key, request_sha256, request_json),
             )
             return _load_project(connection, project_id), False
+
+    def project_update_replay(
+        self,
+        project_id: str,
+        request: m.ProjectUpdateV2,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> ProjectRecordV2 | None:
+        """Return an exact durable PATCH replay before joined-authority recovery."""
+
+        project_id = _resource_id(project_id, label="project")
+        request = _exact_model(m.ProjectUpdateV2, request)
+        if_match = _etag(if_match)
+        idempotency_key = _idempotency_key(idempotency_key)
+        request_json = _project_update_request_bytes(request, if_match=if_match)
+        request_sha256 = hashlib.sha256(request_json).hexdigest()
+        with self._lock, self._transaction() as connection:
+            prior = connection.execute(
+                "SELECT request_sha256, request_json FROM project_update_requests "
+                "WHERE project_id = ? AND idempotency_key = ?",
+                (project_id, idempotency_key),
+            ).fetchone()
+            if prior is None:
+                return None
+            if (
+                prior["request_sha256"] != request_sha256
+                or bytes(prior["request_json"]) != request_json
+            ):
+                raise ProjectIdempotencyConflictV2(
+                    "v2 project update idempotency key was reused"
+                )
+            return _load_project(connection, project_id)
+
+    def update_project_with_authority_document(
+        self,
+        project_id: str,
+        request: m.ProjectUpdateV2,
+        *,
+        if_match: str,
+        current_etag: str,
+        expected_resource_version: int,
+        idempotency_key: str,
+        authority_record_json: bytes,
+        expected_authority_record_sha256: str,
+        now: datetime,
+    ) -> tuple[ProjectRecordV2, ProjectAuthorityDocumentV2, bool]:
+        """Atomically save a desired config and its admission authority document."""
+
+        project_id = _resource_id(project_id, label="project")
+        request = _exact_model(m.ProjectUpdateV2, request)
+        if_match = _etag(if_match)
+        current_etag = _etag(current_etag)
+        expected_resource_version = _resource_version(expected_resource_version)
+        idempotency_key = _idempotency_key(idempotency_key)
+        authority_record_json = _canonical_project_authority_document(
+            authority_record_json
+        )
+        authority_record_sha256 = hashlib.sha256(
+            authority_record_json
+        ).hexdigest()
+        expected_authority_record_sha256 = _sha256(
+            expected_authority_record_sha256,
+            label="project authority record",
+        )
+        request_json = _project_update_request_bytes(request, if_match=if_match)
+        request_sha256 = hashlib.sha256(request_json).hexdigest()
+        timestamp = _timestamp(now)
+        with self._lock, self._transaction() as connection:
+            prior = connection.execute(
+                "SELECT request_sha256, request_json FROM project_update_requests "
+                "WHERE project_id = ? AND idempotency_key = ?",
+                (project_id, idempotency_key),
+            ).fetchone()
+            if prior is not None:
+                if (
+                    prior["request_sha256"] != request_sha256
+                    or bytes(prior["request_json"]) != request_json
+                ):
+                    raise ProjectIdempotencyConflictV2(
+                        "v2 project update idempotency key was reused"
+                    )
+                document = _load_project_authority_document(
+                    connection,
+                    project_id,
+                    required=True,
+                )
+                if document is None:  # pragma: no cover - required=True is authoritative
+                    raise CoreControlStoreV2Error(
+                        "v2 project authority record disappeared"
+                    )
+                return _load_project(connection, project_id), document, True
+            current = _load_project(connection, project_id)
+            if (
+                if_match != current_etag
+                or current.resource_version != expected_resource_version
+            ):
+                raise ProjectPreconditionFailedV2("v2 project resource ETag changed")
+            if request.expected_project_config_sha256 != current.project_config_sha256:
+                raise ProjectPreconditionFailedV2("v2 project config changed")
+            current_document = _load_project_authority_document(
+                connection,
+                project_id,
+                required=True,
+            )
+            if current_document is None:  # pragma: no cover - required=True is authoritative
+                raise CoreControlStoreV2Error(
+                    "v2 project authority record disappeared"
+                )
+            if current_document.record_sha256 != expected_authority_record_sha256:
+                raise ProjectConflictV2("v2 project authority record changed")
+            if (
+                int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM project_update_requests"
+                    ).fetchone()[0]
+                )
+                >= _MAX_OPERATIONS
+            ):
+                raise ProjectConflictV2("v2 project update request capacity is exhausted")
+            config_json = canonical_contract_bytes(request.config)
+            config_sha256 = m.project_config_sha256_for(request.config)
+            connection.execute(
+                "UPDATE projects SET display_name = ?, project_config_sha256 = ?, "
+                "project_config_json = ?, updated_at = ?, "
+                "resource_version = resource_version + 1 WHERE project_id = ?",
+                (
+                    request.display_name,
+                    config_sha256,
+                    config_json,
+                    timestamp,
+                    project_id,
+                ),
+            )
+            connection.execute(
+                "INSERT INTO project_update_requests(project_id, idempotency_key, "
+                "request_sha256, request_json) VALUES (?, ?, ?, ?)",
+                (project_id, idempotency_key, request_sha256, request_json),
+            )
+            connection.execute(
+                "UPDATE project_authority_records SET record_sha256 = ?, "
+                "record_json = ?, resource_version = resource_version + 1 "
+                "WHERE project_id = ?",
+                (
+                    authority_record_sha256,
+                    authority_record_json,
+                    project_id,
+                ),
+            )
+            document = _load_project_authority_document(
+                connection,
+                project_id,
+                required=True,
+            )
+            if document is None:  # pragma: no cover - required=True is authoritative
+                raise CoreControlStoreV2Error(
+                    "v2 project authority record publication failed"
+                )
+            return _load_project(connection, project_id), document, False
 
     def begin_project_validation(
         self,
@@ -1109,6 +1264,29 @@ def _sha256(value: str, *, label: str) -> str:
 def _etag(value: str) -> str:
     if not isinstance(value, str) or _ETAG_RE.fullmatch(value) is None:
         raise ValueError("v2 project ETag is invalid")
+    return value
+
+
+def _project_update_request_bytes(
+    request: m.ProjectUpdateV2,
+    *,
+    if_match: str,
+) -> bytes:
+    return json.dumps(
+        {
+            "if_match": if_match,
+            "request": request.model_dump(mode="json"),
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _resource_version(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("v2 project resource version is invalid")
     return value
 
 

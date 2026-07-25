@@ -583,19 +583,23 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
             resource_version=2,
         )
         catalog.project = partial_project
-        next_authority = owner.publish_project_admission_authority(
-            ScienceProjectAdmissionAuthorityV2(
-                project_id=project_id,
-                active_project_head=successor,
-                project_config_sha256=(
-                    partial_project.project_config_sha256
-                ),
-                workspace_snapshot=next_authority.workspace_snapshot,
-                normalized_evolution_intent_sha256=canonical_digest(
-                    partial_config.evolution
-                ),
+        desired_next_authority = ScienceProjectAdmissionAuthorityV2(
+            project_id=project_id,
+            active_project_head=successor,
+            project_config_sha256=(
+                partial_project.project_config_sha256
             ),
-            expected_project_head_id=successor.project_head_id,
+            workspace_snapshot=next_authority.workspace_snapshot,
+            normalized_evolution_intent_sha256=canonical_digest(
+                partial_config.evolution
+            ),
+        )
+        owner.begin_project_admission_authority_rebind(next_authority)
+        owner.finish_project_admission_authority_rebind(
+            desired_next_authority,
+        )
+        next_authority = owner.release_project_admission_authority_rebind(
+            desired_next_authority,
         )
         second = owner.invoke(
             "submitCoreTaskV2",
@@ -660,25 +664,24 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
             resource_version=3,
         )
         catalog.project = no_evolution_project
-        third_authority = owner.publish_project_admission_authority(
-            ScienceProjectAdmissionAuthorityV2(
-                project_id=project_id,
-                active_project_head=second_successor,
-                project_config_sha256=(
-                    no_evolution_project.project_config_sha256
-                ),
-                workspace_snapshot=(
-                    owner.project_admission_authority(
-                        project_id
-                    ).workspace_snapshot
-                ),
-                normalized_evolution_intent_sha256=canonical_digest(
-                    no_evolution_config.evolution
-                ),
+        current_authority = owner.project_admission_authority(project_id)
+        desired_third_authority = ScienceProjectAdmissionAuthorityV2(
+            project_id=project_id,
+            active_project_head=second_successor,
+            project_config_sha256=(
+                no_evolution_project.project_config_sha256
             ),
-            expected_project_head_id=(
-                second_successor.project_head_id
+            workspace_snapshot=current_authority.workspace_snapshot,
+            normalized_evolution_intent_sha256=canonical_digest(
+                no_evolution_config.evolution
             ),
+        )
+        owner.begin_project_admission_authority_rebind(current_authority)
+        owner.finish_project_admission_authority_rebind(
+            desired_third_authority,
+        )
+        third_authority = owner.release_project_admission_authority_rebind(
+            desired_third_authority,
         )
         prior_materialized_count = evolution.materialized_count
         third = owner.invoke(
