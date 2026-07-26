@@ -41,7 +41,8 @@ from zipfile import BadZipFile, ZipFile
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-NATIVE_PROTOCOL = "openevo-native-sidecar-v1"
+NATIVE_PROTOCOL = "openevo-native-sidecar-v2"
+NATIVE_HEALTH_ROUTE = "/openevo-native/health"
 DESKTOP_SESSION_HEADER = "X-OpenEvo-Desktop-Session"
 RESOURCE_GENERATION_HEADER = "X-OpenEvo-Resource-Generation"
 NATIVE_CHALLENGE_HEADER = "X-OpenEvo-Native-Challenge"
@@ -2248,7 +2249,7 @@ def _wait_sidecar_ready(
         try:
             health = api.request(
                 "GET",
-                "/health",
+                NATIVE_HEALTH_ROUTE,
                 stage="native_readiness",
                 headers={NATIVE_CHALLENGE_HEADER: challenge},
                 authenticated=False,

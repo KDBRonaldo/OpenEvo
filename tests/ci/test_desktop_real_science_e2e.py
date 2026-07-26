@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -9,11 +10,12 @@ import stat
 import subprocess
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from zipfile import ZipFile
 
 import pytest
 
+from desktop.server.launcher import NATIVE_SIDECAR_PROTOCOL, _NATIVE_HEALTH_ROUTE
 from openevo.evolution.framework.runtime import FrameworkDistributionLock
 
 
@@ -526,8 +528,58 @@ def test_native_frame_uses_the_closed_credential_protocol() -> None:
         "session_token",
         "handoff_token",
     }
-    assert payload["protocol"] == module.NATIVE_PROTOCOL
+    assert payload["protocol"] == module.NATIVE_PROTOCOL == NATIVE_SIDECAR_PROTOCOL
     assert credentials.session_token not in repr(credentials)
+
+
+def test_native_readiness_uses_the_launcher_health_route(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_runner()
+    credentials = module.NativeCredentials.create()
+    observed_routes: list[str] = []
+
+    class FakeLocalApi:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def request(
+            self,
+            method: str,
+            route: str,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            assert method == "GET"
+            observed_routes.append(route)
+            headers = kwargs["headers"]
+            assert isinstance(headers, dict)
+            challenge = headers[module.NATIVE_CHALLENGE_HEADER]
+            assert isinstance(challenge, str)
+            domain = (
+                f"{NATIVE_SIDECAR_PROTOCOL}\0{credentials.instance_id}\0{challenge}"
+            ).encode("ascii")
+            return {
+                "service": "openevo-sidecar",
+                "status": "ok",
+                "protocol": NATIVE_SIDECAR_PROTOCOL,
+                "instance_id": credentials.instance_id,
+                "instance_proof": hmac.new(
+                    credentials.readiness_key,
+                    domain,
+                    hashlib.sha256,
+                ).hexdigest(),
+            }
+
+    native = SimpleNamespace(
+        base_url="http://127.0.0.1:12345",
+        credentials=credentials,
+        process=object(),
+        assert_log_budget=lambda: None,
+    )
+    monkeypatch.setattr(module, "LocalApi", FakeLocalApi)
+    monkeypatch.setattr(module, "_process_exited_without_reap", lambda _process: False)
+
+    module._wait_sidecar_ready(native)
+
+    assert observed_routes == [_NATIVE_HEALTH_ROUTE]
 
 
 @pytest.mark.parametrize("body", [b"", b"{}"])
