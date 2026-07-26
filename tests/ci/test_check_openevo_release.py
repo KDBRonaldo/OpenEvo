@@ -2922,6 +2922,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert core_lifecycle_step.count("attachment_name=") == 1
     assert 'attachment_name="bootstrap-${attachment_suffix}.json"' in core_lifecycle_step
     assert core_lifecycle_step.count('--attachment-name "$attachment_name"') == 3
+    assert 'f"http://127.0.0.1:{port}/v2/capabilities?"' in core_lifecycle_step
+    assert "/v1/capabilities" not in core_lifecycle_step
     assert "GITHUB_RUN_ID" not in core_lifecycle_step
     assert "GITHUB_RUN_ATTEMPT" not in core_lifecycle_step
     assert "${{ github.run_id }}" not in core_lifecycle_step

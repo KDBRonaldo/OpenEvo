@@ -966,7 +966,7 @@ jobs:
           token = attachment["bearer_token"]
           opener = build_opener(ProxyHandler({}))
           request = Request(
-              f"http://127.0.0.1:{port}/v1/capabilities?"
+              f"http://127.0.0.1:{port}/v2/capabilities?"
               + urlencode({"execution_mode": "codex_subscription_transcript"}),
               headers={"Authorization": f"Bearer {token}"},
           )
