@@ -114,6 +114,11 @@ DAEMON_V12 = CoreDaemonBundleIdentity(
     canonical_manifest_sha256="7" * 64,
     lifecycle_compatibility=12,
 )
+DAEMON_V13 = CoreDaemonBundleIdentity(
+    bundle_sha256="7" * 64,
+    canonical_manifest_sha256="8" * 64,
+    lifecycle_compatibility=13,
+)
 
 
 class FakeController:
@@ -2077,6 +2082,49 @@ def test_v12_candidate_starts_after_conditional_stop_persists_v11_floor(
     assert upgraded.attached is False
     assert upgraded.generation != old.generation
     assert upgraded.lifecycle_compatibility == 12
+
+
+def test_v13_candidate_starts_after_conditional_stop_persists_v12_floor(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V12,
+        process_controller=controller,
+    )
+
+    stopped = service.stop_core_service_if_generation(
+        service_root=root,
+        expected_generation=old.generation,
+        expected_release_identity=old.release_identity,
+        process_controller=controller,
+    )
+    with HostServiceRoot(root, create=False) as pinned:
+        floor = pinned.read_json("service.json")
+
+    upgraded = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V13,
+        process_controller=controller,
+    )
+
+    assert stopped is True
+    assert floor["state"] == "stopped"
+    assert floor["lifecycle_compatibility"] == 12
+    assert upgraded.attached is False
+    assert upgraded.generation != old.generation
+    assert upgraded.lifecycle_compatibility == 13
 
 
 def test_dead_newer_daemon_floor_rejects_stale_desktop_downgrade(
