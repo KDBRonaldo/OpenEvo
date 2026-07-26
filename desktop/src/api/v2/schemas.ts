@@ -17,6 +17,7 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const STRONG_ETAG = /^"[0-9a-f]{64}"$/;
 const MIME_TYPE = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9][a-z0-9!#$&^_.+-]*$/;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
+const UNSAFE_MULTILINE_CONTROL_CHARACTERS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/;
 
 export const schemaVersionV2Schema = z.literal("2").default("2");
 export const opaqueIdV2Schema = z.string().min(1).max(128).regex(OPAQUE_ID);
@@ -256,7 +257,7 @@ export const scienceEvolutionConfigV2Schema = z.object({
 
 export const scienceTaskConfigV2Schema = z.object({
   title: z.string().min(1).max(256).refine(noControlCharacters),
-  objective: z.string().min(1).max(65_536).refine(noControlCharacters),
+  objective: z.string().min(1).max(65_536).refine(noUnsafeMultilineControlCharacters),
 }).strict();
 
 export const scienceWorkspaceSourceV2Schema = z.object({
@@ -1271,6 +1272,10 @@ export type CursorPageV2<T> = { schema_version: "2"; items: T[]; next_cursor: st
 
 function noControlCharacters(value: string): boolean {
   return !CONTROL_CHARACTERS.test(value);
+}
+
+function noUnsafeMultilineControlCharacters(value: string): boolean {
+  return !UNSAFE_MULTILINE_CONTROL_CHARACTERS.test(value);
 }
 
 function isSafeModelReference(value: string): boolean {

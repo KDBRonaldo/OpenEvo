@@ -4,6 +4,7 @@ import {
   desktopVersionV2Schema,
   projectHeadRefV2Schema,
   remoteProfileV2Schema,
+  scienceProjectConfigV2Schema,
   sshHostCatalogV2Schema,
 } from "./schemas";
 
@@ -182,5 +183,33 @@ describe("Desktop Local API v2 schemas", () => {
     expect(desktopStateV2Schema.parse(state).profiles).toHaveLength(1);
     expect(() => desktopStateV2Schema.parse({ ...state, active_profile_id: "profile-missing" })).toThrow();
     expect(() => desktopStateV2Schema.parse({ ...state, ssh_config_path: "/Users/example/.ssh/config" })).toThrow();
+  });
+
+  it("accepts multiline science objectives while rejecting unsafe text controls", () => {
+    const config = {
+      schema_version: "2",
+      task: {
+        title: "Compare two candidate mechanisms",
+        objective: "Analyze the evidence from both mechanisms.\n\nWrite a concise conclusion with limitations.",
+      },
+      workspace: { kind: "scratch", display_name: "Mechanism study" },
+      execution: {
+        mode: "codex_subscription_transcript",
+        capture_mode: "transcript",
+        token_level_metrics_available: false,
+        harness_id: "codex",
+        codex_model: "gpt-5.6-codex",
+        reasoning_effort: "high",
+        token_limit: 8_192,
+        task_network_allow_internet: true,
+      },
+      evolution: { targets: {} },
+    };
+
+    expect(scienceProjectConfigV2Schema.parse(config).task.objective).toContain("\n\n");
+    expect(() => scienceProjectConfigV2Schema.parse({
+      ...config,
+      task: { ...config.task, objective: "Analyze\u0000hidden" },
+    })).toThrow();
   });
 });
