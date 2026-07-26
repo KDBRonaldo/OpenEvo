@@ -2737,6 +2737,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         in shipped_app_smoke
     )
     assert 'current_state="$current_root/state-v2"' in shipped_app_smoke
+    assert 'current_provider_state="$current_state/provider-v2"' in shipped_app_smoke
     assert 'current_native_state="$current_root/native-state-v2"' in shipped_app_smoke
     assert 'legacy_native_retry="$current_root/.7f3d8b24c1a94762"' in shipped_app_smoke
     assert 'legacy_native_lock="$current_root/.c41d73e981bf4a56"' in shipped_app_smoke
@@ -2746,7 +2747,12 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert "intentionally stale native Preview recovery lock" in shipped_app_smoke
     assert '--existing-home "$HOME"' in shipped_app_smoke
     assert "legacy-state-app-bundle-smoke.json" in shipped_app_smoke
-    assert 'test -f "$current_state/provider.sqlite3"' in shipped_app_smoke
+    assert (
+        'test -f "$current_provider_state/provider-v2.sqlite3"'
+        in shipped_app_smoke
+    )
+    assert 'test -f "$current_provider_state/provider-v2.lock"' in shipped_app_smoke
+    assert 'test ! -e "$current_state/provider.sqlite3"' in shipped_app_smoke
     assert 'test -f "$current_native_state/.c41d73e981bf4a56"' in shipped_app_smoke
     assert 'cmp "$legacy_native_retry" "$RUNNER_TEMP/legacy-native-retry"' in shipped_app_smoke
     assert 'cmp "$legacy_native_lock" "$RUNNER_TEMP/legacy-native-lock"' in shipped_app_smoke

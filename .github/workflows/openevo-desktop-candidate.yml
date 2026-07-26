@@ -589,6 +589,7 @@ jobs:
           legacy_state="$HOME/.openevo/desktop/local-api-v1"
           current_root="$HOME/Library/Application Support/org.openevo.desktop"
           current_state="$current_root/state-v2"
+          current_provider_state="$current_state/provider-v2"
           current_native_state="$current_root/native-state-v2"
           legacy_native_retry="$current_root/.7f3d8b24c1a94762"
           legacy_native_lock="$current_root/.c41d73e981bf4a56"
@@ -637,7 +638,9 @@ jobs:
             --timeout-seconds 120 \
             --evidence-out candidate-artifacts/launchservices-smoke.json
 
-          test -f "$current_state/provider.sqlite3"
+          test -f "$current_provider_state/provider-v2.sqlite3"
+          test -f "$current_provider_state/provider-v2.lock"
+          test ! -e "$current_state/provider.sqlite3"
           test -f "$current_native_state/.c41d73e981bf4a56"
           cmp "$legacy_state/provider.sqlite3" "$RUNNER_TEMP/legacy-provider.sqlite3"
           cmp "$legacy_state/provider.lock" "$RUNNER_TEMP/legacy-provider.lock"
