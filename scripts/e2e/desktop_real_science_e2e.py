@@ -109,7 +109,6 @@ FRAMEWORK_LOCK_KEYS = frozenset(
         "distribution",
         "distribution_version",
         "distribution_digest",
-        "registry_digest",
         "wheel_filename",
     }
 )
@@ -3293,6 +3292,24 @@ def _release_asset_identity(metadata: os.stat_result) -> tuple[int, ...]:
     )
 
 
+def _resolve_private_temporary_root(path: Path) -> Path:
+    try:
+        requested = path.stat()
+        resolved = path.resolve(strict=True)
+        canonical = resolved.lstat()
+    except OSError as exc:
+        raise E2EFailure("runner", "temporary_root_invalid") from exc
+    if (
+        not stat.S_ISDIR(canonical.st_mode)
+        or stat.S_ISLNK(canonical.st_mode)
+        or canonical.st_uid != os.getuid()
+        or stat.S_IMODE(canonical.st_mode) != 0o700
+        or (requested.st_dev, requested.st_ino) != (canonical.st_dev, canonical.st_ino)
+    ):
+        raise E2EFailure("runner", "temporary_root_invalid")
+    return resolved
+
+
 def _file_evidence(path: Path) -> dict[str, object]:
     return {"sha256": _sha256_file(path), "byte_size": path.stat().st_size}
 
@@ -3990,7 +4007,7 @@ def main(argv: list[str] | None = None) -> int:
     exit_code = 1
     evidence_write_failed = False
     with TemporaryDirectory(prefix="openevo-desktop-real-e2e-") as temporary:
-        root = Path(temporary)
+        root = _resolve_private_temporary_root(Path(temporary))
         try:
             assert args.app_bundle is not None
             assert args.core_wheel is not None

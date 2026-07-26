@@ -14,6 +14,8 @@ from zipfile import ZipFile
 
 import pytest
 
+from openevo.evolution.framework.runtime import FrameworkDistributionLock
+
 
 def _load_runner() -> ModuleType:
     path = Path("scripts/e2e/desktop_real_science_e2e.py").resolve()
@@ -582,21 +584,18 @@ def _write_wheel(path: Path, *, version: str = "0.1.9") -> None:
 
 def _write_lock(path: Path, wheel: Path, *, digest: str | None = None) -> None:
     wheel_digest = digest or hashlib.sha256(wheel.read_bytes()).hexdigest()
-    payload = {
-        "schema_version": "1",
-        "distribution": "openevo",
-        "distribution_version": "0.1.9",
-        "distribution_digest": wheel_digest,
-        "registry_digest": _digest("verified-registry"),
-        "wheel_filename": wheel.name,
-    }
+    payload = FrameworkDistributionLock(
+        distribution_version="0.1.9",
+        distribution_digest=wheel_digest,
+        wheel_filename=wheel.name,
+    ).model_dump(mode="json")
     path.write_text(
         json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
         encoding="utf-8",
     )
 
 
-def test_wheel_lock_validation_binds_exact_bytes_and_registry(tmp_path: Path) -> None:
+def test_wheel_lock_validation_accepts_canonical_closed_contract(tmp_path: Path) -> None:
     module = _load_runner()
     wheel = tmp_path / "openevo-0.1.9-py3-none-any.whl"
     lock = tmp_path / "framework-lock.json"
@@ -609,9 +608,34 @@ def test_wheel_lock_validation_binds_exact_bytes_and_registry(tmp_path: Path) ->
         hashlib.sha256(wheel.read_bytes()).hexdigest(),
     )
 
+    payload = json.loads(lock.read_text(encoding="utf-8"))
+    payload["registry_digest"] = _digest("verified-registry")
+    lock.write_text(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(module.E2EFailure, match="framework_lock_wheel_mismatch"):
+        module._validate_wheel_lock(wheel, lock)
+
     _write_lock(lock, wheel, digest="0" * 64)
     with pytest.raises(module.E2EFailure, match="framework_lock_wheel_mismatch"):
         module._validate_wheel_lock(wheel, lock)
+
+
+def test_private_temporary_root_resolves_system_directory_alias(tmp_path: Path) -> None:
+    module = _load_runner()
+    private_parent = tmp_path / "private"
+    private_parent.mkdir()
+    session_root = private_parent / "session"
+    session_root.mkdir(mode=0o700)
+    session_root.chmod(0o700)
+    aliased_parent = tmp_path / "alias"
+    aliased_parent.symlink_to(private_parent, target_is_directory=True)
+
+    resolved = module._resolve_private_temporary_root(aliased_parent / "session")
+
+    assert resolved == session_root.resolve(strict=True)
+    assert not resolved.is_symlink()
 
 
 def test_held_release_asset_rejects_path_replacement(tmp_path: Path) -> None:
