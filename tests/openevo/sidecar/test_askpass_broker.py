@@ -58,6 +58,26 @@ def _identity(
     )
 
 
+def test_process_identity_accepts_posix_session_one_and_rejects_zero() -> None:
+    identity = _identity(
+        71,
+        parent_id=1,
+        executable="/usr/bin/ssh",
+        group=71,
+        session=1,
+    )
+
+    assert identity.session_id == 1
+    with pytest.raises(ValueError, match="invalid process identity"):
+        _identity(
+            71,
+            parent_id=1,
+            executable="/usr/bin/ssh",
+            group=71,
+            session=0,
+        )
+
+
 def _request(
     *,
     capability: str,

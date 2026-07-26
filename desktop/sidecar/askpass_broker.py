@@ -94,7 +94,11 @@ class ProcessIdentity:
             or type(self.process_group_id) is not int
             or self.process_group_id <= 1
             or type(self.session_id) is not int
-            or self.session_id <= 1
+            # POSIX session ID 1 is valid for descendants of launchd/init and
+            # is observed on GitHub-hosted macOS runners. Authority remains
+            # bound by exact SID equality plus PID, PGID, UID, birth identity,
+            # executable path, and parent-chain verification.
+            or self.session_id < 1
             or type(self.user_id) is not int
             or self.user_id < 0
             or type(self.birth_identity) is not str
