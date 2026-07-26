@@ -16,8 +16,9 @@ The server administrator or hosting environment must provide:
 - a selected remote account with a writable home directory (an approved root
   user inside a private user container is supported);
 - Docker Engine access for the supported user-container profile;
-- enough home-directory and container storage for Daemon state, the managed
-  runtime, projects, transcripts, revisions, and artifacts;
+- at least `20,000,000` KiB available on the selected account's home filesystem
+  at connection preflight, plus ongoing container storage for Daemon state, the
+  managed runtime, projects, transcripts, revisions, and artifacts;
 - required outbound HTTPS access, directly or through server-side policy; and
 - a supported Codex CLI installed and signed in to a subscription for that
   exact account.

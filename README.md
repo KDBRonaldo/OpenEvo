@@ -14,7 +14,7 @@ OpenEvo has two user-facing applications:
 - **OpenEvo Daemon** is the Linux service that Desktop installs and controls on
   the selected remote server.
 
-[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.8-v018-startup-logs.29947490201.1)
+[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1)
 | [Read the user guide](docs/user/README.md)
 | [Report a problem](https://github.com/CompLifeLab-ZJU/OpenEvo/issues)
 
@@ -56,7 +56,7 @@ state.
 
 ## Current Preview
 
-The current public release is **OpenEvo Desktop 0.1.8 Preview**. It supports the
+The current public release is **OpenEvo Desktop 0.1.9 Preview**. It supports the
 following exhibition profile:
 
 | Component | Current support |
@@ -66,7 +66,8 @@ following exhibition profile:
 | Harness | Codex CLI already installed and signed in for the SSH user |
 | Execution | Codex subscription with transcript capture |
 | Evolution | Textual memory, trajectory-to-skill, and agent-system evolution |
-| Network | Direct HTTPS or a remote HTTP/HTTPS proxy configured in Desktop |
+| SSH | A literal alias from the Mac user's system OpenSSH configuration |
+| Network | Remote outbound HTTPS configured by the server administrator |
 
 Self-deployed inference, parameter or adapter evolution, other harnesses,
 automatic Codex installation/login, Intel Mac builds, and a general clean-host
@@ -76,12 +77,12 @@ documented host profile and do not depend on it for production-critical work.
 ## Install On macOS
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.8 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.8-v018-startup-logs.29947490201.1).
-2. Download `OpenEvo-Desktop-0.1.8-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.9 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1).
+2. Download `OpenEvo-Desktop-0.1.9-aarch64.dmg` and `SHA256SUMS`.
 3. Verify the DMG before opening it:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.8-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.9-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -104,13 +105,16 @@ The remote account must be reachable over SSH and provide:
 
 - a writable home directory with enough project and container storage;
 - Docker access for the selected user;
-- outbound HTTPS, directly or through the proxy saved in Desktop;
+- outbound HTTPS under the server administrator's network policy;
 - Codex CLI installed and authenticated to a subscription for that same user.
 
-Your SSH identity must be available through the macOS SSH agent. Desktop does
-not accept or upload private-key bytes. On first connection, compare the shown
-`SHA256:` host fingerprint with a value obtained from the server administrator
-through a trusted channel.
+Configure a literal host alias in the Mac user's `~/.ssh/config` and confirm
+that `/usr/bin/ssh <alias>` reaches the intended account. Desktop lists and
+stores that alias; system OpenSSH remains authoritative for the hostname, user,
+port, `IdentityFile`, agent/Keychain, `ProxyJump` or `ProxyCommand`, prompts,
+and host-trust policy. Desktop does not accept or upload private-key bytes. On
+first connection, compare the shown `SHA256:` host fingerprint with a value
+obtained from the server administrator through a trusted channel.
 
 Desktop then transfers the release-matched Daemon, prepares the managed science
 runtime, starts or attaches services, verifies compatibility, and establishes
@@ -123,8 +127,8 @@ See [Remote server setup](docs/user/remote-server-setup.md) and
 
 ## Run Your First Project
 
-1. In Desktop, choose **Add remote workspace** and enter the server address,
-   SSH port, and remote user.
+1. In Desktop, choose **Add remote workspace**, enter a local display name, and
+   select a literal alias discovered from your system OpenSSH configuration.
 2. Connect and confirm the server fingerprint.
 3. Create a project with a task objective and either an empty managed workspace
    or a snapshot of a local folder.
@@ -154,8 +158,10 @@ missed events.
   subscription according to that service's terms.
 - Transcripts, project snapshots, and evolution artifacts are stored on the
   remote server under the selected user account.
-- SSH private keys remain in the macOS SSH agent. Desktop stores the explicitly
-  accepted host identity and fails closed on an unexplained key change.
+- SSH identity handling remains with system OpenSSH, including configured
+  identity files, the macOS agent/Keychain, and native prompts. Desktop stores
+  the selected alias and explicitly accepted host identity, and fails closed
+  on an unexplained key change.
 - Desktop and Daemon communicate through an authenticated private SSH tunnel;
   the Daemon API is not exposed as a normal user surface.
 - The two built-in demonstrations are local and read-only.
@@ -166,15 +172,17 @@ Review the [security policy](SECURITY.md) before using private research data.
 
 - **macOS says the app is damaged or cannot be verified:** verify the DMG
   checksum, then use **Open Anyway** or the scoped `xattr` command above.
-- **SSH connection fails:** check the host, port, user, network, and that the
-  correct key is loaded in the macOS SSH agent.
+- **SSH connection fails:** run `/usr/bin/ssh <selected-alias>` from the same
+  Mac account and repair that alias's normal OpenSSH route, identity,
+  agent/Keychain, or prompt flow before reconnecting in Desktop.
 - **The server identity changed:** stop and confirm the new fingerprint with
   the administrator. Never bypass host-key verification.
 - **Activation reports missing Codex or Docker:** these are host prerequisites
   in this Preview. Ask the administrator to prepare the same SSH account, then
   choose **Retry** in Desktop.
-- **A restricted network blocks downloads:** save the remote proxy settings in
-  the workspace and retry the Desktop-managed preparation.
+- **A restricted network blocks downloads:** ask the server administrator to
+  configure outbound HTTPS and container networking under the supported host
+  policy, then retry the Desktop-managed preparation.
 - **The next task is not ready:** wait for the current task and its successor
   evolution revision to finish; OpenEvo will not silently use partial state.
 

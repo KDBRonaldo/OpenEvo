@@ -86,7 +86,7 @@ remote Codex subscription sessions, all three text-evolution targets,
 next-session artifact reuse, and packaged-renderer observability. It retains
 the same non-gating Preview boundary as `0.1.6` and is not a G1-G12 candidate.
 
-Version `0.1.8` is the current public immutable unsigned exhibition Preview,
+Version `0.1.8` is the previous public immutable unsigned exhibition Preview,
 published on July 22, 2026 from source
 `dde71c6a940d7e17bbfdb7c41ae7f7ee098618b9`, candidate run `29947490201`, and
 publication run `29949667800` under tag
@@ -100,6 +100,27 @@ all three text-evolution targets, next-session artifact reuse, and packaged
 renderer observability. It retains the non-gating Preview boundary and is not a
 G1-G12 candidate.
 
+Version `0.1.9` is the current public immutable unsigned exhibition Preview,
+published on July 27, 2026 from source
+`54650e477a76dd07b0a511ad5450c3b8ea615556`, candidate run `30212086910`, and
+publication run `30214520279` under tag
+`openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1`. Its DMG SHA-256
+is `48ecc88bea4afd5805082a9660d3abc3641172f697b868d1f8cc22498f822cde`.
+It repairs the macOS Tahoe packaged-sidecar failure without disabling library
+validation, makes literal aliases from the user's normal `~/.ssh/config` the
+default remote-workspace selector, and delegates routing, identity, prompts,
+and trust to system OpenSSH. The exact candidate passed mounted-DMG,
+detached-copy, installed-app, native-sidecar, askpass, packaged-renderer, Linux
+Daemon, managed-runtime, and asset-roundtrip checks. Checked-in signed evidence
+with SHA-256
+`205ed88ce3912f216b4fe32ee5bf511bec889ac68278e1d7c15263788afe8dd9`
+verifies two real remote Codex subscription Tasks through one System OpenSSH
+alias, three independently selected text-evolution targets, adjacent successor
+Project Heads, exact Task-2 Runtime Context reuse, and live Desktop v2 renderer
+observability. It remains unsigned, unnotarized, non-gating, and not a G1-G12
+candidate; the clean-host matrix, both execution modes, protected performance,
+and the remaining External Beta gates are still open.
+
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
 architecture, mounts the exact candidate DMG, launches its real Tauri app,
@@ -111,7 +132,7 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-The checked-in evidence for `0.1.4`, `0.1.6`, `0.1.7`, and `0.1.8` is bound to
+The checked-in evidence for `0.1.4`, `0.1.6`, `0.1.7`, `0.1.8`, and `0.1.9` is bound to
 each exact candidate manifest and signed by the release host. It proves the
 stated Preview paths, but it does not by itself satisfy G2, G3, G4, G7, G12, or
 the full ordinary-user qualification matrix.

@@ -25,8 +25,8 @@ You do not install or operate the OpenEvo Daemon manually.
 
 ## Install The Unsigned DMG
 
-1. Open the [OpenEvo releases page](https://github.com/CompLifeLab-ZJU/OpenEvo/releases),
-   select the immutable **OpenEvo Desktop 0.1.9 Preview**, and download
+1. Open the immutable
+   [OpenEvo Desktop 0.1.9 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1), and download
    `OpenEvo-Desktop-0.1.9-aarch64.dmg` plus `SHA256SUMS`.
 2. Verify the exact DMG checksum from that release:
 

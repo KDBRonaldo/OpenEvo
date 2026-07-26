@@ -1,9 +1,9 @@
 # macOS Desktop Development Handoff
 
-Status: active maintainer handoff for the `0.1.8` startup incident and the next
-Desktop patch release
+Status: completed `0.1.9` handoff; retained as the startup-incident and release
+record
 
-Last updated: 2026-07-26
+Last updated: 2026-07-27
 
 This document transfers Desktop development from the Linux/GPU development
 container to a real Apple Silicon Mac. It is an implementation handoff, not a
@@ -28,6 +28,10 @@ Produce the next immutable patch release, necessarily `0.1.9` or later, that:
 
 Local Codex execution on the Mac is deferred to `0.2.0`. Do not mix that feature
 into this startup repair.
+
+The immutable `0.1.9` Preview recorded in section 11.2 completed this objective
+within the explicitly limited Preview support profile. The remaining External
+Beta and unsupported-flow gaps listed there remain open.
 
 Do not change the implementation or behavior of any evolution algorithm while
 repairing Desktop packaging, startup, diagnostics, or remote control.
@@ -240,23 +244,24 @@ release evidence.
 
 ## 4. Current Public Release
 
-The current public artifact is the immutable unsigned `0.1.8` Preview:
+The current public artifact is the immutable unsigned `0.1.9` Preview:
 
-- source commit: `dde71c6a940d7e17bbfdb7c41ae7f7ee098618b9`
-- candidate run: `29947490201`
-- publication run: `29949667800`
-- tag: `openevo-desktop-v0.1.8-v018-startup-logs.29947490201.1`
-- DMG: `OpenEvo-Desktop-0.1.8-aarch64.dmg`
+- source commit: `54650e477a76dd07b0a511ad5450c3b8ea615556`
+- publication-policy commit: `c5eb33faad49704b5eb611e94399b66e4af868ea`
+- candidate run: `30212086910`, attempt `1`
+- publication run: `30214520279`
+- numeric release ID: `360078032`
+- tag: `openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1`
+- DMG: `OpenEvo-Desktop-0.1.9-aarch64.dmg`
 - DMG SHA-256:
-  `8aa5b4c6b06f4883b51fb003f97eccdf28913fff81312641bc2f5818b4689e34`
+  `48ecc88bea4afd5805082a9660d3abc3641172f697b868d1f8cc22498f822cde`
 
-Do not modify, replace, or relabel that release. It is historical evidence, not
-a working-release claim for the Mac described below.
-
-The candidate passed the GitHub-hosted macOS 14 mounted-DMG and copied-app
-smokes. It also has separate two-session remote Codex evidence. Those facts do
-not reproduce the real user's Desktop startup environment and therefore do not
-prove that `0.1.8` is usable on macOS Tahoe.
+The public release is an immutable prerelease and must not be modified,
+replaced, or relabelled. Version `0.1.8` remains historical evidence for the
+incident below; its mounted-DMG and copied-app smokes did not reproduce the
+real Tahoe startup failure. Version `0.1.9` adds exact-candidate Mac and remote
+evidence, but remains a non-gating Preview rather than proof of the complete
+External Beta contract or G1-G12.
 
 ## 5. Reproduced User Failure
 
@@ -717,9 +722,90 @@ advances the Daemon lifecycle floor to `14`. The fixed Daemon started directly
 against the retained production Evolution Store without deleting, rewriting, or
 quarantining that state before the installed-Desktop rehearsal.
 
-Still required before publication are an immutable GitHub candidate built from
-the final reviewed commit, checksum-bound download of that candidate to this
-Mac, repetition of the installed-app and two-Task v2 flow against those exact
-downloaded bytes, the remaining clean-user/Retry/diagnostics acceptance items,
-final review, and guarded Preview publication. Public `0.1.8` remains unchanged
-and is still the current public release.
+Those pre-candidate results were subsequently repeated against the immutable
+GitHub candidate and published through the guarded Preview controller. The
+authoritative final identities and remaining gaps are recorded below.
+
+### 11.2 Final immutable `0.1.9` Preview
+
+On 2026-07-27, candidate run `30212086910` completed all four candidate jobs
+from source commit `54650e477a76dd07b0a511ad5450c3b8ea615556`. The guarded
+publisher run `30214520279` made numeric release `360078032` public under tag
+`openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1`, then re-downloaded
+and verified the immutable public release. The durable publication-policy
+commit is `c5eb33faad49704b5eb611e94399b66e4af868ea`.
+
+The final candidate identities are:
+
+- release candidate manifest:
+  `c9f9b15c0122c57f7790a912a645f01c8669ab1b7194f8588c33cf96bdf1cff3`;
+- DMG `OpenEvo-Desktop-0.1.9-aarch64.dmg`:
+  `48ecc88bea4afd5805082a9660d3abc3641172f697b868d1f8cc22498f822cde`;
+- installed Tauri executable:
+  `c62c9f70682bc327479a9ab6879ae5b26c382ef84ca7064371c0b7e1f4cbbc94`;
+- packaged Desktop sidecar:
+  `39cd42d0fb3418213104a9d20d1f4f341c8f2722c3ae813bdc403126f280f9f1`;
+- packaged SSH askpass helper:
+  `943b74e0c1f9a69abd58f72376e2b0245c8b68f5a143f7600add03cd56c989df`;
+- Linux `x86_64` Daemon Bundle:
+  `58787c1ff65b3659b2386659843820dc2cca752d99f44e4869cb4065606c0294`;
+- Core wheel:
+  `315a6cfddb73fa2c42a1eedb5c13924506d93a2f769d953b62711ce6695f1751`;
+- verified executable registry:
+  `0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874`;
+- signed real-science evidence:
+  `205ed88ce3912f216b4fe32ee5bf511bec889ac68278e1d7c15263788afe8dd9`;
+  and
+- real-science evidence signature:
+  `7ffcd435aa878993ca93dc216e292c2bb5ff7454f72d6e8459d92c9e6aef0265`.
+
+The exact downloaded app was installed at `/Applications/OpenEvo Desktop.app`.
+`codesign --verify --deep --strict`, candidate native readiness, detached-copy
+startup, the packaged-web manifest, and the candidate Playwright record all
+matched the frozen candidate. The final release-host runner selected the
+literal `evolab` alias from the user's normal `~/.ssh/config`; the Desktop
+profile persisted only that alias and delegated routing, user, port, identity,
+agent/Keychain, prompt, proxy, and trust behavior to `/usr/bin/ssh`. No
+IP/username/port or private-key material entered the renderer or profile.
+
+Two real `gpt-5.3-codex-spark`, high-effort Codex Subscription Tasks completed
+with transcript capture. Task 1 pinned generation `0` and committed generation
+`1`; Task 2 pinned that exact successor and Runtime Context and committed
+generation `2`. Each successor contained three independently selected textual
+evolution outputs. The candidate-bound packaged renderer then observed the
+same live Desktop v2 session, System OpenSSH workspace, both Tasks, Project
+Head, Evolution Revision, Runtime Context, Effective Execution, and selected
+methods. Cleanup disconnected the profile and terminated the complete local
+process groups.
+
+The original `0.1.8` startup root cause was Tahoe library validation rejecting
+the nested PyInstaller Python framework extracted by an unsigned, ad-hoc
+hardened-runtime sidecar with no shared Team identity. The durable `0.1.9`
+repair signs the generated sidecar plain ad hoc, disables hardened runtime for
+this unsigned Preview composition, adds no entitlement or library-validation
+bypass, and verifies that exact policy in mounted and copied app bundles.
+Version `0.1.9` also replaces the `-F /dev/null` explicit-host transport with
+the System OpenSSH configured-alias authority. Final candidate work additionally
+fixed project-scoped remote inventory, advanced the Daemon lifecycle contract,
+and allowed safe tab/newline/carriage-return characters in science objectives
+while continuing to reject NUL and other unsafe controls.
+
+The release-host server temporarily ceased to qualify when its available home
+filesystem space fell below the `20,000,000` KiB preflight floor. Maintainers
+removed only reproducible historical release scratch copies, restoring
+`22,234,104` KiB before the final run. A stopped Daemon from the immediately
+preceding `dbc5e3d18b2d9c173dc757bb3bbac97e036a014e` development candidate also
+left an exact lifecycle-compatibility `16` no-downgrade floor. After proving no
+Daemon process was active, that single stale test-candidate floor was moved to
+a recoverable maintainer backup; project and evolution data were retained.
+These were release-host maintenance actions, not ordinary-user repair paths or
+permission to bypass a production no-downgrade boundary.
+
+The public result remains an unsigned, unnotarized Apple Silicon exhibition
+Preview for macOS 12 or later and the documented Linux `x86_64` Docker
+user-container profile. Intel Macs, arbitrary Linux hosts, automatic Codex
+installation/login, Self-Deployed execution, other harnesses, parameter or
+adapter evolution, Task artifact-content collection, a complete clean-host and
+network matrix, Developer ID signing/notarization, and the final Tauri-to-remote
+single-process E2E remain unsupported or unproven. Local Mac execution remains
+deferred to `0.2.0`; the remaining G1-G12 External Beta gates are still open.

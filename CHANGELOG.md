@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.1.9 Preview - 2026-07-27
+
+### Added
+
+- List literal hosts from the Mac user's normal `~/.ssh/config` and make the
+  selected alias the default remote-workspace identity.
+- Delegate routing, user, port, identity files, agent/Keychain, jump or proxy
+  configuration, native prompts, and host trust to system `/usr/bin/ssh`.
+- Use the strict Desktop Local API v2 and active-project Core v2 tunnel for the
+  supported project, Task, successor, capability, and renderer workflow.
+
+### Changed
+
+- Repair the macOS Tahoe packaged-sidecar startup failure with a verified plain
+  ad-hoc signing policy for this unsigned Preview, without adding a
+  library-validation bypass entitlement.
+- Keep remote project inventory scoped to the selected project and preserve
+  safe multiline science objectives while rejecting unsafe control characters.
+- Require signed exact-candidate evidence for two real Codex Subscription
+  Tasks, adjacent successor Project Heads, Task-2 Runtime Context reuse, three
+  independently selected textual evolution targets, and packaged-renderer
+  observability.
+
+### Known Limitations
+
+- This remains an unsigned, unnotarized Apple Silicon exhibition Preview.
+- The supported server is the documented Linux x86-64 Docker user-container
+  profile with at least `20,000,000` KiB available on the remote home
+  filesystem and Codex already installed and signed in for the selected
+  account.
+- Self-Deployed execution, parameter or adapter evolution, other harnesses,
+  Intel Macs, automatic Codex installation/login, and a complete clean-host
+  matrix remain outside this Preview.
+
+The immutable release is available from the
+[OpenEvo Desktop 0.1.9 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1).
+
 ## 0.1.5 Preview - 2026-07-21
 
 ### Added

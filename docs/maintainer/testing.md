@@ -11,14 +11,15 @@ an adjacent successor Project Head chain against a remote host.
 Use focused tests for ordinary changes and broaden the suite when touching
 shared contracts.
 
-Version `0.1.8` is the current unsigned, non-gating Preview. Its real mounted
-and copied DMG, packaged sidecar and renderer, self-contained Daemon Bundle,
-managed runtime, legacy-state startup smoke, native startup diagnostics, and
-immutable asset roundtrip are current Preview evidence. Checked-in, signed
-candidate-bound evidence also covers two real remote Codex subscription
-sessions, all three text-evolution targets, next-session artifact reuse, and
-packaged-renderer observability. It is still not G2, G3, G12, or full External
-Beta evidence. Earlier Preview releases remain historical evidence.
+Version `0.1.9` is the current unsigned, non-gating Preview. Its real mounted
+and copied DMG, Tahoe-compatible packaged sidecar, native askpass helper,
+System OpenSSH alias path, packaged renderer, self-contained Daemon Bundle,
+managed runtime, startup diagnostics, and immutable asset roundtrip are current
+Preview evidence. Checked-in, signed exact-candidate evidence also covers two
+real remote Codex subscription Tasks, all three text-evolution targets,
+adjacent successor Project Heads, next-session Runtime Context reuse, and live
+Desktop v2 renderer observability. It is still not G2, G3, G12, or full
+External Beta evidence. Earlier Preview releases remain historical evidence.
 
 ## Focused Tests
 

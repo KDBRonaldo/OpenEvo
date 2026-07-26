@@ -8,9 +8,8 @@ OpenEvo Preview has two applications:
   operate it directly.
 
 Version `0.1.9` is the immutable Preview described by these guides. Its exact
-DMG and `SHA256SUMS` are available from the
-[OpenEvo releases page](https://github.com/CompLifeLab-ZJU/OpenEvo/releases)
-under **OpenEvo Desktop 0.1.9 Preview**.
+DMG and `SHA256SUMS` are available from the immutable
+[OpenEvo Desktop 0.1.9 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1).
 The Preview DMG is unsigned and not notarized. Open it only after checking the
 exact checksum in the quickstart. Use the current release unless a maintainer
 has asked you to reproduce an older version.
