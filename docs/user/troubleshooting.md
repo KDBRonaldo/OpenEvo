@@ -18,13 +18,15 @@ screenshots, raw terminal output, or copies of local log files.
 
 `ssh_connection_failed`
 
-Check the host, port, user, network, and that the correct key is loaded in the
-Mac SSH agent. Then reconnect.
+Run `/usr/bin/ssh <selected-alias>` from the same Mac account. Check the alias's
+normal OpenSSH configuration, network route, identity/agent/Keychain, and any
+native prompt, then reconnect. Do not replace the alias with manually entered
+IP/user/port fields in Desktop.
 
-`host_key_verification_failed` or `core_ssh_authority_invalid`
+`ssh_host_key_changed` or `core_ssh_authority_invalid`
 
-Stop. Re-check the fingerprint with the server administrator. Do not accept an
-unexplained key change.
+Stop. Re-check the effective alias and fingerprint with the server
+administrator. Do not accept or automatically repair an unexplained key change.
 
 `core_python_runtime_unavailable`
 
@@ -76,10 +78,10 @@ not upload an image manually.
 Select Codex subscription transcript mode. Self-Deployed is not in this
 Preview.
 
-`core_project_not_ready`
+`project_not_ready`
 
-Wait for activation or the successor revision to finish, refresh, and submit
-again. Do not run against the prior revision.
+Wait for the complete successor Project Head to become active, refresh, and
+submit again. Desktop will not admit a Task against a stale or partial head.
 
 ## Unsigned App Is Blocked
 
@@ -97,10 +99,10 @@ Do not remove quarantine from a parent directory or an unverified download.
 
 ## SSH Credential Is Unavailable
 
-This Preview uses the macOS SSH agent and never receives private-key bytes.
-Ensure the configured Mac credential is available through the normal macOS
-credential flow, then choose **Reconnect** in Desktop. Do not disable host-key
-checking and do not open a remote shell to operate OpenEvo.
+This Preview delegates to system OpenSSH and never receives private-key bytes.
+Ensure the selected alias can use its configured `IdentityFile`, agent,
+Keychain, password, or key-passphrase flow, then choose **Reconnect**. Do not
+disable host-key checking or open a remote shell to operate OpenEvo.
 
 ## Codex Readiness Is Unavailable
 
@@ -116,28 +118,29 @@ Choose **Reconnect**. Desktop re-reads authoritative remote state and resumes or
 retries only the relevant operation. If **Cancel operation** was used, wait
 until cancellation settles before starting another connection or activation.
 
-Closing Desktop does not cancel a remote science session. After reopening, make
-the SSH identity available to the agent, reconnect, and let the timeline replay.
-If Desktop says a mutation outcome is unknown, leave it open while it confirms
-the original idempotent action. Repeated clicks do not create a valid shortcut.
+Closing Desktop does not rewrite a remote Task. After reopening, make the
+configured system OpenSSH identity available, reconnect the alias, and refresh
+the authoritative state. If Desktop says a mutation outcome is unknown, leave
+it open while it confirms the original idempotent action. Repeated clicks do not
+create a valid shortcut.
 
-## Session Is Waiting For A Revision
+## Task Is Waiting For A Successor
 
-Cross-session evolution is atomic. The next session cannot start until the
-previous session's complete successor revision is active. A
-`required_revision_uncommitted` status means OpenEvo is still committing that
-revision. Wait and refresh; do not disable evolution merely to force a stale
-run.
+Cross-Task evolution is atomic. The next Task cannot be admitted until the
+previous Task's complete successor Project Head is active. A waiting/not-ready
+status means OpenEvo is still preparing or committing that successor. Wait and
+refresh; do not disable evolution merely to force a stale Task.
 
 If evolution fails, the previous revision remains active but the next draft is
 not silently submitted against it. Use the error's retry or repair action.
 
 ## Cancellation
 
-**Cancel session** requests a remote cancellation. The session may briefly show
-**Cancelling** while the Daemon reconciles the runtime. Only the terminal
-**Cancelled** state confirms the outcome. A cancelled or failed session does
-not report a successful successor revision.
+**Cancel Task** requests remote cancellation. The Task may briefly show
+**Cancelling** while the Daemon reconciles the runtime. Only terminal state
+confirms the outcome. A failed or cancelled Task may append an infrastructure
+Attempt under the same immutable admission; it does not fabricate a successful
+successor.
 
 ## Disk Or Runtime Problems
 

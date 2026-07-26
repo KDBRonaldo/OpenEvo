@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate exact-candidate Desktop real-science evidence before publication."""
+"""Validate exact-candidate Desktop v2 real-science evidence before publication."""
 
 from __future__ import annotations
 
@@ -19,12 +19,29 @@ from typing import Mapping
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_CANDIDATE_SCHEMA_VERSION = 9
 MAX_EVIDENCE_BYTES = 128 * 1024
+EVIDENCE_SCHEMA_IDENTITY = {"schema_version": "2"}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 TARGETS = ("agent_system", "skill_bundle", "text_memory")
-REQUIRED_PHASES = frozenset(
-    {"admission", "preparation", "execution", "evolution", "revision", "terminal"}
+REQUIRED_TASK_EVENT_TYPES = frozenset(
+    {
+        "task_admitted",
+        "attempt_appended",
+        "dataset_sealed",
+        "evolution_revision_committed",
+        "runtime_context_committed",
+        "project_head_activated",
+    }
 )
+VERIFICATION_SCOPE = [
+    "exact_candidate_app_sidecar",
+    "system_openssh_remote_workspace",
+    "daemon_core_v2",
+    "codex_subscription_transcript",
+    "atomic_successor_project_heads",
+    "next_task_runtime_context_reuse",
+    "packaged_renderer_v2_observability",
+]
 
 
 class EvidenceError(RuntimeError):
@@ -80,21 +97,14 @@ def _nonnegative_int(value: object, label: str) -> int:
 
 
 def _nonempty_text(value: object, label: str) -> str:
-    if not isinstance(value, str) or not value or value.strip() != value:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value.strip() != value
+        or any(character in value for character in ("\x00", "\r", "\n"))
+    ):
         raise EvidenceError(f"{label} is not non-empty canonical text")
     return value
-
-
-def _revision(value: object, label: str) -> dict[str, object]:
-    revision = _exact_mapping(
-        value,
-        label,
-        {"id_sha256", "generation", "manifest_sha256"},
-    )
-    _sha256(revision["id_sha256"], f"{label} ID")
-    _nonnegative_int(revision["generation"], f"{label} generation")
-    _sha256(revision["manifest_sha256"], f"{label} manifest")
-    return revision
 
 
 def _asset_identity(value: object, label: str) -> dict[str, object]:
@@ -104,44 +114,69 @@ def _asset_identity(value: object, label: str) -> dict[str, object]:
     return asset
 
 
+def _stable_json_file(path: Path, *, maximum_bytes: int, label: str) -> tuple[bytes, object]:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise EvidenceError(f"{label} is unreadable") from exc
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_nlink != 1
+        or not 0 < metadata.st_size <= maximum_bytes
+    ):
+        raise EvidenceError(f"{label} is not a stable regular file")
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        raise EvidenceError(f"{label} is unreadable") from exc
+    if len(content) != metadata.st_size:
+        raise EvidenceError(f"{label} changed while it was read")
+    try:
+        payload = json.loads(content.decode("utf-8", errors="strict"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError(f"{label} is not valid JSON") from exc
+    return content, payload
+
+
 def _read_candidate_manifest(
     path: Path,
     *,
     expected_sha256: str,
     expected_source_commit: str,
 ) -> dict[str, object]:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise EvidenceError("candidate manifest is unreadable") from exc
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or not 0 < metadata.st_size <= 1024 * 1024
-    ):
-        raise EvidenceError("candidate manifest is not a stable regular file")
-    try:
-        content = path.read_bytes()
-    except OSError as exc:
-        raise EvidenceError("candidate manifest is unreadable") from exc
-    if metadata.st_size != len(content):
-        raise EvidenceError("candidate manifest changed while it was read")
+    content, payload = _stable_json_file(
+        path,
+        maximum_bytes=1024 * 1024,
+        label="candidate manifest",
+    )
     if hashlib.sha256(content).hexdigest() != expected_sha256:
         raise EvidenceError("candidate manifest digest mismatch")
-    try:
-        payload = json.loads(content.decode("utf-8", errors="strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise EvidenceError("candidate manifest is not valid JSON") from exc
-    manifest = dict(_mapping(payload, "candidate manifest"))
+    if content != _canonical_json(payload):
+        raise EvidenceError("candidate manifest is not canonical JSON")
+    manifest = _exact_mapping(
+        payload,
+        "candidate manifest",
+        {
+            "core",
+            "daemon",
+            "files",
+            "macos",
+            "managed_runtime",
+            "release",
+            "schema_version",
+            "source_commit",
+            "version",
+        },
+    )
     if (
-        manifest.get("schema_version") != RELEASE_CANDIDATE_SCHEMA_VERSION
-        or manifest.get("source_commit") != expected_source_commit
-        or not isinstance(manifest.get("version"), str)
-        or not manifest["version"]
+        manifest["schema_version"] != RELEASE_CANDIDATE_SCHEMA_VERSION
+        or manifest["source_commit"] != expected_source_commit
+        or manifest["version"] != "0.1.9"
     ):
         raise EvidenceError("candidate manifest identity is invalid")
     release = _exact_mapping(
-        manifest.get("release"),
+        manifest["release"],
         "candidate release",
         {
             "app_bundle_signature",
@@ -165,7 +200,8 @@ def _read_candidate_manifest(
         "quarantine_removal_tested": True,
     }:
         raise EvidenceError("candidate macOS signing policy is invalid")
-    files = manifest.get("files")
+
+    files = manifest["files"]
     if not isinstance(files, list) or not files:
         raise EvidenceError("candidate manifest file inventory is missing")
     roles: dict[str, dict[str, object]] = {}
@@ -194,7 +230,8 @@ def _read_candidate_manifest(
     }
     if not required_roles.issubset(roles):
         raise EvidenceError("candidate manifest is missing release roles")
-    managed_runtime = _mapping(manifest.get("managed_runtime"), "managed runtime")
+
+    managed_runtime = _mapping(manifest["managed_runtime"], "managed runtime")
     archive = _exact_mapping(
         managed_runtime.get("archive"),
         "managed runtime archive",
@@ -203,8 +240,35 @@ def _read_candidate_manifest(
     _nonempty_text(archive["filename"], "managed runtime filename")
     _sha256(archive["sha256"], "managed runtime digest")
     _positive_int(archive["byte_size"], "managed runtime byte size")
+
+    macos = _exact_mapping(
+        manifest["macos"],
+        "candidate macOS identity",
+        {
+            "architecture",
+            "minimum_system_version",
+            "native_architectures",
+            "rust_target",
+            "rust_toolchain",
+            "ssh_askpass_helper",
+        },
+    )
+    helper = _exact_mapping(
+        macos["ssh_askpass_helper"],
+        "candidate SSH askpass helper",
+        {"architecture", "byte_size", "mode", "relative_path", "sha256", "signature"},
+    )
+    if (
+        helper["mode"] != "0755"
+        or helper["relative_path"] != "Contents/MacOS/openevo-ssh-askpass"
+        or helper["signature"] != "adhoc"
+    ):
+        raise EvidenceError("candidate SSH askpass helper identity is invalid")
+    _sha256(helper["sha256"], "candidate SSH askpass helper digest")
+    _positive_int(helper["byte_size"], "candidate SSH askpass helper byte size")
     manifest["_roles"] = roles
     manifest["_runtime_archive"] = archive
+    manifest["_ssh_askpass_helper"] = helper
     return manifest
 
 
@@ -214,59 +278,65 @@ def _read_candidate_app_smoke(
     role: Mapping[str, object],
     desktop_dmg_role: Mapping[str, object],
 ) -> str:
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise EvidenceError("candidate app smoke is unreadable") from exc
+    content, payload = _stable_json_file(
+        path,
+        maximum_bytes=1024 * 1024,
+        label="candidate app smoke",
+    )
     if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or metadata.st_nlink != 1
-        or not 0 < metadata.st_size <= 1024 * 1024
-        or metadata.st_size != role.get("byte_size")
-    ):
-        raise EvidenceError("candidate app smoke is not a stable candidate asset")
-    try:
-        content = path.read_bytes()
-    except OSError as exc:
-        raise EvidenceError("candidate app smoke is unreadable") from exc
-    if (
-        len(content) != metadata.st_size
+        path.name != role.get("filename")
+        or len(content) != role.get("byte_size")
         or hashlib.sha256(content).hexdigest() != role.get("sha256")
-        or path.name != role.get("filename")
     ):
         raise EvidenceError("candidate app smoke does not match the candidate manifest")
-    try:
-        payload = json.loads(content.decode("utf-8", errors="strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise EvidenceError("candidate app smoke is not valid JSON") from exc
-    smoke = dict(_mapping(payload, "candidate app smoke"))
-    binary_sha256 = smoke.get("binary_sha256")
-    source_dmg = smoke.get("source_dmg")
+    smoke = _exact_mapping(
+        payload,
+        "candidate app smoke",
+        {
+            "binary_sha256",
+            "bundled_external_bin",
+            "bundled_external_bin_resolved",
+            "launch_origin",
+            "mach_o",
+            "native_executable",
+            "native_executable_fd_handoff",
+            "native_listener_fd_handoff",
+            "process_group_cleanup",
+            "renderer_ready",
+            "schema_version",
+            "sidecar_ready",
+            "source_dmg",
+        },
+    )
+    binary = _exact_mapping(
+        smoke["binary_sha256"],
+        "candidate binary digests",
+        {"native_executable", "bundled_external_bin"},
+    )
     if (
-        smoke.get("schema_version") != 3
-        or smoke.get("launch_origin") != "mounted_dmg"
-        or smoke.get("bundled_external_bin") != "openevo-desktop-sidecar"
-        or smoke.get("sidecar_ready") is not True
-        or smoke.get("bundled_external_bin_resolved") is not True
-        or smoke.get("native_listener_fd_handoff") is not True
-        or smoke.get("native_executable_fd_handoff") is not True
-        or smoke.get("process_group_cleanup") is not True
-        or not isinstance(source_dmg, dict)
-        or source_dmg
+        smoke["schema_version"] != 3
+        or smoke["launch_origin"] != "mounted_dmg"
+        or smoke["bundled_external_bin"] != "openevo-desktop-sidecar"
+        or smoke["source_dmg"]
         != {
             "filename": desktop_dmg_role.get("filename"),
             "sha256": desktop_dmg_role.get("sha256"),
         }
-        or not isinstance(binary_sha256, dict)
-        or set(binary_sha256) != {"native_executable", "bundled_external_bin"}
+        or any(
+            smoke[key] is not True
+            for key in (
+                "renderer_ready",
+                "sidecar_ready",
+                "bundled_external_bin_resolved",
+                "native_listener_fd_handoff",
+                "native_executable_fd_handoff",
+                "process_group_cleanup",
+            )
+        )
     ):
-        raise EvidenceError("candidate app smoke does not prove the packaged sidecar")
-    _sha256(binary_sha256.get("native_executable"), "candidate native executable")
-    return _sha256(
-        binary_sha256.get("bundled_external_bin"),
-        "candidate packaged sidecar",
-    )
+        raise EvidenceError("candidate app smoke does not prove the packaged app")
+    _sha256(binary["native_executable"], "candidate native executable digest")
+    return _sha256(binary["bundled_external_bin"], "candidate packaged sidecar digest")
 
 
 def _require_asset_match(
@@ -274,9 +344,10 @@ def _require_asset_match(
     candidate: Mapping[str, object],
     label: str,
 ) -> None:
-    if evidence.get("sha256") != candidate.get("sha256") or evidence.get(
-        "byte_size"
-    ) != candidate.get("byte_size"):
+    if (
+        evidence.get("sha256") != candidate.get("sha256")
+        or evidence.get("byte_size") != candidate.get("byte_size")
+    ):
         raise EvidenceError(f"{label} does not match the candidate manifest")
 
 
@@ -292,255 +363,161 @@ def _timestamp(value: object, label: str) -> datetime:
     return parsed
 
 
-def _string_set(value: object, label: str, *, allow_empty: bool = False) -> list[str]:
-    if (
-        not isinstance(value, list)
-        or (not allow_empty and not value)
-        or any(not isinstance(item, str) or not item for item in value)
-        or value != sorted(set(value))
-    ):
-        raise EvidenceError(f"{label} is not a canonical string set")
-    return value
+def _release_contract() -> Mapping[str, object]:
+    try:
+        payload = json.loads(
+            (REPOSITORY_ROOT / "desktop/release-contract.json").read_text(
+                encoding="utf-8"
+            )
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise EvidenceError("release contract is unavailable") from exc
+    contract = _mapping(payload, "release contract")
+    return _mapping(contract.get("v019"), "v0.1.9 release contract")
 
 
-def _event_inventory(
-    value: object,
-    label: str,
-    *,
-    category_keys: tuple[str, ...],
-) -> dict[str, object]:
-    inventory = _exact_mapping(
-        value,
-        label,
-        {"count", "content_sha256", "evidence_truncated", *category_keys},
-    )
-    count = _positive_int(inventory["count"], f"{label} count")
-    if inventory["evidence_truncated"] is not False:
-        raise EvidenceError(f"{label} is truncated")
-    digests = inventory["content_sha256"]
-    if (
-        not isinstance(digests, list)
-        or len(digests) != count
-        or any(SHA256_PATTERN.fullmatch(item) is None for item in digests if isinstance(item, str))
-        or any(not isinstance(item, str) for item in digests)
-    ):
-        raise EvidenceError(f"{label} content inventory is incomplete")
-    for key in category_keys:
-        _string_set(inventory[key], f"{label} {key}")
-    return inventory
-
-
-def _artifact(
-    value: object,
-    label: str,
-    *,
-    ordinal: int,
-) -> dict[str, object]:
-    artifact = _exact_mapping(
+def _project_head(value: object, label: str) -> dict[str, object]:
+    head = _exact_mapping(
         value,
         label,
         {
-            "artifact_id_sha256",
-            "artifact_type",
-            "target_id",
-            "method_id",
-            "content_sha256",
-            "byte_size",
-            "selected",
-            "promoted",
-            "release_enabled",
-            "source_artifact_count",
-            "source_artifact_ids_sha256",
-            "source_dataset_count",
-            "produced_revision",
+            "project_head_id_sha256",
+            "generation",
+            "predecessor_project_head_id_sha256",
+            "manifest_sha256",
+            "workspace_snapshot",
+            "evolution_revision",
+            "runtime_context_snapshot",
+            "effective_execution_snapshot",
         },
     )
-    target_id = artifact["target_id"]
-    if target_id not in TARGETS or artifact["artifact_type"] != target_id:
-        raise EvidenceError(f"{label} target identity is invalid")
-    _nonempty_text(artifact["method_id"], f"{label} method identity")
-    _sha256(artifact["artifact_id_sha256"], f"{label} ID")
-    _sha256(artifact["content_sha256"], f"{label} content")
-    _positive_int(artifact["byte_size"], f"{label} byte size")
-    if (
-        artifact["selected"] is not True
-        or artifact["release_enabled"] is not True
-        or not isinstance(artifact["promoted"], bool)
-    ):
-        raise EvidenceError(f"{label} selection state is invalid")
-    source_artifacts = _nonnegative_int(
-        artifact["source_artifact_count"], f"{label} source artifact count"
-    )
-    source_artifact_ids = artifact["source_artifact_ids_sha256"]
-    if not isinstance(source_artifact_ids, list) or len(source_artifact_ids) != source_artifacts:
-        raise EvidenceError(f"{label} source artifact identities are incomplete")
-    for index, source_artifact_id in enumerate(source_artifact_ids):
-        _sha256(source_artifact_id, f"{label} source artifact {index}")
-    if len(set(source_artifact_ids)) != len(source_artifact_ids):
-        raise EvidenceError(f"{label} source artifact identities are duplicated")
-    _positive_int(artifact["source_dataset_count"], f"{label} source dataset count")
-    if ordinal == 2 and source_artifacts < 1:
-        raise EvidenceError(f"{label} does not reuse the predecessor artifact")
-    artifact["produced_revision"] = _revision(
-        artifact["produced_revision"], f"{label} produced revision"
-    )
-    return artifact
+    _sha256(head["project_head_id_sha256"], f"{label} ID")
+    _nonnegative_int(head["generation"], f"{label} generation")
+    predecessor = head["predecessor_project_head_id_sha256"]
+    if predecessor is not None:
+        _sha256(predecessor, f"{label} predecessor")
+    _sha256(head["manifest_sha256"], f"{label} manifest")
 
+    workspace = _exact_mapping(
+        head["workspace_snapshot"],
+        f"{label} workspace snapshot",
+        {"workspace_snapshot_id_sha256", "manifest_sha256", "entry_count", "byte_size"},
+    )
+    _sha256(workspace["workspace_snapshot_id_sha256"], f"{label} workspace ID")
+    _sha256(workspace["manifest_sha256"], f"{label} workspace manifest")
+    _nonnegative_int(workspace["entry_count"], f"{label} workspace entry count")
+    _nonnegative_int(workspace["byte_size"], f"{label} workspace byte size")
 
-def _artifact_inspection(
-    value: object,
-    label: str,
-    *,
-    artifact: Mapping[str, object],
-) -> dict[str, object]:
-    inspection = _exact_mapping(
-        value,
-        label,
+    revision = _exact_mapping(
+        head["evolution_revision"],
+        f"{label} Evolution Revision",
+        {"evolution_revision_id_sha256", "manifest_sha256", "artifact_count"},
+    )
+    _sha256(revision["evolution_revision_id_sha256"], f"{label} Evolution Revision ID")
+    _sha256(revision["manifest_sha256"], f"{label} Evolution Revision manifest")
+    _nonnegative_int(revision["artifact_count"], f"{label} artifact count")
+
+    runtime = _exact_mapping(
+        head["runtime_context_snapshot"],
+        f"{label} Runtime Context Snapshot",
         {
-            "artifact_id_sha256",
-            "document_count",
-            "total_documents",
-            "total_utf8_bytes",
-            "truncated",
-            "runtime_document_sha256",
+            "runtime_context_snapshot_id_sha256",
+            "manifest_sha256",
+            "runtime_contract_sha256",
+            "registry_sha256",
         },
     )
-    if inspection["artifact_id_sha256"] != artifact["artifact_id_sha256"]:
-        raise EvidenceError(f"{label} does not identify its artifact")
-    document_count = _positive_int(inspection["document_count"], f"{label} documents")
-    if inspection["total_documents"] != document_count:
-        raise EvidenceError(f"{label} document inventory is incomplete")
-    _positive_int(inspection["total_utf8_bytes"], f"{label} UTF-8 bytes")
-    if inspection["truncated"] is not False:
-        raise EvidenceError(f"{label} is truncated")
-    _sha256(inspection["runtime_document_sha256"], f"{label} runtime document")
-    return inspection
+    for key in runtime:
+        _sha256(runtime[key], f"{label} Runtime Context {key}")
+
+    execution = _exact_mapping(
+        head["effective_execution_snapshot"],
+        f"{label} Effective Execution Snapshot",
+        {
+            "effective_execution_snapshot_id_sha256",
+            "snapshot_sha256",
+            "producer_id_sha256",
+            "mode",
+            "capture_mode",
+            "token_level_metrics_available",
+        },
+    )
+    for key in (
+        "effective_execution_snapshot_id_sha256",
+        "snapshot_sha256",
+        "producer_id_sha256",
+    ):
+        _sha256(execution[key], f"{label} execution {key}")
+    if (
+        execution["mode"] != "codex_subscription_transcript"
+        or execution["capture_mode"] != "transcript"
+        or execution["token_level_metrics_available"] is not False
+    ):
+        raise EvidenceError(f"{label} execution snapshot is not subscription transcript")
+    return head
 
 
-def _session(value: object, *, ordinal: int) -> dict[str, object]:
-    label = f"session {ordinal}"
-    session = _exact_mapping(
+def _task(value: object, *, ordinal: int) -> dict[str, object]:
+    label = f"Task {ordinal}"
+    task = _exact_mapping(
         value,
         label,
         {
             "ordinal",
-            "run_id_sha256",
-            "status",
-            "required_relation",
-            "required_revision",
-            "pinned_revision",
-            "timeline",
-            "logs",
-            "artifacts",
-            "artifact_count",
-            "artifact_evidence_truncated",
-            "artifact_inspections",
-            "runtime_context_receipt_sha256",
-            "runtime_context_receipt_core_provenance_verified",
-            "context",
-            "transcript_dataset_lineage_observed",
+            "task_id_sha256",
+            "state",
+            "task_admission_id_sha256",
+            "admission_sha256",
+            "authoritative_attempt_id_sha256",
+            "attempt_count",
+            "predecessor_project_head",
+            "context_project_head",
+            "successor_project_head",
+            "transition_id_sha256",
+            "transition_state",
+            "timeline_event_types",
+            "timeline_event_count",
         },
     )
-    if (
-        session["ordinal"] != ordinal
-        or session["status"] != "succeeded"
-        or session["required_relation"] != "active"
-        or session["artifact_count"] != len(TARGETS)
-        or session["artifact_evidence_truncated"] is not False
-        or session["transcript_dataset_lineage_observed"] is not True
+    if task["ordinal"] != ordinal or task["state"] != "completed":
+        raise EvidenceError(f"{label} did not complete")
+    for key in (
+        "task_id_sha256",
+        "task_admission_id_sha256",
+        "admission_sha256",
+        "authoritative_attempt_id_sha256",
+        "transition_id_sha256",
     ):
-        raise EvidenceError(f"{label} verdict is incomplete")
-    _sha256(session["run_id_sha256"], f"{label} run ID")
-    required = _revision(session["required_revision"], f"{label} required revision")
-    pinned = _revision(session["pinned_revision"], f"{label} pinned revision")
-    if required != pinned:
-        raise EvidenceError(f"{label} did not pin its required active revision")
-    timeline = _event_inventory(
-        session["timeline"],
-        f"{label} timeline",
-        category_keys=("phase_values", "status_values"),
-    )
-    if not REQUIRED_PHASES.issubset(set(timeline["phase_values"])):
-        raise EvidenceError(f"{label} timeline is missing required phases")
-    logs = _event_inventory(
-        session["logs"],
-        f"{label} logs",
-        category_keys=("stream_values", "level_values"),
-    )
-
-    artifacts_value = session["artifacts"]
-    if not isinstance(artifacts_value, list) or len(artifacts_value) != len(TARGETS):
-        raise EvidenceError(f"{label} artifact inventory is incomplete")
-    artifacts = [_artifact(item, label, ordinal=ordinal) for item in artifacts_value]
-    artifacts_by_target = {str(item["target_id"]): item for item in artifacts}
-    if len(artifacts_by_target) != len(TARGETS) or set(artifacts_by_target) != set(TARGETS):
-        raise EvidenceError(f"{label} artifact targets are invalid")
-    produced_revisions = {
-        json.dumps(item["produced_revision"], sort_keys=True) for item in artifacts
-    }
-    if len(produced_revisions) != 1:
-        raise EvidenceError(f"{label} artifacts do not share one successor revision")
-    produced = dict(artifacts[0]["produced_revision"])
-    if produced["generation"] != pinned["generation"] + 1:
-        raise EvidenceError(f"{label} successor generation is invalid")
-
-    inspections_value = _exact_mapping(
-        session["artifact_inspections"],
-        f"{label} artifact inspections",
-        set(TARGETS),
-    )
-    inspections = {
-        target_id: _artifact_inspection(
-            inspections_value[target_id],
-            f"{label} {target_id} inspection",
-            artifact=artifacts_by_target[target_id],
-        )
-        for target_id in TARGETS
-    }
-    context = _exact_mapping(
-        session["context"],
-        f"{label} context",
-        {
-            "status",
-            "capture_mode",
-            "token_level_metrics_available",
-            "artifact_count",
-            "adapter_count",
-        },
-    )
-    expected_context_artifacts = 0 if ordinal == 1 else len(TARGETS)
+        _sha256(task[key], f"{label} {key}")
+    _positive_int(task["attempt_count"], f"{label} attempt count")
+    if task["transition_state"] != "committed":
+        raise EvidenceError(f"{label} successor transition was not committed")
+    event_types = task["timeline_event_types"]
     if (
-        context["status"] != "succeeded"
-        or context["capture_mode"] != "transcript"
-        or context["token_level_metrics_available"] is not False
-        or context["artifact_count"] != expected_context_artifacts
-        or context["adapter_count"] != 0
+        not isinstance(event_types, list)
+        or event_types != sorted(set(event_types))
+        or not REQUIRED_TASK_EVENT_TYPES.issubset(event_types)
+        or not isinstance(task["timeline_event_count"], int)
+        or task["timeline_event_count"] < len(event_types)
     ):
-        raise EvidenceError(f"{label} runtime context is invalid")
-    receipt = session["runtime_context_receipt_sha256"]
-    if ordinal == 1:
-        if (
-            receipt is not None
-            or session["runtime_context_receipt_core_provenance_verified"] is not False
-        ):
-            raise EvidenceError("session 1 unexpectedly reports successor injection")
-    else:
-        _sha256(receipt, "session 2 runtime-context receipt")
-        if session["runtime_context_receipt_core_provenance_verified"] is not True:
-            raise EvidenceError("session 2 runtime-context receipt lacks Core provenance")
-    session["required_revision"] = required
-    session["pinned_revision"] = pinned
-    session["timeline"] = timeline
-    session["logs"] = logs
-    session["artifacts_by_target"] = artifacts_by_target
-    session["inspections"] = inspections
-    session["produced_revision"] = produced
-    return session
+        raise EvidenceError(f"{label} v2 lifecycle timeline is incomplete")
+    task["predecessor_project_head"] = _project_head(
+        task["predecessor_project_head"], f"{label} predecessor"
+    )
+    task["context_project_head"] = _project_head(
+        task["context_project_head"], f"{label} context"
+    )
+    task["successor_project_head"] = _project_head(
+        task["successor_project_head"], f"{label} successor"
+    )
+    return task
 
 
 def _load_runner() -> ModuleType:
     path = REPOSITORY_ROOT / "scripts/e2e/desktop_real_science_e2e.py"
-    spec = importlib.util.spec_from_file_location("openevo_desktop_real_science_e2e", path)
+    spec = importlib.util.spec_from_file_location(
+        "openevo_desktop_real_science_e2e", path
+    )
     if spec is None or spec.loader is None:
         raise EvidenceError("real-science evidence policy is unavailable")
     module = importlib.util.module_from_spec(spec)
@@ -558,41 +535,34 @@ def validate_evidence(
     expected_source_commit: str,
     expected_candidate_manifest_sha256: str,
 ) -> dict[str, object]:
-    if SHA256_PATTERN.fullmatch(expected_sha256) is None:
-        raise EvidenceError("expected evidence digest is invalid")
+    _sha256(expected_sha256, "expected evidence digest")
     if SOURCE_PATTERN.fullmatch(expected_source_commit) is None:
         raise EvidenceError("expected source commit is invalid")
-    if SHA256_PATTERN.fullmatch(expected_candidate_manifest_sha256) is None:
-        raise EvidenceError("expected candidate manifest digest is invalid")
+    _sha256(expected_candidate_manifest_sha256, "expected candidate manifest digest")
     candidate = _read_candidate_manifest(
         candidate_manifest_path,
         expected_sha256=expected_candidate_manifest_sha256,
         expected_source_commit=expected_source_commit,
     )
-    try:
-        metadata = path.lstat()
-    except OSError as exc:
-        raise EvidenceError("real-science evidence is unreadable") from exc
-    if (
-        path.is_symlink()
-        or not stat.S_ISREG(metadata.st_mode)
-        or not 0 < metadata.st_size <= MAX_EVIDENCE_BYTES
-    ):
-        raise EvidenceError("real-science evidence is not a stable regular file")
-    try:
-        payload_bytes = path.read_bytes()
-    except OSError as exc:
-        raise EvidenceError("real-science evidence is unreadable") from exc
-    if metadata.st_size != len(payload_bytes):
-        raise EvidenceError("real-science evidence changed while it was read")
+    roles = _mapping(candidate["_roles"], "candidate roles")
+    candidate_sidecar_sha256 = _read_candidate_app_smoke(
+        candidate_app_bundle_smoke_path,
+        role=_mapping(roles["app_bundle_smoke"], "candidate app smoke role"),
+        desktop_dmg_role=_mapping(roles["desktop_dmg"], "candidate DMG role"),
+    )
+
+    payload_bytes, payload = _stable_json_file(
+        path,
+        maximum_bytes=MAX_EVIDENCE_BYTES,
+        label="real-science evidence",
+    )
     if hashlib.sha256(payload_bytes).hexdigest() != expected_sha256:
         raise EvidenceError("real-science evidence digest mismatch")
-    try:
-        payload = json.loads(payload_bytes.decode("utf-8", errors="strict"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise EvidenceError("real-science evidence is not valid JSON") from exc
     if payload_bytes != _canonical_json(payload):
         raise EvidenceError("real-science evidence is not canonical JSON")
+    preflight = _mapping(payload, "real-science evidence")
+    if preflight.get("schema_version") != EVIDENCE_SCHEMA_IDENTITY["schema_version"]:
+        raise EvidenceError("real-science evidence schema version is not v2")
     document = _exact_mapping(
         payload,
         "real-science evidence",
@@ -608,21 +578,15 @@ def validate_evidence(
             "desktop",
             "run_mode",
             "verification_scope",
-            "session_count",
-            "evolution_targets_enabled",
-            "artifact_publication_verified",
-            "cross_session_reuse_verified",
-            "release_evolution_path_verified",
-            "canonical_project_head_orchestration_verified",
-            "codex_subscription_transcript_verified",
+            "task_count",
             "remote",
             "project",
-            "sessions",
+            "tasks",
             "reuse",
             "renderer",
             "renderer_observability_verified",
             "renderer_boundary",
-            "native_tauri_live_verified",
+            "candidate_tauri_launch_verified",
             "cleanup",
             "finished_at",
         },
@@ -631,54 +595,27 @@ def validate_evidence(
         _load_runner()._audit_evidence(document, private_values=())
     except Exception as exc:
         raise EvidenceError("real-science evidence violates the privacy contract") from exc
+    if (
+        document["kind"] != "openevo_desktop_real_science_e2e"
+        or document["issue"] != 163
+        or document["real_process_boundary"] is not True
+        or document["outcome"] != "passed"
+        or document["run_mode"] != "two_task_subscription_release"
+        or document["verification_scope"] != VERIFICATION_SCOPE
+        or document["task_count"] != 2
+    ):
+        raise EvidenceError("real-science v2 verdict is incomplete")
+    if _timestamp(document["finished_at"], "finish time") < _timestamp(
+        document["started_at"], "start time"
+    ):
+        raise EvidenceError("real-science timestamps are reversed")
 
-    required_identity: dict[str, object] = {
-        "schema_version": "1",
-        "kind": "openevo_desktop_real_science_e2e",
-        "issue": 163,
-        "real_process_boundary": True,
-        "outcome": "passed",
-        "run_mode": "two_session_subscription_release",
-        "session_count": 2,
-        "evolution_targets_enabled": True,
-        "artifact_publication_verified": True,
-        "cross_session_reuse_verified": True,
-        "release_evolution_path_verified": True,
-        "canonical_project_head_orchestration_verified": False,
-        "codex_subscription_transcript_verified": True,
-        "renderer_observability_verified": True,
-        "renderer_boundary": "packaged_web_to_live_local_api",
-        "native_tauri_live_verified": False,
-    }
-    if any(document.get(key) != value for key, value in required_identity.items()):
-        raise EvidenceError("real-science evidence does not contain the required release verdict")
-    expected_scope = [
-        "desktop_sidecar",
-        "ssh_bootstrap",
-        "daemon_core",
-        "codex_subscription_transcript",
-        "cross_session_artifact_reuse",
-        "packaged_renderer_local_api_observability",
-    ]
-    if document["verification_scope"] != expected_scope:
-        raise EvidenceError("real-science verification scope is incomplete")
-    started = _timestamp(document["started_at"], "evidence start")
-    finished = _timestamp(document["finished_at"], "evidence finish")
-    if finished < started:
-        raise EvidenceError("real-science evidence timestamps are inverted")
-
-    roles = _mapping(candidate["_roles"], "candidate roles")
-    runtime_role = _mapping(candidate["_runtime_archive"], "candidate runtime")
-    candidate_packaged_sidecar_sha256 = _read_candidate_app_smoke(
-        candidate_app_bundle_smoke_path,
-        role=_mapping(roles["app_bundle_smoke"], "candidate app smoke role"),
-        desktop_dmg_role=_mapping(roles["desktop_dmg"], "candidate DMG role"),
-    )
     assets = _exact_mapping(
         document["release_assets"],
         "release assets",
         {
             "sidecar",
+            "ssh_askpass_helper",
             "core_wheel",
             "framework_lock",
             "managed_runtime_archive",
@@ -689,7 +626,8 @@ def validate_evidence(
             "slim_sidecar_excludes_remote_release_assets_verified",
         },
     )
-    _asset_identity(assets["sidecar"], "Desktop sidecar")
+    sidecar = _asset_identity(assets["sidecar"], "candidate sidecar")
+    helper_asset = _asset_identity(assets["ssh_askpass_helper"], "candidate askpass helper")
     wheel = _exact_mapping(
         assets["core_wheel"],
         "Core wheel",
@@ -697,9 +635,8 @@ def validate_evidence(
     )
     _sha256(wheel["sha256"], "Core wheel digest")
     _positive_int(wheel["byte_size"], "Core wheel byte size")
-    _nonempty_text(wheel["filename"], "Core wheel filename")
-    if wheel["distribution"] != "openevo" or wheel["version"] != candidate["version"]:
-        raise EvidenceError("Core wheel product identity is invalid")
+    if wheel["distribution"] != "openevo" or wheel["version"] != "0.1.9":
+        raise EvidenceError("Core wheel release identity is invalid")
     framework_lock = _exact_mapping(
         assets["framework_lock"],
         "framework lock",
@@ -709,70 +646,37 @@ def validate_evidence(
     _positive_int(framework_lock["byte_size"], "framework lock byte size")
     if framework_lock["distribution_digest"] != wheel["sha256"]:
         raise EvidenceError("framework lock does not bind the Core wheel")
-    managed_runtime = _asset_identity(assets["managed_runtime_archive"], "managed runtime")
+    runtime = _asset_identity(assets["managed_runtime_archive"], "managed runtime")
     daemon_bundle = _asset_identity(assets["daemon_bundle"], "Daemon bundle")
     daemon_manifest = _asset_identity(assets["daemon_manifest"], "Daemon manifest")
-    external_assets = _exact_mapping(
+    _require_asset_match(wheel, _mapping(roles["core_wheel"], "candidate Core wheel"), "Core wheel")
+    _require_asset_match(framework_lock, _mapping(roles["framework_lock"], "candidate framework lock"), "framework lock")
+    _require_asset_match(runtime, _mapping(candidate["_runtime_archive"], "candidate runtime"), "managed runtime")
+    _require_asset_match(daemon_bundle, _mapping(roles["daemon_bundle"], "candidate Daemon bundle"), "Daemon bundle")
+    _require_asset_match(daemon_manifest, _mapping(roles["daemon_manifest"], "candidate Daemon manifest"), "Daemon manifest")
+    helper = _mapping(candidate["_ssh_askpass_helper"], "candidate askpass helper")
+    if (
+        sidecar["sha256"] != candidate_sidecar_sha256
+        or helper_asset["sha256"] != helper["sha256"]
+        or helper_asset["byte_size"] != helper["byte_size"]
+        or assets["exact_external_release_assets_verified"] is not True
+        or assets["slim_sidecar_excludes_remote_release_assets_verified"] is not True
+    ):
+        raise EvidenceError("candidate packaged binary binding is invalid")
+    external = _exact_mapping(
         assets["external_release_assets"],
         "external release assets",
         {"source_commit", "registry_digest", "manifest_sha256", "byte_size"},
     )
-    if external_assets["source_commit"] != expected_source_commit:
-        raise EvidenceError("external release assets do not bind the candidate source")
-    _sha256(external_assets["registry_digest"], "external release asset registry")
-    _sha256(external_assets["manifest_sha256"], "external release asset manifest")
-    _positive_int(external_assets["byte_size"], "external release asset manifest byte size")
-    if (
-        assets["exact_external_release_assets_verified"] is not True
-        or assets["slim_sidecar_excludes_remote_release_assets_verified"] is not True
-    ):
-        raise EvidenceError("external release assets were not verified")
-    for evidence_asset, role, label in (
-        (wheel, roles["core_wheel"], "Core wheel"),
-        (framework_lock, roles["framework_lock"], "framework lock"),
-        (daemon_bundle, roles["daemon_bundle"], "Daemon bundle"),
-        (daemon_manifest, roles["daemon_manifest"], "Daemon manifest"),
-        (managed_runtime, runtime_role, "managed runtime"),
-    ):
-        _require_asset_match(
-            _mapping(evidence_asset, label),
-            _mapping(role, f"candidate {label}"),
-            label,
-        )
-    if wheel["filename"] != _mapping(roles["core_wheel"], "candidate wheel")["filename"]:
-        raise EvidenceError("Core wheel filename does not match the candidate")
-
-    desktop = _exact_mapping(
-        document["desktop"],
-        "Desktop identity",
-        {
-            "source_commit",
-            "build_version",
-            "openapi_sha256",
-            "provider_kind",
-            "build_channel",
-            "feature_flags",
-            "legacy_route_rejected",
-            "authenticated_session_probe",
-            "unauthenticated_session_rejected",
-        },
-    )
-    _sha256(desktop["openapi_sha256"], "Desktop OpenAPI digest")
-    _string_set(desktop["feature_flags"], "Desktop feature flags")
-    if (
-        desktop["source_commit"] != expected_source_commit
-        or desktop["build_version"] != candidate["version"]
-        or desktop["provider_kind"] != "desktop_sidecar"
-        or desktop["build_channel"] != "release"
-        or desktop["legacy_route_rejected"] is not True
-        or desktop["authenticated_session_probe"] is not True
-        or desktop["unauthenticated_session_rejected"] is not True
-    ):
-        raise EvidenceError("Desktop release identity is invalid")
+    registry_sha256 = _sha256(external["registry_digest"], "registry digest")
+    _sha256(external["manifest_sha256"], "external asset manifest")
+    _positive_int(external["byte_size"], "external asset manifest byte size")
+    if external["source_commit"] != expected_source_commit:
+        raise EvidenceError("external release assets use another source commit")
 
     binding = _exact_mapping(
         document["renderer_candidate_binding"],
-        "candidate binding",
+        "renderer candidate binding",
         {
             "source_commit",
             "candidate_version",
@@ -780,177 +684,223 @@ def validate_evidence(
             "desktop_dmg_sha256",
             "app_bundle_smoke_sha256",
             "candidate_packaged_sidecar_sha256",
-            "science_sidecar_sha256",
+            "candidate_ssh_askpass_helper_sha256",
             "candidate_native_sidecar_smoke_verified",
-            "cross_platform_source_equivalent_verified",
+            "exact_candidate_packaged_sidecar_verified",
+            "exact_candidate_ssh_askpass_helper_verified",
             "packaged_web_manifest_sha256",
             "playwright_candidate_evidence_sha256",
             "packaged_web_build_digest",
             "source_checkout_verified",
         },
     )
-    for key in (
-        "release_candidate_manifest_sha256",
-        "desktop_dmg_sha256",
-        "app_bundle_smoke_sha256",
-        "candidate_packaged_sidecar_sha256",
-        "science_sidecar_sha256",
-        "packaged_web_manifest_sha256",
-        "playwright_candidate_evidence_sha256",
-        "packaged_web_build_digest",
-    ):
-        _sha256(binding[key], f"candidate binding {key}")
+    expected_binding = {
+        "source_commit": expected_source_commit,
+        "candidate_version": "0.1.9",
+        "release_candidate_manifest_sha256": expected_candidate_manifest_sha256,
+        "desktop_dmg_sha256": roles["desktop_dmg"]["sha256"],
+        "app_bundle_smoke_sha256": roles["app_bundle_smoke"]["sha256"],
+        "candidate_packaged_sidecar_sha256": candidate_sidecar_sha256,
+        "candidate_ssh_askpass_helper_sha256": helper["sha256"],
+        "candidate_native_sidecar_smoke_verified": True,
+        "exact_candidate_packaged_sidecar_verified": True,
+        "exact_candidate_ssh_askpass_helper_verified": True,
+        "packaged_web_manifest_sha256": roles["packaged_web_manifest"]["sha256"],
+        "playwright_candidate_evidence_sha256": roles["playwright_evidence"]["sha256"],
+        "source_checkout_verified": True,
+    }
+    if any(binding.get(key) != value for key, value in expected_binding.items()):
+        raise EvidenceError("renderer candidate binding does not identify the exact candidate")
+    build_digest = _sha256(binding["packaged_web_build_digest"], "packaged web build")
+
+    release_contract = _release_contract()
+    desktop = _exact_mapping(
+        document["desktop"],
+        "Desktop identity",
+        {
+            "source_commit",
+            "release_version",
+            "mutation_major",
+            "openapi_sha256",
+            "event_schema_sha256",
+            "build_id",
+            "provider_kind",
+            "build_channel",
+            "feature_flags",
+            "feature_set_sha256",
+            "required_core_api_major",
+            "mutation_compatible",
+            "v2_only_negotiation_verified",
+            "authenticated_session_probe",
+            "unauthenticated_session_rejected",
+        },
+    )
+    expected_features = release_contract.get("required_desktop_feature_flags")
     if (
-        binding["source_commit"] != expected_source_commit
-        or binding["candidate_version"] != candidate["version"]
-        or binding["release_candidate_manifest_sha256"] != expected_candidate_manifest_sha256
-        or binding["source_checkout_verified"] is not True
-        or binding["candidate_native_sidecar_smoke_verified"] is not True
-        or binding["cross_platform_source_equivalent_verified"] is not True
-        or binding["desktop_dmg_sha256"] != roles["desktop_dmg"]["sha256"]
-        or binding["app_bundle_smoke_sha256"] != roles["app_bundle_smoke"]["sha256"]
-        or binding["candidate_packaged_sidecar_sha256"] != candidate_packaged_sidecar_sha256
-        or binding["science_sidecar_sha256"] != assets["sidecar"]["sha256"]
-        or binding["packaged_web_manifest_sha256"] != roles["packaged_web_manifest"]["sha256"]
-        or binding["playwright_candidate_evidence_sha256"]
-        != roles["playwright_evidence"]["sha256"]
+        desktop["source_commit"] != expected_source_commit
+        or desktop["release_version"] != "0.1.9"
+        or desktop["mutation_major"] != 2
+        or desktop["openapi_sha256"]
+        not in release_contract.get("accepted_desktop_openapi_digests", [])
+        or desktop["event_schema_sha256"]
+        not in release_contract.get("accepted_desktop_event_schema_digests", [])
+        or desktop["provider_kind"] != "desktop_sidecar"
+        or desktop["build_channel"] != "release"
+        or desktop["feature_flags"] != expected_features
+        or desktop["required_core_api_major"] != 2
+        or desktop["mutation_compatible"] is not True
+        or desktop["v2_only_negotiation_verified"] is not True
+        or desktop["authenticated_session_probe"] is not True
+        or desktop["unauthenticated_session_rejected"] is not True
     ):
-        raise EvidenceError("real-science evidence is not bound to the exact candidate")
+        raise EvidenceError("Desktop v2 release identity is invalid")
+    _sha256(desktop["build_id"], "Desktop build ID")
+    expected_feature_digest = hashlib.sha256(
+        json.dumps(
+            expected_features,
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    ).hexdigest()
+    if desktop["feature_set_sha256"] != expected_feature_digest:
+        raise EvidenceError("Desktop feature-set digest is invalid")
 
     remote = _exact_mapping(
         document["remote"],
-        "remote identity",
-        {"ssh_connection_verified", "host_key_verified"},
+        "remote workspace",
+        {
+            "connection_authority",
+            "catalog_selection_verified",
+            "system_openssh_final_authority_verified",
+            "core_api_major",
+            "core_registry_sha256",
+        },
     )
-    if remote != {"ssh_connection_verified": True, "host_key_verified": True}:
-        raise EvidenceError("remote SSH identity verification is incomplete")
+    if (
+        remote["connection_authority"] != "system_openssh"
+        or remote["catalog_selection_verified"] is not True
+        or remote["system_openssh_final_authority_verified"] is not True
+        or remote["core_api_major"] != 2
+        or remote["core_registry_sha256"] != registry_sha256
+    ):
+        raise EvidenceError("remote workspace did not use system OpenSSH and Core v2")
 
     project = _exact_mapping(
         document["project"],
         "project evidence",
         {
             "project_id_sha256",
-            "execution_mode",
-            "capture_mode",
-            "token_level_metrics_available",
-            "codex_model",
-            "reasoning_effort",
+            "execution",
             "target_ids",
-            "method_ids",
-            "allowed_concrete_method_ids",
-            "initial_zero_target_activation_verified",
-            "registry_digest",
-            "validation_check_count",
+            "selected_methods",
+            "registry_sha256",
+            "validation_check_counts",
+            "initial_project_head",
+            "active_project_head",
         },
     )
-    _sha256(project["project_id_sha256"], "project ID")
-    _sha256(project["registry_digest"], "project registry")
-    if project["registry_digest"] != external_assets["registry_digest"]:
-        raise EvidenceError("project registry differs from the packaged release assets")
-    _positive_int(project["validation_check_count"], "project validation checks")
-    method_ids = _exact_mapping(project["method_ids"], "method identities", set(TARGETS))
-    allowed_concrete = _exact_mapping(
-        project["allowed_concrete_method_ids"],
-        "allowed concrete method identities",
-        set(TARGETS),
+    project_id_sha256 = _sha256(project["project_id_sha256"], "project ID")
+    execution = _exact_mapping(
+        project["execution"],
+        "project execution",
+        {
+            "mode",
+            "capture_mode",
+            "token_level_metrics_available",
+            "harness_id",
+            "codex_model",
+            "reasoning_effort",
+            "task_network_allow_internet",
+        },
     )
-    for target_id, values in allowed_concrete.items():
-        if (
-            not isinstance(values, list)
-            or not values
-            or any(
-                not isinstance(value, str) or not value or value.strip() != value
-                for value in values
-            )
-            or values != sorted(set(values))
-        ):
-            raise EvidenceError(f"allowed concrete methods for {target_id} are invalid")
+    if execution != {
+        "mode": "codex_subscription_transcript",
+        "capture_mode": "transcript",
+        "token_level_metrics_available": False,
+        "harness_id": "codex",
+        "codex_model": "gpt-5.3-codex-spark",
+        "reasoning_effort": "high",
+        "task_network_allow_internet": True,
+    }:
+        raise EvidenceError("project execution is not the release Subscription profile")
+    methods = _exact_mapping(project["selected_methods"], "selected methods", set(TARGETS))
     if (
-        project["execution_mode"] != "codex_subscription_transcript"
-        or project["capture_mode"] != "transcript"
-        or project["token_level_metrics_available"] is not False
-        or project["codex_model"] != "gpt-5.3-codex-spark"
-        or project["reasoning_effort"] != "high"
-        or project["target_ids"] != list(TARGETS)
-        or project["initial_zero_target_activation_verified"] is not True
-        or method_ids["agent_system"] != "auto"
+        project["target_ids"] != list(TARGETS)
+        or methods["agent_system"] != "auto"
+        or any(not isinstance(methods[target], str) or not methods[target] for target in TARGETS)
+        or project["registry_sha256"] != registry_sha256
+        or not isinstance(project["validation_check_counts"], list)
+        or len(project["validation_check_counts"]) != 2
         or any(
-            allowed_concrete[target_id] != [method_ids[target_id]]
-            for target_id in ("skill_bundle", "text_memory")
-        )
-        or any(
-            not isinstance(value, str) or not value or value.strip() != value
-            for value in method_ids.values()
+            not isinstance(value, int) or isinstance(value, bool) or value < 1
+            for value in project["validation_check_counts"]
         )
     ):
-        raise EvidenceError("real-science project profile is not the release profile")
+        raise EvidenceError("project registry validation or target selection is incomplete")
+    initial_head = _project_head(project["initial_project_head"], "initial Project Head")
+    active_head = _project_head(project["active_project_head"], "active Project Head")
+    if (
+        initial_head["generation"] != 0
+        or initial_head["predecessor_project_head_id_sha256"] is not None
+        or _mapping(initial_head["evolution_revision"], "initial revision")["artifact_count"] != 0
+        or active_head["generation"] != 2
+        or _mapping(active_head["evolution_revision"], "active revision")["artifact_count"] != 3
+    ):
+        raise EvidenceError("Project Head generation or output count is invalid")
 
-    session_values = document["sessions"]
-    if not isinstance(session_values, list) or len(session_values) != 2:
-        raise EvidenceError("real-science evidence does not contain two sessions")
-    sessions = [
-        _session(value, ordinal=ordinal) for ordinal, value in enumerate(session_values, 1)
-    ]
-    first, second = sessions
-    if first["run_id_sha256"] == second["run_id_sha256"]:
-        raise EvidenceError("real-science sessions do not have distinct run identities")
-    for session in sessions:
-        for target_id, artifact in session["artifacts_by_target"].items():
-            if artifact["method_id"] not in allowed_concrete[target_id]:
-                raise EvidenceError(
-                    "artifact method is not bound to the remote capability selection"
-                )
-    if second["pinned_revision"] != first["produced_revision"]:
-        raise EvidenceError("session 2 did not pin session 1's successor")
-    for target_id in TARGETS:
-        first_artifact = first["artifacts_by_target"][target_id]
-        second_artifact = second["artifacts_by_target"][target_id]
-        if first_artifact["artifact_id_sha256"] == second_artifact["artifact_id_sha256"]:
-            raise EvidenceError("successive sessions reused an output artifact identity")
-        if (
-            first_artifact["artifact_id_sha256"]
-            not in second_artifact["source_artifact_ids_sha256"]
-        ):
-            raise EvidenceError("session 2 lineage is not bound to session 1 artifacts")
+    task_values = document["tasks"]
+    if not isinstance(task_values, list) or len(task_values) != 2:
+        raise EvidenceError("exactly two Tasks are required")
+    first = _task(task_values[0], ordinal=1)
+    second = _task(task_values[1], ordinal=2)
+    first_predecessor = _mapping(first["predecessor_project_head"], "Task 1 predecessor")
+    first_context = _mapping(first["context_project_head"], "Task 1 context")
+    first_successor = _mapping(first["successor_project_head"], "Task 1 successor")
+    second_predecessor = _mapping(second["predecessor_project_head"], "Task 2 predecessor")
+    second_context = _mapping(second["context_project_head"], "Task 2 context")
+    second_successor = _mapping(second["successor_project_head"], "Task 2 successor")
+    if (
+        first_predecessor != initial_head
+        or first_context != initial_head
+        or first_successor["generation"] != 1
+        or first_successor["predecessor_project_head_id_sha256"]
+        != initial_head["project_head_id_sha256"]
+        or _mapping(first_successor["evolution_revision"], "Task 1 revision")["artifact_count"] != 3
+        or second_predecessor != first_successor
+        or second_context != first_successor
+        or second_successor != active_head
+        or second_successor["predecessor_project_head_id_sha256"]
+        != first_successor["project_head_id_sha256"]
+        or _mapping(second_successor["evolution_revision"], "Task 2 revision")["artifact_count"] != 3
+    ):
+        raise EvidenceError("two-Task Project Head and Runtime Context reuse relation is invalid")
+    identity_keys = (
+        "task_id_sha256",
+        "task_admission_id_sha256",
+        "authoritative_attempt_id_sha256",
+        "transition_id_sha256",
+    )
+    if any(first[key] == second[key] for key in identity_keys):
+        raise EvidenceError("Task identities were reused")
 
     reuse = _exact_mapping(
         document["reuse"],
         "reuse evidence",
         {
-            "successor_generation_delta",
-            "followup_admitted_after_successor_active",
-            "session_1_excluded_own_successor",
-            "session_2_pinned_session_1_successor",
-            "session_1_artifacts_reused",
-            "session_2_runtime_injection_verified",
-            "session_2_lineage_verified",
-            "runtime_context_receipt_sha256",
-            "reused_artifact_count",
-            "successor_project_head",
+            "first_context_excluded_own_successor",
+            "second_admission_pinned_first_successor",
+            "second_context_pinned_first_successor",
+            "second_runtime_context_equals_first_successor",
         },
     )
-    required_reuse: dict[str, object] = {
-        "successor_generation_delta": 1,
-        "followup_admitted_after_successor_active": True,
-        "session_1_excluded_own_successor": True,
-        "session_2_pinned_session_1_successor": True,
-        "session_1_artifacts_reused": True,
-        "session_2_runtime_injection_verified": True,
-        "session_2_lineage_verified": True,
-        "reused_artifact_count": 3,
-    }
-    if any(reuse.get(key) != value for key, value in required_reuse.items()):
-        raise EvidenceError("cross-session reuse evidence is incomplete")
-    successor_revision = _revision(reuse["successor_project_head"], "reuse successor")
-    if (
-        successor_revision != first["produced_revision"]
-        or reuse["runtime_context_receipt_sha256"] != second["runtime_context_receipt_sha256"]
-    ):
-        raise EvidenceError("cross-session reuse identities are inconsistent")
+    if any(value is not True for value in reuse.values()):
+        raise EvidenceError("next-Task Runtime Context reuse was not proven")
 
     renderer = _exact_mapping(
         document["renderer"],
-        "renderer result",
+        "renderer evidence",
         {
             "schema_version",
             "kind",
@@ -958,117 +908,73 @@ def validate_evidence(
             "provider_kind",
             "source_commit",
             "packaged_web_build_digest",
+            "desktop_api_major",
             "renderer_ready",
             "builtin_sample_count",
             "project_id_sha256",
-            "session_count",
-            "timeline",
-            "logs",
-            "project_head_generation",
-            "independent_target_controls_verified",
-            "remote_method_selection_verified",
-            "artifacts",
+            "task_count",
+            "task_id_sha256",
+            "active_project_head_generation",
+            "evolution_artifact_count",
+            "system_openssh_workspace_verified",
+            "remote_target_controls_verified",
+            "selected_methods",
+            "observed_route_kinds",
             "screenshot_sha256",
         },
     )
-    _sha256(renderer["screenshot_sha256"], "renderer screenshot")
     if (
-        renderer["schema_version"] != "1"
+        renderer["schema_version"] != "2"
         or renderer["kind"] != "openevo_desktop_live_renderer_observability"
         or renderer["outcome"] != "passed"
         or renderer["provider_kind"] != "desktop_sidecar"
         or renderer["source_commit"] != expected_source_commit
-        or renderer["packaged_web_build_digest"] != binding["packaged_web_build_digest"]
+        or renderer["packaged_web_build_digest"] != build_digest
+        or renderer["desktop_api_major"] != 2
         or renderer["renderer_ready"] is not True
         or renderer["builtin_sample_count"] != 2
-        or renderer["independent_target_controls_verified"] is not True
-        or renderer["remote_method_selection_verified"] is not True
-        or renderer["project_id_sha256"] != project["project_id_sha256"]
-        or renderer["session_count"] != 2
-        or renderer["project_head_generation"] != second["produced_revision"]["generation"]
+        or renderer["project_id_sha256"] != project_id_sha256
+        or renderer["task_count"] != 2
+        or renderer["task_id_sha256"]
+        != [first["task_id_sha256"], second["task_id_sha256"]]
+        or renderer["active_project_head_generation"] != 2
+        or renderer["evolution_artifact_count"] != 3
+        or renderer["system_openssh_workspace_verified"] is not True
+        or renderer["remote_target_controls_verified"] is not True
+        or renderer["selected_methods"] != methods
+        or renderer["observed_route_kinds"] != ["desktop_v2", "packaged_web"]
     ):
-        raise EvidenceError("renderer result is not bound to the completed workflow")
-    renderer_timeline = _exact_mapping(
-        renderer["timeline"], "renderer timeline", {"count", "phase_values"}
-    )
-    expected_phase_values = {
-        phase for session in sessions for phase in session["timeline"]["phase_values"]
-    }
+        raise EvidenceError("packaged renderer v2 observation is incomplete")
+    _sha256(renderer["screenshot_sha256"], "renderer screenshot")
     if (
-        renderer_timeline["count"]
-        != sum(int(session["timeline"]["count"]) for session in sessions)
-        or not isinstance(renderer_timeline["phase_values"], list)
-        or set(renderer_timeline["phase_values"]) != expected_phase_values
-        or len(renderer_timeline["phase_values"]) != len(expected_phase_values)
+        document["renderer_observability_verified"] is not True
+        or document["renderer_boundary"] != "packaged_web_to_live_desktop_v2"
+        or document["candidate_tauri_launch_verified"] is not True
     ):
-        raise EvidenceError("renderer timeline does not match both sessions")
-    renderer_logs = _exact_mapping(renderer["logs"], "renderer logs", {"count"})
-    if (
-        not isinstance(renderer_logs["count"], int)
-        or isinstance(renderer_logs["count"], bool)
-        or renderer_logs["count"] < second["logs"]["count"]
-    ):
-        raise EvidenceError("renderer logs do not include the latest session")
-    renderer_artifacts = renderer["artifacts"]
-    if not isinstance(renderer_artifacts, list) or len(renderer_artifacts) != len(TARGETS):
-        raise EvidenceError("renderer did not observe all release evolution targets")
-    observed_renderer_targets: set[str] = set()
-    for value in renderer_artifacts:
-        item = _exact_mapping(
-            value,
-            "renderer artifact",
-            {
-                "artifact_id_sha256",
-                "artifact_type",
-                "target_id",
-                "document_count",
-                "total_utf8_bytes",
-                "content_sha256",
-                "runtime_document_sha256",
-            },
-        )
-        target_id = item["target_id"]
-        if not isinstance(target_id, str) or target_id not in TARGETS:
-            raise EvidenceError("renderer artifact target is invalid")
-        expected_artifact = second["artifacts_by_target"][target_id]
-        expected_inspection = second["inspections"][target_id]
-        if (
-            target_id in observed_renderer_targets
-            or item["artifact_type"] != target_id
-            or item["artifact_id_sha256"] != expected_artifact["artifact_id_sha256"]
-            or item["content_sha256"] != expected_artifact["content_sha256"]
-            or item["document_count"] != expected_inspection["document_count"]
-            or item["total_utf8_bytes"] != expected_inspection["total_utf8_bytes"]
-            or item["runtime_document_sha256"] != expected_inspection["runtime_document_sha256"]
-        ):
-            raise EvidenceError("renderer artifact does not match session 2")
-        observed_renderer_targets.add(target_id)
-    if observed_renderer_targets != set(TARGETS):
-        raise EvidenceError("renderer artifact targets are incomplete")
+        raise EvidenceError("candidate renderer/native boundary was not verified")
 
     cleanup = _exact_mapping(
         document["cleanup"],
         "cleanup evidence",
         {
-            "active_run_cleanup_required",
-            "active_run_cancel_requested",
-            "active_run_cancelled",
-            "active_run_cleanup_succeeded",
+            "active_task_cleanup_required",
+            "active_task_cancel_requested",
+            "active_task_terminal",
+            "active_task_cleanup_succeeded",
             "desktop_disconnect_succeeded",
             "sidecar_shutdown_succeeded",
             "core_ownership_release_requested",
         },
     )
-    expected_cleanup = {
-        "active_run_cleanup_required": False,
-        "active_run_cancel_requested": False,
-        "active_run_cancelled": False,
-        "active_run_cleanup_succeeded": True,
+    if cleanup != {
+        "active_task_cleanup_required": False,
+        "active_task_cancel_requested": False,
+        "active_task_terminal": True,
+        "active_task_cleanup_succeeded": True,
         "desktop_disconnect_succeeded": True,
         "sidecar_shutdown_succeeded": True,
         "core_ownership_release_requested": True,
-    }
-    if cleanup != expected_cleanup:
+    }:
         raise EvidenceError("real-science ownership cleanup is incomplete")
     return document
 
@@ -1098,7 +1004,7 @@ def main(argv: list[str] | None = None) -> int:
     except EvidenceError as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(f"OpenEvo Desktop real-science evidence passed: {args.evidence}")
+    print(f"OpenEvo Desktop v2 real-science evidence passed: {args.evidence}")
     return 0
 
 

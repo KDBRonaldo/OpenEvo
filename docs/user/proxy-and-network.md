@@ -1,41 +1,40 @@
 # Proxy And Network Settings
 
-The Preview's server profile supports remote HTTP proxy, HTTPS proxy, and
-bypass-list settings. Configure them in **Remote workspace > Network proxy**
-before connecting or activating a project.
+OpenEvo Desktop 0.1.9 delegates SSH routing to the Mac user's system OpenSSH
+configuration. Configure SSH jump hosts or proxy commands in `~/.ssh/config`,
+then select that literal alias in Desktop.
 
-## Supported Values
+Examples:
 
-- **HTTP proxy** and **HTTPS proxy** must be an `http://` or `https://` origin
-  with a host and optional port.
-- Do not include a user name, password, path, query, or fragment in a proxy URL.
-- **Bypass proxy for** is a comma-separated host list. Desktop preserves the
-  required loopback exclusions used by local Daemon services.
-
-Example:
-
-```text
-HTTP proxy:  http://proxy.example.org:8080
-HTTPS proxy: http://proxy.example.org:8080
-Bypass:      localhost, 127.0.0.1, research.internal
+```sshconfig
+Host my-openevo-server
+    HostName server.internal
+    User research-user
+    ProxyJump bastion.example.org
 ```
 
-These settings describe networking on the remote Linux server. They apply to
-supported OpenEvo-managed preparation and services; they do not reconfigure the
-Mac, the SSH server, Docker daemon policy, or a pre-existing interactive shell.
+or, where required by institutional policy:
 
-## Preview Limitations
+```sshconfig
+Host my-openevo-server
+    HostName server.internal
+    User research-user
+    ProxyCommand /usr/bin/nc -X connect -x proxy.example.org:8080 %h %p
+```
 
-The first Preview does not provide proxy credential fields, SSH jump-host
-configuration, custom package indexes, Hugging Face endpoints, or container
-registry mirror controls in the user interface. A proxy URL containing user
-information is rejected instead of sending those credentials.
+System `/usr/bin/ssh <alias>` remains authoritative for these values. OpenEvo
+does not copy or flatten them and does not provide a separate IP/user/port or
+SSH proxy form.
 
-OpenEvo does not bypass institutional network policy. The remote server still
-needs access to the Codex subscription service during a run. If Docker itself
-needs a proxy or registry configuration, the server administrator must
-configure that outside OpenEvo before activation.
+## Remote HTTPS And Container Networking
 
-After changing a profile's proxy settings, save it and reconnect. A failed
-operation reports the phase and a typed next action; use that action instead of
-repeatedly changing unrelated settings.
+The remote server still needs outbound access required by Codex Subscription,
+Daemon preparation, and the managed runtime. v0.1.9 does not expose remote
+HTTP/HTTPS proxy credentials or Docker registry-mirror settings in the Desktop
+v2 project/profile UI. If the environment needs them, the server administrator
+must configure the supported host/runtime policy before connection.
+
+Do not place proxy credentials in an SSH alias, Task objective, or Desktop
+diagnostics. OpenEvo does not bypass institutional policy and does not modify
+the Mac network stack, SSH server, Docker daemon, global shell profiles, custom
+package indexes, or container registry configuration.

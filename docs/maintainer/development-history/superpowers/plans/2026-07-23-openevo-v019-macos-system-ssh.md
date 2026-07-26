@@ -878,6 +878,9 @@ The exact broader gate is added in Task 18 after every slice is present.
 - Modify: `tests/ci/test_desktop_real_science_e2e.py`
 - Modify: `tests/ci/test_validate_desktop_real_science_e2e.py`
 - Modify: `desktop/tests/product-browser/release-live-observability.pw.ts`
+- Modify: `desktop/src/product/localApiProviderV2.ts`
+- Modify: `desktop/src/product/localApiProviderV2.test.ts`
+- Modify: `desktop/src/product/README.md`
 - Modify: `desktop/tests/product-browser/release-live-capture.test.ts` only if
   the v2 live-capture boundary requires it
 - Modify: `tests/ci/test_check_openevo_release.py`
@@ -911,10 +914,18 @@ The exact broader gate is added in Task 18 after every slice is present.
   `agent_system:auto`, validate against the exact registry, and run two real
   `gpt-5.3-codex-spark` high-effort Subscription Tasks with transcript capture.
 - [ ] For each Task, verify the closed admission, Attempt, Task Context,
-  timeline, logs, artifact metadata/content digests, and committed successor.
-  Prove Task 1 consumes generation 0 and publishes generation 1, then Task 2
-  consumes that exact generation-1 Runtime Context Snapshot and publishes
-  generation 2. Do not infer success from SSH or a process exit.
+  authoritative v2 lifecycle timeline, committed successor, and Evolution
+  Revision output count. Prove Task 1 consumes generation 0 and publishes
+  generation 1 with all three configured target outputs, then Task 2 consumes
+  that exact generation-1 Runtime Context Snapshot and publishes generation 2.
+  Do not infer success from SSH or a process exit, and do not claim task-log or
+  artifact-content proof before those Core v2 read operations are implemented.
+- [ ] Keep ordinary renderer refresh on implemented v2 operations: completed
+  Tasks must remain visible without probing the currently unavailable task
+  artifact collection or falling back to SSH/v1. For v0.1.9, expose the
+  authoritative successor Evolution Revision artifact count and target
+  controls; retain the closed artifact model for a later verified Core v2 read
+  implementation.
 - [ ] Replace the live packaged-renderer proof with a v2-only observation of
   the exact active project, system-OpenSSH workspace, both Tasks, Project Head,
   Evolution Revision, Runtime Context, Effective Execution, and the three

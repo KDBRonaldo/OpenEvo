@@ -1,19 +1,30 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import sys
 from types import ModuleType
+from typing import Mapping
 
 import pytest
 
 
 TARGETS = ("agent_system", "skill_bundle", "text_memory")
-PHASES = tuple(
-    sorted(("admission", "execution", "evolution", "preparation", "revision", "terminal"))
+EVENT_TYPES = sorted(
+    {
+        "task_admitted",
+        "attempt_appended",
+        "dataset_sealed",
+        "evolution_revision_committed",
+        "runtime_context_committed",
+        "project_head_activated",
+        "transition_changed",
+    }
 )
+SOURCE = "1" * 40
 
 
 def _load_validator() -> ModuleType:
@@ -30,20 +41,30 @@ def _digest(label: str) -> str:
     return hashlib.sha256(label.encode("utf-8")).hexdigest()
 
 
+def _canonical_bytes(value: object) -> bytes:
+    return (
+        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode("utf-8")
+
+
 def _app_bundle_smoke() -> dict[str, object]:
     return {
         "schema_version": 3,
-        "launch_origin": "mounted_dmg",
-        "source_dmg": {
-            "filename": "OpenEvo-Desktop-0.1.4-aarch64.dmg",
-            "sha256": _digest("desktop_dmg"),
-        },
+        "native_executable": "OpenEvo Desktop",
         "bundled_external_bin": "openevo-desktop-sidecar",
+        "renderer_ready": True,
         "sidecar_ready": True,
         "bundled_external_bin_resolved": True,
         "native_listener_fd_handoff": True,
         "native_executable_fd_handoff": True,
         "process_group_cleanup": True,
+        "mach_o": {},
+        "launch_origin": "mounted_dmg",
+        "source_dmg": {
+            "filename": "OpenEvo-Desktop-0.1.9-aarch64.dmg",
+            "sha256": _digest("desktop_dmg"),
+        },
         "binary_sha256": {
             "native_executable": _digest("candidate-native"),
             "bundled_external_bin": _digest("candidate-sidecar"),
@@ -51,28 +72,22 @@ def _app_bundle_smoke() -> dict[str, object]:
     }
 
 
-def _canonical_bytes(value: object) -> bytes:
-    return (
-        json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
-    ).encode("utf-8")
-
-
-def _candidate(source: str) -> dict[str, object]:
-    app_smoke = _canonical_bytes(_app_bundle_smoke())
+def _candidate() -> tuple[dict[str, object], bytes]:
+    smoke_bytes = _canonical_bytes(_app_bundle_smoke())
     files = [
-        ("core_wheel", "openevo-0.1.4-py3-none-any.whl", 1001),
+        ("core_wheel", "openevo-0.1.9-py3-none-any.whl", 1001),
         ("framework_lock", "framework-lock.json", 1002),
         ("daemon_bundle", "openevo-daemon-linux-x86_64", 1003),
         ("daemon_manifest", "openevo-daemon-bundle.json", 1004),
-        ("desktop_dmg", "OpenEvo-Desktop-0.1.4-aarch64.dmg", 1005),
+        ("desktop_dmg", "OpenEvo-Desktop-0.1.9-aarch64.dmg", 1005),
         ("packaged_web_manifest", "packaged-web-manifest.json", 1006),
         ("playwright_evidence", "playwright-candidate-evidence.json", 1007),
-        ("app_bundle_smoke", "app-bundle-smoke.json", len(app_smoke)),
+        ("app_bundle_smoke", "app-bundle-smoke.json", len(smoke_bytes)),
     ]
-    return {
+    candidate = {
         "schema_version": 9,
-        "source_commit": source,
-        "version": "0.1.4",
+        "source_commit": SOURCE,
+        "version": "0.1.9",
         "release": {
             "app_bundle_signature": "adhoc",
             "channel": "unsigned-preview",
@@ -85,17 +100,21 @@ def _candidate(source: str) -> dict[str, object]:
             "notarized": False,
             "quarantine_removal_tested": True,
         },
-        "files": [
-            {
-                "role": role,
-                "filename": filename,
-                "sha256": hashlib.sha256(app_smoke).hexdigest()
-                if role == "app_bundle_smoke"
-                else _digest(role),
-                "byte_size": size,
-            }
-            for role, filename, size in files
-        ],
+        "macos": {
+            "architecture": "aarch64",
+            "minimum_system_version": "12.0",
+            "native_architectures": {},
+            "rust_target": "aarch64-apple-darwin",
+            "rust_toolchain": "1.88.0",
+            "ssh_askpass_helper": {
+                "architecture": "arm64",
+                "byte_size": 88,
+                "mode": "0755",
+                "relative_path": "Contents/MacOS/openevo-ssh-askpass",
+                "sha256": _digest("candidate-helper"),
+                "signature": "adhoc",
+            },
+        },
         "managed_runtime": {
             "archive": {
                 "filename": "openevo-science-runtime.tar.gz",
@@ -103,469 +122,368 @@ def _candidate(source: str) -> dict[str, object]:
                 "byte_size": 1008,
             }
         },
+        "core": {},
+        "daemon": {},
+        "files": [
+            {
+                "role": role,
+                "filename": filename,
+                "sha256": hashlib.sha256(smoke_bytes).hexdigest()
+                if role == "app_bundle_smoke"
+                else _digest(role),
+                "byte_size": size,
+            }
+            for role, filename, size in files
+        ],
     }
+    return candidate, smoke_bytes
 
 
-def _revision(label: str, generation: int) -> dict[str, object]:
+def _head(label: str, generation: int, predecessor: str | None, artifact_count: int) -> dict[str, object]:
     return {
-        "id_sha256": _digest(f"{label}-id"),
+        "project_head_id_sha256": _digest(f"{label}-head"),
         "generation": generation,
-        "manifest_sha256": _digest(f"{label}-manifest"),
-    }
-
-
-def _artifact(target: str, ordinal: int, produced: dict[str, object]) -> dict[str, object]:
-    return {
-        "artifact_id_sha256": _digest(f"artifact-{ordinal}-{target}"),
-        "artifact_type": target,
-        "target_id": target,
-        "method_id": (
-            "method_agent_system_concrete" if target == "agent_system" else f"method_{target}"
-        ),
-        "content_sha256": _digest(f"content-{ordinal}-{target}"),
-        "byte_size": 100 + ordinal,
-        "selected": True,
-        "promoted": target != "skill_bundle",
-        "release_enabled": True,
-        "source_artifact_count": 0 if ordinal == 1 else 1,
-        "source_artifact_ids_sha256": [] if ordinal == 1 else [_digest(f"artifact-1-{target}")],
-        "source_dataset_count": 1,
-        "produced_revision": produced,
-    }
-
-
-def _session(
-    ordinal: int,
-    pinned: dict[str, object],
-    produced: dict[str, object],
-) -> dict[str, object]:
-    artifacts = [_artifact(target, ordinal, produced) for target in TARGETS]
-    inspections = {
-        target: {
-            "artifact_id_sha256": artifact["artifact_id_sha256"],
-            "document_count": 1,
-            "total_documents": 1,
-            "total_utf8_bytes": 50 + ordinal,
-            "truncated": False,
-            "runtime_document_sha256": _digest(f"runtime-{ordinal}-{target}"),
-        }
-        for target, artifact in zip(TARGETS, artifacts, strict=True)
-    }
-    return {
-        "ordinal": ordinal,
-        "run_id_sha256": _digest(f"run-{ordinal}"),
-        "status": "succeeded",
-        "required_relation": "active",
-        "required_revision": pinned,
-        "pinned_revision": pinned,
-        "timeline": {
-            "count": len(PHASES),
-            "content_sha256": [_digest(f"timeline-{ordinal}-{index}") for index in range(6)],
-            "evidence_truncated": False,
-            "phase_values": list(PHASES),
-            "status_values": ["succeeded"],
+        "predecessor_project_head_id_sha256": predecessor,
+        "manifest_sha256": _digest(f"{label}-head-manifest"),
+        "workspace_snapshot": {
+            "workspace_snapshot_id_sha256": _digest(f"{label}-workspace"),
+            "manifest_sha256": _digest(f"{label}-workspace-manifest"),
+            "entry_count": generation,
+            "byte_size": generation * 10,
         },
-        "logs": {
-            "count": 2,
-            "content_sha256": [_digest(f"log-{ordinal}-{index}") for index in range(2)],
-            "evidence_truncated": False,
-            "stream_values": ["stderr", "stdout"],
-            "level_values": ["info"],
+        "evolution_revision": {
+            "evolution_revision_id_sha256": _digest(f"{label}-evolution"),
+            "manifest_sha256": _digest(f"{label}-evolution-manifest"),
+            "artifact_count": artifact_count,
         },
-        "artifacts": artifacts,
-        "artifact_count": 3,
-        "artifact_evidence_truncated": False,
-        "artifact_inspections": inspections,
-        "runtime_context_receipt_sha256": None
-        if ordinal == 1
-        else _digest("runtime-context-receipt"),
-        "runtime_context_receipt_core_provenance_verified": ordinal == 2,
-        "context": {
-            "status": "succeeded",
+        "runtime_context_snapshot": {
+            "runtime_context_snapshot_id_sha256": _digest(f"{label}-context"),
+            "manifest_sha256": _digest(f"{label}-context-manifest"),
+            "runtime_contract_sha256": _digest(f"{label}-runtime-contract"),
+            "registry_sha256": _digest("registry"),
+        },
+        "effective_execution_snapshot": {
+            "effective_execution_snapshot_id_sha256": _digest(f"{label}-execution"),
+            "snapshot_sha256": _digest(f"{label}-execution-snapshot"),
+            "producer_id_sha256": _digest(f"{label}-producer"),
+            "mode": "codex_subscription_transcript",
             "capture_mode": "transcript",
             "token_level_metrics_available": False,
-            "artifact_count": 0 if ordinal == 1 else 3,
-            "adapter_count": 0,
         },
-        "transcript_dataset_lineage_observed": True,
     }
 
 
-def _payload(
-    source: str,
-    candidate: dict[str, object],
-    candidate_manifest_sha256: str,
-) -> dict[str, object]:
+def _task(ordinal: int, predecessor: dict[str, object], successor: dict[str, object]) -> dict[str, object]:
+    return {
+        "ordinal": ordinal,
+        "task_id_sha256": _digest(f"task-{ordinal}"),
+        "state": "completed",
+        "task_admission_id_sha256": _digest(f"admission-id-{ordinal}"),
+        "admission_sha256": _digest(f"admission-{ordinal}"),
+        "authoritative_attempt_id_sha256": _digest(f"attempt-{ordinal}"),
+        "attempt_count": 1,
+        "predecessor_project_head": predecessor,
+        "context_project_head": predecessor,
+        "successor_project_head": successor,
+        "transition_id_sha256": _digest(f"transition-{ordinal}"),
+        "transition_state": "committed",
+        "timeline_event_types": EVENT_TYPES,
+        "timeline_event_count": len(EVENT_TYPES),
+    }
+
+
+def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str, object]:
     roles = {item["role"]: item for item in candidate["files"]}  # type: ignore[index]
     runtime = candidate["managed_runtime"]["archive"]  # type: ignore[index]
-    revision_0 = _revision("revision-0", 0)
-    revision_1 = _revision("revision-1", 1)
-    revision_2 = _revision("revision-2", 2)
-    sessions = [
-        _session(1, revision_0, revision_1),
-        _session(2, revision_1, revision_2),
-    ]
-    latest = sessions[1]
-    latest_artifacts = {
-        artifact["target_id"]: artifact
-        for artifact in latest["artifacts"]  # type: ignore[index]
+    helper = candidate["macos"]["ssh_askpass_helper"]  # type: ignore[index]
+    head0 = _head("head-0", 0, None, 0)
+    head1 = _head("head-1", 1, head0["project_head_id_sha256"], 3)  # type: ignore[arg-type]
+    head2 = _head("head-2", 2, head1["project_head_id_sha256"], 3)  # type: ignore[arg-type]
+    methods = {
+        "agent_system": "auto",
+        "skill_bundle": "reference_skill_bundle",
+        "text_memory": "reference_text_memory",
     }
-    latest_inspections = latest["artifact_inspections"]  # type: ignore[assignment]
+    release_contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))["v019"]
+    features = release_contract["required_desktop_feature_flags"]
+    feature_digest = hashlib.sha256(
+        json.dumps(features, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
+    ).hexdigest()
     return {
-        "schema_version": "1",
+        "schema_version": "2",
         "kind": "openevo_desktop_real_science_e2e",
         "issue": 163,
         "real_process_boundary": True,
         "outcome": "passed",
-        "started_at": "2026-07-20T01:00:00Z",
+        "started_at": "2026-07-26T01:00:00Z",
         "release_assets": {
-            "sidecar": {"sha256": _digest("sidecar"), "byte_size": 1000},
+            "sidecar": {"sha256": _digest("candidate-sidecar"), "byte_size": 9001},
+            "ssh_askpass_helper": {"sha256": helper["sha256"], "byte_size": helper["byte_size"]},
             "core_wheel": {
                 "sha256": roles["core_wheel"]["sha256"],
                 "byte_size": roles["core_wheel"]["byte_size"],
                 "filename": roles["core_wheel"]["filename"],
                 "distribution": "openevo",
-                "version": "0.1.4",
+                "version": "0.1.9",
             },
             "framework_lock": {
                 "sha256": roles["framework_lock"]["sha256"],
                 "byte_size": roles["framework_lock"]["byte_size"],
                 "distribution_digest": roles["core_wheel"]["sha256"],
             },
-            "managed_runtime_archive": {
-                "sha256": runtime["sha256"],
-                "byte_size": runtime["byte_size"],
-            },
-            "daemon_bundle": {
-                "sha256": roles["daemon_bundle"]["sha256"],
-                "byte_size": roles["daemon_bundle"]["byte_size"],
-            },
-            "daemon_manifest": {
-                "sha256": roles["daemon_manifest"]["sha256"],
-                "byte_size": roles["daemon_manifest"]["byte_size"],
-            },
+            "managed_runtime_archive": {"sha256": runtime["sha256"], "byte_size": runtime["byte_size"]},
+            "daemon_bundle": {"sha256": roles["daemon_bundle"]["sha256"], "byte_size": roles["daemon_bundle"]["byte_size"]},
+            "daemon_manifest": {"sha256": roles["daemon_manifest"]["sha256"], "byte_size": roles["daemon_manifest"]["byte_size"]},
             "external_release_assets": {
-                "source_commit": source,
+                "source_commit": SOURCE,
                 "registry_digest": _digest("registry"),
-                "manifest_sha256": _digest("release-assets-manifest"),
-                "byte_size": 2048,
+                "manifest_sha256": _digest("external-manifest"),
+                "byte_size": 333,
             },
             "exact_external_release_assets_verified": True,
             "slim_sidecar_excludes_remote_release_assets_verified": True,
         },
         "renderer_candidate_binding": {
-            "source_commit": source,
-            "candidate_version": "0.1.4",
-            "release_candidate_manifest_sha256": candidate_manifest_sha256,
+            "source_commit": SOURCE,
+            "candidate_version": "0.1.9",
+            "release_candidate_manifest_sha256": candidate_digest,
             "desktop_dmg_sha256": roles["desktop_dmg"]["sha256"],
             "app_bundle_smoke_sha256": roles["app_bundle_smoke"]["sha256"],
             "candidate_packaged_sidecar_sha256": _digest("candidate-sidecar"),
-            "science_sidecar_sha256": _digest("sidecar"),
+            "candidate_ssh_askpass_helper_sha256": helper["sha256"],
             "candidate_native_sidecar_smoke_verified": True,
-            "cross_platform_source_equivalent_verified": True,
+            "exact_candidate_packaged_sidecar_verified": True,
+            "exact_candidate_ssh_askpass_helper_verified": True,
             "packaged_web_manifest_sha256": roles["packaged_web_manifest"]["sha256"],
             "playwright_candidate_evidence_sha256": roles["playwright_evidence"]["sha256"],
             "packaged_web_build_digest": _digest("packaged-web-build"),
             "source_checkout_verified": True,
         },
         "desktop": {
-            "source_commit": source,
-            "build_version": "0.1.4",
-            "openapi_sha256": _digest("openapi"),
+            "source_commit": SOURCE,
+            "release_version": "0.1.9",
+            "mutation_major": 2,
+            "openapi_sha256": release_contract["accepted_desktop_openapi_digests"][0],
+            "event_schema_sha256": release_contract["accepted_desktop_event_schema_digests"][0],
+            "build_id": _digest("build-id"),
             "provider_kind": "desktop_sidecar",
             "build_channel": "release",
-            "feature_flags": ["daemon_control_v1", "science_projects_v1"],
-            "legacy_route_rejected": True,
+            "feature_flags": features,
+            "feature_set_sha256": feature_digest,
+            "required_core_api_major": 2,
+            "mutation_compatible": True,
+            "v2_only_negotiation_verified": True,
             "authenticated_session_probe": True,
             "unauthenticated_session_rejected": True,
         },
-        "run_mode": "two_session_subscription_release",
+        "run_mode": "two_task_subscription_release",
         "verification_scope": [
-            "desktop_sidecar",
-            "ssh_bootstrap",
-            "daemon_core",
+            "exact_candidate_app_sidecar",
+            "system_openssh_remote_workspace",
+            "daemon_core_v2",
             "codex_subscription_transcript",
-            "cross_session_artifact_reuse",
-            "packaged_renderer_local_api_observability",
+            "atomic_successor_project_heads",
+            "next_task_runtime_context_reuse",
+            "packaged_renderer_v2_observability",
         ],
-        "session_count": 2,
-        "evolution_targets_enabled": True,
-        "artifact_publication_verified": True,
-        "cross_session_reuse_verified": True,
-        "release_evolution_path_verified": True,
-        "canonical_project_head_orchestration_verified": False,
-        "codex_subscription_transcript_verified": True,
+        "task_count": 2,
         "remote": {
-            "ssh_connection_verified": True,
-            "host_key_verified": True,
+            "connection_authority": "system_openssh",
+            "catalog_selection_verified": True,
+            "system_openssh_final_authority_verified": True,
+            "core_api_major": 2,
+            "core_registry_sha256": _digest("registry"),
         },
         "project": {
             "project_id_sha256": _digest("project"),
-            "execution_mode": "codex_subscription_transcript",
-            "capture_mode": "transcript",
-            "token_level_metrics_available": False,
-            "codex_model": "gpt-5.3-codex-spark",
-            "reasoning_effort": "high",
+            "execution": {
+                "mode": "codex_subscription_transcript",
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+                "harness_id": "codex",
+                "codex_model": "gpt-5.3-codex-spark",
+                "reasoning_effort": "high",
+                "task_network_allow_internet": True,
+            },
             "target_ids": list(TARGETS),
-            "method_ids": {
-                "agent_system": "auto",
-                "skill_bundle": "method_skill_bundle",
-                "text_memory": "method_text_memory",
-            },
-            "allowed_concrete_method_ids": {
-                "agent_system": ["method_agent_system_concrete"],
-                "skill_bundle": ["method_skill_bundle"],
-                "text_memory": ["method_text_memory"],
-            },
-            "initial_zero_target_activation_verified": True,
-            "registry_digest": _digest("registry"),
-            "validation_check_count": 3,
+            "selected_methods": methods,
+            "registry_sha256": _digest("registry"),
+            "validation_check_counts": [7, 7],
+            "initial_project_head": head0,
+            "active_project_head": head2,
         },
-        "sessions": sessions,
+        "tasks": [_task(1, head0, head1), _task(2, head1, head2)],
         "reuse": {
-            "successor_generation_delta": 1,
-            "followup_admitted_after_successor_active": True,
-            "session_1_excluded_own_successor": True,
-            "session_2_pinned_session_1_successor": True,
-            "session_1_artifacts_reused": True,
-            "session_2_runtime_injection_verified": True,
-            "session_2_lineage_verified": True,
-            "runtime_context_receipt_sha256": _digest("runtime-context-receipt"),
-            "reused_artifact_count": 3,
-            "successor_project_head": revision_1,
+            "first_context_excluded_own_successor": True,
+            "second_admission_pinned_first_successor": True,
+            "second_context_pinned_first_successor": True,
+            "second_runtime_context_equals_first_successor": True,
         },
         "renderer": {
-            "schema_version": "1",
+            "schema_version": "2",
             "kind": "openevo_desktop_live_renderer_observability",
             "outcome": "passed",
             "provider_kind": "desktop_sidecar",
-            "source_commit": source,
+            "source_commit": SOURCE,
             "packaged_web_build_digest": _digest("packaged-web-build"),
+            "desktop_api_major": 2,
             "renderer_ready": True,
             "builtin_sample_count": 2,
             "project_id_sha256": _digest("project"),
-            "session_count": 2,
-            "timeline": {"count": 12, "phase_values": list(PHASES)},
-            "logs": {"count": 2},
-            "project_head_generation": 2,
-            "independent_target_controls_verified": True,
-            "remote_method_selection_verified": True,
-            "artifacts": [
-                {
-                    "artifact_id_sha256": latest_artifacts[target]["artifact_id_sha256"],
-                    "artifact_type": target,
-                    "target_id": target,
-                    "document_count": latest_inspections[target]["document_count"],
-                    "total_utf8_bytes": latest_inspections[target]["total_utf8_bytes"],
-                    "content_sha256": latest_artifacts[target]["content_sha256"],
-                    "runtime_document_sha256": latest_inspections[target][
-                        "runtime_document_sha256"
-                    ],
-                }
-                for target in TARGETS
-            ],
+            "task_count": 2,
+            "task_id_sha256": [_digest("task-1"), _digest("task-2")],
+            "active_project_head_generation": 2,
+            "evolution_artifact_count": 3,
+            "system_openssh_workspace_verified": True,
+            "remote_target_controls_verified": True,
+            "selected_methods": methods,
+            "observed_route_kinds": ["desktop_v2", "packaged_web"],
             "screenshot_sha256": _digest("screenshot"),
         },
         "renderer_observability_verified": True,
-        "renderer_boundary": "packaged_web_to_live_local_api",
-        "native_tauri_live_verified": False,
+        "renderer_boundary": "packaged_web_to_live_desktop_v2",
+        "candidate_tauri_launch_verified": True,
         "cleanup": {
-            "active_run_cleanup_required": False,
-            "active_run_cancel_requested": False,
-            "active_run_cancelled": False,
-            "active_run_cleanup_succeeded": True,
+            "active_task_cleanup_required": False,
+            "active_task_cancel_requested": False,
+            "active_task_terminal": True,
+            "active_task_cleanup_succeeded": True,
             "desktop_disconnect_succeeded": True,
             "sidecar_shutdown_succeeded": True,
             "core_ownership_release_requested": True,
         },
-        "finished_at": "2026-07-20T02:00:00Z",
+        "finished_at": "2026-07-26T02:00:00Z",
     }
 
 
-def _write(module: ModuleType, path: Path, payload: object) -> str:
-    encoded = module._canonical_json(payload)
-    path.write_bytes(encoded)
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _fixture(
-    module: ModuleType,
-    tmp_path: Path,
-) -> tuple[Path, str, Path, Path, str, str]:
-    source = "b" * 40
-    candidate = _candidate(source)
+def _fixture(module: ModuleType, tmp_path: Path):
+    candidate, smoke_bytes = _candidate()
+    candidate_bytes = _canonical_bytes(candidate)
     candidate_path = tmp_path / "release-candidate.json"
-    candidate_digest = _write(module, candidate_path, candidate)
-    app_smoke = tmp_path / "app-bundle-smoke.json"
-    _write(module, app_smoke, _app_bundle_smoke())
-    evidence = tmp_path / "desktop-real-science-e2e.json"
-    evidence_digest = _write(module, evidence, _payload(source, candidate, candidate_digest))
-    return evidence, evidence_digest, candidate_path, app_smoke, candidate_digest, source
+    candidate_path.write_bytes(candidate_bytes)
+    smoke_path = tmp_path / "app-bundle-smoke.json"
+    smoke_path.write_bytes(smoke_bytes)
+    candidate_digest = hashlib.sha256(candidate_bytes).hexdigest()
+    payload = _payload(candidate, candidate_digest)
+    evidence_bytes = _canonical_bytes(payload)
+    evidence_path = tmp_path / "desktop-real-science-e2e.json"
+    evidence_path.write_bytes(evidence_bytes)
+    return {
+        "candidate": candidate,
+        "candidate_path": candidate_path,
+        "candidate_digest": candidate_digest,
+        "smoke_path": smoke_path,
+        "payload": payload,
+        "evidence_path": evidence_path,
+        "evidence_digest": hashlib.sha256(evidence_bytes).hexdigest(),
+    }
 
 
-def test_exact_candidate_two_session_evidence_passes(tmp_path: Path) -> None:
-    module = _load_validator()
-    evidence, digest, candidate, app_smoke, candidate_digest, source = _fixture(module, tmp_path)
-
-    validated = module.validate_evidence(
-        evidence,
-        candidate_manifest_path=candidate,
-        candidate_app_bundle_smoke_path=app_smoke,
-        expected_sha256=digest,
-        expected_source_commit=source,
-        expected_candidate_manifest_sha256=candidate_digest,
+def _validate(module: ModuleType, fixture: Mapping[str, object]) -> dict[str, object]:
+    return module.validate_evidence(
+        fixture["evidence_path"],
+        candidate_manifest_path=fixture["candidate_path"],
+        candidate_app_bundle_smoke_path=fixture["smoke_path"],
+        expected_sha256=fixture["evidence_digest"],
+        expected_source_commit=SOURCE,
+        expected_candidate_manifest_sha256=fixture["candidate_digest"],
     )
 
-    assert validated["outcome"] == "passed"
+
+def _rewrite_evidence(fixture: dict[str, object], payload: dict[str, object]) -> None:
+    content = _canonical_bytes(payload)
+    fixture["evidence_path"].write_bytes(content)  # type: ignore[union-attr]
+    fixture["evidence_digest"] = hashlib.sha256(content).hexdigest()
+
+
+def test_exact_candidate_two_task_v2_evidence_passes(tmp_path: Path) -> None:
+    module = _load_validator()
+    fixture = _fixture(module, tmp_path)
+
+    assert _validate(module, fixture)["outcome"] == "passed"
+
+
+def test_schema_v1_real_science_evidence_is_rejected(tmp_path: Path) -> None:
+    module = _load_validator()
+    fixture = _fixture(module, tmp_path)
+    payload = copy.deepcopy(fixture["payload"])
+    payload["schema_version"] = "1"
+    _rewrite_evidence(fixture, payload)
+
+    with pytest.raises(module.EvidenceError, match="schema"):
+        _validate(module, fixture)
 
 
 def test_candidate_unsigned_macos_policy_change_fails_closed(tmp_path: Path) -> None:
     module = _load_validator()
-    source = "b" * 40
-    candidate_payload = _candidate(source)
-    candidate_payload["release"]["macos_code_signing"]["hardened_runtime"] = True
-    candidate = tmp_path / "release-candidate.json"
-    candidate_digest = _write(module, candidate, candidate_payload)
+    fixture = _fixture(module, tmp_path)
+    candidate = copy.deepcopy(fixture["candidate"])
+    candidate["release"]["notarized"] = True
+    content = _canonical_bytes(candidate)
+    fixture["candidate_path"].write_bytes(content)
+    fixture["candidate_digest"] = hashlib.sha256(content).hexdigest()
 
     with pytest.raises(module.EvidenceError, match="signing policy"):
-        module._read_candidate_manifest(
-            candidate,
-            expected_sha256=candidate_digest,
-            expected_source_commit=source,
-        )
-
-
-def test_minimal_verdict_claim_fails_closed(tmp_path: Path) -> None:
-    module = _load_validator()
-    source = "b" * 40
-    candidate_payload = _candidate(source)
-    candidate = tmp_path / "release-candidate.json"
-    candidate_digest = _write(module, candidate, candidate_payload)
-    app_smoke = tmp_path / "app-bundle-smoke.json"
-    _write(module, app_smoke, _app_bundle_smoke())
-    evidence = tmp_path / "desktop-real-science-e2e.json"
-    digest = _write(
-        module,
-        evidence,
-        {
-            "schema_version": "1",
-            "kind": "openevo_desktop_real_science_e2e",
-            "outcome": "passed",
-            "cross_session_reuse_verified": True,
-        },
-    )
-
-    with pytest.raises(module.EvidenceError, match="closed schema"):
-        module.validate_evidence(
-            evidence,
-            candidate_manifest_path=candidate,
-            candidate_app_bundle_smoke_path=app_smoke,
-            expected_sha256=digest,
-            expected_source_commit=source,
-            expected_candidate_manifest_sha256=candidate_digest,
-        )
+        _validate(module, fixture)
 
 
 @pytest.mark.parametrize(
     ("path", "value"),
     [
-        (("cross_session_reuse_verified",), False),
-        (("release_assets", "exact_external_release_assets_verified"), False),
-        (
-            ("release_assets", "slim_sidecar_excludes_remote_release_assets_verified"),
-            False,
-        ),
-        (
-            ("release_assets", "external_release_assets", "source_commit"),
-            "f" * 40,
-        ),
-        (
-            ("release_assets", "external_release_assets", "registry_digest"),
-            _digest("wrong-registry"),
-        ),
-        (("renderer_candidate_binding", "source_checkout_verified"), False),
-        (
-            ("renderer_candidate_binding", "candidate_packaged_sidecar_sha256"),
-            _digest("wrong-candidate-sidecar"),
-        ),
-        (("reuse", "session_2_runtime_injection_verified"), False),
-        (("sessions", 1, "context", "artifact_count"), 0),
-        (("sessions", 1, "run_id_sha256"), _digest("run-1")),
-        (("sessions", 1, "artifacts", 0, "source_artifact_count"), 0),
-        (
-            ("sessions", 1, "artifacts", 0, "source_artifact_ids_sha256"),
-            [_digest("unrelated-artifact")],
-        ),
-        (
-            ("sessions", 1, "artifacts", 0, "artifact_id_sha256"),
-            _digest("artifact-1-agent_system"),
-        ),
-        (("renderer", "artifacts", 0, "content_sha256"), _digest("wrong")),
-        (("cleanup", "sidecar_shutdown_succeeded"), False),
+        (("reuse", "second_context_pinned_first_successor"), False),
+        (("remote", "connection_authority"), "manual"),
+        (("renderer", "desktop_api_major"), 1),
+        (("project", "selected_methods", "agent_system"), "concrete"),
+        (("tasks", 1, "predecessor_project_head", "generation"), 0),
+        (("project", "active_project_head", "evolution_revision", "artifact_count"), 2),
     ],
 )
-def test_incomplete_release_claim_fails_closed(
+def test_incomplete_v2_release_claim_fails_closed(
     tmp_path: Path,
-    path: tuple[str | int, ...],
+    path: tuple[object, ...],
     value: object,
 ) -> None:
     module = _load_validator()
-    evidence, _digest_value, candidate, app_smoke, candidate_digest, source = _fixture(
-        module, tmp_path
-    )
-    payload = json.loads(evidence.read_text(encoding="utf-8"))
-    cursor = payload
-    for key in path[:-1]:
-        cursor = cursor[key]
-    cursor[path[-1]] = value
-    digest = _write(module, evidence, payload)
+    fixture = _fixture(module, tmp_path)
+    payload = copy.deepcopy(fixture["payload"])
+    owner: object = payload
+    for segment in path[:-1]:
+        owner = owner[segment]  # type: ignore[index]
+    owner[path[-1]] = value  # type: ignore[index]
+    _rewrite_evidence(fixture, payload)
 
     with pytest.raises(module.EvidenceError):
-        module.validate_evidence(
-            evidence,
-            candidate_manifest_path=candidate,
-            candidate_app_bundle_smoke_path=app_smoke,
-            expected_sha256=digest,
-            expected_source_commit=source,
-            expected_candidate_manifest_sha256=candidate_digest,
-        )
+        _validate(module, fixture)
 
 
 def test_candidate_asset_mismatch_fails_closed(tmp_path: Path) -> None:
     module = _load_validator()
-    evidence, _digest_value, candidate, app_smoke, candidate_digest, source = _fixture(
-        module, tmp_path
-    )
-    payload = json.loads(evidence.read_text(encoding="utf-8"))
-    payload["release_assets"]["daemon_bundle"]["sha256"] = _digest("other-daemon")
-    digest = _write(module, evidence, payload)
+    fixture = _fixture(module, tmp_path)
+    payload = copy.deepcopy(fixture["payload"])
+    payload["release_assets"]["core_wheel"]["sha256"] = _digest("other-wheel")
+    payload["release_assets"]["framework_lock"]["distribution_digest"] = _digest("other-wheel")
+    _rewrite_evidence(fixture, payload)
 
     with pytest.raises(module.EvidenceError, match="candidate manifest"):
-        module.validate_evidence(
-            evidence,
-            candidate_manifest_path=candidate,
-            candidate_app_bundle_smoke_path=app_smoke,
-            expected_sha256=digest,
-            expected_source_commit=source,
-            expected_candidate_manifest_sha256=candidate_digest,
-        )
+        _validate(module, fixture)
 
 
 def test_evidence_digest_and_canonical_bytes_are_required(tmp_path: Path) -> None:
     module = _load_validator()
-    evidence, _digest_value, candidate, app_smoke, candidate_digest, source = _fixture(
-        module, tmp_path
-    )
-    payload = json.loads(evidence.read_text(encoding="utf-8"))
-    evidence.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    digest = hashlib.sha256(evidence.read_bytes()).hexdigest()
-
-    with pytest.raises(module.EvidenceError, match="canonical"):
+    fixture = _fixture(module, tmp_path)
+    with pytest.raises(module.EvidenceError, match="digest"):
         module.validate_evidence(
-            evidence,
-            candidate_manifest_path=candidate,
-            candidate_app_bundle_smoke_path=app_smoke,
-            expected_sha256=digest,
-            expected_source_commit=source,
-            expected_candidate_manifest_sha256=candidate_digest,
+            fixture["evidence_path"],
+            candidate_manifest_path=fixture["candidate_path"],
+            candidate_app_bundle_smoke_path=fixture["smoke_path"],
+            expected_sha256="0" * 64,
+            expected_source_commit=SOURCE,
+            expected_candidate_manifest_sha256=fixture["candidate_digest"],
         )
+
+    payload = fixture["payload"]
+    noncanonical = json.dumps(payload, indent=2).encode("utf-8")
+    fixture["evidence_path"].write_bytes(noncanonical)
+    fixture["evidence_digest"] = hashlib.sha256(noncanonical).hexdigest()
+    with pytest.raises(module.EvidenceError, match="canonical"):
+        _validate(module, fixture)

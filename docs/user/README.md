@@ -7,9 +7,10 @@ OpenEvo Preview has two applications:
   on a remote Linux server. Ordinary users manage it through Desktop and do not
   operate it directly.
 
-Version `0.1.8` is the current immutable Preview described by these guides. Its
-exact DMG and `SHA256SUMS` are available in the
-[OpenEvo Desktop 0.1.8 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.8-v018-startup-logs.29947490201.1).
+Version `0.1.9` is the immutable Preview described by these guides. Its exact
+DMG and `SHA256SUMS` are available from the
+[OpenEvo releases page](https://github.com/CompLifeLab-ZJU/OpenEvo/releases)
+under **OpenEvo Desktop 0.1.9 Preview**.
 The Preview DMG is unsigned and not notarized. Open it only after checking the
 exact checksum in the quickstart. Use the current release unless a maintainer
 has asked you to reproduce an older version.
@@ -17,7 +18,7 @@ has asked you to reproduce an older version.
 ## Start Here
 
 1. [Check host prerequisites](remote-server-setup.md).
-2. [Install Desktop and run two sessions](desktop-quickstart.md).
+2. [Install Desktop and run two Tasks](desktop-quickstart.md).
 3. [Configure a restricted network](proxy-and-network.md), if needed.
 4. [Resolve typed errors](troubleshooting.md).
 
@@ -27,9 +28,10 @@ This Preview packages:
 
 - one Apple Silicon macOS 12+ asset and matching Linux x86-64 Daemon Bundle;
 - two built-in, read-only science project tours, each showing three
-  task sessions and the three textual evolution targets without contacting a
+  Tasks and the three textual evolution targets without contacting a
   server;
-- SSH agent authentication;
+- system OpenSSH aliases, including configured identity, agent/Keychain,
+  proxy-jump/command, prompt, and known-host policy;
 - a host whose remote Codex CLI is already installed and signed in for the
   selected SSH user;
 - the intended Codex subscription transcript path and textual memory, skill

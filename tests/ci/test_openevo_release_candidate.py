@@ -66,7 +66,10 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
         "Preview publication."
     ) in notes
     assert "A candidate that has not passed that gate is not public." in notes
-    assert "real remote OpenEvo Daemon" in notes
+    assert "System OpenSSH remote workspace" in notes
+    assert "verified OpenEvo Daemon/Core v2" in notes
+    assert "two immutable science Tasks" in notes
+    assert "next-Task Runtime Context reuse" in notes
     assert "Remote Core" not in notes
     assert "Codex subscription transcript mode: available in this candidate." not in notes
     assert "Self-Deployed Reference mode: unavailable in this Preview." in notes

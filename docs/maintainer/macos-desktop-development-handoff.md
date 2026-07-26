@@ -569,7 +569,9 @@ macOS Tahoe `26.5.2` machine:
 ### Remote ordinary-user workflow
 
 - The user performs every action from Desktop.
-- Desktop connects to the configured Linux host over SSH.
+- Desktop lists literal aliases from the user's `~/.ssh/config`; the user
+  selects one alias and system `/usr/bin/ssh <alias>` remains the final
+  authority. No manual IP/username/port form is the default path.
 - Desktop installs or upgrades the exact matching Daemon automatically.
 - Desktop detects the existing remote Codex installation and authenticated
   subscription without receiving `~/.codex/auth.json`.
@@ -577,10 +579,12 @@ macOS Tahoe `26.5.2` machine:
   acceptance smoke unless a separately reviewed release profile changes it.
 - Evolution targets are independently selectable. The user is not forced to
   enable textual memory, skill bundle, and agent system together.
-- At least one run exercises each currently supported target and displays its
-  selected method, progress, output artifact, and successor revision.
-- A second task proves that accepted first-task artifacts affect only the next
-  session and are actually injected there.
+- The release rehearsal enables all three currently supported targets and
+  displays each selected method plus the committed successor Evolution
+  Revision output count. v0.1.9 does not probe an unavailable Task-artifact
+  collection endpoint during ordinary refresh.
+- A second Task proves that it pins the first Task's successor Project Head and
+  exact Runtime Context; evolution changes take effect only for that next Task.
 - The two built-in science examples remain visible without configuration and do
   not contact local or remote services.
 
@@ -598,10 +602,10 @@ macOS Tahoe `26.5.2` machine:
 
 - No evolution algorithm source behavior changed as part of this patch.
 - Existing Core, sidecar, renderer, Rust, contract, and release tests pass.
-- The real remote Codex two-session acceptance passes on the exact candidate.
+- The real remote Codex two-Task v2 acceptance passes on the exact candidate.
 - Local builds are debug evidence only. After the GitHub workflow rebuilds the
   candidate, download its manifest-bound DMG to the target M3 Pro and repeat the
-  packaged startup, retained/clean-state, diagnostics, and two-session remote
+  packaged startup, retained/clean-state, diagnostics, and two-Task remote
   acceptance against those exact candidate bytes.
 
 ## 10. Git And Publication Discipline
@@ -692,14 +696,14 @@ profile/project mapping, and reconnected. The closed bootstrap evidence
 SHA-256 is
 `b01c7bf7e04df07d79c2f74b27a3dd352ea8f189e448b542d64ff0faafb5895b`.
 
-Two real `gpt-5.3-codex-spark`, high-effort Codex Subscription tasks then ran
+Two real `gpt-5.3-codex-spark`, high-effort Codex Subscription Tasks then ran
 with explicit transcript capture. `text_memory`, `skill_bundle`, and
 `agent_system` were independently enabled using the remote registry. The first
 task consumed generation `0`, produced three evolution artifacts, and atomically
 activated generation `1`. The second task was admitted against generation `1`,
 consumed the exact runtime-context snapshot from that successor, and atomically
 activated generation `2` with three evolution artifacts. The untracked closed
-two-session evidence SHA-256 is
+pre-candidate two-Task evidence SHA-256 is
 `0fcaab29bffc92c1b2fbb583e1e02f90aa897ac99251ba9877724099953ab13c`.
 
 That rehearsal also found a retained-store upgrade defect after the initial
@@ -715,7 +719,7 @@ quarantining that state before the installed-Desktop rehearsal.
 
 Still required before publication are an immutable GitHub candidate built from
 the final reviewed commit, checksum-bound download of that candidate to this
-Mac, repetition of the installed-app and two-session flow against those exact
+Mac, repetition of the installed-app and two-Task v2 flow against those exact
 downloaded bytes, the remaining clean-user/Retry/diagnostics acceptance items,
 final review, and guarded Preview publication. Public `0.1.8` remains unchanged
 and is still the current public release.

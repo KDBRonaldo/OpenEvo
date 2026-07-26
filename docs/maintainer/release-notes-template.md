@@ -19,8 +19,8 @@ Until exact-candidate Codex science E2E evidence passes the release verifier,
 state that Codex Subscription is packaged and declared but still awaits
 supported-host verification. A verified claim must cite evidence binding the
 packaged Desktop, remote OpenEvo Daemon, subscription-authenticated Codex,
-transcript capture, both science sessions, promoted artifacts, and successor
-session reuse.
+transcript capture, both immutable science Tasks, successor Project Heads,
+typed Evolution Revision outputs, and next-Task Runtime Context reuse.
 
 ## Release
 
@@ -51,7 +51,7 @@ session reuse.
 - Textual memory:
 - Trajectory-to-skill:
 - Agent-system evolution:
-- Science workflow and promoted-artifact reuse:
+- Science Task workflow and successor Runtime Context reuse:
 
 ## Known Limitations
 
@@ -67,7 +67,7 @@ session reuse.
 - Trajectory-to-skill pass@1 rescue count and benchmark summary:
 - Agent-system pass@1 rescue count and benchmark summary:
 - Daemon Bundle clean-install and integration result:
-- Codex three-artifact, two-session science E2E result and evidence identity:
+- Codex three-output, two-Task science E2E result and evidence identity:
 - Self-deployed three-artifact science E2E result:
 - Packaged DMG smoke result:
 - Clean-host matrix result:

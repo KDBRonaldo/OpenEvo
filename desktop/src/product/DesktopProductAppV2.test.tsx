@@ -470,6 +470,51 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("successor-transition-8");
   });
 
+  it("renders a supported Core-owned selection resolver as the saved method", async () => {
+    const snapshot = authoritySnapshot();
+    const project = snapshot.projects[0]!;
+    (project.config.evolution.targets as Record<string, unknown>).agent_system = {
+      enabled: true,
+      method: "auto",
+      config: { target_path: "AGENTS.md" },
+    };
+    snapshot.capability!.capabilities.targets = [{
+      target_id: "agent_system",
+      display_name: "Agent system",
+      description: "Core-owned agent-system evolution.",
+      exposure: "desktop",
+      effective_default_method_id: "concrete_agent_system",
+      methods: [{
+        method_id: "concrete_agent_system",
+        display_name: "Concrete method",
+        default_config_json: "{}",
+      }],
+      accepted_methods: [{
+        method_id: "concrete_agent_system",
+        implementation_identity_digest: DIGEST,
+        support: { overall: "supported" },
+      }],
+      selection_resolvers: [{
+        selection_value: "auto",
+        display_name: "Automatic",
+        description: "Core selects an accepted concrete method.",
+        resolved_methods: [{
+          method_id: "concrete_agent_system",
+          implementation_identity_digest: DIGEST,
+          support: { overall: "supported" },
+        }],
+      }],
+    }] as never;
+    root = await render(providerFixture(snapshot));
+
+    await click("Evolution");
+
+    const method = document.querySelector<HTMLSelectElement>(".v2-target-list select");
+    expect(method?.value).toBe("auto");
+    expect([...method!.options].map((option) => option.textContent)).toContain("Automatic");
+    expect(document.body.textContent).not.toContain("blocks Task admission");
+  });
+
   it("blocks a new task while the successor is not ready and exposes transition recovery", async () => {
     const provider = providerFixture(authoritySnapshot("not_ready"));
     root = await render(provider);

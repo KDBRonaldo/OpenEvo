@@ -1,143 +1,145 @@
 # Release Desktop Real-Science E2E
 
-This maintainer runner is the process-boundary rehearsal for the release
-Desktop sidecar against a real remote science host. It is part of #163. It does
-not add a CLI product surface and does not call Core Control directly.
+This maintainer-only gate runs the exact v0.1.9 macOS Desktop composition
+against a real remote science workspace. It is part of #163. It is not a
+user-facing CLI and never calls Core Control directly.
 
 ## Required environment
 
-Run on a trusted release-verification host with:
+Run the gate on the macOS release-verification host with:
 
-- an existing `SSH_AUTH_SOCK` whose agent can authenticate the requested remote
-  user without an interactive prompt;
-- a separately reviewed SSH host-key algorithm and SHA-256 fingerprint;
-- a Linux x86-64 remote host that satisfies the packaged Core preflight and can
-  run the managed Docker runtime;
-- a working Codex subscription login for the remote user;
-- the exact managed subscription Science runtime archive for the release;
-- the exact Linux Daemon bundle and canonical Daemon manifest for the release;
-- either an exact packaged sidecar/Core wheel/framework lock triplet or the
-  exact Core pair plus the complete local sidecar build toolchain.
+- the exact candidate app copied from the candidate DMG, normally at
+  `/Applications/OpenEvo Desktop.app`;
+- one literal, selectable `Host` alias in the current user's
+  `~/.ssh/config` (for example `evolab`);
+- a system OpenSSH configuration for which `/usr/bin/ssh <alias>` can reach
+  the server using the user's normal `IdentityFile`, agent/Keychain,
+  `ProxyJump`, `User`, port, and host-trust settings;
+- a Linux x86-64 server that passes Daemon preflight, can run the managed
+  Docker runtime, has sufficient storage and outbound access, and has a
+  working Codex subscription login for the remote account; running inside an
+  approved root user container is allowed;
+- the exact candidate Core wheel, framework lock, Linux Daemon bundle and
+  manifest, and managed Science runtime archive;
+- the exact `release-candidate.json`, `app-bundle-smoke.json`, packaged-web
+  manifest, and candidate Playwright evidence downloaded from the same
+  candidate; and
+- a clean checkout of the candidate source commit, whose
+  `desktop/packaging/web` tree matches the packaged-web manifest.
 
-Do not pass an unreviewed fingerprint copied from the runner. The runner
-requires an exact expected fingerprint and accepts only the candidate returned
-by Desktop Local API after the sidecar performs its normal untrusted probe.
+The alias is the only remote selector accepted by the runner. Do not supply a
+hostname, IP address, username, port, private-key path, host-key fingerprint,
+or `SSH_AUTH_SOCK`. Desktop enumerates the literal aliases and delegates the
+connection to `/usr/bin/ssh <alias>`; system OpenSSH is the final authority for
+routing, identity, authentication, and trust.
 
-## Run with exact release assets
+## Run the exact candidate
 
 ```bash
 uv run python scripts/e2e/desktop_real_science_e2e.py \
-  --host <remote-host> \
-  --port 22 \
-  --user <remote-user> \
-  --expected-host-key-fingerprint 'SHA256:<reviewed-fingerprint>' \
-  --sidecar <packaged-sidecar> \
-  --core-wheel <exact-core-wheel> \
-  --framework-lock <exact-framework-lock> \
-  --managed-runtime-archive <exact-managed-runtime-archive> \
-  --daemon-bundle <exact-openevo-daemon-linux-x86_64> \
-  --daemon-manifest <exact-openevo-daemon-bundle.json> \
+  --ssh-host-alias <literal-ssh-config-alias> \
+  --app-bundle '/Applications/OpenEvo Desktop.app' \
+  --core-wheel <candidate-openevo-wheel> \
+  --framework-lock <candidate-framework-lock.json> \
+  --managed-runtime-archive <candidate-managed-runtime.tar> \
+  --daemon-bundle <candidate-openevo-daemon-linux-x86_64> \
+  --daemon-manifest <candidate-openevo-daemon-bundle.json> \
+  --release-candidate-manifest <candidate-release-candidate.json> \
+  --app-bundle-smoke <candidate-app-bundle-smoke.json> \
+  --packaged-web-manifest <candidate-packaged-web-manifest.json> \
+  --playwright-candidate-evidence <candidate-playwright-evidence.json> \
+  --packaged-web-root <candidate-checkout>/desktop/packaging/web \
   --output desktop-real-science-e2e-evidence.json
 ```
 
-The sidecar/Core wheel/framework lock arguments are required together. The
-Daemon pair and runtime archive are required in every real run. Before launch, the
-runner checks the closed framework-lock schema, binds it to the wheel bytes,
-and uses the release builder's PyInstaller inspection to prove that the
-packaged sidecar embeds that exact wheel, lock, runtime archive, Daemon bundle,
-and Daemon manifest. Held file descriptors bind validation, evidence, and the
-executed sidecar snapshot to the same source inodes.
+There is no local-build, smoke-only, single-Task, manual-host, or renderer-skip
+mode in the publication path. The model and effort are fixed to
+`gpt-5.3-codex-spark` and `high`; subscription execution uses explicit
+transcript capture and never claims token-level metrics.
 
-When no packaged sidecar is supplied, the runner builds one from the exact
-Core wheel/framework-lock pair produced with the Daemon composition so both
-applications embed one byte-identical Core release identity. The build uses
-`desktop/packaging/build_sidecar.py`; it is not a substitute for candidate
-signing, DMG copy smoke, or clean-machine rehearsal.
+Before launch, held file descriptors bind the validated bytes to the exact
+files subsequently used. The runner verifies that:
 
-```bash
-uv run python scripts/e2e/desktop_real_science_e2e.py \
-  --host <remote-host> \
-  --port 22 \
-  --user <remote-user> \
-  --expected-host-key-fingerprint 'SHA256:<reviewed-fingerprint>' \
-  --core-wheel <exact-core-wheel> \
-  --framework-lock <exact-framework-lock> \
-  --managed-runtime-archive <exact-managed-runtime-archive> \
-  --daemon-bundle <exact-openevo-daemon-linux-x86_64> \
-  --daemon-manifest <exact-openevo-daemon-bundle.json> \
-  --output desktop-real-science-e2e-evidence.json
-```
+- the installed app's packaged sidecar digest equals the sidecar digest in the
+  mounted-DMG app smoke;
+- the installed `openevo-ssh-askpass` helper digest, size, mode, relative path,
+  architecture policy, and ad-hoc signature equal the candidate manifest;
+- the framework lock binds the exact wheel and verified registry digest;
+- the Daemon bundle, manifest, and managed runtime match the candidate; and
+- the candidate commit, DMG, packaged web, Playwright evidence, and local
+  source checkout all share one immutable identity.
 
-The local mode invokes the builder with the managed runtime and Daemon pair plus
-`--release-build`, so a development sidecar without the complete controlled
-release payload cannot be used as release E2E evidence.
+## Product-boundary flow
 
-The full two-session release gate intentionally enables `text_memory`,
-`skill_bundle`, and `agent_system` to verify the supported text-evolution
-release path. This is verification policy, not a Desktop default: ordinary users
-independently enable any subset and select a method for each enabled target.
-There is no maintainer-runner target or method override. `agent_system` must expose the Core-owned
-`method=auto` resolver, and every concrete method reachable from that resolver
-must match a supported accepted-method identity. This preserves Core's recorded
-requested/resolved method decision. For the other targets, the remote effective
-default is used only when it is supported; fallback remains within visible
-supported methods and prefers stable methods. Remote default config is
-preserved. Missing support fails closed before the first run.
+The runner performs all business actions through the authenticated Desktop
+Local API v2:
 
-`--single-session-evolution` is a narrower diagnostic. It may record
-`artifact_publication_verified=true`, but it always records
-`cross_session_reuse_verified=false` and
-`release_evolution_path_verified=false` because
-it does not prove successor pinning or runtime reuse in a later session.
+1. Launch the sidecar and askpass helper directly from the candidate app bundle
+   using the native listener/executable FD handoff and one bounded credential
+   frame.
+2. Negotiate the strict `/version` v2 identity for release `0.1.9`, require
+   mutation major 2 and Core major 2, reject the legacy shell route, and prove
+   authenticated/unauthenticated `/desktop/v2/state` behavior.
+3. Read `/desktop/v2/ssh-hosts`, select the requested literal alias, create one
+   `system_openssh` profile, and connect it. No manual connection fields are
+   sent.
+4. Create one generation-zero scratch project with all evolution targets
+   disabled. Fetch capabilities through that project's active Core tunnel,
+   then patch the same project to enable `text_memory` and `skill_bundle` with
+   their supported remote effective defaults and `agent_system` with the
+   supported Core-owned `auto` resolver.
+5. Validate the project against the exact remote registry before each Task.
+6. Submit two immutable Tasks. For each Task, verify its admission and
+   authoritative attempt, required v2 timeline event types, exact predecessor
+   Project Head and Runtime Context, committed successor transition, adjacent
+   successor generation, and an Evolution Revision output count of three.
+7. Prove Task 1 uses generation 0, Task 2 pins Task 1's generation-1 successor,
+   and the Task-2 Runtime Context equals the Runtime Context committed by that
+   successor. The final active Project Head must be generation 2.
+8. Run the candidate-bound packaged renderer against the same live Desktop v2
+   session. It must display the real project, both Tasks, Project Head,
+   Evolution Revision, Runtime Context, Effective Execution, three independent
+   target controls with the exact selected methods, and the System OpenSSH
+   workspace. Network access is limited to the packaged origin and authenticated
+   loopback v2 reads.
+9. Disconnect the profile and terminate the complete sidecar/renderer process
+   groups. macOS uses a non-reaping `kqueue` process-exit observer so the group
+   leader remains authoritative until descendants have been closed.
 
-The real run first proves that a newly activated project has every release
-target disabled. Candidate-bound renderer observation then operates each target
-control independently and selects only methods returned by the connected
-Daemon's verified capability registry. The release gate subsequently enables
-all three targets to exercise them together. It does not claim three isolated
-benchmark runs or the not-yet-complete canonical Project Head admission
-orchestration described by the product spec.
+v0.1.9 intentionally does not call the unavailable v2 Task-artifact collection
+endpoint during ordinary refresh or release verification. Artifact content,
+host paths, logs, SSH commands, backend tokens, and Core URLs are not exposed to
+the renderer or used as fallback evidence. The committed Evolution Revision's
+typed `artifact_count` is the v0.1.9 output boundary.
 
-## Candidate-bound renderer observation
+## Evidence and privacy policy
 
-Renderer observation additionally requires the exact candidate metadata and an
-exact source checkout whose committed packaged web bytes match that candidate:
+The output is canonical JSON, mode `0600`, and at most 128 KiB. Its schema is
+v2 and uses a closed field allowlist. It records only candidate asset
+digests/sizes, closed Desktop/Core identities, Project Head composition digests,
+Task/admission/attempt/transition digests and counts, required timeline event
+types, successor-reuse booleans, renderer observations, and cleanup results.
 
-```bash
-uv run python scripts/e2e/desktop_real_science_e2e.py \
-  <release asset and remote host arguments above> \
-  --verify-renderer \
-  --release-candidate-manifest <release-candidate.json> \
-  --app-bundle-smoke <app-bundle-smoke.json> \
-  --packaged-web-manifest <packaged-web-manifest.json> \
-  --playwright-candidate-evidence <playwright-candidate-evidence.json> \
-  --packaged-web-root <exact-source-checkout>/desktop/packaging/web
-```
+It does not retain:
 
-The runner binds the candidate source commit, version, DMG digest, the exact
-candidate `app-bundle-smoke.json`, its packaged macOS sidecar SHA-256, Core wheel,
-framework lock, Daemon pair, managed runtime, packaged-web manifest, candidate
-Playwright evidence, and a clean exact-source checkout before opening the
-renderer. Candidate-bound renderer verification forbids an externally supplied
-`--sidecar`; it builds the Linux verification sidecar from that checkout and the
-exact candidate inputs. This is a source-equivalent verification binary, not the
-macOS sidecar extracted from the DMG. The renderer network gate blocks HTTP,
-WebSocket, every external origin, and every non-allowlisted Local API mutation
-before transmission.
+- the SSH alias (or a hash of it), hostname, IP address, username, port,
+  fingerprint, SSH config, SSH command, or identity path;
+- Desktop session, native handoff/readiness, mutation, Core bearer, password,
+  passphrase, private-key, or Codex authentication values;
+- opaque raw project/Task/admission/attempt/transition IDs;
+- host paths, task objective, transcript, log messages, artifact content, or
+  runtime file content.
 
-Before validation or launch, every release input is copied from its held,
-digest-verified file descriptor into a private read-only snapshot. All pathname-
-based packaging validators and the launched sidecar consume only those snapshots.
+The renderer screenshot masks the alias, raw IDs, and objective before it is
+retained. Failure evidence contains only a bounded stage, typed code, optional
+HTTP status, partial allowlisted observations, and cleanup state. A nominally
+passing run becomes failed if ownership cleanup is incomplete.
 
-This observation proves the candidate-bound packaged web renderer can use the
-live Desktop Local API to display task state, authoritative timeline sequence,
-logs, and verified evolution artifacts. It uses an injected native bridge and
-therefore records `native_tauri_live_verified=false`; mounted-DMG and copied-app
-native launch remain the candidate workflow's separate macOS evidence. Neither
-piece is described as a single end-to-end native UI test.
+## Sign and publish
 
-After the full two-session run passes, sign its canonical evidence with the
-release-host key stored outside the repository:
+After the exact-candidate run passes, place its canonical evidence at the fixed
+candidate-tag path and sign it with the release-host key stored outside the
+repository:
 
 ```bash
 uv run python scripts/ci/desktop_real_science_e2e_attestation.py sign \
@@ -147,120 +149,24 @@ uv run python scripts/ci/desktop_real_science_e2e_attestation.py sign \
   --signature release-evidence/<candidate-tag>/desktop-real-science-e2e.json.sig
 ```
 
-Commit exactly those two new files after the candidate source commit. The
-Preview publisher requires both SHA-256 values, extracts the public key from the
-candidate source rather than the later evidence commit, and requires that key's
-SHA-256 to equal `OPENEVO_REAL_SCIENCE_E2E_PUBLIC_KEY_SHA256` from the protected
-`openevo-preview-publication` environment. It verifies the OpenSSH signature and
-rejects publication unless the complete source-to-policy Git
-delta consists only of those exact evidence and signature paths. It also
-validates the candidate source,
-candidate-manifest digest, two successful sessions, all three release-gate
-targets, concrete method lineage, Core-provenance runtime receipt, successor
-artifact reuse, renderer observation, and ownership cleanup before it
-can make the draft public.
-
-## Product-boundary flow
-
-The runner performs these actions only through Desktop Local API v1:
-
-1. Start the real packaged sidecar with an inherited loopback listener,
-   inherited executable descriptor, and one native credential frame on stdin.
-   Negotiate the exact checked-in release-contract schema, frozen Desktop OpenAPI
-   digest, provider kind, and feature flags against a strict closed `/version`
-   response; require the legacy shell route to return 404; and require authenticated
-   and unauthenticated native session probes to return 204 and 403 respectively.
-2. Create an SSH-agent profile, connect, compare the candidate host key with
-   the expected identity, and confirm it.
-3. Create a scratch project with
-   `codex_subscription_transcript`, explicit transcript capture, no token-level
-   metrics, and initially disabled drafts for all three required evolution
-   targets. Core compiles it to the exact `managed_science` runtime profile with
-   `container_user=host`; the existing experiment model remains fail closed for
-   any other subscription runtime shape.
-4. Activate the project, fetch capabilities through its active tunnel, select
-   all three remote stable methods, reactivate, and run Core project validation.
-5. Run session 1 to `succeeded`; inspect its timeline, logs, context, artifact
-   summary, and bounded artifact content endpoint.
-6. Prove session 1's pinned context contains neither its own output artifact IDs
-   nor their successor revision. Then run session 2 to `succeeded` and prove that
-   its exact pinned revision is the generation-adjacent revision produced by
-   session 1. Require all three session-1 artifacts in session 2's pinned context,
-   require each session-2 artifact lineage to reference its matching predecessor,
-   and verify the Core runtime-context receipt digest. Both successful sessions
-   must contain the real harness execution phase. Codex skill installation is
-   fail-closed; its setup no longer ignores copy failure. Gateway creates the v3
-   receipt only after harness setup, run, postprocess, and a final runtime
-   download/readback. It binds the pinned revision/context, effective instruction
-   SHA-256, complete runtime file inventory/tree, authoritative source content,
-   canonical memory/agent-system files, every skill file, and every agent-system
-   target. Core independently rebuilds the expected rendering from the persisted
-   context before success. Together, the successful execution phase, strict skill
-   installation, effective-instruction binding, and exact post-run receipt prove
-   the Codex harness path consumed the three context surfaces instead of merely
-   accepting a staging receipt. Runner-returned metadata cannot supply or mutate
-   the receipt. No Codex transcript or artifact content is retained in evidence.
-7. If timeout, interruption, or another failure leaves a nonterminal Desktop run,
-   request cancellation and wait a bounded interval for terminal `cancelled`.
-   Record only boolean cleanup outcome fields; cancellation failure remains a
-   failure. Then request profile disconnect and terminate/wait for the sidecar
-   process group. Sidecar shutdown owns tunnel and Core attachment release.
-
-All polling, activation, run, HTTP, build, and shutdown waits are finite and
-positive. The build timeout is configurable with `--build-timeout-seconds`.
-Sidecar and local-build cleanup retain the unreaped process-group leader as PGID
-authority until descendants have been signalled and the leader can be reaped,
-including the race where the leader exits before its descendants.
-
-Any missing product state fails the run. The script does not read a remote DB,
-invoke SSH commands directly after startup, call Core Control directly, or
-manufacture a successor/artifact observation.
-
-## Evidence policy
-
-The output is canonical JSON, mode `0600`, and at most 128 KiB. It contains
-release digests and sizes including the validated managed runtime archive,
-build identity, booleans proving SSH connection and reviewed host-key
-verification, state/count inventories,
-revision generations/manifests, artifact metadata digests, the runtime-context
-receipt digest, session-1 exclusion and session-2 consumption booleans, and
-cleanup results. A closed field allowlist rejects every unrecognized evidence
-key.
-
-It does not contain:
-
-- the Desktop session credential or native handoff/readiness values;
-- a mutation token, Core bearer, password, passphrase, private key,
-  `SSH_AUTH_SOCK`, Codex authentication, or another raw secret;
-- host filesystem paths, remote host/user text, opaque resource IDs, log or
-  timeline messages, or artifact document text.
-
-It deliberately does not retain unsalted hashes of the host, user, port, or
-host-key fingerprint because those small input spaces are enumerable. The
-runner verifies the exact values in memory and publishes only the closed success
-booleans.
-
-Optional screenshots mask the research brief, session output, timeline,
-workspace source, and task title/objective before they are retained.
-
-Failure evidence uses only a bounded stage, typed code, optional HTTP status,
-and partial redacted observations. Sidecar stdout/stderr remains in an unnamed
-temporary file and is never copied into evidence. The runner writes evidence
-only after cleanup has completed; incomplete cleanup changes an otherwise
-passing result to failure.
+After candidate creation, the publication-policy commit may add exactly those
+two files and no source, workflow, validator, documentation, or policy change.
+The protected Preview publisher verifies the caller-supplied evidence and
+signature digests, the exact candidate manifest/app smoke, the frozen public
+key and protected trust anchor, the complete candidate-to-policy Git delta,
+both Tasks and adjacent successor heads, Task-2 context reuse, renderer v2
+observation, and ownership cleanup before making the draft public.
 
 ## Structural verification
 
 ```bash
 uv run python scripts/e2e/desktop_real_science_e2e.py --structural-check
 uv run pytest -q tests/ci/test_desktop_real_science_e2e.py
+uv run pytest -q tests/ci/test_validate_desktop_real_science_e2e.py
 uv run pytest -q tests/ci/test_desktop_real_science_e2e_attestation.py
 ```
 
-`--structural-check` verifies only the frozen release contract shape and native
-launcher shape. It does not build assets, contact a remote host, launch the
-sidecar, require the managed runtime archive or release-asset triplet, or write
-evidence. Its success text explicitly states that E2E was not run. Unit tests
-use synthetic capability/revision/session documents and real local child
-processes only to test fail-closed assertions and cleanup; they never emit a
-passing E2E artifact or claim a real Codex/SSH session ran.
+`--structural-check` verifies only the frozen v2/System OpenSSH and native
+boundary; it does not launch Desktop, contact the remote server, or write
+evidence. Unit tests use synthetic v2 Project Heads/Tasks and local child
+processes and never claim a real remote run occurred.

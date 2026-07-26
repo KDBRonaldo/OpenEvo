@@ -320,26 +320,31 @@ This Playwright result proves only the source-bound packaged Desktop interaction
 and viewport contract represented by those browser tests. It is not evidence
 of a real Codex Subscription science run. Release notes must describe Codex
 Subscription support as packaged and declared while the release remains a
-draft. A public Preview additionally requires candidate-bound evidence for a
-packaged Desktop, a
-supported remote OpenEvo Daemon, subscription-authenticated Codex, transcript
-capture, two completed science sessions, all required selected artifacts, and
-their reuse by the successor session. Without that evidence, neither a Preview
-nor a packaging candidate may say that a real Codex Subscription run was
+draft. A public v0.1.9 Preview additionally requires candidate-bound evidence
+for the exact packaged macOS Desktop sidecar and askpass helper, a
+`system_openssh` workspace selected from the user's literal SSH-config aliases,
+a supported remote OpenEvo Daemon/Core v2, subscription-authenticated Codex
+with transcript capture, two completed immutable Tasks, three typed Evolution
+Revision outputs per successor, an adjacent generation-0 -> generation-1 ->
+generation-2 Project Head chain, Task-2 Runtime Context reuse, and
+packaged-renderer v2 observation. Without that evidence, neither a Preview nor
+a packaging candidate may say that a real Codex Subscription Task was
 validated.
 
-The exact-candidate run is performed after the draft exists. It consumes the
-draft's exact manifest, Daemon, Core, runtime, and packaged-web evidence and
-binds the exact DMG digest. Linux cannot execute the macOS sidecar from that
-DMG, so release acceptance composes this source-equivalent science run with the
-candidate workflow's separate mounted-DMG and copied-app native macOS smokes;
-it does not describe them as one exact-DMG science process. A passing canonical
+The exact-candidate run is performed on the macOS release host after the draft
+exists. It consumes the draft's exact manifest, Daemon, Core, runtime, and
+packaged-web evidence; installs the app copied from the exact DMG; and executes
+that app's packaged macOS sidecar and askpass helper. Release acceptance
+composes this live remote Task run and packaged-renderer observation with the
+candidate workflow's mounted-DMG and copied-app native Tauri smokes. It does
+not claim that Playwright itself drives the Tauri webview. A passing canonical
 record and its OpenSSH signature are committed at
 `release-evidence/<candidate-tag>/desktop-real-science-e2e.json{,.sig}`.
 The candidate manifest's `app_bundle_smoke` role binds the exact macOS sidecar
-digest observed in the mounted DMG; the science-run record separately binds the
-source-equivalent Linux sidecar and does not claim cross-platform binary
-identity. Publication is fail-closed until the reviewed publication workflow
+digest observed in the mounted DMG, and the science-run record requires that
+same digest from the installed app. It also binds the exact candidate askpass
+helper digest, size, mode, relative path, architecture policy, and ad-hoc
+signature. Publication is fail-closed until the reviewed publication workflow
 validates the record, both caller-supplied SHA256 values, and the signature
 against the public key frozen in the candidate source. That key must also match
 the SHA-256 trust anchor configured as
@@ -351,7 +356,7 @@ post-candidate policy relaxation.
 
 The current rehearsal's dependency and security summaries and Core descriptor
 use schema version 2 for those closed contracts. The release candidate manifest
-uses version 8, with explicit Developer ID, ad-hoc bundle signature,
+uses version 9, with explicit Developer ID, ad-hoc bundle signature,
 notarization, quarantine-removal, Rust-toolchain, and closed unsigned macOS
 code-signing-policy fields. For the unsigned Preview, the policy requires plain
 ad-hoc signing with hardened runtime disabled and rejects the
@@ -504,7 +509,7 @@ published only under the Preview policy above.
 Dispatch `Publish validated OpenEvo Desktop Preview` only from `stable` and
 through the protected `openevo-preview-publication` environment. Supply the
 exact candidate tag, numeric release ID, source SHA, `release-candidate.json`
-SHA256, committed two-session real-science evidence SHA256, its OpenSSH
+SHA256, committed two-Task v2 real-science evidence SHA256, its OpenSSH
 signature SHA256, candidate workflow run ID and attempt, plus the explicit
 confirmation.
 The publisher first runs a read-only verification job. That job checks out the
@@ -521,9 +526,10 @@ job. It also validates the fixed candidate-tag evidence path
 with `validate_desktop_real_science_e2e.py`, requiring the exact source and
 candidate-manifest identities, the exact candidate native-sidecar smoke,
 candidate-source public key and protected trust anchor, trusted evidence
-signature, two successful subscription sessions, cross-session artifact reuse,
-concrete method lineage, Core-provenance runtime receipt, renderer observability,
-and complete ownership cleanup.
+signature, two successful subscription Tasks, the exact adjacent Project Head
+chain, three Evolution Revision outputs per successor, Task-2 Runtime Context
+reuse, System OpenSSH authority, renderer v2 observability, and complete
+ownership cleanup.
 It also requires the publication-policy commit to descend from the candidate
 source and permits exactly two added paths in that delta: the candidate-tag
 evidence and its signature.

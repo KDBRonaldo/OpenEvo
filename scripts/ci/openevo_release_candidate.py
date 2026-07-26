@@ -766,7 +766,7 @@ def render_candidate_release_notes(
             "",
             "Codex subscription transcript mode: packaged and declared in this Preview.",
             "Candidate-bound real Codex Subscription science E2E: required before public Preview publication.",
-            "A public Preview carrying these notes has passed the separate signed publication gate for a real remote OpenEvo Daemon, subscription-authenticated Codex, transcript capture, two science sessions, evolution artifacts, cross-session artifact reuse, and Desktop renderer observability. A candidate that has not passed that gate is not public.",
+            "A public Preview carrying these notes has passed the separate signed publication gate for the exact packaged macOS sidecar and askpass helper, a System OpenSSH remote workspace, a verified OpenEvo Daemon/Core v2, subscription-authenticated Codex with transcript capture, two immutable science Tasks, adjacent successor Project Heads, next-Task Runtime Context reuse, three Evolution Revision outputs per successor, and Desktop v2 renderer observability. A candidate that has not passed that gate is not public.",
             "Self-Deployed Reference mode: unavailable in this Preview.",
             "The shipped Desktop release authority blocks saving or running that mode; its Core-side reference architecture is not a Desktop product claim.",
             f"Managed Science runtime archive: {MANAGED_RUNTIME_ARCHIVE_NAME}.",

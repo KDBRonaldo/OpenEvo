@@ -30,7 +30,7 @@ def _write_evidence(path: Path, *, marker: int = 1, outcome: str = "passed") -> 
         "kind": "openevo_desktop_real_science_e2e",
         "marker": marker,
         "outcome": outcome,
-        "run_mode": "two_session_subscription_release",
+        "run_mode": "two_task_subscription_release",
     }
     path.write_text(
         json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n",
@@ -137,7 +137,7 @@ def test_failed_or_partial_evidence_cannot_be_signed(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.json"
     _write_evidence(evidence, outcome="failed")
 
-    with pytest.raises(module.AttestationError, match="passed two-session"):
+    with pytest.raises(module.AttestationError, match="passed two-Task v2"):
         module.sign_attestation(
             evidence,
             private_key_path=private,

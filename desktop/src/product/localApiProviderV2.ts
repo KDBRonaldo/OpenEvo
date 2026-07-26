@@ -11,7 +11,6 @@ import {
 import {
   opaqueIdV2Schema,
   scienceProjectConfigV2Schema,
-  type ArtifactV2,
   type CoreEventEnvelopeV2,
   type DesktopErrorV2,
   type DesktopEventEnvelopeV2,
@@ -480,29 +479,20 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const [capability, taskDetails] = await Promise.all([
       this.client.projectCapabilities(activeProject.project_id),
       Promise.all(tasks.map(async (task) => {
-        const [timeline, artifacts, transition] = await Promise.all([
+        const [timeline, transition] = await Promise.all([
           collectPages((options) => this.client.taskTimeline(task.task_id, options)),
-          collectPages((options) => this.client.taskArtifacts(task.task_id, options)),
           task.successor_transition === null
             ? Promise.resolve(null)
             : this.client.getTransition(task.successor_transition.successor_transition_id),
         ]);
-        return { task, timeline, artifacts, transition };
+        return { task, timeline, transition };
       })),
     ]);
     const timelines: Record<string, readonly CoreEventEnvelopeV2[]> = {};
     const transitions: Record<string, SuccessorTransitionV2> = {};
-    const artifactMap = new Map<string, ArtifactV2>();
     for (const detail of taskDetails) {
       timelines[detail.task.task_id] = detail.timeline;
       if (detail.transition !== null) transitions[detail.transition.transition.successor_transition_id] = detail.transition;
-      for (const artifact of detail.artifacts) {
-        const previous = artifactMap.get(artifact.artifact_id);
-        if (previous !== undefined && JSON.stringify(previous) !== JSON.stringify(artifact)) {
-          throw new DesktopContractErrorV2("Artifact identity changed across task collections");
-        }
-        artifactMap.set(artifact.artifact_id, artifact);
-      }
     }
     if (this.validation !== null && (
       this.validation.project_id !== activeProject.project_id
@@ -516,7 +506,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       tasks,
       transitions,
       timelines,
-      artifacts: [...artifactMap.values()],
+      // v0.1.9 intentionally exposes successor Evolution Revision counts while
+      // Core v2 artifact inspection remains unavailable. Never probe a missing
+      // route or fall back to SSH/v1 during an ordinary snapshot refresh.
+      artifacts: [],
       services,
       capability,
       validation: this.validation,

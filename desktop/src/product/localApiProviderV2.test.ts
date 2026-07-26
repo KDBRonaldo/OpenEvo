@@ -89,6 +89,10 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     listProjects: vi.fn(),
     listTasks: vi.fn(),
     listServices: vi.fn(),
+    projectCapabilities: vi.fn(),
+    taskTimeline: vi.fn(),
+    taskArtifacts: vi.fn(),
+    getTransition: vi.fn(),
     createProfile: vi.fn(),
     connectProfile: vi.fn(),
     eventStreamRequest: vi.fn(),
@@ -131,6 +135,75 @@ describe("Desktop v2 product provider", () => {
     expect(client.listProjects).not.toHaveBeenCalled();
     expect(client.listTasks).not.toHaveBeenCalled();
     expect(client.listServices).not.toHaveBeenCalled();
+  });
+
+  it("refreshes completed tasks without calling the unavailable artifact collection", async () => {
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-1",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const client = clientFixture([current]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: "project-1",
+    });
+    vi.mocked(client.listProjects).mockResolvedValue({
+      schema_version: "2",
+      items: [{
+        project_id: "project-1",
+        config: { execution: { mode: "codex_subscription_transcript" } },
+      }],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    vi.mocked(client.listTasks).mockResolvedValue({
+      schema_version: "2",
+      items: [{
+        task_id: "task-1",
+        project_id: "project-1",
+        state: "completed",
+        successor_transition: null,
+      }],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    vi.mocked(client.listServices).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.projectCapabilities).mockResolvedValue({
+      project_id: "project-1",
+      execution_mode: "codex_subscription_transcript",
+      registry_sha256: DIGEST,
+    } as never);
+    vi.mocked(client.taskTimeline).mockResolvedValue({
+      schema_version: "2",
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.taskArtifacts).mockRejectedValue(new Error("route unavailable"));
+
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("fixture refresh failed");
+    expect(result.snapshot.tasks).toHaveLength(1);
+    expect(result.snapshot.artifacts).toEqual([]);
+    expect(client.taskArtifacts).not.toHaveBeenCalled();
   });
 
   it("creates a profile from an alias only and uses catalog generation authority", async () => {

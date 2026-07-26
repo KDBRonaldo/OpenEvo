@@ -1,5 +1,23 @@
 # Desktop Product Renderer Boundary
 
+## v0.1.9 Desktop v2 release boundary
+
+The release renderer is backed by `LocalApiDesktopProductProviderV2`. Remote
+workspace profiles contain only a literal alias discovered from the user's
+`~/.ssh/config`; the sidecar delegates routing, identity, authentication, and
+trust to system OpenSSH. Once the project tunnel is active, project, Task,
+timeline, capability, validation, service, Project Head, Evolution Revision,
+and Runtime Context reads use Desktop/Core v2 contracts only.
+
+Core v2 does not yet publish the task-artifact collection or artifact-content
+operations. Consequently, the v0.1.9 snapshot refresh deliberately leaves its
+closed `artifacts` collection empty and presents the committed successor
+Evolution Revision's `artifact_count` as the authoritative output summary.
+Completed Tasks and their timelines remain refreshable. The provider must not
+probe an unavailable artifact route or fall back to Desktop v1, direct SSH, or
+a direct Core URL; artifact inspection can be enabled only after the verified
+Core v2 read operations exist.
+
 ## Built-in scientific project demos
 
 The Desktop demonstration surface contains two scientifically distinct,

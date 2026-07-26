@@ -94,6 +94,22 @@ def test_real_science_validator_tracks_release_candidate_schema() -> None:
     )
 
 
+def test_real_science_release_path_is_v2_system_openssh_only() -> None:
+    root = Path(__file__).resolve().parents[2]
+    runner = (root / "scripts/e2e/desktop_real_science_e2e.py").read_text(
+        encoding="utf-8"
+    )
+    validator = (
+        root / "scripts/ci/validate_desktop_real_science_e2e.py"
+    ).read_text(encoding="utf-8")
+
+    assert "/desktop/v2/" in runner
+    assert "--ssh-host-alias" in runner
+    assert "/desktop/v1/" not in runner
+    assert "ssh_agent" not in runner
+    assert '"schema_version": "2"' in validator
+
+
 def _load_framework_wheel_smoke_module():
     path = Path(__file__).resolve().parents[2] / "scripts/ci/smoke_evolution_framework_wheel.py"
     spec = importlib.util.spec_from_file_location("smoke_evolution_framework_wheel", path)

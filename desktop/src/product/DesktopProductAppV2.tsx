@@ -763,12 +763,20 @@ function EvolutionWorkspaceV2({
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
           const methodId = current.method ?? target.effective_default_method_id ?? "";
           const methods = target.methods;
+          const resolvers = target.selection_resolvers.map((resolver) => ({
+            ...resolver,
+            supported: resolver.resolved_methods.length > 0
+              && resolver.resolved_methods.every((method) => method.support.overall === "supported"),
+          }));
+          const selectedResolver = resolvers.find((resolver) => resolver.selection_value === methodId);
+          const selectionAccepted = target.accepted_methods.some((method) => method.method_id === methodId)
+            || selectedResolver?.supported === true;
           return <article key={target.target_id}><label className="v2-target-toggle"><input type="checkbox" checked={current.enabled} onChange={(event) => setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: event.target.checked, method: event.target.checked ? methodId || null : current.method, config: current.config } }))} /><span><strong>{target.display_name}</strong><small>{target.description}</small></span></label><label>Method<select value={methodId} disabled={!current.enabled} onChange={(event) => {
             const selected = methods.find((method) => method.method_id === event.target.value);
             let defaultConfig: ScienceProjectConfigV2["evolution"]["targets"][string]["config"] = {};
             try { defaultConfig = selected ? JSON.parse(selected.default_config_json) as typeof defaultConfig : {}; } catch { defaultConfig = {}; }
             setTargets((previous) => ({ ...previous, [target.target_id]: { enabled: true, method: event.target.value, config: defaultConfig } }));
-          }}><option value="">No supported default</option>{methods.map((method) => <option key={method.method_id} value={method.method_id}>{method.display_name}</option>)}</select></label>{current.enabled && (!methodId || !target.accepted_methods.some((method) => method.method_id === methodId)) ? <p className="form-error" role="alert">This enabled target has no method accepted by the active remote registry and blocks Task admission.</p> : null}</article>;
+          }}><option value="">No supported default</option>{resolvers.map((resolver) => <option key={`resolver:${resolver.selection_value}`} value={resolver.selection_value} disabled={!resolver.supported}>{resolver.display_name}</option>)}{methods.map((method) => <option key={`method:${method.method_id}`} value={method.method_id}>{method.display_name}</option>)}</select></label>{current.enabled && (!methodId || !selectionAccepted) ? <p className="form-error" role="alert">This enabled target has no method accepted by the active remote registry and blocks Task admission.</p> : null}</article>;
         })}</div>}
         <div className="v2-primary-row"><button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button></div>
       </section>
