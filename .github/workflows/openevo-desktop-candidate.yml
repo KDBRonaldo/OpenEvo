@@ -641,7 +641,10 @@ jobs:
           test -f "$current_provider_state/provider-v2.sqlite3"
           test -f "$current_provider_state/provider-v2.lock"
           test ! -e "$current_state/provider.sqlite3"
-          test -f "$current_native_state/.c41d73e981bf4a56"
+          # The v2 renderer delegates mutation idempotency to the durable
+          # sidecar/Core boundary and does not open the retained v1 native
+          # retry journal merely by starting.
+          test ! -e "$current_native_state"
           cmp "$legacy_state/provider.sqlite3" "$RUNNER_TEMP/legacy-provider.sqlite3"
           cmp "$legacy_state/provider.lock" "$RUNNER_TEMP/legacy-provider.lock"
           cmp "$legacy_native_retry" "$RUNNER_TEMP/legacy-native-retry"

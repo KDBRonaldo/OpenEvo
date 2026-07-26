@@ -2753,7 +2753,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )
     assert 'test -f "$current_provider_state/provider-v2.lock"' in shipped_app_smoke
     assert 'test ! -e "$current_state/provider.sqlite3"' in shipped_app_smoke
-    assert 'test -f "$current_native_state/.c41d73e981bf4a56"' in shipped_app_smoke
+    assert shipped_app_smoke.count('test ! -e "$current_native_state"') == 2
     assert 'cmp "$legacy_native_retry" "$RUNNER_TEMP/legacy-native-retry"' in shipped_app_smoke
     assert 'cmp "$legacy_native_lock" "$RUNNER_TEMP/legacy-native-lock"' in shipped_app_smoke
     assert shipped_app_smoke.count('dmg="candidate-artifacts/OpenEvo-Desktop-') == 1
