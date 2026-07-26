@@ -3,7 +3,7 @@
 Status: active maintainer handoff for the `0.1.8` startup incident and the next
 Desktop patch release
 
-Last updated: 2026-07-23
+Last updated: 2026-07-26
 
 This document transfers Desktop development from the Linux/GPU development
 container to a real Apple Silicon Mac. It is an implementation handoff, not a
@@ -639,3 +639,83 @@ When the incident is resolved, update this document with:
 
 After those facts are copied into the durable release and architecture
 documentation, this handoff may be archived as an incident record.
+
+### 11.1 Local `0.1.9` rehearsal on the target Mac
+
+On 2026-07-26, source commit
+`36e0e660df675d60e71459e2647a96d5a599b23b` passed a source-equivalent local
+rehearsal on the target Apple Silicon Mac and the configured `evolab` server.
+This is local pre-candidate evidence. It is not a GitHub-built immutable
+candidate, a public release, notarization evidence, or permission to skip the
+downloaded-candidate repetition required above.
+
+The exact locally composed artifacts were:
+
+- DMG `OpenEvo Desktop_0.1.9_aarch64.dmg`:
+  `b29e3155ddf2688661d32baa70805cc1a2212b7f8d90d93519b77fe9694dba69`;
+- packaged native executable:
+  `55df83eedc55f2ae8c6fca35e53498bdf38569b879edd610818992c3c5a8fba0`;
+- packaged Desktop sidecar:
+  `69da08579d0e85efea2d9bbd06e25b4d871b501aafdfdd3fc45458536f4b1e62`;
+- packaged SSH askpass helper:
+  `b382ace061b2615688f4b4017b4613ca7da87a8497479c2ae7958e3f78e20e82`;
+- Linux `x86_64` Daemon Bundle:
+  `f3566d4651f63ffa8fe47ab8b69a57e36f9ee08056764752d4210ba323f8e857`;
+- Core wheel:
+  `e90a2b4b962299685947407fc155006139727dc432fd53194e68118fcd7c8c32`;
+- framework lock:
+  `4a9b748bbdc366bf75b29b41a1a8b9b53cdaffb249a231a095a4a0a07c793801`;
+- managed science runtime:
+  `ad9c5ebd69b5785b94dd52dc077d93ababfa9cf8cbcbf92940f60bee48a91149`;
+  and
+- verified executable registry:
+  `07061d2d0bff99783f4b5354d61753f22dd5a856d6b030ba8e74f70210f8ac5b`.
+
+The app reached native, renderer, and packaged-sidecar readiness when launched
+from the read-only mounted DMG, from a detached copy, and from
+`/Applications/OpenEvo Desktop.app` through LaunchServices after the documented
+synthetic-quarantine removal. The LaunchServices run verified version `0.1.9`,
+the exact packaged binaries, and complete process-tree cleanup. Its untracked
+closed evidence SHA-256 is
+`a805e560505aab30cbb4ec160e6034828764db8f5bb446f6167aaea9e759c29c`.
+Mounted and detached startup evidence SHA-256 values are respectively
+`de32eeea6eb5352235fc566e378fdf9606e2ca66565f884bfb6b44569fb03aea`
+and
+`f711128393219b0ff6be85c240d4a26679880e8230b25a63dfe16136c3eead8e`.
+
+The installed sidecar enumerated `evolab` from the user's normal
+`~/.ssh/config`, persisted only the literal alias, and let system
+`/usr/bin/ssh` remain the connection authority. It upgraded the retained
+Daemon lifecycle from `13` to `14`, established the active Core v2 tunnel,
+created a generation-zero project, quit, relaunched, recovered the persisted
+profile/project mapping, and reconnected. The closed bootstrap evidence
+SHA-256 is
+`b01c7bf7e04df07d79c2f74b27a3dd352ea8f189e448b542d64ff0faafb5895b`.
+
+Two real `gpt-5.3-codex-spark`, high-effort Codex Subscription tasks then ran
+with explicit transcript capture. `text_memory`, `skill_bundle`, and
+`agent_system` were independently enabled using the remote registry. The first
+task consumed generation `0`, produced three evolution artifacts, and atomically
+activated generation `1`. The second task was admitted against generation `1`,
+consumed the exact runtime-context snapshot from that successor, and atomically
+activated generation `2` with three evolution artifacts. The untracked closed
+two-session evidence SHA-256 is
+`0fcaab29bffc92c1b2fbb583e1e02f90aa897ac99251ba9877724099953ab13c`.
+
+That rehearsal also found a retained-store upgrade defect after the initial
+Desktop/Daemon connection succeeded. A newly optional evolution metadata field
+was serialized as JSON `null` when older materialization rows were read, which
+changed their canonical response digest and made startup fail closed with
+`persisted materialized context snapshot is inconsistent`. The durable repair
+omits that field when it is absent, preserving the canonical identity of
+already persisted rows, adds unit and real-store restart regressions, and
+advances the Daemon lifecycle floor to `14`. The fixed Daemon started directly
+against the retained production Evolution Store without deleting, rewriting, or
+quarantining that state before the installed-Desktop rehearsal.
+
+Still required before publication are an immutable GitHub candidate built from
+the final reviewed commit, checksum-bound download of that candidate to this
+Mac, repetition of the installed-app and two-session flow against those exact
+downloaded bytes, the remaining clean-user/Retry/diagnostics acceptance items,
+final review, and guarded Preview publication. Public `0.1.8` remains unchanged
+and is still the current public release.
