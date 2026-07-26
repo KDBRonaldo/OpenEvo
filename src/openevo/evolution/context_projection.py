@@ -208,6 +208,7 @@ class ContextProjectionEvolutionMetadata(_ProjectionContract):
         Field(
             default=None,
             max_length=128,
+            exclude_if=lambda value: value is None,
         )
     )
 

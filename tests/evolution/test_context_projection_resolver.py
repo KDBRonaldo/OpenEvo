@@ -923,6 +923,22 @@ def test_projection_request_bounds_metadata_elements(
         Request.model_validate(payload)
 
 
+def test_optional_owner_transition_metadata_preserves_prior_request_identity() -> None:
+    Request, _ = _projection_types()
+    payload = _request().model_dump(mode="json")
+    payload["metadata"]["evolution"] = {
+        "context_artifact_ids": ["artifact-prior"],
+    }
+
+    request = Request.model_validate(payload)
+
+    assert canonical_json(request) == canonical_json(payload)
+    assert (
+        "context_artifact_owner_transition_ids"
+        not in request.model_dump(mode="json")["metadata"]["evolution"]
+    )
+
+
 def test_projection_request_enforces_total_canonical_byte_budget(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

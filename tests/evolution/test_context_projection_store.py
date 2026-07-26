@@ -225,6 +225,109 @@ def test_store_materializes_and_persists_registry_bound_context(tmp_path: Path) 
             pass
 
 
+def test_restart_accepts_materialization_from_before_optional_owner_transition_metadata(
+    tmp_path: Path,
+) -> None:
+    registry = verified_builtin_registry(tmp_path / "registry")
+    artifact_root = tmp_path / "managed"
+    db_path = tmp_path / "evolution.db"
+    store = EvolutionStore(
+        db_path=db_path,
+        artifact_root=artifact_root,
+        executable_registry=registry,
+    )
+    store.initialize()
+    request_payload = _request().model_dump(mode="json")
+    request_payload["metadata"]["evolution"] = {"context_artifact_ids": []}
+    request = ContextProjectionResolveRequest.model_validate(request_payload)
+    materialized = store.resolve_materialized_context(request)
+
+    with store.connect() as connection:
+        row = connection.execute(
+            """
+            SELECT contexts.request_json, contexts.response_json,
+                   context_materializations.manifest_json
+            FROM context_materializations
+            JOIN contexts USING (context_id)
+            WHERE context_id = ?
+            """,
+            (materialized.context_id,),
+        ).fetchone()
+        assert row is not None
+        legacy_request = json.loads(row["request_json"])
+        legacy_request["metadata"]["evolution"].pop(
+            "context_artifact_owner_transition_ids",
+            None,
+        )
+        legacy_request_json = canonical_json(legacy_request)
+        legacy_request_digest = hashlib.sha256(
+            legacy_request_json.encode("utf-8")
+        ).hexdigest()
+        legacy_response = json.loads(row["response_json"])
+        legacy_response["request_digest"] = legacy_request_digest
+        legacy_response_json = canonical_json(legacy_response)
+        legacy_manifest = json.loads(row["manifest_json"])
+        legacy_manifest["request_digest"] = legacy_request_digest
+        legacy_manifest_json = canonical_json(legacy_manifest)
+        connection.execute(
+            """
+            UPDATE contexts
+            SET request_json = ?, response_json = ?
+            WHERE context_id = ?
+            """,
+            (
+                legacy_request_json,
+                legacy_response_json,
+                materialized.context_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE context_materializations
+            SET request_digest = ?, manifest_json = ?
+            WHERE context_id = ?
+            """,
+            (
+                legacy_request_digest,
+                legacy_manifest_json,
+                materialized.context_id,
+            ),
+        )
+        connection.commit()
+
+    store.files.context_snapshot_path(materialized.context_id).write_bytes(
+        store_module._context_snapshot_bytes(
+            legacy_request,
+            legacy_response,
+        )
+    )
+    (
+        store.files.context_materialization_dir(materialized.context_id)
+        / "manifest.json"
+    ).write_text(legacy_manifest_json, encoding="utf-8")
+
+    restarted = EvolutionStore(
+        db_path=db_path,
+        artifact_root=artifact_root,
+        executable_registry=registry,
+    )
+    restarted.initialize()
+
+    recovered = restarted.get_materialized_context(materialized.context_id)
+    assert recovered.request_digest == legacy_request_digest
+    with restarted.connect() as connection:
+        recovered_request = json.loads(
+            connection.execute(
+                "SELECT request_json FROM contexts WHERE context_id = ?",
+                (materialized.context_id,),
+            ).fetchone()["request_json"]
+        )
+    assert (
+        "context_artifact_owner_transition_ids"
+        not in recovered_request["metadata"]["evolution"]
+    )
+
+
 def test_successor_materialization_privately_consumes_only_exact_sealed_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
