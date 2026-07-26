@@ -8842,24 +8842,24 @@ mod tests {
             (NATIVE_EXECUTABLE_FD_ENV, "99"),
             (NATIVE_EXECUTABLE_PATH_ENV, "/tmp/attacker-sidecar"),
         ]);
-        let fixture = SidecarFixture::from_existing_for_private_launch(Path::new("/bin/sh"));
+        let fixture = SidecarFixture::executable(
+            concat!(
+                "#!/bin/sh\n",
+                "test -z \"${_PYI_APPLICATION_HOME_DIR+x}\" || exit 31\n",
+                "test -z \"${_PYI_ARCHIVE_FILE+x}\" || exit 32\n",
+                "test -z \"${_PYI_PARENT_PROCESS_LEVEL+x}\" || exit 33\n",
+                "test -z \"${_PYI_SPLASH_IPC+x}\" || exit 34\n",
+                "test -z \"${_PYI_UNKNOWN_PRIVATE_STATE+x}\" || exit 35\n",
+                "test \"$PYINSTALLER_RESET_ENVIRONMENT\" = 1 || exit 36\n",
+            )
+            .as_bytes(),
+        );
         let (verified_executable, private_launch_dir) =
             prepare_packaged_sidecar(fixture.path()).unwrap();
         let allocated = allocate_sidecar_listener().unwrap();
         let launch = SidecarLaunchSpec {
             program: private_copy_test_execution_path(&private_launch_dir),
-            args: vec![
-                "-c".to_string(),
-                concat!(
-                    "test -z \"${_PYI_APPLICATION_HOME_DIR+x}\" || exit 31; ",
-                    "test -z \"${_PYI_ARCHIVE_FILE+x}\" || exit 32; ",
-                    "test -z \"${_PYI_PARENT_PROCESS_LEVEL+x}\" || exit 33; ",
-                    "test -z \"${_PYI_SPLASH_IPC+x}\" || exit 34; ",
-                    "test -z \"${_PYI_UNKNOWN_PRIVATE_STATE+x}\" || exit 35; ",
-                    "test \"$PYINSTALLER_RESET_ENVIRONMENT\" = 1 || exit 36"
-                )
-                .to_string(),
-            ],
+            args: Vec::new(),
             current_dir: None,
             remove_env: &RELEASE_FORBIDDEN_SIDECAR_ENV,
             private_launch_dir: Some(private_launch_dir),
@@ -12558,24 +12558,6 @@ https://user:password@example.invalid/private\n"[..],
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self::write_askpass_helper(&root);
             Self { root, path }
-        }
-
-        fn from_existing_for_private_launch(source: &Path) -> Self {
-            let fixture = Self::from_existing(source);
-            #[cfg(target_os = "macos")]
-            {
-                // Tahoe enforces Apple's platform launch constraint when a copied
-                // system shell is started in a new session. Production sidecars are
-                // plain ad-hoc binaries, so normalize this executable test fixture to
-                // the same identity before the verified private-copy launch.
-                let status = Command::new("/usr/bin/codesign")
-                    .args(["--force", "--sign", "-", "--timestamp=none"])
-                    .arg(fixture.path())
-                    .status()
-                    .unwrap();
-                assert!(status.success());
-            }
-            fixture
         }
 
         fn non_executable() -> Self {
