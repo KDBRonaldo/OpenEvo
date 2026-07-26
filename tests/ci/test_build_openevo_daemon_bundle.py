@@ -592,7 +592,7 @@ def test_service_failure_is_rendered_as_closed_json(
 
 
 def test_daemon_bundle_declares_process_group_lifecycle_compatibility() -> None:
-    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 14
+    assert daemon_bundle._LIFECYCLE_COMPATIBILITY == 15
 
 
 def test_release_daemon_launcher_contains_only_the_v2_mutation_composition() -> None:
