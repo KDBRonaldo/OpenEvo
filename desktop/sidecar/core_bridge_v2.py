@@ -896,11 +896,22 @@ class DesktopCoreBridgeV2:
         limit: int = 50,
         after: str | None = None,
     ) -> core_v2.ProjectPageV2:
-        session = self._session(desktop_project_id, profile_connection_generation)
-        return self._session_core(
-            session,
-            lambda: session.client.list_projects(limit=limit, after=after),
+        del limit
+        if after is not None:
+            raise _bridge_error(
+                "project_page_cursor_invalid",
+                "The active project inventory has no continuation page.",
+                status=400,
+                affected_resource_id=desktop_project_id,
+            )
+        project = self.get_project(
             desktop_project_id,
+            profile_connection_generation,
+        )
+        return core_v2.ProjectPageV2(
+            items=[project],
+            has_more=False,
+            next_cursor=None,
         )
 
     def capabilities(

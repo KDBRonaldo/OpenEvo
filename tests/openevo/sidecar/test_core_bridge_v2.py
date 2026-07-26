@@ -311,6 +311,68 @@ def test_activation_accepts_exact_initial_native_workspace_authority(
     assert len(tunnels.closed) == 1
 
 
+def test_active_project_list_does_not_enumerate_other_core_projects(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    remote = _project()
+    other = remote.model_copy(
+        update={
+            "project_id": "project-other",
+            "display_name": "Other project",
+            "active_project_head": None,
+            "admission_etag": None,
+            "state": "not_ready",
+            "etag": '"' + "7" * 64 + '"',
+        }
+    )
+    base_handler = _base_handler(requests, project=remote)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/v2/projects":
+            requests.append(request)
+            return httpx.Response(
+                200,
+                json=m.ProjectPageV2(
+                    items=[other, remote],
+                    has_more=False,
+                    next_cursor=None,
+                ).model_dump(mode="json"),
+            )
+        return base_handler(request)
+
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(handler),
+        )
+        bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-project-0001",
+        )
+
+        page = bridge.list_projects(
+            "desktop-project-1",
+            3,
+            limit=100,
+            after=None,
+        )
+
+        assert page == m.ProjectPageV2(
+            items=[remote],
+            has_more=False,
+            next_cursor=None,
+        )
+        assert not any(
+            request.method == "GET" and request.url.path == "/v2/projects"
+            for request in requests
+        )
+        bridge.close()
+
+
 def test_reconnect_reuses_exact_core_project_and_advances_only_connection_mapping(
     tmp_path: Path,
 ) -> None:
