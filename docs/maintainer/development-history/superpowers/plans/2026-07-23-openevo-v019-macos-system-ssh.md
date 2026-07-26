@@ -869,6 +869,67 @@ The exact broader gate is added in Task 18 after every slice is present.
 - [ ] Run version parity, package lock, cargo locked, and release-contract tests.
 - [ ] Commit: `chore(release): set OpenEvo Desktop 0.1.9`
 
+### Task 25.5: Cut formal candidate evidence over to Desktop v2
+
+**Files:**
+
+- Modify: `scripts/e2e/desktop_real_science_e2e.py`
+- Modify: `scripts/ci/validate_desktop_real_science_e2e.py`
+- Modify: `tests/ci/test_desktop_real_science_e2e.py`
+- Modify: `tests/ci/test_validate_desktop_real_science_e2e.py`
+- Modify: `desktop/tests/product-browser/release-live-observability.pw.ts`
+- Modify: `desktop/tests/product-browser/release-live-capture.test.ts` only if
+  the v2 live-capture boundary requires it
+- Modify: `tests/ci/test_check_openevo_release.py`
+- Modify: `docs/maintainer/desktop-real-science-e2e.md`
+- Modify: `docs/maintainer/release-process.md`
+
+- [ ] Add RED source guards proving the formal runner contains only
+  `/desktop/v2/*` mutation paths, requires a literal `--ssh-host-alias`, and
+  contains neither `/desktop/v1/*`, `ssh_agent`, nor release flags for raw
+  host, user, port, key path, or out-of-band host-key fingerprint.
+- [ ] Add RED closed-schema validator fixtures for Project Head generations
+  `0 -> 1 -> 2`, immutable Task Admission and Attempt identities, the exact
+  predecessor/context/successor relation for both Tasks, transcript-only
+  Subscription execution, all three release targets, v2 lifecycle events,
+  and second-Task reuse of the first successor Runtime Context Snapshot.
+- [ ] Reject every schema-v1 real-science record. Preserve candidate manifest,
+  DMG/app-smoke, packaged-web, signature, source-commit, and privacy binding;
+  do not add a v1 evidence compatibility path.
+- [ ] Make the release runner consume the exact candidate app bundle's packaged
+  sidecar and native askpass helper, plus the manifest-matched Daemon/Core/
+  runtime assets. Launch with a private disposable Desktop state root and
+  require Desktop Local API mutation major 2.
+- [ ] Discover the requested alias through `/desktop/v2/ssh-hosts`, create only
+  a `connection_authority=system_openssh` profile, and let `/usr/bin/ssh
+  <alias>` remain the final routing, identity, agent/Keychain, trust, and
+  authentication authority. The alias may be hashed into evidence but raw SSH
+  configuration, resolved host/user/port, credentials, and prompt responses
+  must never enter evidence.
+- [ ] Create a generation-zero scratch project, select the verified remote
+  effective defaults for `text_memory` and `skill_bundle` plus Core-owned
+  `agent_system:auto`, validate against the exact registry, and run two real
+  `gpt-5.3-codex-spark` high-effort Subscription Tasks with transcript capture.
+- [ ] For each Task, verify the closed admission, Attempt, Task Context,
+  timeline, logs, artifact metadata/content digests, and committed successor.
+  Prove Task 1 consumes generation 0 and publishes generation 1, then Task 2
+  consumes that exact generation-1 Runtime Context Snapshot and publishes
+  generation 2. Do not infer success from SSH or a process exit.
+- [ ] Replace the live packaged-renderer proof with a v2-only observation of
+  the exact active project, system-OpenSSH workspace, both Tasks, Project Head,
+  Evolution Revision, Runtime Context, Effective Execution, and the three
+  independent negotiated target controls. Reject any renderer request to a
+  v1 route or a non-loopback/non-packaged origin.
+- [ ] Keep the resulting schema-v2 evidence closed, canonical, bounded,
+  path-free, credential-free, and candidate-bound. Sign only the validated
+  canonical bytes on the controlled release host; never transfer the private
+  attestation key to the Mac or repository.
+- [ ] Run focused Python/TypeScript tests, the formal structural check, renderer
+  typecheck, `git diff --check`, and the release policy tests before dispatching
+  the candidate. Commit and push this source change before the candidate so the
+  post-candidate policy delta can remain exactly the evidence JSON and detached
+  signature.
+
 ---
 
 ## Phase G: Integrated verification and release evidence
