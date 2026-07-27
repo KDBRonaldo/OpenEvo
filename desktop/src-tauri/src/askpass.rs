@@ -162,9 +162,18 @@ fn system_executable_identity(
     )
 }
 
+#[cfg(target_os = "linux")]
+const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(target_os = "macos")]
+const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "linux")]
+const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG;
+#[cfg(target_os = "macos")]
+const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;
+
 fn require_trusted_system_executable(metadata: &Metadata) -> Result<(), SystemSshOwnerError> {
     let mode = metadata.mode();
-    if mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
+    if mode & SYSTEM_FILE_TYPE_MASK != SYSTEM_REGULAR_FILE_TYPE
         || metadata.uid() != 0
         || metadata.nlink() != 1
         || mode & 0o022 != 0
@@ -1178,6 +1187,12 @@ mod tests {
             parents: HashMap::from([(300, 200), (200, 1)]),
             paths: HashMap::from([(200, PathBuf::from(SYSTEM_SSH_PATH))]),
         }
+    }
+
+    #[test]
+    fn portable_system_executable_mode_constants_match_host_libc() {
+        assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT as u32);
+        assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG as u32);
     }
 
     #[test]
