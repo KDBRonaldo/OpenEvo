@@ -200,6 +200,49 @@ def test_mutation_replay_ledger_has_exact_state_machine(tmp_path: Path) -> None:
             store.reserve_mutation(replace(prepared, request_sha256="c" * 64))
 
 
+def test_release_evidence_summary_requires_one_applied_project_create(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    mapping = _mapping()
+    action_id = "release-project-create-action"
+    prepared = CoreBridgeMutationV2(
+        desktop_project_id=mapping.desktop_project_id,
+        profile_id=mapping.profile_id,
+        profile_connection_generation=mapping.profile_connection_generation,
+        operation="create_project_v2",
+        resource_scope="projects",
+        idempotency_key=action_id,
+        request_sha256="a" * 64,
+        state=CoreBridgeMutationStateV2.PREPARED,
+        response_sha256=None,
+        response_resource_id=None,
+    )
+    with DesktopCoreBridgeStoreV2(root) as store:
+        store.commit_mapping(mapping, expected_previous=None)
+        store.reserve_mutation(prepared)
+        store.mark_mutation_applied(
+            prepared,
+            response_sha256="b" * 64,
+            response_resource_id=mapping.core_project_id,
+        )
+
+        assert store.release_evidence_summary(
+            core_project_id=mapping.core_project_id,
+            action_id=action_id,
+        ) == {
+            "project_mapping_count": 1,
+            "applied_create_project_mutation_count": 1,
+        }
+
+        with pytest.raises(CoreBridgeStoreDataV2Error, match="release evidence"):
+            store.release_evidence_summary(
+                core_project_id=mapping.core_project_id,
+                action_id="different-release-action",
+            )
+
+
 def test_startup_rejects_tampered_mapping_and_path_replacement(tmp_path: Path) -> None:
     root = tmp_path / "state"
     root.mkdir(mode=0o700)

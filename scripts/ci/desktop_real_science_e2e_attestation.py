@@ -91,11 +91,12 @@ def _canonical_evidence(path: Path) -> bytes:
         raise AttestationError("evidence is not canonical JSON")
     if (
         not isinstance(payload, dict)
+        or payload.get("schema_version") != "3"
         or payload.get("kind") != "openevo_desktop_real_science_e2e"
         or payload.get("outcome") != "passed"
         or payload.get("run_mode") != "two_task_subscription_release"
     ):
-        raise AttestationError("only passed two-Task v2 release evidence can be attested")
+        raise AttestationError("only passed two-Task v3 release evidence can be attested")
     return content
 
 

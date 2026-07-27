@@ -27,6 +27,7 @@ def _load_module() -> ModuleType:
 
 def _write_evidence(path: Path, *, marker: int = 1, outcome: str = "passed") -> None:
     payload = {
+        "schema_version": "3",
         "kind": "openevo_desktop_real_science_e2e",
         "marker": marker,
         "outcome": outcome,
@@ -137,7 +138,7 @@ def test_failed_or_partial_evidence_cannot_be_signed(tmp_path: Path) -> None:
     evidence = tmp_path / "evidence.json"
     _write_evidence(evidence, outcome="failed")
 
-    with pytest.raises(module.AttestationError, match="passed two-Task v2"):
+    with pytest.raises(module.AttestationError, match="passed two-Task v3"):
         module.sign_attestation(
             evidence,
             private_key_path=private,

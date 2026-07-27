@@ -236,6 +236,7 @@ jobs:
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_open_store_rejects_database_pathname_replacement \
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_fresh_initial_schema_hot_journal_rolls_back_then_bootstraps \
+            tests/openevo/sidecar/test_core_bridge_store_v2.py::test_release_evidence_summary_requires_one_applied_project_create \
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 

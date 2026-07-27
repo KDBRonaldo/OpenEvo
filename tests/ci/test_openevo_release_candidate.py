@@ -506,7 +506,10 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         == []
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 9
+    assert payload["schema_version"] == 10
+    assert payload["desktop_contract"] == candidate._desktop_contract_manifest("0.1.0")
+    assert payload["lifecycle_evidence"] == candidate._lifecycle_evidence_requirements()
+    assert payload["lifecycle_evidence"]["require_renderer_secret_canary_absence"] is True
     assert payload["macos"]["ssh_askpass_helper"] == {
         "architecture": "arm64",
         "byte_size": 51,
@@ -587,6 +590,41 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "python_requires": ">=3.11",
         "supported_platforms": ["linux-x86_64"],
     }
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("desktop_contract", "openapi_sha256", "f" * 64),
+        ("desktop_contract", "feature_flags", []),
+        ("lifecycle_evidence", "maximum_reservation_latency_ms", 0),
+        ("lifecycle_evidence", "minimum_terminal_duration_ms", 0),
+        ("lifecycle_evidence", "require_relaunch_recovery", False),
+        ("lifecycle_evidence", "require_secret_canary_absence", False),
+        ("lifecycle_evidence", "require_renderer_secret_canary_absence", False),
+    ],
+)
+def test_candidate_manifest_rejects_changed_lifecycle_contract(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    value: object,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload[section][field] = value
+    _write_json(manifest, payload)
+
+    assert candidate.validate_candidate_manifest(manifest)
 
 
 @pytest.mark.parametrize(

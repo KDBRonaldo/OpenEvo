@@ -407,6 +407,73 @@ class DesktopCoreBridgeStoreV2:
             )
             return None if row is None else self._mutation_from_sized_row(connection, row)
 
+    def release_evidence_summary(
+        self,
+        *,
+        core_project_id: str,
+        action_id: str,
+    ) -> dict[str, int]:
+        """Return bounded counts only after exact release-create authority is proven."""
+
+        _validate_id(core_project_id)
+        _validate_key(action_id)
+        with self._transaction(write=False) as connection:
+            mapping_row = connection.execute(
+                """
+                SELECT desktop_project_id, profile_id, core_project_id,
+                       mapping_generation, document_sha256,
+                       length(CAST(document_json AS BLOB)) AS document_size
+                FROM mappings WHERE core_project_id = ?
+                """,
+                (core_project_id,),
+            ).fetchone()
+            if mapping_row is None:
+                raise CoreBridgeStoreDataV2Error(
+                    "release evidence Core project mapping is absent"
+                )
+            mapping = self._mapping_from_sized_row(
+                connection,
+                "mappings",
+                mapping_row,
+            )
+            mutation_row = self._mutation_row(
+                connection,
+                mapping.desktop_project_id,
+                "create_project_v2",
+                action_id,
+            )
+            if mutation_row is None:
+                raise CoreBridgeStoreDataV2Error(
+                    "release evidence project-create mutation is absent"
+                )
+            mutation = self._mutation_from_sized_row(connection, mutation_row)
+            mapping_count = cast(
+                int,
+                connection.execute("SELECT count(*) FROM mappings").fetchone()[0],
+            )
+            applied_count = cast(
+                int,
+                connection.execute(
+                    """
+                    SELECT count(*) FROM mutation_replays
+                    WHERE operation = 'create_project_v2' AND state = 'applied'
+                    """
+                ).fetchone()[0],
+            )
+            if (
+                mapping_count != 1
+                or applied_count != 1
+                or mutation.state is not CoreBridgeMutationStateV2.APPLIED
+                or mutation.response_resource_id != core_project_id
+            ):
+                raise CoreBridgeStoreDataV2Error(
+                    "release evidence does not identify one applied project create"
+                )
+            return {
+                "project_mapping_count": mapping_count,
+                "applied_create_project_mutation_count": applied_count,
+            }
+
     def reserve_mutation(self, mutation: CoreBridgeMutationV2) -> CoreBridgeMutationV2:
         if (
             type(mutation) is not CoreBridgeMutationV2

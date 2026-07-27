@@ -17,9 +17,9 @@ from typing import Mapping
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-RELEASE_CANDIDATE_SCHEMA_VERSION = 9
+RELEASE_CANDIDATE_SCHEMA_VERSION = 10
 MAX_EVIDENCE_BYTES = 128 * 1024
-EVIDENCE_SCHEMA_IDENTITY = {"schema_version": "2"}
+EVIDENCE_SCHEMA_IDENTITY = {"schema_version": "3"}
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 SOURCE_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 TARGETS = ("agent_system", "skill_bundle", "text_memory")
@@ -42,6 +42,28 @@ VERIFICATION_SCOPE = [
     "next_task_runtime_context_reuse",
     "packaged_renderer_v2_observability",
 ]
+LIFECYCLE_PHASES = (
+    "validation",
+    "queued",
+    "resolving_system_openssh",
+    "connecting",
+    "waiting_for_user",
+    "remote_preflight",
+    "transferring",
+    "verifying",
+    "starting_daemon",
+    "waiting_for_daemon",
+    "opening_project_tunnel",
+    "negotiating_core",
+    "preparing_native_workspace",
+    "creating_remote_project",
+    "verifying_project",
+    "activating",
+    "finalizing",
+)
+PROCESS_LOG_SOURCES = frozenset(
+    {"daemon_stderr", "daemon_stdout", "ssh_stderr", "ssh_stdout"}
+)
 
 
 class EvidenceError(RuntimeError):
@@ -160,7 +182,9 @@ def _read_candidate_manifest(
         {
             "core",
             "daemon",
+            "desktop_contract",
             "files",
+            "lifecycle_evidence",
             "macos",
             "managed_runtime",
             "release",
@@ -172,9 +196,48 @@ def _read_candidate_manifest(
     if (
         manifest["schema_version"] != RELEASE_CANDIDATE_SCHEMA_VERSION
         or manifest["source_commit"] != expected_source_commit
-        or manifest["version"] != "0.1.9"
+        or manifest["version"] != "0.1.10"
     ):
         raise EvidenceError("candidate manifest identity is invalid")
+    release_contract = _release_contract()
+    features = release_contract.get("required_desktop_feature_flags")
+    expected_desktop_contract = {
+        "release_version": "0.1.10",
+        "mutation_major": 2,
+        "openapi_sha256": release_contract.get("accepted_desktop_openapi_digests", [None])[0],
+        "event_schema_sha256": release_contract.get(
+            "accepted_desktop_event_schema_digests", [None]
+        )[0],
+        "feature_flags": features,
+        "feature_set_sha256": hashlib.sha256(
+            json.dumps(
+                features,
+                ensure_ascii=True,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+        ).hexdigest(),
+    }
+    if manifest["desktop_contract"] != expected_desktop_contract:
+        raise EvidenceError("candidate Desktop lifecycle contract is invalid")
+    expected_lifecycle_contract = {
+        "schema_version": 1,
+        "operation_kind": "project_create",
+        "reservation_status": 202,
+        "maximum_reservation_latency_ms": 15_000,
+        "minimum_terminal_duration_ms": 15_000,
+        "minimum_ordered_phase_count": 2,
+        "allowed_process_log_sources": sorted(PROCESS_LOG_SOURCES),
+        "require_sse_reconnect": True,
+        "require_relaunch_recovery": True,
+        "require_stable_action_id": True,
+        "require_single_core_project": True,
+        "require_single_applied_mutation": True,
+        "require_secret_canary_absence": True,
+        "require_renderer_secret_canary_absence": True,
+    }
+    if manifest["lifecycle_evidence"] != expected_lifecycle_contract:
+        raise EvidenceError("candidate lifecycle evidence contract is invalid")
     release = _exact_mapping(
         manifest["release"],
         "candidate release",
@@ -373,7 +436,138 @@ def _release_contract() -> Mapping[str, object]:
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise EvidenceError("release contract is unavailable") from exc
     contract = _mapping(payload, "release contract")
-    return _mapping(contract.get("v019"), "v0.1.9 release contract")
+    return _mapping(contract.get("v0110"), "v0.1.10 release contract")
+
+
+def _validate_lifecycle_evidence(
+    value: object,
+    *,
+    contract: Mapping[str, object],
+) -> dict[str, object]:
+    lifecycle = _exact_mapping(
+        value,
+        "lifecycle evidence",
+        {
+            "operation_kind",
+            "reservation_status",
+            "reservation_latency_ms",
+            "terminal_duration_ms",
+            "action_id_sha256",
+            "operation_id_sha256",
+            "request_sha256",
+            "ordered_phases",
+            "process_logs",
+            "sse_reconnect_verified",
+            "relaunch_recovery_verified",
+            "stable_action_id_after_relaunch",
+            "stable_operation_id_after_relaunch",
+            "mutation_reissued_after_relaunch",
+            "core_authority",
+            "secret_canary_sha256",
+            "secret_canary_absent",
+        },
+    )
+    reservation_latency = _nonnegative_int(
+        lifecycle["reservation_latency_ms"],
+        "lifecycle reservation latency",
+    )
+    terminal_duration = _positive_int(
+        lifecycle["terminal_duration_ms"],
+        "lifecycle terminal duration",
+    )
+    maximum_reservation = _positive_int(
+        contract.get("maximum_reservation_latency_ms"),
+        "lifecycle maximum reservation latency",
+    )
+    minimum_duration = _positive_int(
+        contract.get("minimum_terminal_duration_ms"),
+        "lifecycle minimum terminal duration",
+    )
+    minimum_phases = _positive_int(
+        contract.get("minimum_ordered_phase_count"),
+        "lifecycle minimum phase count",
+    )
+    if (
+        lifecycle["operation_kind"] != contract.get("operation_kind")
+        or lifecycle["reservation_status"] != contract.get("reservation_status")
+        or reservation_latency >= maximum_reservation
+        or terminal_duration <= minimum_duration
+    ):
+        raise EvidenceError("lifecycle reservation or duration evidence is invalid")
+
+    action_id = _sha256(lifecycle["action_id_sha256"], "lifecycle action ID")
+    operation_id = _sha256(lifecycle["operation_id_sha256"], "lifecycle operation ID")
+    _sha256(lifecycle["request_sha256"], "lifecycle request")
+    _sha256(lifecycle["secret_canary_sha256"], "lifecycle secret canary")
+    if action_id == operation_id:
+        raise EvidenceError("lifecycle action and operation identities are not independent")
+
+    phases = lifecycle["ordered_phases"]
+    if (
+        not isinstance(phases, list)
+        or len(phases) < minimum_phases
+        or len(phases) != len(set(phases))
+        or any(type(phase) is not str or phase not in LIFECYCLE_PHASES for phase in phases)
+    ):
+        raise EvidenceError("lifecycle ordered phase evidence is invalid")
+    phase_indexes = [LIFECYCLE_PHASES.index(phase) for phase in phases]
+    if phase_indexes != sorted(phase_indexes) or phases[-1] != "finalizing":
+        raise EvidenceError("lifecycle ordered phases regress or omit completion")
+
+    process_logs = _exact_mapping(
+        lifecycle["process_logs"],
+        "lifecycle process logs",
+        {"entry_count", "sources", "content_sha256"},
+    )
+    _positive_int(process_logs["entry_count"], "lifecycle process log count")
+    _sha256(process_logs["content_sha256"], "lifecycle process log content")
+    sources = process_logs["sources"]
+    allowed_sources = contract.get("allowed_process_log_sources")
+    if (
+        not isinstance(sources, list)
+        or sources != sorted(set(sources))
+        or not sources
+        or not isinstance(allowed_sources, list)
+        or any(source not in allowed_sources for source in sources)
+        or any(source not in PROCESS_LOG_SOURCES for source in sources)
+    ):
+        raise EvidenceError("lifecycle process logs are synthetic or use an invalid source")
+
+    core = _exact_mapping(
+        lifecycle["core_authority"],
+        "lifecycle Core authority",
+        {
+            "project_count",
+            "project_mapping_count",
+            "applied_create_project_mutation_count",
+        },
+    )
+    required_true = (
+        ("sse_reconnect_verified", "require_sse_reconnect"),
+        ("relaunch_recovery_verified", "require_relaunch_recovery"),
+        ("stable_action_id_after_relaunch", "require_stable_action_id"),
+        ("stable_operation_id_after_relaunch", "require_stable_action_id"),
+        ("secret_canary_absent", "require_secret_canary_absence"),
+    )
+    if any(
+        contract.get(requirement) is not True or lifecycle.get(field) is not True
+        for field, requirement in required_true
+    ):
+        raise EvidenceError("lifecycle reconnect, relaunch, identity, or canary proof is incomplete")
+    if lifecycle["mutation_reissued_after_relaunch"] is not False:
+        raise EvidenceError("lifecycle mutation was reissued after relaunch")
+    if (
+        contract.get("require_single_core_project") is not True
+        or contract.get("require_single_applied_mutation") is not True
+        or core
+        != {
+            "project_count": 1,
+            "project_mapping_count": 1,
+            "applied_create_project_mutation_count": 1,
+        }
+    ):
+        raise EvidenceError("lifecycle Core project or mutation authority is not singular")
+    return lifecycle
 
 
 def _project_head(value: object, label: str) -> dict[str, object]:
@@ -562,7 +756,7 @@ def validate_evidence(
         raise EvidenceError("real-science evidence is not canonical JSON")
     preflight = _mapping(payload, "real-science evidence")
     if preflight.get("schema_version") != EVIDENCE_SCHEMA_IDENTITY["schema_version"]:
-        raise EvidenceError("real-science evidence schema version is not v2")
+        raise EvidenceError("real-science evidence schema version is not v3")
     document = _exact_mapping(
         payload,
         "real-science evidence",
@@ -583,6 +777,7 @@ def validate_evidence(
             "project",
             "tasks",
             "reuse",
+            "lifecycle",
             "renderer",
             "renderer_observability_verified",
             "renderer_boundary",
@@ -597,14 +792,14 @@ def validate_evidence(
         raise EvidenceError("real-science evidence violates the privacy contract") from exc
     if (
         document["kind"] != "openevo_desktop_real_science_e2e"
-        or document["issue"] != 163
+        or document["issue"] != 220
         or document["real_process_boundary"] is not True
         or document["outcome"] != "passed"
         or document["run_mode"] != "two_task_subscription_release"
         or document["verification_scope"] != VERIFICATION_SCOPE
         or document["task_count"] != 2
     ):
-        raise EvidenceError("real-science v2 verdict is incomplete")
+        raise EvidenceError("real-science v3 verdict is incomplete")
     if _timestamp(document["finished_at"], "finish time") < _timestamp(
         document["started_at"], "start time"
     ):
@@ -635,7 +830,7 @@ def validate_evidence(
     )
     _sha256(wheel["sha256"], "Core wheel digest")
     _positive_int(wheel["byte_size"], "Core wheel byte size")
-    if wheel["distribution"] != "openevo" or wheel["version"] != "0.1.9":
+    if wheel["distribution"] != "openevo" or wheel["version"] != "0.1.10":
         raise EvidenceError("Core wheel release identity is invalid")
     framework_lock = _exact_mapping(
         assets["framework_lock"],
@@ -696,7 +891,7 @@ def validate_evidence(
     )
     expected_binding = {
         "source_commit": expected_source_commit,
-        "candidate_version": "0.1.9",
+        "candidate_version": "0.1.10",
         "release_candidate_manifest_sha256": expected_candidate_manifest_sha256,
         "desktop_dmg_sha256": roles["desktop_dmg"]["sha256"],
         "app_bundle_smoke_sha256": roles["app_bundle_smoke"]["sha256"],
@@ -738,7 +933,7 @@ def validate_evidence(
     expected_features = release_contract.get("required_desktop_feature_flags")
     if (
         desktop["source_commit"] != expected_source_commit
-        or desktop["release_version"] != "0.1.9"
+        or desktop["release_version"] != "0.1.10"
         or desktop["mutation_major"] != 2
         or desktop["openapi_sha256"]
         not in release_contract.get("accepted_desktop_openapi_digests", [])
@@ -898,6 +1093,11 @@ def validate_evidence(
     if any(value is not True for value in reuse.values()):
         raise EvidenceError("next-Task Runtime Context reuse was not proven")
 
+    _validate_lifecycle_evidence(
+        document["lifecycle"],
+        contract=_mapping(candidate["lifecycle_evidence"], "candidate lifecycle contract"),
+    )
+
     renderer = _exact_mapping(
         document["renderer"],
         "renderer evidence",
@@ -918,6 +1118,7 @@ def validate_evidence(
             "evolution_artifact_count",
             "system_openssh_workspace_verified",
             "remote_target_controls_verified",
+            "secret_canary_absent",
             "selected_methods",
             "observed_route_kinds",
             "screenshot_sha256",
@@ -941,6 +1142,11 @@ def validate_evidence(
         or renderer["evolution_artifact_count"] != 3
         or renderer["system_openssh_workspace_verified"] is not True
         or renderer["remote_target_controls_verified"] is not True
+        or candidate["lifecycle_evidence"].get(
+            "require_renderer_secret_canary_absence"
+        )
+        is not True
+        or renderer["secret_canary_absent"] is not True
         or renderer["selected_methods"] != methods
         or renderer["observed_route_kinds"] != ["desktop_v2", "packaged_web"]
     ):

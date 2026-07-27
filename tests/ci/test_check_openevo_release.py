@@ -2544,6 +2544,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "tests/ci/test_build_sidecar.py",
         "tests/ci/test_openevo_release_candidate.py",
         "tests/ci/test_openevo_release_evidence.py",
+        "tests/openevo/sidecar/test_core_bridge_store_v2.py::test_release_evidence_summary_requires_one_applied_project_create",
         "tests/openevo/remote/test_system_executables.py",
         "tests/openevo/remote/test_host_keys.py",
         "tests/openevo/remote/test_ssh_transport.py",

@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 from types import ModuleType, SimpleNamespace
+from typing import Callable
 from zipfile import ZipFile
 
 import pytest
@@ -139,6 +140,9 @@ class _FakeV2Api:
         *,
         ssh_host_alias: str = "evolab",
         wrong_second_context: bool = False,
+        terminal_timestamp: str = "2026-07-27T00:00:20.500000Z",
+        lifecycle_log_text: str = "OpenSSH connection established",
+        project_inventory_count: int = 1,
     ) -> None:
         self.module = module
         self.ssh_host_alias = ssh_host_alias
@@ -152,6 +156,82 @@ class _FakeV2Api:
         self.connected = False
         self.created_task_count = 0
         self.wrong_second_context = wrong_second_context
+        self.terminal_timestamp = terminal_timestamp
+        self.lifecycle_log_text = lifecycle_log_text
+        self.project_inventory_count = project_inventory_count
+        self.operation_gets: dict[str, int] = {}
+        self.current_operation_id: str | None = None
+        self.relaunch_count = 0
+
+    class _Probe:
+        def __init__(self, owner: _FakeV2Api, sequence: int) -> None:
+            self.owner = owner
+            self.sequence = sequence
+
+        def wait(self, *, timeout_seconds: float):
+            assert timeout_seconds > 0
+            assert self.owner.current_operation_id is not None
+            event_id = f"event-{self.sequence}"
+            return {
+                "event_id": event_id,
+                "envelope": {
+                    "event_id": event_id,
+                    "payload": {
+                        "payload_kind": "lifecycle_operation_changed",
+                        "operation_id": self.owner.current_operation_id,
+                    },
+                },
+            }
+
+    def start_event_probe(self, last_event_id: str | None = None):
+        sequence = 1 if last_event_id is None else 2
+        return self._Probe(self, sequence)
+
+    def relaunch(self):
+        self.relaunch_count += 1
+        return self
+
+    def _operation(
+        self,
+        operation_id: str,
+        *,
+        kind: str,
+        status: str,
+        phase: str,
+        result: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        phase_index = self.module.LIFECYCLE_PHASES.index(phase)
+        terminal = status in {"succeeded", "failed", "cancelled"}
+        return {
+            "schema_version": "2",
+            "operation_id": operation_id,
+            "kind": kind,
+            "resource": {
+                "resource_kind": "profile" if kind.startswith("profile_") else "project",
+                "resource_id": (
+                    "profile-system-openssh" if kind.startswith("profile_") else "desktop-project"
+                ),
+            },
+            "request_sha256": _digest(f"{operation_id}-request"),
+            "status": status,
+            "phase": phase,
+            "phase_index": phase_index,
+            "phase_total": len(self.module.LIFECYCLE_PHASES),
+            "progress": {"kind": "indeterminate"},
+            "cancellable": not terminal,
+            "result": result,
+            "failure": None,
+            "log_sequence_high_watermark": 2 if kind == "project_create" else 0,
+            "created_at": "2026-07-27T00:00:00.000000Z",
+            "started_at": None if status == "queued" else "2026-07-27T00:00:01.000000Z",
+            "updated_at": (
+                self.terminal_timestamp
+                if terminal
+                else "2026-07-27T00:00:05.000000Z"
+            ),
+            "finished_at": self.terminal_timestamp if terminal else None,
+            "etag": f'"{operation_id}-{status}"',
+        }
 
     def _profile(self, *, connected: bool) -> dict[str, object]:
         profile: dict[str, object] = {
@@ -245,12 +325,68 @@ class _FakeV2Api:
             }
             return self._profile(connected=False)
         if method == "POST" and route.endswith("/connect"):
-            self.connected = True
-            return {"status": "succeeded"}
+            self.current_operation_id = "operation-connect"
+            return self._operation(
+                "operation-connect",
+                kind="profile_connect",
+                status="queued",
+                phase="queued",
+            )
         if method == "GET" and route == "/desktop/v2/profiles/profile-system-openssh":
             return self._profile(connected=self.connected)
         if method == "POST" and route == "/desktop/v2/projects":
-            return self._project(0)
+            self.current_operation_id = "operation-project-create"
+            return self._operation(
+                "operation-project-create",
+                kind="project_create",
+                status="queued",
+                phase="queued",
+            )
+        if method == "GET" and route.startswith("/desktop/v2/operations/"):
+            operation_id = route.removeprefix("/desktop/v2/operations/").split("?", 1)[0]
+            gets = self.operation_gets.get(operation_id, 0) + 1
+            self.operation_gets[operation_id] = gets
+            if operation_id == "operation-connect":
+                self.connected = True
+                return self._operation(
+                    operation_id,
+                    kind="profile_connect",
+                    status="succeeded",
+                    phase="finalizing",
+                    result={
+                        "result_kind": "profile",
+                        "profile_id": "profile-system-openssh",
+                        "connection_generation": 1,
+                    },
+                )
+            if operation_id == "operation-project-create":
+                if gets == 1:
+                    return self._operation(
+                        operation_id,
+                        kind="project_create",
+                        status="running",
+                        phase="remote_preflight",
+                    )
+                return self._operation(
+                    operation_id,
+                    kind="project_create",
+                    status="succeeded",
+                    phase="finalizing",
+                    result={"result_kind": "project", "project_id": self.project_id},
+                )
+            if operation_id == "operation-disconnect":
+                self.connected = False
+                return self._operation(
+                    operation_id,
+                    kind="profile_disconnect",
+                    status="succeeded",
+                    phase="finalizing",
+                    result={
+                        "result_kind": "profile",
+                        "profile_id": "profile-system-openssh",
+                        "connection_generation": 2,
+                    },
+                )
         if method == "PATCH" and route == f"/desktop/v2/projects/{self.project_id}":
             body = kwargs["body"]
             assert isinstance(body, dict)
@@ -302,10 +438,41 @@ class _FakeV2Api:
             }
         if method == "GET" and route == f"/desktop/v2/projects/{self.project_id}":
             return self._project(self.created_task_count)
+        if method == "POST" and route.endswith("/disconnect"):
+            self.current_operation_id = "operation-disconnect"
+            return self._operation(
+                "operation-disconnect",
+                kind="profile_disconnect",
+                status="queued",
+                phase="queued",
+            )
         raise AssertionError(f"unexpected request: {method} {route}")
 
     def page(self, route: str, *, stage: str):
         self.calls.append(("PAGE", route, {"stage": stage}))
+        if route.startswith("/desktop/v2/operations/") and route.endswith("/logs"):
+            return [
+                {
+                    "schema_version": "2",
+                    "operation_id": "operation-project-create",
+                    "sequence": 1,
+                    "occurred_at": "2026-07-27T00:00:03.000000Z",
+                    "source": "ssh_stderr",
+                    "text": self.lifecycle_log_text,
+                    "truncated": False,
+                },
+                {
+                    "schema_version": "2",
+                    "operation_id": "operation-project-create",
+                    "sequence": 2,
+                    "occurred_at": "2026-07-27T00:00:04.000000Z",
+                    "source": "daemon_stdout",
+                    "text": "OpenEvo Daemon is ready",
+                    "truncated": False,
+                },
+            ]
+        if route == "/desktop/v2/projects":
+            return [self._project(self.created_task_count)] * self.project_inventory_count
         return [
             {"event_type": event_type}
             for event_type in sorted(self.module.REQUIRED_TASK_EVENT_TYPES)
@@ -324,6 +491,8 @@ def _workflow(module: ModuleType, api: _FakeV2Api):
         poll_seconds=0.001,
         activation_timeout_seconds=1,
         run_timeout_seconds=1,
+        relaunch=api.relaunch,
+        secret_canary="release-secret-canary",
     )
 
 
@@ -349,6 +518,8 @@ def test_formal_release_runner_is_v2_system_openssh_only() -> None:
 
     assert 'z.literal("2")' in renderer
     assert "/desktop/v2/" in renderer
+    assert "OPENEVO_E2E_SECRET_CANARY" in renderer
+    assert "secret_canary_absent" in renderer
     assert "/desktop/v1/" not in renderer
     assert "../../src/api/v1/" not in renderer
 
@@ -411,6 +582,35 @@ def test_two_task_workflow_uses_one_project_and_reuses_successor_head() -> None:
         "second_context_pinned_first_successor": True,
         "second_runtime_context_equals_first_successor": True,
     }
+    assert evidence["lifecycle"] == {
+        "operation_kind": "project_create",
+        "reservation_status": 202,
+        "reservation_latency_ms": evidence["lifecycle"]["reservation_latency_ms"],
+        "terminal_duration_ms": 20500,
+        "action_id_sha256": evidence["lifecycle"]["action_id_sha256"],
+        "operation_id_sha256": _digest("operation-project-create"),
+        "request_sha256": _digest("operation-project-create-request"),
+        "ordered_phases": ["queued", "remote_preflight", "finalizing"],
+        "process_logs": {
+            "entry_count": 2,
+            "sources": ["daemon_stdout", "ssh_stderr"],
+            "content_sha256": evidence["lifecycle"]["process_logs"]["content_sha256"],
+        },
+        "sse_reconnect_verified": True,
+        "relaunch_recovery_verified": True,
+        "stable_action_id_after_relaunch": True,
+        "stable_operation_id_after_relaunch": True,
+        "mutation_reissued_after_relaunch": False,
+        "core_authority": {
+            "project_count": 1,
+            "project_mapping_count": 1,
+            "applied_create_project_mutation_count": 1,
+        },
+        "secret_canary_sha256": _digest("release-secret-canary"),
+        "secret_canary_absent": True,
+    }
+    assert evidence["lifecycle"]["reservation_latency_ms"] < 15_000
+    assert api.relaunch_count == 1
 
     project_creates = [
         call for call in api.calls if call[:2] == ("POST", "/desktop/v2/projects")
@@ -435,6 +635,54 @@ def test_two_task_workflow_fails_closed_when_task_two_context_is_stale() -> None
 
     with pytest.raises(module.E2EFailure, match="task_context_invalid"):
         _workflow(module, api).run()
+
+
+@pytest.mark.parametrize(
+    ("api", "error"),
+    [
+        (
+            lambda module: _FakeV2Api(
+                module,
+                terminal_timestamp="2026-07-27T00:00:15.000000Z",
+            ),
+            "lifecycle_operation_too_short",
+        ),
+        (
+            lambda module: _FakeV2Api(module, project_inventory_count=2),
+            "core_project_authority_not_singular",
+        ),
+        (
+            lambda module: _FakeV2Api(
+                module,
+                lifecycle_log_text="release-secret-canary",
+            ),
+            "secret_canary_in_process_log",
+        ),
+    ],
+)
+def test_project_lifecycle_evidence_fails_closed(
+    api: Callable[[ModuleType], _FakeV2Api],
+    error: str,
+) -> None:
+    module = _load_runner()
+    fake = api(module)
+
+    with pytest.raises(module.E2EFailure, match=error):
+        _workflow(module, fake).run()
+
+
+def test_project_lifecycle_requires_relaunch_without_reissuing_mutation() -> None:
+    module = _load_runner()
+    api = _FakeV2Api(module)
+    workflow = _workflow(module, api)
+    workflow._relaunch = None
+
+    with pytest.raises(module.E2EFailure, match="lifecycle_relaunch_unavailable"):
+        workflow.run()
+
+    assert len(
+        [call for call in api.calls if call[:2] == ("POST", "/desktop/v2/projects")]
+    ) == 1
 
 
 def test_capability_selection_requires_supported_agent_system_auto() -> None:
@@ -488,6 +736,7 @@ def test_renderer_expectations_and_result_bind_live_v2_authority() -> None:
         "evolution_artifact_count": 3,
         "system_openssh_workspace_verified": True,
         "remote_target_controls_verified": True,
+        "secret_canary_absent": True,
         "selected_methods": expectations["method_ids"],
         "observed_route_kinds": ["desktop_v2", "packaged_web"],
         "screenshot_sha256": screenshot_digest,
@@ -501,6 +750,17 @@ def test_renderer_expectations_and_result_bind_live_v2_authority() -> None:
         screenshot_sha256=screenshot_digest,
     ) == payload
 
+    missing_canary_proof = dict(payload)
+    missing_canary_proof.pop("secret_canary_absent")
+    with pytest.raises(module.E2EFailure, match="renderer_result_schema_invalid"):
+        module._validate_renderer_result(
+            missing_canary_proof,
+            expectations=expectations,
+            source_commit=source_commit,
+            packaged_web_build_digest=web_digest,
+            screenshot_sha256=screenshot_digest,
+        )
+
     payload["desktop_api_major"] = 1
     with pytest.raises(module.E2EFailure, match="renderer_result_identity_mismatch"):
         module._validate_renderer_result(
@@ -510,6 +770,17 @@ def test_renderer_expectations_and_result_bind_live_v2_authority() -> None:
             packaged_web_build_digest=web_digest,
             screenshot_sha256=screenshot_digest,
         )
+
+
+def test_renderer_process_log_rejects_secret_canary(tmp_path: Path) -> None:
+    module = _load_runner()
+    canary = "release-renderer-secret-canary"
+    with (tmp_path / "renderer.log").open("w+b") as process_log:
+        process_log.write(b"renderer started\n")
+        module._assert_renderer_process_log(process_log, secret_canary=canary)
+        process_log.write(canary.encode("utf-8"))
+        with pytest.raises(module.E2EFailure, match="secret_canary_in_renderer_process_log"):
+            module._assert_renderer_process_log(process_log, secret_canary=canary)
 
 
 def test_native_frame_uses_the_closed_credential_protocol() -> None:
@@ -798,8 +1069,8 @@ def test_runtime_arguments_pin_release_model_profile(
 
 def _version_payload() -> dict[str, object]:
     contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))
-    v019 = contract["v019"]
-    features = v019["required_desktop_feature_flags"]
+    v0110 = contract["v0110"]
+    features = v0110["required_desktop_feature_flags"]
     feature_digest = hashlib.sha256(
         json.dumps(
             features,
@@ -815,9 +1086,9 @@ def _version_payload() -> dict[str, object]:
         "preferred_major": 2,
         "supported_majors": [2],
         "mutation_major": 2,
-        "openapi_sha256": v019["accepted_desktop_openapi_digests"][0],
-        "event_schema_sha256": v019["accepted_desktop_event_schema_digests"][0],
-        "release_version": "0.1.9",
+        "openapi_sha256": v0110["accepted_desktop_openapi_digests"][0],
+        "event_schema_sha256": v0110["accepted_desktop_event_schema_digests"][0],
+        "release_version": "0.1.10",
         "build_id": _digest("build-id"),
         "source_commit": "f" * 40,
         "build_channel": "release",

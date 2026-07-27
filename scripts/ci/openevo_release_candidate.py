@@ -18,7 +18,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 MANIFEST_NAME = "release-candidate.json"
-RELEASE_CANDIDATE_SCHEMA_VERSION = 9
+RELEASE_CANDIDATE_SCHEMA_VERSION = 10
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
@@ -169,6 +169,13 @@ CANDIDATE_WORKFLOW_RUN_KEYS = {
     "status",
 }
 
+LIFECYCLE_PROCESS_LOG_SOURCES = (
+    "daemon_stderr",
+    "daemon_stdout",
+    "ssh_stderr",
+    "ssh_stdout",
+)
+
 
 class CandidateError(RuntimeError):
     pass
@@ -191,6 +198,74 @@ def _is_regular_file(path: Path) -> bool:
 
 def _canonical_json(payload: object) -> bytes:
     return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+
+
+def _desktop_contract_manifest(version: str) -> dict[str, object]:
+    try:
+        contract = json.loads(
+            (REPO_ROOT / "desktop/release-contract.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("Desktop release contract is unreadable") from exc
+    policy = contract.get("v0110") if type(contract) is dict else None
+    if type(policy) is not dict:
+        raise CandidateError("Desktop v0.1.10 release contract is unavailable")
+    openapi = policy.get("accepted_desktop_openapi_digests")
+    events = policy.get("accepted_desktop_event_schema_digests")
+    features = policy.get("required_desktop_feature_flags")
+    if (
+        policy.get("release_version") != "0.1.10"
+        or policy.get("desktop_local_mutation_major") != 2
+        or type(openapi) is not list
+        or len(openapi) != 1
+        or type(openapi[0]) is not str
+        or DIGEST_PATTERN.fullmatch(openapi[0]) is None
+        or type(events) is not list
+        or len(events) != 1
+        or type(events[0]) is not str
+        or DIGEST_PATTERN.fullmatch(events[0]) is None
+        or type(features) is not list
+        or features != sorted(set(features))
+        or not all(type(flag) is str and flag for flag in features)
+        or not {
+            "lifecycle_operations_v2",
+            "lifecycle_process_logs_v2",
+            "mutation_idempotency_v2",
+        }.issubset(features)
+    ):
+        raise CandidateError("Desktop v0.1.10 release contract is invalid")
+    feature_set_sha256 = hashlib.sha256(
+        json.dumps(features, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    return {
+        "release_version": version,
+        "mutation_major": 2,
+        "openapi_sha256": openapi[0],
+        "event_schema_sha256": events[0],
+        "feature_flags": features,
+        "feature_set_sha256": feature_set_sha256,
+    }
+
+
+def _lifecycle_evidence_requirements() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation_kind": "project_create",
+        "reservation_status": 202,
+        "maximum_reservation_latency_ms": 15_000,
+        "minimum_terminal_duration_ms": 15_000,
+        "minimum_ordered_phase_count": 2,
+        "allowed_process_log_sources": list(LIFECYCLE_PROCESS_LOG_SOURCES),
+        "require_sse_reconnect": True,
+        "require_relaunch_recovery": True,
+        "require_stable_action_id": True,
+        "require_single_core_project": True,
+        "require_single_applied_mutation": True,
+        "require_secret_canary_absence": True,
+        "require_renderer_secret_canary_absence": True,
+    }
 
 
 def _write_new(path: Path, payload: bytes) -> None:
@@ -1718,7 +1793,9 @@ def create_candidate_manifest(
             "manifest_sha256": _sha256(paths["daemon_manifest"]),
             "release_identity": daemon_manifest["release"]["identity"],
         },
+        "desktop_contract": _desktop_contract_manifest(version),
         "files": files,
+        "lifecycle_evidence": _lifecycle_evidence_requirements(),
         "macos": {
             "architecture": architecture,
             "minimum_system_version": MINIMUM_MACOS_VERSION,
@@ -1767,6 +1844,8 @@ def _validate_candidate_manifest(
         "managed_runtime",
         "core",
         "daemon",
+        "desktop_contract",
+        "lifecycle_evidence",
         "files",
     }
     if type(manifest) is not dict or set(manifest) != required_keys:
@@ -1778,6 +1857,8 @@ def _validate_candidate_manifest(
     managed_runtime = manifest.get("managed_runtime")
     core = manifest.get("core")
     daemon = manifest.get("daemon")
+    desktop_contract = manifest.get("desktop_contract")
+    lifecycle_evidence = manifest.get("lifecycle_evidence")
     files = manifest.get("files")
     if manifest.get("schema_version") != RELEASE_CANDIDATE_SCHEMA_VERSION:
         raise CandidateError("candidate manifest schema version is invalid")
@@ -1787,6 +1868,10 @@ def _validate_candidate_manifest(
         raise CandidateError("candidate source commit does not match the expected checkout")
     if type(version) is not str or not version:
         raise CandidateError("candidate version is invalid")
+    if desktop_contract != _desktop_contract_manifest(version):
+        raise CandidateError("candidate Desktop lifecycle contract is invalid")
+    if lifecycle_evidence != _lifecycle_evidence_requirements():
+        raise CandidateError("candidate lifecycle evidence requirements are invalid")
     if release != {
         "app_bundle_signature": "adhoc",
         "channel": "unsigned-preview",
