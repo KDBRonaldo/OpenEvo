@@ -373,7 +373,7 @@ export function LifecycleOperationPanelV2({
         {model.droppedBeforeSequence > 0 ? (
           <p className="lifecycle-log-notice">Earlier log lines through sequence {model.droppedBeforeSequence} are no longer retained.</p>
         ) : null}
-        <ol className="lifecycle-log-viewport" aria-label="Operation process log">
+        <ol className="lifecycle-log-viewport" aria-label="Operation process log" tabIndex={0}>
           {visibleLogs.length === 0 ? <li className="lifecycle-log-empty">{model.emptyLogMessage ?? "Waiting for process output…"}</li> : visibleLogs.map((entry) => (
             <li key={entry.sequence}>
               <span className="lifecycle-log-sequence">{entry.sequence}</span>
