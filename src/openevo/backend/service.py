@@ -92,6 +92,11 @@ class CoreServiceErrorCode(StrEnum):
     VERIFICATION_FAILED = "core_service_verification_failed"
 
 
+class _ProductionV2DiscoveryAuthority(StrEnum):
+    CURRENT = "current"
+    PUBLISHED_V019_PREDECESSOR = "published_v019_predecessor"
+
+
 class CoreServiceError(RuntimeError):
     def __init__(
         self,
@@ -263,6 +268,53 @@ class CoreDaemonBundleIdentity:
             or self.lifecycle_compatibility < 2
         ):
             raise ValueError("Core Daemon bundle identity is invalid.")
+
+
+@dataclass(frozen=True, slots=True)
+class _PublishedDaemonPredecessorProfile:
+    release_version: str
+    release: CoreReleaseIdentity
+    daemon: CoreDaemonBundleIdentity
+    build_id: str
+    openapi_sha256: str
+    event_schema_sha256: str
+    feature_flags: tuple[str, ...]
+    feature_set_sha256: str
+    runtime_contract_sha256: str
+
+
+_PUBLISHED_V019_PREDECESSOR = _PublishedDaemonPredecessorProfile(
+    release_version="0.1.9",
+    release=CoreReleaseIdentity(
+        digest="a7e838f5041c5fbd9414f156034791463fd1590caa183066281cf9d07d276298",
+        registry_digest=("0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"),
+        framework_lock_sha256=("c603f9951bf3234d3ee2b1e648650d162f289c9f724b8417452c0119f0ab2406"),
+        source_commit="54650e477a76dd07b0a511ad5450c3b8ea615556",
+    ),
+    daemon=CoreDaemonBundleIdentity(
+        bundle_sha256=("58787c1ff65b3659b2386659843820dc2cca752d99f44e4869cb4065606c0294"),
+        canonical_manifest_sha256=(
+            "ec9a11829eadd298adcbf2c7d467b426a38ad62d5ce283d7068a0b78dfdc4287"
+        ),
+        lifecycle_compatibility=16,
+    ),
+    build_id="4b42bb11dcd5b3aa66d9de112b101e3f248c6d4e722956f16588f1b288e0559c",
+    openapi_sha256="f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b",
+    event_schema_sha256=("464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"),
+    feature_flags=(
+        "atomic_successor_v2",
+        "event_replay_v2",
+        "project_genesis_v2",
+        "project_heads_v2",
+        "task_admission_v2",
+        "task_execution_v2",
+        "verified_capabilities",
+        "verified_registry",
+        "workspace_snapshots_v2",
+    ),
+    feature_set_sha256=("ba514a0165727757d147ab09d9ee934a0c0eab2411ec5e2244d49237146d3f56"),
+    runtime_contract_sha256=("535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"),
+)
 
 
 class CoreServiceEndpoint(Protocol):
@@ -738,6 +790,11 @@ def observe_core_service_predecessor(
                     generation=ledger["generation"],
                     deadline=deadline,
                     require_production_v2=_ledger_requires_production_v2(ledger),
+                    production_v2_authority=(
+                        _ProductionV2DiscoveryAuthority.PUBLISHED_V019_PREDECESSOR
+                        if _is_exact_published_v019_predecessor_ledger(ledger)
+                        else None
+                    ),
                 )
                 _verify_ready_ledger(root, ledger, proof)
                 return _predecessor_from_ledger(ledger)
@@ -1096,10 +1153,16 @@ def _ensure_locked(
     existing_value = root.read_optional_json(_LEDGER_NAME)
     floor: dict[str, Any] | None = None
     predecessor_consumed = False
+    published_v019_upgrade = False
     if existing_value is None:
         _recover_pending(root, controller=controller, deadline=deadline)
     if existing_value is not None:
         state = _require_service_state(existing_value)
+        published_v019_upgrade = _is_v0110_published_v019_upgrade(
+            state,
+            release=release,
+            candidate=daemon_bundle_identity,
+        )
         if state.get("state") == "stopped":
             floor = state
             if expected_predecessor is not None:
@@ -1168,7 +1231,11 @@ def _ensure_locked(
                     if (
                         not replace_mismatched
                         or current_compatibility is None
-                        or daemon_bundle_identity.lifecycle_compatibility <= current_compatibility
+                        or daemon_bundle_identity.lifecycle_compatibility < current_compatibility
+                        or (
+                            daemon_bundle_identity.lifecycle_compatibility == current_compatibility
+                            and not published_v019_upgrade
+                        )
                     ):
                         raise CoreServiceError(
                             CoreServiceErrorCode.UPDATE_REQUIRED,
@@ -1206,7 +1273,11 @@ def _ensure_locked(
                     root.unlink_regular(_READY_NAME)
                     root.unlink_regular(_PENDING_NAME)
         if floor is not None:
-            _require_floor_compatibility(floor, daemon_bundle_identity)
+            _require_floor_compatibility(
+                floor,
+                daemon_bundle_identity,
+                allow_equal_replacement=published_v019_upgrade,
+            )
             if expected_predecessor is not None and not predecessor_consumed:
                 _require_predecessor_match(
                     expected=expected_predecessor,
@@ -1475,8 +1546,9 @@ def _authenticated_status_proof(
     deadline: float,
     host: str = "127.0.0.1",
     require_production_v2: bool = False,
+    production_v2_authority: _ProductionV2DiscoveryAuthority | None = None,
 ) -> str:
-    return authenticate_core_service_endpoint(
+    return _authenticate_core_service_endpoint(
         host=host,
         port=port,
         bearer=bearer,
@@ -1486,6 +1558,7 @@ def _authenticated_status_proof(
         generation=generation,
         deadline=deadline,
         require_production_v2=require_production_v2,
+        production_v2_authority=production_v2_authority,
     )
 
 
@@ -1536,6 +1609,83 @@ def _is_exact_production_v2_discovery(
         and offer.mutation_compatible is True
         and offer.openapi_sha256 == core_v2_openapi_sha256()
         and offer.event_schema_sha256 == core_v2_events_schema_sha256()
+    )
+
+
+def _is_exact_published_v019_predecessor_ledger(ledger: dict[str, Any]) -> bool:
+    profile = _PUBLISHED_V019_PREDECESSOR
+    return bool(
+        _is_exact_daemon_ledger(ledger)
+        and ledger.get("release_identity") == profile.release.digest
+        and ledger.get("registry_digest") == profile.release.registry_digest
+        and ledger.get("framework_lock_sha256") == profile.release.framework_lock_sha256
+        and ledger.get("source_commit") == profile.release.source_commit
+        and ledger.get("bundle_sha256") == profile.daemon.bundle_sha256
+        and ledger.get("canonical_manifest_sha256") == profile.daemon.canonical_manifest_sha256
+        and ledger.get("lifecycle_compatibility") == profile.daemon.lifecycle_compatibility
+    )
+
+
+def _is_exact_published_v019_predecessor_floor(value: dict[str, Any]) -> bool:
+    profile = _PUBLISHED_V019_PREDECESSOR
+    return bool(
+        value.get("schema_version") == 3
+        and value.get("state") == "stopped"
+        and value.get("release_identity") == profile.release.digest
+        and value.get("bundle_sha256") == profile.daemon.bundle_sha256
+        and value.get("canonical_manifest_sha256") == profile.daemon.canonical_manifest_sha256
+        and value.get("lifecycle_compatibility") == profile.daemon.lifecycle_compatibility
+    )
+
+
+def _is_v0110_published_v019_upgrade(
+    predecessor: dict[str, Any],
+    *,
+    release: CoreReleaseIdentity,
+    candidate: CoreDaemonBundleIdentity | None,
+) -> bool:
+    profile = _PUBLISHED_V019_PREDECESSOR
+    return bool(
+        __version__ == "0.1.10"
+        and candidate is not None
+        and (
+            _is_exact_published_v019_predecessor_ledger(predecessor)
+            or _is_exact_published_v019_predecessor_floor(predecessor)
+        )
+        and release.digest != profile.release.digest
+        and release.source_commit != profile.release.source_commit
+        and candidate.lifecycle_compatibility == V2_DAEMON_LIFECYCLE_COMPATIBILITY
+        and candidate.lifecycle_compatibility == profile.daemon.lifecycle_compatibility
+        and candidate.bundle_sha256 != profile.daemon.bundle_sha256
+        and candidate.canonical_manifest_sha256 != profile.daemon.canonical_manifest_sha256
+    )
+
+
+def _is_exact_published_v019_predecessor_discovery(
+    version: core_v2_models.VersionResponseV2,
+) -> bool:
+    profile = _PUBLISHED_V019_PREDECESSOR
+    if (
+        version.preferred_major != 2
+        or version.supported_majors != [2]
+        or version.mutation_major != 2
+        or version.release_version != profile.release_version
+        or version.build_id != profile.build_id
+        or version.source_commit != profile.release.source_commit
+        or version.registry_sha256 != profile.release.registry_digest
+        or tuple(version.feature_flags) != profile.feature_flags
+        or version.feature_set_sha256 != profile.feature_set_sha256
+        or version.runtime_contract_sha256 != profile.runtime_contract_sha256
+        or len(version.contracts) != 1
+    ):
+        return False
+    offer = version.contracts[0]
+    return (
+        offer.api_major == 2
+        and offer.access == "mutation"
+        and offer.mutation_compatible is True
+        and offer.openapi_sha256 == profile.openapi_sha256
+        and offer.event_schema_sha256 == profile.event_schema_sha256
     )
 
 
@@ -1603,6 +1753,36 @@ def authenticate_core_service_endpoint(
     endpoint: CoreServiceEndpoint | None = None,
     require_production_v2: bool = False,
 ) -> str:
+    """Authenticate without the private published-predecessor observation exception."""
+
+    return _authenticate_core_service_endpoint(
+        host=host,
+        port=port,
+        bearer=bearer,
+        release_identity=release_identity,
+        registry_digest=registry_digest,
+        source_commit=source_commit,
+        generation=generation,
+        deadline=deadline,
+        endpoint=endpoint,
+        require_production_v2=require_production_v2,
+    )
+
+
+def _authenticate_core_service_endpoint(
+    *,
+    host: str | None,
+    port: int | None,
+    bearer: str,
+    release_identity: str,
+    registry_digest: str,
+    source_commit: str,
+    generation: str,
+    deadline: float,
+    endpoint: CoreServiceEndpoint | None = None,
+    require_production_v2: bool = False,
+    production_v2_authority: _ProductionV2DiscoveryAuthority | None = None,
+) -> str:
     if (
         ((endpoint is None) != (host == "127.0.0.1" and type(port) is int and 1 <= port <= 65535))
         or re.fullmatch(r"[A-Za-z0-9_-]{64}", bearer) is None
@@ -1611,6 +1791,13 @@ def authenticate_core_service_endpoint(
         or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
         or re.fullmatch(r"[0-9a-f]{32}", generation) is None
         or not isinstance(require_production_v2, bool)
+        or (
+            production_v2_authority is not None
+            and (
+                not require_production_v2
+                or type(production_v2_authority) is not _ProductionV2DiscoveryAuthority
+            )
+        )
     ):
         raise CoreServiceError(
             CoreServiceErrorCode.STATUS_INVALID,
@@ -1669,7 +1856,15 @@ def authenticate_core_service_endpoint(
             or status_v2.release_version != version_v2.release_version
             or status_v2.source_commit != source_commit
             or status_v2.registry_sha256 != registry_digest
-            or (require_production_v2 and not _is_exact_production_v2_discovery(version_v2))
+            or (
+                require_production_v2
+                and not (
+                    _is_exact_published_v019_predecessor_discovery(version_v2)
+                    if production_v2_authority
+                    is _ProductionV2DiscoveryAuthority.PUBLISHED_V019_PREDECESSOR
+                    else _is_exact_production_v2_discovery(version_v2)
+                )
+            )
         ):
             raise CoreServiceError(
                 CoreServiceErrorCode.STATUS_INVALID,
@@ -2395,6 +2590,8 @@ def _floor_from_ledger(ledger: dict[str, Any]) -> dict[str, Any]:
 def _require_floor_compatibility(
     floor: dict[str, Any],
     candidate: CoreDaemonBundleIdentity | None,
+    *,
+    allow_equal_replacement: bool = False,
 ) -> None:
     if candidate is None:
         raise CoreServiceError(
@@ -2408,7 +2605,14 @@ def _require_floor_compatibility(
         and candidate.bundle_sha256 == floor["bundle_sha256"]
         and candidate.canonical_manifest_sha256 == floor["canonical_manifest_sha256"]
     )
-    if candidate.lifecycle_compatibility <= floor_compatibility and not exact:
+    allowed_equal_replacement = (
+        allow_equal_replacement and candidate.lifecycle_compatibility == floor_compatibility
+    )
+    if (
+        candidate.lifecycle_compatibility <= floor_compatibility
+        and not exact
+        and not allowed_equal_replacement
+    ):
         raise CoreServiceError(
             CoreServiceErrorCode.UPDATE_REQUIRED,
             "The OpenEvo Daemon bundle does not satisfy the persisted no-downgrade floor.",
