@@ -18,6 +18,7 @@ from desktop.sidecar.system_ssh_session import (
     SystemOpenSshSessionError,
     SystemOpenSshSessionOwner,
 )
+from desktop.sidecar.lifecycle_logs_v2 import LifecycleRawOutputObserverV2
 from openevo.deployment.host_keys import (
     HostKeyCandidate,
     HostKeyAlgorithm,
@@ -476,6 +477,7 @@ class _SystemSessionOwnerV2(Protocol):
         *,
         connection_generation: int,
         prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
     ) -> object: ...
 
     def active_session(self) -> SystemOpenSshSession: ...
@@ -540,6 +542,7 @@ class SystemOpenSshRemoteLifecycleV2:
         transport_factory: SystemTransportFactoryV2 = _system_transport_factory_v2,
         discovery_timeout_seconds: float = 30.0,
         owned_askpass_helper: AskpassHelperAuthority | None = None,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
     ) -> None:
         if any(
             not callable(getattr(session_owner, method, None))
@@ -553,7 +556,12 @@ class SystemOpenSshRemoteLifecycleV2:
             raise TypeError("system OpenSSH host trust authority is invalid")
         if not callable(transport_factory):
             raise TypeError("system OpenSSH transport factory is invalid")
-        if owned_askpass_helper is not None and type(owned_askpass_helper) is not AskpassHelperAuthority:
+        if output_observer is not None and not callable(output_observer):
+            raise TypeError("system OpenSSH output observer is invalid")
+        if (
+            owned_askpass_helper is not None
+            and type(owned_askpass_helper) is not AskpassHelperAuthority
+        ):
             raise TypeError("owned system OpenSSH askpass helper is invalid")
         if (
             isinstance(discovery_timeout_seconds, bool)
@@ -571,6 +579,7 @@ class SystemOpenSshRemoteLifecycleV2:
         self._active: _ActiveSystemRemoteV2 | None = None
         self._pending_reviews: dict[str, PendingSystemHostKeyReview] = {}
         self._prompt_observer: SystemPromptObserverV2 | None = None
+        self._output_observer = output_observer
         self._closed = False
 
     def set_prompt_observer(self, observer: SystemPromptObserverV2) -> None:
@@ -603,9 +612,7 @@ class SystemOpenSshRemoteLifecycleV2:
                 or active.profile_id != profile_id
                 or active.connection_generation != profile_connection_generation
             ):
-                raise RemoteConnectionFailedError(
-                    "The requested remote profile is not connected."
-                )
+                raise RemoteConnectionFailedError("The requested remote profile is not connected.")
             return active.transport
 
     def disconnect(self, profile_id: str, connection_generation: int) -> None:
@@ -643,9 +650,7 @@ class SystemOpenSshRemoteLifecycleV2:
                 or pending.review_id != request.review_id
                 or pending.review_sha256 != request.review_sha256
             ):
-                raise RemoteConnectionFailedError(
-                    "The pending SSH host key is no longer current."
-                )
+                raise RemoteConnectionFailedError("The pending SSH host key is no longer current.")
             if request.action == "reject":
                 self._pending_reviews.pop(profile.profile_id, None)
                 self._close_active()
@@ -707,16 +712,23 @@ class SystemOpenSshRemoteLifecycleV2:
             def observe_prompt(observation: AskpassPromptObservation) -> None:
                 if (
                     observer is not None
-                    and observation.connection_generation
-                    == profile.connection_generation
+                    and observation.connection_generation == profile.connection_generation
                 ):
                     observer(profile.profile_id, observation)
 
-            self._session_owner.connect(
-                alias,
-                connection_generation=profile.connection_generation,
-                prompt_observer=observe_prompt if observer is not None else None,
-            )
+            if self._output_observer is not None:
+                self._session_owner.connect(
+                    alias,
+                    connection_generation=profile.connection_generation,
+                    prompt_observer=observe_prompt if observer is not None else None,
+                    output_observer=self._output_observer,
+                )
+            else:
+                self._session_owner.connect(
+                    alias,
+                    connection_generation=profile.connection_generation,
+                    prompt_observer=observe_prompt if observer is not None else None,
+                )
             session = self._session_owner.active_session()
             result = session.run(
                 "id -un",
@@ -803,14 +815,10 @@ class SystemOpenSshRemoteLifecycleV2:
     @staticmethod
     def _remote_user(result: RemoteCommandResult) -> str:
         if not result.ok or type(result.stdout) is not str:
-            raise RemoteConnectionFailedError(
-                "The SSH remote user could not be discovered."
-            )
+            raise RemoteConnectionFailedError("The SSH remote user could not be discovered.")
         lines = result.stdout.splitlines()
         if len(lines) != 1 or _SYSTEM_REMOTE_USER.fullmatch(lines[0]) is None:
-            raise RemoteConnectionFailedError(
-                "The SSH remote user could not be discovered."
-            )
+            raise RemoteConnectionFailedError("The SSH remote user could not be discovered.")
         return lines[0]
 
     @staticmethod
@@ -824,7 +832,9 @@ class SystemOpenSshRemoteLifecycleV2:
 
     @staticmethod
     def _validate_connect_profile(profile: local_v2.RemoteWorkspaceProfileV2) -> None:
-        if type(profile) is not local_v2.RemoteWorkspaceProfileV2 or profile.connection_state not in {
+        if type(
+            profile
+        ) is not local_v2.RemoteWorkspaceProfileV2 or profile.connection_state not in {
             "connecting",
             "bootstrapping",
             "negotiating",
@@ -834,9 +844,7 @@ class SystemOpenSshRemoteLifecycleV2:
     def _require_open(self) -> None:
         with self._state:
             if self._closed:
-                raise RemoteConnectionFailedError(
-                    "The requested remote profile is not connected."
-                )
+                raise RemoteConnectionFailedError("The requested remote profile is not connected.")
 
 
 __all__ = (

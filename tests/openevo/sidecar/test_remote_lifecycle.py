@@ -14,6 +14,10 @@ from desktop.sidecar.contracts.v1.models import (
     RemoteProfileV1,
 )
 from desktop.sidecar.contracts.v2 import models as local_v2
+from desktop.sidecar.lifecycle_logs_v2 import (
+    LifecycleLogSourceV2,
+    LifecycleRawOutputObserverV2,
+)
 from desktop.sidecar.remote_lifecycle import (
     DesktopRemoteLifecycle,
     RemoteConnectionFailedError,
@@ -565,6 +569,7 @@ class _SystemSessionOwner:
         self.connections: list[tuple[SystemOpenSshAliasProfile, int]] = []
         self.disconnects = 0
         self.prompt_observer: Callable[[AskpassPromptObservation], None] | None = None
+        self.output_observer: LifecycleRawOutputObserverV2 | None = None
 
     def connect(
         self,
@@ -572,9 +577,11 @@ class _SystemSessionOwner:
         *,
         connection_generation: int,
         prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
     ) -> object:
         self.connections.append((profile, connection_generation))
         self.prompt_observer = prompt_observer
+        self.output_observer = output_observer
         if self.failures:
             raise self.failures.pop(0)
         self.active = _SystemSession(profile.ssh_host_alias)
@@ -639,8 +646,7 @@ def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -
     assert owner.active is not None
     assert owner.active.commands == ["id -un"]
     assert (
-        lifecycle.active_transport(profile.profile_id, profile.connection_generation)
-        is transport
+        lifecycle.active_transport(profile.profile_id, profile.connection_generation) is transport
     )
     with pytest.raises(RemoteConnectionFailedError):
         lifecycle.active_transport(profile.profile_id, profile.connection_generation - 1)
@@ -648,6 +654,27 @@ def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -
     lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
     assert transport.closed
     assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_passes_only_the_closed_process_output_observer() -> None:
+    owner = _SystemSessionOwner()
+    observed: list[tuple[str, bytes]] = []
+
+    def output_observer(source: LifecycleLogSourceV2, chunk: bytes) -> None:
+        observed.append((source, chunk))
+
+    typed_output_observer: LifecycleRawOutputObserverV2 = output_observer
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: _SystemTransport(),
+        output_observer=typed_output_observer,
+    )
+
+    lifecycle.connect(_system_profile())
+
+    assert owner.output_observer is typed_output_observer
+    assert observed == []
 
 
 def test_v2_lifecycle_replaces_only_the_exact_changed_key_review() -> None:

@@ -28,6 +28,10 @@ from desktop.sidecar.askpass_broker import (
     ProcessInspector,
     SystemProcessInspector,
 )
+from desktop.sidecar.lifecycle_logs_v2 import (
+    LifecycleLogSourceV2,
+    LifecycleRawOutputObserverV2,
+)
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import SystemOpenSshAliasProfile
 from openevo.deployment.host_keys import (
@@ -446,11 +450,16 @@ class SystemOpenSshSessionSnapshot:
 class _CapturedSshMasterProcess:
     """Drain bounded SSH diagnostics without ever exposing the raw stream."""
 
-    def __init__(self, process: subprocess.Popen[bytes]) -> None:
+    def __init__(
+        self,
+        process: subprocess.Popen[bytes],
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
+    ) -> None:
         if process.stderr is None:
             raise ValueError("system OpenSSH diagnostic stream is unavailable")
         self._process = process
         self._stream = process.stderr
+        self._output_observer = output_observer
         self._guard = threading.Lock()
         self._captured = bytearray()
         self._overflow = False
@@ -492,6 +501,7 @@ class _CapturedSshMasterProcess:
                 chunk = self._stream.read(8_192)
                 if not chunk:
                     break
+                _notify_output_observer(self._output_observer, "ssh_stderr", chunk)
                 with self._guard:
                     if self._overflow:
                         continue
@@ -512,10 +522,20 @@ class _CapturedSshMasterProcess:
 
 
 class _SystemSshMasterLauncher:
-    def __init__(self, owner_helper: AskpassHelperAuthority) -> None:
+    def __init__(
+        self,
+        owner_helper: AskpassHelperAuthority,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
+    ) -> None:
         if type(owner_helper) is not AskpassHelperAuthority:
             raise TypeError("system OpenSSH owner helper is invalid")
         self._owner_helper = owner_helper
+        self._output_observer = output_observer
+
+    def set_output_observer(self, observer: LifecycleRawOutputObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("system OpenSSH output observer is invalid")
+        self._output_observer = observer
 
     def spawn(
         self,
@@ -549,7 +569,7 @@ class _SystemSshMasterLauncher:
             )
             executable.verify_path_binding()
             self._owner_helper.verify()
-            return _CapturedSshMasterProcess(process)
+            return _CapturedSshMasterProcess(process, self._output_observer)
         except BaseException:
             if process is not None and process.poll() is None:
                 process.terminate()
@@ -655,6 +675,7 @@ class SystemOpenSshSession:
         launcher: SshMasterLauncher | None = None,
         runner: SessionRunner | None = None,
         host_trust: SystemOpenSshHostTrust | None = None,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
         conditional_config: bool = False,
         startup_timeout_seconds: float = _DEFAULT_STARTUP_TIMEOUT_SECONDS,
         cleanup_timeout_seconds: float = _DEFAULT_CLEANUP_TIMEOUT_SECONDS,
@@ -672,6 +693,8 @@ class SystemOpenSshSession:
             raise TypeError("askpass helper ownership must be boolean")
         if host_trust is not None and not isinstance(host_trust, SystemOpenSshHostTrust):
             raise TypeError("system OpenSSH host trust authority is invalid")
+        if output_observer is not None and not callable(output_observer):
+            raise TypeError("system OpenSSH output observer is invalid")
         if type(conditional_config) is not bool:
             raise TypeError("conditional OpenSSH config flag must be boolean")
         if not 0 < startup_timeout_seconds <= _MAX_STARTUP_TIMEOUT_SECONDS:
@@ -686,8 +709,13 @@ class SystemOpenSshSession:
         self._inherited_environment = dict(inherited_environment)
         self._runtime_parent = Path(runtime_parent)
         self._inspector = inspector or SystemProcessInspector()
-        self._launcher = launcher or _SystemSshMasterLauncher(askpass_helper)
+        self._output_observer = output_observer
+        self._launcher = launcher or _SystemSshMasterLauncher(
+            askpass_helper,
+            output_observer,
+        )
         self._runner = runner or _run_bounded_subprocess
+        self._uses_default_runner = runner is None
         self._owns_host_trust = host_trust is None
         self._host_trust = host_trust or SystemOpenSshHostTrust(
             home=home,
@@ -751,6 +779,20 @@ class SystemOpenSshSession:
                     "SSH prompt observer cannot be changed.",
                 )
             self._prompt_observer = observer
+
+    def set_output_observer(self, observer: LifecycleRawOutputObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("SSH output observer must be callable")
+        with self._guard:
+            if self._started or self._closed or self._output_observer is not None:
+                raise _session_error(
+                    "ssh_session_state_invalid",
+                    "SSH output observer cannot be changed.",
+                )
+            self._output_observer = observer
+            configure = getattr(self._launcher, "set_output_observer", None)
+            if callable(configure):
+                configure(observer)
 
     def start(self) -> SystemOpenSshSessionSnapshot:
         with self._guard:
@@ -874,7 +916,7 @@ class SystemOpenSshSession:
     def run(self, command: str, *, timeout_seconds: float = 30.0) -> RemoteCommandResult:
         argv = self.command_argv(command)
         environment = self._base_environment()
-        completed = self._runner(argv, environment, timeout_seconds)
+        completed = self._run_session_subprocess(argv, environment, timeout_seconds)
         return RemoteCommandResult(
             command=command,
             return_code=completed.returncode,
@@ -924,7 +966,7 @@ class SystemOpenSshSession:
             if snapshot is not None and control_identity is not None:
                 try:
                     self._verify_control_socket(snapshot.control_path, control_identity)
-                    self._runner(
+                    self._run_session_subprocess(
                         build_system_openssh_control_argv(
                             self._profile,
                             control_path=snapshot.control_path,
@@ -1073,7 +1115,7 @@ class SystemOpenSshSession:
         runtime = self._runtime
         if runtime is None:
             raise _session_error("ssh_session_unavailable", "SSH runtime is unavailable.")
-        completed = self._runner(
+        completed = self._run_session_subprocess(
             build_system_openssh_control_argv(
                 self._profile,
                 control_path=runtime.path / _CONTROL_SOCKET_NAME,
@@ -1092,6 +1134,38 @@ class SystemOpenSshSession:
             home=self._home,
             inherited=self._inherited_environment,
         )
+
+    def _run_session_subprocess(
+        self,
+        argv: list[str],
+        environment: dict[str, str],
+        timeout_seconds: float,
+    ) -> subprocess.CompletedProcess[bytes]:
+        if self._uses_default_runner:
+            return _run_bounded_subprocess(
+                argv,
+                environment,
+                timeout_seconds,
+                output_observer=self._output_observer,
+            )
+        completed = self._runner(argv, environment, timeout_seconds)
+        if type(completed.stdout) is bytes:
+            _notify_output_observer(
+                self._output_observer,
+                "ssh_stdout",
+                completed.stdout,
+            )
+        if type(completed.stderr) is bytes:
+            _notify_output_observer(
+                self._output_observer,
+                "ssh_stderr",
+                completed.stderr,
+            )
+        return completed
+
+    def _follower_output_observer(self) -> LifecycleRawOutputObserverV2 | None:
+        with self._guard:
+            return self._output_observer
 
     def _require_healthy_locked(self) -> SystemOpenSshSessionSnapshot:
         if self._closed or self._cancelled or self._snapshot is None:
@@ -1235,6 +1309,7 @@ class SystemOpenSshSessionOwner:
         *,
         connection_generation: int,
         prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
     ) -> SystemOpenSshSessionSnapshot:
         with self._guard:
             if self._closed:
@@ -1247,6 +1322,8 @@ class SystemOpenSshSessionOwner:
                 try:
                     if prompt_observer is not None:
                         session.set_prompt_observer(prompt_observer)
+                    if output_observer is not None:
+                        session.set_output_observer(output_observer)
                     snapshot = session.start()
                 except BaseException as exc:
                     try:
@@ -1300,10 +1377,7 @@ class SystemOpenSshFollowerTransportAuthority:
             or not remote_user
             or len(remote_user) > 128
             or any(
-                not (
-                    character.isascii()
-                    and (character.isalnum() or character in "._%+-")
-                )
+                not (character.isascii() and (character.isalnum() or character in "._%+-"))
                 for character in remote_user
             )
         ):
@@ -1344,10 +1418,7 @@ class SystemOpenSshFollowerTransportAuthority:
             or any(
                 argument not in allowed
                 and re.fullmatch(r"--max-size=[1-9][0-9]{0,19}", argument) is None
-                and re.fullmatch(
-                    r"--filter=protect /[A-Za-z0-9._-]{1,128}", argument
-                )
-                is None
+                and re.fullmatch(r"--filter=protect /[A-Za-z0-9._-]{1,128}", argument) is None
                 for argument in arguments
             )
             or (
@@ -1387,6 +1458,8 @@ class SystemOpenSshFollowerTransportAuthority:
         *,
         stdin_fd: int | None,
         cancel_event: threading.Event | None,
+        stdout_source: LifecycleLogSourceV2 | None = "ssh_stdout",
+        stderr_source: LifecycleLogSourceV2 | None = "ssh_stderr",
     ) -> subprocess.CompletedProcess[str]:
         self._consume(argv)
         self.verify_authority()
@@ -1396,6 +1469,9 @@ class SystemOpenSshFollowerTransportAuthority:
             timeout_seconds,
             stdin_fd=stdin_fd,
             cancel_event=cancel_event,
+            output_observer=self._session._follower_output_observer(),
+            stdout_source=stdout_source,
+            stderr_source=stderr_source,
         )
         self.verify_authority()
         return completed
@@ -1489,6 +1565,9 @@ def _run_verified_follower_subprocess(
     *,
     stdin_fd: int | None,
     cancel_event: threading.Event | None,
+    output_observer: LifecycleRawOutputObserverV2 | None = None,
+    stdout_source: LifecycleLogSourceV2 | None = "ssh_stdout",
+    stderr_source: LifecycleLogSourceV2 | None = "ssh_stderr",
 ) -> subprocess.CompletedProcess[str]:
     if (
         not argv
@@ -1496,6 +1575,8 @@ def _run_verified_follower_subprocess(
         or not 0 < timeout_seconds <= 3600
         or (stdin_fd is not None and (type(stdin_fd) is not int or stdin_fd < 0))
         or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
+        or stdout_source not in {None, "ssh_stdout", "daemon_stdout"}
+        or stderr_source not in {None, "ssh_stderr", "daemon_stderr"}
     ):
         raise ValueError("system OpenSSH follower subprocess request is invalid")
     if cancel_event is not None and cancel_event.is_set():
@@ -1542,6 +1623,9 @@ def _run_verified_follower_subprocess(
             argv,
             timeout_seconds,
             cancel_event=cancel_event,
+            output_observer=output_observer,
+            stdout_source=stdout_source,
+            stderr_source=stderr_source,
         )
         encoding = locale.getpreferredencoding(False)
         return subprocess.CompletedProcess(
@@ -1562,6 +1646,9 @@ def _collect_follower_process(
     timeout_seconds: float,
     *,
     cancel_event: threading.Event | None,
+    output_observer: LifecycleRawOutputObserverV2 | None = None,
+    stdout_source: LifecycleLogSourceV2 | None = "ssh_stdout",
+    stderr_source: LifecycleLogSourceV2 | None = "ssh_stderr",
 ) -> subprocess.CompletedProcess[bytes]:
     assert process.stdout is not None and process.stderr is not None
     deadline = time.monotonic() + timeout_seconds
@@ -1594,6 +1681,9 @@ def _collect_follower_process(
                         "ssh_output_limit_exceeded",
                         "System SSH follower output exceeded its limit.",
                     )
+                source = stdout_source if key.data == "stdout" else stderr_source
+                if source is not None:
+                    _notify_output_observer(output_observer, source, chunk)
                 chunks[key.data].append(chunk)
         process.wait(timeout=max(0.001, deadline - time.monotonic()))
     except BaseException:
@@ -1629,10 +1719,27 @@ def _signal_follower_group(
         return
 
 
+def _notify_output_observer(
+    observer: LifecycleRawOutputObserverV2 | None,
+    source: LifecycleLogSourceV2,
+    chunk: bytes,
+) -> None:
+    if observer is None or not chunk:
+        return
+    try:
+        observer(source, chunk)
+    except Exception:
+        # Process-output observation is diagnostic and cannot change child
+        # success, failure, cancellation, or timeout authority.
+        pass
+
+
 def _run_bounded_subprocess(
     argv: list[str],
     environment: dict[str, str],
     timeout_seconds: float,
+    *,
+    output_observer: LifecycleRawOutputObserverV2 | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("SSH subprocess timeout is invalid")
@@ -1645,13 +1752,20 @@ def _run_bounded_subprocess(
         close_fds=True,
         start_new_session=False,
     )
-    return _collect_bounded_process(process, argv, timeout_seconds)
+    return _collect_bounded_process(
+        process,
+        argv,
+        timeout_seconds,
+        output_observer=output_observer,
+    )
 
 
 def _run_verified_bounded_subprocess(
     argv: list[str],
     environment: dict[str, str],
     timeout_seconds: float,
+    *,
+    output_observer: LifecycleRawOutputObserverV2 | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if not argv:
         raise ValueError("verified SSH subprocess argv is empty")
@@ -1670,7 +1784,12 @@ def _run_verified_bounded_subprocess(
             start_new_session=False,
         )
         executable.verify_path_binding()
-        return _collect_bounded_process(process, argv, timeout_seconds)
+        return _collect_bounded_process(
+            process,
+            argv,
+            timeout_seconds,
+            output_observer=output_observer,
+        )
     finally:
         executable.close()
 
@@ -1679,6 +1798,8 @@ def _collect_bounded_process(
     process: subprocess.Popen[bytes],
     argv: list[str],
     timeout_seconds: float,
+    *,
+    output_observer: LifecycleRawOutputObserverV2 | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("SSH subprocess timeout is invalid")
@@ -1708,6 +1829,11 @@ def _collect_bounded_process(
                         "ssh_output_limit_exceeded",
                         "SSH command output exceeded its limit.",
                     )
+                _notify_output_observer(
+                    output_observer,
+                    "ssh_stdout" if key.data == "stdout" else "ssh_stderr",
+                    chunk,
+                )
                 chunks[key.data].append(chunk)
         remaining = deadline - time.monotonic()
         process.wait(timeout=max(0.001, remaining))

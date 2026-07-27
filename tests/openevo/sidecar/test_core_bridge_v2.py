@@ -32,7 +32,7 @@ from tests.openevo.sidecar.test_core_client_v2 import (
 def _capabilities() -> dict[str, object]:
     return {
         "schema_version": "1",
-        "core_version": "0.1.9",
+        "core_version": "0.1.10",
         "registry_digest": "a" * 64,
         "evaluated_profile": {
             "execution_mode": "subscription",
@@ -49,7 +49,7 @@ def _status() -> dict[str, object]:
     return {
         "schema_version": "2",
         "status": "ready",
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "source_commit": "c" * 40,
         "registry_sha256": "a" * 64,
         "checked_at": "2026-07-23T06:00:00Z",
@@ -282,6 +282,41 @@ def test_activation_bootstraps_only_through_private_project_tunnel_and_persists_
     assert len(tunnels.closed) == 1
 
 
+def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    observed: list[tuple[str, object, bool]] = []
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(_base_handler(requests)),
+            progress_observer=lambda phase, progress, cancellable: observed.append(
+                (phase, progress, cancellable)
+            ),
+        )
+
+        bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-progress-0001",
+        )
+
+        phases = [phase for phase, _progress, _cancellable in observed]
+        assert phases == [
+            "opening_project_tunnel",
+            "negotiating_core",
+            "creating_remote_project",
+            "verifying_project",
+            "activating",
+            "finalizing",
+        ]
+        assert [local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases] == sorted(
+            local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases
+        )
+        bridge.close()
+
+
 def test_activation_accepts_exact_initial_native_workspace_authority(
     tmp_path: Path,
 ) -> None:
@@ -293,9 +328,7 @@ def test_activation_accepts_exact_initial_native_workspace_authority(
             host_service=_HostService(),
             tunnel_factory=tunnels,
             persistence=store,
-            transport_factory=lambda: httpx.MockTransport(
-                _base_handler(requests, project=remote)
-            ),
+            transport_factory=lambda: httpx.MockTransport(_base_handler(requests, project=remote)),
         )
 
         activation = bridge.activate_project(
@@ -367,8 +400,7 @@ def test_active_project_list_does_not_enumerate_other_core_projects(
             next_cursor=None,
         )
         assert not any(
-            request.method == "GET" and request.url.path == "/v2/projects"
-            for request in requests
+            request.method == "GET" and request.url.path == "/v2/projects" for request in requests
         )
         bridge.close()
 

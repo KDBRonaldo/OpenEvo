@@ -145,6 +145,8 @@ class SystemOpenSshFollowerAuthority(Protocol):
         *,
         stdin_fd: int | None,
         cancel_event: threading.Event | None,
+        stdout_source: str | None = "ssh_stdout",
+        stderr_source: str | None = "ssh_stderr",
     ) -> subprocess.CompletedProcess[str]: ...
 
     def start_tunnel(self, argv: list[str], stream_fd: int) -> TunnelProcess: ...
@@ -1459,6 +1461,8 @@ class SshRemoteExecutorTransport:
         timeout_seconds: float,
         *,
         cancel_event: threading.Event | None = None,
+        stdout_source: str | None = "ssh_stdout",
+        stderr_source: str | None = "ssh_stderr",
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         _raise_if_cancelled(cancel_event)
         self._require_open()
@@ -1467,12 +1471,22 @@ class SshRemoteExecutorTransport:
             try:
                 system_authority.verify_authority()
                 argv = argv_factory(Path("/dev/null"))
-                completed = system_authority.run_argv(
-                    argv,
-                    timeout_seconds,
-                    stdin_fd=None,
-                    cancel_event=cancel_event,
-                )
+                if stdout_source == "ssh_stdout" and stderr_source == "ssh_stderr":
+                    completed = system_authority.run_argv(
+                        argv,
+                        timeout_seconds,
+                        stdin_fd=None,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    completed = system_authority.run_argv(
+                        argv,
+                        timeout_seconds,
+                        stdin_fd=None,
+                        cancel_event=cancel_event,
+                        stdout_source=stdout_source,
+                        stderr_source=stderr_source,
+                    )
                 system_authority.verify_authority()
                 _raise_if_cancelled(cancel_event)
                 self._require_open()
@@ -1535,6 +1549,8 @@ class SshRemoteExecutorTransport:
         *,
         stdin_fd: int,
         cancel_event: threading.Event | None,
+        stdout_source: str | None = "ssh_stdout",
+        stderr_source: str | None = "ssh_stderr",
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         _raise_if_cancelled(cancel_event)
         self._require_open()
@@ -1543,12 +1559,22 @@ class SshRemoteExecutorTransport:
             try:
                 system_authority.verify_authority()
                 argv = argv_factory(Path("/dev/null"))
-                completed = system_authority.run_argv(
-                    argv,
-                    timeout_seconds,
-                    stdin_fd=stdin_fd,
-                    cancel_event=cancel_event,
-                )
+                if stdout_source == "ssh_stdout" and stderr_source == "ssh_stderr":
+                    completed = system_authority.run_argv(
+                        argv,
+                        timeout_seconds,
+                        stdin_fd=stdin_fd,
+                        cancel_event=cancel_event,
+                    )
+                else:
+                    completed = system_authority.run_argv(
+                        argv,
+                        timeout_seconds,
+                        stdin_fd=stdin_fd,
+                        cancel_event=cancel_event,
+                        stdout_source=stdout_source,
+                        stderr_source=stderr_source,
+                    )
                 system_authority.verify_authority()
                 _raise_if_cancelled(cancel_event)
                 self._require_open()
@@ -1816,6 +1842,8 @@ class SshRemoteExecutorTransport:
                 timeout_seconds,
                 stdin_fd=snapshot.descriptor,
                 cancel_event=cancel_event,
+                stdout_source="daemon_stdout",
+                stderr_source="daemon_stderr",
             )
         except _SubprocessCancelled:
             failure_code = SshTransportErrorCode.CANCELLED
@@ -2179,6 +2207,8 @@ class SshRemoteExecutorTransport:
                 _stage_remaining(deadline),
                 stdin_fd=opened.descriptor,
                 cancel_event=cancel_event,
+                stdout_source="daemon_stdout",
+                stderr_source="daemon_stderr",
             )
         except _SubprocessCancelled:
             failure_code = SshTransportErrorCode.CANCELLED
@@ -3000,11 +3030,25 @@ class SshRemoteExecutorTransport:
         marked_command = _with_completion_marker(remote_command, completion_marker)
         completed: subprocess.CompletedProcess[str] | None = None
         failure_code: SshTransportErrorCode | None = None
+        daemon_failure_codes = {
+            SshTransportErrorCode.CORE_ASSET_FAILED,
+            SshTransportErrorCode.CORE_PYTHON_PROVISION_FAILED,
+            SshTransportErrorCode.CORE_RUNTIME_PREFLIGHT_FAILED,
+            SshTransportErrorCode.MANAGED_RUNTIME_FAILED,
+            SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
+            SshTransportErrorCode.DAEMON_SERVICE_PREDECESSOR_MISMATCH,
+            SshTransportErrorCode.DAEMON_UPDATE_REQUIRED,
+        }
+        stderr_source = (
+            "daemon_stderr" if remote_failure_code in daemon_failure_codes else "ssh_stderr"
+        )
         try:
             completed, _known_hosts_file = self._run_trusted_subprocess(
                 lambda known_hosts_file: self._ssh_argv(marked_command, known_hosts_file),
                 timeout_seconds,
                 cancel_event=cancel_event,
+                stdout_source=None,
+                stderr_source=stderr_source,
             )
         except _SubprocessCancelled:
             failure_code = SshTransportErrorCode.CANCELLED

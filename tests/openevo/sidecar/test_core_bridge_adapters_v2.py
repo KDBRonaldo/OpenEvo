@@ -8,6 +8,7 @@ import time
 import httpx
 import pytest
 
+from desktop.sidecar.contracts.v2 import models as local_v2
 from desktop.sidecar.core_bridge_adapters_v2 import (
     CoreBootstrapConfigV2,
     DesktopCoreSshBridgeAdapterV2,
@@ -35,7 +36,7 @@ from tests.openevo.sidecar.test_core_bridge_adapters_v1 import (
 
 
 def _bootstrap(tmp_path: Path) -> CoreBootstrapConfigV2:
-    wheel = tmp_path / "openevo-0.1.9-py3-none-any.whl"
+    wheel = tmp_path / "openevo-0.1.10-py3-none-any.whl"
     wheel.write_bytes(b"sealed-wheel")
     framework_lock = tmp_path / "framework-lock.json"
     framework_lock.write_bytes(FRAMEWORK_LOCK_BYTES)
@@ -132,6 +133,40 @@ def test_adapter_binds_every_daemon_step_to_exact_profile_connection_generation(
     assert not transport.secret_commands
     assert "BBBB" not in repr(attachment)
     assert str(tmp_path) not in repr(adapter)
+
+
+def test_adapter_reports_explicit_monotonic_daemon_lifecycle_checkpoints(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    observed: list[tuple[str, object, bool]] = []
+    adapter = DesktopCoreSshBridgeAdapterV2(
+        _Lifecycle(transport),
+        _bootstrap(tmp_path),
+        progress_observer=lambda phase, progress, cancellable: observed.append(
+            (phase, progress, cancellable)
+        ),
+    )
+
+    adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    phases = [phase for phase, _progress, _cancellable in observed]
+    assert phases == [
+        "remote_preflight",
+        "transferring",
+        "transferring",
+        "transferring",
+        "verifying",
+        "starting_daemon",
+        "waiting_for_daemon",
+    ]
+    indices = [local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases]
+    assert indices == sorted(indices)
+    transfers = [progress for phase, progress, _cancellable in observed if phase == "transferring"]
+    assert transfers[0].completed == 0
+    assert 0 < transfers[1].completed < transfers[1].total
+    assert transfers[2].completed == transfers[2].total
+    assert len({progress.total for progress in transfers}) == 1
 
 
 def test_adapter_rejects_stale_profile_generation_before_remote_work(
