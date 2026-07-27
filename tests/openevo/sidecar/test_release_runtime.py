@@ -651,7 +651,7 @@ def test_v2_profile_connector_negotiates_then_closes_its_temporary_tunnel() -> N
 
     version = connector.connect_profile("profile-1", 3)
 
-    assert version.release_version == "0.1.9"
+    assert version.release_version == "0.1.10"
     assert [request.url.path for request in adapter.requests] == [
         "/version",
         "/health",

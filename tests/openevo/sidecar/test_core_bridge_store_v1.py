@@ -1511,6 +1511,8 @@ def test_v0_1_1_mapping_history_is_read_only_compatible_with_new_reader(
 def test_real_core_successor_round_trips_through_desktop_mapping_store(
     tmp_path: Path,
 ) -> None:
+    if not Path("/proc/self/fd").is_dir():
+        pytest.skip("the remote Core Control store requires Linux procfs")
     from tests.openevo.sidecar import test_core_bridge_v1 as bridge_tests
 
     core_state = tmp_path / "core-state"

@@ -34,7 +34,12 @@ import desktop.sidecar.native_workspace as native_workspace
 from desktop.server.launcher import create_app
 import desktop.packaging.sidecar_entry as sidecar_entry
 import desktop.sidecar.release_app as release_app
+from desktop.sidecar.contracts.v2.canonical import (
+    DESKTOP_EVENTS_SCHEMA_SHA256,
+    DESKTOP_OPENAPI_SHA256,
+)
 from desktop.sidecar.workspace_identity import project_id_for_native_import
+from openevo import __version__ as OPENEVO_VERSION
 
 
 class _BinaryStdin:
@@ -563,13 +568,9 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
         assert version["schema_version"] == "2"
         assert version["preferred_major"] == version["mutation_major"] == 2
         assert version["supported_majors"] == [2]
-        assert version["openapi_sha256"] == (
-            "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
-        )
-        assert version["event_schema_sha256"] == (
-            "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
-        )
-        assert version["release_version"] == "0.1.9"
+        assert version["openapi_sha256"] == DESKTOP_OPENAPI_SHA256
+        assert version["event_schema_sha256"] == DESKTOP_EVENTS_SCHEMA_SHA256
+        assert version["release_version"] == OPENEVO_VERSION == "0.1.10"
         assert version["source_commit"] == "89baeb26"
         assert version["build_channel"] == "test"
         assert version["provider_kind"] == "desktop_sidecar"
@@ -1450,35 +1451,40 @@ def test_release_static_app_failure_closes_started_provider(
     assert provider.close_calls == 1
 
 
-def test_release_native_route_failure_closes_started_provider(
+def test_release_native_routes_bind_provider_lifecycle_without_store_escape(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     provider = _ClosingProvider()
     app = _app_with_provider(provider)
-    del provider.workspace_import_store
     monkeypatch.setattr(
         desktop_launcher,
         "create_packaged_release_desktop_local_api_v2_app",
         lambda **_: app,
     )
 
-    with pytest.raises(desktop_launcher.PackagedLauncherStartupError) as exc_info:
-        create_app(
-            static_root=_static_root(tmp_path),
-            desktop_config_root=tmp_path / "config",
-            native_frame=desktop_launcher._NativeLauncherFrame(
-                instance_id="1a" * 16,
-                readiness_key=bytes.fromhex("5a" * 32),
-                session_token="7c" * 32,
-                handoff_token="8d" * 32,
-            ),
-            source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
-            build_channel="release",
-            core_assets_root=tmp_path / "core-assets",
-        )
+    result = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=tmp_path / "config",
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token="7c" * 32,
+            handoff_token="8d" * 32,
+        ),
+        source_commit="89baeb2690ec2f82f24428fe25ddbb0eaa20cf89",
+        build_channel="release",
+        core_assets_root=tmp_path / "core-assets",
+    )
 
-    assert exc_info.value.code == "native_routes_failed"
+    assert result is app
+    assert {
+        desktop_launcher._NATIVE_WORKSPACE_IMPORT_ROUTE,
+        desktop_launcher._NATIVE_WORKSPACE_CANCEL_ROUTE,
+        desktop_launcher._NATIVE_WORKSPACE_DISCARD_ROUTE,
+    }.issubset({route.path for route in app.routes})
+    assert provider.close_calls == 0
+    provider.close()
     assert provider.close_calls == 1
 
 
