@@ -5,6 +5,7 @@ import hashlib
 import importlib.util
 import json
 from pathlib import Path
+import re
 from zipfile import ZipFile
 
 import pytest
@@ -185,6 +186,28 @@ def test_candidate_workflow_roundtrips_closed_playwright_evidence() -> None:
         "openevo_release_candidate.py create"
     )
     assert "path: candidate-artifacts/*" in macos
+
+
+def test_candidate_matrix_covers_every_release_readonly_test() -> None:
+    candidate = _load_module()
+    source = Path("desktop/tests/product-browser/release-readonly.pw.ts").read_text(
+        encoding="utf-8"
+    )
+    declared_tests = {
+        match.group(1)
+        for match in re.finditer(r'^test\("([^"]+)"', source, flags=re.MULTILINE)
+    }
+    declaration_count = sum(
+        line.startswith("test(") for line in source.splitlines()
+    )
+    required_tests = {
+        title
+        for _project, file, title in candidate.PLAYWRIGHT_REQUIRED_CASES
+        if file == "release-readonly.pw.ts"
+    }
+
+    assert len(declared_tests) == declaration_count
+    assert required_tests == declared_tests
 
 
 @pytest.mark.parametrize(
@@ -943,7 +966,7 @@ def test_playwright_candidate_evidence_binds_report_web_build_and_run(
     assert evidence["run"] == {"attempt": 2, "id": 123456}
     assert evidence["browser"] == {"name": "chromium", "version": "149.0.7827.55"}
     assert evidence["status"] == "passed"
-    assert len(evidence["tests"]) == 3
+    assert len(evidence["tests"]) == len(candidate.PLAYWRIGHT_REQUIRED_CASES)
     assert {entry["project"] for entry in evidence["tests"]} == {
         "release-packaged-1440",
         "release-packaged-1024",
@@ -2048,6 +2071,10 @@ def _write_playwright_inputs(
             "release-readonly.pw.ts",
             "first launch uses the release sidecar composition and keeps demo navigation non-mutating",
         ): 33,
+        (
+            "release-readonly.pw.ts",
+            "the packaged release recovers pending lifecycle progress and process logs",
+        ): 325,
     }
     for project, file, title in sorted(candidate.PLAYWRIGHT_REQUIRED_CASES):
         specs.append(
