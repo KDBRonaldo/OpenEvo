@@ -566,22 +566,40 @@ function NewProjectDialogV2({
   const [objective, setObjective] = useState("");
   const [workspaceKind, setWorkspaceKind] = useState<"scratch" | "native_folder_snapshot">("scratch");
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState("Research workspace");
+  const [selectedSourceDisplayName, setSelectedSourceDisplayName] = useState<string | null>(null);
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
   const dialogRef = useDialogBoundary(onClose);
-  const valid = displayName.trim() !== "" && title.trim() !== "" && objective.trim() !== ""
+  const baseDraftValid = displayName.trim() !== "" && title.trim() !== "" && objective.trim() !== "";
+  const valid = baseDraftValid
     && (workspaceKind === "scratch" || sourceActionId !== null);
 
   const chooseFolder = async (): Promise<void> => {
     const actionId = actionIdV2("select-workspace");
     onBusy(true);
     try {
+      const config = scienceProjectConfig(
+        title,
+        objective,
+        "native_folder_snapshot",
+        workspaceDisplayName,
+      );
       const source = await provider.selectNativeWorkspace({
         kind: "native_folder_snapshot",
         actionId,
         streamEpoch: snapshot.stream.epoch,
+        draft: {
+          profileId: profile.profile_id,
+          displayName: displayName.trim(),
+          config,
+        },
+        profileAuthority: {
+          profileId: profile.profile_id,
+          connectionGeneration: profile.connection_generation,
+          etag: profile.etag,
+        },
       });
       setWorkspaceKind("native_folder_snapshot");
-      setWorkspaceDisplayName(source.display_name);
+      setSelectedSourceDisplayName(source.display_name);
       setSourceActionId(actionId);
     } catch (error) {
       onError(error);
@@ -593,22 +611,7 @@ function NewProjectDialogV2({
   const create = async (): Promise<void> => {
     if (!valid) return;
     const actionId = workspaceKind === "native_folder_snapshot" ? sourceActionId! : actionIdV2("create-project");
-    const config: ScienceProjectConfigV2 = {
-      schema_version: "2",
-      task: { title: title.trim(), objective: objective.trim() },
-      workspace: { kind: workspaceKind, display_name: workspaceDisplayName.trim() },
-      execution: {
-        mode: "codex_subscription_transcript",
-        capture_mode: "transcript",
-        token_level_metrics_available: false,
-        harness_id: "codex",
-        codex_model: "gpt-5.3-codex-spark",
-        reasoning_effort: "high",
-        token_limit: 32_000,
-        task_network_allow_internet: true,
-      },
-      evolution: { targets: {} },
-    };
+    const config = scienceProjectConfig(title, objective, workspaceKind, workspaceDisplayName);
     onBusy(true);
     try {
       await provider.createProject({
@@ -616,7 +619,6 @@ function NewProjectDialogV2({
         displayName: displayName.trim(),
         config,
       }, { actionId, streamEpoch: snapshot.stream.epoch });
-      if (workspaceKind === "native_folder_snapshot") await provider.settleNativeWorkspace(actionId, "adopt");
       await onCreated();
     } catch (error) {
       onError(error);
@@ -626,7 +628,7 @@ function NewProjectDialogV2({
   };
 
   const close = async (): Promise<void> => {
-    if (sourceActionId !== null) await provider.cancelNativeWorkspace(sourceActionId).catch(() => {});
+    if (sourceActionId !== null) await provider.settleNativeWorkspace(sourceActionId, "discard").catch(() => {});
     onClose();
   };
 
@@ -636,14 +638,14 @@ function NewProjectDialogV2({
         <div className="drawer-head"><div><span className="panel-kicker">Remote project</span><h2 id="new-project-title">Create science project</h2></div><button type="button" className="icon-button" aria-label="Close project setup" onClick={() => void close()}><X size={18} /></button></div>
         <div className="drawer-content">
           <section className="form-section">
-            <label>Project name<input maxLength={256} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
-            <label>Task title<input maxLength={256} value={title} onChange={(event) => setTitle(event.target.value)} /></label>
-            <label>Task objective<textarea rows={7} maxLength={65_536} value={objective} onChange={(event) => setObjective(event.target.value)} placeholder="Describe the scientific result the agent should produce." /></label>
+            <label>Project name<input maxLength={256} value={displayName} disabled={sourceActionId !== null} onChange={(event) => setDisplayName(event.target.value)} /></label>
+            <label>Task title<input maxLength={256} value={title} disabled={sourceActionId !== null} onChange={(event) => setTitle(event.target.value)} /></label>
+            <label>Task objective<textarea rows={7} maxLength={65_536} value={objective} disabled={sourceActionId !== null} onChange={(event) => setObjective(event.target.value)} placeholder="Describe the scientific result the agent should produce." /></label>
           </section>
           <section className="form-section">
             <h3>Workspace snapshot</h3>
-            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} onClick={() => void chooseFolder()}><FolderOpen size={15} /> Choose folder snapshot</button></div>
-            <p className="form-help">{workspaceKind === "native_folder_snapshot" ? workspaceDisplayName : "Core will create an immutable empty Workspace Snapshot."}</p>
+            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null} onClick={() => void chooseFolder()}><FolderOpen size={15} /> Choose folder snapshot</button></div>
+            <p className="form-help">{workspaceKind === "native_folder_snapshot" ? selectedSourceDisplayName ?? "Preparing selected workspace…" : "Core will create an immutable empty Workspace Snapshot."}</p>
           </section>
           <section className="form-section"><h3>Execution</h3><div className="agent-note"><ShieldCheck size={17} /><span>Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort</span></div></section>
         </div>
@@ -846,6 +848,30 @@ function useDialogBoundary(onClose: () => void) {
 
 function isConnectedProfile(profile: RemoteProfileV2): profile is RemoteWorkspaceProfileV2 {
   return profile.profile_kind === "system_openssh" && profile.connection_state === "connected";
+}
+
+function scienceProjectConfig(
+  title: string,
+  objective: string,
+  workspaceKind: "scratch" | "native_folder_snapshot",
+  workspaceDisplayName: string,
+): ScienceProjectConfigV2 {
+  return {
+    schema_version: "2",
+    task: { title: title.trim(), objective: objective.trim() },
+    workspace: { kind: workspaceKind, display_name: workspaceDisplayName.trim() },
+    execution: {
+      mode: "codex_subscription_transcript",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      harness_id: "codex",
+      codex_model: "gpt-5.3-codex-spark",
+      reasoning_effort: "high",
+      token_limit: 32_000,
+      task_network_allow_internet: true,
+    },
+    evolution: { targets: {} },
+  };
 }
 
 function intentFor(snapshot: DesktopProductSnapshotV2, prefix: string): ProductMutationIntentV2 {

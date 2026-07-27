@@ -77,7 +77,12 @@ export interface NativeWorkspaceSourceV2 {
 
 export interface NativeWorkspaceSelectionIntentV2 extends ProductMutationIntentV2 {
   readonly kind: "native_folder_snapshot";
-  readonly projectId?: string;
+  readonly draft: ProjectDraftV2;
+  readonly profileAuthority: {
+    readonly profileId: string;
+    readonly connectionGeneration: number;
+    readonly etag: string;
+  };
 }
 
 export interface ProjectDraftV2 {

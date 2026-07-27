@@ -118,7 +118,6 @@ const tauriNativeBridge: ReleaseNativeBridgeV2 = {
   selectProjectSource: (intent) => invoke("select_project_source", {
     kind: intent.kind,
     actionId: intent.actionId,
-    ...(intent.projectId === undefined ? {} : { projectId: intent.projectId }),
   }),
   cancelProjectSource: (actionId) => invoke("cancel_project_source", { actionId }),
   settleProjectSource: (actionId, outcome) => invoke("settle_project_source", {
@@ -209,6 +208,7 @@ export async function createReleaseDesktopProductProvider(
           client,
           native: context.native,
           featureFlags: context.featureFlags,
+          providerStreamInstance: version.build_id,
           fetch,
         })
       : await dependencies.adapterFactory(context);

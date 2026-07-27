@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
 import type { DesktopApiClientV2 } from "../api/v2/client";
 import type {
   DesktopStateV2,
   RemoteWorkspaceProfileV2,
+  ScienceProjectConfigV2,
   SshHostCatalogV2,
 } from "../api/v2/schemas";
 import {
@@ -77,6 +79,25 @@ function state(profiles: RemoteWorkspaceProfileV2[] = []): DesktopStateV2 {
   };
 }
 
+function nativeProjectConfig(): ScienceProjectConfigV2 {
+  return {
+    schema_version: "2",
+    task: { title: "Research task", objective: "Analyze the selected workspace." },
+    workspace: { kind: "native_folder_snapshot", display_name: "Research workspace" },
+    execution: {
+      mode: "codex_subscription_transcript",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      harness_id: "codex",
+      codex_model: "gpt-5.3-codex-spark",
+      reasoning_effort: "high",
+      token_limit: 32_000,
+      task_network_allow_internet: true,
+    },
+    evolution: { targets: {} },
+  };
+}
+
 function lifecycleOperation() {
   return {
     schema_version: "2" as const,
@@ -143,7 +164,9 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     taskArtifacts: vi.fn(),
     getTransition: vi.fn(),
     createProfile: vi.fn(),
+    createProject: vi.fn(),
     connectProfile: vi.fn(),
+    getLifecycleOperation: vi.fn(),
     eventStreamRequest: vi.fn(),
   } as unknown as DesktopApiClientV2;
   return client;
@@ -151,23 +174,52 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
 
 function nativeFixture(
   selected: unknown = nativeLifecycleOperation(),
-): LocalApiNativeBridgeV2 {
+): LocalApiNativeBridgeV2 & { readonly journalValue: () => string | null; readonly callOrder: string[] } {
+  let journalValue: string | null = null;
+  const callOrder: string[] = [];
   return {
+    callOrder,
+    journalValue: () => journalValue,
     selectProjectSource: vi.fn().mockResolvedValue(selected),
     cancelProjectSource: vi.fn(),
     settleProjectSource: vi.fn(),
-    readMutationIntentJournalV2: vi.fn().mockResolvedValue(null),
-    compareAndSwapMutationIntentJournalV2: vi.fn(),
+    readMutationIntentJournalV2: vi.fn(async () => {
+      callOrder.push("journal-read");
+      return journalValue;
+    }),
+    compareAndSwapMutationIntentJournalV2: vi.fn(async (expectedValue, newValue) => {
+      callOrder.push("journal-cas");
+      if (expectedValue !== journalValue) throw { code: "mutation_intent_journal_conflict" };
+      journalValue = newValue;
+    }),
   };
 }
 
 describe("Desktop v2 product provider", () => {
+  it("routes every request-creating v2 provider mutation through the durable coordinator", () => {
+    const source = readFileSync(new URL("./localApiProviderV2.ts", import.meta.url), "utf8");
+    const coordinatedMethods = [
+      "rescanSshHosts", "createProfile", "renameProfile", "deleteProfile", "rebindProfile",
+      "connectProfile", "disconnectProfile", "reviewHostKey", "selectNativeWorkspace",
+      "createProject", "updateProject", "activateProject", "validateProject", "submitTask",
+      "cancelTask", "retryTask", "retryTransition", "replaceTransition", "abandonTransition",
+      "restartService", "createDiagnostic",
+    ] as const;
+    for (const method of coordinatedMethods) {
+      const start = source.indexOf(`  async ${method}(`);
+      const nextMethod = source.indexOf("\n  async ", start + 1);
+      expect(start, `${method} implementation`).toBeGreaterThanOrEqual(0);
+      expect(source.slice(start, nextMethod < 0 ? undefined : nextMethod), `${method} coordinator coverage`).toContain("this.dispatchMutationV2({");
+    }
+  });
+
   it("does not call Core collections before an active project tunnel exists", async () => {
     const client = clientFixture();
     const provider = createLocalApiDesktopProductProviderV2({
       client,
       native: nativeFixture(),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
 
     const result = await provider.refresh();
@@ -236,6 +288,7 @@ describe("Desktop v2 product provider", () => {
       client,
       native: nativeFixture(),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
 
     const result = await provider.refresh();
@@ -254,6 +307,7 @@ describe("Desktop v2 product provider", () => {
       client,
       native: nativeFixture(),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
     const result = await provider.refresh();
     if (result.status !== "fresh") throw new Error("fixture refresh failed");
@@ -285,6 +339,7 @@ describe("Desktop v2 product provider", () => {
       client,
       native: nativeFixture(),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
     const result = await provider.refresh();
     if (result.status !== "fresh") throw new Error("fixture refresh failed");
@@ -305,10 +360,12 @@ describe("Desktop v2 product provider", () => {
   });
 
   it("keeps native import references out of the renderer model and rejects path canaries", async () => {
+    const connected = profile({ connection_state: "connected" });
     const provider = createLocalApiDesktopProductProviderV2({
-      client: clientFixture(),
+      client: clientFixture([connected]),
       native: nativeFixture(),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
     const result = await provider.refresh();
     if (result.status !== "fresh") throw new Error("fixture refresh failed");
@@ -316,6 +373,16 @@ describe("Desktop v2 product provider", () => {
       kind: "native_folder_snapshot" as const,
       actionId: "select-workspace-0001",
       streamEpoch: result.snapshot.stream.epoch,
+      draft: {
+        profileId: "profile-lab",
+        displayName: "Native project",
+        config: nativeProjectConfig(),
+      },
+      profileAuthority: {
+        profileId: "profile-lab",
+        connectionGeneration: 4,
+        etag: ETAG,
+      },
     };
 
     await expect(provider.selectNativeWorkspace(intent)).resolves.toEqual({
@@ -324,11 +391,12 @@ describe("Desktop v2 product provider", () => {
     });
 
     const poisoned = createLocalApiDesktopProductProviderV2({
-      client: clientFixture(),
+      client: clientFixture([connected]),
       native: nativeFixture(nativeLifecycleOperation({
         selected_path: "/Users/researcher/secret-project",
       })),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
     const poisonedRefresh = await poisoned.refresh();
     if (poisonedRefresh.status !== "fresh") throw new Error("fixture refresh failed");
@@ -344,6 +412,7 @@ describe("Desktop v2 product provider", () => {
       client,
       native: nativeFixture(),
       featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
     });
     const result = await provider.refresh();
     if (result.status !== "fresh") throw new Error("fixture refresh failed");
@@ -353,5 +422,175 @@ describe("Desktop v2 product provider", () => {
       streamEpoch: result.snapshot.stream.epoch + 1,
     })).rejects.toThrow(/state changed/i);
     expect(client.createProfile).not.toHaveBeenCalled();
+  });
+
+  it("persists before transport and reuses the exact action identity after an ambiguous relaunch", async () => {
+    const native = nativeFixture();
+    const callOrder = native.callOrder;
+    const firstClient = clientFixture();
+    vi.mocked(firstClient.createProfile).mockImplementation(async () => {
+      callOrder.push("transport");
+      throw new TypeError("connection reset after request upload");
+    });
+    const first = createLocalApiDesktopProductProviderV2({
+      client: firstClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const firstRefresh = await first.refresh();
+    if (firstRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(first.createProfile("Lab GPU", "lab-gpu", {
+      actionId: "create-profile-ambiguous-0001",
+      streamEpoch: firstRefresh.snapshot.stream.epoch,
+    })).rejects.toThrow(/connection reset/i);
+
+    expect(callOrder.indexOf("journal-cas")).toBeLessThan(callOrder.indexOf("transport"));
+    expect(native.journalValue()).toContain("create-profile-ambiguous-0001");
+
+    const secondClient = clientFixture();
+    vi.mocked(secondClient.createProfile).mockResolvedValue(profile());
+    const relaunched = createLocalApiDesktopProductProviderV2({
+      client: secondClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const secondRefresh = await relaunched.refresh();
+    if (secondRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+    await relaunched.createProfile("Lab GPU", "lab-gpu", {
+      actionId: "create-profile-new-click-0002",
+      streamEpoch: secondRefresh.snapshot.stream.epoch,
+    });
+
+    expect(secondClient.createProfile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      idempotencyKey: "create-profile-ambiguous-0001",
+    }));
+    expect(native.journalValue()).toBeNull();
+  });
+
+  it("rejects changed intent on an unresolved scope before a second transport", async () => {
+    const native = nativeFixture();
+    const client = clientFixture();
+    vi.mocked(client.createProfile).mockRejectedValue(new TypeError("ambiguous transport"));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const result = await provider.refresh();
+    if (result.status !== "fresh") throw new Error("fixture refresh failed");
+    await expect(provider.createProfile("Lab GPU", "lab-gpu", {
+      actionId: "create-profile-ambiguous-0001",
+      streamEpoch: result.snapshot.stream.epoch,
+    })).rejects.toThrow();
+
+    await expect(provider.createProfile("Changed name", "lab-gpu", {
+      actionId: "create-profile-changed-0002",
+      streamEpoch: result.snapshot.stream.epoch,
+    })).rejects.toThrow(/different request or authority/i);
+    expect(client.createProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("durably binds an accepted lifecycle operation before returning it", async () => {
+    const current = profile();
+    const native = nativeFixture();
+    const client = clientFixture([current]);
+    vi.mocked(client.connectProfile).mockResolvedValue(lifecycleOperation());
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const result = await provider.refresh();
+    if (result.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await provider.connectProfile(current.profile_id, {
+      actionId: "connect-profile-durable-0001",
+      streamEpoch: result.snapshot.stream.epoch,
+    });
+
+    expect(JSON.parse(native.journalValue()!)).toMatchObject({
+      entries: [{
+        action_id: "connect-profile-durable-0001",
+        accepted_operation_id: "lifecycle-profile-connect-1",
+        state: "accepted",
+      }],
+    });
+  });
+
+  it("carries one durable action identity across native preparation and remote project creation", async () => {
+    const connected = profile({ connection_state: "connected" });
+    const native = nativeFixture();
+    const client = clientFixture([connected]);
+    const projectOperation = {
+      ...lifecycleOperation(),
+      operation_id: "lifecycle-project-create-1",
+      kind: "project_create" as const,
+      resource: { resource_kind: "project" as const, resource_id: "project-created-1" },
+      status: "succeeded" as const,
+      phase: "finalizing" as const,
+      phase_index: 16,
+      cancellable: false,
+      result: { result_kind: "project" as const, project_id: "project-created-1" },
+      finished_at: NOW,
+    };
+    vi.mocked(client.createProject).mockResolvedValue(projectOperation);
+    vi.mocked(client.listProjects).mockResolvedValue({
+      schema_version: "2",
+      items: [{ project_id: "project-created-1" }],
+      next_cursor: null,
+      has_more: false,
+    } as never);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const firstRefresh = await provider.refresh();
+    if (firstRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+    const actionId = "project-native-chain-0001";
+    const draft = {
+      profileId: connected.profile_id,
+      displayName: "Native project",
+      config: nativeProjectConfig(),
+    };
+
+    await provider.selectNativeWorkspace({
+      kind: "native_folder_snapshot",
+      actionId,
+      streamEpoch: firstRefresh.snapshot.stream.epoch,
+      draft,
+      profileAuthority: {
+        profileId: connected.profile_id,
+        connectionGeneration: connected.connection_generation,
+        etag: connected.etag,
+      },
+    });
+    expect(JSON.parse(native.journalValue()!)).toMatchObject({
+      entries: [{
+        action_id: actionId,
+        mutation_kind: "project_create",
+        chain_step: "project_create",
+        completed_operation_ids: ["lifecycle-native-workspace-1"],
+      }],
+    });
+
+    const secondRefresh = await provider.refresh();
+    if (secondRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+    await provider.createProject(draft, {
+      actionId,
+      streamEpoch: secondRefresh.snapshot.stream.epoch,
+    });
+
+    expect(client.createProject).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      idempotencyKey: actionId,
+    }));
+    expect(native.settleProjectSource).toHaveBeenCalledWith(actionId, "adopt");
+    expect(native.journalValue()).toBeNull();
   });
 });

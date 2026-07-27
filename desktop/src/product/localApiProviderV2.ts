@@ -9,10 +9,12 @@ import {
   DesktopContractErrorV2,
 } from "../api/v2/client";
 import {
+  canonicalJsonV2,
   compareUtcTimestampsV2,
   lifecycleOperationV2Schema,
   opaqueIdV2Schema,
   scienceProjectConfigV2Schema,
+  sha256Utf8V2,
   type CoreEventEnvelopeV2,
   type DesktopErrorV2,
   type DesktopEventEnvelopeV2,
@@ -46,6 +48,13 @@ import type {
   ProductSubscriptionSignalV2,
   ProjectDraftV2,
 } from "./providerV2";
+import {
+  MutationIntentConflictV2,
+  MutationIntentCoordinatorV2,
+  type MutationChainStepV2,
+  type MutationKindV2,
+  type PendingMutationIntentV2,
+} from "./mutationIntentJournalV2";
 
 const PAGE_LIMIT = 100;
 const MAX_COLLECTION_PAGES = 100;
@@ -68,6 +77,7 @@ export interface LocalApiDesktopProductProviderOptionsV2 {
   readonly client: DesktopApiClientV2;
   readonly native: LocalApiNativeBridgeV2;
   readonly featureFlags: readonly string[];
+  readonly providerStreamInstance: string;
   readonly fetch?: FetchLikeV2;
   readonly reconnectDelaysMs?: readonly number[];
 }
@@ -81,6 +91,8 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private readonly native: LocalApiNativeBridgeV2;
   private readonly fetch: FetchLikeV2;
   private readonly reconnectDelaysMs: readonly number[];
+  private readonly providerStreamInstance: string;
+  private readonly mutationIntents: MutationIntentCoordinatorV2;
   private readonly listeners = new Set<(signal: ProductSubscriptionSignalV2) => void>();
   private readonly replay = new DesktopEventReplayAuthorityV2();
   private refreshSequence = 0;
@@ -96,6 +108,8 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     this.client = options.client;
     this.native = options.native;
     this.featureFlags = Object.freeze([...options.featureFlags]);
+    this.providerStreamInstance = opaqueIdV2Schema.parse(options.providerStreamInstance);
+    this.mutationIntents = new MutationIntentCoordinatorV2(options.native);
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
   }
@@ -103,6 +117,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   async refresh(): Promise<ProductRefreshResultV2> {
     const sequence = ++this.refreshSequence;
     try {
+      await this.mutationIntents.initialize();
       const loaded = await this.loadSnapshot();
       if (sequence !== this.refreshSequence) {
         return { status: "stale", stream: { status: "stale", epoch: this.epoch, reason: "refresh_pending" } };
@@ -114,6 +129,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         stream: { status: "fresh", epoch: this.epoch, lastEventId: this.replay.lastEventId },
       };
       this.snapshot = snapshot;
+      await this.mutationIntents.reconcile(snapshot);
       this.waitingForRefresh = false;
       this.ensureEventStream();
       return { status: "fresh", snapshot };
@@ -145,47 +161,96 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async rescanSshHosts(intent: ProductMutationIntentV2) {
     const snapshot = this.requireIntent(intent);
-    const catalog = await this.client.rescanSshHosts({ schema_version: "2" }, {
-      resourceGeneration: snapshot.catalog.catalog_generation,
-      idempotencyKey: intent.actionId,
+    const request = { schema_version: "2" as const };
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "ssh_catalog_rescan",
+      resourceScope: "catalog:ssh",
+      request,
+      authority: { resource_generation: snapshot.catalog.catalog_generation, etag: null },
+      send: (actionId) => this.client.rescanSshHosts(request, {
+        resourceGeneration: snapshot.catalog.catalog_generation,
+        idempotencyKey: actionId,
+      }),
     });
+    const catalog = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, catalog);
     this.invalidate();
     return catalog;
   }
 
   async createProfile(displayName: string, sshHostAlias: string, intent: ProductMutationIntentV2) {
     const snapshot = this.requireIntent(intent);
-    const profile = await this.client.createProfile({
+    const request = {
       schema_version: "2",
       display_name: displayName,
       connection_authority: "system_openssh",
       ssh_host_alias: sshHostAlias,
-    }, {
-      resourceGeneration: snapshot.catalog.catalog_generation,
-      idempotencyKey: intent.actionId,
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "profile_create",
+      resourceScope: `profile:new:${sshHostAlias}`,
+      request,
+      authority: { resource_generation: snapshot.catalog.catalog_generation, etag: null },
+      send: (actionId) => this.client.createProfile(request, {
+        resourceGeneration: snapshot.catalog.catalog_generation,
+        idempotencyKey: actionId,
+      }),
     });
+    const profile = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, profile);
     this.invalidate();
     return profile;
   }
 
   async renameProfile(profileId: string, input: { schema_version?: "2"; display_name: string }, intent: ProductMutationIntentV2) {
     const profile = this.requireProfile(profileId, intent);
-    const result = await this.client.updateProfile(profileId, input, {
-      resourceGeneration: profile.profile_kind === "system_openssh" ? profile.connection_generation : 0,
-      ifMatch: profile.etag,
-      idempotencyKey: intent.actionId,
+    const snapshot = this.requireSnapshot();
+    const generation = profile.profile_kind === "system_openssh" ? profile.connection_generation : 0;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "profile_update",
+      resourceScope: `profile:${profileId}`,
+      request: input,
+      authority: { resource_generation: generation, etag: profile.etag },
+      send: (actionId) => this.client.updateProfile(profileId, input, {
+        resourceGeneration: generation,
+        ifMatch: profile.etag,
+        idempotencyKey: actionId,
+      }),
     });
+    const result = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, result);
     this.invalidate();
     return result;
   }
 
   async deleteProfile(profileId: string, intent: ProductMutationIntentV2): Promise<void> {
     const profile = this.requireProfile(profileId, intent);
-    await this.client.deleteProfile(profileId, {
-      resourceGeneration: profile.profile_kind === "system_openssh" ? profile.connection_generation : 0,
-      ifMatch: profile.etag,
-      idempotencyKey: intent.actionId,
+    const snapshot = this.requireSnapshot();
+    const generation = profile.profile_kind === "system_openssh" ? profile.connection_generation : 0;
+    const request = { schema_version: "2", expected_profile_id: profileId } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "profile_delete",
+      resourceScope: `profile:${profileId}`,
+      request,
+      authority: { resource_generation: generation, etag: profile.etag },
+      send: async (actionId) => {
+        await this.client.deleteProfile(profileId, {
+          resourceGeneration: generation,
+          ifMatch: profile.etag,
+          idempotencyKey: actionId,
+        });
+        return null;
+      },
     });
+    await this.completeDirectMutationV2(dispatched.entry, null);
     this.invalidate();
   }
 
@@ -193,34 +258,75 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const snapshot = this.requireIntent(intent);
     const profile = snapshot.profiles.find((candidate) => candidate.profile_id === profileId);
     if (profile?.profile_kind !== "legacy_explicit") throw new DesktopContractErrorV2("Only a retained Preview profile can be rebound");
-    const result = await this.client.rebindProfile(profileId, {
+    const request = {
       schema_version: "2",
       connection_authority: "system_openssh",
       ssh_host_alias: sshHostAlias,
       catalog_generation: snapshot.catalog.catalog_generation,
-    }, {
-      resourceGeneration: 0,
-      ifMatch: profile.etag,
-      idempotencyKey: intent.actionId,
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "profile_rebind",
+      resourceScope: `profile:${profileId}`,
+      request,
+      authority: { resource_generation: 0, etag: profile.etag },
+      send: (actionId) => this.client.rebindProfile(profileId, request, {
+        resourceGeneration: 0,
+        ifMatch: profile.etag,
+        idempotencyKey: actionId,
+      }),
     });
+    const result = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, result);
     this.invalidate();
     return result;
   }
 
   async connectProfile(profileId: string, intent: ProductMutationIntentV2) {
     const profile = this.requireSystemProfile(profileId, intent);
-    return this.observeOperation(await this.client.connectProfile(profileId, {
+    const snapshot = this.requireSnapshot();
+    const request = {
       schema_version: "2",
       expected_connection_generation: profile.connection_generation,
-    }, profileMutation(profile, intent)));
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "profile_connect",
+      resourceScope: `profile:${profileId}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      send: (actionId) => this.client.connectProfile(profileId, request, {
+        resourceGeneration: profile.connection_generation,
+        ifMatch: profile.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async disconnectProfile(profileId: string, intent: ProductMutationIntentV2) {
     const profile = this.requireSystemProfile(profileId, intent);
-    return this.observeOperation(await this.client.disconnectProfile(profileId, {
+    const snapshot = this.requireSnapshot();
+    const request = {
       schema_version: "2",
       expected_connection_generation: profile.connection_generation,
-    }, profileMutation(profile, intent)));
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "profile_disconnect",
+      resourceScope: `profile:${profileId}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      send: (actionId) => this.client.disconnectProfile(profileId, request, {
+        resourceGeneration: profile.connection_generation,
+        ifMatch: profile.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async reviewHostKey(profileId: string, action: HostKeyReviewRequestV2["action"], intent: ProductMutationIntentV2) {
@@ -228,26 +334,71 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const reviewId = profile.trust.review_id;
     const reviewSha256 = profile.trust.review_sha256;
     if (reviewId === null || reviewSha256 === null) throw new DesktopContractErrorV2("Profile has no current host-key review authority");
-    return this.observeOperation(await this.client.reviewProfileHostKey(profileId, {
+    const snapshot = this.requireSnapshot();
+    const request = {
       schema_version: "2",
       expected_connection_generation: profile.connection_generation,
       review_id: reviewId,
       review_sha256: reviewSha256,
       action,
-    }, profileMutation(profile, intent)));
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "host_key_review",
+      resourceScope: `profile:${profileId}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      send: (actionId) => this.client.reviewProfileHostKey(profileId, request, {
+        resourceGeneration: profile.connection_generation,
+        ifMatch: profile.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async selectNativeWorkspace(intent: NativeWorkspaceSelectionIntentV2): Promise<NativeWorkspaceSourceV2> {
-    this.requireIntent(intent);
-    const operation = lifecycleOperationV2Schema.parse(await this.native.selectProjectSource(intent));
+    const profile = this.requireSystemProfile(intent.draft.profileId, intent);
+    const snapshot = this.requireSnapshot();
+    if (profile.connection_state !== "connected") {
+      throw new DesktopContractErrorV2("Native workspace preparation requires a connected system-OpenSSH profile");
+    }
+    if (intent.profileAuthority.profileId !== profile.profile_id
+      || intent.profileAuthority.connectionGeneration !== profile.connection_generation
+      || intent.profileAuthority.etag !== profile.etag) {
+      throw new DesktopContractErrorV2("Native workspace profile authority changed before folder selection");
+    }
+    const request = projectCreateRequestV2(intent.draft, profile);
+    if (request.config.workspace.kind !== "native_folder_snapshot") {
+      throw new DesktopContractErrorV2("Native workspace selection requires a native-folder project draft");
+    }
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "project_create",
+      resourceScope: `project:new:${profile.profile_id}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      chainStep: "native_workspace_prepare",
+      includeStreamAuthority: false,
+      send: async (actionId) => lifecycleOperationV2Schema.parse(await this.native.selectProjectSource({
+        ...intent,
+        actionId,
+      })),
+    });
+    const operation = dispatched.value;
     if (operation.kind !== "native_workspace_prepare"
       || operation.resource.resource_kind !== "native_workspace") {
       throw new DesktopContractErrorV2("Native workspace selection returned another lifecycle operation");
     }
     const terminal = await this.waitForLifecycleTerminal(this.observeOperation(operation));
     if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "native_workspace") {
+      await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
       throw lifecycleTerminalError(terminal, "Native workspace preparation did not succeed");
     }
+    await this.mutationIntents.markTerminalObserved(dispatched.entry.action_id, terminal.operation_id);
+    await this.mutationIntents.advanceNativeProjectChain(dispatched.entry.action_id, terminal.operation_id);
     return { kind: "native_folder_snapshot", display_name: terminal.result.display_name };
   }
 
@@ -256,25 +407,35 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   }
 
   async settleNativeWorkspace(actionId: string, outcome: "adopt" | "discard"): Promise<void> {
-    await this.native.settleProjectSource(actionIdV2(actionId), outcome);
+    const action = actionIdV2(actionId);
+    await this.native.settleProjectSource(action, outcome);
+    if (outcome === "discard") await this.mutationIntents.discardNativeProjectChain(action);
   }
 
   async createProject(draft: ProjectDraftV2, intent: ProductMutationIntentV2) {
     const profile = this.requireSystemProfile(draft.profileId, intent);
+    const snapshot = this.requireSnapshot();
     if (profile.connection_state !== "connected") throw new DesktopContractErrorV2("Project creation requires a connected system-OpenSSH profile");
-    const config = scienceProjectConfigV2Schema.parse(draft.config);
-    const operation = this.observeOperation(await this.client.createProject({
-      schema_version: "2",
-      profile_id: profile.profile_id,
-      profile_connection_generation: profile.connection_generation,
-      display_name: draft.displayName,
-      config,
-    }, {
-      resourceGeneration: profile.connection_generation,
-      idempotencyKey: intent.actionId,
-    }));
+    const request = projectCreateRequestV2(draft, profile);
+    const nativeProjectChain = request.config.workspace.kind === "native_folder_snapshot";
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "project_create",
+      resourceScope: `project:new:${profile.profile_id}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      chainStep: nativeProjectChain ? "project_create" : "single",
+      includeStreamAuthority: !nativeProjectChain,
+      send: (actionId) => this.client.createProject(request, {
+        resourceGeneration: profile.connection_generation,
+        idempotencyKey: actionId,
+      }),
+    });
+    const operation = this.observeOperation(dispatched.value);
     const terminal = await this.waitForLifecycleTerminal(operation);
     if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "project") {
+      await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
       throw lifecycleTerminalError(terminal, "Remote project creation did not succeed");
     }
     const projectId = terminal.result.project_id;
@@ -283,22 +444,41 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     if (project === undefined) {
       throw new DesktopContractErrorV2("Project creation result is absent from remote authority");
     }
+    if (nativeProjectChain) await this.native.settleProjectSource(dispatched.entry.action_id, "adopt");
+    await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
     this.invalidate();
     return project;
   }
 
   async updateProject(projectId: string, displayName: string, configInput: ScienceProjectConfigV2, intent: ProductMutationIntentV2) {
     const project = this.requireProject(projectId, intent);
+    const snapshot = this.requireSnapshot();
     const config = scienceProjectConfigV2Schema.parse(configInput);
     const head = project.active_project_head;
-    const result = await this.client.updateProject(projectId, {
+    const request = {
       schema_version: "2",
       expected_project_head_id: head?.project_head_id ?? null,
       expected_project_head_manifest_sha256: head?.manifest_sha256 ?? null,
       expected_project_config_sha256: project.project_config_sha256,
       display_name: displayName,
       config,
-    }, projectMutation(project, intent));
+    } as const;
+    const generation = project.active_project_head?.generation ?? 0;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "project_update",
+      resourceScope: `project:${projectId}`,
+      request,
+      authority: { resource_generation: generation, etag: project.etag },
+      send: (actionId) => this.client.updateProject(projectId, request, {
+        resourceGeneration: generation,
+        ifMatch: project.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    const result = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, result);
     this.validation = null;
     this.invalidate();
     return result;
@@ -306,12 +486,27 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async activateProject(projectId: string, intent: ProductMutationIntentV2) {
     const project = this.requireProject(projectId, intent);
+    const snapshot = this.requireSnapshot();
     const head = requireProjectHead(project);
-    return this.observeOperation(await this.client.activateProject(projectId, {
+    const request = {
       schema_version: "2",
       expected_project_head_id: head.project_head_id,
       expected_project_head_manifest_sha256: head.manifest_sha256,
-    }, projectMutation(project, intent)));
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "project_activate",
+      resourceScope: `project:${projectId}`,
+      request,
+      authority: { resource_generation: head.generation, etag: project.etag },
+      send: (actionId) => this.client.activateProject(projectId, request, {
+        resourceGeneration: head.generation,
+        ifMatch: project.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async loadProjectCapabilities(projectId: string) {
@@ -325,18 +520,34 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async validateProject(projectId: string, intent: ProductMutationIntentV2) {
     const project = this.requireProject(projectId, intent);
+    const snapshot = this.requireSnapshot();
     const head = requireProjectHead(project);
-    const capability = this.requireSnapshot().capability;
+    const capability = snapshot.capability;
     if (capability === null || capability.project_id !== projectId || capability.execution_mode !== project.config.execution.mode) {
       throw new DesktopContractErrorV2("Project validation requires current remote capabilities");
     }
-    const validation = await this.client.validateProject(projectId, {
+    const request = {
       schema_version: "2",
       expected_project_head_id: head.project_head_id,
       expected_project_head_manifest_sha256: head.manifest_sha256,
       expected_project_config_sha256: project.project_config_sha256,
       capability_registry_sha256: capability.registry_sha256,
-    }, projectMutation(project, intent));
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "project_validate",
+      resourceScope: `project:${projectId}`,
+      request,
+      authority: { resource_generation: head.generation, etag: project.etag },
+      send: (actionId) => this.client.validateProject(projectId, request, {
+        resourceGeneration: head.generation,
+        ifMatch: project.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    const validation = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, validation);
     this.validation = validation;
     if (this.snapshot !== null) this.snapshot = { ...this.snapshot, validation };
     return validation;
@@ -344,39 +555,83 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async submitTask(projectId: string, intent: ProductMutationIntentV2) {
     const project = this.requireProject(projectId, intent);
+    const snapshot = this.requireSnapshot();
     const head = requireProjectHead(project);
     if (project.state !== "ready" || project.admission_etag === null) {
       throw new DesktopContractErrorV2("Project successor is not ready for task admission");
     }
-    const capability = this.requireSnapshot().capability;
+    const capability = snapshot.capability;
     const validation = this.validation;
     if (capability === null || validation === null || validation.project_id !== projectId
       || validation.registry_sha256 !== capability.registry_sha256 || !validation.valid) {
       throw new DesktopContractErrorV2("Project must pass current remote validation before task admission");
     }
-    const task = await this.client.submitTask({
+    const request = {
       schema_version: "2",
       project_id: projectId,
       expected_project_admission_etag: project.admission_etag,
       expected_project_head_id: head.project_head_id,
       expected_project_head_manifest_sha256: head.manifest_sha256,
       expected_project_config_sha256: project.project_config_sha256,
-    }, {
-      resourceGeneration: head.generation,
-      idempotencyKey: intent.actionId,
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "task_submit",
+      resourceScope: `project:${projectId}:task:new`,
+      request,
+      authority: { resource_generation: head.generation, etag: project.admission_etag },
+      send: (actionId) => this.client.submitTask(request, {
+        resourceGeneration: head.generation,
+        idempotencyKey: actionId,
+      }),
     });
+    const task = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, task);
     this.invalidate();
     return task;
   }
 
   async cancelTask(taskId: string, intent: ProductMutationIntentV2) {
     const task = this.requireTask(taskId, intent);
-    return this.observeOperation(await this.client.cancelTask(taskId, taskAction(task), taskMutation(task, intent)));
+    const snapshot = this.requireSnapshot();
+    const request = taskAction(task);
+    const mutation = taskMutationAuthority(task);
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "task_cancel",
+      resourceScope: `task:${taskId}`,
+      request,
+      authority: mutation,
+      send: (actionId) => this.client.cancelTask(taskId, request, {
+        resourceGeneration: mutation.resource_generation,
+        ifMatch: mutation.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async retryTask(taskId: string, intent: ProductMutationIntentV2) {
     const task = this.requireTask(taskId, intent);
-    return this.observeOperation(await this.client.retryTask(taskId, taskAction(task), taskMutation(task, intent)));
+    const snapshot = this.requireSnapshot();
+    const request = taskAction(task);
+    const mutation = taskMutationAuthority(task);
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "task_retry",
+      resourceScope: `task:${taskId}`,
+      request,
+      authority: mutation,
+      send: (actionId) => this.client.retryTask(taskId, request, {
+        resourceGeneration: mutation.resource_generation,
+        ifMatch: mutation.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async getProjectHead(projectHeadId: string) {
@@ -393,20 +648,68 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async retryTransition(transitionId: string, intent: ProductMutationIntentV2) {
     const { transition, project } = this.requireTransition(transitionId, intent);
-    return this.observeOperation(await this.client.retryTransition(transitionId, transitionAction(transition), transitionMutation(transition, project, intent)));
+    const snapshot = this.requireSnapshot();
+    const request = transitionAction(transition);
+    const authority = transitionMutationAuthority(transition, project);
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "transition_retry",
+      resourceScope: `transition:${transitionId}`,
+      request,
+      authority,
+      send: (actionId) => this.client.retryTransition(transitionId, request, {
+        resourceGeneration: authority.resource_generation,
+        ifMatch: authority.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async replaceTransition(transitionId: string, intent: ProductMutationIntentV2) {
     const { transition, project } = this.requireTransition(transitionId, intent);
-    return this.observeOperation(await this.client.replaceTransition(transitionId, {
+    const snapshot = this.requireSnapshot();
+    const request = {
       ...transitionAction(transition),
       replacement_plan_sha256: transition.transition.plan_sha256,
-    }, transitionMutation(transition, project, intent)));
+    };
+    const authority = transitionMutationAuthority(transition, project);
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "transition_replace",
+      resourceScope: `transition:${transitionId}`,
+      request,
+      authority,
+      send: (actionId) => this.client.replaceTransition(transitionId, request, {
+        resourceGeneration: authority.resource_generation,
+        ifMatch: authority.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async abandonTransition(transitionId: string, intent: ProductMutationIntentV2) {
     const { transition, project } = this.requireTransition(transitionId, intent);
-    return this.observeOperation(await this.client.abandonTransition(transitionId, transitionAction(transition), transitionMutation(transition, project, intent)));
+    const snapshot = this.requireSnapshot();
+    const request = transitionAction(transition);
+    const authority = transitionMutationAuthority(transition, project);
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "transition_abandon",
+      resourceScope: `transition:${transitionId}`,
+      request,
+      authority,
+      send: (actionId) => this.client.abandonTransition(transitionId, request, {
+        resourceGeneration: authority.resource_generation,
+        ifMatch: authority.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async getArtifactContent(artifactId: string) {
@@ -424,14 +727,24 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const service = snapshot.services.find((candidate) => candidate.service_id === serviceId);
     if (!service) throw new DesktopContractErrorV2("Service restart references an unknown service");
     const profile = activeConnectedProfile(snapshot);
-    return this.observeOperation(await this.client.restartService(serviceId, {
+    const request = {
       schema_version: "2",
       expected_service_id: serviceId,
-    }, {
-      resourceGeneration: profile.connection_generation,
-      ifMatch: service.etag,
-      idempotencyKey: intent.actionId,
-    }));
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "service_restart",
+      resourceScope: `service:${serviceId}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: service.etag },
+      send: (actionId) => this.client.restartService(serviceId, request, {
+        resourceGeneration: profile.connection_generation,
+        ifMatch: service.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
   }
 
   async createDiagnostic(
@@ -440,16 +753,27 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   ) {
     const snapshot = this.requireIntent(intent);
     const profile = activeConnectedProfile(snapshot);
-    const diagnostic = await this.client.createDiagnostic({
+    const request = {
       schema_version: "2",
       profile_id: profile.profile_id,
       profile_connection_generation: profile.connection_generation,
       scope: input.scope,
       resource_id: input.resource_id,
-    }, {
-      resourceGeneration: profile.connection_generation,
-      idempotencyKey: intent.actionId,
+    } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "diagnostic_create",
+      resourceScope: `diagnostic:${input.scope}:${input.resource_id ?? "system"}`,
+      request,
+      authority: { resource_generation: profile.connection_generation, etag: null },
+      send: (actionId) => this.client.createDiagnostic(request, {
+        resourceGeneration: profile.connection_generation,
+        idempotencyKey: actionId,
+      }),
     });
+    const diagnostic = dispatched.value;
+    await this.completeDirectMutationV2(dispatched.entry, diagnostic);
     this.invalidate();
     return diagnostic;
   }
@@ -574,6 +898,70 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const project = snapshot.projects.find((candidate) => candidate.project_id === transition?.transition.project_id);
     if (!transition || !project) throw new DesktopContractErrorV2("Transition action references unknown authority");
     return { transition, project };
+  }
+
+  private async dispatchMutationV2<T>(input: {
+    readonly snapshot: DesktopProductSnapshotV2;
+    readonly intent: ProductMutationIntentV2;
+    readonly mutationKind: MutationKindV2;
+    readonly resourceScope: string;
+    readonly request: unknown;
+    readonly authority: Readonly<Record<string, unknown>>;
+    readonly chainStep?: MutationChainStepV2;
+    readonly includeStreamAuthority?: boolean;
+    readonly send: (actionId: string) => Promise<T>;
+  }): Promise<{ readonly entry: PendingMutationIntentV2; readonly value: T }> {
+    const stream = input.snapshot.stream;
+    if (stream.status !== "fresh") throw new DesktopContractErrorV2("Mutation requires a fresh provider stream authority");
+    const entry = await this.mutationIntents.reserve({
+      proposedActionId: input.intent.actionId,
+      mutationKind: input.mutationKind,
+      resourceScope: input.resourceScope,
+      request: input.request,
+      authority: input.includeStreamAuthority === false
+        ? { schema_version: "2", ...input.authority }
+        : {
+            schema_version: "2",
+            provider_stream_last_event_id: stream.lastEventId,
+            desktop_state_updated_at: input.snapshot.state.updated_at,
+            ...input.authority,
+          },
+      providerStreamInstance: this.providerStreamInstance,
+      providerStreamEpoch: stream.epoch,
+      chainStep: input.chainStep,
+    });
+    if (entry.state === "deterministic_rejection") {
+      throw new MutationIntentConflictV2("This exact mutation was deterministically rejected", entry);
+    }
+    try {
+      const value = await input.send(entry.action_id);
+      const operationId = operationIdOfV2(value);
+      if (operationId !== null) await this.mutationIntents.bindAcceptedOperation(entry.action_id, operationId);
+      return { entry, value };
+    } catch (error) {
+      if (isDeterministicMutationRejectionV2(error)) {
+        await this.mutationIntents.markDeterministicRejection(entry.action_id);
+      }
+      throw error;
+    }
+  }
+
+  private async completeDirectMutationV2(
+    entry: PendingMutationIntentV2,
+    value: unknown,
+  ): Promise<void> {
+    await this.mutationIntents.markDirectResponseObserved(
+      entry.action_id,
+      sha256Utf8V2(canonicalJsonV2(value)),
+    );
+  }
+
+  private async completeTerminalOperationV2(
+    entry: PendingMutationIntentV2,
+    operationId: string,
+  ): Promise<void> {
+    await this.mutationIntents.markTerminalObserved(entry.action_id, operationId);
+    await this.mutationIntents.clearTerminalObserved(entry.action_id, operationId);
   }
 
   private observeOperation<T extends LocalOperationV2 | LifecycleOperationV2 | OperationV2>(operation: T): T {
@@ -754,15 +1142,13 @@ function activeConnectedProfile(snapshot: Pick<DesktopProductSnapshotV2, "state"
   return profile;
 }
 
-function profileMutation(profile: RemoteWorkspaceProfileV2, intent: ProductMutationIntentV2) {
-  return { resourceGeneration: profile.connection_generation, ifMatch: profile.etag, idempotencyKey: intent.actionId };
-}
-
-function projectMutation(project: ProjectV2, intent: ProductMutationIntentV2) {
+function projectCreateRequestV2(draft: ProjectDraftV2, profile: RemoteWorkspaceProfileV2) {
   return {
-    resourceGeneration: project.active_project_head?.generation ?? 0,
-    ifMatch: project.etag,
-    idempotencyKey: intent.actionId,
+    schema_version: "2" as const,
+    profile_id: profile.profile_id,
+    profile_connection_generation: profile.connection_generation,
+    display_name: draft.displayName,
+    config: scienceProjectConfigV2Schema.parse(draft.config),
   };
 }
 
@@ -775,10 +1161,10 @@ function taskAction(task: TaskV2) {
   };
 }
 
-function taskMutation(task: TaskV2, intent: ProductMutationIntentV2) {
+function taskMutationAuthority(task: TaskV2) {
   const attempt = task.attempts.at(-1);
   if (!attempt) throw new DesktopContractErrorV2("Task has no infrastructure attempt authority");
-  return { resourceGeneration: attempt.ordinal, ifMatch: task.etag, idempotencyKey: intent.actionId };
+  return { resource_generation: attempt.ordinal, etag: task.etag };
 }
 
 function transitionAction(transition: SuccessorTransitionV2) {
@@ -789,11 +1175,10 @@ function transitionAction(transition: SuccessorTransitionV2) {
   };
 }
 
-function transitionMutation(transition: SuccessorTransitionV2, project: ProjectV2, intent: ProductMutationIntentV2) {
+function transitionMutationAuthority(transition: SuccessorTransitionV2, project: ProjectV2) {
   return {
-    resourceGeneration: transition.transition.expected_successor_generation,
-    ifMatch: project.etag,
-    idempotencyKey: intent.actionId,
+    resource_generation: transition.transition.expected_successor_generation,
+    etag: project.etag,
   };
 }
 
@@ -806,6 +1191,17 @@ function isLifecycleTerminal(operation: LifecycleOperationV2): boolean {
   return operation.status === "succeeded"
     || operation.status === "failed"
     || operation.status === "cancelled";
+}
+
+function operationIdOfV2(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || !("operation_id" in value)) return null;
+  const operationId = (value as { readonly operation_id?: unknown }).operation_id;
+  return typeof operationId === "string" ? opaqueIdV2Schema.parse(operationId) : null;
+}
+
+function isDeterministicMutationRejectionV2(error: unknown): boolean {
+  return error instanceof DesktopApiErrorV2
+    && (!error.apiError.retryable || [400, 403, 404, 409, 412, 422, 426, 501].includes(error.status));
 }
 
 function lifecycleTerminalError(operation: LifecycleOperationV2, fallback: string): DesktopContractErrorV2 {
