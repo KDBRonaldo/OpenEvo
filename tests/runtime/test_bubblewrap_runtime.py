@@ -298,6 +298,12 @@ async def test_start_requires_core_owned_rootfs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runtime = _runtime(tmp_path)
+    binary_authority = bubblewrap_module._open_executable_authority(runtime._binary_path)
+    monkeypatch.setattr(
+        bubblewrap_module,
+        "_open_executable_authority",
+        lambda _path: binary_authority,
+    )
     actual_uid = os.geteuid()
     monkeypatch.setattr(
         bubblewrap_module.os,

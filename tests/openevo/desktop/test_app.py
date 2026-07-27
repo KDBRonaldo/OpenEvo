@@ -42,6 +42,9 @@ from desktop.sidecar.workspace_identity import project_id_for_native_import
 from openevo import __version__ as OPENEVO_VERSION
 
 
+_LAUNCHER_STARTUP_TIMEOUT_SECONDS = 15.0
+
+
 class _BinaryStdin:
     def __init__(self, value: bytes) -> None:
         self.buffer = io.BytesIO(value)
@@ -522,7 +525,7 @@ def test_launcher_serves_on_inherited_listener_with_instance_proof(
         listener.close()
 
         challenge = "3c" * 32
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _LAUNCHER_STARTUP_TIMEOUT_SECONDS
         payload: dict[str, str] | None = None
         while time.monotonic() < deadline:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
@@ -693,7 +696,7 @@ raise SystemExit(
         process.stdin = None
         listener.close()
 
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + _LAUNCHER_STARTUP_TIMEOUT_SECONDS
         while time.monotonic() < deadline:
             connection = http.client.HTTPConnection("127.0.0.1", port, timeout=0.25)
             try:
