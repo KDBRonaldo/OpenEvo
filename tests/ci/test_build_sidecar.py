@@ -1310,6 +1310,23 @@ def test_tauri_bundles_exact_native_askpass_external_binary() -> None:
     assert 'Command::new("sh")' not in helper
 
 
+def test_native_askpass_source_keeps_linux_clippy_portable() -> None:
+    helper = Path("desktop/src-tauri/src/askpass.rs").read_text(encoding="utf-8")
+
+    assert "libc::S_IFMT as u32" not in helper
+    assert "libc::S_IFREG as u32" not in helper
+    assert "u32::from(libc::S_IFMT)" in helper
+    assert "u32::from(libc::S_IFREG)" in helper
+    assert (
+        '#[cfg(any(test, target_os = "macos"))]\n'
+        "    pub fn new(value: Vec<u8>) -> Self {"
+    ) in helper
+    assert (
+        '#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]\n'
+        "pub enum DialogOutcome {"
+    ) in helper
+
+
 def test_unsigned_macos_sidecar_rejects_hardened_runtime_after_resigning(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

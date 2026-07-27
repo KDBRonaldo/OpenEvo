@@ -164,7 +164,7 @@ fn system_executable_identity(
 
 fn require_trusted_system_executable(metadata: &Metadata) -> Result<(), SystemSshOwnerError> {
     let mode = metadata.mode();
-    if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+    if mode & u32::from(libc::S_IFMT) != u32::from(libc::S_IFREG)
         || metadata.uid() != 0
         || metadata.nlink() != 1
         || mode & 0o022 != 0
@@ -266,6 +266,7 @@ pub enum AskpassError {
 pub struct SecretResponse(Vec<u8>);
 
 impl SecretResponse {
+    #[cfg(any(test, target_os = "macos"))]
     pub fn new(value: Vec<u8>) -> Self {
         Self(value)
     }
@@ -284,6 +285,7 @@ impl Drop for SecretResponse {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub enum DialogOutcome {
     Secret(SecretResponse),
     Confirm(bool),
