@@ -1,6 +1,6 @@
 # OpenEvo Desktop v0.1.10 Lifecycle Operations Design
 
-Status: approved in product discussion; awaiting written-spec review
+Status: approved for implementation
 
 Issue: [#220](https://github.com/CompLifeLab-ZJU/OpenEvo/issues/220)
 
@@ -43,8 +43,9 @@ v0.1.10 fixes the lifecycle model rather than merely increasing one timeout.
   operations, for the same exact-retry rule.
 - Preserve the system-OpenSSH authority model and the post-negotiation active
   project tunnel boundary.
-- Prove the fix with a signed real-macOS E2E in which a cold lifecycle operation
-  exceeds 15 seconds and creates exactly one remote project.
+- Prove the fix with OpenSSH-signed real-macOS evidence in which a cold
+  lifecycle operation exceeds 15 seconds and creates exactly one remote
+  project.
 
 ## Non-goals
 
@@ -74,13 +75,25 @@ that may wait on native I/O, SSH, Daemon preparation, or project activation:
 - native workspace traversal, archive preparation, and sidecar adoption;
 - remote project create and activation.
 
+Native app/sidecar startup precedes the Local API and therefore cannot be a
+sidecar lifecycle operation. Tauri exposes a closed `NativeStartupStatusV2`
+for the already-owned startup epoch. The bootstrap screen polls that authority
+and shows its real fixed stage, checkpoint progress, elapsed time, retry, and
+safe cancellation while the sidecar is unavailable. It does not expose raw
+bootloader/Python stderr; the existing bounded classified startup diagnostic
+remains the failure authority.
+
 SSH catalog scans and ordinary bounded CRUD remain synchronous because their
 current implementations perform no unbounded external work. If implementation
 inspection disproves that premise, the affected route must join the lifecycle
 contract before v0.1.10 release. Core-owned Task, transition, service,
-diagnostic, and maintenance operations retain their Core authority; the shared
-presentation component renders their existing authoritative operation,
-timeline, and log fields without inventing Desktop-owned phases.
+diagnostic, and maintenance operations retain their Core authority. Desktop
+adds only renderer-safe projections for Core operation lookup/cancel, service
+logs, and cache cleanup through the active project tunnel. Task
+state/timeline/logs, transition progress, diagnostic status, service logs, and
+`OperationV2` progress feed the shared presentation component without
+inventing Desktop-owned phases or copying Core operations into the provider
+store.
 
 ### Mutation idempotency audit
 
@@ -112,6 +125,7 @@ renderer form/action
   -> renderer GET operation + paginated logs
   -> authoritative resource refresh
   -> native journal clear after proved terminal reconciliation
+  -> idempotent sidecar terminal acknowledgement
 ```
 
 The initial mutation request performs validation and durable reservation only.
@@ -163,13 +177,33 @@ Long mutation routes return HTTP 202 with `LifecycleOperationV2` immediately:
 - project create/activate;
 - native workspace preparation after the native folder picker has returned.
 
+Native workspace preparation is reserved through the authenticated hidden
+native-to-sidecar workspace-import route because the renderer must never receive
+the selected host path. The Tauri command returns the same renderer-safe
+`LifecycleOperationV2`; the public observation, log, cancellation, state, and SSE
+routes remain the sole renderer-visible operation authority.
+
 Observation and control use:
 
 ```text
 GET  /desktop/v2/operations/{operation_id}
 GET  /desktop/v2/operations/{operation_id}/logs
 POST /desktop/v2/operations/{operation_id}/cancel
+POST /desktop/v2/operations/{operation_id}/acknowledge
 ```
+
+Core-owned observation remains namespaced and tunnel-only:
+
+```text
+GET  /desktop/v2/core-operations/{operation_id}
+POST /desktop/v2/core-operations/{operation_id}/cancel
+GET  /desktop/v2/services/{service_id}/logs
+POST /desktop/v2/maintenance/cache-cleanup
+```
+
+The Core operation responses preserve Core `OperationV2` status, progress,
+failure, and ETag. They never fall back to SSH execution or the Desktop
+lifecycle store.
 
 The log route uses a signed cursor, a maximum page size of 100, stable ascending
 sequence order, explicit truncation metadata, and the same Desktop session
@@ -182,7 +216,16 @@ Core project ID. The renderer refreshes the project collection and accepts only
 the exact matching project. It never fabricates a pending `ProjectV2`.
 
 `DesktopStateV2` gains bounded pending operation references so restart and SSE
-recovery can rediscover work without depending on component-local state.
+recovery can rediscover work without depending on component-local state. The
+list includes every nonterminal operation and every terminal operation whose
+native journal reconciliation has not yet been acknowledged.
+
+Acknowledgement is an idempotent terminal-only handshake. The renderer first
+reconciles the exact terminal result and clears the matching native journal row,
+then acknowledges the immutable terminal operation. A crash after native clear
+but before acknowledgement leaves the terminal operation discoverable in
+`DesktopStateV2`; the next launch can finish the handshake. Acknowledgement is
+stored separately and does not mutate the terminal operation document or ETag.
 
 ### Events
 
@@ -251,16 +294,21 @@ Each `LifecycleLogEntryV2` contains:
 The sidecar strips terminal escape/control sequences before persistence and
 rendering. It never sends the child command line or environment. Known
 credentials, authorization headers, bearer tokens, proxy userinfo, askpass
-values, and configured secret canaries are replaced before a log record can be
-committed. This mandatory secret boundary remains even on a single-user Mac
-because the child process itself may echo authentication material.
+values, configured secret canaries, Core endpoints, and absolute host paths are
+replaced before a log record can be committed. This mandatory contract
+boundary remains even on a single-user Mac because the child process itself may
+echo authentication material or private host authority.
 
 One entry is limited to 16 KiB of UTF-8 text. One operation retains at most
-4,096 entries and 4 MiB. When retention would be exceeded, the oldest complete
-entries are evicted and a durable dropped-before sequence records the gap.
-Writes, cursor reads, recovery, and eviction enforce the same row and aggregate
-byte accounting before loading text into Python. Renderer memory keeps only a
-bounded visible tail; older retained pages load on demand.
+4,096 entries and 4 MiB; the provider store retains at most 32 MiB of lifecycle
+log text across operations. When per-operation or global retention would be
+exceeded, the oldest complete entries are evicted, preferring acknowledged
+terminal operations, and each affected operation records a durable
+dropped-before sequence. Operation/result/idempotency authority is never
+evicted as a substitute for log eviction. Writes, cursor reads, recovery, and
+eviction enforce the same row and aggregate byte accounting before loading text
+into Python. Renderer memory keeps only a bounded visible tail; older retained
+pages load on demand.
 
 ## Durable Operation Store
 
@@ -279,17 +327,20 @@ result and idempotency replay commit together. Same key plus exact request and
 authority returns the same operation/result. Same key plus different bytes or
 authority fails before any external work.
 
-The lifecycle executor retains the existing hard admission limit of 16
-nonterminal operations and one external-work worker. This intentionally
-serializes the process-global SSH/Daemon/project-session authority. Conflicting
-operations that cannot safely wait fail with a typed busy response; no caller
-can create a seventeenth queued operation.
+The lifecycle executor retains one external-work worker. The store admits at
+most 16 recoverable authorities total: nonterminal operations plus terminal
+operations still awaiting reconciliation acknowledgement. This intentionally
+serializes the process-global SSH/Daemon/project-session authority and ensures
+every item fits in `DesktopStateV2`. Conflicting operations that cannot safely
+wait fail with a typed busy response; exact replay remains available at
+capacity, and no caller can create a seventeenth recoverable operation.
 
 Terminal operation, replay, and retained-log authority remains readable for
-seven days. Cleanup never removes a nonterminal operation, an unresolved native
-journal reference, or an idempotency row whose terminal result has not been
-reconciled. Capacity pressure fails new reservation before external work; it
-does not evict live or unreconciled authority.
+seven days after terminal reconciliation acknowledgement. Cleanup never removes
+a nonterminal operation, an unacknowledged terminal operation, or an idempotency
+row whose terminal result has not been reconciled. Capacity pressure fails new
+reservation before external work; it does not evict live or unreconciled
+authority.
 
 On sidecar restart, every nonterminal operation is reconciled from durable
 state. The worker uses the existing remote lifecycle and Core bridge ledgers to
@@ -310,7 +361,9 @@ Each journal entry contains only non-secret authority:
 - mutation kind and resource scope;
 - canonical request digest;
 - observed ETag/generation and provider stream identity;
-- optional accepted operation ID;
+- current chain step;
+- optional current accepted operation ID and at most two completed operation
+  IDs;
 - lifecycle state and timestamps.
 
 The journal holds at most 16 entries, at most 64 KiB of canonical bytes per
@@ -343,17 +396,29 @@ overwrite an unresolved intent. The UI first offers resume/reconcile; a truly
 new action receives a new ID only after the prior intent reaches a proved
 terminal disposition.
 
+Native-folder project creation is one fixed two-step mutation chain because the
+existing private workspace-import ownership derives from the action ID. Before
+the picker opens, the journal binds the current project draft, profile authority,
+and `native_folder_snapshot` source kind; conflicting form controls then freeze.
+The native preparation operation can become a completed intermediate operation,
+be acknowledged, and advance the same journal row to `project_create` without
+clearing or changing its action ID. Project creation binds the second operation.
+The row clears only after that project is reconciled, or after an explicit
+discard proves the prepared import and both operations have no live side effect.
+
 ## User Experience
 
-One reusable lifecycle panel is embedded in the connection drawer, project
-creation drawer, project activation flow, and native workspace preparation
-flow. It contains:
+One reusable lifecycle panel is embedded in the native startup screen,
+connection drawer, project creation drawer, project activation flow, native
+workspace preparation flow, Task/evolution view, transition view, diagnostic
+view, and service/maintenance operation view. Each adapter preserves its native,
+Desktop, or Core authority. It contains:
 
 - operation title and current authoritative phase;
 - determinate checkpoint/byte/item progress where available;
 - indeterminate animation otherwise;
 - elapsed time without an estimated completion time;
-- the latest process log lines in a monospace live region;
+- the latest process log lines in a monospace tail;
 - an expandable, paginated retained log history;
 - typed terminal result or failure and next action;
 - Cancel only while the operation says cancellation is safe;
@@ -424,6 +489,9 @@ includes:
 
 ### Renderer and native host
 
+- native app/sidecar startup exposes fixed-stage progress, elapsed time,
+  retry/cancel state, and a closed failure without waiting for Local API
+  availability;
 - stable action ID on ambiguous retry and across relaunch;
 - changed request cannot reuse or overwrite the retained intent;
 - success/rejection/terminal reconciliation clears only the exact journal row;
@@ -433,18 +501,22 @@ includes:
   baselines;
 - no 15-second timeout error while remote lifecycle work is legitimately
   running.
+- Task/evolution, transition, diagnostic, service, and maintenance views render
+  their existing Core state/progress/log authority through the shared panel and
+  never create a Desktop lifecycle shadow operation.
 
 ### Real release E2E
 
-The exact signed/notarized candidate DMG is installed under `/Applications` on
+The exact ad-hoc-signed, non-notarized candidate DMG is installed under
+`/Applications` on
 the target Mac and tested against the real configured system-OpenSSH alias. A
 cold project lifecycle must:
 
 1. exceed 15 seconds;
 2. return an operation promptly;
 3. show at least two authoritative phase changes and real child log text;
-4. survive one SSE reconnect and one Desktop quit/relaunch or equivalent signed
-   recovery scenario;
+4. survive one SSE reconnect and one Desktop quit/relaunch, or an equivalently
+   strong restart-recovery scenario;
 5. finish with one authoritative Core project and one applied mutation;
 6. run a real science Task and retain the v0.1.9 two-session successor/context
    acceptance path;
@@ -464,9 +536,10 @@ Implementation updates:
   handoff/release notes, and user-facing troubleshooting.
 
 The implementation PR must resolve #220. After all local and CI gates pass, the
-exact candidate is pushed to `stable`, packaged, signed/notarized, installed,
+exact candidate is pushed to `stable`, packaged under the canonical unsigned
+DMG/ad-hoc app-signature policy, installed,
 tested on the real remote workspace, and published as a new immutable public
-v0.1.10 release. The v0.1.9 release and tag are never modified.
+v0.1.10 Preview. The v0.1.9 release and tag are never modified.
 
 ## Design Self-Review Checklist
 
