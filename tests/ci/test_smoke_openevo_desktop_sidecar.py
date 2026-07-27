@@ -102,3 +102,32 @@ def test_recovered_lifecycle_http_evidence_fails_closed_on_identity_change() -> 
     operation["operation_id"] = "operation-smoke-0002"
     with pytest.raises(smoke.SmokeFailure, match="identity changed"):
         smoke._assert_recovered_lifecycle_http(operation, logs, authority)
+
+
+def test_native_restart_uses_distinct_immutable_launch_copies(tmp_path: Path) -> None:
+    smoke = _load_module()
+    source = tmp_path / "packaged-sidecar"
+    source.write_bytes(b"packaged-sidecar-bytes")
+    source.chmod(0o755)
+
+    first = smoke._stage_native_launch_copy(
+        source,
+        parent=tmp_path,
+        basename=smoke.NATIVE_SIDECAR_BASENAME,
+        mode=0o500,
+    )
+    second = smoke._stage_native_launch_copy(
+        source,
+        parent=tmp_path,
+        basename=smoke.NATIVE_SIDECAR_BASENAME,
+        mode=0o500,
+    )
+
+    assert first != second
+    assert first.name == smoke.NATIVE_SIDECAR_BASENAME
+    assert second.name == smoke.NATIVE_SIDECAR_BASENAME
+    assert first.parent != second.parent
+    assert first.read_bytes() == source.read_bytes()
+    assert second.read_bytes() == source.read_bytes()
+    assert first.stat().st_mode & 0o777 == 0o500
+    assert second.stat().st_mode & 0o777 == 0o500

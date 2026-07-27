@@ -16,7 +16,6 @@ import posixpath
 import re
 import secrets
 import signal
-import shutil
 import socket
 import sqlite3
 import stat
@@ -629,6 +628,97 @@ def _force_kill_anchored_process_group(
     process.wait(timeout=10)
 
 
+def _stage_native_launch_copy(
+    source: Path,
+    *,
+    parent: Path,
+    basename: str,
+    mode: int,
+) -> Path:
+    if mode not in {0o500, 0o755}:
+        raise SmokeFailure("native launch copy mode is invalid")
+    source_fd = -1
+    destination_fd = -1
+    destination: Path | None = None
+    launch_root: Path | None = None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+        source_metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_size <= 0:
+            raise SmokeFailure("native launch source metadata is invalid")
+        for _ in range(16):
+            candidate_root = parent / f".native-launch-{secrets.token_hex(12)}"
+            try:
+                candidate_root.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            launch_root = candidate_root
+            destination = launch_root / basename
+            destination_fd = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | nofollow,
+                0o600,
+            )
+            break
+        if destination is None or destination_fd < 0:
+            raise SmokeFailure("native launch copy could not be allocated")
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    raise SmokeFailure("native launch copy write failed")
+                offset += written
+        os.fchmod(destination_fd, mode)
+        os.fsync(destination_fd)
+        destination_metadata = os.fstat(destination_fd)
+        if (
+            not stat.S_ISREG(destination_metadata.st_mode)
+            or destination_metadata.st_nlink != 1
+            or destination_metadata.st_size != source_metadata.st_size
+            or stat.S_IMODE(destination_metadata.st_mode) != mode
+        ):
+            raise SmokeFailure("native launch copy metadata is invalid")
+        return destination
+    except SmokeFailure:
+        if destination is not None:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        if launch_root is not None:
+            try:
+                launch_root.rmdir()
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        if destination is not None:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        if launch_root is not None:
+            try:
+                launch_root.rmdir()
+            except OSError:
+                pass
+        raise SmokeFailure("native launch copy could not be staged") from exc
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
 def _launch_native_sidecar(
     sidecar: Path,
     *,
@@ -655,14 +745,20 @@ def _launch_native_sidecar(
             or not 0 < helper_metadata.st_size <= 16 * 1024 * 1024
         ):
             raise SmokeFailure("packaged SSH askpass helper metadata is invalid")
-    launch_path = config_root.parent / NATIVE_SIDECAR_BASENAME
-    shutil.copyfile(sidecar, launch_path)
-    launch_path.chmod(0o500)
+    launch_path = _stage_native_launch_copy(
+        sidecar,
+        parent=config_root.parent,
+        basename=NATIVE_SIDECAR_BASENAME,
+        mode=0o500,
+    )
     helper_launch_path: Path | None = None
     if helper_source is not None:
-        helper_launch_path = config_root.parent / NATIVE_ASKPASS_BASENAME
-        shutil.copyfile(helper_source, helper_launch_path)
-        helper_launch_path.chmod(0o755)
+        helper_launch_path = _stage_native_launch_copy(
+            helper_source,
+            parent=config_root.parent,
+            basename=NATIVE_ASKPASS_BASENAME,
+            mode=0o755,
+        )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
