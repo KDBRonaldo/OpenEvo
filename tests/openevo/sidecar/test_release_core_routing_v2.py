@@ -21,6 +21,7 @@ from desktop.sidecar.provider_store_v2 import (
     LifecycleNativeWorkspacePrepareRequestV2,
     LifecycleOperationAdvanceV2,
     LifecycleOperationReservationV2,
+    LifecycleProjectActivateRequestV2,
     LifecycleProjectCreateRequestV2,
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_v2_app
@@ -1144,6 +1145,127 @@ def test_running_project_create_waits_for_reconnect_after_sidecar_restart(
     finally:
         client.close()
         provider.close()
+        reopened.close()
+
+
+def test_running_project_activate_waits_for_reconnect_after_sidecar_restart(
+    tmp_path: Path,
+) -> None:
+    first_provider, first_store, _first_lifecycle, bridge = _provider(tmp_path)
+    first_client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=first_provider,
+            close_on_shutdown=False,
+        )
+    )
+    profile = _connected_profile(first_client)
+    created = first_client.post(
+        "/desktop/v2/projects",
+        headers=_headers(
+            **{
+                "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
+                "Idempotency-Key": "routing-activate-restart-create-project-0001",
+            }
+        ),
+        json=_project_create(profile),
+    )
+    assert created.status_code == 202, created.text
+    assert _wait_lifecycle_operation(first_client, created.json())["status"] == "succeeded"
+    project = bridge.project
+    assert project is not None and project.active_project_head is not None
+    first_client.close()
+    first_provider.close()
+
+    head = project.active_project_head
+    operation = first_store.reserve_lifecycle_operation(
+        LifecycleOperationReservationV2(
+            kind="project_activate",
+            resource={"resource_kind": "project", "resource_id": project.project_id},
+            request=LifecycleProjectActivateRequestV2(
+                request_kind="project_activate",
+                project_id=project.project_id,
+                request=local_v2.ProjectActionV2(
+                    expected_project_head_id=head.project_head_id,
+                    expected_project_head_manifest_sha256=head.manifest_sha256,
+                ),
+                resource_generation=head.generation,
+                if_match=project.etag,
+            ),
+        ),
+        idempotency_key="routing-activate-restart-reservation-0001",
+    )
+    claimed = first_store.claim_next_lifecycle_operation()
+    assert claimed is not None and claimed.operation.operation_id == operation.operation_id
+    first_store.close()
+
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    recovered_profiles = reopened.reconcile_process_restart()
+    assert len(recovered_profiles) == 1
+    disconnected = recovered_profiles[0]
+    lifecycle = _Lifecycle()
+    recovered_provider = DesktopReleaseProviderV2(
+        store=reopened,
+        catalog=_Catalog(),
+        lifecycle=lifecycle,
+        core_connector=_CoreConnector(),
+        bridge=bridge,
+        bridge_store=bridge,
+        workspace_import_store=None,
+        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        build_version="0.1.10",
+        source_commit=SOURCE_COMMIT,
+        build_channel="release",
+        instance_id="routing-activate-restart-instance-v2",
+        clock=lambda: NOW,
+        own_resources=False,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=recovered_provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if reopened.get_lifecycle_operation(operation.operation_id).status == "running":
+                break
+            time.sleep(0.01)
+        assert reopened.get_lifecycle_operation(operation.operation_id).status == "running"
+
+        connected = client.post(
+            f"/desktop/v2/profiles/{disconnected.profile_id}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(disconnected.connection_generation),
+                    "If-Match": disconnected.etag,
+                    "Idempotency-Key": "routing-activate-restart-connect-profile-0001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": disconnected.connection_generation,
+            },
+        )
+        assert connected.status_code == 202, connected.text
+        assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
+        terminal = _wait_lifecycle_operation(
+            client,
+            {"operation_id": operation.operation_id},
+        )
+
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == project.project_id
+        assert bridge.active_activation is not None
+        assert (
+            bridge.active_activation.profile_connection_generation
+            == disconnected.connection_generation + 1
+        )
+    finally:
+        client.close()
+        recovered_provider.close()
         reopened.close()
 
 
