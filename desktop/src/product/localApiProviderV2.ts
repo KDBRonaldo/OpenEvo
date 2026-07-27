@@ -196,7 +196,12 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     const catalog = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, catalog);
+    await this.completeDirectMutationV2(dispatched.entry, catalog, async () => {
+      const authoritative = await this.client.listSshHosts();
+      if (authoritative.catalog_generation < catalog.catalog_generation) {
+        throw new DesktopContractErrorV2("SSH catalog rescan is absent from authoritative Desktop state");
+      }
+    });
     this.invalidate();
     return catalog;
   }
@@ -222,7 +227,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     const profile = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, profile);
+    await this.completeDirectMutationV2(dispatched.entry, profile, async () => {
+      const authoritative = await this.client.getProfile(profile.profile_id);
+      if (authoritative.profile_kind !== "system_openssh"
+        || authoritative.display_name !== profile.display_name
+        || authoritative.ssh_host_alias !== profile.ssh_host_alias) {
+        throw new DesktopContractErrorV2("Created profile is absent from authoritative Desktop state");
+      }
+    });
     this.invalidate();
     return profile;
   }
@@ -245,7 +257,13 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     const result = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, result);
+    await this.completeDirectMutationV2(dispatched.entry, result, async () => {
+      const authoritative = await this.client.getProfile(profileId);
+      if (authoritative.profile_id !== result.profile_id
+        || authoritative.display_name !== result.display_name) {
+        throw new DesktopContractErrorV2("Renamed profile is absent from authoritative Desktop state");
+      }
+    });
     this.invalidate();
     return result;
   }
@@ -271,7 +289,12 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         return null;
       },
     });
-    await this.completeDirectMutationV2(dispatched.entry, null);
+    await this.completeDirectMutationV2(dispatched.entry, null, async () => {
+      const profiles = await collectPages((options) => this.client.listProfiles(options));
+      if (profiles.some((candidate) => candidate.profile_id === profileId)) {
+        throw new DesktopContractErrorV2("Deleted profile remains in authoritative Desktop state");
+      }
+    });
     this.invalidate();
   }
 
@@ -299,7 +322,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     const result = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, result);
+    await this.completeDirectMutationV2(dispatched.entry, result, async () => {
+      const authoritative = await this.client.getProfile(profileId);
+      if (authoritative.profile_kind !== "system_openssh"
+        || authoritative.profile_id !== result.profile_id
+        || authoritative.ssh_host_alias !== result.ssh_host_alias) {
+        throw new DesktopContractErrorV2("Rebound profile is absent from authoritative Desktop state");
+      }
+    });
     this.invalidate();
     return result;
   }
@@ -429,7 +459,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       authority: { resource_generation: 0, etag: current.etag },
       send: (actionId) => this.lifecycleOperations.cancel(id, actionId),
     });
-    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value, async () => {
+      await this.lifecycleOperations.refresh(id);
+    });
     return this.observeOperation(dispatched.value);
   }
 
@@ -595,7 +627,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     const result = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, result);
+    await this.completeDirectMutationV2(dispatched.entry, result, async () => {
+      const authoritative = await this.client.getProject(projectId);
+      if (authoritative.project_id !== result.project_id
+        || authoritative.display_name !== result.display_name
+        || authoritative.project_config_sha256 !== result.project_config_sha256) {
+        throw new DesktopContractErrorV2("Updated project is absent from authoritative Core state");
+      }
+    });
     this.validation = null;
     this.invalidate();
     return result;
@@ -705,7 +744,13 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     const task = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, task);
+    await this.completeDirectMutationV2(dispatched.entry, task, async () => {
+      const authoritative = await this.client.getTask(task.task_id);
+      if (authoritative.task_id !== task.task_id
+        || authoritative.admission.admission_sha256 !== task.admission.admission_sha256) {
+        throw new DesktopContractErrorV2("Submitted Task is absent from authoritative Core state");
+      }
+    });
     this.invalidate();
     return task;
   }
@@ -750,7 +795,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         idempotencyKey: actionId,
       }),
     });
-    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value, async () => {
+      const authoritative = await this.client.getTask(taskId);
+      const expectedOrdinal = task.attempts.length + 1;
+      if (authoritative.admission.admission_sha256 !== task.admission.admission_sha256
+        || authoritative.attempts.at(-1)?.ordinal !== expectedOrdinal) {
+        throw new DesktopContractErrorV2("Retried Task Attempt is absent from authoritative Core state");
+      }
+    });
     return this.observeOperation(dispatched.value);
   }
 
@@ -809,7 +861,12 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         idempotencyKey: actionId,
       }),
     });
-    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value, async () => {
+      const authoritative = await this.client.getTransition(transitionId);
+      if (authoritative.transition.successor_transition_id !== transitionId) {
+        throw new DesktopContractErrorV2("Replaced successor transition is absent from authoritative Core state");
+      }
+    });
     return this.observeOperation(dispatched.value);
   }
 
@@ -901,7 +958,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       authority: { resource_generation: authority.resourceGeneration, etag: current.etag },
       send: (actionId) => this.coreOperations.cancel(id, actionId),
     });
-    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value, async () => {
+      await this.coreOperations.refresh(id);
+    });
     return this.observeOperation(dispatched.value);
   }
 
@@ -1285,6 +1344,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       chainStep: input.chainStep,
     });
     if (entry.state === "deterministic_rejection") {
+      await this.mutationIntents.markDirectResponseObserved(
+        entry.action_id,
+        deterministicRejectionDigestV2(),
+      );
       throw new MutationIntentConflictV2("This exact mutation was deterministically rejected", entry);
     }
     try {
@@ -1302,6 +1365,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     } catch (error) {
       if (isDeterministicMutationRejectionV2(error)) {
         await this.mutationIntents.markDeterministicRejection(entry.action_id);
+        await this.mutationIntents.markDirectResponseObserved(
+          entry.action_id,
+          deterministicRejectionDigestV2(),
+        );
       }
       throw error;
     }
@@ -1310,7 +1377,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private async completeDirectMutationV2(
     entry: PendingMutationIntentV2,
     value: unknown,
+    verify?: () => Promise<void>,
   ): Promise<void> {
+    await verify?.();
     await this.mutationIntents.markDirectResponseObserved(
       entry.action_id,
       sha256Utf8V2(canonicalJsonV2(value)),
@@ -1667,6 +1736,10 @@ function diagnosticIdOfV2(value: unknown): string | null {
 function isDeterministicMutationRejectionV2(error: unknown): boolean {
   return error instanceof DesktopApiErrorV2
     && (!error.apiError.retryable || [400, 403, 404, 409, 412, 422, 426, 501].includes(error.status));
+}
+
+function deterministicRejectionDigestV2(): string {
+  return sha256Utf8V2(canonicalJsonV2({ status: "deterministic_rejection" }));
 }
 
 function lifecycleTerminalError(operation: LifecycleOperationV2, fallback: string): DesktopContractErrorV2 {

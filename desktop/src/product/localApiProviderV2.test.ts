@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import type { DesktopApiClientV2 } from "../api/v2/client";
+import { DesktopApiErrorV2, type DesktopApiClientV2 } from "../api/v2/client";
 import type {
   DesktopStateV2,
   RemoteWorkspaceProfileV2,
@@ -314,7 +314,9 @@ describe("Desktop v2 product provider", () => {
 
   it("creates a profile from an alias only and uses catalog generation authority", async () => {
     const client = clientFixture();
-    vi.mocked(client.createProfile).mockResolvedValue(profile());
+    const created = profile();
+    vi.mocked(client.createProfile).mockResolvedValue(created);
+    vi.mocked(client.getProfile).mockResolvedValue(created);
     const provider = createLocalApiDesktopProductProviderV2({
       client,
       native: nativeFixture(),
@@ -462,7 +464,9 @@ describe("Desktop v2 product provider", () => {
     expect(native.journalValue()).toContain("create-profile-ambiguous-0001");
 
     const secondClient = clientFixture();
-    vi.mocked(secondClient.createProfile).mockResolvedValue(profile());
+    const created = profile();
+    vi.mocked(secondClient.createProfile).mockResolvedValue(created);
+    vi.mocked(secondClient.getProfile).mockResolvedValue(created);
     const relaunched = createLocalApiDesktopProductProviderV2({
       client: secondClient,
       native,
@@ -479,6 +483,50 @@ describe("Desktop v2 product provider", () => {
     expect(secondClient.createProfile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       idempotencyKey: "create-profile-ambiguous-0001",
     }));
+    expect(native.journalValue()).toBeNull();
+  });
+
+  it("keeps a direct success retryable until its exact resource is authoritatively re-read", async () => {
+    const native = nativeFixture();
+    const created = profile();
+    const firstClient = clientFixture();
+    vi.mocked(firstClient.createProfile).mockResolvedValue(created);
+    vi.mocked(firstClient.getProfile).mockRejectedValue(new TypeError("authority refresh interrupted"));
+    const first = createLocalApiDesktopProductProviderV2({
+      client: firstClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const firstRefresh = await first.refresh();
+    if (firstRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(first.createProfile("Lab GPU", "lab-gpu", {
+      actionId: "create-profile-verify-0001",
+      streamEpoch: firstRefresh.snapshot.stream.epoch,
+    })).rejects.toThrow(/authority refresh interrupted/i);
+    expect(native.journalValue()).toContain("create-profile-verify-0001");
+
+    const secondClient = clientFixture();
+    vi.mocked(secondClient.createProfile).mockResolvedValue(created);
+    vi.mocked(secondClient.getProfile).mockResolvedValue(created);
+    const relaunched = createLocalApiDesktopProductProviderV2({
+      client: secondClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const secondRefresh = await relaunched.refresh();
+    if (secondRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+    await relaunched.createProfile("Lab GPU", "lab-gpu", {
+      actionId: "create-profile-new-click-0002",
+      streamEpoch: secondRefresh.snapshot.stream.epoch,
+    });
+
+    expect(secondClient.createProfile).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      idempotencyKey: "create-profile-verify-0001",
+    }));
+    expect(secondClient.getProfile).toHaveBeenCalledWith(created.profile_id);
     expect(native.journalValue()).toBeNull();
   });
 
@@ -504,6 +552,34 @@ describe("Desktop v2 product provider", () => {
       streamEpoch: result.snapshot.stream.epoch,
     })).rejects.toThrow(/different request or authority/i);
     expect(client.createProfile).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases an exact deterministic rejection because it proves no side effect can publish", async () => {
+    const native = nativeFixture();
+    const client = clientFixture();
+    vi.mocked(client.createProfile).mockRejectedValue(new DesktopApiErrorV2(409, {
+      schema_version: "2",
+      code: "profile_already_exists",
+      summary: "A profile already uses this SSH alias.",
+      retryable: false,
+      action: "none",
+      affected_resource_id: null,
+    }));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const result = await provider.refresh();
+    if (result.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(provider.createProfile("Lab GPU", "lab-gpu", {
+      actionId: "create-profile-rejected-0001",
+      streamEpoch: result.snapshot.stream.epoch,
+    })).rejects.toThrow(/already uses/i);
+
+    expect(native.journalValue()).toBeNull();
   });
 
   it("durably binds an accepted lifecycle operation before returning it", async () => {
