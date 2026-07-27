@@ -25,11 +25,15 @@ use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
 
 mod desktop_log;
+mod private_json_journal;
 
 use desktop_log::{
     DesktopDiagnosticLogV2, DesktopEnvironmentSummaryV2, DesktopLogLevel, DesktopLogSource,
     DesktopLogStore, DesktopLogTailV1, DesktopStartupResult, DesktopStartupStage,
 };
+#[cfg(test)]
+use private_json_journal::PrivateJsonJournalRoot;
+use private_json_journal::{PrivateJsonJournal, PrivateJsonJournalPolicy};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
@@ -6370,152 +6374,18 @@ fn stop_sidecar_inner_with<C: ProcessControl>(
     Ok(stopped_host_status())
 }
 
-struct RunRetryRecoveryRoot {
-    path: PathBuf,
-    directory: File,
-    device: u64,
-    inode: u64,
-}
-
-struct RunRetryRecoveryProcessLock {
-    root: RunRetryRecoveryRoot,
-    name: CString,
-    file: File,
-    identity: FileIdentity,
-}
-
-impl RunRetryRecoveryProcessLock {
-    fn acquire(path: &Path) -> HostResult<Self> {
-        let root =
-            open_run_retry_recovery_root(path, true)?.ok_or_else(run_retry_recovery_error)?;
-        root.validate()?;
-        let name = run_retry_recovery_lock_name();
-        let previous_identity = run_retry_recovery_identity_at_optional(&root.directory, &name)?;
-        if let Some(identity) = previous_identity.as_ref() {
-            validate_run_retry_recovery_lock_identity(identity)?;
-        }
-        let file = openat_file(
-            root.directory.as_raw_fd(),
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0o600,
-        )
-        .map_err(|_| run_retry_recovery_error())?;
-        let identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-        validate_run_retry_recovery_lock_identity(&identity)?;
-        validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
-        if previous_identity.is_some_and(|previous| previous != identity)
-            || run_retry_recovery_identity_at_optional(&root.directory, &name)?.as_ref()
-                != Some(&identity)
-        {
-            return Err(run_retry_recovery_error());
-        }
-        root.validate()?;
-
-        let deadline = Instant::now() + RUN_RETRY_RECOVERY_LOCK_TIMEOUT;
-        loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(code) if code == libc::EINTR => continue,
-                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(run_retry_recovery_error());
-                    }
-                    thread::sleep(
-                        RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL
-                            .min(deadline.saturating_duration_since(now)),
-                    );
-                }
-                _ => return Err(run_retry_recovery_error()),
-            }
-        }
-
-        let lock = Self {
-            root,
-            name,
-            file,
-            identity,
-        };
-        lock.validate()?;
-        Ok(lock)
-    }
-
-    fn validate(&self) -> HostResult<()> {
-        self.root.validate()?;
-        let open_identity = file_identity(&self.file).map_err(|_| run_retry_recovery_error())?;
-        validate_run_retry_recovery_lock_identity(&open_identity)?;
-        validate_anchored_extended_acl(&self.file).map_err(|_| run_retry_recovery_error())?;
-        if open_identity != self.identity
-            || run_retry_recovery_identity_at_optional(&self.root.directory, &self.name)?.as_ref()
-                != Some(&self.identity)
-        {
-            return Err(run_retry_recovery_error());
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RunRetryRecoveryProcessLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-impl RunRetryRecoveryRoot {
-    fn validate(&self) -> HostResult<()> {
-        let reopened = open_run_retry_recovery_root(&self.path, false)?
-            .ok_or_else(run_retry_recovery_error)?;
-        let held = file_identity(&self.directory).map_err(|_| run_retry_recovery_error())?;
-        let current = file_identity(&reopened.directory).map_err(|_| run_retry_recovery_error())?;
-        if held.device != self.device
-            || held.inode != self.inode
-            || current.device != self.device
-            || current.inode != self.inode
-        {
-            return Err(run_retry_recovery_error());
-        }
-        validate_run_retry_recovery_root_identity(&held)
-    }
-}
-
-struct RunRetryRecoveryTemp<'a> {
-    directory: &'a File,
-    name: CString,
-    file: File,
-    published: bool,
-}
-
-impl Drop for RunRetryRecoveryTemp<'_> {
-    fn drop(&mut self) {
-        if self.published {
-            return;
-        }
-        let Ok(open_identity) = file_identity(&self.file) else {
-            return;
-        };
-        let Ok(Some(path_identity)) =
-            run_retry_recovery_identity_at_optional(self.directory, &self.name)
-        else {
-            return;
-        };
-        if open_identity == path_identity
-            && open_identity.mode & FILE_TYPE_MASK == REGULAR_FILE_TYPE
-            && open_identity.owner == unsafe { libc::geteuid() }
-            && open_identity.links == 1
-        {
-            let removed =
-                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
-            if removed == 0 {
-                let _ = self.directory.sync_all();
-            }
-        }
-    }
+fn run_retry_recovery_journal() -> PrivateJsonJournal {
+    PrivateJsonJournal::new(PrivateJsonJournalPolicy {
+        file_name: RUN_RETRY_RECOVERY_FILE_NAME,
+        temp_prefix: RUN_RETRY_RECOVERY_TEMP_PREFIX,
+        lock_file_name: RUN_RETRY_RECOVERY_LOCK_FILE_NAME,
+        max_bytes: RUN_RETRY_RECOVERY_MAX_BYTES,
+        lock_timeout: RUN_RETRY_RECOVERY_LOCK_TIMEOUT,
+        lock_poll_interval: RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL,
+        unavailable_error: run_retry_recovery_error,
+        too_large_error: run_retry_recovery_too_large_error,
+        conflict_error: run_retry_recovery_conflict_error,
+    })
 }
 
 fn run_retry_recovery_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
@@ -6529,294 +6399,27 @@ fn run_retry_recovery_root_from_app_data(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(RUN_RETRY_RECOVERY_DIRECTORY_NAME)
 }
 
-#[cfg(target_os = "linux")]
-fn trusted_run_retry_recovery_root_path(path: &Path) -> PathBuf {
-    path.to_path_buf()
-}
-
-#[cfg(target_os = "macos")]
-fn trusted_run_retry_recovery_root_path(path: &Path) -> PathBuf {
-    macos_trusted_path_alias(path)
-}
-
 fn with_run_retry_recovery_transaction<T>(
     state: &DesktopHostState,
     path: &Path,
     operation: impl FnOnce() -> HostResult<T>,
 ) -> HostResult<T> {
-    let _thread_guard = state
-        .run_retry_recovery
-        .lock()
-        .map_err(|_| run_retry_recovery_error())?;
-    let process_lock = RunRetryRecoveryProcessLock::acquire(path)?;
-    let result = operation();
-    process_lock.validate()?;
-    result
+    run_retry_recovery_journal().transaction(&state.run_retry_recovery, path, operation)
 }
 
+#[cfg(test)]
 fn open_run_retry_recovery_root(
     path: &Path,
     create: bool,
-) -> HostResult<Option<RunRetryRecoveryRoot>> {
-    let trusted_path = trusted_run_retry_recovery_root_path(path);
-    let path = trusted_path.as_path();
-    if !path.is_absolute() {
-        return Err(run_retry_recovery_error());
-    }
-    let mut names = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => names.push(name),
-            _ => return Err(run_retry_recovery_error()),
-        }
-    }
-    if names.is_empty() {
-        return Err(run_retry_recovery_error());
-    }
-
-    let mut current = open_directory(Path::new("/")).map_err(|_| run_retry_recovery_error())?;
-    validate_run_retry_recovery_parent(&current)?;
-    for (index, name) in names.iter().enumerate() {
-        let name = CString::new(name.as_bytes()).map_err(|_| run_retry_recovery_error())?;
-        let is_root = index + 1 == names.len();
-        let next = match openat_file(
-            current.as_raw_fd(),
-            &name,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        ) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
-                return Ok(None);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let created = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
-                if created == -1 {
-                    let mkdir_error = std::io::Error::last_os_error();
-                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(run_retry_recovery_error());
-                    }
-                } else {
-                    current.sync_all().map_err(|_| run_retry_recovery_error())?;
-                }
-                openat_file(
-                    current.as_raw_fd(),
-                    &name,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0,
-                )
-                .map_err(|_| run_retry_recovery_error())?
-            }
-            Err(_) => return Err(run_retry_recovery_error()),
-        };
-        if is_root {
-            validate_run_retry_recovery_root_identity(
-                &file_identity(&next).map_err(|_| run_retry_recovery_error())?,
-            )?;
-        } else {
-            validate_run_retry_recovery_parent(&next)?;
-        }
-        validate_anchored_extended_acl(&next).map_err(|_| run_retry_recovery_error())?;
-        current = next;
-    }
-    let identity = file_identity(&current).map_err(|_| run_retry_recovery_error())?;
-    Ok(Some(RunRetryRecoveryRoot {
-        path: trusted_path,
-        directory: current,
-        device: identity.device,
-        inode: identity.inode,
-    }))
-}
-
-fn validate_run_retry_recovery_parent(directory: &File) -> HostResult<()> {
-    let identity = file_identity(directory).map_err(|_| run_retry_recovery_error())?;
-    let effective_user = unsafe { libc::geteuid() };
-    let root_sticky_boundary = identity.owner == 0 && identity.mode & STICKY_MODE_BIT != 0;
-    if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
-        || (identity.owner != 0 && identity.owner != effective_user)
-        || (identity.mode & 0o022 != 0 && !root_sticky_boundary)
-    {
-        return Err(run_retry_recovery_error());
-    }
-    validate_anchored_extended_acl(directory).map_err(|_| run_retry_recovery_error())
-}
-
-fn validate_run_retry_recovery_root_identity(identity: &FileIdentity) -> HostResult<()> {
-    if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
-        || identity.owner != unsafe { libc::geteuid() }
-        || identity.mode & 0o777 != 0o700
-    {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn run_retry_recovery_identity_at_optional(
-    directory: &File,
-    name: &CString,
-) -> HostResult<Option<FileIdentity>> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        return Ok(Some(file_identity_from_stat(unsafe {
-            &stat.assume_init()
-        })));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::NotFound {
-        Ok(None)
-    } else {
-        Err(run_retry_recovery_error())
-    }
-}
-
-fn validate_run_retry_recovery_file_identity(identity: &FileIdentity) -> HostResult<()> {
-    if identity.mode & FILE_TYPE_MASK != REGULAR_FILE_TYPE
-        || identity.owner != unsafe { libc::geteuid() }
-        || identity.mode & 0o777 != 0o600
-        || identity.links != 1
-    {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn validate_run_retry_recovery_lock_identity(identity: &FileIdentity) -> HostResult<()> {
-    validate_run_retry_recovery_file_identity(identity)?;
-    if identity.size != 0 {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn validate_run_retry_recovery_read_identity(identity: &FileIdentity) -> HostResult<()> {
-    validate_run_retry_recovery_file_identity(identity)?;
-    if identity.size > RUN_RETRY_RECOVERY_MAX_BYTES as u64 {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn run_retry_recovery_name() -> CString {
-    CString::new(RUN_RETRY_RECOVERY_FILE_NAME).expect("recovery file name has no NUL")
-}
-
-fn run_retry_recovery_lock_name() -> CString {
-    CString::new(RUN_RETRY_RECOVERY_LOCK_FILE_NAME).expect("recovery lock name has no NUL")
-}
-
-fn read_run_retry_recovery_from_root(
-    root: &RunRetryRecoveryRoot,
-    expected_identity: Option<&FileIdentity>,
-) -> HostResult<Option<String>> {
-    root.validate()?;
-    let name = run_retry_recovery_name();
-    let Some(path_identity) = run_retry_recovery_identity_at_optional(&root.directory, &name)?
-    else {
-        return if expected_identity.is_none() {
-            Ok(None)
-        } else {
-            Err(run_retry_recovery_error())
-        };
-    };
-    validate_run_retry_recovery_read_identity(&path_identity)?;
-    if expected_identity.is_some_and(|expected| expected != &path_identity) {
-        return Err(run_retry_recovery_error());
-    }
-    let mut file = openat_file(
-        root.directory.as_raw_fd(),
-        &name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    )
-    .map_err(|_| run_retry_recovery_error())?;
-    let opened_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    if opened_identity != path_identity {
-        return Err(run_retry_recovery_error());
-    }
-    validate_run_retry_recovery_read_identity(&opened_identity)?;
-    validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
-
-    let capacity = usize::try_from(opened_identity.size).map_err(|_| run_retry_recovery_error())?;
-    let mut bytes = Vec::with_capacity(capacity);
-    (&mut file)
-        .take((RUN_RETRY_RECOVERY_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| run_retry_recovery_error())?;
-    if bytes.len() != capacity || bytes.len() > RUN_RETRY_RECOVERY_MAX_BYTES {
-        return Err(run_retry_recovery_error());
-    }
-    let final_open_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    let final_path_identity = run_retry_recovery_identity_at_optional(&root.directory, &name)?
-        .ok_or_else(run_retry_recovery_error)?;
-    if final_open_identity != opened_identity || final_path_identity != opened_identity {
-        return Err(run_retry_recovery_error());
-    }
-    root.validate()?;
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| run_retry_recovery_error())
+) -> HostResult<Option<PrivateJsonJournalRoot>> {
+    run_retry_recovery_journal().open_root(path, create)
 }
 
 fn read_run_retry_recovery_at(path: &Path) -> HostResult<Option<String>> {
-    let Some(root) = open_run_retry_recovery_root(path, false)? else {
-        return Ok(None);
-    };
-    read_run_retry_recovery_from_root(&root, None)
+    run_retry_recovery_journal().read(path)
 }
 
-fn create_run_retry_recovery_temp(
-    root: &RunRetryRecoveryRoot,
-) -> HostResult<RunRetryRecoveryTemp<'_>> {
-    for _ in 0..64 {
-        let mut random = [0_u8; 16];
-        OsRng
-            .try_fill_bytes(&mut random)
-            .map_err(|_| run_retry_recovery_error())?;
-        let name = CString::new(format!(
-            "{RUN_RETRY_RECOVERY_TEMP_PREFIX}{}",
-            encode_hex(&random)
-        ))
-        .expect("recovery temp name has no NUL");
-        let file = match openat_file(
-            root.directory.as_raw_fd(),
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(run_retry_recovery_error()),
-        };
-        let temp = RunRetryRecoveryTemp {
-            directory: &root.directory,
-            name,
-            file,
-            published: false,
-        };
-        temp.file
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| run_retry_recovery_error())?;
-        let identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
-        validate_run_retry_recovery_file_identity(&identity)?;
-        if run_retry_recovery_identity_at_optional(&root.directory, &temp.name)?.as_ref()
-            != Some(&identity)
-        {
-            return Err(run_retry_recovery_error());
-        }
-        return Ok(temp);
-    }
-    Err(run_retry_recovery_error())
-}
-
+#[cfg(test)]
 fn write_some_run_retry_recovery_at_with<F>(
     path: &Path,
     value: &str,
@@ -6825,132 +6428,12 @@ fn write_some_run_retry_recovery_at_with<F>(
 where
     F: FnOnce(&mut File) -> HostResult<()>,
 {
-    if value.len() > RUN_RETRY_RECOVERY_MAX_BYTES {
-        return Err(run_retry_recovery_too_large_error());
-    }
-    let root = open_run_retry_recovery_root(path, true)?.ok_or_else(run_retry_recovery_error)?;
-    root.validate()?;
-    let target_name = run_retry_recovery_name();
-    let previous_identity = run_retry_recovery_identity_at_optional(&root.directory, &target_name)?;
-    if let Some(identity) = previous_identity.as_ref() {
-        validate_run_retry_recovery_file_identity(identity)?;
-        read_run_retry_recovery_from_root(&root, Some(identity))?;
-    }
-
-    let mut temp = create_run_retry_recovery_temp(&root)?;
-    temp.file
-        .write_all(value.as_bytes())
-        .map_err(|_| run_retry_recovery_error())?;
-    temp.file.flush().map_err(|_| run_retry_recovery_error())?;
-    temp.file
-        .sync_all()
-        .map_err(|_| run_retry_recovery_error())?;
-    let temp_identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
-    validate_run_retry_recovery_file_identity(&temp_identity)?;
-    if temp_identity.size != value.len() as u64
-        || run_retry_recovery_identity_at_optional(&root.directory, &temp.name)?.as_ref()
-            != Some(&temp_identity)
-        || run_retry_recovery_identity_at_optional(&root.directory, &target_name)?
-            != previous_identity
-    {
-        return Err(run_retry_recovery_error());
-    }
-    root.validate()?;
-    let renamed = unsafe {
-        libc::renameat(
-            root.directory.as_raw_fd(),
-            temp.name.as_ptr(),
-            root.directory.as_raw_fd(),
-            target_name.as_ptr(),
-        )
-    };
-    if renamed == -1 {
-        return Err(run_retry_recovery_error());
-    }
-    temp.published = true;
-    root.directory
-        .sync_all()
-        .map_err(|_| run_retry_recovery_error())?;
-    after_directory_sync(&mut temp.file)?;
-
-    let published_identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
-    validate_run_retry_recovery_file_identity(&published_identity)?;
-    if read_run_retry_recovery_from_root(&root, Some(&published_identity))?.as_deref()
-        != Some(value)
-    {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
+    run_retry_recovery_journal().write_some_with(path, value, after_directory_sync)
 }
 
-fn write_some_run_retry_recovery_at(path: &Path, value: &str) -> HostResult<()> {
-    write_some_run_retry_recovery_at_with(path, value, |_| Ok(()))
-}
-
-fn same_run_retry_recovery_identity_after_unlink(
-    actual: &FileIdentity,
-    expected: &FileIdentity,
-) -> bool {
-    if expected.links != 1 || actual.links != 0 {
-        return false;
-    }
-    let mut normalized = actual.clone();
-    normalized.links = expected.links;
-    normalized.changed_seconds = expected.changed_seconds;
-    normalized.changed_nanoseconds = expected.changed_nanoseconds;
-    &normalized == expected
-}
-
-fn clear_run_retry_recovery_at(path: &Path) -> HostResult<()> {
-    let Some(root) = open_run_retry_recovery_root(path, false)? else {
-        return Ok(());
-    };
-    root.validate()?;
-    let name = run_retry_recovery_name();
-    let Some(path_identity) = run_retry_recovery_identity_at_optional(&root.directory, &name)?
-    else {
-        return Ok(());
-    };
-    validate_run_retry_recovery_file_identity(&path_identity)?;
-    let file = openat_file(
-        root.directory.as_raw_fd(),
-        &name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    )
-    .map_err(|_| run_retry_recovery_error())?;
-    let opened_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    if opened_identity != path_identity {
-        return Err(run_retry_recovery_error());
-    }
-    validate_run_retry_recovery_file_identity(&opened_identity)?;
-    validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
-    root.validate()?;
-    if run_retry_recovery_identity_at_optional(&root.directory, &name)?.as_ref()
-        != Some(&opened_identity)
-    {
-        return Err(run_retry_recovery_error());
-    }
-    if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } == -1 {
-        return Err(run_retry_recovery_error());
-    }
-    root.directory
-        .sync_all()
-        .map_err(|_| run_retry_recovery_error())?;
-    let unlinked_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    if !same_run_retry_recovery_identity_after_unlink(&unlinked_identity, &opened_identity)
-        || run_retry_recovery_identity_at_optional(&root.directory, &name)?.is_some()
-    {
-        return Err(run_retry_recovery_error());
-    }
-    root.validate()
-}
-
+#[cfg(test)]
 fn write_run_retry_recovery_at(path: &Path, value: Option<&str>) -> HostResult<()> {
-    match value {
-        Some(value) => write_some_run_retry_recovery_at(path, value),
-        None => clear_run_retry_recovery_at(path),
-    }
+    run_retry_recovery_journal().write(path, value)
 }
 
 fn compare_and_swap_run_retry_recovery_at(
@@ -6959,17 +6442,12 @@ fn compare_and_swap_run_retry_recovery_at(
     expected_value: Option<&str>,
     value: Option<&str>,
 ) -> HostResult<()> {
-    with_run_retry_recovery_transaction(state, path, || {
-        if expected_value.is_some_and(|expected| expected.len() > RUN_RETRY_RECOVERY_MAX_BYTES)
-            || value.is_some_and(|new_value| new_value.len() > RUN_RETRY_RECOVERY_MAX_BYTES)
-        {
-            return Err(run_retry_recovery_too_large_error());
-        }
-        if read_run_retry_recovery_at(path)?.as_deref() != expected_value {
-            return Err(run_retry_recovery_conflict_error());
-        }
-        write_run_retry_recovery_at(path, value)
-    })
+    run_retry_recovery_journal().compare_and_swap(
+        &state.run_retry_recovery,
+        path,
+        expected_value,
+        value,
+    )
 }
 
 fn run_retry_recovery_error() -> NativeHostError {
