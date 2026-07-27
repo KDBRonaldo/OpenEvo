@@ -1191,8 +1191,16 @@ mod tests {
 
     #[test]
     fn portable_system_executable_mode_constants_match_host_libc() {
-        assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT as u32);
-        assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG as u32);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT);
+            assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(SYSTEM_FILE_TYPE_MASK, u32::from(libc::S_IFMT));
+            assert_eq!(SYSTEM_REGULAR_FILE_TYPE, u32::from(libc::S_IFREG));
+        }
     }
 
     #[test]

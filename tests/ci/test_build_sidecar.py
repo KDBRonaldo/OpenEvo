@@ -1329,6 +1329,12 @@ def test_native_askpass_source_keeps_linux_clippy_portable() -> None:
         '#[cfg(target_os = "macos")]\n'
         "const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;"
     ) in helper
+    assert "assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT as u32);" not in helper
+    assert "assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG as u32);" not in helper
+    assert "assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT);" in helper
+    assert "assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG);" in helper
+    assert "assert_eq!(SYSTEM_FILE_TYPE_MASK, u32::from(libc::S_IFMT));" in helper
+    assert "assert_eq!(SYSTEM_REGULAR_FILE_TYPE, u32::from(libc::S_IFREG));" in helper
     assert (
         '#[cfg(any(test, target_os = "macos"))]\n'
         "    pub fn new(value: Vec<u8>) -> Self {"
