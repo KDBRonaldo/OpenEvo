@@ -1040,6 +1040,19 @@ class DesktopProviderStoreV2:
                 self._require_lifecycle_operation_row(connection, operation_id)
             )
 
+    def get_lifecycle_operation_work(
+        self,
+        operation_id: str,
+    ) -> LifecycleOperationWorkV2:
+        self._validate_profile_id(operation_id)
+        with self._transaction(
+            write=False,
+            operation="getLifecycleOperationWorkV2",
+        ) as connection:
+            return self._lifecycle_work_from_row(
+                self._require_lifecycle_operation_row(connection, operation_id)
+            )
+
     def list_pending_lifecycle_operations(
         self,
     ) -> tuple[m.LifecycleOperationRefV2, ...]:
@@ -1339,6 +1352,8 @@ class DesktopProviderStoreV2:
                 raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
             if current.status in {"succeeded", "failed", "cancelled"}:
                 raise ProviderConflictV2("terminal lifecycle operation cannot be cancelled")
+            if not current.cancellable:
+                raise ProviderConflictV2("lifecycle operation is not safely cancellable")
             version = self._next_lifecycle_version(row)
             timestamp = self._timestamp()
             etag = self._etag("lifecycle_operation", operation_id, version)
