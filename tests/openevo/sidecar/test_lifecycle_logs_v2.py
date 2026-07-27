@@ -100,6 +100,56 @@ def test_sanitizer_redacts_named_credentials_and_sensitive_query_values() -> Non
     assert "access_token=[REDACTED_CREDENTIAL]" in rendered
 
 
+def test_sanitizer_redacts_multiline_secret_canaries_before_line_persistence() -> None:
+    entries: list[tuple[str, str, bool]] = []
+    sanitizer = LifecycleOutputSanitizerV2(
+        lambda source, text, truncated: entries.append((source, text, truncated)),
+        secret_canaries=("BEGIN-PRIVATE\nKEY-MATERIAL",),
+    )
+
+    sanitizer.feed("ssh_stdout", b"BEGIN-PRIVATE\n")
+    sanitizer.feed("ssh_stdout", b"KEY-MATERIAL\nvisible\n")
+    sanitizer.flush()
+
+    rendered = "".join(text for _source, text, _truncated in entries)
+    assert "BEGIN-PRIVATE" not in rendered
+    assert "KEY-MATERIAL" not in rendered
+    assert rendered.count("[REDACTED_SECRET]") == 2
+    assert "visible\n" in rendered
+
+
+def test_sanitizer_redacts_arbitrary_absolute_posix_paths() -> None:
+    entries: list[tuple[str, str, bool]] = []
+    sanitizer = LifecycleOutputSanitizerV2(
+        lambda source, text, truncated: entries.append((source, text, truncated))
+    )
+
+    sanitizer.feed(
+        "daemon_stderr",
+        (
+            "binary=/usr/local/bin/openevo "
+            "app=/Applications/OpenEvo.app/Contents/MacOS/OpenEvo "
+            "library=/Library/ApplicationSupport/OpenEvo "
+            "device=/dev/null process=/proc/123/status\n"
+            "ratio=1/2 url=https://example.test/public/path\n"
+        ).encode(),
+    )
+    sanitizer.flush()
+
+    rendered = "".join(text for _source, text, _truncated in entries)
+    for absolute_path in (
+        "/usr/local/bin/openevo",
+        "/Applications/OpenEvo.app/Contents/MacOS/OpenEvo",
+        "/Library/ApplicationSupport/OpenEvo",
+        "/dev/null",
+        "/proc/123/status",
+    ):
+        assert absolute_path not in rendered
+    assert rendered.count("[REDACTED_HOST_PATH]") == 5
+    assert "ratio=1/2" in rendered
+    assert "https://example.test/public/path" in rendered
+
+
 def test_bounded_subprocess_observer_receives_only_stream_and_bytes() -> None:
     observed: list[tuple[str, bytes]] = []
     command_canary = "argv-must-not-be-observed"

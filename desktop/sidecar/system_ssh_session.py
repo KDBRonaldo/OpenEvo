@@ -250,6 +250,33 @@ class SystemOpenSshHostTrust:
                 "The changed host key could not be removed from the user trust store.",
             ) from exc
 
+    def reissue_changed_key_review(
+        self,
+        current_review: PendingSystemHostKeyReview,
+        *,
+        profile: SystemOpenSshAliasProfile,
+        connection_generation: int,
+        review_id: str,
+        review_sha256: str,
+    ) -> PendingSystemHostKeyReview:
+        if self._closed:
+            raise _session_error(
+                "ssh_host_trust_unavailable", "System SSH host trust is unavailable."
+            )
+        try:
+            return self._review_authority.reissue_matching_review(
+                current_review,
+                profile=profile,
+                connection_generation=connection_generation,
+                review_id=review_id,
+                review_sha256=review_sha256,
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            raise _session_error(
+                "ssh_host_key_review_invalid",
+                "The changed host-key review is no longer current.",
+            ) from exc
+
     def _inspect_policy(
         self,
         profile: SystemOpenSshAliasProfile,

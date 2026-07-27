@@ -56,6 +56,10 @@ class _LifecycleExecutorStopping(Exception):
     """The process is stopping and must leave durable work recoverable."""
 
 
+class LifecycleOperationDeferredV2(Exception):
+    """A durable operation is waiting for another lifecycle prerequisite."""
+
+
 class LifecycleExecutionContextV2:
     """A runner's narrow interface to one persisted lifecycle operation."""
 
@@ -116,6 +120,23 @@ class LifecycleExecutionContextV2:
 
         with self._mutation_lock:
             self._raise_if_interrupted_locked()
+            current = self._work.operation
+            target_phase_index = m.LIFECYCLE_PHASES.index(phase)
+            if target_phase_index <= current.phase_index:
+                retained_progress = self._retained_replay_progress(
+                    current.progress,
+                    progress,
+                    same_phase=target_phase_index == current.phase_index,
+                )
+                retained_cancellable = current.cancellable and cancellable
+                if (
+                    retained_progress == current.progress
+                    and retained_cancellable == current.cancellable
+                ):
+                    return current
+                phase = current.phase
+                progress = retained_progress
+                cancellable = retained_cancellable
             updated = self._store.advance_lifecycle_operation(
                 LifecycleOperationAdvanceV2(
                     operation_id=self._work.operation.operation_id,
@@ -132,6 +153,27 @@ class LifecycleExecutionContextV2:
                 cancellation_requested=False,
             )
         self._publish(updated)
+        return updated
+
+    @staticmethod
+    def _retained_replay_progress(
+        current: m.LifecycleProgressV2 | None,
+        updated: m.LifecycleProgressV2 | None,
+        *,
+        same_phase: bool,
+    ) -> m.LifecycleProgressV2 | None:
+        if not same_phase or current is None:
+            return current
+        if isinstance(current, m.LifecycleProgressIndeterminateV2):
+            return current if updated is None else updated
+        if (
+            updated is None
+            or isinstance(updated, m.LifecycleProgressIndeterminateV2)
+            or type(updated) is not type(current)
+            or updated.total != current.total
+            or updated.completed < current.completed
+        ):
+            return current
         return updated
 
     def check_cancelled(self) -> None:
@@ -247,6 +289,7 @@ class DesktopLifecycleExecutorV2:
         self._started = False
         self._stopping = False
         self._fatal_error: BaseException | None = None
+        self._deferred_operation_ids: set[str] = set()
 
     def start(self) -> None:
         """Reconcile persisted authority before accepting reservations."""
@@ -329,18 +372,7 @@ class DesktopLifecycleExecutorV2:
         with self._condition:
             context = self._active_context
         if context is not None:
-            try:
-                context.checkpoint(phase, progress, cancellable=cancellable)
-            except (_LifecycleCancelled, _LifecycleExecutorStopping):
-                if not cancellable:
-                    raise
-                # Progress callbacks can run inside transport exception
-                # projection. The runner observes the durable interruption at
-                # its next explicit checkpoint without converting a safe,
-                # pre-barrier interruption to a transport failure. A durable
-                # non-cancellable mutation barrier must propagate so external
-                # mutation cannot start after cancellation or shutdown.
-                return
+            context.checkpoint(phase, progress, cancellable=cancellable)
 
     def observe_output(self, source: LifecycleLogSourceV2, chunk: bytes) -> None:
         """Route owned SSH/Daemon bytes to the active operation sanitizer."""
@@ -364,7 +396,11 @@ class DesktopLifecycleExecutorV2:
                 with self._condition:
                     if self._stopping:
                         return
-                work = self._store.claim_next_lifecycle_operation()
+                with self._condition:
+                    deferred = frozenset(self._deferred_operation_ids)
+                work = self._store.claim_next_lifecycle_operation(
+                    exclude_running_operation_ids=deferred,
+                )
                 if work is None:
                     with self._condition:
                         if self._stopping:
@@ -372,14 +408,19 @@ class DesktopLifecycleExecutorV2:
                         self._condition.wait()
                     continue
                 self._publish(work.operation)
-                self._execute(work)
+                was_deferred = self._execute(work)
+                with self._condition:
+                    if was_deferred:
+                        self._deferred_operation_ids.add(work.operation.operation_id)
+                    else:
+                        self._deferred_operation_ids.clear()
         except BaseException as exc:
             with self._condition:
                 self._fatal_error = exc
                 self._stopping = True
                 self._condition.notify_all()
 
-    def _execute(self, work: LifecycleOperationWorkV2) -> None:
+    def _execute(self, work: LifecycleOperationWorkV2) -> bool:
         context = LifecycleExecutionContextV2(
             store=self._store,
             work=work,
@@ -390,7 +431,7 @@ class DesktopLifecycleExecutorV2:
         )
         with self._condition:
             if self._stopping:
-                return
+                return False
             self._active_context = context
         try:
             if work.cancellation_requested:
@@ -413,10 +454,15 @@ class DesktopLifecycleExecutorV2:
                 failure=None,
             )
         except _LifecycleExecutorStopping:
-            return
+            return False
+        except LifecycleOperationDeferredV2:
+            if context.is_shutdown_requested():
+                return False
+            context.flush_output()
+            return True
         except _LifecycleCancelled:
             if context.is_shutdown_requested():
-                return
+                return False
             context.flush_output()
             current = context.current_work()
             self._finish_with_fence(
@@ -427,7 +473,7 @@ class DesktopLifecycleExecutorV2:
             )
         except BaseException as exc:
             if context.is_shutdown_requested():
-                return
+                return False
             context.flush_output()
             current = context.current_work()
             if current.cancellation_requested:
@@ -451,6 +497,7 @@ class DesktopLifecycleExecutorV2:
                 if self._active_context is context:
                     self._active_context = None
                 self._condition.notify_all()
+        return False
 
     def _finish_with_fence(
         self,
@@ -540,6 +587,7 @@ __all__ = [
     "DesktopLifecycleExecutorV2",
     "LifecycleErrorMapperV2",
     "LifecycleExecutionContextV2",
+    "LifecycleOperationDeferredV2",
     "LifecycleOperationObserverV2",
     "LifecycleRunnerV2",
 ]

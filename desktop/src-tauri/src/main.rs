@@ -12243,12 +12243,12 @@ https://user:password@example.invalid/private\n"[..],
             std::env::var_os("OPENEVO_PACKAGED_SIDECAR_PATH")
                 .expect("OPENEVO_PACKAGED_SIDECAR_PATH is required"),
         );
-        #[cfg(target_os = "macos")]
-        let packaged_fixture = SidecarFixture::from_existing(&raw_path);
-        #[cfg(target_os = "macos")]
+        let raw_askpass_path = PathBuf::from(
+            std::env::var_os("OPENEVO_PACKAGED_ASKPASS_PATH")
+                .expect("OPENEVO_PACKAGED_ASKPASS_PATH is required"),
+        );
+        let packaged_fixture = SidecarFixture::from_existing_pair(&raw_path, &raw_askpass_path);
         let path = packaged_fixture.path().to_path_buf();
-        #[cfg(not(target_os = "macos"))]
-        let path = raw_path;
         let state = DesktopHostState::default();
 
         let context = start_sidecar_inner(&state, LaunchPolicy::Release, Some(&path)).unwrap();
@@ -12740,6 +12740,19 @@ https://user:password@example.invalid/private\n"[..],
             fs::copy(source, &path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self::write_askpass_helper(&root);
+            Self { root, path }
+        }
+
+        fn from_existing_pair(sidecar: &Path, askpass: &Path) -> Self {
+            let root = unique_test_dir();
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.join(BUNDLED_SIDECAR_BINARY);
+            fs::copy(sidecar, &path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            let askpass_path = root.join(BUNDLED_ASKPASS_BINARY);
+            fs::copy(askpass, &askpass_path).unwrap();
+            fs::set_permissions(&askpass_path, fs::Permissions::from_mode(0o755)).unwrap();
             Self { root, path }
         }
 

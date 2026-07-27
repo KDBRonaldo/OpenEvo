@@ -605,6 +605,17 @@ class _SystemTransport(FakeTransport):
 class _SystemHostTrust:
     def __init__(self) -> None:
         self.replacements: list[tuple[object, ...]] = []
+        self.reissues: list[tuple[object, object]] = []
+        self.reissued_review: PendingSystemHostKeyReview | None = None
+
+    def reissue_changed_key_review(
+        self,
+        review: object,
+        **arguments: object,
+    ) -> PendingSystemHostKeyReview:
+        self.reissues.append((review, arguments))
+        assert self.reissued_review is not None
+        return self.reissued_review
 
     def replace_changed_key(self, review: object, **arguments: object) -> None:
         self.replacements.append((review, arguments))
@@ -654,6 +665,19 @@ def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -
     lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
     assert transport.closed
     assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_disconnect_is_restart_idempotent_without_an_owned_session() -> None:
+    owner = _SystemSessionOwner()
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: _SystemTransport(),
+    )
+
+    lifecycle.disconnect("profile-system-1", 3)
+
+    assert owner.disconnects == 0
 
 
 def test_v2_lifecycle_passes_only_the_closed_process_output_observer() -> None:
@@ -731,6 +755,86 @@ def test_v2_lifecycle_replaces_only_the_exact_changed_key_review() -> None:
     assert arguments["review_sha256"] == review.review_sha256
     assert owner.connections[-1][1] == 3
     assert lifecycle.active_transport("profile-system-1", 3) is transports[0]
+
+
+def test_v2_lifecycle_reissues_an_exact_changed_key_review_after_restart() -> None:
+    owner = _SystemSessionOwner()
+    policy = SystemKnownHostsPolicy(
+        repair_support="automatic_replacement_available",
+        reason="test",
+        known_hosts_file=None,
+        lookup_token=None,
+        _file_identity=None,
+    )
+    rediscovered = PendingSystemHostKeyReview(
+        review_id="host-review-new",
+        review_sha256="a" * 64,
+        profile_id="profile-system-1",
+        connection_generation=3,
+        key_fingerprints=(("ssh-ed25519", "SHA256:" + ("A" * 43)),),
+        repair_support="automatic_replacement_available",
+        _policy=policy,
+        _authority_token=object(),
+    )
+    restored = PendingSystemHostKeyReview(
+        review_id="host-review-old",
+        review_sha256="e" * 64,
+        profile_id="profile-system-1",
+        connection_generation=2,
+        key_fingerprints=rediscovered.key_fingerprints,
+        repair_support="automatic_replacement_available",
+        _policy=policy,
+        _authority_token=object(),
+    )
+    owner.failures.append(
+        SystemOpenSshSessionError(
+            "ssh_host_key_changed",
+            "The configured server identity changed and requires review.",
+            host_key_review=rediscovered,
+        )
+    )
+    trust = _SystemHostTrust()
+    trust.reissued_review = restored
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, trust),
+        transport_factory=lambda *_: _SystemTransport(),
+    )
+    request = local_v2.HostKeyReviewRequestV2(
+        expected_connection_generation=2,
+        review_id=restored.review_id,
+        review_sha256=restored.review_sha256,
+        action="replace_changed_key",
+    )
+
+    assert lifecycle.review_host_key(_system_profile(generation=3), request) == "connected"
+
+    assert len(trust.reissues) == 1
+    current, reissue_arguments = trust.reissues[0]
+    assert current is rediscovered
+    assert reissue_arguments["connection_generation"] == 2
+    assert reissue_arguments["review_id"] == restored.review_id
+    assert reissue_arguments["review_sha256"] == restored.review_sha256
+    assert trust.replacements[0][0] is restored
+    assert [generation for _, generation in owner.connections] == [3, 3]
+
+
+def test_v2_lifecycle_rejects_a_persisted_changed_key_review_after_restart() -> None:
+    owner = _SystemSessionOwner()
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: _SystemTransport(),
+    )
+    request = local_v2.HostKeyReviewRequestV2(
+        expected_connection_generation=2,
+        review_id="host-review-old",
+        review_sha256="e" * 64,
+        action="reject",
+    )
+
+    assert lifecycle.review_host_key(_system_profile(generation=3), request) == "rejected"
+    assert owner.connections == []
 
 
 def test_v2_lifecycle_binds_text_free_native_prompt_observations_to_profile() -> None:

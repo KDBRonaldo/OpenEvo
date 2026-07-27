@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import base64
 import binascii
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Collection, Iterator, Mapping
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 import fcntl
@@ -1128,19 +1128,42 @@ class DesktopProviderStoreV2:
                 for row in rows
             )
 
-    def claim_next_lifecycle_operation(self) -> LifecycleOperationWorkV2 | None:
+    def claim_next_lifecycle_operation(
+        self,
+        *,
+        exclude_running_operation_ids: Collection[str] = (),
+    ) -> LifecycleOperationWorkV2 | None:
+        excluded = tuple(sorted(set(exclude_running_operation_ids)))
+        if (
+            len(excluded) > self._max_lifecycle_operations
+            or any(type(operation_id) is not str for operation_id in excluded)
+        ):
+            raise ProviderContractV2Error("lifecycle claim exclusions are invalid")
+        for operation_id in excluded:
+            self._validate_profile_id(operation_id)
         with self._transaction(
             write=True,
             operation="claimLifecycleOperationV2",
         ) as connection:
+            exclusion_clause = ""
+            parameters: tuple[object, ...] = ()
+            if excluded:
+                placeholders = ", ".join("?" for _operation_id in excluded)
+                exclusion_clause = (
+                    " AND (cancellation_requested = 1 "
+                    f"OR operation_id NOT IN ({placeholders}))"
+                )
+                parameters = cast(tuple[object, ...], excluded)
             row = connection.execute(
                 f"""
                 SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
                 FROM lifecycle_operations
                 WHERE status = 'running'
+                {exclusion_clause}
                 ORDER BY created_at, operation_id
                 LIMIT 1
-                """
+                """,
+                parameters,
             ).fetchone()
             if row is None:
                 row = connection.execute(
@@ -1849,6 +1872,10 @@ class DesktopProviderStoreV2:
                 raise ProviderPreconditionFailedV2("profile connection generation changed")
             if not hmac.compare_digest(current.etag, if_match):
                 raise ProviderPreconditionFailedV2("profile ETag changed")
+            if action == "host_key_review":
+                if not isinstance(validated, m.HostKeyReviewRequestV2):
+                    raise ProviderContractV2Error("host-key review request is invalid")
+                self._require_current_host_key_review(current, validated)
             current_version = cast(int, row["resource_version"])
             if (
                 current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER
@@ -3580,6 +3607,8 @@ class DesktopProviderStoreV2:
             raise ProviderPreconditionFailedV2("profile connection generation changed")
         if not hmac.compare_digest(current.etag, request.if_match):
             raise ProviderPreconditionFailedV2("profile ETag changed")
+        if isinstance(request, LifecycleHostKeyReviewRequestV2):
+            self._require_current_host_key_review(current, request.request)
         current_version = row["resource_version"]
         if (
             type(current_version) is not int
@@ -3629,6 +3658,30 @@ class DesktopProviderStoreV2:
         )
         self._update_profile(connection, updated, version=version)
         return updated
+
+    @staticmethod
+    def _require_current_host_key_review(
+        current: m.RemoteWorkspaceProfileV2,
+        request: m.HostKeyReviewRequestV2,
+    ) -> None:
+        if (
+            current.connection_state != "host_key_review"
+            or current.trust.state != "changed_key_blocked"
+            or current.trust.review_id is None
+            or current.trust.review_sha256 is None
+            or request.action not in {"replace_changed_key", "reject"}
+            or request.review_id != current.trust.review_id
+            or not hmac.compare_digest(
+                request.review_sha256,
+                current.trust.review_sha256,
+            )
+            or (
+                request.action == "replace_changed_key"
+                and current.trust.repair_support
+                != "automatic_replacement_available"
+            )
+        ):
+            raise ProviderConflictV2("host-key review authority changed")
 
     def _require_lifecycle_operation_row(
         self,

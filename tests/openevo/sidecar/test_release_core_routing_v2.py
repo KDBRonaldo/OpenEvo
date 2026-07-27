@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import hashlib
 from pathlib import Path
 from threading import Event
@@ -18,7 +19,9 @@ from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
     LifecycleNativeWorkspacePrepareRequestV2,
+    LifecycleOperationAdvanceV2,
     LifecycleOperationReservationV2,
+    LifecycleProjectCreateRequestV2,
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_v2_app
 from desktop.sidecar.release_provider_v2 import DesktopReleaseProviderV2
@@ -31,6 +34,8 @@ from desktop.sidecar.workspace_imports import (
     WorkspaceImportNotFoundError,
     WorkspaceImportStore,
 )
+from desktop.sidecar.native_workspace import NativeWorkspaceArchiveCancelled
+import desktop.sidecar.release_provider_v2 as release_provider_module
 from openevo.backend.contracts.v2 import models as core_v2
 from tests.openevo.sidecar.test_core_bridge_v2 import _capabilities, _task
 from tests.openevo.sidecar.test_core_bridge_store_v2 import _mapping
@@ -1028,6 +1033,120 @@ def test_project_create_and_read_use_only_generation_bound_core_v2(
         store.close()
 
 
+def test_running_project_create_waits_for_reconnect_after_sidecar_restart(
+    tmp_path: Path,
+) -> None:
+    first_provider, first_store, _first_lifecycle, _first_bridge = _provider(tmp_path)
+    first_client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=first_provider,
+            close_on_shutdown=False,
+        )
+    )
+    profile = _connected_profile(first_client)
+    first_client.close()
+    first_provider.close()
+
+    action_id = "routing-restart-project-create-0001"
+    project_id = "desktop-project-restart-1"
+    request = local_v2.ProjectCreateV2.model_validate(_project_create(profile))
+    operation = first_store.reserve_lifecycle_operation(
+        LifecycleOperationReservationV2(
+            kind="project_create",
+            resource={"resource_kind": "project", "resource_id": project_id},
+            request=LifecycleProjectCreateRequestV2(
+                request_kind="project_create",
+                project_id=project_id,
+                action_id=action_id,
+                request=request,
+                resource_generation=request.profile_connection_generation,
+            ),
+        ),
+        idempotency_key="routing-restart-project-reservation-0001",
+    )
+    claimed = first_store.claim_next_lifecycle_operation()
+    assert claimed is not None and claimed.operation.operation_id == operation.operation_id
+    first_store.advance_lifecycle_operation(
+        LifecycleOperationAdvanceV2(
+            operation_id=operation.operation_id,
+            expected_etag=claimed.operation.etag,
+            phase="creating_remote_project",
+            progress=local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
+    )
+    first_store.close()
+
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    recovered_profiles = reopened.reconcile_process_restart()
+    assert len(recovered_profiles) == 1
+    disconnected = recovered_profiles[0]
+    lifecycle = _Lifecycle()
+    bridge = _RoutingBridge()
+    provider = DesktopReleaseProviderV2(
+        store=reopened,
+        catalog=_Catalog(),
+        lifecycle=lifecycle,
+        core_connector=_CoreConnector(),
+        bridge=bridge,
+        bridge_store=bridge,
+        workspace_import_store=None,
+        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        build_version="0.1.10",
+        source_commit=SOURCE_COMMIT,
+        build_channel="release",
+        instance_id="routing-restart-instance-v2",
+        clock=lambda: NOW,
+        own_resources=False,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if reopened.get_lifecycle_operation(operation.operation_id).status == "running":
+                break
+            time.sleep(0.01)
+        assert reopened.get_lifecycle_operation(operation.operation_id).status == "running"
+        assert bridge.calls == []
+
+        connected = client.post(
+            f"/desktop/v2/profiles/{disconnected.profile_id}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(disconnected.connection_generation),
+                    "If-Match": disconnected.etag,
+                    "Idempotency-Key": "routing-restart-connect-profile-0001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": disconnected.connection_generation,
+            },
+        )
+        assert connected.status_code == 202, connected.text
+        assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
+        terminal = _wait_lifecycle_operation(
+            client,
+            {"operation_id": operation.operation_id},
+        )
+
+        assert terminal["status"] == "succeeded"
+        assert [call[0] for call in bridge.calls] == ["activate_project"]
+        assert bridge.calls[0][3] == disconnected.connection_generation + 1
+        assert bridge.calls[0][4] == action_id
+    finally:
+        client.close()
+        provider.close()
+        reopened.close()
+
+
 def test_project_create_returns_before_a_sixteen_second_bridge_activation(
     tmp_path: Path,
 ) -> None:
@@ -1297,6 +1416,100 @@ def test_native_project_streams_verified_private_import_to_core_v2_only(
         provider.close()
         store.close()
         workspace_store.close()
+
+
+def test_native_workspace_prepare_resumes_without_reselection_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "selected-workspace"
+    selected.mkdir()
+    (selected / "input.txt").write_text("workspace input\n", encoding="utf-8")
+    selected_stat = selected.stat()
+    workspace_root = tmp_path / "workspace-imports"
+    first_workspace_store = WorkspaceImportStore(workspace_root)
+    provider, store, _lifecycle, _bridge = _provider(
+        tmp_path,
+        workspace_import_store=first_workspace_store,
+    )
+    started = Event()
+    original_prepare = release_provider_module.prepare_native_workspace
+
+    @contextmanager
+    def interrupted_prepare(*_args: object, **kwargs: object):
+        cancel_check = kwargs["cancel_check"]
+        assert callable(cancel_check)
+        started.set()
+        while not cancel_check():
+            time.sleep(0.01)
+        raise NativeWorkspaceArchiveCancelled("sidecar stopped")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        release_provider_module,
+        "prepare_native_workspace",
+        interrupted_prepare,
+    )
+    action_id = "routing-native-restart-prepare-0001"
+    operation = provider.reserve_native_workspace_prepare(
+        action_id=action_id,
+        selected_path=str(selected),
+        selected_device=selected_stat.st_dev,
+        selected_inode=selected_stat.st_ino,
+        cancellation_token="a" * 64,
+        project_id=None,
+    )
+    assert started.wait(1)
+    provider.close()
+    assert store.get_lifecycle_operation(operation.operation_id).status == "running"
+    store.close()
+    first_workspace_store.close()
+
+    monkeypatch.setattr(
+        release_provider_module,
+        "prepare_native_workspace",
+        original_prepare,
+    )
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    second_workspace_store = WorkspaceImportStore(workspace_root)
+    lifecycle = _Lifecycle()
+    bridge = _RoutingBridge()
+    recovered_provider = DesktopReleaseProviderV2(
+        store=reopened,
+        catalog=_Catalog(),
+        lifecycle=lifecycle,
+        core_connector=_CoreConnector(),
+        bridge=bridge,
+        bridge_store=bridge,
+        workspace_import_store=second_workspace_store,
+        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        build_version="0.1.10",
+        source_commit=SOURCE_COMMIT,
+        build_channel="release",
+        instance_id="routing-native-restart-instance-v2",
+        clock=lambda: NOW,
+        own_resources=False,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=recovered_provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        terminal = _wait_lifecycle_operation(
+            client,
+            {"operation_id": operation.operation_id},
+        )
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["result_kind"] == "native_workspace"
+        assert str(selected) not in str(terminal)
+    finally:
+        client.close()
+        recovered_provider.close()
+        reopened.close()
+        second_workspace_store.close()
 
 
 def test_native_project_retry_releases_import_after_remote_finalize(

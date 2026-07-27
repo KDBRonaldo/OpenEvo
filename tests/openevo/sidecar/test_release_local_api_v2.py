@@ -115,6 +115,7 @@ class _Lifecycle:
         self.active: tuple[str, int] | None = None
         self.calls: list[tuple[str, str, int]] = []
         self.connect_errors: list[Exception] = []
+        self.disconnect_errors: list[Exception] = []
         self.review_outcome = "connected"
         self.prompt_observer = None
         self.prompt_started: Event | None = None
@@ -160,6 +161,8 @@ class _Lifecycle:
 
     def disconnect(self, profile_id: str, connection_generation: int) -> None:
         self.calls.append(("disconnect", profile_id, connection_generation))
+        if self.disconnect_errors:
+            raise self.disconnect_errors.pop(0)
         if self.active == (profile_id, connection_generation - 1):
             self.active = None
 
@@ -777,6 +780,87 @@ def test_profile_connect_uses_literal_alias_and_exact_generation(
         store.close()
 
 
+def test_profile_disconnect_cleanup_failure_never_reports_success(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, _connector = _provider(tmp_path)
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        connected_response = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-before-cleanup-failure-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert connected_response.status_code == 202, connected_response.text
+        assert (
+            _wait_lifecycle_operation(client, connected_response.json())["status"]
+            == "succeeded"
+        )
+        connected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        lifecycle.disconnect_errors.append(
+            SystemOpenSshSessionError(
+                "ssh_cleanup_failed",
+                "SSH master did not stop before its deadline.",
+            )
+        )
+        disconnect_headers = _headers(
+            **{
+                "X-OpenEvo-Resource-Generation": str(connected["connection_generation"]),
+                "If-Match": str(connected["etag"]),
+                "Idempotency-Key": "disconnect-cleanup-failure-01",
+            }
+        )
+        disconnect_body = {
+            "schema_version": "2",
+            "expected_connection_generation": connected["connection_generation"],
+        }
+
+        response = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=disconnect_headers,
+            json=disconnect_body,
+        )
+
+        assert response.status_code == 202, response.text
+        terminal = _wait_lifecycle_operation(client, response.json())
+        assert terminal["status"] == "failed"
+        assert terminal["failure"] == {
+            "schema_version": "2",
+            "code": "ssh_cleanup_failed",
+            "summary": "The system OpenSSH connection could not be closed safely.",
+            "retryable": True,
+            "action": "retry",
+            "affected_resource_id": profile["profile_id"],
+        }
+        unresolved = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert unresolved["connection_state"] == "disconnecting"
+        assert lifecycle.active == (profile["profile_id"], connected["connection_generation"])
+
+        replay = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=disconnect_headers,
+            json=disconnect_body,
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["operation_id"] == terminal["operation_id"]
+        assert [call[0] for call in lifecycle.calls].count("disconnect") == 1
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
 def test_profile_connect_preserves_typed_daemon_bootstrap_failure(
     tmp_path: Path,
 ) -> None:
@@ -1161,6 +1245,27 @@ def test_changed_system_host_key_is_reviewed_then_reconnected_exactly(
             "repair_support": "automatic_replacement_available",
         }
         assert connector.calls == []
+
+        mismatched = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/host-key/review",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "2",
+                    "If-Match": str(pending["etag"]),
+                    "Idempotency-Key": "mismatched-host-review-key-01",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": 2,
+                "review_id": review.review_id,
+                "review_sha256": "8" * 64,
+                "action": "replace_changed_key",
+            },
+        )
+        assert mismatched.status_code == 409, mismatched.text
+        assert mismatched.json()["code"] == "local_resource_conflict"
+        assert lifecycle.calls == [("connect", "gpu-lab", 2)]
 
         replay = client.post(
             f"/desktop/v2/profiles/{profile['profile_id']}/connect",

@@ -31,11 +31,16 @@ from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.lifecycle_executor_v2 import (
     DesktopLifecycleExecutorV2,
     LifecycleExecutionContextV2,
+    LifecycleOperationDeferredV2,
 )
 from desktop.sidecar.native_workspace import (
     NativeWorkspaceArchiveCancelled,
     NativeWorkspaceArchiveError,
     prepare_native_workspace,
+)
+from desktop.sidecar.native_workspace_sources_v2 import (
+    NativeWorkspaceSourceRecordV2,
+    NativeWorkspaceSourceStoreV2,
 )
 from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
@@ -211,6 +216,39 @@ class _NativeWorkspacePrepareAuthorityV2:
             operation_id=operation_id,
         )
 
+    def source_record(self) -> NativeWorkspaceSourceRecordV2:
+        return NativeWorkspaceSourceRecordV2(
+            schema_version="2",
+            action_id=self.action_id,
+            import_id=self.import_id,
+            selected_path=self.selected_path,
+            selected_device=self.selected_device,
+            selected_inode=self.selected_inode,
+            project_id=self.project_id,
+            display_name=self.display_name,
+            journal_sha256=self.journal_sha256,
+        )
+
+    @classmethod
+    def from_source_record(
+        cls,
+        record: NativeWorkspaceSourceRecordV2,
+        *,
+        operation_id: str,
+    ) -> _NativeWorkspacePrepareAuthorityV2:
+        return cls(
+            action_id=record.action_id,
+            import_id=record.import_id,
+            selected_path=record.selected_path,
+            selected_device=record.selected_device,
+            selected_inode=record.selected_inode,
+            cancellation_token="0" * 64,
+            project_id=record.project_id,
+            display_name=record.display_name,
+            journal_sha256=record.journal_sha256,
+            operation_id=operation_id,
+        )
+
 
 _OPERATIONS = frozenset(
     {
@@ -374,6 +412,10 @@ class DesktopReleaseProviderV2:
             str,
             _NativeWorkspacePrepareAuthorityV2,
         ] = {}
+        self._native_workspace_source_store = NativeWorkspaceSourceStoreV2(
+            store.state_root.parent / "native-workspace-sources-v2"
+        )
+        self._recover_native_workspace_sources()
         self._closed = False
         set_prompt_observer = getattr(lifecycle, "set_prompt_observer", None)
         if callable(set_prompt_observer):
@@ -419,9 +461,7 @@ class DesktopReleaseProviderV2:
             "connectRemoteWorkspaceProfileV2": self._connect_profile,
             "disconnectRemoteWorkspaceProfileV2": self._disconnect_profile,
             "reviewRemoteWorkspaceHostKeyV2": self._review_host_key,
-            "getDesktopLifecycleOperationByActionV2": (
-                self._get_lifecycle_operation_by_action
-            ),
+            "getDesktopLifecycleOperationByActionV2": (self._get_lifecycle_operation_by_action),
             "getDesktopLifecycleOperationV2": self._get_lifecycle_operation,
             "getDesktopLifecycleOperationLogsV2": self._get_lifecycle_logs,
             "cancelDesktopLifecycleOperationV2": self._cancel_lifecycle_operation,
@@ -486,6 +526,7 @@ class DesktopReleaseProviderV2:
         self._lifecycle_executor.close()
         with self._guard:
             self._native_workspace_sources.clear()
+        self._native_workspace_source_store.close()
         if not self._own_resources:
             return
         failure: BaseException | None = None
@@ -512,6 +553,39 @@ class DesktopReleaseProviderV2:
     @property
     def workspace_import_store(self) -> WorkspaceImportStore | None:
         return self._workspace_import_store
+
+    def _recover_native_workspace_sources(self) -> None:
+        for record in self._native_workspace_source_store.list_records():
+            try:
+                work = self._store.get_lifecycle_operation_work(
+                    self._store.get_lifecycle_operation_by_action(record.action_id).operation_id
+                )
+            except ProviderNotFoundV2:
+                self._native_workspace_source_store.remove(record)
+                continue
+            request = work.request
+            operation = work.operation
+            if (
+                operation.kind != "native_workspace_prepare"
+                or operation.resource.resource_kind != "native_workspace"
+                or operation.resource.resource_id != record.import_id
+                or type(request) is not LifecycleNativeWorkspacePrepareRequestV2
+                or request.native_workspace_id != record.import_id
+                or request.native_journal_sha256 != record.journal_sha256
+                or request.display_name != record.display_name
+            ):
+                raise WorkspaceImportIntegrityError(
+                    "persisted native workspace source differs from lifecycle authority"
+                )
+            if operation.status in {"succeeded", "failed", "cancelled"}:
+                self._native_workspace_source_store.remove(record)
+                continue
+            self._native_workspace_sources[record.import_id] = (
+                _NativeWorkspacePrepareAuthorityV2.from_source_record(
+                    record,
+                    operation_id=operation.operation_id,
+                )
+            )
 
     def reserve_native_workspace_prepare(
         self,
@@ -575,6 +649,8 @@ class DesktopReleaseProviderV2:
             native_journal_sha256=journal_sha256,
             display_name=display_name,
         )
+        source_record = authority.source_record()
+        source_published = False
         inserted = False
         with self._guard:
             if self._closed:
@@ -588,9 +664,19 @@ class DesktopReleaseProviderV2:
                     action="correct_project",
                     affected_resource_id=import_id,
                 )
+            source_published = self._native_workspace_source_store.put(source_record)
             if existing is None:
                 self._native_workspace_sources[import_id] = authority
                 inserted = True
+            elif not hmac.compare_digest(
+                existing.cancellation_token,
+                cancellation_token,
+            ):
+                self._native_workspace_sources[import_id] = (
+                    authority.with_operation(existing.operation_id)
+                    if existing.operation_id is not None
+                    else authority
+                )
         try:
             operation = self._lifecycle_executor.reserve(
                 LifecycleOperationReservationV2(
@@ -608,6 +694,8 @@ class DesktopReleaseProviderV2:
                 with self._guard:
                     if self._native_workspace_sources.get(import_id) is authority:
                         self._native_workspace_sources.pop(import_id, None)
+            if source_published:
+                self._native_workspace_source_store.remove(source_record)
             raise
         if operation.status == "succeeded":
             try:
@@ -652,6 +740,8 @@ class DesktopReleaseProviderV2:
                     self._native_workspace_sources[import_id] = current.with_operation(
                         operation.operation_id
                     )
+        if operation.status in {"succeeded", "failed", "cancelled"}:
+            self._native_workspace_source_store.remove(source_record)
         return operation
 
     def cancel_native_workspace_prepare(
@@ -1134,9 +1224,14 @@ class DesktopReleaseProviderV2:
                 started.connection_generation,
             )
         except Exception:
-            # The process-local SSH owner may already be absent during restart
-            # recovery. Local disconnection is still the safe terminal state.
-            pass
+            raise _provider_error(
+                "ssh_cleanup_failed",
+                "The system OpenSSH connection could not be closed safely.",
+                status=503,
+                retryable=True,
+                action="retry",
+                affected_resource_id=started.profile_id,
+            ) from None
         context.checkpoint(
             "activating",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
@@ -1366,12 +1461,14 @@ class DesktopReleaseProviderV2:
             context.check_cancelled()
             raise
         finally:
-            with self._guard:
-                current = self._native_workspace_sources.get(source.import_id)
-                if current is source or (
-                    current is not None and current.journal_sha256 == source.journal_sha256
-                ):
-                    self._native_workspace_sources.pop(source.import_id, None)
+            if not context.is_shutdown_requested():
+                with self._guard:
+                    current = self._native_workspace_sources.get(source.import_id)
+                    if current is source or (
+                        current is not None and current.journal_sha256 == source.journal_sha256
+                    ):
+                        self._native_workspace_sources.pop(source.import_id, None)
+                self._native_workspace_source_store.remove(source.source_record())
         return local_v2.LifecycleNativeWorkspaceResultV2(
             result_kind="native_workspace",
             import_id=import_ref.import_id,
@@ -1391,16 +1488,22 @@ class DesktopReleaseProviderV2:
             raise TypeError("project-create lifecycle request has the wrong type")
         request = persisted.request
         action_id = persisted.action_id
-        profile = self._connected_profile(
+        profile = self._project_lifecycle_profile(
             request.profile_id,
             request.profile_connection_generation,
         )
-        if persisted.resource_generation != profile.connection_generation:
+        if persisted.resource_generation > profile.connection_generation:
             raise _generation_changed(profile.profile_id)
+        if request.profile_connection_generation != profile.connection_generation:
+            request = request.model_copy(
+                update={
+                    "profile_connection_generation": profile.connection_generation,
+                }
+            )
         desktop_project_id = persisted.project_id
-        context.checkpoint(
+        self._checkpoint_lifecycle_forward(
+            context,
             "remote_preflight",
-            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
         activation = self._bridge.activate_project(
@@ -1459,11 +1562,12 @@ class DesktopReleaseProviderV2:
         request = context.request
         if type(request) is not LifecycleProjectActivateRequestV2:
             raise TypeError("project-activate lifecycle request has the wrong type")
-        context.checkpoint(
+        self._checkpoint_lifecycle_forward(
+            context,
             "verifying_project",
-            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
+        self._defer_project_activation_until_reconnected(request.project_id)
         _activation, _desktop_id, _profile_generation, project = self._active_authority(
             request.project_id
         )
@@ -2832,6 +2936,30 @@ class DesktopReleaseProviderV2:
             raise _generation_changed(profile_id)
         return profile
 
+    def _project_lifecycle_profile(
+        self,
+        profile_id: str,
+        minimum_connection_generation: int,
+    ) -> local_v2.RemoteWorkspaceProfileV2:
+        profile = self._store.get_profile(profile_id)
+        if (
+            not isinstance(profile, local_v2.RemoteWorkspaceProfileV2)
+            or profile.connection_generation < minimum_connection_generation
+        ):
+            raise _generation_changed(profile_id)
+        if profile.connection_state != "connected":
+            raise LifecycleOperationDeferredV2
+        return profile
+
+    def _defer_project_activation_until_reconnected(self, project_id: str) -> None:
+        for profile in self._store.list_profiles():
+            if (
+                isinstance(profile, local_v2.RemoteWorkspaceProfileV2)
+                and profile.active_project_id == project_id
+                and profile.connection_state != "connected"
+            ):
+                raise LifecycleOperationDeferredV2
+
     def _active_authority(
         self,
         project_id: str | None = None,
@@ -3026,10 +3154,7 @@ def _derived_idempotency_key(parent: str, operation: str) -> str:
     encoded_parent = parent.encode("utf-8")
     if (
         parent != parent.strip()
-        or any(
-            ord(character) < 0x20 or ord(character) == 0x7F
-            for character in parent
-        )
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in parent)
         or not 16 <= len(encoded_parent) <= 256
     ):
         raise ValueError("parent action identity is invalid")

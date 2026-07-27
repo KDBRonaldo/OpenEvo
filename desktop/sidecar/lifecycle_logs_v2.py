@@ -46,9 +46,8 @@ _LOOPBACK_ENDPOINT_RE = re.compile(
     r"(?::[0-9]{1,5})?(?:/[^\s]*)?"
 )
 _ABSOLUTE_HOST_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9._-])"
-    r"/(?:Users|Volumes|home|root|private|tmp|var|opt|srv|mnt|run|etc|workspace|openevo)"
-    r"(?:/[^\s\t\r\n'\"<>]+)*"
+    r"(?<![A-Za-z0-9._~:/-])"
+    r"/(?!/)(?:[^\s\t\r\n'\"<>/]+)(?:/[^\s\t\r\n'\"<>/]+)*"
 )
 _MAX_UNTERMINATED_LINE_BYTES = MAX_LIFECYCLE_LOG_ENTRY_BYTES
 _UNTERMINATED_LINE_OMITTED = "[TRUNCATED: unterminated process output omitted]\n"
@@ -73,10 +72,7 @@ class LifecycleOutputSanitizerV2:
         if not callable(sink):
             raise TypeError("lifecycle log sink must be callable")
         self._sink = sink
-        self._secret_canaries = self._validated_literals(
-            secret_canaries,
-            label="secret canary",
-        )
+        self._secret_canaries = self._validated_secret_canaries(secret_canaries)
         self._forbidden_endpoints = self._validated_literals(
             forbidden_endpoints,
             label="Core endpoint",
@@ -180,15 +176,7 @@ class LifecycleOutputSanitizerV2:
                 self._emit_bounded(source, safe)
 
     def _sanitize(self, value: str) -> str:
-        safe = _OSC_RE.sub("", value)
-        safe = _CSI_RE.sub("", safe)
-        safe = _ESCAPE_RE.sub("", safe)
-        safe = "".join(
-            character
-            for character in safe
-            if character in {"\n", "\t"}
-            or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F)
-        )
+        safe = self._strip_terminal_controls(value)
         for canary in self._secret_canaries:
             safe = safe.replace(canary, "[REDACTED_SECRET]")
         safe = _AUTHORIZATION_RE.sub(r"\1[REDACTED_CREDENTIAL]", safe)
@@ -244,6 +232,30 @@ class LifecycleOutputSanitizerV2:
     @staticmethod
     def _normalize_newlines(value: str) -> str:
         return value.replace("\r\n", "\n").replace("\r", "\n")
+
+    @staticmethod
+    def _strip_terminal_controls(value: str) -> str:
+        safe = _OSC_RE.sub("", value)
+        safe = _CSI_RE.sub("", safe)
+        safe = _ESCAPE_RE.sub("", safe)
+        return "".join(
+            character
+            for character in safe
+            if character in {"\n", "\t"}
+            or (ord(character) >= 0x20 and not 0x7F <= ord(character) <= 0x9F)
+        )
+
+    @classmethod
+    def _validated_secret_canaries(cls, values: Iterable[str]) -> tuple[str, ...]:
+        validated = cls._validated_literals(values, label="secret canary")
+        expanded: set[str] = set()
+        for value in validated:
+            visible = cls._strip_terminal_controls(cls._normalize_newlines(value))
+            if not visible:
+                continue
+            expanded.add(visible)
+            expanded.update(part for part in visible.split("\n") if part)
+        return tuple(sorted(expanded, key=lambda item: (-len(item), item)))
 
     @staticmethod
     def _validated_literals(values: Iterable[str], *, label: str) -> tuple[str, ...]:

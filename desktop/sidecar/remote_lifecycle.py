@@ -488,6 +488,16 @@ class _SystemSessionOwnerV2(Protocol):
 
 
 class _SystemHostTrustV2(Protocol):
+    def reissue_changed_key_review(
+        self,
+        current_review: PendingSystemHostKeyReview,
+        *,
+        profile: SystemOpenSshAliasProfile,
+        connection_generation: int,
+        review_id: str,
+        review_sha256: str,
+    ) -> PendingSystemHostKeyReview: ...
+
     def replace_changed_key(
         self,
         review: PendingSystemHostKeyReview,
@@ -551,7 +561,7 @@ class SystemOpenSshRemoteLifecycleV2:
             raise TypeError("system OpenSSH session owner is invalid")
         if any(
             not callable(getattr(host_trust, method, None))
-            for method in ("replace_changed_key", "close")
+            for method in ("reissue_changed_key_review", "replace_changed_key", "close")
         ):
             raise TypeError("system OpenSSH host trust authority is invalid")
         if not callable(transport_factory):
@@ -630,10 +640,11 @@ class SystemOpenSshRemoteLifecycleV2:
             self._require_open()
             with self._state:
                 active = self._active
-                if (
-                    active is None
-                    or active.profile_id != profile_id
-                    or active.connection_generation + 1 != connection_generation
+                if active is None:
+                    self._pending_reviews.pop(profile_id, None)
+                    return
+                if active.profile_id != profile_id or (
+                    active.connection_generation + 1 != connection_generation
                 ):
                     raise RemoteConnectionFailedError(
                         "The requested remote profile is not connected."
@@ -652,6 +663,39 @@ class SystemOpenSshRemoteLifecycleV2:
         with self._transition:
             self._require_open()
             pending = self._pending_reviews.get(profile.profile_id)
+            if pending is None and request.action == "reject":
+                # The user decision is durably digest-bound by the provider.
+                # Rejection has no remote side effect, so a restarted owner can
+                # complete it without rebuilding private repair authority.
+                self._close_active()
+                return "rejected"
+            if pending is None and request.action == "replace_changed_key":
+                try:
+                    self._connect_locked(profile)
+                except SystemOpenSshSessionError as exc:
+                    current_review = exc.host_key_review
+                    if exc.code != "ssh_host_key_changed" or current_review is None:
+                        raise
+                else:
+                    # A previous attempt may have completed trust repair before
+                    # process shutdown.  System OpenSSH is the final connection
+                    # authority, so a clean exact-alias reconnect completes it.
+                    return "connected"
+                try:
+                    pending = self._host_trust.reissue_changed_key_review(
+                        current_review,
+                        profile=self._alias_profile(profile),
+                        connection_generation=request.expected_connection_generation,
+                        review_id=request.review_id,
+                        review_sha256=request.review_sha256,
+                    )
+                except SystemOpenSshSessionError:
+                    raise
+                except Exception:
+                    raise RemoteConnectionFailedError(
+                        "The pending SSH host key is no longer current."
+                    ) from None
+                self._pending_reviews[profile.profile_id] = pending
             if (
                 pending is None
                 or pending.profile_id != profile.profile_id

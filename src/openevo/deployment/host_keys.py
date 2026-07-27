@@ -280,6 +280,108 @@ class SystemHostKeyReviewAuthority:
             self._records[review_id] = _SystemHostKeyReviewRecord(review=review)
         return review
 
+    def reissue_matching_review(
+        self,
+        current_review: PendingSystemHostKeyReview,
+        *,
+        profile: SystemOpenSshAliasProfile,
+        connection_generation: int,
+        review_id: str,
+        review_sha256: str,
+    ) -> PendingSystemHostKeyReview:
+        """Restore one persisted decision after exact changed-key rediscovery.
+
+        The authority key is intentionally process-local.  Recovery therefore
+        re-observes the changed key and effective known-hosts policy, then only
+        restores the old public identity when those canonical bytes still hash
+        to the digest persisted with the user's decision.
+        """
+
+        if not isinstance(current_review, PendingSystemHostKeyReview) or not isinstance(
+            profile, SystemOpenSshAliasProfile
+        ):
+            raise TypeError("system host-key review recovery authority is invalid")
+        if (
+            type(connection_generation) is not int
+            or not 1 <= connection_generation <= (1 << 53) - 1
+        ):
+            raise ValueError("system host-key review generation is invalid")
+        if re.fullmatch(r"host-review-[0-9a-f]{24}", review_id) is None or re.fullmatch(
+            r"[0-9a-f]{64}", review_sha256
+        ) is None:
+            raise ValueError("system host-key persisted review identity is invalid")
+        if profile.profile_id != current_review.profile_id:
+            raise ValueError("system host-key review profile changed")
+        policy = current_review._policy
+        evidence = SystemHostKeyFailureEvidence(
+            code=SystemHostKeyFailureCode.CHANGED,
+            presented_fingerprints=current_review.key_fingerprints,
+            offending_known_hosts_file=policy.known_hosts_file,
+            offending_line=None,
+        )
+        current_payload = _canonical_system_host_key_review(
+            review_id=current_review.review_id,
+            profile=profile,
+            connection_generation=current_review.connection_generation,
+            evidence=evidence,
+            policy=policy,
+        )
+        restored_payload = _canonical_system_host_key_review(
+            review_id=review_id,
+            profile=profile,
+            connection_generation=connection_generation,
+            evidence=evidence,
+            policy=policy,
+        )
+        if not hmac.compare_digest(
+            hashlib.sha256(restored_payload).hexdigest(),
+            review_sha256,
+        ):
+            raise ValueError("rediscovered system host-key review does not match")
+        token = current_review._authority_token
+        if (
+            type(token) is not tuple
+            or len(token) != 2
+            or token[0] is not self._token
+            or type(token[1]) is not bytes
+        ):
+            raise ValueError("system host-key review authority is invalid")
+        expected_current_token = hmac.new(
+            bytes(self._hmac_key), current_payload, hashlib.sha256
+        ).digest()
+        if not hmac.compare_digest(token[1], expected_current_token):
+            raise ValueError("system host-key review authority is invalid")
+        restored_token = hmac.new(
+            bytes(self._hmac_key), restored_payload, hashlib.sha256
+        ).digest()
+        restored = PendingSystemHostKeyReview(
+            review_id=review_id,
+            review_sha256=review_sha256,
+            profile_id=profile.profile_id,
+            connection_generation=connection_generation,
+            key_fingerprints=current_review.key_fingerprints,
+            repair_support=policy.repair_support,
+            _policy=policy,
+            _authority_token=(self._token, restored_token),
+        )
+        with self._lock:
+            if self._closed:
+                raise ValueError("system host-key review is no longer current")
+            current_record = self._records.get(current_review.review_id)
+            if (
+                current_record is None
+                or current_record.review is not current_review
+                or current_record.consumed
+            ):
+                raise ValueError("system host-key review is no longer current")
+            existing = self._records.get(review_id)
+            if existing is not None and existing is not current_record:
+                raise ValueError("system host-key persisted review identity is already in use")
+            current_record.consumed = True
+            self._records.pop(current_review.review_id, None)
+            self._records[review_id] = _SystemHostKeyReviewRecord(review=restored)
+        return restored
+
     def claim_replacement(
         self,
         review: PendingSystemHostKeyReview,

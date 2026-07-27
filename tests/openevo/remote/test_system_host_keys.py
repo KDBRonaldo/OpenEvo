@@ -292,6 +292,74 @@ def test_changed_key_review_is_digest_bound_single_use_and_path_free(
         )
 
 
+def test_changed_key_review_can_be_reissued_after_restart_only_from_exact_current_evidence(
+    tmp_path: Path,
+) -> None:
+    path = _known_hosts(tmp_path)
+    evidence = classify_system_openssh_host_key_failure(_changed_key_stderr(path))
+    policy = inspect_system_known_hosts_policy(
+        _config(path), home=tmp_path, offending_known_hosts_file=path
+    )
+    original_authority = SystemHostKeyReviewAuthority(hmac_key=b"o" * 32)
+    original = original_authority.issue(
+        _profile(), connection_generation=9, evidence=evidence, policy=policy
+    )
+    original_authority.close()
+
+    restarted_authority = SystemHostKeyReviewAuthority(hmac_key=b"n" * 32)
+    rediscovered = restarted_authority.issue(
+        _profile(), connection_generation=10, evidence=evidence, policy=policy
+    )
+    reissued = restarted_authority.reissue_matching_review(
+        rediscovered,
+        profile=_profile(),
+        connection_generation=9,
+        review_id=original.review_id,
+        review_sha256=original.review_sha256,
+    )
+
+    assert reissued.review_id == original.review_id
+    assert reissued.review_sha256 == original.review_sha256
+    assert reissued.connection_generation == 9
+    replacement = restarted_authority.claim_replacement(
+        reissued,
+        profile=_profile(),
+        connection_generation=9,
+        review_id=original.review_id,
+        review_sha256=original.review_sha256,
+    )
+    assert replacement.known_hosts_file == path
+
+
+def test_changed_key_review_reissue_rejects_changed_evidence(
+    tmp_path: Path,
+) -> None:
+    path = _known_hosts(tmp_path)
+    evidence = classify_system_openssh_host_key_failure(_changed_key_stderr(path))
+    policy = inspect_system_known_hosts_policy(
+        _config(path), home=tmp_path, offending_known_hosts_file=path
+    )
+    original = SystemHostKeyReviewAuthority(hmac_key=b"o" * 32).issue(
+        _profile(), connection_generation=9, evidence=evidence, policy=policy
+    )
+    changed_evidence = classify_system_openssh_host_key_failure(
+        _changed_key_stderr(path, fingerprint="SHA256:" + ("B" * 43))
+    )
+    restarted_authority = SystemHostKeyReviewAuthority(hmac_key=b"n" * 32)
+    rediscovered = restarted_authority.issue(
+        _profile(), connection_generation=10, evidence=changed_evidence, policy=policy
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        restarted_authority.reissue_matching_review(
+            rediscovered,
+            profile=_profile(),
+            connection_generation=9,
+            review_id=original.review_id,
+            review_sha256=original.review_sha256,
+        )
+
+
 def test_changed_key_review_rejects_forgery_generation_and_ambiguous_policy(
     tmp_path: Path,
 ) -> None:

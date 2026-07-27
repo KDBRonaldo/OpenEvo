@@ -10,6 +10,7 @@ from desktop.sidecar.contracts.v2 import models as m
 from desktop.sidecar.lifecycle_executor_v2 import (
     DesktopLifecycleExecutorV2,
     LifecycleExecutionContextV2,
+    LifecycleOperationDeferredV2,
 )
 from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
@@ -307,6 +308,52 @@ def test_pending_cancel_stops_at_the_non_cancellable_mutation_barrier(
     store.close()
 
 
+def test_cancellable_progress_callback_propagates_cancel_before_side_effect(
+    tmp_path: Path,
+) -> None:
+    before_second_checkpoint = Event()
+    enter_second_checkpoint = Event()
+    side_effect_applied = Event()
+    executor: DesktopLifecycleExecutorV2
+
+    def apply_after_progress(context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        executor.observe_progress(
+            "transferring",
+            m.LifecycleProgressBytesV2(kind="bytes", completed=1, total=2),
+            True,
+        )
+        before_second_checkpoint.set()
+        assert enter_second_checkpoint.wait(2)
+        executor.observe_progress(
+            "transferring",
+            m.LifecycleProgressBytesV2(kind="bytes", completed=2, total=2),
+            True,
+        )
+        side_effect_applied.set()
+        return _project_result(context)
+
+    store = DesktopProviderStoreV2(tmp_path / "provider", clock=_Clock())
+    executor = DesktopLifecycleExecutorV2(store, runners=_runners(apply_after_progress))
+    executor.start()
+    operation = executor.reserve(
+        _reservation("project-cancellable-progress"),
+        idempotency_key="cancellable-progress-project-create-0001",
+    )
+    assert before_second_checkpoint.wait(1)
+    current = store.get_lifecycle_operation(operation.operation_id)
+    executor.cancel(
+        operation.operation_id,
+        if_match=current.etag,
+        idempotency_key="cancel-cancellable-progress-0001",
+    )
+    enter_second_checkpoint.set()
+
+    assert _wait_terminal(store, operation.operation_id).status == "cancelled"
+    assert not side_effect_applied.is_set()
+    executor.close()
+    store.close()
+
+
 def test_restart_reconciles_the_same_running_operation(tmp_path: Path) -> None:
     root = tmp_path / "provider"
     store = DesktopProviderStoreV2(root, clock=_Clock())
@@ -330,6 +377,89 @@ def test_restart_reconciles_the_same_running_operation(tmp_path: Path) -> None:
 
     assert _wait_terminal(reopened, operation.operation_id).status == "succeeded"
     assert seen == [operation.operation_id]
+    executor.close()
+    reopened.close()
+
+
+def test_deferred_running_operation_yields_to_prerequisite_then_resumes(
+    tmp_path: Path,
+) -> None:
+    prerequisite_ready = Event()
+    deferred_seen = Event()
+    calls: list[str] = []
+
+    def run(context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        project_id = context.operation.resource.resource_id
+        calls.append(project_id)
+        if project_id == "project-deferred" and not prerequisite_ready.is_set():
+            deferred_seen.set()
+            raise LifecycleOperationDeferredV2
+        if project_id == "project-prerequisite":
+            prerequisite_ready.set()
+        return _project_result(context)
+
+    store = DesktopProviderStoreV2(tmp_path / "provider", clock=_Clock())
+    executor = DesktopLifecycleExecutorV2(store, runners=_runners(run))
+    executor.start()
+    deferred = executor.reserve(
+        _reservation("project-deferred"),
+        idempotency_key="deferred-project-create-0001",
+    )
+    assert deferred_seen.wait(1)
+    assert store.get_lifecycle_operation(deferred.operation_id).status == "running"
+
+    prerequisite = executor.reserve(
+        _reservation("project-prerequisite"),
+        idempotency_key="prerequisite-project-create-0001",
+    )
+
+    assert _wait_terminal(store, prerequisite.operation_id).status == "succeeded"
+    assert _wait_terminal(store, deferred.operation_id).status == "succeeded"
+    assert calls == ["project-deferred", "project-prerequisite", "project-deferred"]
+    executor.close()
+    store.close()
+
+
+def test_recovered_checkpoint_replay_never_regresses_durable_phase(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    operation = store.reserve_lifecycle_operation(
+        _reservation("project-phase-replay"),
+        idempotency_key="phase-replay-project-create-0001",
+    )
+    claimed = store.claim_next_lifecycle_operation()
+    assert claimed is not None
+    advanced = store.advance_lifecycle_operation(
+        {
+            "operation_id": operation.operation_id,
+            "expected_etag": claimed.operation.etag,
+            "phase": "creating_remote_project",
+            "progress": {"kind": "indeterminate"},
+            "cancellable": False,
+        }
+    )
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+
+    def replay(context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        retained = context.checkpoint(
+            "remote_preflight",
+            m.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        assert retained.phase == advanced.phase
+        assert not retained.cancellable
+        return _project_result(context)
+
+    executor = DesktopLifecycleExecutorV2(reopened, runners=_runners(replay))
+    executor.start()
+
+    terminal = _wait_terminal(reopened, operation.operation_id)
+    assert terminal.status == "succeeded"
+    assert terminal.phase == "finalizing"
     executor.close()
     reopened.close()
 
