@@ -9,6 +9,7 @@ import sqlite3
 
 import pytest
 
+from desktop.sidecar.contracts.v2 import models as contract_models
 from desktop.sidecar.contracts.v2.models import (
     ProfileConnectionActionV2,
     ProfileDisplayNamePatchV2,
@@ -43,6 +44,19 @@ class _Clock:
         value = self._next
         self._next += timedelta(microseconds=1)
         return value
+
+
+class _MutableClock:
+    def __init__(self) -> None:
+        self.value = datetime(2026, 7, 27, 4, tzinfo=timezone.utc)
+
+    def __call__(self) -> datetime:
+        current = self.value
+        self.value += timedelta(microseconds=1)
+        return current
+
+    def advance(self, delta: timedelta) -> None:
+        self.value += delta
 
 
 def _profile(alias: str = "evolab") -> SystemOpenSshProfileCreateV2:
@@ -100,9 +114,7 @@ def _core_version() -> VersionResponseV2:
             ContractOfferV2(
                 api_major=2,
                 openapi_sha256=V0110_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
-                event_schema_sha256=(
-                    V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
-                ),
+                event_schema_sha256=(V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256),
                 access="mutation",
                 mutation_compatible=True,
             )
@@ -120,6 +132,48 @@ def _core_version() -> VersionResponseV2:
     )
 
 
+def _project_create_request() -> contract_models.ProjectCreateV2:
+    return contract_models.ProjectCreateV2(
+        profile_id="profile-project-owner",
+        profile_connection_generation=3,
+        display_name="Lifecycle project",
+        config=_science_config(),
+    )
+
+
+def _project_reservation(
+    project_id: str = "desktop-project-1",
+) -> object:
+    return store_module.LifecycleOperationReservationV2(
+        kind="project_create",
+        resource={"resource_kind": "project", "resource_id": project_id},
+        request=store_module.LifecycleProjectCreateRequestV2(
+            request_kind="project_create",
+            project_id=project_id,
+            request=_project_create_request(),
+            resource_generation=3,
+        ),
+    )
+
+
+def _connect_reservation(
+    profile: contract_models.RemoteWorkspaceProfileV2,
+) -> object:
+    return store_module.LifecycleOperationReservationV2(
+        kind="profile_connect",
+        resource={"resource_kind": "profile", "resource_id": profile.profile_id},
+        request=store_module.LifecycleProfileConnectRequestV2(
+            request_kind="profile_connect",
+            profile_id=profile.profile_id,
+            request=ProfileConnectionActionV2(
+                expected_connection_generation=profile.connection_generation
+            ),
+            resource_generation=profile.connection_generation,
+            if_match=profile.etag,
+        ),
+    )
+
+
 def test_release_state_uses_a_separate_v2_namespace_and_exact_schema(
     tmp_path: Path,
 ) -> None:
@@ -129,6 +183,9 @@ def test_release_state_uses_a_separate_v2_namespace_and_exact_schema(
     assert store_module.EXPECTED_SCHEMA_V2_SHA256 == (
         "7314032a52da83b70a43f36f161984bef8bf03274848bf62ab1963a039279c06"
     )
+    assert store_module.EXPECTED_SCHEMA_V3_SHA256 == (
+        "fa2284e9374ed21bdeaa318565c81692314430ce9a1bd43251bccb886c31c5c6"
+    )
     base = tmp_path / "state-v2"
     runtime = create_release_local_state_v2(base, clock=_Clock())
     try:
@@ -136,20 +193,20 @@ def test_release_state_uses_a_separate_v2_namespace_and_exact_schema(
         assert store.state_root == base / "provider-v2"
         assert store.database_path == base / "provider-v2" / "provider-v2.sqlite3"
         assert not (base / "provider.sqlite3").exists()
-        assert store.schema_fingerprint == store_module.EXPECTED_SCHEMA_V2_SHA256
+        assert store.schema_fingerprint == store_module.EXPECTED_SCHEMA_V3_SHA256
         assert store.list_profiles() == ()
         assert runtime.legacy_import.profiles == ()
         assert runtime.legacy_import.diagnostics == ()
 
         with sqlite3.connect(store.database_path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
             row = connection.execute(
                 "SELECT namespace, schema_version, schema_sha256 FROM schema_metadata"
             ).fetchone()
             assert row == (
                 "openevo.desktop.provider.v2",
-                2,
-                store_module.EXPECTED_SCHEMA_V2_SHA256,
+                3,
+                store_module.EXPECTED_SCHEMA_V3_SHA256,
             )
     finally:
         runtime.close()
@@ -236,9 +293,7 @@ def test_disconnect_and_process_restart_preserve_the_reconnect_project_binding(
     )
     connecting = store.begin_profile_action(
         created.profile_id,
-        ProfileConnectionActionV2(
-            expected_connection_generation=created.connection_generation
-        ),
+        ProfileConnectionActionV2(expected_connection_generation=created.connection_generation),
         action="connect",
         resource_generation=created.connection_generation,
         if_match=created.etag,
@@ -257,9 +312,7 @@ def test_disconnect_and_process_restart_preserve_the_reconnect_project_binding(
 
     disconnecting = store.begin_profile_action(
         created.profile_id,
-        ProfileConnectionActionV2(
-            expected_connection_generation=bound.connection_generation
-        ),
+        ProfileConnectionActionV2(expected_connection_generation=bound.connection_generation),
         action="disconnect",
         resource_generation=bound.connection_generation,
         if_match=bound.etag,
@@ -497,6 +550,146 @@ def _write_schema_v1_database(root: Path) -> None:
         connection.execute("PRAGMA user_version = 1")
 
 
+def _write_schema_v2_database_with_authority(root: Path) -> tuple[str, str]:
+    root.mkdir(mode=0o700)
+    database = root / store_module.DATABASE_FILENAME
+    database.touch(mode=0o600)
+    timestamp = "2026-07-23T04:00:00.000000Z"
+    profile_id = "profile-preserved-v2"
+    draft_id = "draft-preserved-v2"
+    profile = contract_models.RemoteWorkspaceProfileV2(
+        profile_id=profile_id,
+        display_name="Preserved profile",
+        ssh_host_alias="preserved-lab",
+        catalog_generation=2,
+        connection_generation=1,
+        connection_state="disconnected",
+        prompt=None,
+        trust=contract_models.SshTrustStateV2(
+            connection_generation=1,
+            state="unverified",
+            review_id=None,
+            review_sha256=None,
+            key_fingerprints=[],
+            repair_support="not_needed",
+        ),
+        failure=None,
+        active_project_id=None,
+        core_api_major=None,
+        core_openapi_sha256=None,
+        core_event_schema_sha256=None,
+        core_registry_sha256=None,
+        created_at=timestamp,
+        updated_at=timestamp,
+        etag=DesktopProviderStoreV2._etag("profile", profile_id, 1),
+    )
+    config = _science_config()
+    draft = store_module.LocalProjectDraftV2(
+        draft_id=draft_id,
+        profile_id=profile_id,
+        display_name="Preserved draft",
+        config=config,
+        project_config_sha256=store_module.project_config_sha256_for(config),
+        legacy_source_ref_sha256="7" * 64,
+        legacy_source_document_sha256="8" * 64,
+        created_at=timestamp,
+        updated_at=timestamp,
+        etag=DesktopProviderStoreV2._etag("draft", draft_id, 1),
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        for statement in (
+            *store_module._SCHEMA_V1_STATEMENTS,
+            *store_module._SCHEMA_V2_ADDITIONS,
+        ):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO schema_metadata VALUES (1, ?, 2, ?, ?)",
+            (
+                store_module.STORE_NAMESPACE,
+                store_module.EXPECTED_SCHEMA_V2_SHA256,
+                timestamp,
+            ),
+        )
+        connection.executemany(
+            "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+            ((1, timestamp), (2, timestamp)),
+        )
+        connection.execute(
+            """
+            INSERT INTO profiles(
+                profile_id, profile_kind, document_json, resource_version,
+                legacy_source_ref_sha256, legacy_source_document_sha256,
+                rebound_from_sha256, created_at, updated_at
+            ) VALUES (?, 'system_openssh', ?, 1, NULL, NULL, NULL, ?, ?)
+            """,
+            (
+                profile_id,
+                store_module._canonical_json_bytes(profile),
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO project_drafts(
+                draft_id, profile_id, document_json, config_json,
+                project_config_sha256, legacy_source_ref_sha256,
+                legacy_source_document_sha256, resource_version,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            """,
+            (
+                draft_id,
+                profile_id,
+                store_module._canonical_json_bytes(draft),
+                store_module._canonical_json_bytes(config),
+                draft.project_config_sha256,
+                draft.legacy_source_ref_sha256,
+                draft.legacy_source_document_sha256,
+                timestamp,
+                timestamp,
+            ),
+        )
+        for operation, scope, key, response_kind, response in (
+            (
+                "createSystemOpenSshProfileV2",
+                "profiles",
+                "preserved-profile-key-001",
+                "profile",
+                profile,
+            ),
+            (
+                "copyLegacyDraftV2",
+                draft.legacy_source_ref_sha256,
+                "preserved-draft-key-0001",
+                "draft",
+                draft,
+            ),
+        ):
+            connection.execute(
+                """
+                INSERT INTO idempotency_records(
+                    principal, operation, resource_scope, idempotency_key,
+                    request_sha256, response_kind, response_resource_version,
+                    response_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    store_module.LOCAL_PRINCIPAL,
+                    operation,
+                    scope,
+                    key,
+                    "9" * 64,
+                    response_kind,
+                    store_module._canonical_json_bytes(response),
+                    timestamp,
+                ),
+            )
+        connection.execute("PRAGMA user_version = 2")
+    return profile_id, draft_id
+
+
 def test_schema_migration_is_atomic_and_retries_after_interruption(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -524,7 +717,7 @@ def test_schema_migration_is_atomic_and_retries_after_interruption(
     monkeypatch.setattr(store_module, "_migration_checkpoint", lambda _stage: None)
     store = DesktopProviderStoreV2(root, clock=_Clock())
     try:
-        assert store.schema_fingerprint == store_module.EXPECTED_SCHEMA_V2_SHA256
+        assert store.schema_fingerprint == store_module.EXPECTED_SCHEMA_V3_SHA256
     finally:
         store.close()
 
@@ -712,4 +905,346 @@ def test_startup_rejects_a_draft_without_its_system_openssh_profile(
         )
 
     with pytest.raises(store_module.ProviderDataV2Error):
+        DesktopProviderStoreV2(root, clock=_Clock())
+
+
+def test_schema_v3_migration_is_atomic_and_preserves_v019_authority(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "provider-v2"
+    profile_id, draft_id = _write_schema_v2_database_with_authority(root)
+
+    def interrupt(stage: str) -> None:
+        if stage == "v2_to_v3_after_ddl":
+            raise RuntimeError("simulated v2-to-v3 interruption")
+
+    monkeypatch.setattr(store_module, "_migration_checkpoint", interrupt)
+    with pytest.raises(RuntimeError, match="v2-to-v3"):
+        DesktopProviderStoreV2(root, clock=_Clock())
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_schema WHERE name = 'lifecycle_operations'"
+            ).fetchone()
+            is None
+        )
+
+    monkeypatch.setattr(store_module, "_migration_checkpoint", lambda _stage: None)
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        assert store_module.SCHEMA_VERSION == 3
+        assert store.schema_fingerprint == store_module.EXPECTED_SCHEMA_V3_SHA256
+        assert store.get_profile(profile_id).profile_id == profile_id
+        assert [draft.draft_id for draft in store.list_drafts()] == [draft_id]
+        with sqlite3.connect(store.database_path) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 3
+            assert (
+                connection.execute("SELECT count(*) FROM idempotency_records").fetchone()[0] == 2
+            )
+            assert (
+                len(
+                    connection.execute(
+                        "SELECT cursor_key FROM lifecycle_cursor_key WHERE singleton = 1"
+                    ).fetchone()[0]
+                )
+                == 32
+            )
+    finally:
+        store.close()
+
+
+def test_lifecycle_reservation_is_exact_replay_and_survives_capacity_and_restart(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(
+        root,
+        clock=_Clock(),
+        max_lifecycle_operations=1,
+    )
+    request = _project_reservation()
+    operation = store.reserve_lifecycle_operation(
+        request,
+        idempotency_key="project-create-action-0001",
+    )
+    assert operation.kind == "project_create"
+    assert operation.status == "queued"
+    assert operation.phase == "queued"
+    assert operation.started_at is None
+    assert (
+        store.reserve_lifecycle_operation(
+            request,
+            idempotency_key="project-create-action-0001",
+        )
+        == operation
+    )
+
+    with pytest.raises(ProviderIdempotencyConflictV2):
+        store.reserve_lifecycle_operation(
+            _project_reservation("desktop-project-conflict"),
+            idempotency_key="project-create-action-0001",
+        )
+    with pytest.raises(ProviderCapacityV2Error):
+        store.reserve_lifecycle_operation(
+            _project_reservation("desktop-project-2"),
+            idempotency_key="project-create-action-0002",
+        )
+    assert store.list_pending_lifecycle_operations() == (
+        contract_models.LifecycleOperationRefV2.from_operation(operation),
+    )
+    store.close()
+
+    reopened = DesktopProviderStoreV2(
+        root,
+        clock=_Clock(),
+        max_lifecycle_operations=1,
+    )
+    try:
+        assert reopened.get_lifecycle_operation(operation.operation_id) == operation
+        assert (
+            reopened.reserve_lifecycle_operation(
+                request,
+                idempotency_key="project-create-action-0001",
+            )
+            == operation
+        )
+    finally:
+        reopened.close()
+
+
+def test_profile_transition_and_lifecycle_reservation_are_one_transaction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    profile = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="atomic-profile-create-0001",
+    )
+
+    def interrupt(stage: str) -> None:
+        if stage == "after_profile_transition":
+            raise RuntimeError("simulated reservation interruption")
+
+    monkeypatch.setattr(store_module, "_lifecycle_reservation_checkpoint", interrupt)
+    with pytest.raises(RuntimeError, match="reservation interruption"):
+        store.reserve_lifecycle_operation(
+            _connect_reservation(profile),
+            idempotency_key="atomic-profile-connect-001",
+        )
+    assert store.get_profile(profile.profile_id) == profile
+    assert store.list_pending_lifecycle_operations() == ()
+
+    monkeypatch.setattr(
+        store_module,
+        "_lifecycle_reservation_checkpoint",
+        lambda _stage: None,
+    )
+    operation = store.reserve_lifecycle_operation(
+        _connect_reservation(profile),
+        idempotency_key="atomic-profile-connect-001",
+    )
+    transitioned = store.get_profile(profile.profile_id)
+    assert transitioned.connection_state == "connecting"
+    assert transitioned.connection_generation == profile.connection_generation + 1
+    assert operation.resource.resource_id == profile.profile_id
+    assert (
+        store.reserve_lifecycle_operation(
+            _connect_reservation(profile),
+            idempotency_key="atomic-profile-connect-001",
+        )
+        == operation
+    )
+    store.close()
+
+
+def test_lifecycle_progress_logs_terminal_retry_and_acknowledgement_are_durable(
+    tmp_path: Path,
+) -> None:
+    clock = _MutableClock()
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=clock)
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation(),
+        idempotency_key="progress-project-create-001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    assert work.operation.operation_id == queued.operation_id
+    assert work.operation.status == "running"
+
+    transferring = store.advance_lifecycle_operation(
+        store_module.LifecycleOperationAdvanceV2(
+            operation_id=work.operation.operation_id,
+            expected_etag=work.operation.etag,
+            phase="transferring",
+            progress={"kind": "bytes", "completed": 5, "total": 10},
+            cancellable=True,
+        )
+    )
+    with pytest.raises(ProviderPreconditionFailedV2, match="regress"):
+        store.advance_lifecycle_operation(
+            store_module.LifecycleOperationAdvanceV2(
+                operation_id=transferring.operation_id,
+                expected_etag=transferring.etag,
+                phase="transferring",
+                progress={"kind": "bytes", "completed": 4, "total": 10},
+                cancellable=True,
+            )
+        )
+
+    with_log = store.append_lifecycle_log(
+        store_module.LifecycleLogAppendV2(
+            operation_id=transferring.operation_id,
+            source="ssh_stdout",
+            text="Preparing remote project\n",
+            truncated=False,
+        )
+    )
+    assert with_log.log_sequence_high_watermark == 1
+    completion = store_module.LifecycleOperationCompletionV2(
+        operation_id=with_log.operation_id,
+        expected_etag=with_log.etag,
+        status="succeeded",
+        result={"result_kind": "project", "project_id": "desktop-project-1"},
+        failure=None,
+    )
+    finished = store.finish_lifecycle_operation(completion)
+    assert finished.status == "succeeded"
+    assert store.finish_lifecycle_operation(completion) == finished
+    with pytest.raises(store_module.ProviderConflictV2, match="terminal"):
+        store.append_lifecycle_log(
+            store_module.LifecycleLogAppendV2(
+                operation_id=finished.operation_id,
+                source="daemon_stderr",
+                text="late output",
+                truncated=False,
+            )
+        )
+
+    acknowledgement = contract_models.LifecycleAcknowledgeV2(
+        expected_operation_id=finished.operation_id,
+        expected_terminal_status="succeeded",
+    )
+    store.acknowledge_lifecycle_operation(
+        finished.operation_id,
+        acknowledgement,
+        if_match=finished.etag,
+        idempotency_key="ack-project-create-0001",
+    )
+    store.acknowledge_lifecycle_operation(
+        finished.operation_id,
+        acknowledgement,
+        if_match=finished.etag,
+        idempotency_key="ack-project-create-0001",
+    )
+    assert store.list_pending_lifecycle_operations() == ()
+
+    clock.advance(timedelta(days=8))
+    assert store.reconcile_lifecycle_operations() == ()
+    with pytest.raises(store_module.ProviderNotFoundV2):
+        store.get_lifecycle_operation(finished.operation_id)
+    store.close()
+
+
+def test_lifecycle_log_pages_are_bounded_signed_and_report_eviction(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(
+        tmp_path / "provider-v2",
+        clock=_Clock(),
+        max_lifecycle_log_entries=2,
+        max_lifecycle_log_bytes=store_module.MAX_LIFECYCLE_LOG_BYTES,
+        max_lifecycle_global_log_bytes=store_module.MAX_LIFECYCLE_GLOBAL_LOG_BYTES,
+    )
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation(),
+        idempotency_key="log-project-create-000001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    for text in ("first", "second", "third"):
+        store.append_lifecycle_log(
+            store_module.LifecycleLogAppendV2(
+                operation_id=queued.operation_id,
+                source="daemon_stdout",
+                text=text,
+                truncated=False,
+            )
+        )
+    page = store.read_lifecycle_logs(queued.operation_id, limit=1, after=None)
+    assert page.dropped_before_sequence == 1
+    assert [entry.text for entry in page.items] == ["second"]
+    assert page.has_more and page.next_cursor is not None
+    with pytest.raises(store_module.ProviderContractV2Error):
+        store.read_lifecycle_logs(
+            queued.operation_id,
+            limit=1,
+            after=page.next_cursor + "tampered",
+        )
+
+    cursor = page.next_cursor
+    store.append_lifecycle_log(
+        store_module.LifecycleLogAppendV2(
+            operation_id=queued.operation_id,
+            source="ssh_stderr",
+            text="fourth",
+            truncated=False,
+        )
+    )
+    store.append_lifecycle_log(
+        store_module.LifecycleLogAppendV2(
+            operation_id=queued.operation_id,
+            source="ssh_stderr",
+            text="fifth",
+            truncated=False,
+        )
+    )
+    with pytest.raises(store_module.ProviderCursorExpiredV2):
+        store.read_lifecycle_logs(queued.operation_id, limit=1, after=cursor)
+
+    oversized = store.append_lifecycle_log(
+        store_module.LifecycleLogAppendV2(
+            operation_id=queued.operation_id,
+            source="ssh_stdout",
+            text="界" * 6_000,
+            truncated=False,
+        )
+    )
+    tail = store.read_lifecycle_logs(oversized.operation_id, limit=2, after=None)
+    entry = tail.items[-1]
+    assert len(entry.text.encode("utf-8")) <= 16 * 1024
+    assert entry.truncated is True
+    store.close()
+
+
+def test_lifecycle_recovery_rejects_oversized_log_before_loading_text(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation(),
+        idempotency_key="corrupt-log-project-0001",
+    )
+    store.claim_next_lifecycle_operation()
+    store.append_lifecycle_log(
+        store_module.LifecycleLogAppendV2(
+            operation_id=queued.operation_id,
+            source="desktop",
+            text="checkpoint",
+            truncated=False,
+        )
+    )
+    store.close()
+
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        connection.execute("PRAGMA ignore_check_constraints = ON")
+        connection.execute(
+            "UPDATE lifecycle_operation_logs SET text = zeroblob(?)",
+            (store_module.MAX_LIFECYCLE_LOG_ENTRY_BYTES + 1,),
+        )
+    with pytest.raises(store_module.ProviderDataV2Error, match="log"):
         DesktopProviderStoreV2(root, clock=_Clock())

@@ -1,16 +1,18 @@
 """Isolated durable state for the Desktop Local API v2 provider.
 
-The v2 store is intentionally small: it owns only local system-OpenSSH
-profiles, non-connectable migration records, validated local project drafts,
+The v2 store owns local system-OpenSSH profiles, non-connectable migration
+records, validated local project drafts, bounded lifecycle operations/logs,
 and their idempotency/migration receipts.  Remote Core authority is never
 persisted here.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import hmac
@@ -22,9 +24,16 @@ import secrets
 import sqlite3
 import stat
 import threading
-from typing import Literal, TypeVar, cast
+from typing import Annotated, Literal, TypeAlias, TypeVar, cast
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    model_validator,
+)
 
 from desktop.sidecar.contracts.v2 import models as m
 from openevo.backend.contracts.v2.models import (
@@ -36,7 +45,7 @@ from openevo.deployment.host_keys import PendingSystemHostKeyReview
 
 
 STORE_NAMESPACE = "openevo.desktop.provider.v2"
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DATABASE_FILENAME = "provider-v2.sqlite3"
 JOURNAL_FILENAME = f"{DATABASE_FILENAME}-journal"
 WAL_FILENAME = f"{DATABASE_FILENAME}-wal"
@@ -52,15 +61,25 @@ MAX_PROFILE_DOCUMENT_BYTES = 65_536
 MAX_DRAFT_DOCUMENT_BYTES = 1_048_576
 MAX_IDEMPOTENT_RESPONSE_BYTES = 1_048_576
 MAX_RECOVERY_BYTES = 16_777_216
+MAX_LIFECYCLE_REQUEST_BYTES = 1_048_576
+MAX_LIFECYCLE_DOCUMENT_BYTES = 65_536
+MAX_LIFECYCLE_LOG_ENTRY_BYTES = m.MAX_LIFECYCLE_LOG_ENTRY_BYTES
+MAX_LIFECYCLE_LOG_ENTRIES = 4_096
+MAX_LIFECYCLE_LOG_BYTES = 4 * 1_048_576
+MAX_LIFECYCLE_GLOBAL_LOG_BYTES = 32 * 1_048_576
+MAX_LIFECYCLE_AUTHORITY_RECOVERY_BYTES = 32 * 1_048_576
+LIFECYCLE_TERMINAL_RETENTION = timedelta(days=7)
 DEFAULT_MAX_PROFILES = 100
 DEFAULT_MAX_DRAFTS = 100
 DEFAULT_MAX_IDEMPOTENCY_RECORDS = 2_000
 DEFAULT_MAX_MIGRATION_DIAGNOSTICS = 64
+DEFAULT_MAX_LIFECYCLE_OPERATIONS = m.MAX_LIFECYCLE_OPERATION_COUNT
 
 _TIMESTAMP_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$")
 _ETAG_RE = re.compile(r'^"[0-9a-f]{64}"$')
 _DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 _PROFILE_ADAPTER = TypeAdapter(m.RemoteProfileV2)
+_LIFECYCLE_RESOURCE_ADAPTER = TypeAdapter(m.LifecycleResourceRefV2)
 
 
 class ProviderStoreV2Error(RuntimeError):
@@ -105,6 +124,10 @@ class ProviderNotFoundV2(ProviderStoreV2Error):
 
 class ProviderContractV2Error(ProviderStoreV2Error):
     """Caller input is not an exact closed v2 model."""
+
+
+class ProviderCursorExpiredV2(ProviderStoreV2Error):
+    """A signed lifecycle log cursor names data outside the retained window."""
 
 
 class _StrictModel(BaseModel):
@@ -176,6 +199,162 @@ class MigrationDiagnosticV2(_StrictModel):
     source_kind: Literal["store", "profile", "project"]
     source_ref_sha256: m.Digest | None
     created_at: m.UtcTimestamp
+
+
+class LifecycleProfileConnectRequestV2(_StrictModel):
+    request_kind: Literal["profile_connect"]
+    profile_id: m.OpaqueId
+    request: m.ProfileConnectionActionV2
+    resource_generation: int
+    if_match: m.ETag
+
+
+class LifecycleProfileDisconnectRequestV2(_StrictModel):
+    request_kind: Literal["profile_disconnect"]
+    profile_id: m.OpaqueId
+    request: m.ProfileConnectionActionV2
+    resource_generation: int
+    if_match: m.ETag
+
+
+class LifecycleHostKeyReviewRequestV2(_StrictModel):
+    request_kind: Literal["host_key_review"]
+    profile_id: m.OpaqueId
+    request: m.HostKeyReviewRequestV2
+    resource_generation: int
+    if_match: m.ETag
+
+
+class LifecycleNativeWorkspacePrepareRequestV2(_StrictModel):
+    request_kind: Literal["native_workspace_prepare"]
+    native_workspace_id: m.OpaqueId
+    native_journal_sha256: m.Digest
+    display_name: m.DisplayName
+
+
+class LifecycleProjectCreateRequestV2(_StrictModel):
+    request_kind: Literal["project_create"]
+    project_id: m.OpaqueId
+    request: m.ProjectCreateV2
+    resource_generation: int
+
+
+class LifecycleProjectActivateRequestV2(_StrictModel):
+    request_kind: Literal["project_activate"]
+    project_id: m.OpaqueId
+    request: m.ProjectActionV2
+    resource_generation: int
+    if_match: m.ETag
+
+
+LifecycleRequestV2: TypeAlias = Annotated[
+    LifecycleProfileConnectRequestV2
+    | LifecycleProfileDisconnectRequestV2
+    | LifecycleHostKeyReviewRequestV2
+    | LifecycleNativeWorkspacePrepareRequestV2
+    | LifecycleProjectCreateRequestV2
+    | LifecycleProjectActivateRequestV2,
+    Field(discriminator="request_kind"),
+]
+
+
+class LifecycleOperationReservationV2(_StrictModel):
+    kind: m.LifecycleOperationKindV2
+    resource: m.LifecycleResourceRefV2
+    request: LifecycleRequestV2
+
+    @model_validator(mode="after")
+    def _bind_request_identity(self) -> LifecycleOperationReservationV2:
+        if self.kind != self.request.request_kind:
+            raise ValueError("lifecycle reservation kind differs from its request")
+        if self.resource.resource_kind == "profile":
+            request_id = getattr(self.request, "profile_id", None)
+        elif self.resource.resource_kind == "project":
+            request_id = getattr(self.request, "project_id", None)
+        else:
+            request_id = getattr(self.request, "native_workspace_id", None)
+        if request_id != self.resource.resource_id:
+            raise ValueError("lifecycle request belongs to another resource")
+        expected_resource_kind = {
+            "profile_connect": "profile",
+            "profile_disconnect": "profile",
+            "host_key_review": "profile",
+            "native_workspace_prepare": "native_workspace",
+            "project_create": "project",
+            "project_activate": "project",
+        }[self.kind]
+        if self.resource.resource_kind != expected_resource_kind:
+            raise ValueError("lifecycle operation kind and resource kind differ")
+        generation = getattr(self.request, "resource_generation", None)
+        if generation is not None and (
+            type(generation) is not int or not 0 <= generation <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+        ):
+            raise ValueError("lifecycle request generation is outside bounds")
+        if isinstance(self.request, LifecycleProjectCreateRequestV2):
+            if (
+                self.request.request.profile_connection_generation
+                != self.request.resource_generation
+            ):
+                raise ValueError("project create generations differ")
+        return self
+
+
+class LifecycleOperationWorkV2(_StrictModel):
+    operation: m.LifecycleOperationV2
+    request: LifecycleRequestV2
+    cancellation_requested: bool
+
+
+class LifecycleOperationAdvanceV2(_StrictModel):
+    operation_id: m.OpaqueId
+    expected_etag: m.ETag
+    phase: m.LifecyclePhaseV2
+    progress: m.LifecycleProgressV2 | None
+    cancellable: bool
+
+
+class LifecycleLogAppendV2(_StrictModel):
+    operation_id: m.OpaqueId
+    source: Literal[
+        "desktop",
+        "ssh_stdout",
+        "ssh_stderr",
+        "daemon_stdout",
+        "daemon_stderr",
+    ]
+    text: str
+    truncated: bool
+
+    @model_validator(mode="after")
+    def _bounded_input(self) -> LifecycleLogAppendV2:
+        if not self.text or len(self.text.encode("utf-8")) > MAX_LIFECYCLE_REQUEST_BYTES:
+            raise ValueError("lifecycle log append input is outside its byte bound")
+        return self
+
+
+class LifecycleOperationCompletionV2(_StrictModel):
+    operation_id: m.OpaqueId
+    expected_etag: m.ETag
+    status: Literal["succeeded", "failed", "cancelled"]
+    result: m.LifecycleResultV2 | None
+    failure: m.DesktopErrorV2 | None
+
+    @model_validator(mode="after")
+    def _terminal_shape(self) -> LifecycleOperationCompletionV2:
+        if self.status == "succeeded":
+            if self.result is None or self.failure is not None:
+                raise ValueError("successful lifecycle completion requires only a result")
+        elif self.status == "failed":
+            if self.failure is None or self.result is not None:
+                raise ValueError("failed lifecycle completion requires only a failure")
+        elif self.result is not None or self.failure is not None:
+            raise ValueError("cancelled lifecycle completion has no result or failure")
+        return self
+
+
+_LIFECYCLE_REQUEST_ADAPTER = TypeAdapter(LifecycleRequestV2)
+_LIFECYCLE_PROGRESS_ADAPTER = TypeAdapter(m.LifecycleProgressV2 | None)
+_LIFECYCLE_RESULT_ADAPTER = TypeAdapter(m.LifecycleResultV2 | None)
 
 
 _SCHEMA_V1_STATEMENTS = (
@@ -290,6 +469,175 @@ _SCHEMA_V2_ADDITIONS = (
     """,
 )
 
+_SCHEMA_V3_ADDITIONS = (
+    "ALTER TABLE schema_metadata RENAME TO schema_metadata_before_v3",
+    """
+    CREATE TABLE schema_metadata (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        namespace TEXT NOT NULL CHECK (namespace = 'openevo.desktop.provider.v2'),
+        schema_version INTEGER NOT NULL CHECK (schema_version BETWEEN 1 AND 3),
+        schema_sha256 TEXT NOT NULL CHECK (length(schema_sha256) = 64),
+        created_at TEXT NOT NULL CHECK (length(CAST(created_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    """
+    INSERT INTO schema_metadata(singleton, namespace, schema_version, schema_sha256, created_at)
+    SELECT singleton, namespace, schema_version, schema_sha256, created_at
+    FROM schema_metadata_before_v3
+    """,
+    "DROP TABLE schema_metadata_before_v3",
+    "ALTER TABLE schema_migrations RENAME TO schema_migrations_before_v3",
+    """
+    CREATE TABLE schema_migrations (
+        version INTEGER PRIMARY KEY CHECK (version BETWEEN 1 AND 3),
+        applied_at TEXT NOT NULL CHECK (length(CAST(applied_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+    """
+    INSERT INTO schema_migrations(version, applied_at)
+    SELECT version, applied_at FROM schema_migrations_before_v3
+    """,
+    "DROP TABLE schema_migrations_before_v3",
+    f"""
+    CREATE TABLE lifecycle_operations (
+        operation_id TEXT PRIMARY KEY
+            CHECK (length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 128),
+        kind TEXT NOT NULL CHECK (kind IN (
+            'profile_connect', 'profile_disconnect', 'host_key_review',
+            'native_workspace_prepare', 'project_create', 'project_activate'
+        )),
+        resource_kind TEXT NOT NULL
+            CHECK (resource_kind IN ('profile', 'native_workspace', 'project')),
+        resource_id TEXT NOT NULL
+            CHECK (length(CAST(resource_id AS BLOB)) BETWEEN 1 AND 128),
+        request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+        request_json BLOB NOT NULL
+            CHECK (length(request_json) BETWEEN 2 AND {MAX_LIFECYCLE_REQUEST_BYTES}),
+        phase_plan_json BLOB NOT NULL
+            CHECK (length(phase_plan_json) BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}),
+        status TEXT NOT NULL
+            CHECK (status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+        phase TEXT NOT NULL CHECK (phase IN (
+            'validation', 'queued', 'resolving_system_openssh', 'connecting',
+            'waiting_for_user', 'remote_preflight', 'transferring', 'verifying',
+            'starting_daemon', 'waiting_for_daemon', 'opening_project_tunnel',
+            'negotiating_core', 'preparing_native_workspace',
+            'creating_remote_project', 'verifying_project', 'activating', 'finalizing'
+        )),
+        phase_index INTEGER NOT NULL CHECK (phase_index BETWEEN 0 AND 16),
+        phase_total INTEGER NOT NULL CHECK (phase_total = 17),
+        progress_json BLOB NOT NULL
+            CHECK (length(progress_json) BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}),
+        cancellable INTEGER NOT NULL CHECK (cancellable IN (0, 1)),
+        result_json BLOB
+            CHECK (result_json IS NULL OR length(result_json) BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}),
+        failure_json BLOB
+            CHECK (failure_json IS NULL OR length(failure_json) BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}),
+        log_sequence_high_watermark INTEGER NOT NULL
+            CHECK (log_sequence_high_watermark BETWEEN 0 AND 9007199254740991),
+        dropped_before_sequence INTEGER NOT NULL
+            CHECK (dropped_before_sequence BETWEEN 0 AND log_sequence_high_watermark),
+        log_byte_count INTEGER NOT NULL CHECK (log_byte_count >= 0),
+        cancellation_requested INTEGER NOT NULL CHECK (cancellation_requested IN (0, 1)),
+        resource_version INTEGER NOT NULL
+            CHECK (resource_version BETWEEN 1 AND 9007199254740991),
+        created_at TEXT NOT NULL CHECK (length(CAST(created_at AS BLOB)) = 27),
+        started_at TEXT CHECK (
+            started_at IS NULL OR length(CAST(started_at AS BLOB)) = 27
+        ),
+        updated_at TEXT NOT NULL CHECK (length(CAST(updated_at AS BLOB)) = 27),
+        finished_at TEXT CHECK (
+            finished_at IS NULL OR length(CAST(finished_at AS BLOB)) = 27
+        ),
+        etag TEXT NOT NULL CHECK (
+            length(CAST(etag AS BLOB)) = 66 AND substr(etag, 1, 1) = '"' AND
+            substr(etag, 66, 1) = '"'
+        ),
+        CHECK (
+            (status = 'failed' AND failure_json IS NOT NULL AND result_json IS NULL) OR
+            (status = 'succeeded' AND result_json IS NOT NULL AND failure_json IS NULL) OR
+            (status IN ('queued', 'running', 'cancelled') AND
+             result_json IS NULL AND failure_json IS NULL)
+        ),
+        CHECK ((status IN ('succeeded', 'failed', 'cancelled')) = (finished_at IS NOT NULL)),
+        CHECK (status NOT IN ('succeeded', 'failed', 'cancelled') OR cancellable = 0)
+    ) STRICT
+    """,
+    """
+    CREATE INDEX lifecycle_operations_pending_idx
+    ON lifecycle_operations(status, created_at, operation_id)
+    """,
+    f"""
+    CREATE TABLE lifecycle_operation_logs (
+        operation_id TEXT NOT NULL,
+        sequence INTEGER NOT NULL CHECK (sequence BETWEEN 1 AND 9007199254740991),
+        occurred_at TEXT NOT NULL CHECK (length(CAST(occurred_at AS BLOB)) = 27),
+        source TEXT NOT NULL CHECK (source IN (
+            'desktop', 'ssh_stdout', 'ssh_stderr', 'daemon_stdout', 'daemon_stderr'
+        )),
+        text BLOB NOT NULL CHECK (length(text) BETWEEN 1 AND {MAX_LIFECYCLE_LOG_ENTRY_BYTES}),
+        text_bytes INTEGER NOT NULL CHECK (
+            text_bytes BETWEEN 1 AND {MAX_LIFECYCLE_LOG_ENTRY_BYTES} AND
+            text_bytes = length(text)
+        ),
+        truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+        PRIMARY KEY (operation_id, sequence),
+        FOREIGN KEY (operation_id) REFERENCES lifecycle_operations(operation_id)
+            ON DELETE CASCADE
+    ) STRICT
+    """,
+    """
+    CREATE INDEX lifecycle_operation_logs_time_idx
+    ON lifecycle_operation_logs(occurred_at, operation_id, sequence)
+    """,
+    """
+    CREATE TABLE lifecycle_idempotency_records (
+        principal TEXT NOT NULL CHECK (principal = 'desktop-local-v2'),
+        action TEXT NOT NULL CHECK (action IN ('reserve', 'cancel')),
+        resource_scope TEXT NOT NULL
+            CHECK (length(CAST(resource_scope AS BLOB)) BETWEEN 1 AND 128),
+        idempotency_key TEXT NOT NULL
+            CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
+        request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+        operation_id TEXT NOT NULL,
+        created_at TEXT NOT NULL CHECK (length(CAST(created_at AS BLOB)) = 27),
+        PRIMARY KEY (principal, action, resource_scope, idempotency_key),
+        FOREIGN KEY (operation_id) REFERENCES lifecycle_operations(operation_id)
+            ON DELETE CASCADE
+    ) STRICT
+    """,
+    """
+    CREATE UNIQUE INDEX lifecycle_reservation_operation_idx
+    ON lifecycle_idempotency_records(operation_id)
+    WHERE action = 'reserve'
+    """,
+    """
+    CREATE TABLE lifecycle_reconciliation_acknowledgements (
+        operation_id TEXT PRIMARY KEY,
+        terminal_status TEXT NOT NULL
+            CHECK (terminal_status IN ('succeeded', 'failed', 'cancelled')),
+        terminal_etag TEXT NOT NULL CHECK (length(CAST(terminal_etag AS BLOB)) = 66),
+        request_sha256 TEXT NOT NULL CHECK (length(request_sha256) = 64),
+        idempotency_key TEXT NOT NULL
+            CHECK (length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256),
+        acknowledged_at TEXT NOT NULL CHECK (length(CAST(acknowledged_at AS BLOB)) = 27),
+        FOREIGN KEY (operation_id) REFERENCES lifecycle_operations(operation_id)
+            ON DELETE CASCADE
+    ) STRICT
+    """,
+    """
+    CREATE INDEX lifecycle_acknowledgements_time_idx
+    ON lifecycle_reconciliation_acknowledgements(acknowledged_at, operation_id)
+    """,
+    """
+    CREATE TABLE lifecycle_cursor_key (
+        singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+        cursor_key BLOB NOT NULL CHECK (length(cursor_key) = 32),
+        created_at TEXT NOT NULL CHECK (length(CAST(created_at AS BLOB)) = 27)
+    ) STRICT
+    """,
+)
+
 
 def _canonical_json_bytes(value: object) -> bytes:
     if isinstance(value, BaseModel):
@@ -351,11 +699,16 @@ _EXPECTED_SCHEMA_V1_ROWS, _COMPUTED_SCHEMA_V1_SHA256 = _expected_schema(_SCHEMA_
 _EXPECTED_SCHEMA_V2_ROWS, _COMPUTED_SCHEMA_V2_SHA256 = _expected_schema(
     (*_SCHEMA_V1_STATEMENTS, *_SCHEMA_V2_ADDITIONS)
 )
+_EXPECTED_SCHEMA_V3_ROWS, _COMPUTED_SCHEMA_V3_SHA256 = _expected_schema(
+    (*_SCHEMA_V1_STATEMENTS, *_SCHEMA_V2_ADDITIONS, *_SCHEMA_V3_ADDITIONS)
+)
 EXPECTED_SCHEMA_V1_SHA256 = "d2ae490ad5b98ca03548570a8d56a6a5ea349694ed647102a69eb5b69e3dac34"
 EXPECTED_SCHEMA_V2_SHA256 = "7314032a52da83b70a43f36f161984bef8bf03274848bf62ab1963a039279c06"
+EXPECTED_SCHEMA_V3_SHA256 = "fa2284e9374ed21bdeaa318565c81692314430ce9a1bd43251bccb886c31c5c6"
 if (
     _COMPUTED_SCHEMA_V1_SHA256 != EXPECTED_SCHEMA_V1_SHA256
     or _COMPUTED_SCHEMA_V2_SHA256 != EXPECTED_SCHEMA_V2_SHA256
+    or _COMPUTED_SCHEMA_V3_SHA256 != EXPECTED_SCHEMA_V3_SHA256
 ):
     raise RuntimeError("Desktop provider v2 schema changed without a migration")
 
@@ -392,6 +745,46 @@ _IDEMPOTENCY_SELECT_COLUMNS = f"""
     length(CAST(response_json AS BLOB)) AS response_json_bytes,
     created_at
 """
+_LIFECYCLE_OPERATION_SELECT_COLUMNS = f"""
+    rowid, operation_id, kind, resource_kind, resource_id, request_sha256,
+    CASE WHEN length(CAST(request_json AS BLOB))
+                   BETWEEN 2 AND {MAX_LIFECYCLE_REQUEST_BYTES}
+         THEN request_json END AS request_json,
+    length(CAST(request_json AS BLOB)) AS request_json_bytes,
+    CASE WHEN length(CAST(phase_plan_json AS BLOB))
+                   BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}
+         THEN phase_plan_json END AS phase_plan_json,
+    length(CAST(phase_plan_json AS BLOB)) AS phase_plan_json_bytes,
+    status, phase, phase_index, phase_total,
+    CASE WHEN length(CAST(progress_json AS BLOB))
+                   BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}
+         THEN progress_json END AS progress_json,
+    length(CAST(progress_json AS BLOB)) AS progress_json_bytes,
+    cancellable,
+    CASE WHEN result_json IS NULL THEN NULL
+         WHEN length(CAST(result_json AS BLOB))
+                   BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}
+         THEN result_json END AS result_json,
+    CASE WHEN result_json IS NULL THEN 0
+         ELSE length(CAST(result_json AS BLOB)) END AS result_json_bytes,
+    CASE WHEN failure_json IS NULL THEN NULL
+         WHEN length(CAST(failure_json AS BLOB))
+                   BETWEEN 2 AND {MAX_LIFECYCLE_DOCUMENT_BYTES}
+         THEN failure_json END AS failure_json,
+    CASE WHEN failure_json IS NULL THEN 0
+         ELSE length(CAST(failure_json AS BLOB)) END AS failure_json_bytes,
+    log_sequence_high_watermark, dropped_before_sequence, log_byte_count,
+    cancellation_requested, resource_version, created_at, started_at,
+    updated_at, finished_at, etag
+"""
+_LIFECYCLE_LOG_SELECT_COLUMNS = f"""
+    operation_id, sequence, occurred_at, source,
+    CASE WHEN length(CAST(text AS BLOB))
+                   BETWEEN 1 AND {MAX_LIFECYCLE_LOG_ENTRY_BYTES}
+         THEN text END AS text,
+    length(CAST(text AS BLOB)) AS text_bytes_actual,
+    text_bytes, truncated
+"""
 
 
 def _migration_checkpoint(_stage: str) -> None:
@@ -400,6 +793,10 @@ def _migration_checkpoint(_stage: str) -> None:
 
 def _post_commit_checkpoint(_operation: str) -> None:
     """Private process-loss boundary after an authoritative commit."""
+
+
+def _lifecycle_reservation_checkpoint(_stage: str) -> None:
+    """Private crash-injection boundary for atomic lifecycle reservation tests."""
 
 
 _ModelT = TypeVar("_ModelT", bound=BaseModel)
@@ -417,6 +814,10 @@ class DesktopProviderStoreV2:
         max_drafts: int = DEFAULT_MAX_DRAFTS,
         max_idempotency_records: int = DEFAULT_MAX_IDEMPOTENCY_RECORDS,
         max_migration_diagnostics: int = DEFAULT_MAX_MIGRATION_DIAGNOSTICS,
+        max_lifecycle_operations: int = DEFAULT_MAX_LIFECYCLE_OPERATIONS,
+        max_lifecycle_log_entries: int = MAX_LIFECYCLE_LOG_ENTRIES,
+        max_lifecycle_log_bytes: int = MAX_LIFECYCLE_LOG_BYTES,
+        max_lifecycle_global_log_bytes: int = MAX_LIFECYCLE_GLOBAL_LOG_BYTES,
     ) -> None:
         self._require_secure_platform()
         for label, value in (
@@ -424,17 +825,35 @@ class DesktopProviderStoreV2:
             ("max_drafts", max_drafts),
             ("max_idempotency_records", max_idempotency_records),
             ("max_migration_diagnostics", max_migration_diagnostics),
+            ("max_lifecycle_operations", max_lifecycle_operations),
+            ("max_lifecycle_log_entries", max_lifecycle_log_entries),
+            ("max_lifecycle_log_bytes", max_lifecycle_log_bytes),
+            ("max_lifecycle_global_log_bytes", max_lifecycle_global_log_bytes),
         ):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{label} must be a positive integer")
         if max_profiles > DEFAULT_MAX_PROFILES:
             raise ValueError("max_profiles exceeds the public v2 profile bound")
+        if max_lifecycle_operations > DEFAULT_MAX_LIFECYCLE_OPERATIONS:
+            raise ValueError("max_lifecycle_operations exceeds the public v2 bound")
+        if max_lifecycle_log_entries > MAX_LIFECYCLE_LOG_ENTRIES:
+            raise ValueError("max_lifecycle_log_entries exceeds the public v2 bound")
+        if max_lifecycle_log_bytes > MAX_LIFECYCLE_LOG_BYTES:
+            raise ValueError("max_lifecycle_log_bytes exceeds the public v2 bound")
+        if max_lifecycle_global_log_bytes > MAX_LIFECYCLE_GLOBAL_LOG_BYTES:
+            raise ValueError("max_lifecycle_global_log_bytes exceeds the public v2 bound")
+        if max_lifecycle_global_log_bytes < max_lifecycle_log_bytes:
+            raise ValueError("global lifecycle log capacity is below per-operation capacity")
 
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._max_profiles = max_profiles
         self._max_drafts = max_drafts
         self._max_idempotency_records = max_idempotency_records
         self._max_migration_diagnostics = max_migration_diagnostics
+        self._max_lifecycle_operations = max_lifecycle_operations
+        self._max_lifecycle_log_entries = max_lifecycle_log_entries
+        self._max_lifecycle_log_bytes = max_lifecycle_log_bytes
+        self._max_lifecycle_global_log_bytes = max_lifecycle_global_log_bytes
         self._closed = False
         self._lock = threading.RLock()
         root = Path(os.path.abspath(os.fspath(Path(state_root).expanduser())))
@@ -472,7 +891,7 @@ class DesktopProviderStoreV2:
 
     @property
     def schema_fingerprint(self) -> str:
-        return EXPECTED_SCHEMA_V2_SHA256
+        return EXPECTED_SCHEMA_V3_SHA256
 
     def close(self) -> None:
         with self._lock:
@@ -493,6 +912,619 @@ class DesktopProviderStoreV2:
                 self.close()
             except OSError:
                 pass
+
+    def reserve_lifecycle_operation(
+        self,
+        request: LifecycleOperationReservationV2 | Mapping[str, object],
+        *,
+        idempotency_key: str,
+    ) -> m.LifecycleOperationV2:
+        """Atomically reserve one closed long operation and its local authority."""
+
+        validated = self._validate_model(LifecycleOperationReservationV2, request)
+        self._validate_idempotency_key(idempotency_key)
+        request_document = _canonical_json_bytes(validated.request)
+        if len(request_document) > MAX_LIFECYCLE_REQUEST_BYTES:
+            raise ProviderCapacityV2Error("lifecycle request exceeds its byte bound")
+        request_sha256 = hashlib.sha256(_canonical_json_bytes(validated)).hexdigest()
+        resource_scope = "lifecycle_operations"
+        with self._transaction(
+            write=True,
+            operation="reserveLifecycleOperationV2",
+        ) as connection:
+            replay = connection.execute(
+                """
+                SELECT request_sha256, operation_id
+                FROM lifecycle_idempotency_records
+                WHERE principal = ? AND action = 'reserve'
+                  AND resource_scope = ? AND idempotency_key = ?
+                """,
+                (LOCAL_PRINCIPAL, resource_scope, idempotency_key),
+            ).fetchone()
+            if replay is not None:
+                if not hmac.compare_digest(replay["request_sha256"], request_sha256):
+                    raise ProviderIdempotencyConflictV2(
+                        "lifecycle idempotency key was reused for another request"
+                    )
+                return self._lifecycle_operation_from_row(
+                    self._require_lifecycle_operation_row(
+                        connection,
+                        cast(str, replay["operation_id"]),
+                    )
+                )
+
+            recoverable_count = cast(
+                int,
+                connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM lifecycle_operations AS operation
+                    LEFT JOIN lifecycle_reconciliation_acknowledgements AS acknowledgement
+                      ON acknowledgement.operation_id = operation.operation_id
+                    WHERE operation.status IN ('queued', 'running')
+                       OR acknowledgement.operation_id IS NULL
+                    """
+                ).fetchone()[0],
+            )
+            if recoverable_count >= self._max_lifecycle_operations:
+                raise ProviderCapacityV2Error("lifecycle operation capacity is full")
+
+            if validated.kind in {
+                "profile_connect",
+                "profile_disconnect",
+                "host_key_review",
+            }:
+                self._transition_profile_for_lifecycle(connection, validated.request)
+                _lifecycle_reservation_checkpoint("after_profile_transition")
+
+            operation_id = self._new_id("operation")
+            timestamp = self._timestamp()
+            version = 1
+            etag = self._etag("lifecycle_operation", operation_id, version)
+            phase_plan = _canonical_json_bytes(list(m.LIFECYCLE_PHASES))
+            progress = _canonical_json_bytes({"kind": "indeterminate"})
+            connection.execute(
+                """
+                INSERT INTO lifecycle_operations(
+                    operation_id, kind, resource_kind, resource_id,
+                    request_sha256, request_json, phase_plan_json,
+                    status, phase, phase_index, phase_total, progress_json,
+                    cancellable, result_json, failure_json,
+                    log_sequence_high_watermark, dropped_before_sequence,
+                    log_byte_count, cancellation_requested, resource_version,
+                    created_at, started_at, updated_at, finished_at, etag
+                ) VALUES (
+                    ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', 1, 17, ?,
+                    1, NULL, NULL, 0, 0, 0, 0, ?, ?, NULL, ?, NULL, ?
+                )
+                """,
+                (
+                    operation_id,
+                    validated.kind,
+                    validated.resource.resource_kind,
+                    validated.resource.resource_id,
+                    request_sha256,
+                    request_document,
+                    phase_plan,
+                    progress,
+                    version,
+                    timestamp,
+                    timestamp,
+                    etag,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO lifecycle_idempotency_records(
+                    principal, action, resource_scope, idempotency_key,
+                    request_sha256, operation_id, created_at
+                ) VALUES (?, 'reserve', ?, ?, ?, ?, ?)
+                """,
+                (
+                    LOCAL_PRINCIPAL,
+                    resource_scope,
+                    idempotency_key,
+                    request_sha256,
+                    operation_id,
+                    timestamp,
+                ),
+            )
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(connection, operation_id)
+            )
+
+    def get_lifecycle_operation(self, operation_id: str) -> m.LifecycleOperationV2:
+        self._validate_profile_id(operation_id)
+        with self._transaction(write=False, operation="getLifecycleOperationV2") as connection:
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(connection, operation_id)
+            )
+
+    def list_pending_lifecycle_operations(
+        self,
+    ) -> tuple[m.LifecycleOperationRefV2, ...]:
+        with self._transaction(
+            write=False,
+            operation="listPendingLifecycleOperationsV2",
+        ) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+                FROM lifecycle_operations AS operation
+                WHERE operation.status IN ('queued', 'running')
+                   OR NOT EXISTS (
+                       SELECT 1
+                       FROM lifecycle_reconciliation_acknowledgements AS acknowledgement
+                       WHERE acknowledgement.operation_id = operation.operation_id
+                   )
+                ORDER BY operation.created_at, operation.operation_id
+                """
+            ).fetchall()
+            if len(rows) > self._max_lifecycle_operations:
+                raise ProviderCapacityConfigurationV2Error(
+                    "persisted lifecycle operations exceed configured capacity"
+                )
+            return tuple(
+                m.LifecycleOperationRefV2.from_operation(
+                    self._lifecycle_operation_from_row(cast(sqlite3.Row, row))
+                )
+                for row in rows
+            )
+
+    def claim_next_lifecycle_operation(self) -> LifecycleOperationWorkV2 | None:
+        with self._transaction(
+            write=True,
+            operation="claimLifecycleOperationV2",
+        ) as connection:
+            row = connection.execute(
+                f"""
+                SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+                FROM lifecycle_operations
+                WHERE status = 'running'
+                ORDER BY created_at, operation_id
+                LIMIT 1
+                """
+            ).fetchone()
+            if row is None:
+                row = connection.execute(
+                    f"""
+                    SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+                    FROM lifecycle_operations
+                    WHERE status = 'queued'
+                    ORDER BY created_at, operation_id
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    return None
+                typed_row = cast(sqlite3.Row, row)
+                version = self._next_lifecycle_version(typed_row)
+                timestamp = self._timestamp()
+                etag = self._etag(
+                    "lifecycle_operation",
+                    cast(str, typed_row["operation_id"]),
+                    version,
+                )
+                connection.execute(
+                    """
+                    UPDATE lifecycle_operations
+                    SET status = 'running', started_at = ?, updated_at = ?,
+                        resource_version = ?, etag = ?
+                    WHERE operation_id = ?
+                    """,
+                    (
+                        timestamp,
+                        timestamp,
+                        version,
+                        etag,
+                        typed_row["operation_id"],
+                    ),
+                )
+                row = self._require_lifecycle_operation_row(
+                    connection,
+                    cast(str, typed_row["operation_id"]),
+                )
+            return self._lifecycle_work_from_row(cast(sqlite3.Row, row))
+
+    def advance_lifecycle_operation(
+        self,
+        update: LifecycleOperationAdvanceV2 | Mapping[str, object],
+    ) -> m.LifecycleOperationV2:
+        validated = self._validate_model(LifecycleOperationAdvanceV2, update)
+        with self._transaction(
+            write=True,
+            operation="advanceLifecycleOperationV2",
+        ) as connection:
+            row = self._require_lifecycle_operation_row(connection, validated.operation_id)
+            current = self._lifecycle_operation_from_row(row)
+            if (
+                current.phase == validated.phase
+                and current.progress == validated.progress
+                and current.cancellable == validated.cancellable
+            ):
+                return current
+            if current.status != "running":
+                raise ProviderConflictV2("only a running lifecycle operation can advance")
+            if not hmac.compare_digest(current.etag, validated.expected_etag):
+                raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
+            next_phase_index = m.LIFECYCLE_PHASES.index(validated.phase)
+            if next_phase_index < current.phase_index:
+                raise ProviderPreconditionFailedV2("lifecycle phase cannot regress")
+            self._validate_lifecycle_progress_advance(
+                current=current.progress,
+                updated=validated.progress,
+                same_phase=next_phase_index == current.phase_index,
+            )
+            version = self._next_lifecycle_version(row)
+            timestamp = self._timestamp()
+            etag = self._etag("lifecycle_operation", current.operation_id, version)
+            connection.execute(
+                """
+                UPDATE lifecycle_operations
+                SET phase = ?, phase_index = ?, progress_json = ?, cancellable = ?,
+                    updated_at = ?, resource_version = ?, etag = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    validated.phase,
+                    next_phase_index,
+                    _canonical_json_bytes(validated.progress),
+                    int(validated.cancellable),
+                    timestamp,
+                    version,
+                    etag,
+                    current.operation_id,
+                ),
+            )
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(connection, current.operation_id)
+            )
+
+    def append_lifecycle_log(
+        self,
+        entry: LifecycleLogAppendV2 | Mapping[str, object],
+    ) -> m.LifecycleOperationV2:
+        validated = self._validate_model(LifecycleLogAppendV2, entry)
+        safe_text, truncated = self._truncate_lifecycle_log_text(
+            validated.text,
+            already_truncated=validated.truncated,
+        )
+        with self._transaction(write=True, operation="appendLifecycleLogV2") as connection:
+            row = self._require_lifecycle_operation_row(connection, validated.operation_id)
+            current = self._lifecycle_operation_from_row(row)
+            if current.status in {"succeeded", "failed", "cancelled"}:
+                raise ProviderConflictV2("terminal lifecycle operation logs are immutable")
+            sequence = current.log_sequence_high_watermark + 1
+            occurred_at = self._timestamp()
+            try:
+                public_entry = m.LifecycleLogEntryV2(
+                    operation_id=current.operation_id,
+                    sequence=sequence,
+                    occurred_at=occurred_at,
+                    source=validated.source,
+                    text=safe_text,
+                    truncated=truncated,
+                )
+            except ValidationError as exc:
+                raise ProviderContractV2Error("lifecycle log entry is unsafe") from exc
+            text_bytes = public_entry.text.encode("utf-8")
+            connection.execute(
+                """
+                INSERT INTO lifecycle_operation_logs(
+                    operation_id, sequence, occurred_at, source,
+                    text, text_bytes, truncated
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    public_entry.operation_id,
+                    public_entry.sequence,
+                    public_entry.occurred_at,
+                    public_entry.source,
+                    text_bytes,
+                    len(text_bytes),
+                    int(public_entry.truncated),
+                ),
+            )
+            version = self._next_lifecycle_version(row)
+            etag = self._etag("lifecycle_operation", current.operation_id, version)
+            connection.execute(
+                """
+                UPDATE lifecycle_operations
+                SET log_sequence_high_watermark = ?, log_byte_count = log_byte_count + ?,
+                    updated_at = ?, resource_version = ?, etag = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    sequence,
+                    len(text_bytes),
+                    occurred_at,
+                    version,
+                    etag,
+                    current.operation_id,
+                ),
+            )
+            self._enforce_lifecycle_log_budgets(connection, current.operation_id)
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(connection, current.operation_id)
+            )
+
+    def read_lifecycle_logs(
+        self,
+        operation_id: str,
+        *,
+        limit: int,
+        after: str | None,
+    ) -> m.LifecycleLogPageV2:
+        self._validate_profile_id(operation_id)
+        if type(limit) is not int or not 1 <= limit <= m.MAX_LIFECYCLE_LOG_PAGE_ENTRIES:
+            raise ProviderContractV2Error("lifecycle log page limit is invalid")
+        with self._transaction(write=False, operation="readLifecycleLogsV2") as connection:
+            operation_row = self._require_lifecycle_operation_row(connection, operation_id)
+            dropped_before = cast(int, operation_row["dropped_before_sequence"])
+            next_sequence = dropped_before + 1
+            if after is not None:
+                cursor = self._decode_lifecycle_cursor(connection, after)
+                if cursor["operation_id"] != operation_id:
+                    raise ProviderContractV2Error("lifecycle cursor belongs to another operation")
+                cursor_dropped = cast(int, cursor["dropped_before_sequence"])
+                if cursor_dropped > dropped_before:
+                    raise ProviderContractV2Error("lifecycle cursor has an invalid boundary")
+                next_sequence = cast(int, cursor["next_sequence"])
+                if next_sequence <= dropped_before:
+                    raise ProviderCursorExpiredV2("lifecycle log cursor was evicted")
+            rows = connection.execute(
+                f"""
+                SELECT {_LIFECYCLE_LOG_SELECT_COLUMNS}
+                FROM lifecycle_operation_logs
+                WHERE operation_id = ? AND sequence >= ?
+                ORDER BY sequence
+                LIMIT ?
+                """,
+                (operation_id, next_sequence, limit + 1),
+            ).fetchall()
+            has_more = len(rows) > limit
+            visible = rows[:limit]
+            items = [self._lifecycle_log_from_row(cast(sqlite3.Row, row)) for row in visible]
+            next_cursor = None
+            if has_more and items:
+                next_cursor = self._encode_lifecycle_cursor(
+                    connection,
+                    operation_id=operation_id,
+                    next_sequence=items[-1].sequence + 1,
+                    dropped_before_sequence=dropped_before,
+                )
+            return m.LifecycleLogPageV2(
+                operation_id=operation_id,
+                dropped_before_sequence=dropped_before,
+                items=items,
+                next_cursor=next_cursor,
+                has_more=has_more,
+            )
+
+    def request_lifecycle_cancellation(
+        self,
+        operation_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> m.LifecycleOperationV2:
+        self._validate_profile_id(operation_id)
+        self._validate_etag(if_match)
+        self._validate_idempotency_key(idempotency_key)
+        request_sha256 = hashlib.sha256(
+            _canonical_json_bytes({"operation_id": operation_id, "if_match": if_match})
+        ).hexdigest()
+        with self._transaction(
+            write=True,
+            operation="cancelLifecycleOperationV2",
+        ) as connection:
+            replay = connection.execute(
+                """
+                SELECT request_sha256, operation_id
+                FROM lifecycle_idempotency_records
+                WHERE principal = ? AND action = 'cancel'
+                  AND resource_scope = ? AND idempotency_key = ?
+                """,
+                (LOCAL_PRINCIPAL, operation_id, idempotency_key),
+            ).fetchone()
+            if replay is not None:
+                if not hmac.compare_digest(replay["request_sha256"], request_sha256):
+                    raise ProviderIdempotencyConflictV2("lifecycle cancellation key was reused")
+                return self._lifecycle_operation_from_row(
+                    self._require_lifecycle_operation_row(connection, operation_id)
+                )
+            row = self._require_lifecycle_operation_row(connection, operation_id)
+            current = self._lifecycle_operation_from_row(row)
+            if not hmac.compare_digest(current.etag, if_match):
+                raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
+            if current.status in {"succeeded", "failed", "cancelled"}:
+                raise ProviderConflictV2("terminal lifecycle operation cannot be cancelled")
+            version = self._next_lifecycle_version(row)
+            timestamp = self._timestamp()
+            etag = self._etag("lifecycle_operation", operation_id, version)
+            if current.status == "queued":
+                connection.execute(
+                    """
+                    UPDATE lifecycle_operations
+                    SET status = 'cancelled', cancellable = 0,
+                        cancellation_requested = 1, updated_at = ?, finished_at = ?,
+                        resource_version = ?, etag = ?
+                    WHERE operation_id = ?
+                    """,
+                    (timestamp, timestamp, version, etag, operation_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE lifecycle_operations
+                    SET cancellable = 0, cancellation_requested = 1,
+                        updated_at = ?, resource_version = ?, etag = ?
+                    WHERE operation_id = ?
+                    """,
+                    (timestamp, version, etag, operation_id),
+                )
+            connection.execute(
+                """
+                INSERT INTO lifecycle_idempotency_records(
+                    principal, action, resource_scope, idempotency_key,
+                    request_sha256, operation_id, created_at
+                ) VALUES (?, 'cancel', ?, ?, ?, ?, ?)
+                """,
+                (
+                    LOCAL_PRINCIPAL,
+                    operation_id,
+                    idempotency_key,
+                    request_sha256,
+                    operation_id,
+                    timestamp,
+                ),
+            )
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(connection, operation_id)
+            )
+
+    def finish_lifecycle_operation(
+        self,
+        completion: LifecycleOperationCompletionV2 | Mapping[str, object],
+    ) -> m.LifecycleOperationV2:
+        validated = self._validate_model(LifecycleOperationCompletionV2, completion)
+        with self._transaction(write=True, operation="finishLifecycleOperationV2") as connection:
+            row = self._require_lifecycle_operation_row(connection, validated.operation_id)
+            current = self._lifecycle_operation_from_row(row)
+            if current.status in {"succeeded", "failed", "cancelled"}:
+                if (
+                    current.status == validated.status
+                    and current.result == validated.result
+                    and current.failure == validated.failure
+                ):
+                    return current
+                raise ProviderConflictV2("terminal lifecycle operation is immutable")
+            if not hmac.compare_digest(current.etag, validated.expected_etag):
+                raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
+            if current.status != "running":
+                raise ProviderConflictV2("only a running lifecycle operation can finish")
+            version = self._next_lifecycle_version(row)
+            timestamp = self._timestamp()
+            phase = "finalizing" if validated.status == "succeeded" else current.phase
+            phase_index = 16 if validated.status == "succeeded" else current.phase_index
+            result_json = (
+                _canonical_json_bytes(validated.result) if validated.result is not None else None
+            )
+            failure_json = (
+                _canonical_json_bytes(validated.failure) if validated.failure is not None else None
+            )
+            etag = self._etag("lifecycle_operation", current.operation_id, version)
+            connection.execute(
+                """
+                UPDATE lifecycle_operations
+                SET status = ?, phase = ?, phase_index = ?, cancellable = 0,
+                    result_json = ?, failure_json = ?, updated_at = ?, finished_at = ?,
+                    resource_version = ?, etag = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    validated.status,
+                    phase,
+                    phase_index,
+                    result_json,
+                    failure_json,
+                    timestamp,
+                    timestamp,
+                    version,
+                    etag,
+                    current.operation_id,
+                ),
+            )
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(connection, current.operation_id)
+            )
+
+    def acknowledge_lifecycle_operation(
+        self,
+        operation_id: str,
+        request: m.LifecycleAcknowledgeV2 | Mapping[str, object],
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> None:
+        self._validate_profile_id(operation_id)
+        validated = self._validate_model(m.LifecycleAcknowledgeV2, request)
+        self._validate_etag(if_match)
+        self._validate_idempotency_key(idempotency_key)
+        request_sha256 = hashlib.sha256(_canonical_json_bytes(validated)).hexdigest()
+        with self._transaction(
+            write=True,
+            operation="acknowledgeLifecycleOperationV2",
+        ) as connection:
+            existing = connection.execute(
+                """
+                SELECT terminal_status, terminal_etag, request_sha256, idempotency_key
+                FROM lifecycle_reconciliation_acknowledgements
+                WHERE operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if existing is not None:
+                if (
+                    existing["terminal_status"] == validated.expected_terminal_status
+                    and hmac.compare_digest(existing["terminal_etag"], if_match)
+                    and hmac.compare_digest(existing["request_sha256"], request_sha256)
+                    and hmac.compare_digest(existing["idempotency_key"], idempotency_key)
+                ):
+                    return
+                raise ProviderIdempotencyConflictV2(
+                    "lifecycle acknowledgement differs from the recorded request"
+                )
+            row = self._require_lifecycle_operation_row(connection, operation_id)
+            operation = self._lifecycle_operation_from_row(row)
+            if validated.expected_operation_id != operation_id:
+                raise ProviderPreconditionFailedV2(
+                    "lifecycle acknowledgement operation identity changed"
+                )
+            if (
+                operation.status != validated.expected_terminal_status
+                or operation.status not in {"succeeded", "failed", "cancelled"}
+                or not hmac.compare_digest(operation.etag, if_match)
+            ):
+                raise ProviderPreconditionFailedV2(
+                    "lifecycle terminal authority changed before acknowledgement"
+                )
+            connection.execute(
+                """
+                INSERT INTO lifecycle_reconciliation_acknowledgements(
+                    operation_id, terminal_status, terminal_etag,
+                    request_sha256, idempotency_key, acknowledged_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id,
+                    operation.status,
+                    operation.etag,
+                    request_sha256,
+                    idempotency_key,
+                    self._timestamp(),
+                ),
+            )
+
+    def reconcile_lifecycle_operations(self) -> tuple[LifecycleOperationWorkV2, ...]:
+        with self._transaction(
+            write=True,
+            operation="reconcileLifecycleOperationsV2",
+        ) as connection:
+            self._cleanup_acknowledged_lifecycle_operations(connection)
+            rows = connection.execute(
+                f"""
+                SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+                FROM lifecycle_operations
+                WHERE status IN ('queued', 'running')
+                ORDER BY created_at, operation_id
+                """
+            ).fetchall()
+            if len(rows) > self._max_lifecycle_operations:
+                raise ProviderCapacityConfigurationV2Error(
+                    "persisted lifecycle operations exceed configured capacity"
+                )
+            return tuple(self._lifecycle_work_from_row(cast(sqlite3.Row, row)) for row in rows)
 
     def create_system_profile(
         self,
@@ -908,9 +1940,7 @@ class DesktopProviderStoreV2:
                 for algorithm, fingerprint in review.key_fingerprints
             ]
         except (TypeError, ValueError, ValidationError) as exc:
-            raise ProviderContractV2Error(
-                "host-key review fingerprints are invalid"
-            ) from exc
+            raise ProviderContractV2Error("host-key review fingerprints are invalid") from exc
         trust = m.SshTrustStateV2(
             connection_generation=connection_generation,
             state="changed_key_blocked",
@@ -1221,9 +2251,7 @@ class DesktopProviderStoreV2:
                     current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER
                     or current.connection_generation >= m.MAX_JAVASCRIPT_SAFE_INTEGER
                 ):
-                    raise ProviderCapacityV2Error(
-                        "profile restart generation is exhausted"
-                    )
+                    raise ProviderCapacityV2Error("profile restart generation is exhausted")
                 version = current_version + 1
                 generation = current.connection_generation + 1
                 recovered_profile = m.RemoteWorkspaceProfileV2(
@@ -1665,18 +2693,26 @@ class DesktopProviderStoreV2:
             if version == 0:
                 if _schema_rows(connection):
                     raise ProviderSchemaV2Error("unversioned v2 database is not empty")
-                for statement in (*_SCHEMA_V1_STATEMENTS, *_SCHEMA_V2_ADDITIONS):
+                for statement in (
+                    *_SCHEMA_V1_STATEMENTS,
+                    *_SCHEMA_V2_ADDITIONS,
+                    *_SCHEMA_V3_ADDITIONS,
+                ):
                     connection.execute(statement)
                 _migration_checkpoint("fresh_after_ddl")
                 connection.execute(
-                    "INSERT INTO schema_metadata VALUES (1, ?, 2, ?, ?)",
-                    (STORE_NAMESPACE, EXPECTED_SCHEMA_V2_SHA256, timestamp),
+                    "INSERT INTO schema_metadata VALUES (1, ?, 3, ?, ?)",
+                    (STORE_NAMESPACE, EXPECTED_SCHEMA_V3_SHA256, timestamp),
                 )
                 connection.executemany(
                     "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
-                    ((1, timestamp), (2, timestamp)),
+                    ((1, timestamp), (2, timestamp), (3, timestamp)),
                 )
-                connection.execute("PRAGMA user_version = 2")
+                connection.execute(
+                    "INSERT INTO lifecycle_cursor_key VALUES (1, ?, ?)",
+                    (secrets.token_bytes(32), timestamp),
+                )
+                connection.execute("PRAGMA user_version = 3")
             elif version == 1:
                 self._validate_schema_version(
                     connection,
@@ -1696,13 +2732,43 @@ class DesktopProviderStoreV2:
                     (timestamp,),
                 )
                 connection.execute("PRAGMA user_version = 2")
-            elif version != SCHEMA_VERSION:
+                self._validate_schema_version(
+                    connection,
+                    expected_rows=_EXPECTED_SCHEMA_V2_ROWS,
+                    expected_sha256=EXPECTED_SCHEMA_V2_SHA256,
+                    version=2,
+                )
+                version = 2
+            if version == 2:
+                self._validate_schema_version(
+                    connection,
+                    expected_rows=_EXPECTED_SCHEMA_V2_ROWS,
+                    expected_sha256=EXPECTED_SCHEMA_V2_SHA256,
+                    version=2,
+                )
+                for statement in _SCHEMA_V3_ADDITIONS:
+                    connection.execute(statement)
+                _migration_checkpoint("v2_to_v3_after_ddl")
+                connection.execute(
+                    "UPDATE schema_metadata SET schema_version = 3, schema_sha256 = ?",
+                    (EXPECTED_SCHEMA_V3_SHA256,),
+                )
+                connection.execute(
+                    "INSERT INTO schema_migrations(version, applied_at) VALUES (3, ?)",
+                    (timestamp,),
+                )
+                connection.execute(
+                    "INSERT INTO lifecycle_cursor_key VALUES (1, ?, ?)",
+                    (secrets.token_bytes(32), timestamp),
+                )
+                connection.execute("PRAGMA user_version = 3")
+            elif version not in {0, SCHEMA_VERSION}:
                 raise ProviderSchemaV2Error(f"unsupported v2 provider schema version {version}")
             self._validate_schema_version(
                 connection,
-                expected_rows=_EXPECTED_SCHEMA_V2_ROWS,
-                expected_sha256=EXPECTED_SCHEMA_V2_SHA256,
-                version=2,
+                expected_rows=_EXPECTED_SCHEMA_V3_ROWS,
+                expected_sha256=EXPECTED_SCHEMA_V3_SHA256,
+                version=3,
             )
             self._verify_storage_files()
             connection.commit()
@@ -1749,7 +2815,34 @@ class DesktopProviderStoreV2:
             raise ProviderSchemaV2Error("v2 migration history is invalid")
 
     def _recover_and_validate(self) -> None:
-        with self._transaction(write=False, operation="recoverProviderV2") as connection:
+        with self._transaction(write=True, operation="recoverProviderV2") as connection:
+            log_summary = connection.execute(
+                """
+                SELECT count(*), coalesce(max(length(CAST(text AS BLOB))), 0),
+                       coalesce(sum(length(CAST(text AS BLOB))), 0),
+                       coalesce(sum(text_bytes), 0)
+                FROM lifecycle_operation_logs
+                """
+            ).fetchone()
+            if log_summary is None or any(
+                type(value) is not int for value in cast(sqlite3.Row, log_summary)
+            ):
+                raise ProviderDataV2Error("lifecycle log summary is invalid")
+            log_count = cast(int, log_summary[0])
+            maximum_log_bytes = cast(int, log_summary[1])
+            actual_log_bytes = cast(int, log_summary[2])
+            recorded_log_bytes = cast(int, log_summary[3])
+            if (
+                log_count < 0
+                or maximum_log_bytes > MAX_LIFECYCLE_LOG_ENTRY_BYTES
+                or actual_log_bytes != recorded_log_bytes
+                or actual_log_bytes > MAX_LIFECYCLE_GLOBAL_LOG_BYTES
+            ):
+                raise ProviderDataV2Error("lifecycle log bytes exceed recovery bounds")
+            if actual_log_bytes > self._max_lifecycle_global_log_bytes:
+                raise ProviderCapacityConfigurationV2Error(
+                    "persisted lifecycle logs exceed configured global capacity"
+                )
             integrity = connection.execute("PRAGMA integrity_check(1)").fetchone()
             if integrity is None or integrity[0] != "ok":
                 raise ProviderDataV2Error("v2 provider integrity check failed")
@@ -1776,6 +2869,23 @@ class DesktopProviderStoreV2:
                     raise ProviderCapacityConfigurationV2Error(
                         f"persisted {table} exceeds configured capacity"
                     )
+            recoverable_lifecycle_count = cast(
+                int,
+                connection.execute(
+                    """
+                    SELECT count(*)
+                    FROM lifecycle_operations AS operation
+                    LEFT JOIN lifecycle_reconciliation_acknowledgements AS acknowledgement
+                      ON acknowledgement.operation_id = operation.operation_id
+                    WHERE operation.status IN ('queued', 'running')
+                       OR acknowledgement.operation_id IS NULL
+                    """
+                ).fetchone()[0],
+            )
+            if recoverable_lifecycle_count > self._max_lifecycle_operations:
+                raise ProviderCapacityConfigurationV2Error(
+                    "persisted lifecycle operations exceed configured capacity"
+                )
             aggregate = cast(
                 int,
                 connection.execute(
@@ -1824,6 +2934,52 @@ class DesktopProviderStoreV2:
             )
             if aggregate > MAX_RECOVERY_BYTES:
                 raise ProviderDataV2Error("v2 provider rows exceed recovery byte budget")
+            lifecycle_aggregate = cast(
+                int,
+                connection.execute(
+                    """
+                    SELECT
+                        coalesce((SELECT sum(
+                            length(CAST(operation_id AS BLOB)) +
+                            length(CAST(kind AS BLOB)) +
+                            length(CAST(resource_kind AS BLOB)) +
+                            length(CAST(resource_id AS BLOB)) +
+                            length(CAST(request_sha256 AS BLOB)) +
+                            length(CAST(request_json AS BLOB)) +
+                            length(CAST(phase_plan_json AS BLOB)) +
+                            length(CAST(status AS BLOB)) +
+                            length(CAST(phase AS BLOB)) +
+                            length(CAST(progress_json AS BLOB)) +
+                            coalesce(length(CAST(result_json AS BLOB)), 0) +
+                            coalesce(length(CAST(failure_json AS BLOB)), 0) +
+                            length(CAST(created_at AS BLOB)) +
+                            coalesce(length(CAST(started_at AS BLOB)), 0) +
+                            length(CAST(updated_at AS BLOB)) +
+                            coalesce(length(CAST(finished_at AS BLOB)), 0) +
+                            length(CAST(etag AS BLOB))
+                        ) FROM lifecycle_operations), 0) +
+                        coalesce((SELECT sum(
+                            length(CAST(principal AS BLOB)) +
+                            length(CAST(action AS BLOB)) +
+                            length(CAST(resource_scope AS BLOB)) +
+                            length(CAST(idempotency_key AS BLOB)) +
+                            length(CAST(request_sha256 AS BLOB)) +
+                            length(CAST(operation_id AS BLOB)) +
+                            length(CAST(created_at AS BLOB))
+                        ) FROM lifecycle_idempotency_records), 0) +
+                        coalesce((SELECT sum(
+                            length(CAST(operation_id AS BLOB)) +
+                            length(CAST(terminal_status AS BLOB)) +
+                            length(CAST(terminal_etag AS BLOB)) +
+                            length(CAST(request_sha256 AS BLOB)) +
+                            length(CAST(idempotency_key AS BLOB)) +
+                            length(CAST(acknowledged_at AS BLOB))
+                        ) FROM lifecycle_reconciliation_acknowledgements), 0)
+                    """
+                ).fetchone()[0],
+            )
+            if lifecycle_aggregate > MAX_LIFECYCLE_AUTHORITY_RECOVERY_BYTES:
+                raise ProviderDataV2Error("lifecycle operation rows exceed recovery byte budget")
             for row in connection.execute(
                 f"SELECT {_PROFILE_SELECT_COLUMNS} FROM profiles ORDER BY rowid"
             ):
@@ -1855,6 +3011,195 @@ class DesktopProviderStoreV2:
                 "SELECT * FROM migration_diagnostics ORDER BY diagnostic_id"
             ):
                 self._diagnostic_from_row(cast(sqlite3.Row, row))
+            self._validate_lifecycle_recovery(connection)
+            self._cleanup_acknowledged_lifecycle_operations(connection)
+
+    def _validate_lifecycle_recovery(self, connection: sqlite3.Connection) -> None:
+        operation_rows: dict[str, sqlite3.Row] = {}
+        operations: dict[str, m.LifecycleOperationV2] = {}
+        for raw_row in connection.execute(
+            f"""
+            SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+            FROM lifecycle_operations
+            ORDER BY rowid
+            """
+        ):
+            row = cast(sqlite3.Row, raw_row)
+            operation = self._lifecycle_operation_from_row(row)
+            if operation.operation_id in operations:
+                raise ProviderDataV2Error("duplicate lifecycle operation identity")
+            operation_rows[operation.operation_id] = row
+            operations[operation.operation_id] = operation
+
+        grouped_logs: dict[str, tuple[int, int, int, int, int]] = {}
+        for raw_row in connection.execute(
+            """
+            SELECT operation_id, count(*) AS entry_count,
+                   min(sequence) AS minimum_sequence,
+                   max(sequence) AS maximum_sequence,
+                   coalesce(sum(text_bytes), 0) AS recorded_bytes,
+                   coalesce(sum(length(CAST(text AS BLOB))), 0) AS actual_bytes
+            FROM lifecycle_operation_logs
+            GROUP BY operation_id
+            ORDER BY operation_id
+            """
+        ):
+            row = cast(sqlite3.Row, raw_row)
+            operation_id = row["operation_id"]
+            values = (
+                row["entry_count"],
+                row["minimum_sequence"],
+                row["maximum_sequence"],
+                row["recorded_bytes"],
+                row["actual_bytes"],
+            )
+            if (
+                type(operation_id) is not str
+                or operation_id not in operations
+                or any(type(value) is not int for value in values)
+            ):
+                raise ProviderDataV2Error("lifecycle log ownership is invalid")
+            grouped_logs[operation_id] = cast(tuple[int, int, int, int, int], values)
+
+        grouped_count = 0
+        grouped_bytes = 0
+        for operation_id, operation in operations.items():
+            row = operation_rows[operation_id]
+            dropped = cast(int, row["dropped_before_sequence"])
+            byte_count = cast(int, row["log_byte_count"])
+            stats = grouped_logs.get(operation_id)
+            if stats is None:
+                if dropped != operation.log_sequence_high_watermark or byte_count != 0:
+                    raise ProviderDataV2Error("lifecycle empty-log authority differs")
+                continue
+            entry_count, minimum, maximum, recorded_bytes, actual_bytes = stats
+            grouped_count += entry_count
+            grouped_bytes += actual_bytes
+            if entry_count > self._max_lifecycle_log_entries:
+                raise ProviderCapacityConfigurationV2Error(
+                    "persisted lifecycle log entries exceed configured capacity"
+                )
+            if actual_bytes > self._max_lifecycle_log_bytes:
+                raise ProviderCapacityConfigurationV2Error(
+                    "persisted lifecycle log bytes exceed configured capacity"
+                )
+            if (
+                entry_count < 1
+                or minimum != dropped + 1
+                or maximum != operation.log_sequence_high_watermark
+                or entry_count != maximum - dropped
+                or recorded_bytes != actual_bytes
+                or byte_count != actual_bytes
+            ):
+                raise ProviderDataV2Error("lifecycle log sequence authority differs")
+        if grouped_count != cast(
+            int,
+            connection.execute("SELECT count(*) FROM lifecycle_operation_logs").fetchone()[0],
+        ) or grouped_bytes != cast(
+            int,
+            connection.execute(
+                "SELECT coalesce(sum(text_bytes), 0) FROM lifecycle_operation_logs"
+            ).fetchone()[0],
+        ):
+            raise ProviderDataV2Error("lifecycle aggregate log authority differs")
+
+        for raw_row in connection.execute(
+            f"""
+            SELECT {_LIFECYCLE_LOG_SELECT_COLUMNS}
+            FROM lifecycle_operation_logs
+            ORDER BY operation_id, sequence
+            """
+        ):
+            row = cast(sqlite3.Row, raw_row)
+            entry = self._lifecycle_log_from_row(row)
+            operation = operations.get(entry.operation_id)
+            if operation is None or not (
+                operation.created_at <= entry.occurred_at <= operation.updated_at
+            ):
+                raise ProviderDataV2Error("lifecycle log timestamp is outside its operation")
+
+        reservation_counts = {operation_id: 0 for operation_id in operations}
+        for raw_row in connection.execute(
+            """
+            SELECT principal, action, resource_scope, idempotency_key,
+                   request_sha256, operation_id, created_at
+            FROM lifecycle_idempotency_records
+            ORDER BY rowid
+            """
+        ):
+            row = cast(sqlite3.Row, raw_row)
+            operation_id = row["operation_id"]
+            operation = operations.get(operation_id)
+            if (
+                operation is None
+                or row["principal"] != LOCAL_PRINCIPAL
+                or row["action"] not in {"reserve", "cancel"}
+                or not self._is_digest(row["request_sha256"])
+                or type(row["created_at"]) is not str
+                or _TIMESTAMP_RE.fullmatch(row["created_at"]) is None
+                or not operation.created_at <= row["created_at"] <= operation.updated_at
+            ):
+                raise ProviderDataV2Error("stored lifecycle idempotency identity is invalid")
+            try:
+                self._validate_idempotency_key(row["idempotency_key"])
+            except ProviderContractV2Error as exc:
+                raise ProviderDataV2Error("stored lifecycle idempotency key is invalid") from exc
+            if row["action"] == "reserve":
+                if (
+                    row["resource_scope"] != "lifecycle_operations"
+                    or row["request_sha256"] != operation.request_sha256
+                ):
+                    raise ProviderDataV2Error(
+                        "lifecycle reservation idempotency authority differs"
+                    )
+                reservation_counts[operation_id] += 1
+            elif row["resource_scope"] != operation_id:
+                raise ProviderDataV2Error("lifecycle cancellation idempotency authority differs")
+        if any(count != 1 for count in reservation_counts.values()):
+            raise ProviderDataV2Error("lifecycle operation lacks one reservation authority")
+
+        for raw_row in connection.execute(
+            """
+            SELECT operation_id, terminal_status, terminal_etag,
+                   request_sha256, idempotency_key, acknowledged_at
+            FROM lifecycle_reconciliation_acknowledgements
+            ORDER BY operation_id
+            """
+        ):
+            row = cast(sqlite3.Row, raw_row)
+            operation = operations.get(row["operation_id"])
+            if operation is None:
+                raise ProviderDataV2Error("lifecycle acknowledgement is orphaned")
+            try:
+                self._validate_idempotency_key(row["idempotency_key"])
+            except ProviderContractV2Error as exc:
+                raise ProviderDataV2Error(
+                    "stored lifecycle acknowledgement key is invalid"
+                ) from exc
+            if operation.status not in {"succeeded", "failed", "cancelled"}:
+                raise ProviderDataV2Error(
+                    "lifecycle acknowledgement belongs to a nonterminal operation"
+                )
+            expected_request = m.LifecycleAcknowledgeV2(
+                expected_operation_id=operation.operation_id,
+                expected_terminal_status=cast(
+                    Literal["succeeded", "failed", "cancelled"],
+                    operation.status,
+                ),
+            )
+            expected_sha256 = hashlib.sha256(_canonical_json_bytes(expected_request)).hexdigest()
+            if (
+                row["terminal_status"] != operation.status
+                or row["terminal_etag"] != operation.etag
+                or not hmac.compare_digest(row["request_sha256"], expected_sha256)
+                or type(row["acknowledged_at"]) is not str
+                or _TIMESTAMP_RE.fullmatch(row["acknowledged_at"]) is None
+                or operation.finished_at is None
+                or row["acknowledged_at"] < operation.finished_at
+            ):
+                raise ProviderDataV2Error("lifecycle acknowledgement authority differs")
+
+        self._lifecycle_cursor_key(connection)
 
     @contextmanager
     def _transaction(
@@ -2124,6 +3469,589 @@ class DesktopProviderStoreV2:
             raise ProviderDataV2Error(
                 "stored idempotency response differs from its operation scope"
             )
+
+    def _transition_profile_for_lifecycle(
+        self,
+        connection: sqlite3.Connection,
+        request: LifecycleRequestV2,
+    ) -> m.RemoteWorkspaceProfileV2:
+        if not isinstance(
+            request,
+            (
+                LifecycleProfileConnectRequestV2,
+                LifecycleProfileDisconnectRequestV2,
+                LifecycleHostKeyReviewRequestV2,
+            ),
+        ):
+            raise ProviderContractV2Error("lifecycle request is not a profile action")
+        row = self._require_profile_row(connection, request.profile_id)
+        current = self._profile_from_row(row)
+        if not isinstance(current, m.RemoteWorkspaceProfileV2):
+            raise ProviderConflictV2("legacy profiles must be rebound before connection")
+        if (
+            request.resource_generation < 1
+            or current.connection_generation != request.resource_generation
+            or request.request.expected_connection_generation != request.resource_generation
+        ):
+            raise ProviderPreconditionFailedV2("profile connection generation changed")
+        if not hmac.compare_digest(current.etag, request.if_match):
+            raise ProviderPreconditionFailedV2("profile ETag changed")
+        current_version = row["resource_version"]
+        if (
+            type(current_version) is not int
+            or current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            or current.connection_generation >= m.MAX_JAVASCRIPT_SAFE_INTEGER
+        ):
+            raise ProviderCapacityV2Error("profile generation is exhausted")
+        version = current_version + 1
+        generation = current.connection_generation + 1
+        timestamp = self._timestamp()
+        trust_state: Literal["unverified", "trusted", "repairing"]
+        if isinstance(request, LifecycleHostKeyReviewRequestV2):
+            trust_state = "repairing"
+        elif current.trust.state == "trusted":
+            trust_state = "trusted"
+        else:
+            trust_state = "unverified"
+        updated = m.RemoteWorkspaceProfileV2(
+            profile_id=current.profile_id,
+            display_name=current.display_name,
+            ssh_host_alias=current.ssh_host_alias,
+            catalog_generation=current.catalog_generation,
+            connection_generation=generation,
+            connection_state=(
+                "disconnecting"
+                if isinstance(request, LifecycleProfileDisconnectRequestV2)
+                else "connecting"
+            ),
+            prompt=None,
+            trust=m.SshTrustStateV2(
+                connection_generation=generation,
+                state=trust_state,
+                review_id=None,
+                review_sha256=None,
+                key_fingerprints=[],
+                repair_support="not_needed",
+            ),
+            failure=None,
+            active_project_id=current.active_project_id,
+            core_api_major=None,
+            core_openapi_sha256=None,
+            core_event_schema_sha256=None,
+            core_registry_sha256=None,
+            created_at=current.created_at,
+            updated_at=timestamp,
+            etag=self._etag("profile", current.profile_id, version),
+        )
+        self._update_profile(connection, updated, version=version)
+        return updated
+
+    def _require_lifecycle_operation_row(
+        self,
+        connection: sqlite3.Connection,
+        operation_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            f"""
+            SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+            FROM lifecycle_operations
+            WHERE operation_id = ?
+            """,
+            (operation_id,),
+        ).fetchone()
+        if row is None:
+            raise ProviderNotFoundV2("lifecycle operation was not found")
+        return cast(sqlite3.Row, row)
+
+    def _lifecycle_request_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> LifecycleRequestV2:
+        size = self._bounded_blob_size(
+            row,
+            "request_json",
+            maximum=MAX_LIFECYCLE_REQUEST_BYTES,
+        )
+        raw = bytes(row["request_json"])
+        if len(raw) != size:
+            raise ProviderDataV2Error("lifecycle request length changed")
+        try:
+            request = _LIFECYCLE_REQUEST_ADAPTER.validate_json(raw, strict=True)
+        except ValidationError as exc:
+            raise ProviderDataV2Error("stored lifecycle request is invalid") from exc
+        if _canonical_json_bytes(request) != raw:
+            raise ProviderDataV2Error("stored lifecycle request is not canonical")
+        return request
+
+    def _optional_lifecycle_json(
+        self,
+        row: sqlite3.Row,
+        column: Literal["result_json", "failure_json"],
+    ) -> bytes | None:
+        size = row[f"{column}_bytes"]
+        value = row[column]
+        if value is None:
+            if size != 0:
+                raise ProviderDataV2Error(f"stored {column} null length is invalid")
+            return None
+        if (
+            type(size) is not int
+            or not 2 <= size <= MAX_LIFECYCLE_DOCUMENT_BYTES
+            or not isinstance(value, (bytes, bytearray, memoryview))
+        ):
+            raise ProviderDataV2Error(f"stored {column} exceeds its byte bound")
+        raw = bytes(value)
+        if len(raw) != size:
+            raise ProviderDataV2Error(f"stored {column} length changed")
+        return raw
+
+    def _lifecycle_operation_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> m.LifecycleOperationV2:
+        request = self._lifecycle_request_from_row(row)
+        phase_plan_size = self._bounded_blob_size(
+            row,
+            "phase_plan_json",
+            maximum=MAX_LIFECYCLE_DOCUMENT_BYTES,
+        )
+        phase_plan = bytes(row["phase_plan_json"])
+        if len(phase_plan) != phase_plan_size or phase_plan != _canonical_json_bytes(
+            list(m.LIFECYCLE_PHASES)
+        ):
+            raise ProviderDataV2Error("stored lifecycle phase plan is invalid")
+        progress_size = self._bounded_blob_size(
+            row,
+            "progress_json",
+            maximum=MAX_LIFECYCLE_DOCUMENT_BYTES,
+        )
+        progress_raw = bytes(row["progress_json"])
+        if len(progress_raw) != progress_size:
+            raise ProviderDataV2Error("stored lifecycle progress length changed")
+        try:
+            progress = _LIFECYCLE_PROGRESS_ADAPTER.validate_json(
+                progress_raw,
+                strict=True,
+            )
+        except ValidationError as exc:
+            raise ProviderDataV2Error("stored lifecycle progress is invalid") from exc
+        if _canonical_json_bytes(progress) != progress_raw:
+            raise ProviderDataV2Error("stored lifecycle progress is not canonical")
+
+        result_raw = self._optional_lifecycle_json(row, "result_json")
+        failure_raw = self._optional_lifecycle_json(row, "failure_json")
+        try:
+            result = (
+                _LIFECYCLE_RESULT_ADAPTER.validate_json(result_raw, strict=True)
+                if result_raw is not None
+                else None
+            )
+            failure = (
+                m.DesktopErrorV2.model_validate_json(failure_raw, strict=True)
+                if failure_raw is not None
+                else None
+            )
+        except ValidationError as exc:
+            raise ProviderDataV2Error("stored lifecycle terminal document is invalid") from exc
+        if (result_raw is not None and _canonical_json_bytes(result) != result_raw) or (
+            failure_raw is not None and _canonical_json_bytes(failure) != failure_raw
+        ):
+            raise ProviderDataV2Error("stored lifecycle terminal document is not canonical")
+
+        flags = (row["cancellable"], row["cancellation_requested"])
+        if any(type(value) is not int or value not in (0, 1) for value in flags):
+            raise ProviderDataV2Error("stored lifecycle flags are invalid")
+        version = row["resource_version"]
+        watermark = row["log_sequence_high_watermark"]
+        dropped = row["dropped_before_sequence"]
+        log_bytes = row["log_byte_count"]
+        if (
+            type(version) is not int
+            or not 1 <= version <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            or type(watermark) is not int
+            or not 0 <= watermark <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            or type(dropped) is not int
+            or not 0 <= dropped <= watermark
+            or type(log_bytes) is not int
+            or log_bytes < 0
+        ):
+            raise ProviderDataV2Error("stored lifecycle scalar authority is invalid")
+        if row["etag"] != self._etag("lifecycle_operation", row["operation_id"], version):
+            raise ProviderDataV2Error("stored lifecycle ETag differs from its version")
+        if row["status"] == "queued" and row["cancellation_requested"]:
+            raise ProviderDataV2Error("queued lifecycle operation requests cancellation")
+        if row["status"] == "cancelled" and not row["cancellation_requested"]:
+            raise ProviderDataV2Error("cancelled lifecycle operation lacks cancellation intent")
+
+        try:
+            resource = _LIFECYCLE_RESOURCE_ADAPTER.validate_python(
+                {
+                    "resource_kind": row["resource_kind"],
+                    "resource_id": row["resource_id"],
+                },
+                strict=True,
+            )
+            reservation = LifecycleOperationReservationV2(
+                kind=row["kind"],
+                resource=resource,
+                request=request,
+            )
+            operation = m.LifecycleOperationV2(
+                operation_id=row["operation_id"],
+                kind=row["kind"],
+                resource=resource,
+                request_sha256=row["request_sha256"],
+                status=row["status"],
+                phase=row["phase"],
+                phase_index=row["phase_index"],
+                phase_total=row["phase_total"],
+                progress=progress,
+                cancellable=bool(row["cancellable"]),
+                result=result,
+                failure=failure,
+                log_sequence_high_watermark=watermark,
+                created_at=row["created_at"],
+                started_at=row["started_at"],
+                updated_at=row["updated_at"],
+                finished_at=row["finished_at"],
+                etag=row["etag"],
+            )
+        except ValidationError as exc:
+            raise ProviderDataV2Error("stored lifecycle operation is invalid") from exc
+        expected_request_sha256 = hashlib.sha256(_canonical_json_bytes(reservation)).hexdigest()
+        if not hmac.compare_digest(operation.request_sha256, expected_request_sha256):
+            raise ProviderDataV2Error("stored lifecycle request digest changed")
+        return operation
+
+    def _lifecycle_work_from_row(
+        self,
+        row: sqlite3.Row,
+    ) -> LifecycleOperationWorkV2:
+        return LifecycleOperationWorkV2(
+            operation=self._lifecycle_operation_from_row(row),
+            request=self._lifecycle_request_from_row(row),
+            cancellation_requested=bool(row["cancellation_requested"]),
+        )
+
+    @staticmethod
+    def _next_lifecycle_version(row: sqlite3.Row) -> int:
+        version = row["resource_version"]
+        if type(version) is not int or not 1 <= version < m.MAX_JAVASCRIPT_SAFE_INTEGER:
+            raise ProviderCapacityV2Error("lifecycle operation version is exhausted")
+        return version + 1
+
+    @staticmethod
+    def _validate_lifecycle_progress_advance(
+        *,
+        current: m.LifecycleProgressV2 | None,
+        updated: m.LifecycleProgressV2 | None,
+        same_phase: bool,
+    ) -> None:
+        if not same_phase or current is None:
+            return
+        if updated is None:
+            raise ProviderPreconditionFailedV2("lifecycle progress cannot regress")
+        if isinstance(current, m.LifecycleProgressIndeterminateV2):
+            return
+        if isinstance(updated, m.LifecycleProgressIndeterminateV2):
+            raise ProviderPreconditionFailedV2("lifecycle progress cannot regress")
+        if type(current) is not type(updated) or current.total != updated.total:
+            raise ProviderPreconditionFailedV2(
+                "lifecycle progress kind or total cannot change within a phase"
+            )
+        if updated.completed < current.completed:
+            raise ProviderPreconditionFailedV2("lifecycle progress cannot regress")
+
+    @staticmethod
+    def _truncate_lifecycle_log_text(
+        value: str,
+        *,
+        already_truncated: bool,
+    ) -> tuple[str, bool]:
+        raw = value.encode("utf-8")
+        if len(raw) <= MAX_LIFECYCLE_LOG_ENTRY_BYTES:
+            return value, already_truncated
+        prefix = raw[:MAX_LIFECYCLE_LOG_ENTRY_BYTES]
+        try:
+            text = prefix.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            text = prefix[: exc.start].decode("utf-8", errors="strict")
+        return text, True
+
+    def _enforce_lifecycle_log_budgets(
+        self,
+        connection: sqlite3.Connection,
+        operation_id: str,
+    ) -> None:
+        while True:
+            count, byte_count = cast(
+                tuple[int, int],
+                connection.execute(
+                    """
+                    SELECT count(*), coalesce(sum(text_bytes), 0)
+                    FROM lifecycle_operation_logs
+                    WHERE operation_id = ?
+                    """,
+                    (operation_id,),
+                ).fetchone(),
+            )
+            if (
+                count <= self._max_lifecycle_log_entries
+                and byte_count <= self._max_lifecycle_log_bytes
+            ):
+                break
+            oldest = connection.execute(
+                """
+                SELECT sequence, text_bytes
+                FROM lifecycle_operation_logs
+                WHERE operation_id = ?
+                ORDER BY sequence
+                LIMIT 1
+                """,
+                (operation_id,),
+            ).fetchone()
+            if oldest is None:
+                raise ProviderDataV2Error("lifecycle log budget accounting changed")
+            self._evict_lifecycle_log(
+                connection,
+                operation_id=operation_id,
+                sequence=cast(int, oldest["sequence"]),
+                text_bytes=cast(int, oldest["text_bytes"]),
+            )
+
+        while True:
+            global_bytes = cast(
+                int,
+                connection.execute(
+                    "SELECT coalesce(sum(text_bytes), 0) FROM lifecycle_operation_logs"
+                ).fetchone()[0],
+            )
+            if global_bytes <= self._max_lifecycle_global_log_bytes:
+                return
+            oldest = connection.execute(
+                """
+                SELECT log.operation_id, log.sequence, log.text_bytes
+                FROM lifecycle_operation_logs AS log
+                JOIN lifecycle_operations AS operation
+                  ON operation.operation_id = log.operation_id
+                LEFT JOIN lifecycle_reconciliation_acknowledgements AS acknowledgement
+                  ON acknowledgement.operation_id = operation.operation_id
+                ORDER BY
+                    CASE
+                        WHEN acknowledgement.operation_id IS NOT NULL
+                         AND operation.status IN ('succeeded', 'failed', 'cancelled')
+                        THEN 0 ELSE 1
+                    END,
+                    log.occurred_at, log.operation_id, log.sequence
+                LIMIT 1
+                """
+            ).fetchone()
+            if oldest is None:
+                raise ProviderDataV2Error("global lifecycle log accounting changed")
+            self._evict_lifecycle_log(
+                connection,
+                operation_id=cast(str, oldest["operation_id"]),
+                sequence=cast(int, oldest["sequence"]),
+                text_bytes=cast(int, oldest["text_bytes"]),
+            )
+
+    @staticmethod
+    def _evict_lifecycle_log(
+        connection: sqlite3.Connection,
+        *,
+        operation_id: str,
+        sequence: int,
+        text_bytes: int,
+    ) -> None:
+        deleted = connection.execute(
+            """
+            DELETE FROM lifecycle_operation_logs
+            WHERE operation_id = ? AND sequence = ? AND text_bytes = ?
+            """,
+            (operation_id, sequence, text_bytes),
+        ).rowcount
+        if deleted != 1:
+            raise ProviderDataV2Error("lifecycle log changed during bounded eviction")
+        connection.execute(
+            """
+            UPDATE lifecycle_operations
+            SET dropped_before_sequence = max(dropped_before_sequence, ?),
+                log_byte_count = log_byte_count - ?
+            WHERE operation_id = ?
+            """,
+            (sequence, text_bytes, operation_id),
+        )
+
+    def _lifecycle_cursor_key(self, connection: sqlite3.Connection) -> bytes:
+        row = connection.execute(
+            """
+            SELECT CASE WHEN length(cursor_key) = 32 THEN cursor_key END AS cursor_key,
+                   length(cursor_key) AS cursor_key_bytes,
+                   created_at
+            FROM lifecycle_cursor_key
+            WHERE singleton = 1
+            """
+        ).fetchone()
+        if (
+            row is None
+            or row["cursor_key_bytes"] != 32
+            or not isinstance(row["cursor_key"], (bytes, bytearray, memoryview))
+            or type(row["created_at"]) is not str
+            or _TIMESTAMP_RE.fullmatch(row["created_at"]) is None
+        ):
+            raise ProviderDataV2Error("lifecycle cursor authority is invalid")
+        key = bytes(row["cursor_key"])
+        if len(key) != 32:
+            raise ProviderDataV2Error("lifecycle cursor key length changed")
+        return key
+
+    def _encode_lifecycle_cursor(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        operation_id: str,
+        next_sequence: int,
+        dropped_before_sequence: int,
+    ) -> str:
+        payload = _canonical_json_bytes(
+            {
+                "dropped_before_sequence": dropped_before_sequence,
+                "namespace": STORE_NAMESPACE,
+                "next_sequence": next_sequence,
+                "operation_id": operation_id,
+                "schema_version": SCHEMA_VERSION,
+            }
+        )
+        signature = hmac.new(
+            self._lifecycle_cursor_key(connection),
+            b"openevo-desktop-lifecycle-cursor-v2\0" + payload,
+            hashlib.sha256,
+        ).digest()
+        encoded_payload = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+        encoded_signature = base64.urlsafe_b64encode(signature).rstrip(b"=").decode("ascii")
+        cursor = f"{encoded_payload}.{encoded_signature}"
+        if len(cursor.encode("utf-8")) > 512:
+            raise ProviderCapacityV2Error("lifecycle cursor exceeds its public bound")
+        return cursor
+
+    def _decode_lifecycle_cursor(
+        self,
+        connection: sqlite3.Connection,
+        cursor: str,
+    ) -> dict[str, object]:
+        if type(cursor) is not str or not 1 <= len(cursor.encode("utf-8")) <= 512:
+            raise ProviderContractV2Error("lifecycle cursor is invalid")
+        parts = cursor.split(".")
+        if len(parts) != 2 or not all(parts):
+            raise ProviderContractV2Error("lifecycle cursor is invalid")
+        try:
+            payload = base64.b64decode(
+                parts[0] + "=" * (-len(parts[0]) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+            signature = base64.b64decode(
+                parts[1] + "=" * (-len(parts[1]) % 4),
+                altchars=b"-_",
+                validate=True,
+            )
+        except (binascii.Error, ValueError) as exc:
+            raise ProviderContractV2Error("lifecycle cursor encoding is invalid") from exc
+        expected = hmac.new(
+            self._lifecycle_cursor_key(connection),
+            b"openevo-desktop-lifecycle-cursor-v2\0" + payload,
+            hashlib.sha256,
+        ).digest()
+        if len(signature) != 32 or not hmac.compare_digest(signature, expected):
+            raise ProviderContractV2Error("lifecycle cursor signature is invalid")
+        try:
+            value = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProviderContractV2Error("lifecycle cursor payload is invalid") from exc
+        if type(value) is not dict or set(value) != {
+            "dropped_before_sequence",
+            "namespace",
+            "next_sequence",
+            "operation_id",
+            "schema_version",
+        }:
+            raise ProviderContractV2Error("lifecycle cursor payload is not closed")
+        if _canonical_json_bytes(value) != payload:
+            raise ProviderContractV2Error("lifecycle cursor payload is not canonical")
+        if value["namespace"] != STORE_NAMESPACE or value["schema_version"] != SCHEMA_VERSION:
+            raise ProviderContractV2Error("lifecycle cursor authority differs")
+        try:
+            self._validate_profile_id(cast(str, value["operation_id"]))
+        except ProviderContractV2Error as exc:
+            raise ProviderContractV2Error("lifecycle cursor operation is invalid") from exc
+        next_sequence = value["next_sequence"]
+        dropped = value["dropped_before_sequence"]
+        if (
+            type(next_sequence) is not int
+            or not 1 <= next_sequence <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            or type(dropped) is not int
+            or not 0 <= dropped <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            or next_sequence <= dropped
+        ):
+            raise ProviderContractV2Error("lifecycle cursor sequence is invalid")
+        return cast(dict[str, object], value)
+
+    def _lifecycle_log_from_row(self, row: sqlite3.Row) -> m.LifecycleLogEntryV2:
+        actual = row["text_bytes_actual"]
+        recorded = row["text_bytes"]
+        raw = row["text"]
+        truncated = row["truncated"]
+        if (
+            type(actual) is not int
+            or not 1 <= actual <= MAX_LIFECYCLE_LOG_ENTRY_BYTES
+            or recorded != actual
+            or not isinstance(raw, (bytes, bytearray, memoryview))
+            or type(truncated) is not int
+            or truncated not in (0, 1)
+        ):
+            raise ProviderDataV2Error("stored lifecycle log exceeds its byte bound")
+        raw_bytes = bytes(raw)
+        if len(raw_bytes) != actual:
+            raise ProviderDataV2Error("stored lifecycle log length changed")
+        try:
+            text = raw_bytes.decode("utf-8", errors="strict")
+            return m.LifecycleLogEntryV2(
+                operation_id=row["operation_id"],
+                sequence=row["sequence"],
+                occurred_at=row["occurred_at"],
+                source=row["source"],
+                text=text,
+                truncated=bool(truncated),
+            )
+        except (UnicodeDecodeError, ValidationError) as exc:
+            raise ProviderDataV2Error("stored lifecycle log entry is invalid") from exc
+
+    def _cleanup_acknowledged_lifecycle_operations(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        now = self._clock()
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise ProviderStoreV2Error("v2 provider clock must be timezone-aware")
+        cutoff = (
+            (now.astimezone(timezone.utc) - LIFECYCLE_TERMINAL_RETENTION)
+            .isoformat(timespec="microseconds")
+            .replace("+00:00", "Z")
+        )
+        connection.execute(
+            """
+            DELETE FROM lifecycle_operations
+            WHERE operation_id IN (
+                SELECT acknowledgement.operation_id
+                FROM lifecycle_reconciliation_acknowledgements AS acknowledgement
+                JOIN lifecycle_operations AS operation
+                  ON operation.operation_id = acknowledgement.operation_id
+                WHERE acknowledgement.acknowledged_at <= ?
+                  AND operation.status IN ('succeeded', 'failed', 'cancelled')
+            )
+            """,
+            (cutoff,),
+        )
 
     def _new_system_profile(
         self,
@@ -2473,21 +4401,39 @@ __all__ = [
     "DATABASE_FILENAME",
     "DEFAULT_MAX_DRAFTS",
     "DEFAULT_MAX_IDEMPOTENCY_RECORDS",
+    "DEFAULT_MAX_LIFECYCLE_OPERATIONS",
     "DEFAULT_MAX_MIGRATION_DIAGNOSTICS",
     "DEFAULT_MAX_PROFILES",
     "DesktopProviderStoreV2",
     "EXPECTED_SCHEMA_V1_SHA256",
     "EXPECTED_SCHEMA_V2_SHA256",
+    "EXPECTED_SCHEMA_V3_SHA256",
     "LegacyDraftSourceV2",
     "LegacyProfileImportV2",
+    "LifecycleHostKeyReviewRequestV2",
+    "LifecycleLogAppendV2",
+    "LifecycleNativeWorkspacePrepareRequestV2",
+    "LifecycleOperationAdvanceV2",
+    "LifecycleOperationCompletionV2",
+    "LifecycleOperationReservationV2",
+    "LifecycleOperationWorkV2",
+    "LifecycleProfileConnectRequestV2",
+    "LifecycleProfileDisconnectRequestV2",
+    "LifecycleProjectActivateRequestV2",
+    "LifecycleProjectCreateRequestV2",
     "LocalProjectDraftV2",
     "MAX_DATABASE_BYTES",
+    "MAX_LIFECYCLE_LOG_BYTES",
+    "MAX_LIFECYCLE_LOG_ENTRIES",
+    "MAX_LIFECYCLE_LOG_ENTRY_BYTES",
+    "MAX_LIFECYCLE_GLOBAL_LOG_BYTES",
     "MAX_PROFILE_DOCUMENT_BYTES",
     "MigrationDiagnosticV2",
     "ProviderCapacityConfigurationV2Error",
     "ProviderCapacityV2Error",
     "ProviderConflictV2",
     "ProviderContractV2Error",
+    "ProviderCursorExpiredV2",
     "ProviderDataV2Error",
     "ProviderIdempotencyConflictV2",
     "ProviderNotFoundV2",
