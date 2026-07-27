@@ -12,6 +12,7 @@ export const MAX_JSON_COLLECTION_ITEMS_V2 = 1_024;
 export const MAX_JSON_TEXT_BYTES_V2 = 524_288;
 
 const UTC_RFC3339 = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$/;
+const UTC_RFC3339_COMPONENTS = /^([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]{1,9}))?Z$/;
 const OPAQUE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
 const STRONG_ETAG = /^"[0-9a-f]{64}"$/;
@@ -24,7 +25,8 @@ export const opaqueIdV2Schema = z.string().min(1).max(128).regex(OPAQUE_ID);
 export const sshHostAliasV2Schema = opaqueIdV2Schema;
 export const sha256DigestV2Schema = z.string().regex(SHA256);
 export const etagV2Schema = z.string().length(66).regex(STRONG_ETAG);
-export const utcTimestampV2Schema = z.string().regex(UTC_RFC3339);
+export const utcTimestampV2Schema = z.string().regex(UTC_RFC3339)
+  .refine((value) => canonicalUtcTimestampV2(value) !== null, "invalid UTC timestamp");
 export const cursorV2Schema = z.string().min(1).max(512);
 export const displayNameV2Schema = z.string().min(1).max(128).refine(noControlCharacters);
 export const safeSummaryV2Schema = z.string().min(1).max(512).refine(noControlCharacters);
@@ -969,6 +971,216 @@ export const hostKeyReviewRequestV2Schema = z.object({
   action: z.enum(["accept_first_use", "replace_changed_key", "reject"]),
 }).strict();
 
+export const lifecycleOperationKindV2Schema = z.enum([
+  "profile_connect",
+  "profile_disconnect",
+  "host_key_review",
+  "native_workspace_prepare",
+  "project_create",
+  "project_activate",
+]);
+export const lifecycleOperationStatusV2Schema = z.enum([
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+export const LIFECYCLE_PHASES_V2 = [
+  "validation",
+  "queued",
+  "resolving_system_openssh",
+  "connecting",
+  "waiting_for_user",
+  "remote_preflight",
+  "transferring",
+  "verifying",
+  "starting_daemon",
+  "waiting_for_daemon",
+  "opening_project_tunnel",
+  "negotiating_core",
+  "preparing_native_workspace",
+  "creating_remote_project",
+  "verifying_project",
+  "activating",
+  "finalizing",
+] as const;
+export const lifecyclePhaseV2Schema = z.enum(LIFECYCLE_PHASES_V2);
+
+export const lifecycleProgressV2Schema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("indeterminate") }).strict(),
+  z.object({
+    kind: z.literal("bytes"),
+    completed: nonNegativeSafeIntegerV2Schema,
+    total: positiveSafeIntegerV2Schema,
+  }).strict(),
+  z.object({
+    kind: z.literal("items"),
+    completed: nonNegativeSafeIntegerV2Schema,
+    total: positiveSafeIntegerV2Schema,
+  }).strict(),
+]).superRefine((value, context) => {
+  if (value.kind !== "indeterminate") validateLifecycleProgressV2(value, context);
+});
+
+export const lifecycleResourceRefV2Schema = z.discriminatedUnion("resource_kind", [
+  z.object({ resource_kind: z.literal("profile"), resource_id: opaqueIdV2Schema }).strict(),
+  z.object({ resource_kind: z.literal("native_workspace"), resource_id: opaqueIdV2Schema }).strict(),
+  z.object({ resource_kind: z.literal("project"), resource_id: opaqueIdV2Schema }).strict(),
+]);
+
+export const lifecycleResultV2Schema = z.discriminatedUnion("result_kind", [
+  z.object({
+    result_kind: z.literal("profile"),
+    profile_id: opaqueIdV2Schema,
+    connection_generation: positiveSafeIntegerV2Schema,
+  }).strict(),
+  z.object({
+    result_kind: z.literal("native_workspace"),
+    import_id: opaqueIdV2Schema,
+    content_sha256: sha256DigestV2Schema,
+    byte_size: positiveSafeIntegerV2Schema,
+    entry_count: nonNegativeSafeIntegerV2Schema,
+    extracted_byte_size: nonNegativeSafeIntegerV2Schema,
+    display_name: displayNameV2Schema,
+  }).strict(),
+  z.object({
+    result_kind: z.literal("project"),
+    project_id: opaqueIdV2Schema,
+  }).strict(),
+]);
+
+const lifecycleOperationBaseV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  operation_id: opaqueIdV2Schema,
+  kind: lifecycleOperationKindV2Schema,
+  resource: lifecycleResourceRefV2Schema,
+  request_sha256: sha256DigestV2Schema,
+  status: lifecycleOperationStatusV2Schema,
+  phase: lifecyclePhaseV2Schema,
+  phase_index: z.number().int().min(0).max(LIFECYCLE_PHASES_V2.length - 1),
+  phase_total: z.number().int().min(1).max(LIFECYCLE_PHASES_V2.length),
+  log_sequence_high_watermark: nonNegativeSafeIntegerV2Schema,
+  updated_at: utcTimestampV2Schema,
+  etag: etagV2Schema,
+}).strict();
+
+export const lifecycleOperationRefV2Schema = lifecycleOperationBaseV2Schema
+  .superRefine((value, context) => validateLifecycleIdentityAndPhaseV2(value, null, context));
+
+export const lifecycleOperationV2Schema = lifecycleOperationBaseV2Schema.extend({
+  progress: lifecycleProgressV2Schema.nullable(),
+  cancellable: z.boolean(),
+  result: lifecycleResultV2Schema.nullable(),
+  failure: desktopErrorV2Schema.nullable(),
+  created_at: utcTimestampV2Schema,
+  started_at: utcTimestampV2Schema.nullable(),
+  finished_at: utcTimestampV2Schema.nullable(),
+}).strict().superRefine((value, context) => {
+  validateLifecycleIdentityAndPhaseV2(value, value.result, context);
+  if (value.status === "succeeded") {
+    if (value.result === null) issue(context, ["result"], "succeeded operation requires a typed result");
+    if (value.failure !== null) issue(context, ["failure"], "succeeded operation cannot retain a failure");
+    if (value.phase !== "finalizing") issue(context, ["phase"], "succeeded operation requires the final phase");
+  } else if (value.status === "failed") {
+    if (value.failure === null) issue(context, ["failure"], "failed operation requires a typed failure");
+    if (value.result !== null) issue(context, ["result"], "failed operation cannot retain a result");
+  } else if (value.result !== null || value.failure !== null) {
+    issue(context, ["result"], "result and failure are terminal status fields");
+  }
+  const terminal = ["succeeded", "failed", "cancelled"].includes(value.status);
+  if (terminal !== (value.finished_at !== null)) {
+    issue(context, ["finished_at"], "finished timestamp must match terminal status");
+  }
+  if (terminal && value.cancellable) issue(context, ["cancellable"], "terminal operation cannot remain cancellable");
+  if (value.status === "queued" && value.started_at !== null) {
+    issue(context, ["started_at"], "queued operation cannot have a started timestamp");
+  }
+  if (value.status === "running" && value.started_at === null) {
+    issue(context, ["started_at"], "running operation requires a started timestamp");
+  }
+  const timestamps = [value.created_at, ...(value.started_at === null ? [] : [value.started_at]), value.updated_at]
+    .map((timestamp) => canonicalUtcTimestampV2(timestamp));
+  if (timestamps.some((timestamp) => timestamp === null)
+    || timestamps.some((timestamp, index) => index > 0 && timestamp! < timestamps[index - 1]!)) {
+    issue(context, ["updated_at"], "lifecycle timestamps cannot regress");
+  }
+  if (value.finished_at !== null
+    && canonicalUtcTimestampV2(value.finished_at) !== timestamps[timestamps.length - 1]) {
+    issue(context, ["finished_at"], "terminal timestamp must equal the immutable update timestamp");
+  }
+});
+
+export const lifecycleLogEntryV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  operation_id: opaqueIdV2Schema,
+  sequence: positiveSafeIntegerV2Schema,
+  occurred_at: utcTimestampV2Schema,
+  source: z.enum(["desktop", "ssh_stdout", "ssh_stderr", "daemon_stdout", "daemon_stderr"]),
+  text: z.string().min(1)
+    .refine((text) => utf8ByteLength(text) <= 16 * 1024, "lifecycle log text exceeds the UTF-8 byte limit")
+    .refine(isSafeLifecycleLogTextV2, "lifecycle log text contains a prohibited control character"),
+  truncated: z.boolean(),
+}).strict();
+
+export const lifecycleLogPageV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  operation_id: opaqueIdV2Schema,
+  dropped_before_sequence: nonNegativeSafeIntegerV2Schema,
+  items: z.array(lifecycleLogEntryV2Schema).max(100),
+  next_cursor: cursorV2Schema.nullable().default(null),
+  has_more: z.boolean(),
+}).strict().superRefine((value, context) => {
+  if (value.has_more !== (value.next_cursor !== null)) issue(context, ["next_cursor"], "has_more must match next_cursor presence");
+  const sequences = value.items.map((entry) => entry.sequence);
+  if (value.items.some((entry) => entry.operation_id !== value.operation_id)) {
+    issue(context, ["items"], "lifecycle log entry belongs to another operation");
+  }
+  if (sequences.some((sequence, index) => index > 0 && sequence <= sequences[index - 1]!)) {
+    issue(context, ["items"], "lifecycle log sequences must be unique and ascending");
+  }
+  if (sequences.some((sequence) => sequence <= value.dropped_before_sequence)) {
+    issue(context, ["dropped_before_sequence"], "lifecycle log entry is at or before the dropped boundary");
+  }
+});
+
+export const lifecycleCancelV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  expected_operation_id: opaqueIdV2Schema,
+}).strict();
+
+export const lifecycleAcknowledgeV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  expected_operation_id: opaqueIdV2Schema,
+  expected_terminal_status: z.enum(["succeeded", "failed", "cancelled"]),
+}).strict();
+
+export const coreOperationV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  operation_id: opaqueIdV2Schema,
+  kind: z.enum([
+    "transition_retry",
+    "transition_abandon",
+    "attempt_cancel",
+    "task_close",
+    "service_restart",
+    "diagnostic",
+    "cache_cleanup",
+  ]),
+  status: z.enum(["queued", "running", "succeeded", "failed", "cancelled"]),
+  progress_completed: z.number().int().min(0).max(10_000),
+  progress_total: z.number().int().min(0).max(10_000),
+  error: apiErrorV2Schema.nullable(),
+  created_at: utcTimestampV2Schema,
+  updated_at: utcTimestampV2Schema,
+  etag: etagV2Schema,
+}).strict();
+
+export const cacheCleanupRequestV2Schema = z.object({
+  schema_version: schemaVersionV2Schema,
+  scope: z.literal("safe_unreferenced").default("safe_unreferenced"),
+}).strict();
+
 export const localOperationV2Schema = z.object({
   schema_version: schemaVersionV2Schema,
   operation_id: opaqueIdV2Schema,
@@ -1059,6 +1271,7 @@ export const desktopStateV2Schema = z.object({
   profiles: z.array(remoteProfileV2Schema).max(MAX_PROFILE_COUNT_V2),
   active_profile_id: opaqueIdV2Schema.nullable(),
   active_project_id: opaqueIdV2Schema.nullable(),
+  pending_operations: z.array(lifecycleOperationRefV2Schema).max(16),
   last_event_id: opaqueIdV2Schema.nullable(),
   updated_at: utcTimestampV2Schema,
 }).strict().superRefine((value, context) => {
@@ -1066,6 +1279,7 @@ export const desktopStateV2Schema = z.object({
   if (value.active_profile_id !== null && !value.profiles.some((profile) => profile.profile_id === value.active_profile_id)) {
     issue(context, ["active_profile_id"], "active profile is absent from state");
   }
+  uniqueBy(value.pending_operations, (operation) => operation.operation_id, context, ["pending_operations"]);
 });
 
 export const serviceRestartV2Schema = z.object({
@@ -1114,11 +1328,22 @@ const diagnosticEventPayloadV2Schema = z.object({
   status: z.enum(["queued", "running", "ready", "failed"]),
 }).strict();
 
+const lifecycleOperationEventPayloadV2Schema = z.object({
+  payload_kind: z.literal("lifecycle_operation_changed"),
+  operation_id: opaqueIdV2Schema,
+  kind: lifecycleOperationKindV2Schema,
+  status: lifecycleOperationStatusV2Schema,
+  phase: lifecyclePhaseV2Schema,
+  etag: etagV2Schema,
+  log_sequence_high_watermark: nonNegativeSafeIntegerV2Schema,
+}).strict();
+
 export const desktopEventPayloadV2Schema = z.union([
   hostCatalogEventPayloadV2Schema,
   profileEventPayloadV2Schema,
   coreAuthorityEventPayloadV2Schema,
   diagnosticEventPayloadV2Schema,
+  lifecycleOperationEventPayloadV2Schema,
 ]);
 
 export const desktopEventTypeV2Schema = z.enum([
@@ -1126,6 +1351,7 @@ export const desktopEventTypeV2Schema = z.enum([
   "profile_connection_changed",
   "core_authority_changed",
   "diagnostic_changed",
+  "lifecycle_operation_changed",
 ]);
 
 export const desktopEventEnvelopeV2Schema = z.object({
@@ -1229,6 +1455,20 @@ export type ProfileDisplayNamePatchV2 = z.input<typeof profileDisplayNamePatchV2
 export type ProfileRebindV2 = z.input<typeof profileRebindV2Schema>;
 export type ProfileConnectionActionV2 = z.input<typeof profileConnectionActionV2Schema>;
 export type HostKeyReviewRequestV2 = z.input<typeof hostKeyReviewRequestV2Schema>;
+export type LifecycleOperationKindV2 = z.infer<typeof lifecycleOperationKindV2Schema>;
+export type LifecycleOperationStatusV2 = z.infer<typeof lifecycleOperationStatusV2Schema>;
+export type LifecyclePhaseV2 = z.infer<typeof lifecyclePhaseV2Schema>;
+export type LifecycleProgressV2 = z.infer<typeof lifecycleProgressV2Schema>;
+export type LifecycleResourceRefV2 = z.infer<typeof lifecycleResourceRefV2Schema>;
+export type LifecycleResultV2 = z.infer<typeof lifecycleResultV2Schema>;
+export type LifecycleOperationRefV2 = z.infer<typeof lifecycleOperationRefV2Schema>;
+export type LifecycleOperationV2 = z.infer<typeof lifecycleOperationV2Schema>;
+export type LifecycleLogEntryV2 = z.infer<typeof lifecycleLogEntryV2Schema>;
+export type LifecycleLogPageV2 = z.infer<typeof lifecycleLogPageV2Schema>;
+export type LifecycleCancelV2 = z.input<typeof lifecycleCancelV2Schema>;
+export type LifecycleAcknowledgeV2 = z.input<typeof lifecycleAcknowledgeV2Schema>;
+export type OperationV2 = z.infer<typeof coreOperationV2Schema>;
+export type CacheCleanupRequestV2 = z.input<typeof cacheCleanupRequestV2Schema>;
 export type LocalOperationV2 = z.infer<typeof localOperationV2Schema>;
 export type ScienceProjectConfigV2 = z.infer<typeof scienceProjectConfigV2Schema>;
 export type ProjectCreateV2 = z.input<typeof projectCreateV2Schema>;
@@ -1269,6 +1509,83 @@ export type DesktopEventTypeV2 = z.infer<typeof desktopEventTypeV2Schema>;
 export type DesktopSseFrameV2 = z.infer<typeof desktopSseFrameV2Schema>;
 export type EvolutionCapabilitiesV2 = z.infer<typeof evolutionCapabilitiesV2Schema>;
 export type CursorPageV2<T> = { schema_version: "2"; items: T[]; next_cursor: string | null; has_more: boolean };
+
+function validateLifecycleProgressV2(
+  value: { completed: number; total: number },
+  context: z.RefinementCtx,
+): void {
+  if (value.completed > value.total) issue(context, ["completed"], "completed progress exceeds total");
+}
+
+function validateLifecycleIdentityAndPhaseV2(
+  value: {
+    kind: z.output<typeof lifecycleOperationKindV2Schema>;
+    resource: z.output<typeof lifecycleResourceRefV2Schema>;
+    phase: z.output<typeof lifecyclePhaseV2Schema>;
+    phase_index: number;
+    phase_total: number;
+  },
+  result: z.output<typeof lifecycleResultV2Schema> | null,
+  context: z.RefinementCtx,
+): void {
+  const expectedResourceKind = ["profile_connect", "profile_disconnect", "host_key_review"].includes(value.kind)
+    ? "profile"
+    : value.kind === "native_workspace_prepare" ? "native_workspace" : "project";
+  if (value.resource.resource_kind !== expectedResourceKind) {
+    issue(context, ["resource", "resource_kind"], "operation kind and resource kind do not match");
+  }
+  if (value.phase_total !== LIFECYCLE_PHASES_V2.length) {
+    issue(context, ["phase_total"], "lifecycle phase total differs from the fixed phase plan");
+  }
+  if (LIFECYCLE_PHASES_V2[value.phase_index] !== value.phase) {
+    issue(context, ["phase_index"], "lifecycle phase index differs from the fixed phase plan");
+  }
+  if (result === null) return;
+  if (result.result_kind !== expectedResourceKind) {
+    issue(context, ["result", "result_kind"], "operation resource and result kind do not match");
+    return;
+  }
+  if (value.kind === "project_create") return;
+  const resultResourceId = result.result_kind === "profile"
+    ? result.profile_id
+    : result.result_kind === "native_workspace" ? result.import_id : result.project_id;
+  if (resultResourceId !== value.resource.resource_id) {
+    issue(context, ["result"], "operation result belongs to another resource");
+  }
+}
+
+function isSafeLifecycleLogTextV2(text: string): boolean {
+  return !Array.from(text).some((character) => {
+    const point = character.codePointAt(0)!;
+    return (point < 0x20 && character !== "\n" && character !== "\t")
+      || (point >= 0x7f && point <= 0x9f);
+  });
+}
+
+export function compareUtcTimestampsV2(left: string, right: string): number {
+  const canonicalLeft = canonicalUtcTimestampV2(left);
+  const canonicalRight = canonicalUtcTimestampV2(right);
+  if (canonicalLeft === null || canonicalRight === null) {
+    throw new RangeError("invalid UTC timestamp");
+  }
+  return canonicalLeft < canonicalRight ? -1 : canonicalLeft > canonicalRight ? 1 : 0;
+}
+
+function canonicalUtcTimestampV2(value: string): string | null {
+  const match = UTC_RFC3339_COMPONENTS.exec(value);
+  if (match === null) return null;
+  const [year, month, day, hour, minute, second] = match.slice(1, 7).map(Number);
+  if (year === undefined || month === undefined || day === undefined
+    || hour === undefined || minute === undefined || second === undefined
+    || year === 0 || month < 1 || month > 12 || hour > 23 || minute > 59 || second > 59) {
+    return null;
+  }
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31] as const;
+  if (day < 1 || day > monthDays[month - 1]!) return null;
+  const fraction = (match[7] ?? "").padEnd(9, "0");
+  return `${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}.${fraction}Z`;
+}
 
 function noControlCharacters(value: string): boolean {
   return !CONTROL_CHARACTERS.test(value);

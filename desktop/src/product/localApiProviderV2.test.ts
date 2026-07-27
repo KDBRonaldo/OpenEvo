@@ -71,8 +71,57 @@ function state(profiles: RemoteWorkspaceProfileV2[] = []): DesktopStateV2 {
     profiles,
     active_profile_id: null,
     active_project_id: null,
+    pending_operations: [],
     last_event_id: null,
     updated_at: NOW,
+  };
+}
+
+function lifecycleOperation() {
+  return {
+    schema_version: "2" as const,
+    operation_id: "lifecycle-profile-connect-1",
+    kind: "profile_connect" as const,
+    resource: { resource_kind: "profile" as const, resource_id: "profile-lab" },
+    request_sha256: DIGEST,
+    status: "queued" as const,
+    phase: "queued" as const,
+    phase_index: 1,
+    phase_total: 17,
+    progress: null,
+    cancellable: true,
+    result: null,
+    failure: null,
+    log_sequence_high_watermark: 0,
+    created_at: NOW,
+    started_at: null,
+    updated_at: NOW,
+    finished_at: null,
+    etag: ETAG,
+  };
+}
+
+function nativeLifecycleOperation(overrides: Record<string, unknown> = {}) {
+  return {
+    ...lifecycleOperation(),
+    operation_id: "lifecycle-native-workspace-1",
+    kind: "native_workspace_prepare",
+    resource: { resource_kind: "native_workspace", resource_id: "workspace-import-1" },
+    status: "succeeded",
+    phase: "finalizing",
+    phase_index: 16,
+    cancellable: false,
+    result: {
+      result_kind: "native_workspace",
+      import_id: "workspace-import-1",
+      content_sha256: DIGEST,
+      byte_size: 1_024,
+      entry_count: 1,
+      extracted_byte_size: 32,
+      display_name: "My workspace",
+    },
+    finished_at: NOW,
+    ...overrides,
   };
 }
 
@@ -101,17 +150,7 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
 }
 
 function nativeFixture(
-  selected: unknown = {
-    kind: "native_folder_snapshot",
-    display_name: "My workspace",
-    import_ref: {
-      import_id: "import-1",
-      content_sha256: DIGEST,
-      byte_size: 1_024,
-      entry_count: 1,
-      extracted_byte_size: 32,
-    },
-  },
+  selected: unknown = nativeLifecycleOperation(),
 ): LocalApiNativeBridgeV2 {
   return {
     selectProjectSource: vi.fn().mockResolvedValue(selected),
@@ -239,15 +278,7 @@ describe("Desktop v2 product provider", () => {
   it("derives connect CAS authority from the current profile", async () => {
     const current = profile();
     const client = clientFixture([current]);
-    vi.mocked(client.connectProfile).mockResolvedValue({
-      schema_version: "2",
-      operation_id: "operation-connect-1",
-      kind: "profile_connect",
-      status: "queued",
-      failure: null,
-      created_at: NOW,
-      updated_at: NOW,
-    });
+    vi.mocked(client.connectProfile).mockResolvedValue(lifecycleOperation());
     const provider = createLocalApiDesktopProductProviderV2({
       client,
       native: nativeFixture(),
@@ -292,18 +323,9 @@ describe("Desktop v2 product provider", () => {
 
     const poisoned = createLocalApiDesktopProductProviderV2({
       client: clientFixture(),
-      native: nativeFixture({
-        kind: "native_folder_snapshot",
-        display_name: "My workspace",
-        import_ref: {
-          import_id: "import-1",
-          content_sha256: DIGEST,
-          byte_size: 1_024,
-          entry_count: 1,
-          extracted_byte_size: 32,
-        },
+      native: nativeFixture(nativeLifecycleOperation({
         selected_path: "/Users/researcher/secret-project",
-      }),
+      })),
       featureFlags: ["system_openssh_profiles"],
     });
     const poisonedRefresh = await poisoned.refresh();

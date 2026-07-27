@@ -9,7 +9,9 @@ import type {
   DiagnosticV2,
   EvolutionRevisionRefV2,
   HostKeyReviewRequestV2,
+  LifecycleOperationV2,
   LocalOperationV2,
+  OperationV2,
   ProfileDisplayNamePatchV2,
   ProjectCapabilityProjectionV2,
   ProjectCreateV2,
@@ -26,6 +28,8 @@ import type {
   SuccessorTransitionV2,
   TaskV2,
 } from "../api/v2/schemas";
+
+export type ProductOperationV2 = LocalOperationV2 | LifecycleOperationV2 | OperationV2;
 
 export type ProductStreamStateV2 =
   | { readonly status: "fresh"; readonly epoch: number; readonly lastEventId: string | null }
@@ -45,7 +49,7 @@ export interface DesktopProductSnapshotV2 {
   readonly services: readonly ServiceV2[];
   readonly capability: ProjectCapabilityProjectionV2 | null;
   readonly validation: ProjectValidationV2 | null;
-  readonly activeOperation: LocalOperationV2 | null;
+  readonly activeOperation: ProductOperationV2 | null;
   readonly stream: ProductStreamStateV2;
 }
 
@@ -93,29 +97,29 @@ export interface DesktopProductProviderV2 {
   renameProfile(profileId: string, input: ProfileDisplayNamePatchV2, intent: ProductMutationIntentV2): Promise<RemoteProfileV2>;
   deleteProfile(profileId: string, intent: ProductMutationIntentV2): Promise<void>;
   rebindProfile(profileId: string, sshHostAlias: string, intent: ProductMutationIntentV2): Promise<RemoteWorkspaceProfileV2>;
-  connectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
-  disconnectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
-  reviewHostKey(profileId: string, action: HostKeyReviewRequestV2["action"], intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  connectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
+  disconnectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
+  reviewHostKey(profileId: string, action: HostKeyReviewRequestV2["action"], intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   selectNativeWorkspace(intent: NativeWorkspaceSelectionIntentV2): Promise<NativeWorkspaceSourceV2>;
   cancelNativeWorkspace(actionId: string): Promise<void>;
   settleNativeWorkspace(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
   createProject(draft: ProjectDraftV2, intent: ProductMutationIntentV2): Promise<ProjectV2>;
   updateProject(projectId: string, displayName: string, config: ScienceProjectConfigV2, intent: ProductMutationIntentV2): Promise<ProjectV2>;
-  activateProject(projectId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  activateProject(projectId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   loadProjectCapabilities(projectId: string): Promise<ProjectCapabilityProjectionV2>;
   validateProject(projectId: string, intent: ProductMutationIntentV2): Promise<ProjectValidationV2>;
   submitTask(projectId: string, intent: ProductMutationIntentV2): Promise<TaskV2>;
-  cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;
   getRuntimeContext(runtimeContextSnapshotId: string): Promise<RuntimeContextSnapshotRefV2>;
-  retryTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  retryTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   replaceTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
-  abandonTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  abandonTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV2>;
   getArtifactDiff(artifactId: string, previousArtifactId?: string): Promise<ArtifactDiffV2>;
-  restartService(serviceId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  restartService(serviceId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   createDiagnostic(input: Omit<DiagnosticRequestV2, "schema_version" | "profile_id" | "profile_connection_generation">, intent: ProductMutationIntentV2): Promise<DiagnosticV2>;
   getDiagnostic(diagnosticId: string): Promise<DiagnosticV2>;
 }

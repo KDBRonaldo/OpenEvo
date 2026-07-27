@@ -41,12 +41,12 @@ const RELEASE_ASSETS_DIRECTORY: &str = "openevo-release-assets";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v2";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
+    "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a";
 const DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256: &str =
-    "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
-const DESKTOP_RELEASE_VERSION: &str = "0.1.9";
+    "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
+const DESKTOP_RELEASE_VERSION: &str = "0.1.10";
 const DESKTOP_FEATURE_SET_SHA256: &str =
-    "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
+    "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
 const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V2";
 const RENDERER_STAGE_VOCABULARY: [&str; 20] = [
@@ -146,6 +146,7 @@ const NATIVE_WORKSPACE_CANCEL_GRACE: Duration = Duration::from_secs(3);
 const NATIVE_WORKSPACE_IO_POLL: Duration = Duration::from_millis(50);
 const MAX_PENDING_WORKSPACE_IMPORTS: usize = 64;
 const MAX_CANCELLED_PICKER_ACTIONS: usize = 64;
+const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const RUN_RETRY_RECOVERY_MAX_BYTES: usize = 1024 * 1024;
 const RUN_RETRY_RECOVERY_DIRECTORY_NAME: &str = "native-state-v2";
 const RUN_RETRY_RECOVERY_FILE_NAME: &str = ".7f3d8b24c1a94762";
@@ -1385,16 +1386,22 @@ enum FeatureFlagV2 {
     DaemonBundleV2,
     EventReplayV2,
     HostKeyReview,
+    LifecycleOperationsV2,
+    LifecycleProcessLogsV2,
+    MutationIdempotencyV2,
     NativeAskpass,
     SystemOpensshProfiles,
     TaskAdmissionV2,
 }
 
-const REQUIRED_DESKTOP_FEATURE_FLAGS: [FeatureFlagV2; 7] = [
+const REQUIRED_DESKTOP_FEATURE_FLAGS: [FeatureFlagV2; 10] = [
     FeatureFlagV2::CoreControlV2,
     FeatureFlagV2::DaemonBundleV2,
     FeatureFlagV2::EventReplayV2,
     FeatureFlagV2::HostKeyReview,
+    FeatureFlagV2::LifecycleOperationsV2,
+    FeatureFlagV2::LifecycleProcessLogsV2,
+    FeatureFlagV2::MutationIdempotencyV2,
     FeatureFlagV2::NativeAskpass,
     FeatureFlagV2::SystemOpensshProfiles,
     FeatureFlagV2::TaskAdmissionV2,
@@ -1469,47 +1476,81 @@ struct NativeWorkspaceSelection<'a> {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeWorkspaceImportRefV2 {
+struct NativeLifecycleResourceRefV2 {
+    resource_kind: String,
+    resource_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum NativeLifecycleProgressV2 {
+    Indeterminate,
+    Bytes { completed: u64, total: u64 },
+    Items { completed: u64, total: u64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeLifecycleResultV2 {
+    result_kind: String,
     import_id: String,
     content_sha256: String,
     byte_size: u64,
     entry_count: u64,
     extracted_byte_size: u64,
+    display_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeProjectSourceV2 {
-    kind: String,
-    display_name: String,
-    import_ref: NativeWorkspaceImportRefV2,
+struct NativeLifecycleFailureV2 {
+    schema_version: String,
+    code: String,
+    summary: String,
+    retryable: bool,
+    action: String,
+    affected_resource_id: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeWorkspaceImportResponseV2 {
+struct NativeLifecycleOperationV2 {
     schema_version: String,
-    source: NativeProjectSourceV2,
-    lease_token: String,
+    operation_id: String,
+    kind: String,
+    resource: NativeLifecycleResourceRefV2,
+    request_sha256: String,
+    status: String,
+    phase: String,
+    phase_index: u8,
+    phase_total: u8,
+    progress: Option<NativeLifecycleProgressV2>,
+    cancellable: bool,
+    result: Option<NativeLifecycleResultV2>,
+    failure: Option<NativeLifecycleFailureV2>,
+    log_sequence_high_watermark: u64,
+    created_at: String,
+    started_at: Option<String>,
+    updated_at: String,
+    finished_at: Option<String>,
+    etag: String,
 }
 
 #[derive(Serialize)]
 struct NativeWorkspaceDiscardRequestV2<'a> {
     schema_version: &'static str,
     action_id: &'a str,
-    import_ref: &'a NativeWorkspaceImportRefV2,
-    lease_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_id: Option<&'a str>,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 struct PendingNativeWorkspaceImport {
     sidecar_instance: [u8; INSTANCE_ID_BYTES],
     action_id: String,
     project_id: Option<String>,
-    source: NativeProjectSourceV2,
-    lease_token: String,
+    lifecycle: NativeLifecycleOperationV2,
+    operation: Arc<NativePickerOperation>,
 }
 
 struct NativePickerOperation {
@@ -1854,6 +1895,17 @@ fn cancel_active_picker(
             .expect("active picker disappeared while locked");
         operation.cancel();
         return Ok(Some(operation));
+    }
+    drop(active);
+    if let Some(pending) = state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?
+        .get(action_id)
+        .cloned()
+    {
+        pending.operation.cancel();
+        return Ok(Some(pending.operation));
     }
     let mut cancelled = state
         .cancelled_picker_actions
@@ -4097,7 +4149,7 @@ fn register_native_workspace_source(
     handoff_token: &str,
     selection: NativeWorkspaceSelection<'_>,
     operation: &NativePickerOperation,
-) -> HostResult<NativeWorkspaceImportResponseV2> {
+) -> HostResult<NativeLifecycleOperationV2> {
     if selection.kind != "native_folder_snapshot"
         || selection.action_id.len() < 16
         || selection.action_id.len() > 256
@@ -4147,23 +4199,17 @@ fn register_native_workspace_source(
             workspace_import_error()
         }
     })?;
-    if response.status != 201 {
+    if response.status != 202 {
         return Err(if operation.is_cancelled() {
             workspace_selection_cancelled_error()
         } else {
             workspace_import_error()
         });
     }
-    let pending: NativeWorkspaceImportResponseV2 =
+    let lifecycle: NativeLifecycleOperationV2 =
         serde_json::from_str(&response.body).map_err(|_| workspace_import_error())?;
-    if pending.schema_version != "2"
-        || pending.lease_token.len() != 64
-        || !pending.lease_token.bytes().all(is_lower_hex)
-    {
-        return Err(workspace_import_error());
-    }
-    validate_native_project_source(&pending.source)?;
-    Ok(pending)
+    validate_native_lifecycle_operation(&lifecycle, selection.action_id)?;
+    Ok(lifecycle)
 }
 
 fn cancel_native_workspace_operation(
@@ -4202,8 +4248,6 @@ fn discard_native_workspace_source(
     let body = serde_json::to_vec(&NativeWorkspaceDiscardRequestV2 {
         schema_version: "2",
         action_id: &pending.action_id,
-        import_ref: &pending.source.import_ref,
-        lease_token: &pending.lease_token,
         project_id: pending.project_id.as_deref(),
     })
     .map_err(|_| workspace_import_error())?;
@@ -4223,35 +4267,278 @@ fn discard_native_workspace_source(
     Ok(())
 }
 
-fn validate_native_project_source(source: &NativeProjectSourceV2) -> HostResult<()> {
-    let import = &source.import_ref;
-    let import_suffix = import
-        .import_id
-        .strip_prefix("workspace-import-")
-        .ok_or_else(workspace_import_error)?;
-    if source.kind != "native_folder_snapshot"
-        || source.display_name.is_empty()
-        || source.display_name.len() > 256
-        || source.display_name.trim() != source.display_name
-        || matches!(source.display_name.as_str(), "." | "..")
-        || source.display_name.contains(['/', '\\'])
-        || source
-            .display_name
-            .chars()
-            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
-        || import_suffix.len() != 48
-        || !import_suffix.bytes().all(is_lower_hex)
-        || import.content_sha256.len() != 64
-        || !import.content_sha256.bytes().all(is_lower_hex)
-        || !(1024..=16 * 1024 * 1024 * 1024).contains(&import.byte_size)
-        || !import.byte_size.is_multiple_of(512)
-        || import.entry_count > 100_000
-        || import.extracted_byte_size > 16 * 1024 * 1024 * 1024
-        || (import.entry_count == 0 && import.extracted_byte_size != 0)
+const NATIVE_LIFECYCLE_PHASES: [&str; 17] = [
+    "validation",
+    "queued",
+    "resolving_system_openssh",
+    "connecting",
+    "waiting_for_user",
+    "remote_preflight",
+    "transferring",
+    "verifying",
+    "starting_daemon",
+    "waiting_for_daemon",
+    "opening_project_tunnel",
+    "negotiating_core",
+    "preparing_native_workspace",
+    "creating_remote_project",
+    "verifying_project",
+    "activating",
+    "finalizing",
+];
+
+fn native_import_id_for_action_v2(action_id: &str) -> HostResult<String> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"openevo.desktop.native-import.v1\0");
+    hasher.update(action_id.as_bytes());
+    let digest = encode_hex(&hasher.finalize());
+    Ok(format!("workspace-import-{}", &digest[..48]))
+}
+
+fn validate_native_lifecycle_operation(
+    operation: &NativeLifecycleOperationV2,
+    action_id: &str,
+) -> HostResult<()> {
+    let expected_import_id = native_import_id_for_action_v2(action_id)?;
+    if operation.schema_version != "2"
+        || !is_valid_opaque_id_v2(&operation.operation_id)
+        || operation.kind != "native_workspace_prepare"
+        || operation.resource.resource_kind != "native_workspace"
+        || operation.resource.resource_id != expected_import_id
+        || !is_digest_v2(&operation.request_sha256)
+        || operation.phase_total as usize != NATIVE_LIFECYCLE_PHASES.len()
+        || operation.phase_index as usize >= NATIVE_LIFECYCLE_PHASES.len()
+        || NATIVE_LIFECYCLE_PHASES[operation.phase_index as usize] != operation.phase
+        || operation.log_sequence_high_watermark > MAX_JAVASCRIPT_SAFE_INTEGER
+        || !is_etag_v2(&operation.etag)
     {
         return Err(workspace_import_error());
     }
+    match operation.status.as_str() {
+        "queued" | "running" | "succeeded" | "failed" | "cancelled" => {}
+        _ => return Err(workspace_import_error()),
+    }
+    if let Some(progress) = &operation.progress {
+        match progress {
+            NativeLifecycleProgressV2::Indeterminate => {}
+            NativeLifecycleProgressV2::Bytes { completed, total }
+            | NativeLifecycleProgressV2::Items { completed, total } => {
+                if *total == 0 || *total > MAX_JAVASCRIPT_SAFE_INTEGER || *completed > *total {
+                    return Err(workspace_import_error());
+                }
+            }
+        }
+    }
+    let created_at =
+        parse_utc_timestamp_v2(&operation.created_at).ok_or_else(workspace_import_error)?;
+    let started_at = operation
+        .started_at
+        .as_deref()
+        .map(parse_utc_timestamp_v2)
+        .transpose_option()
+        .ok_or_else(workspace_import_error)?;
+    let updated_at =
+        parse_utc_timestamp_v2(&operation.updated_at).ok_or_else(workspace_import_error)?;
+    let finished_at = operation
+        .finished_at
+        .as_deref()
+        .map(parse_utc_timestamp_v2)
+        .transpose_option()
+        .ok_or_else(workspace_import_error)?;
+    let mut timestamps = vec![created_at];
+    if let Some(started) = started_at {
+        timestamps.push(started);
+    }
+    timestamps.push(updated_at);
+    if timestamps.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(workspace_import_error());
+    }
+    let terminal = matches!(
+        operation.status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    );
+    if terminal != finished_at.is_some()
+        || terminal && operation.cancellable
+        || operation.status == "queued" && started_at.is_some()
+        || operation.status == "running" && started_at.is_none()
+        || finished_at.is_some_and(|finished| finished != updated_at)
+    {
+        return Err(workspace_import_error());
+    }
+    match operation.status.as_str() {
+        "succeeded" => {
+            let result = operation
+                .result
+                .as_ref()
+                .ok_or_else(workspace_import_error)?;
+            if operation.failure.is_some()
+                || operation.phase != "finalizing"
+                || !validate_native_lifecycle_result(result, &expected_import_id)
+            {
+                return Err(workspace_import_error());
+            }
+        }
+        "failed" => {
+            let failure = operation
+                .failure
+                .as_ref()
+                .ok_or_else(workspace_import_error)?;
+            if operation.result.is_some() || !validate_native_lifecycle_failure(failure) {
+                return Err(workspace_import_error());
+            }
+        }
+        _ if operation.result.is_some() || operation.failure.is_some() => {
+            return Err(workspace_import_error());
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+trait TransposeOption<T> {
+    fn transpose_option(self) -> Option<Option<T>>;
+}
+
+impl<T> TransposeOption<T> for Option<Option<T>> {
+    fn transpose_option(self) -> Option<Option<T>> {
+        match self {
+            Some(Some(value)) => Some(Some(value)),
+            Some(None) => None,
+            None => Some(None),
+        }
+    }
+}
+
+fn validate_native_lifecycle_result(
+    result: &NativeLifecycleResultV2,
+    expected_import_id: &str,
+) -> bool {
+    result.result_kind == "native_workspace"
+        && result.import_id == expected_import_id
+        && is_digest_v2(&result.content_sha256)
+        && (1..=MAX_JAVASCRIPT_SAFE_INTEGER).contains(&result.byte_size)
+        && result.entry_count <= MAX_JAVASCRIPT_SAFE_INTEGER
+        && result.extracted_byte_size <= MAX_JAVASCRIPT_SAFE_INTEGER
+        && is_valid_display_name_v2(&result.display_name)
+}
+
+fn validate_native_lifecycle_failure(failure: &NativeLifecycleFailureV2) -> bool {
+    failure.schema_version == "2"
+        && is_valid_error_code_v2(&failure.code)
+        && !failure.summary.is_empty()
+        && failure.summary.chars().count() <= 512
+        && matches!(
+            failure.action.as_str(),
+            "retry"
+                | "rescan"
+                | "review_host_key"
+                | "rebind"
+                | "reconnect"
+                | "install_repair_daemon"
+                | "administrator_action"
+                | "correct_project"
+                | "wait_for_successor"
+                | "none"
+        )
+        && failure
+            .affected_resource_id
+            .as_deref()
+            .is_none_or(is_valid_opaque_id_v2)
+}
+
+fn is_valid_opaque_id_v2(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_valid_error_code_v2(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn is_digest_v2(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(is_lower_hex)
+}
+
+fn is_etag_v2(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value.as_bytes()[1..65].iter().copied().all(is_lower_hex)
+}
+
+fn is_valid_display_name_v2(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 128
+        && value.trim() == value
+        && !matches!(value, "." | "..")
+        && !value.contains(['/', '\\'])
+        && !value
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+}
+
+fn parse_utc_timestamp_v2(value: &str) -> Option<(u16, u8, u8, u8, u8, u8, u32)> {
+    let bytes = value.as_bytes();
+    if !(bytes.len() == 20 || (22..=30).contains(&bytes.len()))
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.last() != Some(&b'Z')
+    {
+        return None;
+    }
+    let year = parse_ascii_digits(&bytes[0..4])? as u16;
+    let month = parse_ascii_digits(&bytes[5..7])? as u8;
+    let day = parse_ascii_digits(&bytes[8..10])? as u8;
+    let hour = parse_ascii_digits(&bytes[11..13])? as u8;
+    let minute = parse_ascii_digits(&bytes[14..16])? as u8;
+    let second = parse_ascii_digits(&bytes[17..19])? as u8;
+    let nanos = if bytes.len() == 20 {
+        0
+    } else {
+        if bytes[19] != b'.' {
+            return None;
+        }
+        let digits = &bytes[20..bytes.len() - 1];
+        let fraction = parse_ascii_digits(digits)?;
+        fraction.checked_mul(10_u32.pow((9 - digits.len()) as u32))?
+    };
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year == 0 || day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some((year, month, day, hour, minute, second, nanos))
+}
+
+fn parse_ascii_digits(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))
+    })
 }
 
 fn remember_pending_workspace_import(
@@ -4264,7 +4551,13 @@ fn remember_pending_workspace_import(
         .map_err(|_| workspace_import_error())?;
     imports.retain(|_, value| value.sidecar_instance == pending.sidecar_instance);
     if let Some(existing) = imports.get(&pending.action_id) {
-        return if existing == &pending {
+        return if existing.sidecar_instance == pending.sidecar_instance
+            && existing.action_id == pending.action_id
+            && existing.project_id == pending.project_id
+            && existing.lifecycle.operation_id == pending.lifecycle.operation_id
+            && existing.lifecycle.resource == pending.lifecycle.resource
+            && Arc::ptr_eq(&existing.operation, &pending.operation)
+        {
             Ok(())
         } else {
             Err(workspace_import_error())
@@ -4275,6 +4568,21 @@ fn remember_pending_workspace_import(
     }
     imports.insert(pending.action_id.clone(), pending);
     Ok(())
+}
+
+fn pending_workspace_import(
+    state: &DesktopHostState,
+    action_id: &str,
+) -> HostResult<Option<PendingNativeWorkspaceImport>> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    Ok(state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?
+        .get(action_id)
+        .cloned())
 }
 
 fn take_pending_workspace_import(
@@ -7405,11 +7713,20 @@ async fn select_project_source(
     kind: String,
     action_id: String,
     project_id: Option<String>,
-) -> HostResult<NativeProjectSourceV2> {
+) -> HostResult<NativeLifecycleOperationV2> {
     if kind != "native_folder_snapshot" {
         return Err(workspace_selection_error());
     }
     let expected_instance = active_sidecar_instance(&state)?;
+    if let Some(pending) = pending_workspace_import(&state, &action_id)? {
+        if pending.sidecar_instance == expected_instance {
+            if pending.project_id != project_id {
+                return Err(workspace_import_error());
+            }
+            return Ok(pending.lifecycle);
+        }
+        let _ = take_pending_workspace_import(&state, &action_id)?;
+    }
     let picker_claim = PickerClaim::acquire(&state, action_id.clone(), expected_instance)?;
     let operation = picker_claim.operation.clone();
     let selected =
@@ -7452,8 +7769,8 @@ async fn select_project_source(
         sidecar_instance: expected_instance,
         action_id: pending_action_id,
         project_id: pending_project_id,
-        source: response.source.clone(),
-        lease_token: response.lease_token,
+        lifecycle: response.clone(),
+        operation: operation.clone(),
     };
     if let Err(error) = remember_pending_workspace_import(&state, pending.clone()) {
         if let Ok(ActiveSidecarConnection {
@@ -7462,7 +7779,11 @@ async fn select_project_source(
         }) = active_sidecar_connection(&state, expected_instance)
         {
             let _ = tauri::async_runtime::spawn_blocking(move || {
-                discard_native_workspace_source(&mut stream, handoff_token.expose(), &pending)
+                cancel_native_workspace_operation(
+                    &mut stream,
+                    handoff_token.expose(),
+                    &pending.operation,
+                )
             })
             .await;
         }
@@ -7474,22 +7795,19 @@ async fn select_project_source(
             handoff_token,
         }) = active_sidecar_connection(&state, expected_instance)
         {
-            let pending_to_discard = pending.clone();
-            let discard_result = tauri::async_runtime::spawn_blocking(move || {
-                discard_native_workspace_source(
+            let pending_to_cancel = pending.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                cancel_native_workspace_operation(
                     &mut stream,
                     handoff_token.expose(),
-                    &pending_to_discard,
+                    &pending_to_cancel.operation,
                 )
             })
             .await;
-            if matches!(discard_result, Ok(Ok(()))) {
-                let _ = take_pending_workspace_import(&state, &pending.action_id);
-            }
         }
         return Err(workspace_selection_cancelled_error());
     }
-    Ok(response.source)
+    Ok(response)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -9474,27 +9792,13 @@ mod tests {
             assert!(headers.contains(NATIVE_WORKSPACE_IMPORT_ROUTE));
             write_json_response(
                 &mut accepted,
-                201,
-                serde_json::json!({
-                    "schema_version": "2",
-                    "lease_token": "3c".repeat(32),
-                    "source": {
-                        "kind": "native_folder_snapshot",
-                        "display_name": "study",
-                        "import_ref": {
-                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                            "content_sha256": "2b".repeat(32),
-                            "byte_size": 1024,
-                            "entry_count": 1,
-                            "extracted_byte_size": 4,
-                        }
-                    },
-                }),
+                202,
+                valid_native_workspace_operation("native-source-action-pinned-0001"),
             );
         });
 
         let operation = test_picker_operation("native-source-action-pinned-0001");
-        let source = register_native_workspace_source(
+        let lifecycle = register_native_workspace_source(
             &mut stream,
             handoff_token.expose(),
             NativeWorkspaceSelection {
@@ -9510,7 +9814,11 @@ mod tests {
         .unwrap();
         old_server.join().unwrap();
 
-        assert_eq!(source.source.display_name, "study");
+        assert_eq!(lifecycle.kind, "native_workspace_prepare");
+        assert_eq!(
+            lifecycle.resource.resource_id,
+            test_native_import_id("native-source-action-pinned-0001")
+        );
         assert_eq!(old_port, stream.peer_addr().unwrap().port());
         assert!(matches!(
             replacement_probe.accept(),
@@ -9664,18 +9972,13 @@ mod tests {
                     sidecar_instance: [0x11; INSTANCE_ID_BYTES],
                     action_id,
                     project_id: None,
-                    source: NativeProjectSourceV2 {
-                        kind: "native_folder_snapshot".to_string(),
-                        display_name: "study".to_string(),
-                        import_ref: NativeWorkspaceImportRefV2 {
-                            import_id: format!("workspace-import-{:048x}", index),
-                            content_sha256: format!("{:064x}", index),
-                            byte_size: 1024,
-                            entry_count: 1,
-                            extracted_byte_size: 4,
-                        },
-                    },
-                    lease_token: format!("{:064x}", index),
+                    lifecycle: serde_json::from_value(valid_native_workspace_operation(&format!(
+                        "native-pending-action-{index:04}"
+                    )))
+                    .unwrap(),
+                    operation: Arc::new(test_picker_operation(&format!(
+                        "native-pending-action-{index:04}"
+                    ))),
                 },
             )
             .unwrap();
@@ -9684,16 +9987,11 @@ mod tests {
             sidecar_instance: [0x11; INSTANCE_ID_BYTES],
             action_id: "native-pending-action-overflow".to_string(),
             project_id: None,
-            source: state
-                .pending_workspace_imports
-                .lock()
-                .unwrap()
-                .values()
-                .next()
-                .unwrap()
-                .source
-                .clone(),
-            lease_token: "ff".repeat(32),
+            lifecycle: serde_json::from_value(valid_native_workspace_operation(
+                "native-pending-action-overflow",
+            ))
+            .unwrap(),
+            operation: Arc::new(test_picker_operation("native-pending-action-overflow")),
         };
 
         assert!(remember_pending_workspace_import(&state, overflow).is_err());
@@ -9704,7 +10002,7 @@ mod tests {
     }
 
     #[test]
-    fn native_workspace_discard_uses_the_hidden_lease_route() {
+    fn native_workspace_discard_derives_authority_from_the_hidden_action() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
@@ -9713,18 +10011,11 @@ mod tests {
             sidecar_instance: [0x11; INSTANCE_ID_BYTES],
             action_id: "native-pending-action-discard-0001".to_string(),
             project_id: Some("project-existing-1".to_string()),
-            source: NativeProjectSourceV2 {
-                kind: "native_folder_snapshot".to_string(),
-                display_name: "study".to_string(),
-                import_ref: NativeWorkspaceImportRefV2 {
-                    import_id: format!("workspace-import-{}", "1a".repeat(24)),
-                    content_sha256: "2b".repeat(32),
-                    byte_size: 1024,
-                    entry_count: 1,
-                    extracted_byte_size: 4,
-                },
-            },
-            lease_token: "3c".repeat(32),
+            lifecycle: serde_json::from_value(valid_native_workspace_operation(
+                "native-pending-action-discard-0001",
+            ))
+            .unwrap(),
+            operation: Arc::new(test_picker_operation("native-pending-action-discard-0001")),
         };
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -9736,8 +10027,10 @@ mod tests {
                 .lines()
                 .any(|line| line == format!("{NATIVE_HANDOFF_HEADER}: {expected_token}")));
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["lease_token"], "3c".repeat(32));
             assert_eq!(body["action_id"], "native-pending-action-discard-0001");
+            assert_eq!(body["project_id"], "project-existing-1");
+            assert!(body.get("lease_token").is_none());
+            assert!(body.get("import_ref").is_none());
             assert!(body.get("selected_path").is_none());
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -9839,28 +10132,14 @@ mod tests {
             );
             write_json_response(
                 &mut stream,
-                201,
-                serde_json::json!({
-                    "schema_version": "2",
-                    "lease_token": "3c".repeat(32),
-                    "source": {
-                        "kind": "native_folder_snapshot",
-                        "display_name": "study",
-                        "import_ref": {
-                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                            "content_sha256": "2b".repeat(32),
-                            "byte_size": 1024,
-                            "entry_count": 1,
-                            "extracted_byte_size": 4,
-                        }
-                    },
-                }),
+                202,
+                valid_native_workspace_operation("native-source-action-0001"),
             );
         });
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let operation = test_picker_operation("native-source-action-0001");
-        let source = register_native_workspace_source(
+        let lifecycle = register_native_workspace_source(
             &mut stream,
             &handoff_token,
             NativeWorkspaceSelection {
@@ -9876,9 +10155,8 @@ mod tests {
         .unwrap();
         server.join().unwrap();
 
-        let renderer_data = serde_json::to_string(&source.source).unwrap();
-        assert_eq!(source.source.display_name, "study");
-        assert!(!renderer_data.contains(&source.lease_token));
+        let renderer_data = serde_json::to_string(&lifecycle).unwrap();
+        assert_eq!(lifecycle.kind, "native_workspace_prepare");
         assert!(!renderer_data.contains("/Users"));
         assert!(!renderer_data.contains("private"));
         assert!(!renderer_data.contains("selected_path"));
@@ -9886,60 +10164,23 @@ mod tests {
 
     #[test]
     fn native_workspace_registration_rejects_open_or_malformed_responses() {
-        for body in [
-            serde_json::json!({
-                "schema_version": "2",
-                "lease_token": "3c".repeat(32),
-                "source": {
-                    "kind": "native_folder_snapshot",
-                    "display_name": "study",
-                    "selected_path": "/private/study",
-                    "import_ref": {
-                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
-                },
-            }),
-            serde_json::json!({
-                "schema_version": "2",
-                "lease_token": "3c".repeat(32),
-                "source": {
-                    "kind": "native_folder_snapshot",
-                    "display_name": "study",
-                    "import_ref": {
-                        "import_id": "workspace-import-not-opaque",
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
-                },
-            }),
-            serde_json::json!({
-                "schema_version": "2",
-                "lease_token": "3c".repeat(32),
-                "source": {
-                    "kind": "native_folder_snapshot",
-                    "display_name": "/Users/researcher/private/study",
-                    "import_ref": {
-                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
-                },
-            }),
-        ] {
+        let mut open = valid_native_workspace_operation("native-source-action-0002");
+        open.as_object_mut().unwrap().insert(
+            "selected_path".to_string(),
+            serde_json::json!("/private/study"),
+        );
+        let mut wrong_resource = valid_native_workspace_operation("native-source-action-0002");
+        wrong_resource["resource"]["resource_id"] =
+            serde_json::json!("workspace-import-not-the-action");
+        let mut malformed_status = valid_native_workspace_operation("native-source-action-0002");
+        malformed_status["status"] = serde_json::json!("succeeded");
+        for body in [open, wrong_resource, malformed_status] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let _ = read_http_request_with_body(&mut stream);
-                write_json_response(&mut stream, 201, body);
+                write_json_response(&mut stream, 202, body);
             });
 
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -12333,6 +12574,9 @@ https://user:password@example.invalid/private\n"[..],
                 "daemon_bundle_v2",
                 "event_replay_v2",
                 "host_key_review",
+                "lifecycle_operations_v2",
+                "lifecycle_process_logs_v2",
+                "mutation_idempotency_v2",
                 "native_askpass",
                 "system_openssh_profiles",
                 "task_admission_v2"
@@ -12482,6 +12726,44 @@ https://user:password@example.invalid/private\n"[..],
             cancellation_token: [0x4d; WORKSPACE_CANCELLATION_TOKEN_BYTES],
             cancelled: AtomicBool::new(false),
         }
+    }
+
+    fn test_native_import_id(action_id: &str) -> String {
+        let digest = Sha256::digest(
+            [
+                b"openevo.desktop.native-import.v1\0".as_slice(),
+                action_id.as_bytes(),
+            ]
+            .concat(),
+        );
+        format!("workspace-import-{}", &encode_hex(&digest)[..48])
+    }
+
+    fn valid_native_workspace_operation(action_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "2",
+            "operation_id": format!("lifecycle-native-{}", &test_native_import_id(action_id)[17..]),
+            "kind": "native_workspace_prepare",
+            "resource": {
+                "resource_kind": "native_workspace",
+                "resource_id": test_native_import_id(action_id),
+            },
+            "request_sha256": "2b".repeat(32),
+            "status": "queued",
+            "phase": "queued",
+            "phase_index": 1,
+            "phase_total": 17,
+            "progress": null,
+            "cancellable": true,
+            "result": null,
+            "failure": null,
+            "log_sequence_high_watermark": 0,
+            "created_at": "2026-07-27T08:00:00Z",
+            "started_at": null,
+            "updated_at": "2026-07-27T08:00:00Z",
+            "finished_at": null,
+            "etag": format!("\"{}\"", "3c".repeat(32)),
+        })
     }
 
     fn test_bootstrap_state() -> SidecarBootstrapState {

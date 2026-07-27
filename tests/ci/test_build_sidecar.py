@@ -58,8 +58,6 @@ def _write_repo_skeleton(repo: Path) -> None:
                     "scaffold",
                     "dry-run",
                     "dry_run",
-                    "stdout",
-                    "stderr",
                     "host path",
                     "host_path",
                     "host-path",
@@ -703,8 +701,6 @@ def test_product_web_build_requires_exact_audited_dist_and_packaged_assets(
         "scaffold",
         "dry-run",
         "dry_run",
-        "stdout",
-        "stderr",
         "host path",
         "host_path",
         "host-path",
@@ -733,6 +729,25 @@ def test_product_web_policy_rejects_every_non_release_provider_kind() -> None:
     assert {"contract_simulator", "scaffold", "dry_run"}.issubset(policy["forbidden_text"])
     schemas = Path("desktop/src/api/v1/schemas.ts").read_text(encoding="utf-8")
     assert '["dry", "run"].join("_")' not in schemas
+
+
+def test_product_web_policy_allows_sanitized_lifecycle_process_log_sources(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    lifecycle_sources = "ssh_stdout ssh_stderr daemon_stdout daemon_stderr"
+    _write_product_web(repo / "desktop/dist", javascript=lifecycle_sources)
+    _write_product_web(repo / "desktop/packaging/web", javascript=lifecycle_sources)
+
+    assert len(builder._validate_product_web_build(repo / "desktop")) == 64
+    policy = json.loads(
+        Path("desktop/packaging/product-web-policy.json").read_text(encoding="utf-8")
+    )
+    assert "stdout" not in policy["forbidden_text"]
+    assert "stderr" not in policy["forbidden_text"]
+    assert {"command", "host_path", "host-path"}.issubset(policy["forbidden_text"])
 
 
 def test_packaged_product_graph_excludes_non_release_provider_code() -> None:

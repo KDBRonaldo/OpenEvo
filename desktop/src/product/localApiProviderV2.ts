@@ -9,13 +9,17 @@ import {
   DesktopContractErrorV2,
 } from "../api/v2/client";
 import {
+  compareUtcTimestampsV2,
+  lifecycleOperationV2Schema,
   opaqueIdV2Schema,
   scienceProjectConfigV2Schema,
   type CoreEventEnvelopeV2,
   type DesktopErrorV2,
   type DesktopEventEnvelopeV2,
   type DesktopStateV2,
+  type LifecycleOperationV2,
   type LocalOperationV2,
+  type OperationV2,
   type HostKeyReviewRequestV2,
   type ProjectV2,
   type RemoteProfileV2,
@@ -36,6 +40,7 @@ import type {
   NativeWorkspaceSelectionIntentV2,
   NativeWorkspaceSourceV2,
   ProductMutationIntentV2,
+  ProductOperationV2,
   ProductRefreshResultV2,
   ProductStreamStateV2,
   ProductSubscriptionSignalV2,
@@ -47,18 +52,6 @@ const MAX_COLLECTION_PAGES = 100;
 const MAX_REFRESH_RESOURCES = 20_000;
 const MAX_SSE_BUFFER_BYTES = 1_048_580;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
-
-const nativeWorkspaceSourceSchema = z.object({
-  kind: z.literal("native_folder_snapshot"),
-  display_name: z.string().min(1).max(256).refine((value) => value === value.trim() && !/[\/\\\u0000-\u001f\u007f]/.test(value)),
-  import_ref: z.object({
-    import_id: opaqueIdV2Schema,
-    content_sha256: z.string().regex(/^[0-9a-f]{64}$/),
-    byte_size: z.number().int().safe().min(1_024).max(16 * 1024 * 1024 * 1024),
-    entry_count: z.number().int().safe().min(0).max(100_000),
-    extracted_byte_size: z.number().int().safe().min(0).max(16 * 1024 * 1024 * 1024),
-  }).strict(),
-}).strict();
 
 export interface LocalApiNativeBridgeV2 {
   selectProjectSource(intent: NativeWorkspaceSelectionIntentV2): Promise<unknown>;
@@ -89,7 +82,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private epoch = 0;
   private snapshot: DesktopProductSnapshotV2 | null = null;
   private validation: DesktopProductSnapshotV2["validation"] = null;
-  private activeOperation: LocalOperationV2 | null = null;
+  private activeOperation: ProductOperationV2 | null = null;
   private streamAbort: AbortController | null = null;
   private streamPromise: Promise<void> | null = null;
   private waitingForRefresh = false;
@@ -241,8 +234,16 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async selectNativeWorkspace(intent: NativeWorkspaceSelectionIntentV2): Promise<NativeWorkspaceSourceV2> {
     this.requireIntent(intent);
-    const source = nativeWorkspaceSourceSchema.parse(await this.native.selectProjectSource(intent));
-    return { kind: source.kind, display_name: source.display_name };
+    const operation = lifecycleOperationV2Schema.parse(await this.native.selectProjectSource(intent));
+    if (operation.kind !== "native_workspace_prepare"
+      || operation.resource.resource_kind !== "native_workspace") {
+      throw new DesktopContractErrorV2("Native workspace selection returned another lifecycle operation");
+    }
+    const terminal = await this.waitForLifecycleTerminal(this.observeOperation(operation));
+    if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "native_workspace") {
+      throw lifecycleTerminalError(terminal, "Native workspace preparation did not succeed");
+    }
+    return { kind: "native_folder_snapshot", display_name: terminal.result.display_name };
   }
 
   async cancelNativeWorkspace(actionId: string): Promise<void> {
@@ -257,7 +258,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const profile = this.requireSystemProfile(draft.profileId, intent);
     if (profile.connection_state !== "connected") throw new DesktopContractErrorV2("Project creation requires a connected system-OpenSSH profile");
     const config = scienceProjectConfigV2Schema.parse(draft.config);
-    const project = await this.client.createProject({
+    const operation = this.observeOperation(await this.client.createProject({
       schema_version: "2",
       profile_id: profile.profile_id,
       profile_connection_generation: profile.connection_generation,
@@ -266,7 +267,17 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     }, {
       resourceGeneration: profile.connection_generation,
       idempotencyKey: intent.actionId,
-    });
+    }));
+    const terminal = await this.waitForLifecycleTerminal(operation);
+    if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "project") {
+      throw lifecycleTerminalError(terminal, "Remote project creation did not succeed");
+    }
+    const projectId = terminal.result.project_id;
+    const projects = await collectPages((options) => this.client.listProjects(options));
+    const project = projects.find((candidate) => candidate.project_id === projectId);
+    if (project === undefined) {
+      throw new DesktopContractErrorV2("Project creation result is absent from remote authority");
+    }
     this.invalidate();
     return project;
   }
@@ -560,10 +571,21 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return { transition, project };
   }
 
-  private observeOperation(operation: LocalOperationV2): LocalOperationV2 {
+  private observeOperation<T extends LocalOperationV2 | LifecycleOperationV2 | OperationV2>(operation: T): T {
     this.activeOperation = operation;
     this.invalidate();
     return operation;
+  }
+
+  private async waitForLifecycleTerminal(initial: LifecycleOperationV2): Promise<LifecycleOperationV2> {
+    let current = initial;
+    while (!isLifecycleTerminal(current)) {
+      await delayV2(250);
+      const next = await this.client.getLifecycleOperation(current.operation_id);
+      assertLifecycleObservationDoesNotRegress(current, next);
+      current = this.observeOperation(next);
+    }
+    return current;
   }
 
   private invalidate(): void {
@@ -773,6 +795,53 @@ function transitionMutation(transition: SuccessorTransitionV2, project: ProjectV
 function requireProjectHead(project: ProjectV2) {
   if (project.active_project_head === null) throw new DesktopContractErrorV2("Project has no active Project Head");
   return project.active_project_head;
+}
+
+function isLifecycleTerminal(operation: LifecycleOperationV2): boolean {
+  return operation.status === "succeeded"
+    || operation.status === "failed"
+    || operation.status === "cancelled";
+}
+
+function lifecycleTerminalError(operation: LifecycleOperationV2, fallback: string): DesktopContractErrorV2 {
+  return new DesktopContractErrorV2(operation.failure?.summary ?? fallback);
+}
+
+function assertLifecycleObservationDoesNotRegress(
+  previous: LifecycleOperationV2,
+  next: LifecycleOperationV2,
+): void {
+  if (next.operation_id !== previous.operation_id
+    || next.kind !== previous.kind
+    || JSON.stringify(next.resource) !== JSON.stringify(previous.resource)
+    || next.request_sha256 !== previous.request_sha256
+    || next.created_at !== previous.created_at) {
+    throw new DesktopContractErrorV2("Lifecycle operation identity changed while being observed");
+  }
+  if (isLifecycleTerminal(previous) && JSON.stringify(next) !== JSON.stringify(previous)) {
+    throw new DesktopContractErrorV2("Terminal lifecycle operation changed");
+  }
+  if (next.phase_index < previous.phase_index
+    || next.log_sequence_high_watermark < previous.log_sequence_high_watermark
+    || compareUtcTimestampsV2(next.updated_at, previous.updated_at) < 0) {
+    throw new DesktopContractErrorV2("Lifecycle operation progress regressed");
+  }
+  if (previous.status === "running" && next.status === "queued") {
+    throw new DesktopContractErrorV2("Lifecycle operation status regressed");
+  }
+  if (previous.progress?.kind === next.progress?.kind
+    && previous.progress !== null
+    && next.progress !== null
+    && previous.progress.kind !== "indeterminate"
+    && next.progress.kind !== "indeterminate"
+    && (next.progress.total !== previous.progress.total
+      || next.progress.completed < previous.progress.completed)) {
+    throw new DesktopContractErrorV2("Lifecycle operation measurable progress regressed");
+  }
+}
+
+function delayV2(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
 function actionIdV2(value: string): string {

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { DesktopApiErrorV2, DesktopContractErrorV2 } from "./client";
 import { DesktopEventReplayAuthorityV2, parseEventStreamFailureV2, parseSseFrameV2 } from "./sse";
+import { canonicalJsonV2, sha256Utf8V2 } from "./schemas";
 
 const EVENT = {
   schema_version: "2",
@@ -62,5 +63,37 @@ describe("Desktop Local API v2 SSE", () => {
       .toThrow(DesktopApiErrorV2);
     expect(() => parseEventStreamFailureV2(410, { ...expired, secret_path: "/tmp/canary" }))
       .toThrow(DesktopContractErrorV2);
+  });
+
+  it("parses lifecycle invalidations without carrying process log bodies", () => {
+    const payload = {
+      payload_kind: "lifecycle_operation_changed",
+      operation_id: "lifecycle-profile-connect-1",
+      kind: "profile_connect",
+      status: "running",
+      phase: "connecting",
+      etag: `"${"b".repeat(64)}"`,
+      log_sequence_high_watermark: 3,
+    };
+    const lifecycleEvent = {
+      schema_version: "2",
+      event_id: "event-lifecycle-1",
+      sequence: 4,
+      occurred_at: "2026-07-27T08:00:00Z",
+      event_type: "lifecycle_operation_changed",
+      payload_sha256: sha256Utf8V2(canonicalJsonV2(payload)),
+      payload,
+    };
+
+    const parsed = parseSseFrameV2({
+      id: lifecycleEvent.event_id,
+      event: lifecycleEvent.event_type,
+      data: JSON.stringify(lifecycleEvent),
+    });
+    expect(parsed).toMatchObject({
+      kind: "event",
+      envelope: { payload: { operation_id: "lifecycle-profile-connect-1" } },
+    });
+    expect(JSON.stringify(parsed)).not.toMatch(/ssh stdout|daemon stderr|log_text/i);
   });
 });
