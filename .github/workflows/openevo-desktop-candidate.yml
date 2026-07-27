@@ -402,6 +402,7 @@ jobs:
           test -x "$sidecar"
           test -x "$askpass"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
+          echo "OPENEVO_PACKAGED_ASKPASS_PATH=$askpass" >> "$GITHUB_ENV"
 
       - name: Clean-install and verify final Core wheel, lock, and registry
         run: |
@@ -730,6 +731,9 @@ jobs:
         run: |
           if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
             rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          if [ -n "${OPENEVO_PACKAGED_ASKPASS_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_ASKPASS_PATH"
           fi
           rm -rf \
             .candidate-core \

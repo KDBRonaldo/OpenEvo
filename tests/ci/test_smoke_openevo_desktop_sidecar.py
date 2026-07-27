@@ -82,8 +82,9 @@ def test_recovered_lifecycle_http_evidence_fails_closed_on_identity_change() -> 
         "operation_id": authority.operation_id,
         "request_sha256": authority.request_sha256,
         "kind": "project_create",
-        "status": "failed",
+        "status": "running",
         "phase": "remote_preflight",
+        "cancellable": True,
     }
     logs = {
         "operation_id": authority.operation_id,

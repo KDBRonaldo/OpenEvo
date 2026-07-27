@@ -162,6 +162,7 @@ def test_sanitizer_redacts_home_relative_host_paths() -> None:
             "identity=~/.ssh/openevo_ed25519 "
             "other=~researcher/.config/openevo/settings.json "
             "env=$HOME/.ssh/config braced=${HOME}/.ssh/known_hosts\n"
+            "roots=~/ ~researcher/ $HOME ${HOME}/\n"
         ).encode(),
     )
     sanitizer.flush()
@@ -172,9 +173,13 @@ def test_sanitizer_redacts_home_relative_host_paths() -> None:
         "~researcher/.config/openevo/settings.json",
         "$HOME/.ssh/config",
         "${HOME}/.ssh/known_hosts",
+        "~/",
+        "~researcher/",
+        "$HOME",
+        "${HOME}/",
     ):
         assert host_path not in rendered
-    assert rendered.count("[REDACTED_HOST_PATH]") == 4
+    assert rendered.count("[REDACTED_HOST_PATH]") == 8
 
 
 def test_bounded_subprocess_observer_receives_only_stream_and_bytes() -> None:

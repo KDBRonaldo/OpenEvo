@@ -51,8 +51,9 @@ _ABSOLUTE_HOST_PATH_RE = re.compile(
 )
 _HOME_RELATIVE_HOST_PATH_RE = re.compile(
     r"(?<![A-Za-z0-9._~:/-])"
-    r"(?:~[A-Za-z0-9._-]*|\$HOME|\$\{HOME\})/"
-    r"(?:[^\s\t\r\n'\"<>/]+)(?:/[^\s\t\r\n'\"<>/]+)*"
+    r"(?:~[A-Za-z0-9._-]*|\$HOME|\$\{HOME\})"
+    r"(?:/(?:[^\s\t\r\n'\"<>/]+(?:/[^\s\t\r\n'\"<>/]+)*)?)?"
+    r"(?![A-Za-z0-9._~:/+-])"
 )
 _MAX_UNTERMINATED_LINE_BYTES = MAX_LIFECYCLE_LOG_ENTRY_BYTES
 _UNTERMINATED_LINE_OMITTED = "[TRUNCATED: unterminated process output omitted]\n"

@@ -452,6 +452,13 @@ def test_recovered_checkpoint_replay_never_regresses_durable_phase(
         )
         assert retained.phase == advanced.phase
         assert not retained.cancellable
+        later = context.checkpoint(
+            "verifying_project",
+            m.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        assert later.phase == "verifying_project"
+        assert not later.cancellable
         return _project_result(context)
 
     executor = DesktopLifecycleExecutorV2(reopened, runners=_runners(replay))

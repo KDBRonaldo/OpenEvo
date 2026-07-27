@@ -471,8 +471,12 @@ def _assert_recovered_lifecycle_http(
         or operation.get("kind") != "project_create"
     ):
         raise SmokeFailure("recovered lifecycle operation identity changed")
-    if operation.get("status") != "failed" or operation.get("phase") != "remote_preflight":
-        raise SmokeFailure("recovered lifecycle operation did not terminate predictably")
+    if (
+        operation.get("status") != "running"
+        or operation.get("phase") != "remote_preflight"
+        or operation.get("cancellable") is not True
+    ):
+        raise SmokeFailure("recovered lifecycle operation did not wait for reconnect")
     items = logs.get("items")
     if logs.get("operation_id") != authority.operation_id or not isinstance(items, list):
         raise SmokeFailure("recovered lifecycle log authority changed")
@@ -1178,8 +1182,12 @@ def smoke_sidecar(
                 lifecycle_authority=authority,
             )
             replay = _verify_exact_lifecycle_replay(config_root, authority)
-            if replay.status != "failed" or replay.phase != "remote_preflight":
-                raise SmokeFailure("recovered lifecycle replay is not terminal")
+            if (
+                replay.status != "running"
+                or replay.phase != "remote_preflight"
+                or not replay.cancellable
+            ):
+                raise SmokeFailure("recovered lifecycle replay did not wait for reconnect")
 
 
 def _smoke_sidecar_instance(
@@ -1253,16 +1261,10 @@ def _smoke_sidecar_instance(
             ),
         )
         if lifecycle_authority is not None:
-            while time.monotonic() < deadline:
-                operation = _read_json(
-                    f"{base_url}/desktop/v2/operations/{lifecycle_authority.operation_id}",
-                    headers=session_headers,
-                )
-                if operation.get("status") in {"succeeded", "failed", "cancelled"}:
-                    break
-                time.sleep(0.05)
-            else:
-                raise SmokeFailure("recovered lifecycle operation did not become terminal")
+            operation = _read_json(
+                f"{base_url}/desktop/v2/operations/{lifecycle_authority.operation_id}",
+                headers=session_headers,
+            )
             logs = _read_json(
                 f"{base_url}/desktop/v2/operations/{lifecycle_authority.operation_id}/logs?limit=100",
                 headers=session_headers,

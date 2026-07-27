@@ -121,6 +121,7 @@ class LifecycleExecutionContextV2:
         with self._mutation_lock:
             self._raise_if_interrupted_locked()
             current = self._work.operation
+            cancellable = current.cancellable and cancellable
             target_phase_index = m.LIFECYCLE_PHASES.index(phase)
             if target_phase_index <= current.phase_index:
                 retained_progress = self._retained_replay_progress(
@@ -128,15 +129,13 @@ class LifecycleExecutionContextV2:
                     progress,
                     same_phase=target_phase_index == current.phase_index,
                 )
-                retained_cancellable = current.cancellable and cancellable
                 if (
                     retained_progress == current.progress
-                    and retained_cancellable == current.cancellable
+                    and cancellable == current.cancellable
                 ):
                     return current
                 phase = current.phase
                 progress = retained_progress
-                cancellable = retained_cancellable
             updated = self._store.advance_lifecycle_operation(
                 LifecycleOperationAdvanceV2(
                     operation_id=self._work.operation.operation_id,
