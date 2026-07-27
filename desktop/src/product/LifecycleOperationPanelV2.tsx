@@ -1,38 +1,68 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
-  DesktopErrorV2,
+  CoreEventEnvelopeV2,
+  DiagnosticV2,
   LifecycleLogEntryV2,
   LifecycleOperationV2,
   LifecycleProgressV2,
+  OperationV2,
+  ServiceV2,
+  SuccessorTransitionV2,
+  TaskV2,
 } from "../api/v2/schemas";
+import type { LogEntryV2 } from "../api/v2/logs";
 import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
 
 const COLLAPSED_LOG_LINES = 6;
+
+export type OperationPanelLogSourceV2 = LifecycleLogEntryV2["source"]
+  | "core_event"
+  | "service_system"
+  | "service_stdout"
+  | "service_stderr"
+  | "service_transcript";
+
+export interface OperationPanelLogEntryV2 {
+  readonly sequence: number;
+  readonly occurred_at: string;
+  readonly source: OperationPanelLogSourceV2;
+  readonly text: string;
+  readonly truncated: boolean;
+}
 
 export interface OperationPanelModelV2 {
   readonly operationId: string;
   readonly title: string;
   readonly status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
   readonly phaseLabel: string;
-  readonly checkpointCompleted: number;
-  readonly checkpointTotal: number;
+  readonly checkpointCompleted: number | null;
+  readonly checkpointTotal: number | null;
   readonly progress: LifecycleProgressV2 | null;
   readonly createdAt: string;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
   readonly cancellable: boolean;
-  readonly failure: DesktopErrorV2 | null;
-  readonly logs: readonly LifecycleLogEntryV2[];
+  readonly failure: OperationPanelFailureV2 | null;
+  readonly logs: readonly OperationPanelLogEntryV2[];
+  readonly logTitle?: string;
   readonly droppedBeforeSequence: number;
   readonly hasOlderLogs: boolean;
+  readonly hasNewerLogs: boolean;
   readonly unresolvedMutation: boolean;
   readonly emptyLogMessage?: string;
+}
+
+export interface OperationPanelFailureV2 {
+  readonly summary: string;
+  readonly retryable: boolean;
+  readonly nextAction?: string;
 }
 
 export interface LifecycleOperationPanelV2Props {
   readonly model: OperationPanelModelV2;
   readonly onCancel?: () => void | Promise<void>;
   readonly onLoadOlder?: () => void | Promise<void>;
+  readonly onLoadLatest?: () => void | Promise<void>;
   readonly onResume?: () => void | Promise<void>;
 }
 
@@ -42,7 +72,6 @@ export function lifecycleOperationPanelModelV2(
   options: { readonly unresolvedMutation?: boolean } = {},
 ): OperationPanelModelV2 {
   const operation = state.operation;
-  const firstSequence = state.logs[0]?.sequence ?? null;
   return Object.freeze({
     operationId: operation.operation_id,
     title,
@@ -58,8 +87,195 @@ export function lifecycleOperationPanelModelV2(
     failure: operation.failure,
     logs: state.logs,
     droppedBeforeSequence: state.droppedBeforeSequence,
-    hasOlderLogs: firstSequence !== null && firstSequence > state.droppedBeforeSequence + 1,
+    hasOlderLogs: state.hasOlderLogs,
+    hasNewerLogs: state.hasNewerLogs,
     unresolvedMutation: options.unresolvedMutation ?? false,
+  });
+}
+
+export function coreOperationPanelModelV2(operation: OperationV2): OperationPanelModelV2 {
+  const terminal = !["queued", "running"].includes(operation.status);
+  const progress: LifecycleProgressV2 | null = operation.progress_total > 0
+    ? { kind: "items", completed: operation.progress_completed, total: operation.progress_total }
+    : terminal ? null : { kind: "indeterminate" };
+  return Object.freeze({
+    operationId: operation.operation_id,
+    title: coreOperationTitleV2(operation.kind),
+    status: operation.status,
+    phaseLabel: `Core status: ${operation.status}`,
+    checkpointCompleted: null,
+    checkpointTotal: null,
+    progress,
+    createdAt: operation.created_at,
+    startedAt: operation.created_at,
+    finishedAt: terminal ? operation.updated_at : null,
+    cancellable: !terminal,
+    failure: operation.error === null ? null : {
+      summary: operation.error.message,
+      retryable: operation.error.retryable,
+      nextAction: operation.error.next_action,
+    },
+    logs: Object.freeze([]),
+    droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
+    unresolvedMutation: false,
+    emptyLogMessage: "Core operation output is available from the owning Task, transition, or service view.",
+  });
+}
+
+export function taskPanelModelV2(
+  task: TaskV2,
+  timeline: readonly CoreEventEnvelopeV2[],
+): OperationPanelModelV2 {
+  const terminal = ["completed", "closed", "failed", "cancelled"].includes(task.state);
+  const status: OperationPanelModelV2["status"] = task.state === "failed"
+    ? "failed"
+    : task.state === "cancelled"
+      ? "cancelled"
+      : ["completed", "closed"].includes(task.state) ? "succeeded" : "running";
+  const progress: LifecycleProgressV2 | null = terminal ? null : { kind: "indeterminate" };
+  return Object.freeze({
+    operationId: task.task_id,
+    title: "Run science Task",
+    status,
+    phaseLabel: `Task state: ${task.state}`,
+    checkpointCompleted: null,
+    checkpointTotal: null,
+    progress,
+    createdAt: task.created_at,
+    startedAt: task.created_at,
+    finishedAt: terminal ? task.updated_at : null,
+    cancellable: ["admitted", "preparing", "running"].includes(task.state),
+    failure: task.state === "failed" ? {
+      summary: "The authoritative Task failed.",
+      retryable: true,
+      nextAction: "Append a new infrastructure Attempt under the same Task Admission.",
+    } : null,
+    logs: coreTimelineLogsV2(timeline),
+    logTitle: "Core timeline",
+    droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
+    unresolvedMutation: false,
+    emptyLogMessage: "Waiting for an authoritative Core timeline event…",
+  });
+}
+
+export function transitionPanelModelV2(
+  transition: SuccessorTransitionV2,
+  timeline: readonly CoreEventEnvelopeV2[],
+): OperationPanelModelV2 {
+  const terminal = ["committed", "failed", "cancelled", "superseded"].includes(transition.state);
+  const status: OperationPanelModelV2["status"] = transition.state === "committed"
+    ? "succeeded"
+    : transition.state === "failed"
+      ? "failed"
+      : ["cancelled", "superseded"].includes(transition.state) ? "cancelled" : "running";
+  const progress: LifecycleProgressV2 | null = transition.progress_total > 0
+    ? {
+        kind: "items",
+        completed: transition.progress_completed,
+        total: transition.progress_total,
+      }
+    : terminal ? null : { kind: "indeterminate" };
+  return Object.freeze({
+    operationId: transition.transition.successor_transition_id,
+    title: "Build successor Project Head",
+    status,
+    phaseLabel: `Successor state: ${transition.state}`,
+    checkpointCompleted: null,
+    checkpointTotal: null,
+    progress,
+    createdAt: transition.created_at,
+    startedAt: transition.created_at,
+    finishedAt: terminal ? transition.updated_at : null,
+    cancellable: false,
+    failure: transition.error === null ? null : {
+      summary: transition.error.message,
+      retryable: transition.error.retryable,
+      nextAction: transition.error.next_action,
+    },
+    logs: coreTimelineLogsV2(timeline),
+    logTitle: "Core timeline",
+    droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
+    unresolvedMutation: false,
+    emptyLogMessage: "Waiting for an authoritative successor event…",
+  });
+}
+
+export function diagnosticPanelModelV2(diagnostic: DiagnosticV2): OperationPanelModelV2 {
+  const terminal = ["ready", "failed"].includes(diagnostic.status);
+  const progress: LifecycleProgressV2 | null = terminal ? null : { kind: "indeterminate" };
+  return Object.freeze({
+    operationId: diagnostic.diagnostic_id,
+    title: `Collect ${diagnostic.scope} diagnostics`,
+    status: diagnostic.status === "ready" ? "succeeded" : diagnostic.status,
+    phaseLabel: `Diagnostic status: ${diagnostic.status}`,
+    checkpointCompleted: null,
+    checkpointTotal: null,
+    progress,
+    createdAt: diagnostic.created_at,
+    startedAt: diagnostic.created_at,
+    finishedAt: terminal ? diagnostic.updated_at : null,
+    cancellable: false,
+    failure: diagnostic.status === "failed" ? {
+      summary: "Remote diagnostic collection failed.",
+      retryable: true,
+    } : null,
+    logs: Object.freeze([]),
+    logTitle: "Diagnostic output",
+    droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
+    unresolvedMutation: false,
+    emptyLogMessage: diagnostic.artifact_id === null
+      ? "Waiting for the diagnostic artifact…"
+      : `Diagnostic artifact ${diagnostic.artifact_id} is ready.`,
+  });
+}
+
+export function servicePanelModelV2(
+  service: ServiceV2,
+  logs: readonly LogEntryV2[],
+): OperationPanelModelV2 {
+  const status: OperationPanelModelV2["status"] = service.status === "ready"
+    ? "succeeded"
+    : ["starting", "stopping"].includes(service.status) ? "running" : "failed";
+  const progress: LifecycleProgressV2 | null = ["starting", "stopping"].includes(service.status)
+    ? { kind: "indeterminate" }
+    : null;
+  return Object.freeze({
+    operationId: service.service_id,
+    title: `${capitalizeV2(service.kind)} service`,
+    status,
+    phaseLabel: `Service status: ${service.status}`,
+    checkpointCompleted: null,
+    checkpointTotal: null,
+    progress,
+    createdAt: service.updated_at,
+    startedAt: ["starting", "stopping"].includes(service.status) ? service.updated_at : null,
+    finishedAt: ["starting", "stopping"].includes(service.status) ? null : service.updated_at,
+    cancellable: false,
+    failure: ["degraded", "unavailable"].includes(service.status) ? {
+      summary: `The remote ${service.kind} service is ${service.status}.`,
+      retryable: true,
+    } : null,
+    logs: Object.freeze(logs.slice(-200).map((entry) => ({
+      sequence: entry.sequence,
+      occurred_at: entry.occurred_at,
+      source: `service_${entry.stream}` as OperationPanelLogSourceV2,
+      text: entry.message,
+      truncated: false,
+    }))),
+    logTitle: "Service log",
+    droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
+    unresolvedMutation: false,
+    emptyLogMessage: "No retained service output is loaded.",
   });
 }
 
@@ -67,6 +283,7 @@ export function LifecycleOperationPanelV2({
   model,
   onCancel,
   onLoadOlder,
+  onLoadLatest,
   onResume,
 }: LifecycleOperationPanelV2Props) {
   const [expanded, setExpanded] = useState(false);
@@ -104,15 +321,19 @@ export function LifecycleOperationPanelV2({
       </div>
 
       <div className="lifecycle-progress-stack">
-        <div className="lifecycle-progress-label">
-          <span>{model.phaseLabel}</span>
-          <span>Checkpoint {model.checkpointCompleted} of {model.checkpointTotal}</span>
-        </div>
-        <progress
-          aria-label="Lifecycle checkpoints"
-          max={model.checkpointTotal}
-          value={model.checkpointCompleted}
-        />
+        {model.checkpointCompleted === null || model.checkpointTotal === null ? null : (
+          <>
+            <div className="lifecycle-progress-label">
+              <span>{model.phaseLabel}</span>
+              <span>Checkpoint {model.checkpointCompleted} of {model.checkpointTotal}</span>
+            </div>
+            <progress
+              aria-label="Lifecycle checkpoints"
+              max={model.checkpointTotal}
+              value={model.checkpointCompleted}
+            />
+          </>
+        )}
         {model.progress === null ? null : (
           <div className="lifecycle-subprogress">
             <progress
@@ -136,12 +357,13 @@ export function LifecycleOperationPanelV2({
         <div className="lifecycle-failure" role="alert">
           <strong>{model.failure.summary}</strong>
           <span>{model.failure.retryable ? "This operation can be reconciled or retried safely." : "Review the required action before continuing."}</span>
+          {model.failure.nextAction ? <span>{model.failure.nextAction}</span> : null}
         </div>
       )}
 
       <div className="lifecycle-log-section">
         <div className="lifecycle-log-head">
-          <strong>Process log</strong>
+          <strong>{model.logTitle ?? "Process log"}</strong>
           {model.logs.length > COLLAPSED_LOG_LINES ? (
             <button type="button" className="text-button" onClick={() => setExpanded((value) => !value)}>
               {expanded ? "Show latest logs" : "Show all logs"}
@@ -166,6 +388,9 @@ export function LifecycleOperationPanelV2({
       <footer className="lifecycle-operation-actions">
         {model.hasOlderLogs && onLoadOlder !== undefined ? (
           <button type="button" className="text-button" onClick={() => void onLoadOlder()}>Load older logs</button>
+        ) : null}
+        {model.hasNewerLogs && onLoadLatest !== undefined ? (
+          <button type="button" className="text-button" onClick={() => void onLoadLatest()}>Show latest log tail</button>
         ) : null}
         {(model.unresolvedMutation || model.failure?.retryable === true) && onResume !== undefined ? (
           <button type="button" className="secondary-button" onClick={() => void onResume()}>Resume / reconcile</button>
@@ -228,15 +453,36 @@ function statusLabelV2(status: OperationPanelModelV2["status"]): string {
   return labels[status];
 }
 
-function sourceLabelV2(source: LifecycleLogEntryV2["source"]): string {
-  const labels: Record<LifecycleLogEntryV2["source"], string> = {
+function sourceLabelV2(source: OperationPanelLogSourceV2): string {
+  const labels: Record<OperationPanelLogSourceV2, string> = {
     desktop: "Desktop",
     ssh_stdout: "SSH output",
     ssh_stderr: "SSH error",
     daemon_stdout: "Daemon output",
     daemon_stderr: "Daemon error",
+    core_event: "Core event",
+    service_system: "Service",
+    service_stdout: "Service output",
+    service_stderr: "Service error",
+    service_transcript: "Transcript",
   };
   return labels[source];
+}
+
+function coreTimelineLogsV2(
+  timeline: readonly CoreEventEnvelopeV2[],
+): readonly OperationPanelLogEntryV2[] {
+  return Object.freeze(timeline.slice(-200).map((event) => ({
+    sequence: event.sequence,
+    occurred_at: event.occurred_at,
+    source: "core_event" as const,
+    text: `Core event: ${event.event_type.replaceAll("_", " ")}`,
+    truncated: false,
+  })));
+}
+
+function capitalizeV2(value: string): string {
+  return value.length === 0 ? value : `${value[0]!.toUpperCase()}${value.slice(1)}`;
 }
 
 function phaseLabelV2(phase: LifecycleOperationV2["phase"]): string {
@@ -272,4 +518,17 @@ function lifecycleTitleV2(operation: LifecycleOperationV2): string {
     project_activate: "Activate remote project",
   };
   return labels[operation.kind];
+}
+
+function coreOperationTitleV2(kind: OperationV2["kind"]): string {
+  const titles: Record<OperationV2["kind"], string> = {
+    transition_retry: "Retry successor transition",
+    transition_abandon: "Abandon successor transition",
+    attempt_cancel: "Cancel Task attempt",
+    task_close: "Close Task",
+    service_restart: "Restart remote service",
+    diagnostic: "Collect remote diagnostics",
+    cache_cleanup: "Clean safe remote caches",
+  };
+  return titles[kind];
 }

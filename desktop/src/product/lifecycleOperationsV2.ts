@@ -29,6 +29,8 @@ export interface LifecycleOperationStateV2 {
   readonly operation: LifecycleOperationV2;
   readonly logs: readonly LifecycleLogEntryV2[];
   readonly droppedBeforeSequence: number;
+  readonly hasOlderLogs: boolean;
+  readonly hasNewerLogs: boolean;
 }
 
 export interface LifecycleOperationControllerOptionsV2 {
@@ -95,6 +97,8 @@ export class LifecycleOperationControllerV2 {
       operation,
       logs: previous?.logs ?? Object.freeze([]),
       droppedBeforeSequence: previous?.droppedBeforeSequence ?? 0,
+      hasOlderLogs: previous?.hasOlderLogs ?? false,
+      hasNewerLogs: previous?.hasNewerLogs ?? false,
     }));
     this.emit();
     return operation;
@@ -109,6 +113,21 @@ export class LifecycleOperationControllerV2 {
   }
 
   async loadLogs(operationId: string): Promise<LifecycleOperationStateV2> {
+    return this.loadLogWindow(operationId, "preserve");
+  }
+
+  async loadOlderLogs(operationId: string): Promise<LifecycleOperationStateV2> {
+    return this.loadLogWindow(operationId, "older");
+  }
+
+  async loadLatestLogs(operationId: string): Promise<LifecycleOperationStateV2> {
+    return this.loadLogWindow(operationId, "latest");
+  }
+
+  private async loadLogWindow(
+    operationId: string,
+    mode: "preserve" | "older" | "latest",
+  ): Promise<LifecycleOperationStateV2> {
     const current = this.states.get(operationId);
     if (current === undefined) {
       throw new LifecycleOperationContractErrorV2("Lifecycle logs reference an unobserved operation");
@@ -135,20 +154,43 @@ export class LifecycleOperationControllerV2 {
         bySequence.set(entry.sequence, entry);
       }
     }
-    const logs = [...bySequence.values()]
+    const retainedLogs = [...bySequence.values()]
       .sort((left, right) => left.sequence - right.sequence)
-      .filter((entry) => entry.sequence > droppedBeforeSequence)
-      .slice(-MAX_LOG_TAIL);
-    if (logs.some((entry) => entry.sequence > current.operation.log_sequence_high_watermark)) {
+      .filter((entry) => entry.sequence > droppedBeforeSequence);
+    if (retainedLogs.some((entry) => entry.sequence > current.operation.log_sequence_high_watermark)) {
       throw new LifecycleOperationContractErrorV2("Lifecycle logs exceed the observed operation watermark");
     }
+    let logs: readonly LifecycleLogEntryV2[];
+    if (mode === "older") {
+      const firstVisibleSequence = current.logs[0]?.sequence
+        ?? current.operation.log_sequence_high_watermark + 1;
+      const older = retainedLogs.filter((entry) => entry.sequence < firstVisibleSequence).slice(-MAX_LOG_TAIL);
+      logs = older.length === 0 ? current.logs : older;
+    } else if (mode === "preserve" && current.hasNewerLogs && current.logs.length > 0) {
+      const firstVisibleSequence = current.logs[0]!.sequence;
+      const lastVisibleSequence = current.logs.at(-1)!.sequence;
+      const preserved = retainedLogs.filter((entry) => (
+        entry.sequence >= firstVisibleSequence && entry.sequence <= lastVisibleSequence
+      )).slice(-MAX_LOG_TAIL);
+      logs = preserved.length === 0 ? retainedLogs.slice(-MAX_LOG_TAIL) : preserved;
+    } else {
+      logs = retainedLogs.slice(-MAX_LOG_TAIL);
+    }
+    const firstSequence = logs[0]?.sequence ?? null;
+    const lastSequence = logs.at(-1)?.sequence ?? null;
     const next = Object.freeze({
       operation: current.operation,
-      logs: Object.freeze(logs),
+      logs: Object.freeze([...logs]),
       droppedBeforeSequence,
+      hasOlderLogs: firstSequence !== null
+        && retainedLogs.some((entry) => entry.sequence < firstSequence),
+      hasNewerLogs: lastSequence !== null
+        && retainedLogs.some((entry) => entry.sequence > lastSequence),
     });
     if (canonicalJsonV2(current.logs) === canonicalJsonV2(next.logs)
-      && current.droppedBeforeSequence === next.droppedBeforeSequence) {
+      && current.droppedBeforeSequence === next.droppedBeforeSequence
+      && current.hasOlderLogs === next.hasOlderLogs
+      && current.hasNewerLogs === next.hasNewerLogs) {
       return current;
     }
     this.states.set(operationId, next);
@@ -283,7 +325,11 @@ export class CoreOperationControllerV2 {
     return this.observe(operation);
   }
 
-  async pollUntilTerminal(operationId: string, signal?: AbortSignal): Promise<OperationV2> {
+  async pollUntilTerminal(
+    operationId: string,
+    signal?: AbortSignal,
+    onObservation?: (operation: OperationV2) => void | Promise<void>,
+  ): Promise<OperationV2> {
     let operation = this.operations.get(operationId)?.operation;
     if (operation === undefined) operation = await this.refresh(operationId);
     let delayIndex = 0;
@@ -292,6 +338,7 @@ export class CoreOperationControllerV2 {
       await this.wait(POLL_DELAYS_MS[delayIndex]!);
       const before = coreProgressFingerprintV2(operation);
       operation = await this.refresh(operationId);
+      await onObservation?.(operation);
       delayIndex = coreProgressFingerprintV2(operation) === before
         ? Math.min(delayIndex + 1, POLL_DELAYS_MS.length - 1)
         : 0;

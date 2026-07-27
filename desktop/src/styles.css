@@ -3938,6 +3938,23 @@ pre.json {
   border-bottom: 1px solid var(--line);
 }
 
+.v2-service-list > .v2-service-observation {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.v2-service-observation > div:first-child {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.v2-service-observation > .lifecycle-operation-panel,
+.v2-task-card > .lifecycle-operation-panel {
+  margin-top: 12px;
+}
+
 .v2-service-list strong,
 .v2-service-list small {
   display: block;
@@ -4220,7 +4237,8 @@ pre.json {
   .v2-authority-grid,
   .v2-task-authority,
   .v2-target-list > article,
-  .v2-source-choice {
+  .v2-source-choice,
+  .v2-service-observation > div:first-child {
     grid-template-columns: minmax(0, 1fr);
   }
 

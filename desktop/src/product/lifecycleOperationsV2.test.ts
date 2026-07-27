@@ -122,6 +122,21 @@ describe("lifecycle operation controller v2", () => {
     expect(observed.logs[0]?.sequence).toBe(51);
     expect(observed.logs.at(-1)?.sequence).toBe(250);
     expect(observed.droppedBeforeSequence).toBe(0);
+    expect(observed.hasOlderLogs).toBe(true);
+    expect(observed.hasNewerLogs).toBe(false);
+
+    const older = await controller.loadOlderLogs(operation.operation_id);
+    expect(older.logs.map((entry) => entry.sequence)).toEqual(
+      Array.from({ length: 50 }, (_, index) => index + 1),
+    );
+    expect(older.hasOlderLogs).toBe(false);
+    expect(older.hasNewerLogs).toBe(true);
+
+    const latest = await controller.loadLatestLogs(operation.operation_id);
+    expect(latest.logs[0]?.sequence).toBe(51);
+    expect(latest.logs.at(-1)?.sequence).toBe(250);
+    expect(latest.hasOlderLogs).toBe(true);
+    expect(latest.hasNewerLogs).toBe(false);
   });
 
   it("fails closed when lifecycle status, phase, progress, or log authority regresses", () => {

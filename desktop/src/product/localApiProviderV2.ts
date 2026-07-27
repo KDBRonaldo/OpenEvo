@@ -10,6 +10,7 @@ import {
 } from "../api/v2/client";
 import {
   canonicalJsonV2,
+  compareUtcTimestampsV2,
   lifecycleOperationV2Schema,
   opaqueIdV2Schema,
   scienceProjectConfigV2Schema,
@@ -18,6 +19,7 @@ import {
   type DesktopErrorV2,
   type DesktopEventEnvelopeV2,
   type DesktopStateV2,
+  type DiagnosticV2,
   type LifecycleOperationV2,
   type LocalOperationV2,
   type OperationV2,
@@ -66,6 +68,7 @@ const MAX_COLLECTION_PAGES = 100;
 const MAX_REFRESH_RESOURCES = 20_000;
 const MAX_SSE_BUFFER_BYTES = 1_048_580;
 const DEFAULT_RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 4_000] as const;
+const RESOURCE_POLL_DELAYS_MS = [500, 1_000, 2_000, 4_000] as const;
 
 export interface LocalApiNativeBridgeV2 {
   selectProjectSource(intent: NativeWorkspaceSelectionIntentV2): Promise<unknown>;
@@ -103,6 +106,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private readonly listeners = new Set<(signal: ProductSubscriptionSignalV2) => void>();
   private readonly replay = new DesktopEventReplayAuthorityV2();
   private readonly lifecyclePolls = new Map<string, Promise<void>>();
+  private readonly corePolls = new Map<string, Promise<void>>();
+  private readonly diagnostics = new Map<string, DiagnosticV2>();
+  private readonly diagnosticPolls = new Map<string, Promise<void>>();
   private refreshSequence = 0;
   private epoch = 0;
   private snapshot: DesktopProductSnapshotV2 | null = null;
@@ -142,6 +148,8 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       };
       this.snapshot = snapshot;
       await this.reconcilePendingOperationsV2(snapshot);
+      for (const operation of this.coreOperations.list()) this.ensureCorePollingV2(operation);
+      for (const diagnostic of this.diagnostics.values()) this.ensureDiagnosticPollingV2(diagnostic);
       snapshot = this.snapshot ?? snapshot;
       this.waitingForRefresh = false;
       this.ensureEventStream();
@@ -395,6 +403,18 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return this.lifecycleOperations.loadLogs(id);
   }
 
+  async loadOlderLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2> {
+    const id = opaqueIdV2Schema.parse(operationId);
+    if (this.lifecycleOperations.get(id) === null) await this.lifecycleOperations.refresh(id);
+    return this.lifecycleOperations.loadOlderLogs(id);
+  }
+
+  async loadLatestLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2> {
+    const id = opaqueIdV2Schema.parse(operationId);
+    if (this.lifecycleOperations.get(id) === null) await this.lifecycleOperations.refresh(id);
+    return this.lifecycleOperations.loadLatestLogs(id);
+  }
+
   async cancelLifecycleOperation(operationId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2> {
     const snapshot = this.requireIntent(intent);
     const id = opaqueIdV2Schema.parse(operationId);
@@ -431,6 +451,11 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       const operation = await this.lifecycleOperations.refresh(entry.accepted_operation_id);
       if (!isLifecycleTerminalV2(operation)) {
         await this.lifecycleOperations.pollUntilTerminal(operation.operation_id);
+      }
+    } else if (entry.mutation_kind === "diagnostic_create") {
+      const diagnostic = await this.refreshDiagnosticV2(entry.accepted_operation_id);
+      if (!isDiagnosticTerminalV2(diagnostic)) {
+        await this.pollDiagnosticUntilTerminalV2(diagnostic.diagnostic_id);
       }
     } else {
       const operation = await this.coreOperations.refresh(entry.accepted_operation_id);
@@ -846,6 +871,16 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return this.observeOperation(dispatched.value);
   }
 
+  listCoreOperations(): readonly OperationV2[] {
+    const unresolvedIds = new Set(this.mutationIntents.list().flatMap((entry) => [
+      ...(entry.accepted_operation_id === null ? [] : [entry.accepted_operation_id]),
+      ...entry.completed_operation_ids,
+    ]));
+    return this.coreOperations.list().filter((operation) => unresolvedIds.has(operation.operation_id)
+      || !isCoreOperationTerminalV2(operation)
+      || this.activeOperation?.operation_id === operation.operation_id);
+  }
+
   async getCoreOperation(operationId: string): Promise<OperationV2> {
     return this.coreOperations.refresh(opaqueIdV2Schema.parse(operationId));
   }
@@ -919,19 +954,22 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `diagnostic:${input.scope}:${input.resource_id ?? "system"}`,
       request,
       authority: { resource_generation: profile.connection_generation, etag: null },
+      operationAuthority: "diagnostic",
       send: (actionId) => this.client.createDiagnostic(request, {
         resourceGeneration: profile.connection_generation,
         idempotencyKey: actionId,
       }),
     });
-    const diagnostic = dispatched.value;
-    await this.completeDirectMutationV2(dispatched.entry, diagnostic);
-    this.invalidate();
-    return diagnostic;
+    return this.observeDiagnosticV2(dispatched.value);
+  }
+
+  listDiagnostics(): readonly DiagnosticV2[] {
+    return Object.freeze([...this.diagnostics.values()]
+      .sort((left, right) => compareUtcTimestampsV2(left.created_at, right.created_at)));
   }
 
   async getDiagnostic(diagnosticId: string) {
-    return this.client.getDiagnostic(diagnosticId);
+    return this.refreshDiagnosticV2(opaqueIdV2Schema.parse(diagnosticId));
   }
 
   private async loadSnapshot(): Promise<Omit<DesktopProductSnapshotV2, "activeOperation" | "stream">> {
@@ -1075,6 +1113,17 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     };
   }
 
+  private activeDiagnosticAuthorityV2(): string | null {
+    const snapshot = this.snapshot;
+    if (snapshot === null || snapshot.state.active_profile_id === null) return null;
+    const profile = snapshot.profiles.find((candidate) => candidate.profile_id === snapshot.state.active_profile_id);
+    if (profile?.profile_kind !== "system_openssh" || profile.connection_state !== "connected") return null;
+    return canonicalJsonV2({
+      profile_id: profile.profile_id,
+      connection_generation: profile.connection_generation,
+    });
+  }
+
   private async reconcilePendingOperationsV2(snapshot: DesktopProductSnapshotV2): Promise<void> {
     const entries = [...this.mutationIntents.list()];
     const acknowledged = new Set<string>();
@@ -1089,6 +1138,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         if (isLifecycleTerminalV2(operation)) {
           await this.reconcileLifecycleTerminalV2(entry, operation, snapshot);
           acknowledged.add(operation.operation_id);
+        }
+      } else if (entry.mutation_kind === "diagnostic_create") {
+        const diagnostic = await this.refreshDiagnosticV2(entry.accepted_operation_id);
+        if (isDiagnosticTerminalV2(diagnostic)) {
+          if (entry.state === "accepted") {
+            await this.mutationIntents.markTerminalObserved(entry.action_id, diagnostic.diagnostic_id);
+          }
+          await this.mutationIntents.clearTerminalObserved(entry.action_id, diagnostic.diagnostic_id);
         }
       } else if (isCoreOperationMutationV2(entry.mutation_kind)) {
         const operation = this.coreOperations.get(entry.accepted_operation_id)
@@ -1205,7 +1262,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     readonly authority: Readonly<Record<string, unknown>>;
     readonly chainStep?: MutationChainStepV2;
     readonly includeStreamAuthority?: boolean;
-    readonly operationAuthority?: "lifecycle" | "core";
+    readonly operationAuthority?: "lifecycle" | "core" | "diagnostic";
     readonly send: (actionId: string) => Promise<T>;
   }): Promise<{ readonly entry: PendingMutationIntentV2; readonly value: T }> {
     const stream = input.snapshot.stream;
@@ -1233,7 +1290,9 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     try {
       const value = await input.send(entry.action_id);
       if (input.operationAuthority !== undefined) {
-        const operationId = operationIdOfV2(value);
+        const operationId = input.operationAuthority === "diagnostic"
+          ? diagnosticIdOfV2(value)
+          : operationIdOfV2(value);
         if (operationId === null) {
           throw new DesktopContractErrorV2(`${input.operationAuthority} mutation did not return operation authority`);
         }
@@ -1271,7 +1330,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       const lifecycle = this.lifecycleOperations.observe(operation as LifecycleOperationV2);
       this.ensureLifecyclePollingV2(lifecycle);
     }
-    if ("progress_completed" in operation) this.coreOperations.observe(operation as OperationV2);
+    if ("progress_completed" in operation) {
+      const core = this.coreOperations.observe(operation as OperationV2);
+      this.ensureCorePollingV2(core);
+    }
     this.activeOperation = operation;
     this.invalidate();
     return operation;
@@ -1298,6 +1360,80 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       this.lifecyclePolls.delete(operation.operation_id);
     });
     this.lifecyclePolls.set(operation.operation_id, polling);
+  }
+
+  private ensureCorePollingV2(operation: OperationV2): void {
+    if (isCoreOperationTerminalV2(operation) || this.corePolls.has(operation.operation_id)) return;
+    const polling = this.coreOperations.pollUntilTerminal(
+      operation.operation_id,
+      undefined,
+      async (observed) => {
+        this.activeOperation = observed;
+        if (this.snapshot !== null) this.snapshot = { ...this.snapshot, activeOperation: observed };
+        this.emit({ kind: "snapshot_changed" });
+      },
+    ).then((terminal) => {
+      this.activeOperation = terminal;
+      if (this.snapshot !== null) this.snapshot = { ...this.snapshot, activeOperation: terminal };
+      this.emit({ kind: "snapshot_changed" });
+    }).catch((error) => {
+      this.emit({ kind: "stream_error", error: apiErrorOfV2(error) });
+    }).finally(() => {
+      this.corePolls.delete(operation.operation_id);
+    });
+    this.corePolls.set(operation.operation_id, polling);
+  }
+
+  private observeDiagnosticV2(diagnostic: DiagnosticV2): DiagnosticV2 {
+    const previous = this.diagnostics.get(diagnostic.diagnostic_id);
+    if (previous !== undefined) assertDiagnosticDoesNotRegressV2(previous, diagnostic);
+    if (previous !== undefined && canonicalJsonV2(previous) === canonicalJsonV2(diagnostic)) {
+      return previous;
+    }
+    this.diagnostics.set(diagnostic.diagnostic_id, diagnostic);
+    this.ensureDiagnosticPollingV2(diagnostic);
+    this.emit({ kind: "snapshot_changed" });
+    return diagnostic;
+  }
+
+  private async refreshDiagnosticV2(diagnosticId: string): Promise<DiagnosticV2> {
+    const authority = this.activeDiagnosticAuthorityV2();
+    if (authority === null) throw new DesktopContractErrorV2("Diagnostic lookup requires a connected system-OpenSSH profile");
+    const diagnostic = await this.client.getDiagnostic(diagnosticId);
+    if (this.activeDiagnosticAuthorityV2() !== authority) {
+      throw new DesktopContractErrorV2("Active diagnostic profile authority changed");
+    }
+    if (diagnostic.diagnostic_id !== diagnosticId) {
+      throw new DesktopContractErrorV2("Diagnostic lookup returned another diagnostic");
+    }
+    return this.observeDiagnosticV2(diagnostic);
+  }
+
+  private ensureDiagnosticPollingV2(diagnostic: DiagnosticV2): void {
+    if (isDiagnosticTerminalV2(diagnostic) || this.diagnosticPolls.has(diagnostic.diagnostic_id)) return;
+    const polling = this.pollDiagnosticUntilTerminalV2(diagnostic.diagnostic_id)
+      .then(() => undefined)
+      .catch((error) => {
+        this.emit({ kind: "stream_error", error: apiErrorOfV2(error) });
+      })
+      .finally(() => {
+        this.diagnosticPolls.delete(diagnostic.diagnostic_id);
+      });
+    this.diagnosticPolls.set(diagnostic.diagnostic_id, polling);
+  }
+
+  private async pollDiagnosticUntilTerminalV2(diagnosticId: string): Promise<DiagnosticV2> {
+    let diagnostic = this.diagnostics.get(diagnosticId) ?? await this.refreshDiagnosticV2(diagnosticId);
+    let delayIndex = 0;
+    while (!isDiagnosticTerminalV2(diagnostic)) {
+      await waitForV2(RESOURCE_POLL_DELAYS_MS[delayIndex]!);
+      const before = canonicalJsonV2({ status: diagnostic.status, updated_at: diagnostic.updated_at });
+      diagnostic = await this.refreshDiagnosticV2(diagnosticId);
+      delayIndex = canonicalJsonV2({ status: diagnostic.status, updated_at: diagnostic.updated_at }) === before
+        ? Math.min(delayIndex + 1, RESOURCE_POLL_DELAYS_MS.length - 1)
+        : 0;
+    }
+    return diagnostic;
   }
 
   private async waitForLifecycleTerminal(initial: LifecycleOperationV2): Promise<LifecycleOperationV2> {
@@ -1522,6 +1658,12 @@ function operationIdOfV2(value: unknown): string | null {
   return typeof operationId === "string" ? opaqueIdV2Schema.parse(operationId) : null;
 }
 
+function diagnosticIdOfV2(value: unknown): string | null {
+  if (typeof value !== "object" || value === null || !("diagnostic_id" in value)) return null;
+  const diagnosticId = (value as { readonly diagnostic_id?: unknown }).diagnostic_id;
+  return typeof diagnosticId === "string" ? opaqueIdV2Schema.parse(diagnosticId) : null;
+}
+
 function isDeterministicMutationRejectionV2(error: unknown): boolean {
   return error instanceof DesktopApiErrorV2
     && (!error.apiError.retryable || [400, 403, 404, 409, 412, 422, 426, 501].includes(error.status));
@@ -1563,8 +1705,41 @@ function isCoreOperationTerminalV2(operation: OperationV2): boolean {
     || operation.status === "cancelled";
 }
 
+function isDiagnosticTerminalV2(diagnostic: DiagnosticV2): boolean {
+  return diagnostic.status === "ready" || diagnostic.status === "failed";
+}
+
+function assertDiagnosticDoesNotRegressV2(previous: DiagnosticV2, next: DiagnosticV2): void {
+  const ranks: Record<DiagnosticV2["status"], number> = {
+    queued: 0,
+    running: 1,
+    ready: 2,
+    failed: 2,
+  };
+  if (previous.diagnostic_id !== next.diagnostic_id
+    || previous.scope !== next.scope
+    || previous.resource_id !== next.resource_id
+    || previous.created_at !== next.created_at
+    || compareUtcTimestampsV2(next.updated_at, previous.updated_at) < 0
+    || ranks[next.status] < ranks[previous.status]) {
+    throw new DesktopContractErrorV2("Diagnostic authority regressed");
+  }
+  if (isDiagnosticTerminalV2(previous) && canonicalJsonV2(previous) !== canonicalJsonV2(next)) {
+    throw new DesktopContractErrorV2("Terminal diagnostic authority changed");
+  }
+  const sameDocument = canonicalJsonV2({ ...previous, etag: null })
+    === canonicalJsonV2({ ...next, etag: null });
+  if (sameDocument !== (previous.etag === next.etag)) {
+    throw new DesktopContractErrorV2("Diagnostic ETag authority drifted");
+  }
+}
+
 function actionIdV2(value: string): string {
   return z.string().min(16).max(256).refine((item) => item === item.trim() && !/[\u0000-\u001f\u007f]/.test(item)).parse(value);
+}
+
+function waitForV2(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
 }
 
 function apiErrorOfV2(error: unknown): DesktopErrorV2 | null {

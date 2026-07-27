@@ -3,11 +3,16 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { LifecycleOperationV2 } from "../api/v2/schemas";
+import type { LifecycleOperationV2, OperationV2 } from "../api/v2/schemas";
 import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
 import {
   LifecycleOperationPanelV2,
+  coreOperationPanelModelV2,
+  diagnosticPanelModelV2,
   lifecycleOperationPanelModelV2,
+  servicePanelModelV2,
+  taskPanelModelV2,
+  transitionPanelModelV2,
 } from "./LifecycleOperationPanelV2";
 
 const NOW = "2026-07-27T08:00:00Z";
@@ -44,6 +49,8 @@ function state(overrides: Partial<LifecycleOperationStateV2> = {}): LifecycleOpe
   return {
     operation: current,
     droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
     logs: [{
       schema_version: "2",
       operation_id: current.operation_id,
@@ -61,6 +68,22 @@ function state(overrides: Partial<LifecycleOperationStateV2> = {}): LifecycleOpe
       text: "Waiting for readiness probe",
       truncated: true,
     }],
+    ...overrides,
+  };
+}
+
+function coreOperation(overrides: Partial<OperationV2> = {}): OperationV2 {
+  return {
+    schema_version: "2",
+    operation_id: "core-service-restart-1",
+    kind: "service_restart",
+    status: "running",
+    progress_completed: 2,
+    progress_total: 4,
+    error: null,
+    created_at: NOW,
+    updated_at: NOW,
+    etag: ETAG,
     ...overrides,
   };
 }
@@ -110,6 +133,71 @@ describe("LifecycleOperationPanelV2", () => {
     expect(document.body.textContent).toContain("Elapsed 7s");
   });
 
+  it("preserves Core operation authority without inventing Desktop lifecycle checkpoints", async () => {
+    root = await render(coreOperationPanelModelV2(coreOperation()));
+
+    expect(document.body.textContent).toContain("Restart remote service");
+    expect(document.body.textContent).toContain("Core status: running");
+    expect(document.body.textContent).toContain("2 of 4 items");
+    expect(document.querySelector('progress[aria-label="Lifecycle checkpoints"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Checkpoint");
+  });
+
+  it("adapts Task, transition, diagnostic, and service authority into the shared presentation", async () => {
+    const task = taskPanelModelV2({
+      task_id: "task-running-1",
+      state: "running",
+      created_at: NOW,
+      updated_at: NOW,
+    } as never, [{
+      event_id: "event-task-1",
+      event_type: "attempt_appended",
+      sequence: 7,
+      occurred_at: NOW,
+    }] as never);
+    expect(task.phaseLabel).toBe("Task state: running");
+    expect(task.progress).toEqual({ kind: "indeterminate" });
+    expect(task.logTitle).toBe("Core timeline");
+    expect(task.logs[0]?.source).toBe("core_event");
+
+    const transition = transitionPanelModelV2({
+      transition: { successor_transition_id: "transition-1" },
+      state: "materializing",
+      progress_completed: 3,
+      progress_total: 5,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+    } as never, []);
+    expect(transition.phaseLabel).toBe("Successor state: materializing");
+    expect(transition.progress).toEqual({ kind: "items", completed: 3, total: 5 });
+
+    const diagnostic = diagnosticPanelModelV2({
+      diagnostic_id: "diagnostic-1",
+      scope: "system",
+      status: "running",
+      created_at: NOW,
+      updated_at: NOW,
+    } as never);
+    expect(diagnostic.title).toBe("Collect system diagnostics");
+    expect(diagnostic.progress).toEqual({ kind: "indeterminate" });
+
+    root = await render(servicePanelModelV2({
+      service_id: "service-daemon-1",
+      kind: "daemon",
+      status: "starting",
+      updated_at: NOW,
+    } as never, [{
+      sequence: 1,
+      occurred_at: NOW,
+      stream: "stderr",
+      message: "Daemon is warming its registry",
+    }]));
+    expect(document.body.textContent).toContain("Daemon service");
+    expect(document.body.textContent).toContain("Service error");
+    expect(document.body.textContent).toContain("Daemon is warming its registry");
+  });
+
   it("supports log expansion, older-page loading, safe cancellation, and reconciliation", async () => {
     const onCancel = vi.fn();
     const onLoadOlder = vi.fn();
@@ -123,7 +211,10 @@ describe("LifecycleOperationPanelV2", () => {
       text: `checkpoint line ${index + 1}`,
       truncated: false,
     }));
-    root = await render(lifecycleOperationPanelModelV2(state({ logs: manyLogs }), undefined, {
+    root = await render(lifecycleOperationPanelModelV2(state({
+      logs: manyLogs,
+      hasOlderLogs: true,
+    }), undefined, {
       unresolvedMutation: true,
     }), { onCancel, onLoadOlder, onResume });
 
@@ -139,6 +230,17 @@ describe("LifecycleOperationPanelV2", () => {
 
     await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(logTexts()).not.toContain("checkpoint line 1");
+  });
+
+  it("offers an explicit return to the authoritative latest log tail", async () => {
+    const onLoadLatest = vi.fn();
+    root = await render(lifecycleOperationPanelModelV2(state({
+      hasNewerLogs: true,
+    })), { onLoadLatest });
+
+    await click("Show latest log tail");
+
+    expect(onLoadLatest).toHaveBeenCalledTimes(1);
   });
 
   it("announces typed terminal failure without making the log viewport live", async () => {
@@ -165,10 +267,11 @@ describe("LifecycleOperationPanelV2", () => {
   });
 
   async function render(
-    model: ReturnType<typeof lifecycleOperationPanelModelV2>,
+    model: ReturnType<typeof lifecycleOperationPanelModelV2> | ReturnType<typeof coreOperationPanelModelV2>,
     actions: {
       readonly onCancel?: () => void;
       readonly onLoadOlder?: () => void;
+      readonly onLoadLatest?: () => void;
       readonly onResume?: () => void;
     } = {},
   ): Promise<Root> {

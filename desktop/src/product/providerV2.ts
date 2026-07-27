@@ -111,6 +111,8 @@ export interface DesktopProductProviderV2 {
   listLifecycleOperations(): readonly LifecycleOperationStateV2[];
   getLifecycleOperation(operationId: string): Promise<LifecycleOperationV2>;
   loadLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2>;
+  loadOlderLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2>;
+  loadLatestLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2>;
   cancelLifecycleOperation(operationId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   listMutationIntents(): readonly PendingMutationIntentV2[];
   resumeMutationIntent(actionId: string): Promise<void>;
@@ -134,11 +136,13 @@ export interface DesktopProductProviderV2 {
   getArtifactContent(artifactId: string): Promise<ArtifactContentV2>;
   getArtifactDiff(artifactId: string, previousArtifactId?: string): Promise<ArtifactDiffV2>;
   restartService(serviceId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
+  listCoreOperations(): readonly OperationV2[];
   getCoreOperation(operationId: string): Promise<OperationV2>;
   cancelCoreOperation(operationId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   loadServiceLogs(serviceId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
   cleanupCaches(intent: ProductMutationIntentV2): Promise<OperationV2>;
   createDiagnostic(input: Omit<DiagnosticRequestV2, "schema_version" | "profile_id" | "profile_connection_generation">, intent: ProductMutationIntentV2): Promise<DiagnosticV2>;
+  listDiagnostics(): readonly DiagnosticV2[];
   getDiagnostic(diagnosticId: string): Promise<DiagnosticV2>;
 }
 
@@ -174,6 +178,8 @@ export const unavailableDesktopProductProviderV2: DesktopProductProviderV2 = {
   listLifecycleOperations: () => [],
   getLifecycleOperation: unavailable,
   loadLifecycleLogs: unavailable,
+  loadOlderLifecycleLogs: unavailable,
+  loadLatestLifecycleLogs: unavailable,
   cancelLifecycleOperation: unavailable,
   listMutationIntents: () => [],
   resumeMutationIntent: unavailable,
@@ -197,11 +203,13 @@ export const unavailableDesktopProductProviderV2: DesktopProductProviderV2 = {
   getArtifactContent: unavailable,
   getArtifactDiff: unavailable,
   restartService: unavailable,
+  listCoreOperations: () => [],
   getCoreOperation: unavailable,
   cancelCoreOperation: unavailable,
   loadServiceLogs: unavailable,
   cleanupCaches: unavailable,
   createDiagnostic: unavailable,
+  listDiagnostics: () => [],
   getDiagnostic: unavailable,
 };
 

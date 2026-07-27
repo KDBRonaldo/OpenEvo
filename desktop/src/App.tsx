@@ -610,16 +610,13 @@ function nativeStartupPanelModelV2(status: NativeStartupStatusV2): OperationPane
       : null,
     cancellable: status.cancellable,
     failure: status.failure === null ? null : {
-      schema_version: "2",
-      code: status.failure.code,
       summary: status.failure.message,
       retryable: true,
-      action: "retry",
-      affected_resource_id: null,
     },
     logs: [],
     droppedBeforeSequence: 0,
     hasOlderLogs: false,
+    hasNewerLogs: false,
     unresolvedMutation: false,
     emptyLogMessage: "Native startup output remains available through Diagnostics.",
   };

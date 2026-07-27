@@ -165,6 +165,13 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     getTransition: vi.fn(),
     getProfile: vi.fn(),
     getProject: vi.fn(),
+    getCoreOperation: vi.fn(),
+    cancelCoreOperation: vi.fn(),
+    restartService: vi.fn(),
+    serviceLogs: vi.fn(),
+    cleanupCaches: vi.fn(),
+    createDiagnostic: vi.fn(),
+    getDiagnostic: vi.fn(),
     createProfile: vi.fn(),
     createProject: vi.fn(),
     connectProfile: vi.fn(),
@@ -685,5 +692,53 @@ describe("Desktop v2 product provider", () => {
     expect(client.acknowledgeLifecycleOperation).toHaveBeenCalledTimes(1);
     const lastCas = native.callOrder.lastIndexOf("journal-cas");
     expect(lastCas).toBeLessThan(native.callOrder.indexOf("acknowledge"));
+  });
+
+  it("retains diagnostic identity until the exact terminal diagnostic is reconciled", async () => {
+    const connected = profile({ connection_state: "connected" });
+    const native = nativeFixture();
+    const client = clientFixture([connected]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([connected]),
+      active_profile_id: connected.profile_id,
+    });
+    const diagnostic = {
+      schema_version: "2" as const,
+      diagnostic_id: "diagnostic-system-1",
+      scope: "system" as const,
+      resource_id: null,
+      status: "ready" as const,
+      artifact_id: "artifact-diagnostic-1",
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    vi.mocked(client.createDiagnostic).mockResolvedValue(diagnostic);
+    vi.mocked(client.getDiagnostic).mockResolvedValue(diagnostic);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const initial = await provider.refresh();
+    if (initial.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await provider.createDiagnostic(
+      { scope: "system", resource_id: null },
+      { actionId: "diagnostic-system-action-0001", streamEpoch: initial.snapshot.stream.epoch },
+    );
+
+    expect(JSON.parse(native.journalValue()!)).toMatchObject({
+      entries: [{
+        action_id: "diagnostic-system-action-0001",
+        accepted_operation_id: diagnostic.diagnostic_id,
+        state: "accepted",
+      }],
+    });
+    await provider.refresh();
+    expect(native.journalValue()).toBeNull();
+    expect(provider.listDiagnostics()).toEqual([diagnostic]);
+    expect(client.getDiagnostic).toHaveBeenCalledWith(diagnostic.diagnostic_id);
   });
 });

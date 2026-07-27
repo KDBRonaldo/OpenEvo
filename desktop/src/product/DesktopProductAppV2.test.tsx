@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopProductSnapshotV2 } from "./providerV2";
+import type { OperationV2 } from "../api/v2/schemas";
 import {
   unavailableDesktopProductProviderV2,
   type DesktopProductProviderV2,
@@ -526,7 +527,147 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Next task is not ready");
     expect(button("Validate and run task").disabled).toBe(true);
     expect(button("Retry successor transition")).toBeTruthy();
+    expect(document.body.textContent).toContain("Build successor Project Head");
+    expect(document.body.textContent).toContain("Successor state: failed");
+    expect(document.body.textContent).toContain("2 of 5 items");
     expect(provider.submitTask).not.toHaveBeenCalled();
+  });
+
+  it("renders an active Task through the shared long-operation presentation", async () => {
+    const snapshot = authoritySnapshot();
+    const runningTask = {
+      ...snapshot.tasks[0]!,
+      state: "running" as const,
+      successor_transition: null,
+    };
+    const runningSnapshot: DesktopProductSnapshotV2 = {
+      ...snapshot,
+      tasks: [runningTask],
+      transitions: {},
+    };
+
+    root = await render(providerFixture(runningSnapshot));
+
+    expect(document.body.textContent).toContain("Run science Task");
+    expect(document.body.textContent).toContain("Task state: running");
+    expect(document.body.textContent).toContain("Working — progress is not measurable for this phase");
+  });
+
+  it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {
+    const operation: OperationV2 = {
+      schema_version: "2",
+      operation_id: "core-service-restart-1",
+      kind: "service_restart",
+      status: "running",
+      progress_completed: 2,
+      progress_total: 4,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const cancelCoreOperation = vi.fn(async () => ({
+      ...operation,
+      status: "cancelled" as const,
+      updated_at: "2026-07-23T06:00:01Z",
+    }));
+    const provider = {
+      ...providerFixture(authoritySnapshot()),
+      listCoreOperations: () => [operation],
+      cancelCoreOperation,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+
+    expect(document.body.textContent).toContain("Restart remote service");
+    expect(document.body.textContent).toContain("Core status: running");
+    expect(document.body.textContent).toContain("2 of 4 items");
+    await click("Cancel operation");
+    expect(cancelCoreOperation).toHaveBeenCalledWith(
+      operation.operation_id,
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("keeps diagnostic collection observable as its own Core resource", async () => {
+    const snapshot = authoritySnapshot();
+    const diagnostic = {
+      schema_version: "2" as const,
+      diagnostic_id: "diagnostic-system-1",
+      scope: "system" as const,
+      resource_id: null,
+      status: "running" as const,
+      artifact_id: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const createDiagnostic = vi.fn(async () => diagnostic);
+    const provider = {
+      ...providerFixture(snapshot),
+      listDiagnostics: () => [diagnostic],
+      createDiagnostic,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("System");
+
+    expect(document.body.textContent).toContain("Diagnostic status: running");
+    await click("Collect system diagnostics");
+    expect(createDiagnostic).toHaveBeenCalledWith(
+      { scope: "system", resource_id: null },
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("loads remote service output and starts idempotent safe-cache cleanup", async () => {
+    const base = authoritySnapshot();
+    const service = {
+      schema_version: "2" as const,
+      service_id: "service-daemon-1",
+      kind: "daemon" as const,
+      status: "ready" as const,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const snapshot: DesktopProductSnapshotV2 = { ...base, services: [service] };
+    const loadServiceLogs = vi.fn(async () => ({
+      schema_version: "2" as const,
+      items: [{
+        sequence: 1,
+        occurred_at: NOW,
+        stream: "stdout" as const,
+        message: "Daemon registry is ready",
+      }],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const cleanupCaches = vi.fn(async () => ({
+      schema_version: "2" as const,
+      operation_id: "core-cache-cleanup-1",
+      kind: "cache_cleanup" as const,
+      status: "queued" as const,
+      progress_completed: 0,
+      progress_total: 0,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    }));
+    const provider = {
+      ...providerFixture(snapshot),
+      loadServiceLogs,
+      cleanupCaches,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("System");
+    await click("View logs");
+
+    expect(document.body.textContent).toContain("Daemon registry is ready");
+    expect(document.body.textContent).toContain("Service output");
+    await click("Clean safe caches");
+    expect(cleanupCaches).toHaveBeenCalledWith(expect.objectContaining({ streamEpoch: 1 }));
   });
 
   it("keeps one project create visibly active beyond 15 seconds without a Local API timeout", async () => {
@@ -587,6 +728,8 @@ describe("Desktop v2 product renderer", () => {
         truncated: false,
       }],
       droppedBeforeSequence: 0,
+      hasOlderLogs: false,
+      hasNewerLogs: false,
     } satisfies LifecycleOperationStateV2;
     let operationVisible = false;
     let listener: (() => void) | null = null;
