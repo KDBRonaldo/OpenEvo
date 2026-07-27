@@ -7,14 +7,17 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 
 const DESKTOP_ENDPOINT = "http://127.0.0.1:43117";
 const DESKTOP_SESSION_TOKEN = "release-readonly-session-token-000000000001";
-const OPENAPI_SHA256 = "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
-const EVENT_SCHEMA_SHA256 = "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
-const FEATURE_SET_SHA256 = "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
+const OPENAPI_SHA256 = "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a";
+const EVENT_SCHEMA_SHA256 = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
+const FEATURE_SET_SHA256 = "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 const FEATURE_FLAGS = [
   "core_control_v2",
   "daemon_bundle_v2",
   "event_replay_v2",
   "host_key_review",
+  "lifecycle_operations_v2",
+  "lifecycle_process_logs_v2",
+  "mutation_idempotency_v2",
   "native_askpass",
   "system_openssh_profiles",
   "task_admission_v2",
@@ -25,6 +28,9 @@ const EXPECTED_PROJECTS = new Set([
   "release-packaged-1024",
   "release-packaged-760",
 ]);
+const LIFECYCLE_OPERATION_ID = "release-pending-connect-1";
+const LIFECYCLE_REQUEST_SHA256 = "d".repeat(64);
+const LIFECYCLE_ETAG = `"${"e".repeat(64)}"`;
 
 type HarnessObservation = {
   nativeCalls: Array<{ command: string; args: Record<string, unknown> }>;
@@ -194,9 +200,12 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   expect(connectedObservation.nativeCalls.every(({ command }) => [
     "begin_sidecar_start",
     "sidecar_bootstrap_context",
+    "sidecar_startup_status",
     "stop_sidecar",
     "renderer_bootstrap_stage",
     "renderer_ready",
+    "read_mutation_intent_journal_v2",
+    "compare_and_swap_mutation_intent_journal_v2",
   ].includes(command))).toBe(true);
 
   await page.evaluate(() => window.scrollTo(0, 0));
@@ -301,13 +310,50 @@ test("first launch uses the release sidecar composition and keeps demo navigatio
   expect(failedObservation.nativeCalls.every(({ command }) => [
     "begin_sidecar_start",
     "sidecar_bootstrap_context",
+    "sidecar_startup_status",
     "stop_sidecar",
     "renderer_bootstrap_stage",
+    "read_mutation_intent_journal_v2",
+    "compare_and_swap_mutation_intent_journal_v2",
   ].includes(command))).toBe(true);
 
   await page.evaluate(() => window.scrollTo(0, 0));
   await assertViewportSafety(page, testInfo.project.name);
   await assertAccessibility(page);
+});
+
+test("the packaged release recovers pending lifecycle progress and process logs", async ({ page }) => {
+  const observation: Pick<HarnessObservation, "httpCalls" | "unexpectedCalls"> = {
+    httpCalls: [],
+    unexpectedCalls: [],
+  };
+  await installReleaseNativeContract(page);
+  await installReleaseSidecarContract(page, observation, { lifecycleOperation: true });
+
+  await page.goto("/");
+  const panel = page.locator(".lifecycle-operation-panel").filter({
+    has: page.getByRole("heading", { name: "Connect remote workspace", exact: true }),
+  });
+  await expect(panel).toBeVisible();
+  await expect(panel.getByText("Checking remote server requirements", { exact: true }).last()).toBeVisible();
+  await expect(panel.getByText("Checkpoint 6 of 17", { exact: true })).toBeVisible();
+  await expect(panel.getByText("3 of 8 items", { exact: true })).toBeVisible();
+  await expect(panel.getByText("SSH output", { exact: true })).toBeVisible();
+  await expect(panel.getByText("Daemon output", { exact: true })).toBeVisible();
+  await expect(panel.getByText("remote preflight accepted", { exact: true })).toBeVisible();
+  await expect(panel.getByText("daemon bundle inventory verified", { exact: true })).toBeVisible();
+  await assertViewportSafety(page, "release-lifecycle");
+  await assertAccessibility(page);
+
+  const nativeObservation = await readHarnessObservation(page);
+  expect(nativeObservation.unexpectedCalls).toEqual([]);
+  expect(observation.unexpectedCalls).toEqual([]);
+  expect(observation.httpCalls).toEqual(expect.arrayContaining([
+    { method: "GET", path: `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}`, authenticated: true },
+    { method: "GET", path: `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100`, authenticated: true },
+  ]));
+  expect(observation.httpCalls.every(({ method }) => method === "GET")).toBe(true);
+  await page.goto("about:blank");
 });
 
 async function installReleaseNativeContract(page: Page): Promise<void> {
@@ -331,6 +377,21 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
         invoke: async (command: string, args: Record<string, unknown> = {}) => {
           observation.nativeCalls.push({ command, args });
           if (command === "stop_sidecar") return null;
+          if (command === "sidecar_startup_status") {
+            return {
+              schema_version: "2",
+              startup_epoch: 1,
+              status: "succeeded",
+              phase: "ready",
+              phase_index: 5,
+              phase_total: 6,
+              elapsed_milliseconds: 750,
+              cancellable: false,
+              failure: null,
+            };
+          }
+          if (command === "read_mutation_intent_journal_v2") return null;
+          if (command === "compare_and_swap_mutation_intent_journal_v2") return null;
           if (command === "renderer_bootstrap_stage") {
             const allowedStages = new Set([
               "bootstrap_context_validated",
@@ -354,7 +415,7 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
             if (
               args.openapiSha256 !== contract.openapiSha256
               || args.eventSchemaSha256 !== contract.eventSchemaSha256
-              || args.releaseVersion !== "0.1.9"
+              || args.releaseVersion !== "0.1.10"
             ) {
               observation.unexpectedCalls.push("renderer_ready digest");
               throw new Error("Renderer readiness digest mismatch");
@@ -377,7 +438,7 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
                 mutation_major: 2,
                 openapi_sha256: contract.openapiSha256,
                 event_schema_sha256: contract.eventSchemaSha256,
-                release_version: "0.1.9",
+                release_version: "0.1.10",
                 build_id: "a".repeat(64),
                 source_commit: "abcdef1",
                 provider_kind: "desktop_sidecar",
@@ -407,6 +468,7 @@ async function installReleaseNativeContract(page: Page): Promise<void> {
 async function installReleaseSidecarContract(
   page: Page,
   observation: Pick<HarnessObservation, "httpCalls" | "unexpectedCalls">,
+  options: { lifecycleOperation?: boolean } = {},
 ): Promise<void> {
   await page.route(`${DESKTOP_ENDPOINT}/**`, async (route) => {
     const request = route.request();
@@ -430,7 +492,7 @@ async function installReleaseSidecarContract(
         mutation_major: 2,
         openapi_sha256: OPENAPI_SHA256,
         event_schema_sha256: EVENT_SCHEMA_SHA256,
-        release_version: "0.1.9",
+        release_version: "0.1.10",
         build_id: "a".repeat(64),
         source_commit: "abcdef1",
         build_channel: "release",
@@ -445,7 +507,7 @@ async function installReleaseSidecarContract(
       return rejectUnexpectedRoute(route, observation, `unauthenticated ${path}`);
     }
     if (path === "/desktop/v2/state") {
-      return json(route, disconnectedDesktopState());
+      return json(route, disconnectedDesktopState(options.lifecycleOperation === true));
     }
     if (path === "/desktop/v2/ssh-hosts") {
       return json(route, configuredSshHosts());
@@ -465,18 +527,96 @@ async function installReleaseSidecarContract(
         body: ": release-readonly heartbeat\n\n",
       });
     }
+    if (options.lifecycleOperation === true
+      && path === `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}`) {
+      return json(route, pendingLifecycleOperation());
+    }
+    if (options.lifecycleOperation === true
+      && path === `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100`) {
+      return json(route, pendingLifecycleLogs());
+    }
     return rejectUnexpectedRoute(route, observation, `${method} ${path}`);
   });
 }
 
-function disconnectedDesktopState() {
+function disconnectedDesktopState(withLifecycleOperation = false) {
   return {
     schema_version: "2",
     profiles: [],
     active_profile_id: null,
     active_project_id: null,
+    pending_operations: withLifecycleOperation ? [pendingLifecycleOperationReference()] : [],
     last_event_id: null,
     updated_at: "2026-07-19T12:00:00Z",
+  };
+}
+
+function pendingLifecycleOperationReference() {
+  return {
+    schema_version: "2",
+    operation_id: LIFECYCLE_OPERATION_ID,
+    kind: "profile_connect",
+    resource: { resource_kind: "profile", resource_id: "profile-release-lab" },
+    request_sha256: LIFECYCLE_REQUEST_SHA256,
+    status: "running",
+    phase: "remote_preflight",
+    phase_index: 5,
+    phase_total: 17,
+    log_sequence_high_watermark: 3,
+    updated_at: "2026-07-27T08:00:03Z",
+    etag: LIFECYCLE_ETAG,
+  };
+}
+
+function pendingLifecycleOperation() {
+  return {
+    ...pendingLifecycleOperationReference(),
+    progress: { kind: "items", completed: 3, total: 8 },
+    cancellable: true,
+    result: null,
+    failure: null,
+    created_at: "2026-07-27T08:00:00Z",
+    started_at: "2026-07-27T08:00:01Z",
+    finished_at: null,
+  };
+}
+
+function pendingLifecycleLogs() {
+  return {
+    schema_version: "2",
+    operation_id: LIFECYCLE_OPERATION_ID,
+    dropped_before_sequence: 0,
+    items: [
+      {
+        schema_version: "2",
+        operation_id: LIFECYCLE_OPERATION_ID,
+        sequence: 1,
+        occurred_at: "2026-07-27T08:00:01Z",
+        source: "ssh_stdout",
+        text: "remote preflight accepted",
+        truncated: false,
+      },
+      {
+        schema_version: "2",
+        operation_id: LIFECYCLE_OPERATION_ID,
+        sequence: 2,
+        occurred_at: "2026-07-27T08:00:02Z",
+        source: "daemon_stdout",
+        text: "daemon bundle inventory verified",
+        truncated: false,
+      },
+      {
+        schema_version: "2",
+        operation_id: LIFECYCLE_OPERATION_ID,
+        sequence: 3,
+        occurred_at: "2026-07-27T08:00:03Z",
+        source: "daemon_stderr",
+        text: "verified registry is still warming",
+        truncated: false,
+      },
+    ],
+    next_cursor: null,
+    has_more: false,
   };
 }
 
