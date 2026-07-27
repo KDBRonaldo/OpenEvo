@@ -14,9 +14,9 @@ import {
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-const OPENAPI = "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
-const EVENTS = "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
-const FEATURE_DIGEST = "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
+const OPENAPI = "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a";
+const EVENTS = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
+const FEATURE_DIGEST = "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 
 function version() {
   return {
@@ -27,7 +27,7 @@ function version() {
     mutation_major: 2,
     openapi_sha256: OPENAPI,
     event_schema_sha256: EVENTS,
-    release_version: "0.1.9",
+    release_version: "0.1.10",
     build_id: "a".repeat(64),
     source_commit: "abcdef1",
     build_channel: "release",
@@ -59,12 +59,12 @@ function native(value: unknown = bootstrap()) {
   };
 }
 
-describe("v0.1.9 release provider", () => {
+describe("v0.1.10 release provider", () => {
   beforeEach(() => invokeMock.mockReset());
 
   it("pins the exact Desktop v2 contract and event schema", () => {
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT).toMatchObject({
-      releaseVersion: "0.1.9",
+      releaseVersion: "0.1.10",
       acceptedOpenApiDigests: [OPENAPI],
       acceptedEventSchemaDigests: [EVENTS],
       allowedProviderKinds: ["desktop_sidecar"],
@@ -74,21 +74,24 @@ describe("v0.1.9 release provider", () => {
       "daemon_bundle_v2",
       "event_replay_v2",
       "host_key_review",
+      "lifecycle_operations_v2",
+      "lifecycle_process_logs_v2",
+      "mutation_idempotency_v2",
       "native_askpass",
       "system_openssh_profiles",
       "task_admission_v2",
     ]);
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT).toMatchObject({
-      releaseVersion: releaseManifest.v019.release_version,
-      acceptedOpenApiDigests: releaseManifest.v019.accepted_desktop_openapi_digests,
-      acceptedEventSchemaDigests: releaseManifest.v019.accepted_desktop_event_schema_digests,
-      requiredFeatureFlags: releaseManifest.v019.required_desktop_feature_flags,
+      releaseVersion: releaseManifest.v0110.release_version,
+      acceptedOpenApiDigests: releaseManifest.v0110.accepted_desktop_openapi_digests,
+      acceptedEventSchemaDigests: releaseManifest.v0110.accepted_desktop_event_schema_digests,
+      requiredFeatureFlags: releaseManifest.v0110.required_desktop_feature_flags,
     });
     expect(CORE_PRODUCT_RELEASE_CONTRACT).toMatchObject({
-      releaseVersion: releaseManifest.v019.release_version,
-      acceptedOpenApiDigests: releaseManifest.v019.accepted_core_openapi_digests,
-      acceptedEventSchemaDigests: releaseManifest.v019.accepted_core_event_schema_digests,
-      requiredFeatureFlags: releaseManifest.v019.required_core_feature_flags,
+      releaseVersion: releaseManifest.v0110.release_version,
+      acceptedOpenApiDigests: releaseManifest.v0110.accepted_core_openapi_digests,
+      acceptedEventSchemaDigests: releaseManifest.v0110.accepted_core_event_schema_digests,
+      requiredFeatureFlags: releaseManifest.v0110.required_core_feature_flags,
     });
   });
 
@@ -100,7 +103,7 @@ describe("v0.1.9 release provider", () => {
     expect(invokeMock).toHaveBeenCalledWith("renderer_ready", {
       openapiSha256: OPENAPI,
       eventSchemaSha256: EVENTS,
-      releaseVersion: "0.1.9",
+      releaseVersion: "0.1.10",
     });
   });
 

@@ -74,7 +74,7 @@ from desktop.sidecar.release_provider_v2 import (
 )
 from desktop.sidecar.release_capabilities import (
     RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
-    validate_v019_release_composition,
+    validate_v0110_release_composition,
 )
 from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
@@ -363,10 +363,10 @@ def create_release_desktop_local_api_app(
 ) -> FastAPI:
     """Create the frozen 0.1.8 Local API v1 provider and own its durable store."""
 
-    if build_version == "0.1.9":
+    if build_version == "0.1.10":
         # The v1 provider must never become a mutation fallback merely because the
         # package version advanced. Task 21 supplies the separate v2 provider.
-        validate_v019_release_composition(
+        validate_v0110_release_composition(
             provider_kind="desktop_sidecar",
             local_api_major=1,
             core_transport="active_project_ssh_tunnel",
@@ -860,7 +860,7 @@ def create_packaged_release_desktop_local_api_v2_app(
     startup_phase: Callable[[str], None] | None = None,
     close_on_shutdown: bool = True,
 ) -> FastAPI:
-    """Compose the complete v0.1.9 Local API around system OpenSSH and Core v2."""
+    """Compose the complete v0.1.10 Local API around system OpenSSH and Core v2."""
 
     if type(system_ssh_askpass_helper) is not AskpassHelperAuthority:
         raise TypeError("packaged Local API v2 requires the sealed askpass helper")
@@ -1006,7 +1006,7 @@ def create_release_desktop_local_api_v2_app(
     provider: DesktopReleaseProviderV2,
     close_on_shutdown: bool = True,
 ) -> FastAPI:
-    """Mount the packaged 0.1.9 provider on Local API v2 only."""
+    """Mount the packaged 0.1.10 provider on Local API v2 only."""
 
     if (
         type(session_token) is not str
@@ -1018,7 +1018,7 @@ def create_release_desktop_local_api_v2_app(
         raise TypeError("Local API v2 requires the exact release provider")
     if type(close_on_shutdown) is not bool:
         raise TypeError("shutdown ownership must be boolean")
-    validate_v019_release_composition(
+    validate_v0110_release_composition(
         provider_kind="desktop_sidecar",
         local_api_major=2,
         core_transport="active_project_ssh_tunnel",

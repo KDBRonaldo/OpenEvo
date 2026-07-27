@@ -463,7 +463,7 @@ def _create_app(
             session_token=native_frame.session_token,
             instance_id=native_frame.instance_id,
             source_commit=source_commit,
-            build_version="0.1.9",
+            build_version="0.1.10",
             build_channel=build_channel,
             core_assets_root=core_assets_root,
             release_assets_root=release_assets_root,

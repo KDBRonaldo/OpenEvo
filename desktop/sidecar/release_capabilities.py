@@ -46,7 +46,7 @@ RELEASE_EXECUTION_MODE_CAPABILITIES_V1 = ExecutionModeCapabilitiesV1(
 
 
 class ReleaseAuthorityNegotiationError(RuntimeError):
-    """The discovered or composed authority cannot mutate for v0.1.9."""
+    """The discovered or composed authority cannot mutate for v0.1.10."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,7 +82,7 @@ class NegotiatedMutationAuthorityV2:
     runtime_contract_sha256: str
 
 
-_V019_POLICY_FIELDS = {
+_V0110_POLICY_FIELDS = {
     "accepted_core_event_schema_digests",
     "accepted_core_openapi_digests",
     "accepted_desktop_event_schema_digests",
@@ -108,24 +108,24 @@ def _exact_string_tuple(value: object, *, field: str) -> tuple[str, ...]:
         or any(type(item) is not str or not item for item in value)
         or len(value) != len(set(value))
     ):
-        raise RuntimeError(f"v0.1.9 release authority field {field} is invalid")
+        raise RuntimeError(f"v0.1.10 release authority field {field} is invalid")
     result = tuple(value)
     if result != tuple(sorted(result)):
-        raise RuntimeError(f"v0.1.9 release authority field {field} must be sorted")
+        raise RuntimeError(f"v0.1.10 release authority field {field} must be sorted")
     return result
 
 
-def load_v019_release_authority_policy(
+def load_v0110_release_authority_policy(
     path: Path | None = None,
 ) -> ReleaseAuthorityPolicyV2:
     manifest_path = path or Path(__file__).resolve().parents[1] / "release-contract.json"
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise RuntimeError("v0.1.9 release authority manifest is unavailable") from exc
-    policy = manifest.get("v019") if type(manifest) is dict else None
-    if type(policy) is not dict or set(policy) != _V019_POLICY_FIELDS:
-        raise RuntimeError("v0.1.9 release authority manifest is not closed")
+        raise RuntimeError("v0.1.10 release authority manifest is unavailable") from exc
+    policy = manifest.get("v0110") if type(manifest) is dict else None
+    if type(policy) is not dict or set(policy) != _V0110_POLICY_FIELDS:
+        raise RuntimeError("v0.1.10 release authority manifest is not closed")
 
     desktop_digests = _exact_string_tuple(
         policy["accepted_desktop_openapi_digests"],
@@ -157,7 +157,7 @@ def load_v019_release_authority_policy(
         policy["required_core_feature_flags"], field="required_core_feature_flags"
     )
     expected_scalars = {
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "desktop_local_mutation_major": 2,
         "core_control_mutation_major": 2,
         "core_transport": "active_project_ssh_tunnel",
@@ -166,17 +166,33 @@ def load_v019_release_authority_policy(
         "require_registry_identity": True,
     }
     if any(policy.get(key) != value for key, value in expected_scalars.items()):
-        raise RuntimeError("v0.1.9 release authority manifest weakens the release policy")
+        raise RuntimeError("v0.1.10 release authority manifest weakens the release policy")
     if desktop_digests != (DESKTOP_OPENAPI_SHA256,):
-        raise RuntimeError("v0.1.9 release authority has the wrong Desktop OpenAPI digest")
+        raise RuntimeError("v0.1.10 release authority has the wrong Desktop OpenAPI digest")
     if desktop_event_digests != (DESKTOP_EVENTS_SCHEMA_SHA256,):
-        raise RuntimeError("v0.1.9 release authority has the wrong Desktop event digest")
+        raise RuntimeError("v0.1.10 release authority has the wrong Desktop event digest")
     if core_digests != (core_openapi_sha256(),):
-        raise RuntimeError("v0.1.9 release authority has the wrong Core OpenAPI digest")
+        raise RuntimeError("v0.1.10 release authority has the wrong Core OpenAPI digest")
     if core_event_digests != (core_events_schema_sha256(),):
-        raise RuntimeError("v0.1.9 release authority has the wrong Core event digest")
+        raise RuntimeError("v0.1.10 release authority has the wrong Core event digest")
     if allowed_provider_kinds != ("desktop_sidecar",):
-        raise RuntimeError("v0.1.9 release authority requires the packaged Desktop sidecar")
+        raise RuntimeError("v0.1.10 release authority requires the packaged Desktop sidecar")
+    required_desktop_features = (
+        "core_control_v2",
+        "daemon_bundle_v2",
+        "event_replay_v2",
+        "host_key_review",
+        "lifecycle_operations_v2",
+        "lifecycle_process_logs_v2",
+        "mutation_idempotency_v2",
+        "native_askpass",
+        "system_openssh_profiles",
+        "task_admission_v2",
+    )
+    if desktop_features != required_desktop_features:
+        raise RuntimeError(
+            "v0.1.10 release authority has an incomplete Desktop feature set"
+        )
     required_forbidden = {
         "contract_simulator",
         "direct_backend",
@@ -185,10 +201,10 @@ def load_v019_release_authority_policy(
         "source_sidecar",
     }
     if set(forbidden_provider_kinds) != required_forbidden:
-        raise RuntimeError("v0.1.9 release authority has an incomplete provider denylist")
+        raise RuntimeError("v0.1.10 release authority has an incomplete provider denylist")
 
     return ReleaseAuthorityPolicyV2(
-        release_version="0.1.9",
+        release_version="0.1.10",
         desktop_mutation_api_major=2,
         core_mutation_api_major=2,
         desktop_openapi_sha256=desktop_digests[0],
@@ -206,13 +222,13 @@ def load_v019_release_authority_policy(
     )
 
 
-V019_RELEASE_AUTHORITY_POLICY = load_v019_release_authority_policy()
+V0110_RELEASE_AUTHORITY_POLICY = load_v0110_release_authority_policy()
 
 
 def negotiate_desktop_v2_mutation(
     payload: Mapping[str, object],
     *,
-    policy: ReleaseAuthorityPolicyV2 = V019_RELEASE_AUTHORITY_POLICY,
+    policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
 ) -> DesktopVersionV2:
     try:
         version = DesktopVersionV2.model_validate(dict(payload))
@@ -236,7 +252,7 @@ def negotiate_desktop_v2_mutation(
 def negotiate_core_v2_mutation(
     payload: Mapping[str, object],
     *,
-    policy: ReleaseAuthorityPolicyV2 = V019_RELEASE_AUTHORITY_POLICY,
+    policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
 ) -> VersionResponseV2:
     registry_identity = payload.get("registry_sha256")
     if payload.get("schema_version") == "2" and policy.require_registry_identity and (
@@ -270,21 +286,21 @@ def negotiate_core_v2_mutation(
     return version
 
 
-def validate_v019_release_composition(
+def validate_v0110_release_composition(
     *,
     provider_kind: object,
     local_api_major: object,
     core_transport: object,
     allow_direct_core_url: object,
     allow_legacy_route_fallback: object,
-    policy: ReleaseAuthorityPolicyV2 = V019_RELEASE_AUTHORITY_POLICY,
+    policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
 ) -> None:
     if provider_kind not in policy.allowed_provider_kinds:
         raise ReleaseAuthorityNegotiationError("Release provider kind is forbidden.")
     if provider_kind in policy.forbidden_provider_kinds:
         raise ReleaseAuthorityNegotiationError("Release provider kind is forbidden.")
     if local_api_major != policy.desktop_mutation_api_major:
-        raise ReleaseAuthorityNegotiationError("The 0.1.9 release requires Local API v2.")
+        raise ReleaseAuthorityNegotiationError("The 0.1.10 release requires Local API v2.")
     if core_transport != policy.core_transport:
         raise ReleaseAuthorityNegotiationError("Core must use the active project SSH tunnel.")
     if allow_direct_core_url is not False or policy.allow_direct_core_url:
@@ -293,11 +309,11 @@ def validate_v019_release_composition(
         raise ReleaseAuthorityNegotiationError("Legacy route fallback is forbidden in release.")
 
 
-def negotiate_v019_mutation_authority(
+def negotiate_v0110_mutation_authority(
     desktop_payload: Mapping[str, object],
     core_payload: Mapping[str, object],
     *,
-    policy: ReleaseAuthorityPolicyV2 = V019_RELEASE_AUTHORITY_POLICY,
+    policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
 ) -> NegotiatedMutationAuthorityV2:
     desktop = negotiate_desktop_v2_mutation(desktop_payload, policy=policy)
     core = negotiate_core_v2_mutation(core_payload, policy=policy)
@@ -327,10 +343,10 @@ __all__ = (
     "NegotiatedMutationAuthorityV2",
     "ReleaseAuthorityNegotiationError",
     "ReleaseAuthorityPolicyV2",
-    "V019_RELEASE_AUTHORITY_POLICY",
-    "load_v019_release_authority_policy",
+    "V0110_RELEASE_AUTHORITY_POLICY",
+    "load_v0110_release_authority_policy",
     "negotiate_core_v2_mutation",
     "negotiate_desktop_v2_mutation",
-    "negotiate_v019_mutation_authority",
-    "validate_v019_release_composition",
+    "negotiate_v0110_mutation_authority",
+    "validate_v0110_release_composition",
 )

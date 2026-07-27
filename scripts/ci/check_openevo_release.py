@@ -304,23 +304,23 @@ def validate_local_versions(expected_version: str) -> list[str]:
     return errors
 
 
-def validate_v019_contract_manifest(
+def validate_v0110_contract_manifest(
     repo_root: Path = REPO_ROOT,
     *,
     expected_version: str,
 ) -> list[str]:
-    """Require exact Core v2 mutation authority for the 0.1.9 release."""
+    """Require exact Core v2 mutation authority for the 0.1.10 release."""
 
-    if expected_version != "0.1.9":
+    if expected_version != "0.1.10":
         return []
 
     manifest_path = repo_root / "desktop/release-contract.json"
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return ["The 0.1.9 release contract manifest is missing or unreadable."]
+        return ["The 0.1.10 release contract manifest is missing or unreadable."]
     if not isinstance(payload, dict):
-        return ["The 0.1.9 release contract manifest must be a JSON object."]
+        return ["The 0.1.10 release contract manifest must be a JSON object."]
 
     if str(SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(SRC_ROOT))
@@ -332,34 +332,34 @@ def validate_v019_contract_manifest(
         RELEASE_DAEMON_FEATURE_FLAGS_V2,
     )
 
-    policy = payload.get("v019")
+    policy = payload.get("v0110")
     if not isinstance(policy, dict):
-        return ["The 0.1.9 release contract manifest is missing its closed v019 policy."]
+        return ["The 0.1.10 release contract manifest is missing its closed v0110 policy."]
 
     errors: list[str] = []
-    if policy.get("release_version") != "0.1.9":
-        errors.append("The v019 release authority must bind release version 0.1.9.")
+    if policy.get("release_version") != "0.1.10":
+        errors.append("The v0110 release authority must bind release version 0.1.10.")
     if policy.get("core_control_mutation_major") != 2:
-        errors.append("The 0.1.9 release must require Core Control API v2 for mutation.")
+        errors.append("The 0.1.10 release must require Core Control API v2 for mutation.")
     if policy.get("accepted_core_openapi_digests") != [openapi_sha256()]:
         errors.append(
-            "The 0.1.9 release manifest must pin the exact generated Core v2 OpenAPI digest."
+            "The 0.1.10 release manifest must pin the exact generated Core v2 OpenAPI digest."
         )
     if policy.get("accepted_core_event_schema_digests") != [events_schema_sha256()]:
         errors.append(
-            "The 0.1.9 release manifest must pin the exact generated Core v2 event schema digest."
+            "The 0.1.10 release manifest must pin the exact generated Core v2 event schema digest."
         )
     if policy.get("required_core_feature_flags") != list(RELEASE_DAEMON_FEATURE_FLAGS_V2):
         errors.append(
-            "The 0.1.9 release manifest must require the complete production Daemon v2 feature set."
+            "The 0.1.10 release manifest must require the complete production Daemon v2 feature set."
         )
     if policy.get("allow_legacy_route_fallback") is not False:
-        errors.append("The 0.1.9 release manifest must forbid legacy route fallback.")
+        errors.append("The 0.1.10 release manifest must forbid legacy route fallback.")
     launcher_path = repo_root / "src/openevo/backend/launcher.py"
     try:
         launcher = launcher_path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
-        errors.append("The 0.1.9 release Daemon launcher is unreadable.")
+        errors.append("The 0.1.10 release Daemon launcher is unreadable.")
     else:
         required_composition = (
             "CoreControlProviderV2",
@@ -369,14 +369,14 @@ def validate_v019_contract_manifest(
             "install_core_run_admission_endpoint",
         )
         if any(value not in launcher for value in required_composition):
-            errors.append("The 0.1.9 release Daemon launcher is missing its production v2 owners.")
+            errors.append("The 0.1.10 release Daemon launcher is missing its production v2 owners.")
         if (
             "contracts.v1.provider" in launcher
             or "CoreScienceRunOwner" in launcher
             or "create_core_control_app(" in launcher
         ):
             errors.append(
-                "The 0.1.9 release Daemon launcher retains a legacy mutation composition."
+                "The 0.1.10 release Daemon launcher retains a legacy mutation composition."
             )
     return errors
 
@@ -638,7 +638,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     all_errors: list[str] = []
     all_errors.extend(validate_local_versions(expected_version))
-    all_errors.extend(validate_v019_contract_manifest(expected_version=expected_version))
+    all_errors.extend(validate_v0110_contract_manifest(expected_version=expected_version))
     all_errors.extend(validate_unsigned_macos_release_policy())
     if args.artifact is not None:
         all_errors.extend(

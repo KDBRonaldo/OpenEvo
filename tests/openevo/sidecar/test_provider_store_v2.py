@@ -27,7 +27,7 @@ from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
 )
 from desktop.sidecar.release_runtime import create_release_local_state_v2
-from desktop.sidecar.release_capabilities import V019_RELEASE_AUTHORITY_POLICY
+from desktop.sidecar.release_capabilities import V0110_RELEASE_AUTHORITY_POLICY
 from openevo.backend.contracts.v2.models import (
     ContractOfferV2,
     ScienceProjectConfigV2,
@@ -89,7 +89,7 @@ def _legacy_profile(*, state: str = "rebind_required") -> LegacyProfileImportV2:
 
 
 def _core_version() -> VersionResponseV2:
-    features = list(V019_RELEASE_AUTHORITY_POLICY.required_core_feature_flags)
+    features = list(V0110_RELEASE_AUTHORITY_POLICY.required_core_feature_flags)
     encoded = json.dumps(features, separators=(",", ":")).encode("ascii")
     return VersionResponseV2(
         api_name="openevo-core-control-api",
@@ -99,15 +99,15 @@ def _core_version() -> VersionResponseV2:
         contracts=[
             ContractOfferV2(
                 api_major=2,
-                openapi_sha256=V019_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
+                openapi_sha256=V0110_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
                 event_schema_sha256=(
-                    V019_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
+                    V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
                 ),
                 access="mutation",
                 mutation_compatible=True,
             )
         ],
-        release_version="0.1.9",
+        release_version="0.1.10",
         build_id="b" * 64,
         source_commit="a" * 40,
         build_channel="release",

@@ -21,7 +21,7 @@ from desktop.sidecar.release_app import (
     create_packaged_release_desktop_local_api_v2_app,
     create_release_desktop_local_api_v2_app,
 )
-from desktop.sidecar.release_capabilities import V019_RELEASE_AUTHORITY_POLICY
+from desktop.sidecar.release_capabilities import V0110_RELEASE_AUTHORITY_POLICY
 from desktop.sidecar.release_provider_v2 import DesktopReleaseProviderV2
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
@@ -51,7 +51,7 @@ def _feature_digest(features: list[str]) -> str:
 
 
 def _core_version() -> core_v2.VersionResponseV2:
-    features = list(V019_RELEASE_AUTHORITY_POLICY.required_core_feature_flags)
+    features = list(V0110_RELEASE_AUTHORITY_POLICY.required_core_feature_flags)
     return core_v2.VersionResponseV2(
         api_name="openevo-core-control-api",
         preferred_major=2,
@@ -60,15 +60,15 @@ def _core_version() -> core_v2.VersionResponseV2:
         contracts=[
             core_v2.ContractOfferV2(
                 api_major=2,
-                openapi_sha256=V019_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
+                openapi_sha256=V0110_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
                 event_schema_sha256=(
-                    V019_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
+                    V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
                 ),
                 access="mutation",
                 mutation_compatible=True,
             )
         ],
-        release_version="0.1.9",
+        release_version="0.1.10",
         build_id="2" * 64,
         source_commit=SOURCE_COMMIT,
         build_channel="release",
@@ -234,7 +234,7 @@ def _provider(
         bridge_store=None,
         workspace_import_store=None,
         event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
-        build_version="0.1.9",
+        build_version="0.1.10",
         source_commit=SOURCE_COMMIT,
         build_channel="release",
         instance_id="instance-v2",
@@ -307,7 +307,7 @@ def test_release_app_mounts_only_authenticated_v2_mutation_routes(tmp_path: Path
         assert payload["mutation_major"] == 2
         assert payload["mutation_compatible"] is True
         assert payload["openapi_sha256"] == (
-            V019_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256
+            V0110_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256
         )
 
         assert client.get("/desktop/v2/state").status_code == 401
@@ -394,7 +394,7 @@ def test_packaged_v2_composition_owns_catalog_state_runtime_and_ssh_authorities(
         session_token=SESSION,
         instance_id="packaged-instance-v2",
         source_commit=SOURCE_COMMIT,
-        build_version="0.1.9",
+        build_version="0.1.10",
         build_channel="test",
         core_assets_root=tmp_path / "deferred-core-assets",
         system_ssh_askpass_helper=helper,
@@ -483,7 +483,7 @@ def test_packaged_v2_restart_invalidates_process_authority_and_preserves_project
         session_token=SESSION,
         instance_id="packaged-restart-instance-v2",
         source_commit=SOURCE_COMMIT,
-        build_version="0.1.9",
+        build_version="0.1.10",
         build_channel="test",
         core_assets_root=tmp_path / "deferred-core-assets",
         system_ssh_askpass_helper=helper,

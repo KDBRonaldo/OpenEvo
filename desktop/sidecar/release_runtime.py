@@ -1254,7 +1254,7 @@ def create_release_core_runtime_v2(
     packaged_resource_assets: bool = False,
     startup_phase: Callable[[str], None] | None = None,
 ) -> DesktopReleaseCoreRuntimeV2:
-    """Compose the v0.1.9 Core-only business authority."""
+    """Compose the v0.1.10 Core-only business authority."""
 
     if type(provider_store) is not DesktopProviderStoreV2:
         raise TypeError("v2 Core runtime requires the exact provider store")

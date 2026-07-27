@@ -27,7 +27,7 @@ from desktop.sidecar.core_bridge_v2 import (
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
 from desktop.sidecar.release_capabilities import (
-    V019_RELEASE_AUTHORITY_POLICY,
+    V0110_RELEASE_AUTHORITY_POLICY,
     ReleaseAuthorityNegotiationError,
     negotiate_core_v2_mutation,
 )
@@ -235,7 +235,7 @@ _LocalOperationKindV2 = Literal[
 
 
 class DesktopReleaseProviderV2:
-    """Strict packaged provider for the 0.1.9 Local API v2 surface."""
+    """Strict packaged provider for the 0.1.10 Local API v2 surface."""
 
     def __init__(
         self,
@@ -273,8 +273,8 @@ class DesktopReleaseProviderV2:
             raise TypeError("release v2 Core bridge store is invalid")
         if workspace_import_store is not None and type(workspace_import_store) is not WorkspaceImportStore:
             raise TypeError("release v2 workspace import store is invalid")
-        if build_version != "0.1.9":
-            raise ValueError("release v2 provider requires version 0.1.9")
+        if build_version != "0.1.10":
+            raise ValueError("release v2 provider requires version 0.1.10")
         if (
             type(source_commit) is not str
             or not 7 <= len(source_commit) <= 40
@@ -426,7 +426,7 @@ class DesktopReleaseProviderV2:
 
     def _version(self, arguments: Mapping[str, object]) -> local_v2.DesktopVersionV2:
         _require_no_arguments(arguments)
-        features = list(V019_RELEASE_AUTHORITY_POLICY.required_desktop_feature_flags)
+        features = list(V0110_RELEASE_AUTHORITY_POLICY.required_desktop_feature_flags)
         build_id = _digest(
             {
                 "schema_version": "2",
@@ -442,9 +442,9 @@ class DesktopReleaseProviderV2:
             preferred_major=2,
             supported_majors=[2],
             mutation_major=2,
-            openapi_sha256=V019_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256,
+            openapi_sha256=V0110_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256,
             event_schema_sha256=(
-                V019_RELEASE_AUTHORITY_POLICY.desktop_event_schema_sha256
+                V0110_RELEASE_AUTHORITY_POLICY.desktop_event_schema_sha256
             ),
             release_version=self._build_version,
             build_id=build_id,

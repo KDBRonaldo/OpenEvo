@@ -5,14 +5,14 @@ function nonEmpty<T>(values: readonly T[], label: string): readonly [T, ...T[]] 
   return Object.freeze([values[0]!, ...values.slice(1)]);
 }
 
-// Updated only with reviewed, checked-in v0.1.9 Desktop/Core contract snapshots.
+// Updated only with reviewed, checked-in v0.1.10 Desktop/Core contract snapshots.
 export const DESKTOP_PRODUCT_RELEASE_CONTRACT: DesktopReleaseContractV2 = Object.freeze({
-  releaseVersion: "0.1.9",
+  releaseVersion: "0.1.10",
   acceptedOpenApiDigests: nonEmpty([
-    "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672",
+    "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a",
   ], "a Desktop v2 OpenAPI digest"),
   acceptedEventSchemaDigests: nonEmpty([
-    "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28",
+    "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b",
   ], "a Desktop v2 event schema digest"),
   allowedProviderKinds: Object.freeze(["desktop_sidecar"] as const),
   requiredFeatureFlags: Object.freeze([
@@ -20,6 +20,9 @@ export const DESKTOP_PRODUCT_RELEASE_CONTRACT: DesktopReleaseContractV2 = Object
     "daemon_bundle_v2",
     "event_replay_v2",
     "host_key_review",
+    "lifecycle_operations_v2",
+    "lifecycle_process_logs_v2",
+    "mutation_idempotency_v2",
     "native_askpass",
     "system_openssh_profiles",
     "task_admission_v2",
@@ -27,7 +30,7 @@ export const DESKTOP_PRODUCT_RELEASE_CONTRACT: DesktopReleaseContractV2 = Object
 });
 
 export const CORE_PRODUCT_RELEASE_CONTRACT = Object.freeze({
-  releaseVersion: "0.1.9",
+  releaseVersion: "0.1.10",
   mutationMajor: 2,
   acceptedOpenApiDigests: nonEmpty([
     "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b",

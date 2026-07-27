@@ -25,13 +25,13 @@ RELEASE_CONTRACT = json.loads(
         encoding="utf-8"
     )
 )
-V019_RELEASE_CONTRACT = RELEASE_CONTRACT["v019"]
-RELEASE_VERSION = V019_RELEASE_CONTRACT["release_version"]
-RELEASE_OPENAPI_SHA256 = V019_RELEASE_CONTRACT["accepted_desktop_openapi_digests"][0]
-RELEASE_EVENT_SCHEMA_SHA256 = V019_RELEASE_CONTRACT[
+V0110_RELEASE_CONTRACT = RELEASE_CONTRACT["v0110"]
+RELEASE_VERSION = V0110_RELEASE_CONTRACT["release_version"]
+RELEASE_OPENAPI_SHA256 = V0110_RELEASE_CONTRACT["accepted_desktop_openapi_digests"][0]
+RELEASE_EVENT_SCHEMA_SHA256 = V0110_RELEASE_CONTRACT[
     "accepted_desktop_event_schema_digests"
 ][0]
-RELEASE_FEATURE_FLAGS = V019_RELEASE_CONTRACT["required_desktop_feature_flags"]
+RELEASE_FEATURE_FLAGS = V0110_RELEASE_CONTRACT["required_desktop_feature_flags"]
 
 
 GOOD_METADATA = "\n".join(
@@ -3621,7 +3621,7 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
         == cargo_config["package"]["version"]
         == project_config["project"]["version"]
         == package_config["version"]
-        == release_contract["v019"]["release_version"]
+        == release_contract["v0110"]["release_version"]
         == core_version
     )
     assert config["identifier"] == "org.openevo.desktop"
@@ -4020,7 +4020,7 @@ def test_disabled_release_artifact_workflow_does_not_upload_checksums_or_notes()
     assert "release-artifacts/openevo-desktop-dmg/*" not in text
 
 
-def test_v019_docs_define_system_openssh_and_v2_authority() -> None:
+def test_v0110_docs_define_system_openssh_and_v2_authority() -> None:
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
     product_spec = Path("docs/maintainer/productization/spec.md").read_text(
         encoding="utf-8"
@@ -4063,7 +4063,7 @@ def test_v019_docs_define_system_openssh_and_v2_authority() -> None:
     assert "Server address" not in handoff
 
 
-def test_v019_release_manifest_pins_v2_mutation_and_forbids_fallbacks() -> None:
+def test_v0110_release_manifest_pins_v2_mutation_and_forbids_fallbacks() -> None:
     checker = _load_module()
     from desktop.sidecar.contracts.v2.canonical import (
         DESKTOP_EVENTS_SCHEMA_SHA256,
@@ -4078,9 +4078,9 @@ def test_v019_release_manifest_pins_v2_mutation_and_forbids_fallbacks() -> None:
     )
 
     manifest = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))
-    policy = manifest["v019"]
+    policy = manifest["v0110"]
 
-    assert checker.validate_v019_contract_manifest(expected_version="0.1.9") == []
+    assert checker.validate_v0110_contract_manifest(expected_version="0.1.10") == []
     assert policy["desktop_local_mutation_major"] == 2
     assert policy["core_control_mutation_major"] == 2
     assert policy["accepted_desktop_openapi_digests"] == [DESKTOP_OPENAPI_SHA256]
@@ -4091,6 +4091,20 @@ def test_v019_release_manifest_pins_v2_mutation_and_forbids_fallbacks() -> None:
     assert policy["accepted_core_event_schema_digests"] == [events_schema_sha256()]
     assert policy["required_core_feature_flags"] == list(
         RELEASE_DAEMON_FEATURE_FLAGS_V2
+    )
+    assert policy["required_desktop_feature_flags"] == sorted(
+        [
+            "core_control_v2",
+            "daemon_bundle_v2",
+            "event_replay_v2",
+            "host_key_review",
+            "lifecycle_operations_v2",
+            "lifecycle_process_logs_v2",
+            "mutation_idempotency_v2",
+            "native_askpass",
+            "system_openssh_profiles",
+            "task_admission_v2",
+        ]
     )
     assert policy["core_transport"] == "active_project_ssh_tunnel"
     assert policy["allow_direct_core_url"] is False
@@ -4263,7 +4277,7 @@ def _release_version_payload() -> dict[str, object]:
         "build_channel": "release",
         "openapi_sha256": RELEASE_OPENAPI_SHA256,
         "event_schema_sha256": RELEASE_EVENT_SCHEMA_SHA256,
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "build_id": "ab" * 32,
         "source_commit": "89baeb26",
         "feature_flags": RELEASE_FEATURE_FLAGS,

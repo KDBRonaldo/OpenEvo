@@ -176,10 +176,10 @@ def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
         "allowed_provider_kinds",
         "required_feature_flags",
         "schema_version",
-        "v019",
+        "v0110",
     }:
         raise RuntimeError("Desktop release contract does not use the closed schema")
-    policy = payload.get("v019")
+    policy = payload.get("v0110")
     digests = policy.get("accepted_desktop_openapi_digests") if type(policy) is dict else None
     event_digests = (
         policy.get("accepted_desktop_event_schema_digests")
@@ -199,7 +199,7 @@ def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
         or len(event_digests) != 1
         or type(event_digests[0]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", event_digests[0]) is None
-        or release_version != "0.1.9"
+        or release_version != "0.1.10"
         or provider_kinds != ["desktop_sidecar"]
         or type(features) is not list
         or not features
