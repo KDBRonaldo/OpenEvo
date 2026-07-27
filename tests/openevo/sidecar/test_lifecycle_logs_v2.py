@@ -60,6 +60,46 @@ def test_sanitizer_splits_utf8_at_exact_public_entry_boundary() -> None:
     assert "".join(text for _source, text, _truncated in entries) == "界" * 6_000 + "\n"
 
 
+def test_sanitizer_bounds_and_discards_an_unterminated_process_line() -> None:
+    entries: list[tuple[str, str, bool]] = []
+    sanitizer = LifecycleOutputSanitizerV2(
+        lambda source, text, truncated: entries.append((source, text, truncated))
+    )
+
+    for _ in range(1_024):
+        sanitizer.feed("daemon_stderr", b"x" * 8_192)
+    sanitizer.feed("daemon_stderr", b"\nafter oversized output\n")
+    sanitizer.flush()
+
+    rendered = "".join(text for _source, text, _truncated in entries)
+    assert "x" * 1_024 not in rendered
+    assert "unterminated process output omitted" in rendered
+    assert "after oversized output\n" in rendered
+    assert len(rendered.encode("utf-8")) <= 2 * 16 * 1_024
+    assert any(truncated for _source, _text, truncated in entries)
+
+
+def test_sanitizer_redacts_named_credentials_and_sensitive_query_values() -> None:
+    entries: list[tuple[str, str, bool]] = []
+    sanitizer = LifecycleOutputSanitizerV2(
+        lambda source, text, truncated: entries.append((source, text, truncated))
+    )
+
+    sanitizer.feed("ssh_stderr", b"OPENAI_API_")
+    sanitizer.feed("ssh_stderr", b"KEY=sk-live-example-value\n")
+    sanitizer.feed(
+        "daemon_stdout",
+        b"request=https://example.test/run?access_token=query-secret&mode=fast\n",
+    )
+    sanitizer.flush()
+
+    rendered = "".join(text for _source, text, _truncated in entries)
+    assert "sk-live-example-value" not in rendered
+    assert "query-secret" not in rendered
+    assert "OPENAI_API_KEY=[REDACTED_CREDENTIAL]" in rendered
+    assert "access_token=[REDACTED_CREDENTIAL]" in rendered
+
+
 def test_bounded_subprocess_observer_receives_only_stream_and_bytes() -> None:
     observed: list[tuple[str, bytes]] = []
     command_canary = "argv-must-not-be-observed"

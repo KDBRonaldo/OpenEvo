@@ -339,6 +339,14 @@ def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Pat
         assert [local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases] == sorted(
             local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases
         )
+        assert [cancellable for _phase, _progress, cancellable in observed] == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+        ]
         bridge.close()
 
 

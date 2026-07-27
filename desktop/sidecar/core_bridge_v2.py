@@ -767,7 +767,7 @@ class DesktopCoreBridgeV2:
                 display_name=request.display_name,
                 config=request.config,
             )
-            self._observe_lifecycle_progress("creating_remote_project", cancellable=True)
+            self._observe_lifecycle_progress("creating_remote_project", cancellable=False)
             bootstrap_version: core_v2.VersionResponseV2 | None
             if previous is None:
                 connection, bootstrap_version = self._bootstrap_project(
@@ -793,7 +793,7 @@ class DesktopCoreBridgeV2:
             client = self._new_client(connection, deadline)
             native_workspace = request.config.workspace.kind == "native_folder_snapshot"
             if not native_workspace:
-                self._observe_lifecycle_progress("verifying_project", cancellable=True)
+                self._observe_lifecycle_progress("verifying_project", cancellable=False)
             version = self._call_core(client.version)
             if bootstrap_version is not None and version != bootstrap_version:
                 raise _bridge_error(

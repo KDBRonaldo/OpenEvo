@@ -260,6 +260,52 @@ def test_running_cancellation_fences_a_late_success(tmp_path: Path) -> None:
     store.close()
 
 
+def test_pending_cancel_stops_at_the_non_cancellable_mutation_barrier(
+    tmp_path: Path,
+) -> None:
+    before_barrier = Event()
+    enter_barrier = Event()
+    mutation_applied = Event()
+    executor: DesktopLifecycleExecutorV2
+
+    def apply_after_barrier(context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        context.checkpoint(
+            "remote_preflight",
+            m.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        before_barrier.set()
+        assert enter_barrier.wait(2)
+        executor.observe_progress(
+            "creating_remote_project",
+            m.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            False,
+        )
+        mutation_applied.set()
+        return _project_result(context)
+
+    store = DesktopProviderStoreV2(tmp_path / "provider", clock=_Clock())
+    executor = DesktopLifecycleExecutorV2(store, runners=_runners(apply_after_barrier))
+    executor.start()
+    operation = executor.reserve(
+        _reservation("project-barrier"),
+        idempotency_key="barrier-project-create-0001",
+    )
+    assert before_barrier.wait(1)
+    current = store.get_lifecycle_operation(operation.operation_id)
+    executor.cancel(
+        operation.operation_id,
+        if_match=current.etag,
+        idempotency_key="cancel-before-project-barrier-0001",
+    )
+    enter_barrier.set()
+
+    assert _wait_terminal(store, operation.operation_id).status == "cancelled"
+    assert not mutation_applied.is_set()
+    executor.close()
+    store.close()
+
+
 def test_restart_reconciles_the_same_running_operation(tmp_path: Path) -> None:
     root = tmp_path / "provider"
     store = DesktopProviderStoreV2(root, clock=_Clock())

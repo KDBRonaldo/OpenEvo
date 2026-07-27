@@ -7,7 +7,7 @@ is delegated to the active project Core v2 bridge.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -312,6 +312,9 @@ class DesktopReleaseProviderV2:
         build_channel: Literal["release", "development", "test"],
         instance_id: str,
         clock: Callable[[], datetime] | None = None,
+        lifecycle_secret_canaries: Iterable[str] = (),
+        lifecycle_forbidden_endpoints: Iterable[str] = (),
+        lifecycle_forbidden_paths: Iterable[str] = (),
         own_resources: bool = True,
     ) -> None:
         if type(store) is not DesktopProviderStoreV2:
@@ -385,6 +388,9 @@ class DesktopReleaseProviderV2:
             },
             operation_observer=self._publish_lifecycle_operation,
             error_mapper=self._map_lifecycle_error,
+            secret_canaries=lifecycle_secret_canaries,
+            forbidden_endpoints=lifecycle_forbidden_endpoints,
+            forbidden_paths=lifecycle_forbidden_paths,
         )
         self._configure_lifecycle_observers()
         self._lifecycle_executor.start()
@@ -1041,15 +1047,15 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
+        context.checkpoint(
+            "connecting",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
         self._deactivate_profile_project(
             started.profile_id,
             started.connection_generation - 1,
             started.active_project_id,
-        )
-        context.checkpoint(
-            "connecting",
-            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=True,
         )
         try:
             self._lifecycle.connect(started)
@@ -1072,7 +1078,6 @@ class DesktopReleaseProviderV2:
             raise self._fail_profile_connect(started, exc.code) from None
         except Exception:
             raise self._fail_profile_connect(started, "ssh_connection_failed") from None
-        context.check_cancelled()
         return self._complete_profile_core_connection(context, started)
 
     def _run_profile_disconnect(
@@ -1091,7 +1096,7 @@ class DesktopReleaseProviderV2:
         context.checkpoint(
             "connecting",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=True,
+            cancellable=False,
         )
         self._deactivate_profile_project(
             started.profile_id,
@@ -1107,7 +1112,6 @@ class DesktopReleaseProviderV2:
             # The process-local SSH owner may already be absent during restart
             # recovery. Local disconnection is still the safe terminal state.
             pass
-        context.check_cancelled()
         context.checkpoint(
             "activating",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
@@ -1147,6 +1151,11 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
+        context.checkpoint(
+            "waiting_for_user",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
         try:
             outcome = self._lifecycle.review_host_key(started, request.request)
         except SystemOpenSshSessionError as exc:
@@ -1156,7 +1165,6 @@ class DesktopReleaseProviderV2:
                 started,
                 "ssh_host_key_review_failed",
             ) from None
-        context.check_cancelled()
         if outcome == "rejected":
             context.checkpoint(
                 "activating",
@@ -1181,18 +1189,17 @@ class DesktopReleaseProviderV2:
         context.checkpoint(
             "remote_preflight",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=True,
+            cancellable=False,
         )
         try:
             remote = self._core_connector.connect_profile(
                 started.profile_id,
                 started.connection_generation,
             )
-            context.check_cancelled()
             context.checkpoint(
                 "negotiating_core",
                 local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-                cancellable=True,
+                cancellable=False,
             )
             negotiated = self._exact_core_version(remote, started.profile_id)
             self._reactivate_saved_project(started)
@@ -1563,7 +1570,7 @@ class DesktopReleaseProviderV2:
                         completed=upload.accepted_byte_size,
                         total=import_ref.byte_size,
                     ),
-                    cancellable=True,
+                    cancellable=False,
                 )
             with store.resolve(import_ref, ownership=expected_ownership) as stream:
                 stream.seek(upload.accepted_byte_size)
@@ -1597,7 +1604,7 @@ class DesktopReleaseProviderV2:
                                 completed=upload.accepted_byte_size,
                                 total=import_ref.byte_size,
                             ),
-                            cancellable=True,
+                            cancellable=False,
                         )
                     if upload.state != "open" and (upload.next_chunk_index != upload.chunk_count):
                         raise _core_authority_invalid(project.project_id)
@@ -1630,13 +1637,13 @@ class DesktopReleaseProviderV2:
                     completed=import_ref.byte_size,
                     total=import_ref.byte_size,
                 ),
-                cancellable=True,
+                cancellable=False,
             )
         if lifecycle_context is not None:
             self._checkpoint_lifecycle_forward(
                 lifecycle_context,
                 "verifying_project",
-                cancellable=True,
+                cancellable=False,
             )
         refreshed: core_v2.ProjectV2 | None = None
         last_read_failure: DesktopCoreBridgeErrorV2 | None = None

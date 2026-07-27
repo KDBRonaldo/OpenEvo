@@ -35,6 +35,12 @@ _ESCAPE_RE = re.compile(r"\x1b[@-_]")
 _AUTHORIZATION_RE = re.compile(r"(?i)(authorization[ \t]*:[ \t]*)(?:bearer|basic)[ \t]+[^\s]+")
 _BEARER_RE = re.compile(r"(?i)\bbearer[ \t]+[A-Za-z0-9._~+/=-]{8,}")
 _PROXY_USERINFO_RE = re.compile(r"(?i)\b(https?://)[^/@\s:]+:[^/@\s]+@")
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    r"(?i)\b("
+    r"[a-z0-9_-]*(?:api[_-]?key|token|secret|password|passwd|private[_-]?key|"
+    r"credential|capability)[a-z0-9_-]*"
+    r")([ \t]*[:=][ \t]*)(?:\"[^\"\r\n]*\"|'[^'\r\n]*'|[^\s&;,\r\n]+)"
+)
 _LOOPBACK_ENDPOINT_RE = re.compile(
     r"(?i)\bhttps?://(?:127(?:\.[0-9]{1,3}){3}|localhost|\[::1\])"
     r"(?::[0-9]{1,5})?(?:/[^\s]*)?"
@@ -44,6 +50,8 @@ _ABSOLUTE_HOST_PATH_RE = re.compile(
     r"/(?:Users|Volumes|home|root|private|tmp|var|opt|srv|mnt|run|etc|workspace|openevo)"
     r"(?:/[^\s\t\r\n'\"<>]+)*"
 )
+_MAX_UNTERMINATED_LINE_BYTES = MAX_LIFECYCLE_LOG_ENTRY_BYTES
+_UNTERMINATED_LINE_OMITTED = "[TRUNCATED: unterminated process output omitted]\n"
 
 
 class LifecycleOutputSanitizerV2:
@@ -82,6 +90,7 @@ class LifecycleOutputSanitizerV2:
             for source in _PROCESS_SOURCES
         }
         self._pending = {source: "" for source in _PROCESS_SOURCES}
+        self._discarding_unterminated = {source: False for source in _PROCESS_SOURCES}
         self._lock = threading.RLock()
         self._closed = False
 
@@ -99,7 +108,14 @@ class LifecycleOutputSanitizerV2:
             if self._closed:
                 return
             decoded = self._decoders[source].decode(chunk, final=False)
-            self._pending[source] += decoded
+            normalized = self._normalize_newlines(decoded)
+            if self._discarding_unterminated[source]:
+                boundary = normalized.find("\n")
+                if boundary < 0:
+                    return
+                self._discarding_unterminated[source] = False
+                normalized = normalized[boundary + 1 :]
+            self._pending[source] += normalized
             self._drain_complete_lines(source)
 
     def flush(self, source: LifecycleLogSourceV2 | None = None) -> None:
@@ -110,9 +126,13 @@ class LifecycleOutputSanitizerV2:
                 return
             sources = tuple(_PROCESS_SOURCES) if source is None else (source,)
             for current in sources:
-                self._pending[current] += self._decoders[current].decode(b"", final=True)
+                final = self._decoders[current].decode(b"", final=True)
+                if not self._discarding_unterminated[current]:
+                    self._pending[current] += final
                 pending, self._pending[current] = self._pending[current], ""
-                self._emit_lines(current, self._normalize_newlines(pending))
+                if not self._discarding_unterminated[current]:
+                    self._emit_lines(current, self._normalize_newlines(pending))
+                self._discarding_unterminated[current] = False
                 self._decoders[current] = codecs.getincrementaldecoder("utf-8")(errors="replace")
 
     def close(self) -> None:
@@ -127,11 +147,31 @@ class LifecycleOutputSanitizerV2:
         normalized = self._normalize_newlines(self._pending[source])
         boundary = normalized.rfind("\n")
         if boundary < 0:
-            self._pending[source] = normalized
+            if len(normalized.encode("utf-8")) > _MAX_UNTERMINATED_LINE_BYTES:
+                self._pending[source] = ""
+                self._discarding_unterminated[source] = True
+                self._emit_bounded(
+                    source,
+                    _UNTERMINATED_LINE_OMITTED,
+                    force_truncated=True,
+                )
+            else:
+                self._pending[source] = normalized
             return
         complete = normalized[: boundary + 1]
-        self._pending[source] = normalized[boundary + 1 :]
+        trailing = normalized[boundary + 1 :]
+        if len(trailing.encode("utf-8")) > _MAX_UNTERMINATED_LINE_BYTES:
+            self._pending[source] = ""
+            self._discarding_unterminated[source] = True
+        else:
+            self._pending[source] = trailing
         self._emit_lines(source, complete)
+        if self._discarding_unterminated[source]:
+            self._emit_bounded(
+                source,
+                _UNTERMINATED_LINE_OMITTED,
+                force_truncated=True,
+            )
 
     def _emit_lines(self, source: LifecycleLogSourceV2, value: str) -> None:
         for line in value.splitlines(keepends=True):
@@ -154,6 +194,10 @@ class LifecycleOutputSanitizerV2:
         safe = _AUTHORIZATION_RE.sub(r"\1[REDACTED_CREDENTIAL]", safe)
         safe = _BEARER_RE.sub("[REDACTED_CREDENTIAL]", safe)
         safe = _PROXY_USERINFO_RE.sub(r"\1[REDACTED_CREDENTIAL]@", safe)
+        safe = _SENSITIVE_ASSIGNMENT_RE.sub(
+            r"\1\2[REDACTED_CREDENTIAL]",
+            safe,
+        )
         for endpoint in self._forbidden_endpoints:
             safe = re.sub(
                 re.escape(endpoint) + r"(?:/[^\s]*)?",
@@ -169,9 +213,15 @@ class LifecycleOutputSanitizerV2:
             )
         return _ABSOLUTE_HOST_PATH_RE.sub("[REDACTED_HOST_PATH]", safe)
 
-    def _emit_bounded(self, source: LifecycleLogSourceV2, value: str) -> None:
+    def _emit_bounded(
+        self,
+        source: LifecycleLogSourceV2,
+        value: str,
+        *,
+        force_truncated: bool = False,
+    ) -> None:
         original_bytes = len(value.encode("utf-8"))
-        split = original_bytes > MAX_LIFECYCLE_LOG_ENTRY_BYTES
+        split = force_truncated or original_bytes > MAX_LIFECYCLE_LOG_ENTRY_BYTES
         remaining = value
         while remaining:
             raw = remaining.encode("utf-8")

@@ -129,6 +129,11 @@ ErrorCategory = Literal[
     "maintenance",
 ]
 
+_SENSITIVE_ENVIRONMENT_NAME = re.compile(
+    r"(?i)(?:api[_-]?key|token|secret|password|passwd|private[_-]?key|"
+    r"credential|capability)"
+)
+
 _TAURI_RELEASE_ORIGINS = ("tauri://localhost", "http://tauri.localhost")
 _TAURI_RELEASE_METHODS = ("GET", "POST", "PATCH", "DELETE")
 _TAURI_RELEASE_HEADERS = (
@@ -165,6 +170,20 @@ def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
         cleanup()
     except BaseException:
         pass
+
+
+def _lifecycle_secret_canaries(
+    session_token: str,
+    environment: Mapping[str, str],
+) -> tuple[str, ...]:
+    values = {session_token}
+    for name, value in environment.items():
+        if _SENSITIVE_ENVIRONMENT_NAME.search(name) is None or not value:
+            continue
+        if len(value.encode("utf-8")) > 65_536 or "\x00" in value:
+            raise ValueError("sensitive process environment value is outside log-redaction bounds")
+        values.add(value)
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
 
 
 def _error_response(
@@ -972,6 +991,11 @@ def create_packaged_release_desktop_local_api_v2_app(
             build_channel=build_channel,
             instance_id=instance_id,
             clock=clock,
+            lifecycle_secret_canaries=_lifecycle_secret_canaries(
+                session_token,
+                environment,
+            ),
+            lifecycle_forbidden_paths=(str(root), str(home_path)),
             own_resources=True,
         )
         if startup_phase is not None:

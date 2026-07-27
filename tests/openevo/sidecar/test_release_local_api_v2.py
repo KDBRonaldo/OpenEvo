@@ -439,6 +439,7 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
         assert expired.json()["code"] == "lifecycle_log_cursor_expired"
 
         current = client.get(f"/desktop/v2/operations/{operation_id}", headers=_headers()).json()
+        assert current["cancellable"] is False
         stale_cancel = client.post(
             f"/desktop/v2/operations/{operation_id}/cancel",
             headers=_headers(
@@ -452,7 +453,7 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
         )
         assert stale_cancel.status_code == 412, stale_cancel.text
 
-        cancelled = client.post(
+        blocked_cancel = client.post(
             f"/desktop/v2/operations/{operation_id}/cancel",
             headers=_headers(
                 **{
@@ -463,11 +464,11 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
             ),
             json={"schema_version": "2", "expected_operation_id": operation_id},
         )
-        assert cancelled.status_code == 202, cancelled.text
-        assert cancelled.json()["cancellable"] is False
+        assert blocked_cancel.status_code == 409, blocked_cancel.text
+        assert blocked_cancel.json()["code"] == "local_resource_conflict"
         lifecycle.connect_release.set()
-        terminal = _wait_lifecycle_operation(client, cancelled.json())
-        assert terminal["status"] == "cancelled"
+        terminal = _wait_lifecycle_operation(client, running.json())
+        assert terminal["status"] == "succeeded"
         assert [
             item["operation_id"]
             for item in client.get("/desktop/v2/state", headers=_headers()).json()[
@@ -487,7 +488,7 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
             json={
                 "schema_version": "2",
                 "expected_operation_id": operation_id,
-                "expected_terminal_status": "cancelled",
+                "expected_terminal_status": "succeeded",
             },
         )
         assert acknowledged.status_code == 204, acknowledged.text
@@ -571,6 +572,10 @@ def test_packaged_v2_composition_owns_catalog_state_runtime_and_ssh_authorities(
     )
     trust = SystemOpenSshHostTrust(home=home, inherited_environment={"HOME": str(home)})
     state_root = tmp_path / "state-v2"
+    environment = {
+        "HOME": str(home),
+        "OPENAI_API_KEY": "packaged-environment-secret",
+    }
 
     app = create_packaged_release_desktop_local_api_v2_app(
         state_root=state_root,
@@ -583,7 +588,7 @@ def test_packaged_v2_composition_owns_catalog_state_runtime_and_ssh_authorities(
         system_ssh_askpass_helper=helper,
         system_ssh_host_trust=trust,
         home=home,
-        inherited_environment={"HOME": str(home)},
+        inherited_environment=environment,
         close_on_shutdown=False,
     )
     client = TestClient(app)
@@ -599,6 +604,11 @@ def test_packaged_v2_composition_owns_catalog_state_runtime_and_ssh_authorities(
         assert (state_root / "provider-v2" / "core-bridge-v2").is_dir()
         assert (state_root / "workspace-imports-v2").is_dir()
         assert not (tmp_path / "deferred-core-assets").exists()
+        executor = app.state.desktop_release_provider._lifecycle_executor
+        assert SESSION in executor._secret_canaries
+        assert "packaged-environment-secret" in executor._secret_canaries
+        assert str(state_root.resolve()) in executor._forbidden_paths
+        assert str(home.resolve()) in executor._forbidden_paths
     finally:
         client.close()
         app.state.desktop_release_provider.close()

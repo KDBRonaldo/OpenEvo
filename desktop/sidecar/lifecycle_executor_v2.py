@@ -332,10 +332,14 @@ class DesktopLifecycleExecutorV2:
             try:
                 context.checkpoint(phase, progress, cancellable=cancellable)
             except (_LifecycleCancelled, _LifecycleExecutorStopping):
+                if not cancellable:
+                    raise
                 # Progress callbacks can run inside transport exception
                 # projection. The runner observes the durable interruption at
-                # its next explicit checkpoint without converting it to a
-                # transport failure.
+                # its next explicit checkpoint without converting a safe,
+                # pre-barrier interruption to a transport failure. A durable
+                # non-cancellable mutation barrier must propagate so external
+                # mutation cannot start after cancellation or shutdown.
                 return
 
     def observe_output(self, source: LifecycleLogSourceV2, chunk: bytes) -> None:
