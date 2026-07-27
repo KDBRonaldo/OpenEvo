@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import threading
+import time
 
 from fastapi.testclient import TestClient
 from httpx import Response as HttpResponse
@@ -16,6 +17,7 @@ from desktop.sidecar import workspace_imports as workspace_imports_module
 SESSION_TOKEN = "7c" * 32
 HANDOFF_TOKEN = "8d" * 32
 HANDOFF_HEADERS = {desktop_launcher.NATIVE_HANDOFF_HEADER: HANDOFF_TOKEN}
+SESSION_HEADERS = {desktop_launcher.NATIVE_SESSION_HEADER: SESSION_TOKEN}
 
 
 def _cancellation_token(action_id: str) -> str:
@@ -72,13 +74,47 @@ def _import_pending(
         project_id=project_id,
         cancellation_token=cancellation_token,
     )
-    assert response.status_code == 201, response.text
-    payload = response.json()
-    assert set(payload) == {"schema_version", "source", "lease_token"}
-    assert payload["schema_version"] == "2"
-    assert isinstance(payload["source"], dict)
-    assert isinstance(payload["lease_token"], str)
-    return payload
+    assert response.status_code == 202, response.text
+    operation = _wait_operation(client, response)
+    assert operation["status"] == "succeeded", operation
+    result = operation["result"]
+    assert isinstance(result, dict)
+    return {
+        "schema_version": "2",
+        "source": {
+            "kind": "native_folder_snapshot",
+            "display_name": result["display_name"],
+            "import_ref": {
+                "import_id": result["import_id"],
+                "content_sha256": result["content_sha256"],
+                "byte_size": result["byte_size"],
+                "entry_count": result["entry_count"],
+                "extracted_byte_size": result["extracted_byte_size"],
+            },
+        },
+    }
+
+
+def _wait_operation(
+    client: TestClient,
+    response: HttpResponse,
+    *,
+    timeout: float = 5.0,
+) -> dict[str, object]:
+    assert response.status_code == 202, response.text
+    operation_id = response.json()["operation_id"]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        observed = client.get(
+            f"/desktop/v2/operations/{operation_id}",
+            headers=SESSION_HEADERS,
+        )
+        assert observed.status_code == 200, observed.text
+        operation = observed.json()
+        if operation["status"] in {"succeeded", "failed", "cancelled"}:
+            return operation
+        time.sleep(0.01)
+    raise AssertionError("native workspace lifecycle operation did not finish")
 
 
 def _import_response(
@@ -115,13 +151,9 @@ def _discard_pending(
     action_id: str,
     project_id: str | None = None,
 ) -> HttpResponse:
-    source = pending["source"]
-    assert isinstance(source, dict)
     request: dict[str, object] = {
         "schema_version": "2",
         "action_id": action_id,
-        "import_ref": source["import_ref"],
-        "lease_token": pending["lease_token"],
     }
     if project_id is not None:
         request["project_id"] = project_id
@@ -176,9 +208,15 @@ def test_picker_pending_import_requires_exact_explicit_discard(tmp_path: Path) -
         import_directory = _import_directory(config_root, pending)
         assert import_directory.is_dir()
 
-        wrong_lease = dict(pending)
-        wrong_lease["lease_token"] = "0" * 64
-        assert _discard_pending(client, wrong_lease, action_id=action_id).status_code == 409
+        assert (
+            _discard_pending(
+                client,
+                pending,
+                action_id=action_id,
+                project_id="project-owned-by-another-action",
+            ).status_code
+            == 409
+        )
         assert import_directory.is_dir()
 
         assert _discard_pending(client, pending, action_id=action_id).status_code == 204
@@ -223,12 +261,12 @@ def test_identical_archives_have_action_bound_authority_and_replay_after_restart
         assert owner_conflict.status_code == 409
 
         (first_root / "changed.txt").write_text("changed", encoding="utf-8")
-        changed_content = _import_response(
+        changed_content = _import_pending(
             restarted,
             first_root,
             action_id=first_action,
         )
-        assert changed_content.status_code == 409
+        assert changed_content == first_pending
 
         assert (
             _discard_pending(restarted, first_pending, action_id=first_action).status_code == 204
@@ -257,19 +295,14 @@ def test_native_import_cancel_stops_archive_work_and_rejects_stale_identity(
         assert release_worker.wait(timeout=5)
 
     monkeypatch.setattr(native_workspace_module, "_after_archive_write", hold_after_archive)
-    responses: list[HttpResponse] = []
     with TestClient(_app(config_root, static_root)) as client:
-        worker = threading.Thread(
-            target=lambda: responses.append(
-                _import_response(
-                    client,
-                    source_root,
-                    action_id=action_id,
-                    cancellation_token=cancellation_token,
-                )
-            )
+        response = _import_response(
+            client,
+            source_root,
+            action_id=action_id,
+            cancellation_token=cancellation_token,
         )
-        worker.start()
+        assert response.status_code == 202, response.text
         assert archive_written.wait(timeout=5)
         stale = _cancel_import(
             client,
@@ -277,7 +310,6 @@ def test_native_import_cancel_stops_archive_work_and_rejects_stale_identity(
             cancellation_token="ff" * 32,
         )
         assert stale.status_code == 409
-        assert worker.is_alive()
         assert (
             _cancel_import(
                 client,
@@ -287,12 +319,8 @@ def test_native_import_cancel_stops_archive_work_and_rejects_stale_identity(
             == 204
         )
         release_worker.set()
-        worker.join(timeout=5)
+        assert _wait_operation(client, response)["status"] == "cancelled"
 
-    assert not worker.is_alive()
-    assert len(responses) == 1
-    assert responses[0].status_code == 409
-    assert responses[0].json()["code"] == "workspace_import_cancelled"
     assert list(_workspace_import_root(config_root).iterdir()) == []
 
 
@@ -308,9 +336,8 @@ def test_native_import_cancel_before_begin_is_identity_bound_and_fail_closed(
 
     with TestClient(_app(config_root, static_root)) as client:
         assert _cancel_import(client, action_id=action_id).status_code == 204
-        cancelled = _import_response(client, source_root, action_id=action_id)
-        assert cancelled.status_code == 409
-        assert cancelled.json()["code"] == "workspace_import_cancelled"
+        pending = _import_pending(client, source_root, action_id=action_id)
+        assert _discard_pending(client, pending, action_id=action_id).status_code == 204
 
         stale_action = "native-stale-cancel-before-begin-0001"
         assert (
@@ -321,8 +348,8 @@ def test_native_import_cancel_before_begin_is_identity_bound_and_fail_closed(
             ).status_code
             == 204
         )
-        pending = _import_pending(client, source_root, action_id=stale_action)
-        assert _discard_pending(client, pending, action_id=stale_action).status_code == 204
+        stale_pending = _import_pending(client, source_root, action_id=stale_action)
+        assert _discard_pending(client, stale_pending, action_id=stale_action).status_code == 204
 
     assert list(_workspace_import_root(config_root).iterdir()) == []
 
@@ -345,23 +372,14 @@ def test_cancel_after_atomic_publication_discards_the_recoverable_lease(
         assert release_worker.wait(timeout=5)
 
     monkeypatch.setattr(workspace_imports_module, "_after_import_publish", hold_after_publish)
-    responses: list[HttpResponse] = []
     with TestClient(_app(config_root, static_root)) as client:
-        worker = threading.Thread(
-            target=lambda: responses.append(
-                _import_response(client, source_root, action_id=action_id)
-            )
-        )
-        worker.start()
+        response = _import_response(client, source_root, action_id=action_id)
+        assert response.status_code == 202, response.text
         assert published.wait(timeout=5)
         assert _cancel_import(client, action_id=action_id).status_code == 204
         release_worker.set()
-        worker.join(timeout=5)
+        assert _wait_operation(client, response)["status"] == "cancelled"
 
-    assert not worker.is_alive()
-    assert len(responses) == 1
-    assert responses[0].status_code == 409
-    assert responses[0].json()["code"] == "workspace_import_cancelled"
     assert list(_workspace_import_root(config_root).iterdir()) == []
 
 
@@ -395,12 +413,22 @@ def test_v2_restart_retains_valid_pending_and_discards_corrupt_pending(
         assert valid_directory.is_dir()
         assert not corrupt_directory.exists()
         assert _import_pending(restarted, valid_root, action_id=valid_action) == valid_pending
-        recovered = _import_pending(
+        unavailable = _import_response(
             restarted,
             corrupt_root,
             action_id=corrupt_action,
         )
-        assert recovered == corrupt_pending
+        assert unavailable.status_code == 409
+        recovered_action = "native-corrupt-restart-import-0002"
+        recovered = _import_pending(
+            restarted,
+            corrupt_root,
+            action_id=recovered_action,
+        )
+        assert (
+            recovered["source"]["import_ref"]["content_sha256"]
+            == (corrupt_pending["source"]["import_ref"]["content_sha256"])
+        )
         assert (
             _discard_pending(
                 restarted,
@@ -413,7 +441,7 @@ def test_v2_restart_retains_valid_pending_and_discards_corrupt_pending(
             _discard_pending(
                 restarted,
                 recovered,
-                action_id=corrupt_action,
+                action_id=recovered_action,
             ).status_code
             == 204
         )

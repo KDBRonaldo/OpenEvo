@@ -14,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+from threading import Event
 import time
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ from desktop.server import (
 )
 
 import desktop.server.launcher as desktop_launcher
+import desktop.sidecar.native_workspace as native_workspace
 from desktop.server.launcher import create_app
 import desktop.packaging.sidecar_entry as sidecar_entry
 import desktop.sidecar.release_app as release_app
@@ -799,6 +801,90 @@ def test_release_removes_native_credential_route_and_rejects_native_authenticati
         assert "/openevo-native/credentials" not in client.get("/openapi.json").text
 
 
+def test_native_workspace_route_reserves_before_archive_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_root = tmp_path / "config"
+    source_root = tmp_path / "slow-research-data"
+    source_root.mkdir()
+    (source_root / "observations.csv").write_text(
+        "sample,value\na,7\n",
+        encoding="utf-8",
+    )
+    archive_started = Event()
+    archive_release = Event()
+
+    def pause_after_archive(_root_descriptor: int) -> None:
+        archive_started.set()
+        assert archive_release.wait(2)
+
+    monkeypatch.setattr(native_workspace, "_after_archive_write", pause_after_archive)
+    session_token = "7c" * 32
+    handoff_token = "8d" * 32
+    app = create_app(
+        static_root=_static_root(tmp_path),
+        desktop_config_root=config_root,
+        native_frame=desktop_launcher._NativeLauncherFrame(
+            instance_id="1a" * 16,
+            readiness_key=bytes.fromhex("5a" * 32),
+            session_token=session_token,
+            handoff_token=handoff_token,
+        ),
+        source_commit="89baeb26",
+        build_channel="test",
+        **_v2_launcher_resources(tmp_path),
+    )
+    request = {
+        "schema_version": "2",
+        "kind": "native_folder_snapshot",
+        "action_id": "native-source-slow-action-01",
+        "selected_path": str(source_root.resolve()),
+        "selected_device": source_root.stat().st_dev,
+        "selected_inode": source_root.stat().st_ino,
+        "cancellation_token": "9c" * 32,
+    }
+
+    with TestClient(app) as client:
+        before = time.monotonic()
+        reserved = client.post(
+            "/openevo-native/workspace-imports",
+            headers={desktop_launcher.NATIVE_HANDOFF_HEADER: handoff_token},
+            json=request,
+        )
+        elapsed = time.monotonic() - before
+        try:
+            assert reserved.status_code == 202, reserved.text
+            assert elapsed < 0.5
+            operation = reserved.json()
+            assert operation["kind"] == "native_workspace_prepare"
+            assert operation["resource"]["resource_kind"] == "native_workspace"
+            assert "selected_path" not in reserved.text
+            assert str(source_root) not in reserved.text
+            assert "lease_token" not in reserved.text
+            assert archive_started.wait(2)
+        finally:
+            archive_release.set()
+
+        operation_id = operation["operation_id"]
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            current = client.get(
+                f"/desktop/v2/operations/{operation_id}",
+                headers={desktop_launcher.NATIVE_SESSION_HEADER: session_token},
+            )
+            assert current.status_code == 200, current.text
+            if current.json()["status"] == "succeeded":
+                break
+            time.sleep(0.01)
+        else:
+            raise AssertionError("native workspace operation did not finish")
+        result = current.json()["result"]
+        assert result["result_kind"] == "native_workspace"
+        assert result["display_name"] == "slow-research-data"
+        assert result["import_id"].startswith("workspace-import-")
+
+
 def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path: Path) -> None:
     config_root = tmp_path / "config"
     source_root = tmp_path / "research-data"
@@ -851,6 +937,23 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
             headers=handoff_headers,
             json=request,
         )
+
+        def terminal_result(response) -> dict[str, object]:
+            operation_id = response.json()["operation_id"]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                observed = client.get(
+                    f"/desktop/v2/operations/{operation_id}",
+                    headers=session_headers,
+                )
+                assert observed.status_code == 200, observed.text
+                if observed.json()["status"] == "succeeded":
+                    return observed.json()["result"]
+                time.sleep(0.01)
+            raise AssertionError("native workspace operation did not finish")
+
+        imported_result = terminal_result(imported)
+        bound_project_id = project_id_for_native_import(str(imported_result["import_id"]))
         reselected = client.post(
             "/openevo-native/workspace-imports",
             headers=handoff_headers,
@@ -858,41 +961,27 @@ def test_native_workspace_route_is_private_idempotent_and_project_bound(tmp_path
                 **request,
                 "action_id": "native-source-action-0002",
                 "cancellation_token": "9d" * 32,
-                "project_id": project_id_for_native_import(
-                    imported.json()["source"]["import_ref"]["import_id"]
-                ),
+                "project_id": bound_project_id,
             },
         )
+        reselected_result = terminal_result(reselected)
 
-        assert imported.status_code == replayed.status_code == reselected.status_code == 201
-        assert imported.json() == replayed.json()
-        assert (
-            imported.json()["source"]["import_ref"]["content_sha256"]
-            == reselected.json()["source"]["import_ref"]["content_sha256"]
-        )
-        assert (
-            imported.json()["source"]["import_ref"]["import_id"]
-            != reselected.json()["source"]["import_ref"]["import_id"]
-        )
+        assert imported.status_code == replayed.status_code == reselected.status_code == 202
+        assert imported.json()["operation_id"] == replayed.json()["operation_id"]
+        assert imported_result["content_sha256"] == reselected_result["content_sha256"]
+        assert imported_result["import_id"] != reselected_result["import_id"]
         payload = imported.json()
-        assert set(payload) == {"schema_version", "source", "lease_token"}
-        source = payload["source"]
-        assert source["kind"] == "native_folder_snapshot"
-        assert source["display_name"] == "research-data"
-        assert source["import_ref"]["import_id"].startswith("workspace-import-")
+        assert payload["kind"] == "native_workspace_prepare"
+        assert imported_result["display_name"] == "research-data"
+        assert str(imported_result["import_id"]).startswith("workspace-import-")
+        assert "lease_token" not in imported.text
         assert str(source_root) not in imported.text
         assert "selected_path" not in imported.text
         assert "/openevo-native/workspace-imports" not in client.get("/openapi.json").text
 
-        reselected_payload = reselected.json()
-        bound_project_id = project_id_for_native_import(
-            imported.json()["source"]["import_ref"]["import_id"]
-        )
         discard = {
             "schema_version": "2",
             "action_id": "native-source-action-0002",
-            "import_ref": reselected_payload["source"]["import_ref"],
-            "lease_token": reselected_payload["lease_token"],
             "project_id": bound_project_id,
         }
         assert (
@@ -1137,9 +1226,7 @@ def test_packaged_launcher_prefers_native_final_askpass_inventory(
     )
 
     assert result == 0
-    assert captured["packaged_askpass_helper_path"] == Path(
-        "/final/app/openevo-ssh-askpass"
-    )
+    assert captured["packaged_askpass_helper_path"] == Path("/final/app/openevo-ssh-askpass")
     assert captured["packaged_askpass_helper_sha256"] == "b" * 64
     assert captured["packaged_askpass_helper_byte_size"] == 588064
     assert provider.close_calls == 1

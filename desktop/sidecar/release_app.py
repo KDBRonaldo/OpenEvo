@@ -53,6 +53,7 @@ from desktop.sidecar.provider_store_v2 import (
     ProviderCapacityV2Error,
     ProviderConflictV2,
     ProviderContractV2Error,
+    ProviderCursorExpiredV2,
     ProviderIdempotencyConflictV2,
     ProviderNotFoundV2,
     ProviderPreconditionFailedV2,
@@ -1037,13 +1038,9 @@ def create_release_desktop_local_api_v2_app(
         path = request.url.path
         if path == "/desktop/v2" or path.startswith("/desktop/v2/"):
             header_name = DESKTOP_SESSION_HEADER.lower().encode("ascii")
-            candidates = [
-                value for name, value in request.scope["headers"] if name == header_name
-            ]
+            candidates = [value for name, value in request.scope["headers"] if name == header_name]
             candidate = candidates[0] if len(candidates) == 1 else b""
-            if len(candidates) != 1 or not hmac.compare_digest(
-                candidate, encoded_session_token
-            ):
+            if len(candidates) != 1 or not hmac.compare_digest(candidate, encoded_session_token):
                 return _v2_error_response(
                     status_code=401,
                     code="desktop_session_invalid",
@@ -1081,6 +1078,14 @@ def create_release_desktop_local_api_v2_app(
         exc: ProviderStoreV2Error,
     ) -> JSONResponse:
         del request
+        if isinstance(exc, ProviderCursorExpiredV2):
+            return _v2_error_response(
+                status_code=410,
+                code="lifecycle_log_cursor_expired",
+                summary="The lifecycle log cursor is outside the retained window.",
+                retryable=True,
+                action="retry",
+            )
         if isinstance(exc, ProviderNotFoundV2):
             return _v2_error_response(
                 status_code=404,
@@ -1093,11 +1098,7 @@ def create_release_desktop_local_api_v2_app(
             generation = "generation" in str(exc).lower()
             return _v2_error_response(
                 status_code=412,
-                code=(
-                    "profile_generation_changed"
-                    if generation
-                    else "etag_precondition_failed"
-                ),
+                code=("profile_generation_changed" if generation else "etag_precondition_failed"),
                 summary=(
                     "The remote-workspace profile generation changed."
                     if generation

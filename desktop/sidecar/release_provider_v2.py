@@ -8,9 +8,12 @@ is delegated to the active project Core v2 bridge.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
+import hmac
 import json
+import os
 import threading
 from typing import Literal, Protocol, TypeVar
 
@@ -28,6 +31,11 @@ from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.lifecycle_executor_v2 import (
     DesktopLifecycleExecutorV2,
     LifecycleExecutionContextV2,
+)
+from desktop.sidecar.native_workspace import (
+    NativeWorkspaceArchiveCancelled,
+    NativeWorkspaceArchiveError,
+    prepare_native_workspace,
 )
 from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
@@ -52,6 +60,7 @@ from desktop.sidecar.workspace_identity import (
     project_id_for_native_import,
 )
 from desktop.sidecar.workspace_imports import (
+    WorkspaceImportCancelled,
     WorkspaceImportIntegrityError,
     WorkspaceImportNotFoundError,
     WorkspaceImportStore,
@@ -174,6 +183,34 @@ class _CoreBridgeV2(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class _NativeWorkspacePrepareAuthorityV2:
+    action_id: str
+    import_id: str
+    selected_path: str
+    selected_device: int
+    selected_inode: int
+    cancellation_token: str
+    project_id: str
+    display_name: str
+    journal_sha256: str
+    operation_id: str | None = None
+
+    def with_operation(self, operation_id: str) -> _NativeWorkspacePrepareAuthorityV2:
+        return _NativeWorkspacePrepareAuthorityV2(
+            action_id=self.action_id,
+            import_id=self.import_id,
+            selected_path=self.selected_path,
+            selected_device=self.selected_device,
+            selected_inode=self.selected_inode,
+            cancellation_token=self.cancellation_token,
+            project_id=self.project_id,
+            display_name=self.display_name,
+            journal_sha256=self.journal_sha256,
+            operation_id=operation_id,
+        )
+
+
 _OPERATIONS = frozenset(
     {
         "getDesktopContractVersionV2",
@@ -194,6 +231,8 @@ _OPERATIONS = frozenset(
         "getDesktopLifecycleOperationLogsV2",
         "cancelDesktopLifecycleOperationV2",
         "acknowledgeDesktopLifecycleOperationV2",
+        "getDesktopCoreOperationV2",
+        "cancelDesktopCoreOperationV2",
         "listDesktopProjectsV2",
         "createDesktopProjectV2",
         "getDesktopProjectV2",
@@ -222,6 +261,8 @@ _OPERATIONS = frozenset(
         "getDesktopArtifactDiffV2",
         "listDesktopServicesV2",
         "restartDesktopServiceV2",
+        "getDesktopServiceLogsV2",
+        "cleanupDesktopCachesV2",
         "createDesktopDiagnosticV2",
         "getDesktopDiagnosticV2",
         "streamDesktopEventsV2",
@@ -289,7 +330,10 @@ class DesktopReleaseProviderV2:
             getattr(bridge_store, "load_mapping_by_core_project_id", None)
         ):
             raise TypeError("release v2 Core bridge store is invalid")
-        if workspace_import_store is not None and type(workspace_import_store) is not WorkspaceImportStore:
+        if (
+            workspace_import_store is not None
+            and type(workspace_import_store) is not WorkspaceImportStore
+        ):
             raise TypeError("release v2 workspace import store is invalid")
         if build_version != "0.1.10":
             raise ValueError("release v2 provider requires version 0.1.10")
@@ -321,6 +365,10 @@ class DesktopReleaseProviderV2:
         self._own_resources = own_resources
         self._guard = threading.RLock()
         self._ssh_profile_transition = threading.Lock()
+        self._native_workspace_sources: dict[
+            str,
+            _NativeWorkspacePrepareAuthorityV2,
+        ] = {}
         self._closed = False
         set_prompt_observer = getattr(lifecycle, "set_prompt_observer", None)
         if callable(set_prompt_observer):
@@ -366,9 +414,9 @@ class DesktopReleaseProviderV2:
             "getDesktopLifecycleOperationV2": self._get_lifecycle_operation,
             "getDesktopLifecycleOperationLogsV2": self._get_lifecycle_logs,
             "cancelDesktopLifecycleOperationV2": self._cancel_lifecycle_operation,
-            "acknowledgeDesktopLifecycleOperationV2": (
-                self._acknowledge_lifecycle_operation
-            ),
+            "acknowledgeDesktopLifecycleOperationV2": (self._acknowledge_lifecycle_operation),
+            "getDesktopCoreOperationV2": self._get_core_operation,
+            "cancelDesktopCoreOperationV2": self._cancel_core_operation,
             "listDesktopProjectsV2": self._list_projects,
             "createDesktopProjectV2": self._create_project,
             "getDesktopProjectV2": self._get_project,
@@ -397,6 +445,8 @@ class DesktopReleaseProviderV2:
             "getDesktopArtifactDiffV2": self._artifact_diff,
             "listDesktopServicesV2": self._list_services,
             "restartDesktopServiceV2": self._restart_service,
+            "getDesktopServiceLogsV2": self._service_logs,
+            "cleanupDesktopCachesV2": self._cleanup_caches,
             "createDesktopDiagnosticV2": self._create_diagnostic,
             "getDesktopDiagnosticV2": self._get_diagnostic,
             "streamDesktopEventsV2": self._events,
@@ -423,6 +473,8 @@ class DesktopReleaseProviderV2:
                 return
             self._closed = True
         self._lifecycle_executor.close()
+        with self._guard:
+            self._native_workspace_sources.clear()
         if not self._own_resources:
             return
         failure: BaseException | None = None
@@ -449,6 +501,198 @@ class DesktopReleaseProviderV2:
     @property
     def workspace_import_store(self) -> WorkspaceImportStore | None:
         return self._workspace_import_store
+
+    def reserve_native_workspace_prepare(
+        self,
+        *,
+        action_id: str,
+        selected_path: str,
+        selected_device: int,
+        selected_inode: int,
+        cancellation_token: str,
+        project_id: str | None,
+    ) -> local_v2.LifecycleOperationV2:
+        """Reserve native snapshot work before opening the selected directory."""
+
+        import_id = native_import_id_for_action(action_id)
+        if (
+            type(selected_path) is not str
+            or not selected_path.startswith("/")
+            or not 1 <= len(selected_path.encode("utf-8", errors="strict")) <= 4096
+            or any(ord(character) < 0x20 or ord(character) == 0x7F for character in selected_path)
+            or type(selected_device) is not int
+            or selected_device < 0
+            or type(selected_inode) is not int
+            or selected_inode <= 0
+            or type(cancellation_token) is not str
+            or len(cancellation_token) != 64
+            or any(character not in "0123456789abcdef" for character in cancellation_token)
+        ):
+            raise ValueError("native workspace selection authority is invalid")
+        display_name = os.path.basename(os.path.normpath(selected_path))
+        target_project_id = project_id or project_id_for_native_import(import_id)
+        selected_path_sha256 = hashlib.sha256(
+            selected_path.encode("utf-8", errors="strict")
+        ).hexdigest()
+        journal_sha256 = _digest(
+            {
+                "schema_version": "2",
+                "kind": "native_workspace_prepare",
+                "action_id": action_id,
+                "import_id": import_id,
+                "selected_path_sha256": selected_path_sha256,
+                "selected_device": selected_device,
+                "selected_inode": selected_inode,
+                "project_id": target_project_id,
+                "display_name": display_name,
+            }
+        )
+        authority = _NativeWorkspacePrepareAuthorityV2(
+            action_id=action_id,
+            import_id=import_id,
+            selected_path=selected_path,
+            selected_device=selected_device,
+            selected_inode=selected_inode,
+            cancellation_token=cancellation_token,
+            project_id=target_project_id,
+            display_name=display_name,
+            journal_sha256=journal_sha256,
+        )
+        request = LifecycleNativeWorkspacePrepareRequestV2(
+            request_kind="native_workspace_prepare",
+            native_workspace_id=import_id,
+            native_journal_sha256=journal_sha256,
+            display_name=display_name,
+        )
+        inserted = False
+        with self._guard:
+            if self._closed:
+                raise RuntimeError("release v2 provider is closed")
+            existing = self._native_workspace_sources.get(import_id)
+            if existing is not None and existing.journal_sha256 != journal_sha256:
+                raise _provider_error(
+                    "native_workspace_intent_conflict",
+                    "The selected native workspace differs from the unresolved action.",
+                    status=409,
+                    action="correct_project",
+                    affected_resource_id=import_id,
+                )
+            if existing is None:
+                self._native_workspace_sources[import_id] = authority
+                inserted = True
+        try:
+            operation = self._lifecycle_executor.reserve(
+                LifecycleOperationReservationV2(
+                    kind="native_workspace_prepare",
+                    resource={
+                        "resource_kind": "native_workspace",
+                        "resource_id": import_id,
+                    },
+                    request=request,
+                ),
+                idempotency_key=action_id,
+            )
+        except BaseException:
+            if inserted:
+                with self._guard:
+                    if self._native_workspace_sources.get(import_id) is authority:
+                        self._native_workspace_sources.pop(import_id, None)
+            raise
+        if operation.status == "succeeded":
+            try:
+                retained = self._require_workspace_import_store().inspect(import_id)
+            except WorkspaceImportNotFoundError:
+                with self._guard:
+                    current = self._native_workspace_sources.get(import_id)
+                    if current is not None and current.journal_sha256 == journal_sha256:
+                        self._native_workspace_sources.pop(import_id, None)
+                raise _provider_error(
+                    "workspace_import_invalid",
+                    "The prepared native workspace snapshot is no longer available.",
+                    status=409,
+                    action="correct_project",
+                    affected_resource_id=import_id,
+                ) from None
+            result = operation.result
+            if not isinstance(result, local_v2.LifecycleNativeWorkspaceResultV2) or (
+                retained.import_ref.import_id != result.import_id
+                or retained.import_ref.content_sha256 != result.content_sha256
+                or retained.import_ref.byte_size != result.byte_size
+                or retained.import_ref.entry_count != result.entry_count
+                or retained.import_ref.extracted_byte_size != result.extracted_byte_size
+            ):
+                with self._guard:
+                    current = self._native_workspace_sources.get(import_id)
+                    if current is not None and current.journal_sha256 == journal_sha256:
+                        self._native_workspace_sources.pop(import_id, None)
+                raise _provider_error(
+                    "workspace_import_invalid",
+                    "The prepared native workspace authority changed.",
+                    status=409,
+                    action="correct_project",
+                    affected_resource_id=import_id,
+                )
+        with self._guard:
+            current = self._native_workspace_sources.get(import_id)
+            if current is not None and current.journal_sha256 == journal_sha256:
+                if operation.status in {"succeeded", "failed", "cancelled"}:
+                    self._native_workspace_sources.pop(import_id, None)
+                else:
+                    self._native_workspace_sources[import_id] = current.with_operation(
+                        operation.operation_id
+                    )
+        return operation
+
+    def cancel_native_workspace_prepare(
+        self,
+        *,
+        action_id: str,
+        cancellation_token: str,
+    ) -> None:
+        import_id = native_import_id_for_action(action_id)
+        with self._guard:
+            authority = self._native_workspace_sources.get(import_id)
+        if authority is None:
+            return
+        if not hmac.compare_digest(authority.cancellation_token, cancellation_token):
+            raise ValueError("native workspace cancellation authority changed")
+        operation_id = authority.operation_id
+        if operation_id is None:
+            raise RuntimeError("native workspace operation reservation is incomplete")
+        operation = self._store.get_lifecycle_operation(operation_id)
+        if operation.status in {"succeeded", "failed", "cancelled"}:
+            return
+        self._lifecycle_executor.cancel(
+            operation_id,
+            if_match=operation.etag,
+            idempotency_key=_derived_idempotency_key(action_id, "native-cancel"),
+        )
+
+    def discard_native_workspace_prepare(
+        self,
+        *,
+        action_id: str,
+        project_id: str | None,
+    ) -> None:
+        import_id = native_import_id_for_action(action_id)
+        with self._guard:
+            source = self._native_workspace_sources.get(import_id)
+        if source is not None and source.operation_id is not None:
+            operation = self._store.get_lifecycle_operation(source.operation_id)
+            if operation.status not in {"succeeded", "failed", "cancelled"}:
+                raise RuntimeError("native workspace preparation is still running")
+        store = self._require_workspace_import_store()
+        try:
+            authority = store.inspect(import_id)
+        except WorkspaceImportNotFoundError:
+            return
+        expected = ownership_for_native_import(
+            authority.import_ref,
+            project_id=project_id,
+        )
+        if authority.ownership != expected:
+            raise WorkspaceImportIntegrityError("native workspace discard ownership changed")
+        store.discard_pending_authority(import_id, ownership=expected)
 
     def discard_pending_workspace_import(
         self,
@@ -483,9 +727,7 @@ class DesktopReleaseProviderV2:
             supported_majors=[2],
             mutation_major=2,
             openapi_sha256=V0110_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256,
-            event_schema_sha256=(
-                V0110_RELEASE_AUTHORITY_POLICY.desktop_event_schema_sha256
-            ),
+            event_schema_sha256=(V0110_RELEASE_AUTHORITY_POLICY.desktop_event_schema_sha256),
             release_version=self._build_version,
             build_id=build_id,
             source_commit=self._source_commit,
@@ -526,9 +768,7 @@ class DesktopReleaseProviderV2:
         self,
         arguments: Mapping[str, object],
     ) -> local_v2.LifecycleOperationV2:
-        return self._store.get_lifecycle_operation(
-            _string_argument(arguments, "operation_id")
-        )
+        return self._store.get_lifecycle_operation(_string_argument(arguments, "operation_id"))
 
     def _get_lifecycle_logs(
         self,
@@ -892,8 +1132,7 @@ class DesktopReleaseProviderV2:
             request.resource_generation + 1,
         )
         if started.connection_state == "connected" or (
-            started.connection_state == "disconnected"
-            and started.trust.state == "rejected"
+            started.connection_state == "disconnected" and started.trust.state == "rejected"
         ):
             return self._profile_lifecycle_result(started)
         if started.connection_state == "failed" and started.failure is not None:
@@ -999,14 +1238,108 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
-        authority = self._require_workspace_import_store().inspect(
-            request.native_workspace_id
-        )
-        import_ref = authority.import_ref
-        if request.native_journal_sha256 != import_ref.content_sha256:
-            raise WorkspaceImportIntegrityError(
-                "native workspace lifecycle authority changed"
+        store = self._require_workspace_import_store()
+        try:
+            retained = store.inspect(request.native_workspace_id)
+        except WorkspaceImportNotFoundError:
+            retained = None
+        if retained is not None:
+            import_ref = retained.import_ref
+            return local_v2.LifecycleNativeWorkspaceResultV2(
+                result_kind="native_workspace",
+                import_id=import_ref.import_id,
+                content_sha256=import_ref.content_sha256,
+                byte_size=import_ref.byte_size,
+                entry_count=import_ref.entry_count,
+                extracted_byte_size=import_ref.extracted_byte_size,
+                display_name=request.display_name,
             )
+
+        with self._guard:
+            source = self._native_workspace_sources.get(request.native_workspace_id)
+        if source is None:
+            raise _provider_error(
+                "native_workspace_reselection_required",
+                "Desktop restarted before the selected folder snapshot was retained.",
+                status=409,
+                retryable=True,
+                action="correct_project",
+                affected_resource_id=request.native_workspace_id,
+            )
+        if (
+            source.import_id != request.native_workspace_id
+            or source.journal_sha256 != request.native_journal_sha256
+            or source.display_name != request.display_name
+        ):
+            raise WorkspaceImportIntegrityError("native workspace lifecycle authority changed")
+
+        def progress(completed: int, total: int) -> None:
+            context.checkpoint(
+                "preparing_native_workspace",
+                local_v2.LifecycleProgressBytesV2(
+                    kind="bytes",
+                    completed=completed,
+                    total=total,
+                ),
+                cancellable=True,
+            )
+
+        try:
+            with prepare_native_workspace(
+                source.selected_path,
+                import_id=source.import_id,
+                temporary_root=self._store.state_root,
+                expected_device=source.selected_device,
+                expected_inode=source.selected_inode,
+                cancel_check=context.cancellation_event.is_set,
+                progress_observer=progress,
+            ) as prepared:
+                if prepared.display_name != source.display_name:
+                    raise NativeWorkspaceArchiveError("selected workspace display name changed")
+                ownership = ownership_for_native_import(
+                    prepared.import_ref,
+                    project_id=source.project_id,
+                )
+                pending = store.ingest_pending(
+                    prepared.stream,
+                    ownership=ownership,
+                    import_id=source.import_id,
+                    cancel_check=context.cancellation_event.is_set,
+                )
+                import_ref = pending.import_ref
+                if context.cancellation_event.is_set():
+                    store.discard_pending_authority(
+                        source.import_id,
+                        ownership=ownership,
+                    )
+                    context.check_cancelled()
+        except (NativeWorkspaceArchiveCancelled, WorkspaceImportCancelled):
+            try:
+                published = store.inspect(source.import_id)
+            except WorkspaceImportNotFoundError:
+                pass
+            else:
+                expected = ownership_for_native_import(
+                    published.import_ref,
+                    project_id=source.project_id,
+                )
+                if published.ownership != expected:
+                    raise WorkspaceImportIntegrityError(
+                        "cancelled native workspace ownership changed"
+                    ) from None
+                store.discard_pending_authority(
+                    source.import_id,
+                    ownership=expected,
+                )
+            context.check_cancelled()
+            raise
+        finally:
+            with self._guard:
+                current = self._native_workspace_sources.get(source.import_id)
+                if current is source or (
+                    current is not None and current.journal_sha256 == source.journal_sha256
+                ):
+                    self._native_workspace_sources.pop(source.import_id, None)
         return local_v2.LifecycleNativeWorkspaceResultV2(
             result_kind="native_workspace",
             import_id=import_ref.import_id,
@@ -1098,15 +1431,14 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
-        _activation, _desktop_id, _profile_generation, project = (
-            self._active_authority(request.project_id)
+        _activation, _desktop_id, _profile_generation, project = self._active_authority(
+            request.project_id
         )
         self._require_project_cas(project, request.resource_generation, request.if_match)
         head = project.active_project_head
         if head is None or (
             request.request.expected_project_head_id != head.project_head_id
-            or request.request.expected_project_head_manifest_sha256
-            != head.manifest_sha256
+            or request.request.expected_project_head_manifest_sha256 != head.manifest_sha256
         ):
             raise _resource_changed(
                 "project",
@@ -1267,9 +1599,7 @@ class DesktopReleaseProviderV2:
                             ),
                             cancellable=True,
                         )
-                    if upload.state != "open" and (
-                        upload.next_chunk_index != upload.chunk_count
-                    ):
+                    if upload.state != "open" and (upload.next_chunk_index != upload.chunk_count):
                         raise _core_authority_invalid(project.project_id)
                 if stream.read(1) != b"":
                     raise WorkspaceImportIntegrityError(
@@ -1350,8 +1680,7 @@ class DesktopReleaseProviderV2:
             upload.project_id != project.project_id
             or upload.expected_project_head_id is not None
             or upload.expected_project_head_manifest_sha256 is not None
-            or upload.expected_project_config_sha256
-            != project.project_config_sha256
+            or upload.expected_project_config_sha256 != project.project_config_sha256
             or upload.archive != request.archive
             or upload.chunk_byte_size != request.chunk_byte_size
             or upload.chunk_count != request.chunk_count
@@ -1405,9 +1734,7 @@ class DesktopReleaseProviderV2:
 
     def _get_project(self, arguments: Mapping[str, object]) -> core_v2.ProjectV2:
         project_id = _string_argument(arguments, "project_id")
-        activation, desktop_project_id, generation, _project = self._active_authority(
-            project_id
-        )
+        activation, desktop_project_id, generation, _project = self._active_authority(project_id)
         del activation
         return self._bridge.get_project(
             desktop_project_id,
@@ -1420,15 +1747,13 @@ class DesktopReleaseProviderV2:
         generation = _integer_argument(arguments, "resource_generation")
         if_match = _string_argument(arguments, "if_match")
         key = _string_argument(arguments, "idempotency_key")
-        _activation, desktop_project_id, profile_generation, project = (
-            self._active_authority(project_id)
+        _activation, desktop_project_id, profile_generation, project = self._active_authority(
+            project_id
         )
         self._require_project_cas(project, generation, if_match)
         update = core_v2.ProjectUpdateV2(
             expected_project_head_id=request.expected_project_head_id,
-            expected_project_head_manifest_sha256=(
-                request.expected_project_head_manifest_sha256
-            ),
+            expected_project_head_manifest_sha256=(request.expected_project_head_manifest_sha256),
             expected_project_config_sha256=request.expected_project_config_sha256,
             display_name=request.display_name,
             config=request.config,
@@ -1450,9 +1775,7 @@ class DesktopReleaseProviderV2:
         generation = _integer_argument(arguments, "resource_generation")
         if_match = _string_argument(arguments, "if_match")
         key = _string_argument(arguments, "idempotency_key")
-        _activation, _desktop_id, _profile_generation, project = self._active_authority(
-            project_id
-        )
+        _activation, _desktop_id, _profile_generation, project = self._active_authority(project_id)
         self._require_project_cas(project, generation, if_match)
         head = project.active_project_head
         if head is None or (
@@ -1480,9 +1803,7 @@ class DesktopReleaseProviderV2:
         arguments: Mapping[str, object],
     ) -> local_v2.ProjectCapabilityProjectionV2:
         project_id = _string_argument(arguments, "project_id")
-        _activation, desktop_id, profile_generation, project = self._active_authority(
-            project_id
-        )
+        _activation, desktop_id, profile_generation, project = self._active_authority(project_id)
         mode = project.config.execution.mode
         capabilities = self._bridge.capabilities(  # type: ignore[attr-defined]
             desktop_id,
@@ -1507,9 +1828,7 @@ class DesktopReleaseProviderV2:
         generation = _integer_argument(arguments, "resource_generation")
         if_match = _string_argument(arguments, "if_match")
         key = _string_argument(arguments, "idempotency_key")
-        _activation, desktop_id, profile_generation, project = self._active_authority(
-            project_id
-        )
+        _activation, desktop_id, profile_generation, project = self._active_authority(project_id)
         self._require_project_cas(project, generation, if_match)
         head = project.active_project_head
         if head is None or (
@@ -1551,9 +1870,7 @@ class DesktopReleaseProviderV2:
         requested_project = arguments.get("project_id")
         if requested_project is not None and type(requested_project) is not str:
             raise TypeError("project_id has the wrong type")
-        _activation, desktop_id, generation, project = self._active_authority(
-            requested_project
-        )
+        _activation, desktop_id, generation, project = self._active_authority(requested_project)
         page = self._bridge.list_tasks(  # type: ignore[attr-defined]
             desktop_id,
             generation,
@@ -1741,8 +2058,8 @@ class DesktopReleaseProviderV2:
         return transition
 
     def _retry_transition(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
-        transition_id, request, key, desktop_id, generation = (
-            self._transition_action_arguments(arguments)
+        transition_id, request, key, desktop_id, generation = self._transition_action_arguments(
+            arguments
         )
         operation = self._bridge.retry_transition(  # type: ignore[attr-defined]
             desktop_id,
@@ -1769,8 +2086,8 @@ class DesktopReleaseProviderV2:
         )
 
     def _abandon_transition(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
-        transition_id, request, key, desktop_id, generation = (
-            self._transition_action_arguments(arguments)
+        transition_id, request, key, desktop_id, generation = self._transition_action_arguments(
+            arguments
         )
         operation = self._bridge.abandon_transition(  # type: ignore[attr-defined]
             desktop_id,
@@ -1817,22 +2134,20 @@ class DesktopReleaseProviderV2:
             raise TypeError("previous artifact identity has the wrong type")
         current = self._get_artifact({"artifact_id": artifact_id})
         previous = (
-            None
-            if previous_id is None
-            else self._get_artifact({"artifact_id": previous_id})
+            None if previous_id is None else self._get_artifact({"artifact_id": previous_id})
         )
         comparable = previous is not None and previous.artifact_type == current.artifact_type
         return local_v2.ArtifactDiffV2(
             artifact_id=current.artifact_id,
             previous_artifact_id=None if previous is None else previous.artifact_id,
             current_manifest_sha256=current.manifest_sha256,
-            previous_manifest_sha256=(
-                None if previous is None else previous.manifest_sha256
-            ),
+            previous_manifest_sha256=(None if previous is None else previous.manifest_sha256),
             status=(
                 "unavailable"
                 if previous is None
-                else "available" if comparable else "not_comparable"
+                else "available"
+                if comparable
+                else "not_comparable"
             ),
         )
 
@@ -1845,6 +2160,50 @@ class DesktopReleaseProviderV2:
             limit=limit,
             after=after,
         )
+
+    def _get_core_operation(
+        self,
+        arguments: Mapping[str, object],
+    ) -> core_v2.OperationV2:
+        operation_id = _string_argument(arguments, "operation_id")
+        _activation, desktop_id, generation, _project = self._active_authority()
+        operation = self._bridge.get_operation(  # type: ignore[attr-defined]
+            desktop_id,
+            generation,
+            operation_id,
+        )
+        if operation.operation_id != operation_id:
+            raise _core_authority_invalid(operation_id)
+        return operation
+
+    def _cancel_core_operation(
+        self,
+        arguments: Mapping[str, object],
+    ) -> core_v2.OperationV2:
+        operation_id = _string_argument(arguments, "operation_id")
+        resource_generation = _integer_argument(arguments, "resource_generation")
+        if_match = _string_argument(arguments, "if_match")
+        key = _string_argument(arguments, "idempotency_key")
+        _activation, desktop_id, generation, _project = self._active_authority()
+        if resource_generation != generation:
+            raise _resource_changed("operation", operation_id, action="reconnect")
+        current = self._bridge.get_operation(  # type: ignore[attr-defined]
+            desktop_id,
+            generation,
+            operation_id,
+        )
+        if current.operation_id != operation_id or current.etag != if_match:
+            raise _resource_changed("operation", operation_id, action="retry")
+        operation = self._bridge.cancel_operation(  # type: ignore[attr-defined]
+            desktop_id,
+            generation,
+            operation_id,
+            if_match=if_match,
+            idempotency_key=key,
+        )
+        if operation.operation_id != operation_id:
+            raise _core_authority_invalid(operation_id)
+        return operation
 
     def _restart_service(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
         service_id = _string_argument(arguments, "service_id")
@@ -1878,6 +2237,46 @@ class DesktopReleaseProviderV2:
         )
         return operation
 
+    def _service_logs(self, arguments: Mapping[str, object]) -> core_v2.LogPageV2:
+        service_id = _string_argument(arguments, "service_id")
+        limit, after = _page_arguments(arguments)
+        _activation, desktop_id, generation, _project = self._active_authority()
+        service = self._bridge.get_service(  # type: ignore[attr-defined]
+            desktop_id,
+            generation,
+            service_id,
+        )
+        if service.service_id != service_id:
+            raise _core_authority_invalid(service_id)
+        return self._bridge.service_logs(  # type: ignore[attr-defined]
+            desktop_id,
+            generation,
+            service_id,
+            limit=limit,
+            after=after,
+        )
+
+    def _cleanup_caches(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
+        request = _argument(
+            arguments,
+            "request",
+            local_v2.DesktopCacheCleanupRequestV2,
+        )
+        resource_generation = _integer_argument(arguments, "resource_generation")
+        key = _string_argument(arguments, "idempotency_key")
+        _activation, desktop_id, generation, project = self._active_authority()
+        if resource_generation != generation:
+            raise _resource_changed("project", project.project_id, action="reconnect")
+        operation = self._bridge.cache_cleanup(  # type: ignore[attr-defined]
+            desktop_id,
+            generation,
+            request,
+            idempotency_key=key,
+        )
+        if operation.kind != "cache_cleanup":
+            raise _core_authority_invalid(operation.operation_id)
+        return operation
+
     def _create_diagnostic(self, arguments: Mapping[str, object]) -> core_v2.DiagnosticV2:
         request = _argument(arguments, "request", local_v2.DiagnosticRequestV2)
         resource_generation = _integer_argument(arguments, "resource_generation")
@@ -1887,14 +2286,8 @@ class DesktopReleaseProviderV2:
             request.profile_id != getattr(_activation, "profile_id")
             or request.profile_connection_generation != generation
             or resource_generation != generation
-            or (
-                request.scope != "system"
-                and request.resource_id is None
-            )
-            or (
-                request.scope == "project"
-                and request.resource_id != project.project_id
-            )
+            or (request.scope != "system" and request.resource_id is None)
+            or (request.scope == "project" and request.resource_id != project.project_id)
         ):
             raise _resource_changed("profile", request.profile_id, action="reconnect")
         diagnostic = self._bridge.create_diagnostic(  # type: ignore[attr-defined]
@@ -2105,9 +2498,7 @@ class DesktopReleaseProviderV2:
             error = exc.error
             if error.affected_resource_id is None:
                 error = error.model_copy(
-                    update={
-                        "affected_resource_id": work.operation.resource.resource_id
-                    }
+                    update={"affected_resource_id": work.operation.resource.resource_id}
                 )
             return error
         if isinstance(
@@ -2117,6 +2508,14 @@ class DesktopReleaseProviderV2:
             return local_v2.DesktopErrorV2(
                 code="workspace_import_invalid",
                 summary="The selected native workspace snapshot is unavailable.",
+                retryable=False,
+                action="correct_project",
+                affected_resource_id=work.operation.resource.resource_id,
+            )
+        if isinstance(exc, NativeWorkspaceArchiveError):
+            return local_v2.DesktopErrorV2(
+                code="native_workspace_invalid",
+                summary="The selected folder could not become a safe workspace snapshot.",
                 retryable=False,
                 action="correct_project",
                 affected_resource_id=work.operation.resource.resource_id,
@@ -2171,9 +2570,7 @@ class DesktopReleaseProviderV2:
                 status=operation.status,
                 phase=operation.phase,
                 etag=operation.etag,
-                log_sequence_high_watermark=(
-                    operation.log_sequence_high_watermark
-                ),
+                log_sequence_high_watermark=(operation.log_sequence_high_watermark),
             )
         )
 
@@ -2198,9 +2595,7 @@ class DesktopReleaseProviderV2:
             if observation.state == "pending":
                 self._lifecycle_executor.observe_progress(
                     "waiting_for_user",
-                    local_v2.LifecycleProgressIndeterminateV2(
-                        kind="indeterminate"
-                    ),
+                    local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
                     True,
                 )
 
@@ -2346,9 +2741,7 @@ class DesktopReleaseProviderV2:
                 abort_transport=True,
             )
         if error.affected_resource_id is None:
-            error = error.model_copy(
-                update={"affected_resource_id": profile.profile_id}
-            )
+            error = error.model_copy(update={"affected_resource_id": profile.profile_id})
         self._abort_profile_transport(profile)
         failed = self._store.fail_profile_connection(
             profile.profile_id,
@@ -2454,12 +2847,15 @@ def _completed_operation(
     idempotency_key: str,
     timestamp: str,
 ) -> local_v2.LocalOperationV2:
-    operation_id = "local-" + hashlib.sha256(
-        b"openevo-desktop-local-operation-v2\0"
-        + str(kind).encode("ascii")
-        + b"\0"
-        + idempotency_key.encode("utf-8")
-    ).hexdigest()[:48]
+    operation_id = (
+        "local-"
+        + hashlib.sha256(
+            b"openevo-desktop-local-operation-v2\0"
+            + str(kind).encode("ascii")
+            + b"\0"
+            + idempotency_key.encode("utf-8")
+        ).hexdigest()[:48]
+    )
     return local_v2.LocalOperationV2(
         operation_id=operation_id,
         kind=kind,

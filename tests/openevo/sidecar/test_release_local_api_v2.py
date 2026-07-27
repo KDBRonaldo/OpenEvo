@@ -17,6 +17,7 @@ from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
 from desktop.sidecar.provider_store_v2 import (
     DesktopProviderStoreV2,
     LegacyProfileImportV2,
+    LifecycleLogAppendV2,
 )
 from desktop.sidecar.release_app import (
     create_packaged_release_desktop_local_api_v2_app,
@@ -46,9 +47,7 @@ def _timestamp() -> str:
 
 
 def _feature_digest(features: list[str]) -> str:
-    return hashlib.sha256(
-        json.dumps(features, separators=(",", ":")).encode("ascii")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps(features, separators=(",", ":")).encode("ascii")).hexdigest()
 
 
 def _core_version() -> core_v2.VersionResponseV2:
@@ -62,9 +61,7 @@ def _core_version() -> core_v2.VersionResponseV2:
             core_v2.ContractOfferV2(
                 api_major=2,
                 openapi_sha256=V0110_RELEASE_AUTHORITY_POLICY.core_openapi_sha256,
-                event_schema_sha256=(
-                    V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
-                ),
+                event_schema_sha256=(V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256),
                 access="mutation",
                 mutation_compatible=True,
             )
@@ -130,9 +127,7 @@ class _Lifecycle:
         self.prompt_observer = observer
 
     def connect(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
-        self.calls.append(
-            ("connect", profile.ssh_host_alias, profile.connection_generation)
-        )
+        self.calls.append(("connect", profile.ssh_host_alias, profile.connection_generation))
         connect_count = sum(call[0] == "connect" for call in self.calls)
         if connect_count >= 2 and self.second_connect_started is not None:
             self.second_connect_started.set()
@@ -174,9 +169,7 @@ class _Lifecycle:
         request: local_v2.HostKeyReviewRequestV2,
     ) -> str:
         del request
-        self.calls.append(
-            ("review", profile.ssh_host_alias, profile.connection_generation)
-        )
+        self.calls.append(("review", profile.ssh_host_alias, profile.connection_generation))
         if self.review_outcome == "connected":
             self.active = (profile.profile_id, profile.connection_generation)
         return self.review_outcome
@@ -219,10 +212,16 @@ class _Bridge:
 
 def _provider(
     tmp_path: Path,
+    *,
+    max_lifecycle_log_entries: int | None = None,
 ) -> tuple[DesktopReleaseProviderV2, DesktopProviderStoreV2, _Lifecycle, _CoreConnector]:
+    store_options = {}
+    if max_lifecycle_log_entries is not None:
+        store_options["max_lifecycle_log_entries"] = max_lifecycle_log_entries
     store = DesktopProviderStoreV2(
         tmp_path / "provider-v2",
         clock=lambda: NOW,
+        **store_options,
     )
     lifecycle = _Lifecycle()
     connector = _CoreConnector()
@@ -343,14 +342,160 @@ def test_release_app_mounts_only_authenticated_v2_mutation_routes(tmp_path: Path
         assert payload["preferred_major"] == 2
         assert payload["mutation_major"] == 2
         assert payload["mutation_compatible"] is True
-        assert payload["openapi_sha256"] == (
-            V0110_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256
-        )
+        assert payload["openapi_sha256"] == (V0110_RELEASE_AUTHORITY_POLICY.desktop_openapi_sha256)
 
         assert client.get("/desktop/v2/state").status_code == 401
         assert client.get("/desktop/v2/state", headers=_headers()).status_code == 200
         assert client.get("/desktop/v1/state", headers=_headers()).status_code == 404
     finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, _connector = _provider(
+        tmp_path,
+        max_lifecycle_log_entries=2,
+    )
+    lifecycle.connect_started = Event()
+    lifecycle.connect_release = Event()
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "observable-connect-profile-key-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        operation_id = started.json()["operation_id"]
+        assert lifecycle.connect_started.wait(2)
+
+        assert client.get(f"/desktop/v2/operations/{operation_id}").status_code == 401
+        running = client.get(f"/desktop/v2/operations/{operation_id}", headers=_headers())
+        assert running.status_code == 200, running.text
+        assert running.json()["status"] == "running"
+        state = client.get("/desktop/v2/state", headers=_headers()).json()
+        assert [item["operation_id"] for item in state["pending_operations"]] == [operation_id]
+
+        for text, source in (
+            ("resolving alias", "desktop"),
+            ("ssh connected", "ssh_stdout"),
+        ):
+            store.append_lifecycle_log(
+                LifecycleLogAppendV2(
+                    operation_id=operation_id,
+                    source=source,
+                    text=text,
+                    truncated=False,
+                )
+            )
+        first_page = client.get(
+            f"/desktop/v2/operations/{operation_id}/logs?limit=1",
+            headers=_headers(),
+        )
+        assert first_page.status_code == 200, first_page.text
+        assert first_page.json()["items"][0]["text"] == "resolving alias"
+        old_cursor = first_page.json()["next_cursor"]
+        assert old_cursor
+
+        for text, source in (
+            ("daemon starting", "daemon_stdout"),
+            ("daemon ready", "daemon_stderr"),
+        ):
+            store.append_lifecycle_log(
+                LifecycleLogAppendV2(
+                    operation_id=operation_id,
+                    source=source,
+                    text=text,
+                    truncated=False,
+                )
+            )
+        retained = client.get(
+            f"/desktop/v2/operations/{operation_id}/logs?limit=100",
+            headers=_headers(),
+        )
+        assert retained.status_code == 200, retained.text
+        assert retained.json()["dropped_before_sequence"] == 2
+        assert [item["text"] for item in retained.json()["items"]] == [
+            "daemon starting",
+            "daemon ready",
+        ]
+        expired = client.get(
+            f"/desktop/v2/operations/{operation_id}/logs",
+            params={"after": old_cursor},
+            headers=_headers(),
+        )
+        assert expired.status_code == 410, expired.text
+        assert expired.json()["code"] == "lifecycle_log_cursor_expired"
+
+        current = client.get(f"/desktop/v2/operations/{operation_id}", headers=_headers()).json()
+        stale_cancel = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": '"' + ("0" * 64) + '"',
+                    "Idempotency-Key": "cancel-observable-operation-01",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert stale_cancel.status_code == 412, stale_cancel.text
+
+        cancelled = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": current["etag"],
+                    "Idempotency-Key": "cancel-observable-operation-02",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert cancelled.status_code == 202, cancelled.text
+        assert cancelled.json()["cancellable"] is False
+        lifecycle.connect_release.set()
+        terminal = _wait_lifecycle_operation(client, cancelled.json())
+        assert terminal["status"] == "cancelled"
+        assert [
+            item["operation_id"]
+            for item in client.get("/desktop/v2/state", headers=_headers()).json()[
+                "pending_operations"
+            ]
+        ] == [operation_id]
+
+        acknowledged = client.post(
+            f"/desktop/v2/operations/{operation_id}/acknowledge",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": terminal["etag"],
+                    "Idempotency-Key": "ack-observable-operation-001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_operation_id": operation_id,
+                "expected_terminal_status": "cancelled",
+            },
+        )
+        assert acknowledged.status_code == 204, acknowledged.text
+        assert (
+            client.get("/desktop/v2/state", headers=_headers()).json()["pending_operations"] == []
+        )
+    finally:
+        lifecycle.connect_release.set()
         client.close()
         provider.close()
         store.close()
@@ -380,9 +525,10 @@ def test_release_v2_cors_admits_the_exact_renderer_headers_outside_error_boundar
         )
         assert preflight.status_code == 200, preflight.text
         assert preflight.headers["access-control-allow-origin"] == "tauri://localhost"
-        assert "x-openevo-resource-generation" in preflight.headers[
-            "access-control-allow-headers"
-        ].lower()
+        assert (
+            "x-openevo-resource-generation"
+            in preflight.headers["access-control-allow-headers"].lower()
+        )
 
         provider._health = lambda _arguments: (_ for _ in ()).throw(  # type: ignore[method-assign]
             RuntimeError("injected renderer-safe boundary failure")
@@ -447,9 +593,7 @@ def test_packaged_v2_composition_owns_catalog_state_runtime_and_ssh_authorities(
         assert version.json()["preferred_major"] == 2
         catalog = client.get("/desktop/v2/ssh-hosts", headers=_headers())
         assert catalog.status_code == 200, catalog.text
-        assert [item["ssh_host_alias"] for item in catalog.json()["hosts"]] == [
-            "gpu-lab"
-        ]
+        assert [item["ssh_host_alias"] for item in catalog.json()["hosts"]] == ["gpu-lab"]
         assert client.get("/desktop/v1/state", headers=_headers()).status_code == 404
         assert (state_root / "provider-v2" / "provider-v2.sqlite3").is_file()
         assert (state_root / "provider-v2" / "core-bridge-v2").is_dir()
@@ -531,9 +675,7 @@ def test_packaged_v2_restart_invalidates_process_authority_and_preserves_project
     )
     client = TestClient(app)
     try:
-        recovered = client.get(
-            f"/desktop/v2/profiles/{created.profile_id}", headers=_headers()
-        )
+        recovered = client.get(f"/desktop/v2/profiles/{created.profile_id}", headers=_headers())
         assert recovered.status_code == 200, recovered.text
         profile = recovered.json()
         assert profile["connection_state"] == "disconnected"
@@ -557,9 +699,7 @@ def test_profile_connect_uses_literal_alias_and_exact_generation(
             f"/desktop/v2/profiles/{profile['profile_id']}/connect",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        profile["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                     "If-Match": str(profile["etag"]),
                     "Idempotency-Key": "connect-profile-key-0001",
                 }
@@ -631,9 +771,7 @@ def test_profile_connect_preserves_typed_daemon_bootstrap_failure(
             f"/desktop/v2/profiles/{profile['profile_id']}/connect",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        profile["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                     "If-Match": str(profile["etag"]),
                     "Idempotency-Key": "connect-profile-daemon-timeout-01",
                 }
@@ -787,8 +925,7 @@ def test_old_connect_replay_after_a_new_generation_never_reopens_ssh(
         )
         assert connected_response.status_code == 202, connected_response.text
         assert (
-            _wait_lifecycle_operation(client, connected_response.json())["status"]
-            == "succeeded"
+            _wait_lifecycle_operation(client, connected_response.json())["status"] == "succeeded"
         )
         connected = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
@@ -820,10 +957,7 @@ def test_old_connect_replay_after_a_new_generation_never_reopens_ssh(
             json=connect_body,
         )
         assert stale_replay.status_code == 202, stale_replay.text
-        assert (
-            stale_replay.json()["operation_id"]
-            == connected_response.json()["operation_id"]
-        )
+        assert stale_replay.json()["operation_id"] == connected_response.json()["operation_id"]
         assert lifecycle.calls == calls_before_replay
     finally:
         client.close()
@@ -1134,9 +1268,7 @@ def test_incompatible_daemon_fails_closed_and_exact_retry_never_reopens_ssh(
     tmp_path: Path,
 ) -> None:
     provider, store, lifecycle, connector = _provider(tmp_path)
-    connector.version = connector.version.model_copy(
-        update={"source_commit": "f" * 40}
-    )
+    connector.version = connector.version.model_copy(update={"source_commit": "f" * 40})
     client = _app_client(provider)
     try:
         profile = _create_profile(client)

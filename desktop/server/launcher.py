@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Annotated, Callable
 from dataclasses import dataclass, field
+from functools import partial
 import hashlib
 import hmac
 import json
@@ -26,12 +27,6 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from starlette.concurrency import run_in_threadpool
 
 from desktop.server.app import create_desktop_app
-from desktop.sidecar.contracts.v1 import ProjectSourceV1, WorkspaceImportRefV1
-from desktop.sidecar.native_workspace import (
-    NativeWorkspaceArchiveCancelled,
-    NativeWorkspaceArchiveError,
-    prepare_native_workspace,
-)
 from desktop.sidecar.release_app import (
     create_packaged_release_desktop_local_api_v2_app,
 )
@@ -39,15 +34,7 @@ from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     SystemOpenSshHostTrust,
 )
-from desktop.sidecar.workspace_identity import (
-    native_import_id_for_action,
-    ownership_for_native_import,
-)
-from desktop.sidecar.workspace_imports import (
-    WorkspaceImportCancelled,
-    WorkspaceImportError,
-    WorkspaceImportStore,
-)
+from desktop.sidecar.workspace_imports import WorkspaceImportError
 
 
 DARWIN_DESKTOP_CONFIG_ROOT = Path("~/Library/Application Support/org.openevo.desktop")
@@ -67,7 +54,6 @@ _NATIVE_WORKSPACE_IMPORT_ROUTE = "/openevo-native/workspace-imports"
 _NATIVE_WORKSPACE_CANCEL_ROUTE = "/openevo-native/workspace-imports/cancel"
 _NATIVE_WORKSPACE_DISCARD_ROUTE = "/openevo-native/workspace-imports/discard"
 _NATIVE_WORKSPACE_REQUEST_MAX_BYTES = 8192
-_MAX_NATIVE_WORKSPACE_OPERATIONS = 64
 _SOURCE_COMMIT_PATTERN = re.compile(r"[0-9a-f]{7,40}")
 _PACKAGED_STARTUP_PHASES = frozenset(
     {
@@ -188,17 +174,6 @@ class _NativeWorkspaceImportRequest(BaseModel):
     project_id: _NativeText | None = None
 
 
-class _NativeWorkspaceImportResponse(BaseModel):
-    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
-
-    schema_version: Literal["2"] = "2"
-    source: ProjectSourceV1
-    lease_token: Annotated[
-        str,
-        StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
-    ]
-
-
 class _NativeWorkspaceDiscardRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True, hide_input_in_errors=True)
 
@@ -211,12 +186,6 @@ class _NativeWorkspaceDiscardRequest(BaseModel):
             max_length=256,
             pattern=r"^[^\x00-\x20\x7f](?:[^\x00-\x1f\x7f]*[^\x00-\x20\x7f])?$",
         ),
-    ]
-    import_ref: WorkspaceImportRefV1
-    lease_token: Annotated[
-        str,
-        Field(repr=False),
-        StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
     ]
     project_id: _NativeText | None = None
 
@@ -239,60 +208,6 @@ class _NativeWorkspaceCancelRequest(BaseModel):
         Field(repr=False),
         StringConstraints(strict=True, pattern=r"^[0-9a-f]{64}$"),
     ]
-
-
-@dataclass(frozen=True)
-class _NativeWorkspaceOperation:
-    action_id: str
-    cancellation_token: str = field(repr=False)
-    cancelled: threading.Event = field(default_factory=threading.Event, repr=False)
-
-
-class _NativeWorkspaceOperations:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._active: dict[str, _NativeWorkspaceOperation] = {}
-        self._cancelled_before_begin: dict[str, str] = {}
-
-    def begin(self, action_id: str, cancellation_token: str) -> _NativeWorkspaceOperation:
-        operation = _NativeWorkspaceOperation(
-            action_id=action_id,
-            cancellation_token=cancellation_token,
-        )
-        with self._lock:
-            if action_id in self._active:
-                raise ValueError("native workspace action is already active")
-            if len(self._active) >= _MAX_NATIVE_WORKSPACE_OPERATIONS:
-                raise ValueError("native workspace operation capacity exceeded")
-            cancelled_token = self._cancelled_before_begin.pop(action_id, None)
-            if cancelled_token is not None and secrets.compare_digest(
-                cancelled_token,
-                cancellation_token,
-            ):
-                operation.cancelled.set()
-            self._active[action_id] = operation
-        return operation
-
-    def cancel(self, action_id: str, cancellation_token: str) -> None:
-        with self._lock:
-            operation = self._active.get(action_id)
-            if operation is None:
-                if len(self._cancelled_before_begin) >= _MAX_NATIVE_WORKSPACE_OPERATIONS:
-                    oldest = next(iter(self._cancelled_before_begin))
-                    del self._cancelled_before_begin[oldest]
-                self._cancelled_before_begin[action_id] = cancellation_token
-                return
-            if not secrets.compare_digest(
-                operation.cancellation_token,
-                cancellation_token,
-            ):
-                raise ValueError("native workspace cancellation identity conflicts")
-            operation.cancelled.set()
-
-    def finish(self, operation: _NativeWorkspaceOperation) -> None:
-        with self._lock:
-            if self._active.get(operation.action_id) is operation:
-                del self._active[operation.action_id]
 
 
 def _close_startup_app(app: FastAPI) -> None:
@@ -483,8 +398,6 @@ def _create_app(
     owned_apps.append(app)
     expected_session_token = native_frame.session_token.encode("ascii")
     expected_handoff_token = native_frame.handoff_token.encode("ascii")
-    workspace_import_store = app.state.desktop_release_provider.workspace_import_store
-    workspace_operations = _NativeWorkspaceOperations()
 
     @app.get(
         _NATIVE_HEALTH_ROUTE,
@@ -494,9 +407,9 @@ def _create_app(
         challenge = _native_challenge(request)
         if challenge is None:
             return Response(status_code=403)
-        domain = (
-            f"{NATIVE_SIDECAR_PROTOCOL}\0{native_frame.instance_id}\0{challenge}"
-        ).encode("ascii")
+        domain = (f"{NATIVE_SIDECAR_PROTOCOL}\0{native_frame.instance_id}\0{challenge}").encode(
+            "ascii"
+        )
         proof = hmac.new(
             native_frame.readiness_key,
             domain,
@@ -530,7 +443,7 @@ def _create_app(
     @app.post(
         _NATIVE_WORKSPACE_IMPORT_ROUTE,
         include_in_schema=False,
-        status_code=201,
+        status_code=202,
     )
     async def native_workspace_import(request: Request) -> Response:
         if not _native_credential_matches(
@@ -555,39 +468,23 @@ def _create_app(
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ValidationError):
             return _native_workspace_error(status_code=422)
         try:
-            operation = workspace_operations.begin(
-                parsed.action_id,
-                parsed.cancellation_token,
-            )
-        except ValueError:
-            return _native_workspace_error(status_code=409)
-        try:
-            try:
-                pending = await run_in_threadpool(
-                    _ingest_native_workspace,
-                    workspace_import_store,
-                    parsed,
-                    state_root,
-                    operation.cancelled.is_set,
+            operation = await run_in_threadpool(
+                partial(
+                    app.state.desktop_release_provider.reserve_native_workspace_prepare,
+                    action_id=parsed.action_id,
+                    selected_path=parsed.selected_path,
+                    selected_device=parsed.selected_device,
+                    selected_inode=parsed.selected_inode,
+                    cancellation_token=parsed.cancellation_token,
+                    project_id=parsed.project_id,
                 )
-            except (NativeWorkspaceArchiveCancelled, WorkspaceImportCancelled):
-                return _native_workspace_cancelled()
-            except (NativeWorkspaceArchiveError, WorkspaceImportError, OSError):
-                return _native_workspace_error(status_code=409)
-            if operation.cancelled.is_set():
-                try:
-                    await run_in_threadpool(
-                        app.state.desktop_release_provider.discard_pending_workspace_import,
-                        pending.source.import_ref,
-                        project_id=parsed.project_id,
-                        lease_token=pending.lease_token,
-                    )
-                except (WorkspaceImportError, OSError):
-                    return _native_workspace_error(status_code=409)
-                return _native_workspace_cancelled()
-            return JSONResponse(status_code=201, content=pending.model_dump(mode="json"))
-        finally:
-            workspace_operations.finish(operation)
+            )
+        except (ValueError, RuntimeError, OSError):
+            return _native_workspace_error(status_code=409)
+        return JSONResponse(
+            status_code=202,
+            content=operation.model_dump(mode="json"),
+        )
 
     @app.post(
         _NATIVE_WORKSPACE_CANCEL_ROUTE,
@@ -614,11 +511,20 @@ def _create_app(
                 object_pairs_hook=_strict_json_object,
             )
             parsed = _NativeWorkspaceCancelRequest.model_validate(document)
-            workspace_operations.cancel(
-                parsed.action_id,
-                parsed.cancellation_token,
+            await run_in_threadpool(
+                partial(
+                    app.state.desktop_release_provider.cancel_native_workspace_prepare,
+                    action_id=parsed.action_id,
+                    cancellation_token=parsed.cancellation_token,
+                )
             )
-        except (UnicodeDecodeError, json.JSONDecodeError, ValueError, ValidationError):
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            ValueError,
+            ValidationError,
+            RuntimeError,
+        ):
             return _native_workspace_error(status_code=409)
         return Response(status_code=204)
 
@@ -651,10 +557,11 @@ def _create_app(
             return _native_workspace_error(status_code=422)
         try:
             await run_in_threadpool(
-                app.state.desktop_release_provider.discard_pending_workspace_import,
-                parsed.import_ref,
-                project_id=parsed.project_id,
-                lease_token=parsed.lease_token,
+                partial(
+                    app.state.desktop_release_provider.discard_native_workspace_prepare,
+                    action_id=parsed.action_id,
+                    project_id=parsed.project_id,
+                )
             )
         except (WorkspaceImportError, OSError):
             return _native_workspace_error(status_code=409)
@@ -684,9 +591,7 @@ def _native_credential_matches(
 
 def _native_challenge(request: Request) -> str | None:
     candidates = [
-        value
-        for name, value in request.scope["headers"]
-        if name == _NATIVE_CHALLENGE_HEADER_BYTES
+        value for name, value in request.scope["headers"] if name == _NATIVE_CHALLENGE_HEADER_BYTES
     ]
     if len(candidates) != 1:
         return None
@@ -718,51 +623,6 @@ def _native_workspace_error(*, status_code: int) -> JSONResponse:
             "message": "OpenEvo Desktop could not prepare the selected research folder.",
         },
     )
-
-
-def _native_workspace_cancelled() -> JSONResponse:
-    return JSONResponse(
-        status_code=409,
-        content={
-            "code": "workspace_import_cancelled",
-            "message": "OpenEvo Desktop cancelled the selected research folder import.",
-        },
-    )
-
-
-def _ingest_native_workspace(
-    store: WorkspaceImportStore,
-    request: _NativeWorkspaceImportRequest,
-    temporary_root: Path,
-    cancel_check: Callable[[], bool],
-) -> _NativeWorkspaceImportResponse:
-    import_id = native_import_id_for_action(request.action_id)
-    with prepare_native_workspace(
-        request.selected_path,
-        import_id=import_id,
-        temporary_root=temporary_root,
-        expected_device=request.selected_device,
-        expected_inode=request.selected_inode,
-        cancel_check=cancel_check,
-    ) as prepared:
-        ownership = ownership_for_native_import(
-            prepared.import_ref,
-            project_id=request.project_id,
-        )
-        pending = store.ingest_pending(
-            prepared.stream,
-            ownership=ownership,
-            import_id=import_id,
-            cancel_check=cancel_check,
-        )
-        return _NativeWorkspaceImportResponse(
-            source=ProjectSourceV1(
-                kind="native_folder_snapshot",
-                display_name=prepared.display_name,
-                import_ref=pending.import_ref,
-            ),
-            lease_token=pending.lease_token,
-        )
 
 
 def _read_native_instance_frame() -> _NativeLauncherFrame:
@@ -909,12 +769,8 @@ def main(
             if args.ssh_askpass_helper_path is not None
             else packaged_askpass_helper_path
         ),
-        packaged_askpass_helper_sha256=(
-            args.ssh_askpass_helper_sha256
-        ),
-        packaged_askpass_helper_byte_size=(
-            args.ssh_askpass_helper_byte_size
-        ),
+        packaged_askpass_helper_sha256=(args.ssh_askpass_helper_sha256),
+        packaged_askpass_helper_byte_size=(args.ssh_askpass_helper_byte_size),
     )
     listener: socket.socket | None = None
     try:
