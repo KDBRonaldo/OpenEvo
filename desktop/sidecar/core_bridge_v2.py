@@ -651,6 +651,23 @@ class DesktopCoreBridgeV2:
                 )
         return self
 
+    def set_progress_observer(
+        self,
+        observer: Callable[
+            [local_v2.LifecyclePhaseV2, local_v2.LifecycleProgressV2 | None, bool],
+            None,
+        ],
+    ) -> None:
+        if not callable(observer):
+            raise TypeError("Core bridge lifecycle progress observer is invalid")
+        with self._lock:
+            if self._active is not None or self._progress_observer is not None:
+                raise RuntimeError("Core bridge lifecycle progress observer cannot be changed")
+            set_host_progress = getattr(self._host_service, "set_progress_observer", None)
+            if callable(set_host_progress):
+                set_host_progress(observer)
+            self._progress_observer = observer
+
     def __exit__(self, *_exc: object) -> None:
         self.close()
 
@@ -771,7 +788,9 @@ class DesktopCoreBridgeV2:
                 )
                 bootstrap_version = previous.core_version
             client = self._new_client(connection, deadline)
-            self._observe_lifecycle_progress("verifying_project", cancellable=True)
+            native_workspace = request.config.workspace.kind == "native_folder_snapshot"
+            if not native_workspace:
+                self._observe_lifecycle_progress("verifying_project", cancellable=True)
             version = self._call_core(client.version)
             if version != bootstrap_version:
                 raise _bridge_error(
@@ -810,7 +829,8 @@ class DesktopCoreBridgeV2:
             if previous is not None and self._same_mapping_authority(previous, mapping):
                 mapping = previous
             else:
-                self._observe_lifecycle_progress("activating", cancellable=False)
+                if not native_workspace:
+                    self._observe_lifecycle_progress("activating", cancellable=False)
                 self._call_adapter(
                     lambda: self._persistence.commit_mapping(
                         mapping,
@@ -820,7 +840,8 @@ class DesktopCoreBridgeV2:
                     failure_summary="Desktop could not commit the Core project mapping.",
                 )
             if previous is not None and self._same_mapping_authority(previous, mapping):
-                self._observe_lifecycle_progress("activating", cancellable=False)
+                if not native_workspace:
+                    self._observe_lifecycle_progress("activating", cancellable=False)
             activation = CoreActivationV2(
                 desktop_project_id=desktop_project_id,
                 profile_id=request.profile_id,
@@ -852,7 +873,8 @@ class DesktopCoreBridgeV2:
                 published = True
             if old is not None:
                 self._retire_or_retain(old, deadline=deadline, suppress_errors=True)
-            self._observe_lifecycle_progress("finalizing", cancellable=False)
+            if not native_workspace:
+                self._observe_lifecycle_progress("activating", cancellable=False)
             return activation
         except DesktopCoreBridgeErrorV2:
             raise

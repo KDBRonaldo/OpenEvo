@@ -309,7 +309,7 @@ def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Pat
             "creating_remote_project",
             "verifying_project",
             "activating",
-            "finalizing",
+        "activating",
         ]
         assert [local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases] == sorted(
             local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases

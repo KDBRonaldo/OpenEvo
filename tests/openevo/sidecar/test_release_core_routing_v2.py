@@ -4,7 +4,9 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
+import time
 
 from fastapi.testclient import TestClient
 import pytest
@@ -35,6 +37,7 @@ from tests.openevo.sidecar.test_release_local_api_v2 import (
     _Catalog,
     _CoreConnector,
     _Lifecycle,
+    _wait_lifecycle_operation,
 )
 
 
@@ -49,6 +52,8 @@ class _RoutingBridge:
         self.project: core_v2.ProjectV2 | None = None
         self.upload: core_v2.WorkspaceUploadSessionV2 | None = None
         self.mapping = None
+        self.activation_started: Event | None = None
+        self.activation_release: Event | None = None
 
     def activate_project(
         self,
@@ -66,6 +71,9 @@ class _RoutingBridge:
                 idempotency_key,
             )
         )
+        if self.activation_started is not None and self.activation_release is not None:
+            self.activation_started.set()
+            assert self.activation_release.wait(16)
         if self.project is None:
             if request.config.workspace.kind == "native_folder_snapshot":
                 self.project = core_v2.ProjectV2(
@@ -837,7 +845,7 @@ def _provider(
         bridge_store=bridge,
         workspace_import_store=workspace_import_store,
         event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
-        build_version="0.1.9",
+        build_version="0.1.10",
         source_commit=SOURCE_COMMIT,
         build_channel="release",
         instance_id="routing-instance-v2",
@@ -881,6 +889,7 @@ def _connected_profile(client: TestClient) -> dict[str, object]:
         json={"schema_version": "2", "expected_connection_generation": 1},
     )
     assert connected.status_code == 202, connected.text
+    assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
     return client.get(
         f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
     ).json()
@@ -922,8 +931,10 @@ def test_project_create_and_read_use_only_generation_bound_core_v2(
             ),
             json=_project_create(profile),
         )
-        assert created.status_code == 201, created.text
-        assert created.json()["project_id"] == "project-1"
+        assert created.status_code == 202, created.text
+        terminal = _wait_lifecycle_operation(client, created.json())
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == "project-1"
         assert bridge.calls[0][0] == "activate_project"
         assert bridge.calls[0][2:] == (
             profile["profile_id"],
@@ -938,6 +949,58 @@ def test_project_create_and_read_use_only_generation_bound_core_v2(
         assert bridge.calls[-1][0] == "get_project"
         assert lifecycle.calls == ssh_calls
     finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_project_create_returns_before_a_sixteen_second_bridge_activation(
+    tmp_path: Path,
+) -> None:
+    provider, store, _lifecycle, bridge = _provider(tmp_path)
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    bridge.activation_started = Event()
+    bridge.activation_release = Event()
+    try:
+        profile = _connected_profile(client)
+        headers = _headers(
+            **{
+                "X-OpenEvo-Resource-Generation": str(
+                    profile["connection_generation"]
+                ),
+                "Idempotency-Key": "routing-slow-project-create-01",
+            }
+        )
+        before = time.monotonic()
+        created = client.post(
+            "/desktop/v2/projects",
+            headers=headers,
+            json=_project_create(profile),
+        )
+        elapsed = time.monotonic() - before
+
+        assert created.status_code == 202, created.text
+        assert elapsed < 0.5
+        assert bridge.activation_started.wait(2)
+        replay = client.post(
+            "/desktop/v2/projects",
+            headers=headers,
+            json=_project_create(profile),
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["operation_id"] == created.json()["operation_id"]
+        assert len([call for call in bridge.calls if call[0] == "activate_project"]) == 1
+        bridge.activation_release.set()
+        terminal = _wait_lifecycle_operation(client, created.json())
+        assert terminal["status"] == "succeeded"
+    finally:
+        bridge.activation_release.set()
         client.close()
         provider.close()
         store.close()
@@ -968,7 +1031,8 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             ),
             json=_project_create(profile),
         )
-        assert created.status_code == 201, created.text
+        assert created.status_code == 202, created.text
+        assert _wait_lifecycle_operation(client, created.json())["status"] == "succeeded"
         bound = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -991,6 +1055,10 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             },
         )
         assert disconnected.status_code == 202, disconnected.text
+        assert (
+            _wait_lifecycle_operation(client, disconnected.json())["status"]
+            == "succeeded"
+        )
         offline = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1015,6 +1083,10 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             },
         )
         assert reconnected.status_code == 202, reconnected.text
+        assert (
+            _wait_lifecycle_operation(client, reconnected.json())["status"]
+            == "succeeded"
+        )
         online = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1078,7 +1150,8 @@ def test_stale_project_create_and_core_failure_never_fall_back_to_ssh(
             ),
             json=_project_create(profile),
         )
-        assert created.status_code == 201, created.text
+        assert created.status_code == 202, created.text
+        assert _wait_lifecycle_operation(client, created.json())["status"] == "succeeded"
         bridge.fail_reads = True
         failed = client.get("/desktop/v2/projects/project-1", headers=_headers())
         assert failed.status_code == 503, failed.text
@@ -1149,8 +1222,10 @@ def test_native_project_streams_verified_private_import_to_core_v2_only(
             json=request,
         )
 
-        assert created.status_code == 201, created.text
-        assert created.json()["state"] == "ready"
+        assert created.status_code == 202, created.text
+        terminal = _wait_lifecycle_operation(client, created.json())
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == "project-1"
         assert [call[0] for call in bridge.calls] == [
             "activate_project",
             "create_workspace_upload",
@@ -1224,15 +1299,23 @@ def test_native_project_retry_releases_import_after_remote_finalize(
 
         failed = client.post("/desktop/v2/projects", headers=headers, json=request)
 
-        assert failed.status_code == 503, failed.text
-        assert failed.json()["code"] == "core_temporarily_unavailable"
+        assert failed.status_code == 202, failed.text
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not any(
+            call[0] == "get_project" for call in bridge.calls
+        ):
+            time.sleep(0.01)
+        assert any(call[0] == "get_project" for call in bridge.calls)
         assert workspace_store.inspect(import_id).pending
 
         bridge.fail_reads = False
         retried = client.post("/desktop/v2/projects", headers=headers, json=request)
 
-        assert retried.status_code == 201, retried.text
-        assert retried.json()["state"] == "ready"
+        assert retried.status_code == 202, retried.text
+        assert retried.json()["operation_id"] == failed.json()["operation_id"]
+        terminal = _wait_lifecycle_operation(client, retried.json())
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == "project-1"
         with pytest.raises(WorkspaceImportNotFoundError):
             workspace_store.inspect(import_id)
     finally:
@@ -1265,9 +1348,15 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             ),
             json=_project_create(profile),
         )
-        assert create.status_code == 201, create.text
+        assert create.status_code == 202, create.text
+        assert _wait_lifecycle_operation(client, create.json())["status"] == "succeeded"
         ssh_calls = list(lifecycle.calls)
-        project = create.json()
+        project_response = client.get(
+            "/desktop/v2/projects/project-1",
+            headers=_headers(),
+        )
+        assert project_response.status_code == 200, project_response.text
+        project = project_response.json()
         head = project["active_project_head"]
         project_headers = _headers(
             **{
@@ -1365,7 +1454,7 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             json=task_action,
         )
         assert cancelled.status_code == 202, cancelled.text
-        assert cancelled.json()["kind"] == "task_cancel"
+        assert cancelled.json()["kind"] == "attempt_cancel"
         retried = client.post(
             "/desktop/v2/tasks/task-1/retry",
             headers={**task_headers, "Idempotency-Key": "routing-task-retry-001"},

@@ -539,6 +539,11 @@ def _validate_lifecycle_identity(
         return
     if result.result_kind != expected_kind:
         raise ValueError("operation resource and result kind do not match")
+    if kind == "project_create":
+        # The reserved resource is the Desktop bridge identity available
+        # before remote mutation. Core issues the authoritative project ID only
+        # when that idempotent mutation succeeds.
+        return
     result_resource_id = {
         "profile": getattr(result, "profile_id", None),
         "native_workspace": getattr(result, "import_id", None),

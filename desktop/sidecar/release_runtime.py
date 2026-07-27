@@ -36,6 +36,7 @@ from desktop.sidecar.core_bridge_store_v1 import DesktopCoreBridgeStoreV1
 from desktop.sidecar.core_bridge_adapters_v2 import (
     CoreBootstrapConfigV2,
     DesktopCoreSshBridgeAdapterV2,
+    LifecycleProgressObserverV2,
     SealedCoreBootstrapAssetV2,
     SealedDaemonBundleV2,
     SealedManagedRuntimeArchiveV2,
@@ -204,6 +205,19 @@ class _DeferredCoreSshBridgeAdapterV2:
         self._bootstrap_loader = bootstrap_loader
         self._lock = threading.Lock()
         self._adapter: DesktopCoreSshBridgeAdapterV2 | None = None
+        self._progress_observer: LifecycleProgressObserverV2 | None = None
+
+    def set_progress_observer(self, observer: LifecycleProgressObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("Core lifecycle progress observer is invalid")
+        with self._lock:
+            if self._progress_observer is observer:
+                return
+            if self._progress_observer is not None:
+                raise RuntimeError("Core lifecycle progress observer cannot be changed")
+            self._progress_observer = observer
+            if self._adapter is not None:
+                self._adapter.set_progress_observer(observer)
 
     def ensure_core(
         self,
@@ -257,7 +271,11 @@ class _DeferredCoreSshBridgeAdapterV2:
                         affected_resource_id=None,
                     ),
                 ) from None
-            adapter = DesktopCoreSshBridgeAdapterV2(self._lifecycle, bootstrap)
+            adapter = DesktopCoreSshBridgeAdapterV2(
+                self._lifecycle,
+                bootstrap,
+                progress_observer=self._progress_observer,
+            )
             self._adapter = adapter
             return adapter
 
@@ -286,6 +304,25 @@ class DesktopCoreProfileConnectorV2:
         self._timeout_seconds = float(timeout_seconds)
         self._transition = threading.Lock()
         self._closed = False
+        self._progress_observer: LifecycleProgressObserverV2 | None = None
+
+    def set_progress_observer(self, observer: LifecycleProgressObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("Core profile progress observer is invalid")
+        with self._transition:
+            if self._closed or self._progress_observer is not None:
+                raise RuntimeError("Core profile progress observer cannot be changed")
+            self._adapter.set_progress_observer(observer)
+            self._progress_observer = observer
+
+    def _observe_progress(self, phase: local_v2.LifecyclePhaseV2) -> None:
+        observer = self._progress_observer
+        if observer is not None:
+            observer(
+                phase,
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                True,
+            )
 
     def connect_profile(
         self,
@@ -309,6 +346,7 @@ class DesktopCoreProfileConnectorV2:
                     profile_connection_generation,
                     deadline=deadline,
                 )
+                self._observe_progress("opening_project_tunnel")
                 session_id = f"core-profile-{secrets.token_hex(20)}"
                 tunnel = self._adapter.open_tunnel(
                     profile_id=profile_id,
@@ -324,6 +362,7 @@ class DesktopCoreProfileConnectorV2:
                     profile_connection_generation=profile_connection_generation,
                     session_id=session_id,
                 )
+                self._observe_progress("negotiating_core")
                 client = CoreProjectBootstrapClientV2(
                     connection,
                     transport=self._adapter.new_http_transport(),

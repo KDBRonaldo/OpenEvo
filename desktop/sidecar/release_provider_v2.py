@@ -25,7 +25,21 @@ from desktop.sidecar.core_bridge_v2 import (
     DesktopCoreBridgeErrorV2,
 )
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
-from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
+from desktop.sidecar.lifecycle_executor_v2 import (
+    DesktopLifecycleExecutorV2,
+    LifecycleExecutionContextV2,
+)
+from desktop.sidecar.provider_store_v2 import (
+    DesktopProviderStoreV2,
+    LifecycleHostKeyReviewRequestV2,
+    LifecycleNativeWorkspacePrepareRequestV2,
+    LifecycleOperationReservationV2,
+    LifecycleOperationWorkV2,
+    LifecycleProfileConnectRequestV2,
+    LifecycleProfileDisconnectRequestV2,
+    LifecycleProjectActivateRequestV2,
+    LifecycleProjectCreateRequestV2,
+)
 from desktop.sidecar.release_capabilities import (
     V0110_RELEASE_AUTHORITY_POLICY,
     ReleaseAuthorityNegotiationError,
@@ -176,6 +190,10 @@ _OPERATIONS = frozenset(
         "connectRemoteWorkspaceProfileV2",
         "disconnectRemoteWorkspaceProfileV2",
         "reviewRemoteWorkspaceHostKeyV2",
+        "getDesktopLifecycleOperationV2",
+        "getDesktopLifecycleOperationLogsV2",
+        "cancelDesktopLifecycleOperationV2",
+        "acknowledgeDesktopLifecycleOperationV2",
         "listDesktopProjectsV2",
         "createDesktopProjectV2",
         "getDesktopProjectV2",
@@ -307,6 +325,21 @@ class DesktopReleaseProviderV2:
         set_prompt_observer = getattr(lifecycle, "set_prompt_observer", None)
         if callable(set_prompt_observer):
             set_prompt_observer(self._observe_ssh_prompt)
+        self._lifecycle_executor = DesktopLifecycleExecutorV2(
+            store,
+            runners={
+                "profile_connect": self._run_profile_connect,
+                "profile_disconnect": self._run_profile_disconnect,
+                "host_key_review": self._run_host_key_review,
+                "native_workspace_prepare": self._run_native_workspace_prepare,
+                "project_create": self._run_project_create,
+                "project_activate": self._run_project_activate,
+            },
+            operation_observer=self._publish_lifecycle_operation,
+            error_mapper=self._map_lifecycle_error,
+        )
+        self._configure_lifecycle_observers()
+        self._lifecycle_executor.start()
 
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         if operation_id not in _OPERATIONS:
@@ -330,6 +363,12 @@ class DesktopReleaseProviderV2:
             "connectRemoteWorkspaceProfileV2": self._connect_profile,
             "disconnectRemoteWorkspaceProfileV2": self._disconnect_profile,
             "reviewRemoteWorkspaceHostKeyV2": self._review_host_key,
+            "getDesktopLifecycleOperationV2": self._get_lifecycle_operation,
+            "getDesktopLifecycleOperationLogsV2": self._get_lifecycle_logs,
+            "cancelDesktopLifecycleOperationV2": self._cancel_lifecycle_operation,
+            "acknowledgeDesktopLifecycleOperationV2": (
+                self._acknowledge_lifecycle_operation
+            ),
             "listDesktopProjectsV2": self._list_projects,
             "createDesktopProjectV2": self._create_project,
             "getDesktopProjectV2": self._get_project,
@@ -383,6 +422,7 @@ class DesktopReleaseProviderV2:
             if self._closed:
                 return
             self._closed = True
+        self._lifecycle_executor.close()
         if not self._own_resources:
             return
         failure: BaseException | None = None
@@ -477,8 +517,65 @@ class DesktopReleaseProviderV2:
             profiles=profiles,
             active_profile_id=None if active is None else active.profile_id,
             active_project_id=None if active is None else active.active_project_id,
+            pending_operations=list(self._store.list_pending_lifecycle_operations()),
             last_event_id=None,
             updated_at=self._timestamp(),
+        )
+
+    def _get_lifecycle_operation(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
+        return self._store.get_lifecycle_operation(
+            _string_argument(arguments, "operation_id")
+        )
+
+    def _get_lifecycle_logs(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleLogPageV2:
+        operation_id = _string_argument(arguments, "operation_id")
+        limit = _integer_argument(arguments, "limit")
+        after = arguments.get("after")
+        if after is not None and type(after) is not str:
+            raise TypeError("lifecycle log cursor has the wrong type")
+        return self._store.read_lifecycle_logs(
+            operation_id,
+            limit=limit,
+            after=after,
+        )
+
+    def _cancel_lifecycle_operation(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
+        operation_id = _string_argument(arguments, "operation_id")
+        request = _argument(arguments, "request", local_v2.LifecycleCancelV2)
+        if request.expected_operation_id != operation_id:
+            raise _resource_changed("operation", operation_id, action="retry")
+        if _integer_argument(arguments, "resource_generation") != 0:
+            raise _resource_changed("operation", operation_id, action="retry")
+        return self._lifecycle_executor.cancel(
+            operation_id,
+            if_match=_string_argument(arguments, "if_match"),
+            idempotency_key=_string_argument(arguments, "idempotency_key"),
+        )
+
+    def _acknowledge_lifecycle_operation(
+        self,
+        arguments: Mapping[str, object],
+    ) -> None:
+        operation_id = _string_argument(arguments, "operation_id")
+        request = _argument(arguments, "request", local_v2.LifecycleAcknowledgeV2)
+        if request.expected_operation_id != operation_id:
+            raise _resource_changed("operation", operation_id, action="retry")
+        if _integer_argument(arguments, "resource_generation") != 0:
+            raise _resource_changed("operation", operation_id, action="retry")
+        self._store.acknowledge_lifecycle_operation(
+            operation_id,
+            request,
+            if_match=_string_argument(arguments, "if_match"),
+            idempotency_key=_string_argument(arguments, "idempotency_key"),
         )
 
     def _list_hosts(self, arguments: Mapping[str, object]) -> local_v2.SshHostCatalogV2:
@@ -601,52 +698,118 @@ class DesktopReleaseProviderV2:
             idempotency_key=_string_argument(arguments, "idempotency_key"),
         )
 
-    def _connect_profile(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
+    def _connect_profile(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
         profile_id = _string_argument(arguments, "profile_id")
         request = _argument(arguments, "request", local_v2.ProfileConnectionActionV2)
         generation = _integer_argument(arguments, "resource_generation")
         key = _string_argument(arguments, "idempotency_key")
-        started = self._store.begin_profile_action(
-            profile_id,
-            request,
-            action="connect",
-            resource_generation=generation,
-            if_match=_string_argument(arguments, "if_match"),
+        operation = self._lifecycle_executor.reserve(
+            LifecycleOperationReservationV2(
+                kind="profile_connect",
+                resource={"resource_kind": "profile", "resource_id": profile_id},
+                request=LifecycleProfileConnectRequestV2(
+                    request_kind="profile_connect",
+                    profile_id=profile_id,
+                    request=request,
+                    resource_generation=generation,
+                    if_match=_string_argument(arguments, "if_match"),
+                ),
+            ),
             idempotency_key=key,
         )
-        current = self._store.get_profile(profile_id)
-        if (
-            not isinstance(current, local_v2.RemoteWorkspaceProfileV2)
-            or current.connection_generation != started.connection_generation
-        ):
-            raise _generation_changed(profile_id)
-        if (
-            current.connection_state == "connected"
-        ):
-            return _completed_operation("profile_connect", key, started.updated_at)
-        if current.connection_state == "host_key_review":
+        self._publish_reserved_profile(profile_id)
+        return operation
+
+    def _disconnect_profile(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
+        profile_id = _string_argument(arguments, "profile_id")
+        request = _argument(arguments, "request", local_v2.ProfileConnectionActionV2)
+        generation = _integer_argument(arguments, "resource_generation")
+        key = _string_argument(arguments, "idempotency_key")
+        operation = self._lifecycle_executor.reserve(
+            LifecycleOperationReservationV2(
+                kind="profile_disconnect",
+                resource={"resource_kind": "profile", "resource_id": profile_id},
+                request=LifecycleProfileDisconnectRequestV2(
+                    request_kind="profile_disconnect",
+                    profile_id=profile_id,
+                    request=request,
+                    resource_generation=generation,
+                    if_match=_string_argument(arguments, "if_match"),
+                ),
+            ),
+            idempotency_key=key,
+        )
+        self._publish_reserved_profile(profile_id)
+        return operation
+
+    def _review_host_key(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
+        profile_id = _string_argument(arguments, "profile_id")
+        request = _argument(arguments, "request", local_v2.HostKeyReviewRequestV2)
+        generation = _integer_argument(arguments, "resource_generation")
+        key = _string_argument(arguments, "idempotency_key")
+        operation = self._lifecycle_executor.reserve(
+            LifecycleOperationReservationV2(
+                kind="host_key_review",
+                resource={"resource_kind": "profile", "resource_id": profile_id},
+                request=LifecycleHostKeyReviewRequestV2(
+                    request_kind="host_key_review",
+                    profile_id=profile_id,
+                    request=request,
+                    resource_generation=generation,
+                    if_match=_string_argument(arguments, "if_match"),
+                ),
+            ),
+            idempotency_key=key,
+        )
+        self._publish_reserved_profile(profile_id)
+        return operation
+
+    def _run_profile_connect(
+        self,
+        context: LifecycleExecutionContextV2,
+    ) -> local_v2.LifecycleProfileResultV2:
+        request = context.request
+        if type(request) is not LifecycleProfileConnectRequestV2:
+            raise TypeError("profile-connect lifecycle request has the wrong type")
+        started = self._profile_for_lifecycle(
+            request.profile_id,
+            request.resource_generation + 1,
+        )
+        if started.connection_state == "connected":
+            return self._profile_lifecycle_result(started)
+        if started.connection_state == "host_key_review":
             raise _provider_error(
                 "ssh_host_key_changed",
                 "The configured server identity changed and requires review.",
                 status=409,
                 action="review_host_key",
-                affected_resource_id=profile_id,
+                affected_resource_id=started.profile_id,
             )
-        if current.connection_state == "failed" and current.failure is not None:
-            raise _replayed_profile_failure(current.failure)
-        if current.connection_state == "prompt_pending":
-            raise _provider_error(
-                "ssh_prompt_pending",
-                "System OpenSSH is waiting for the native authentication prompt.",
-                status=409,
-                retryable=True,
-                action="retry",
-                affected_resource_id=profile_id,
-            )
+        if started.connection_state == "failed" and started.failure is not None:
+            raise _replayed_profile_failure(started.failure)
+        context.checkpoint(
+            "resolving_system_openssh",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
         self._deactivate_profile_project(
-            profile_id,
+            started.profile_id,
             started.connection_generation - 1,
             started.active_project_id,
+        )
+        context.checkpoint(
+            "connecting",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
         )
         try:
             self._lifecycle.connect(started)
@@ -654,7 +817,7 @@ class DesktopReleaseProviderV2:
             review = exc.host_key_review
             if review is not None and exc.code == "ssh_host_key_changed":
                 pending = self._store.publish_profile_host_key_review(
-                    profile_id,
+                    started.profile_id,
                     connection_generation=started.connection_generation,
                     review=review,
                 )
@@ -664,139 +827,140 @@ class DesktopReleaseProviderV2:
                     "The configured server identity changed and requires review.",
                     status=409,
                     action="review_host_key",
-                    affected_resource_id=profile_id,
+                    affected_resource_id=started.profile_id,
                 ) from None
             raise self._fail_profile_connect(started, exc.code) from None
         except Exception:
             raise self._fail_profile_connect(started, "ssh_connection_failed") from None
-        try:
-            remote = self._core_connector.connect_profile(
-                profile_id,
-                started.connection_generation,
-            )
-            negotiated = self._exact_core_version(remote, profile_id)
-            self._reactivate_saved_project(started)
-        except DesktopReleaseProviderV2Error as exc:
-            self._abort_profile_transport(started)
-            failed = self._store.fail_profile_connection(
-                profile_id,
-                connection_generation=started.connection_generation,
-                failure=exc.error,
-            )
-            self._publish_profile(failed)
-            raise
-        except DesktopCoreBridgeErrorV2 as exc:
-            raise self._fail_profile_core_connect(started, exc) from None
-        except Exception:
-            raise self._fail_profile_connect(
-                started,
-                "core_connection_failed",
-                abort_transport=True,
-            ) from None
-        connected = self._store.complete_profile_connection(
-            profile_id,
-            connection_generation=started.connection_generation,
-            core_version=negotiated,
-        )
-        self._publish_profile(connected)
-        return _completed_operation("profile_connect", key, started.updated_at)
+        context.check_cancelled()
+        return self._complete_profile_core_connection(context, started)
 
-    def _disconnect_profile(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
-        profile_id = _string_argument(arguments, "profile_id")
-        request = _argument(arguments, "request", local_v2.ProfileConnectionActionV2)
-        generation = _integer_argument(arguments, "resource_generation")
-        key = _string_argument(arguments, "idempotency_key")
-        started = self._store.begin_profile_action(
-            profile_id,
-            request,
-            action="disconnect",
-            resource_generation=generation,
-            if_match=_string_argument(arguments, "if_match"),
-            idempotency_key=key,
+    def _run_profile_disconnect(
+        self,
+        context: LifecycleExecutionContextV2,
+    ) -> local_v2.LifecycleProfileResultV2:
+        request = context.request
+        if type(request) is not LifecycleProfileDisconnectRequestV2:
+            raise TypeError("profile-disconnect lifecycle request has the wrong type")
+        started = self._profile_for_lifecycle(
+            request.profile_id,
+            request.resource_generation + 1,
         )
-        current = self._store.get_profile(profile_id)
-        if (
-            not isinstance(current, local_v2.RemoteWorkspaceProfileV2)
-            or current.connection_generation != started.connection_generation
-        ):
-            raise _generation_changed(profile_id)
-        if (
-            current.connection_state == "disconnected"
-        ):
-            return _completed_operation("profile_disconnect", key, started.updated_at)
+        if started.connection_state == "disconnected":
+            return self._profile_lifecycle_result(started)
+        context.checkpoint(
+            "connecting",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
         self._deactivate_profile_project(
-            profile_id,
+            started.profile_id,
             started.connection_generation - 1,
             started.active_project_id,
         )
-        self._lifecycle.disconnect(profile_id, started.connection_generation)
+        try:
+            self._lifecycle.disconnect(
+                started.profile_id,
+                started.connection_generation,
+            )
+        except Exception:
+            # The process-local SSH owner may already be absent during restart
+            # recovery. Local disconnection is still the safe terminal state.
+            pass
+        context.check_cancelled()
+        context.checkpoint(
+            "activating",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
         disconnected = self._store.complete_profile_disconnect(
-            profile_id,
+            started.profile_id,
             connection_generation=started.connection_generation,
         )
         self._publish_profile(disconnected)
-        return _completed_operation("profile_disconnect", key, started.updated_at)
+        return self._profile_lifecycle_result(disconnected)
 
-    def _review_host_key(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
-        profile_id = _string_argument(arguments, "profile_id")
-        request = _argument(arguments, "request", local_v2.HostKeyReviewRequestV2)
-        generation = _integer_argument(arguments, "resource_generation")
-        key = _string_argument(arguments, "idempotency_key")
-        started = self._store.begin_profile_action(
-            profile_id,
-            request,
-            action="host_key_review",
-            resource_generation=generation,
-            if_match=_string_argument(arguments, "if_match"),
-            idempotency_key=key,
+    def _run_host_key_review(
+        self,
+        context: LifecycleExecutionContextV2,
+    ) -> local_v2.LifecycleProfileResultV2:
+        request = context.request
+        if type(request) is not LifecycleHostKeyReviewRequestV2:
+            raise TypeError("host-key lifecycle request has the wrong type")
+        started = self._profile_for_lifecycle(
+            request.profile_id,
+            request.resource_generation + 1,
         )
-        current = self._store.get_profile(profile_id)
-        if (
-            not isinstance(current, local_v2.RemoteWorkspaceProfileV2)
-            or current.connection_generation != started.connection_generation
+        if started.connection_state == "connected" or (
+            started.connection_state == "disconnected"
+            and started.trust.state == "rejected"
         ):
-            raise _generation_changed(profile_id)
-        if current.connection_state == "connected":
-            return _completed_operation("host_key_review", key, started.updated_at)
-        if current.connection_state == "disconnected" and current.trust.state == "rejected":
-            return _completed_operation("host_key_review", key, started.updated_at)
-        if current.connection_state == "failed" and current.failure is not None:
-            raise _replayed_profile_failure(current.failure)
-        if current.connection_state == "prompt_pending":
-            raise _provider_error(
-                "ssh_prompt_pending",
-                "System OpenSSH is waiting for the native authentication prompt.",
-                status=409,
-                retryable=True,
-                action="retry",
-                affected_resource_id=profile_id,
-            )
+            return self._profile_lifecycle_result(started)
+        if started.connection_state == "failed" and started.failure is not None:
+            raise _replayed_profile_failure(started.failure)
+        context.checkpoint(
+            "connecting",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        context.checkpoint(
+            "waiting_for_user",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
         try:
-            outcome = self._lifecycle.review_host_key(started, request)
+            outcome = self._lifecycle.review_host_key(started, request.request)
         except SystemOpenSshSessionError as exc:
             raise self._fail_profile_connect(started, exc.code) from None
         except Exception:
-            raise self._fail_profile_connect(started, "ssh_host_key_review_failed") from None
+            raise self._fail_profile_connect(
+                started,
+                "ssh_host_key_review_failed",
+            ) from None
+        context.check_cancelled()
         if outcome == "rejected":
+            context.checkpoint(
+                "activating",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=False,
+            )
             rejected = self._store.complete_profile_rejection(
-                profile_id,
+                started.profile_id,
                 connection_generation=started.connection_generation,
             )
             self._publish_profile(rejected)
-            return _completed_operation("host_key_review", key, started.updated_at)
+            return self._profile_lifecycle_result(rejected)
         if outcome != "connected":
             raise self._fail_profile_connect(started, "ssh_host_key_review_failed")
+        return self._complete_profile_core_connection(context, started)
+
+    def _complete_profile_core_connection(
+        self,
+        context: LifecycleExecutionContextV2,
+        started: local_v2.RemoteWorkspaceProfileV2,
+    ) -> local_v2.LifecycleProfileResultV2:
+        context.checkpoint(
+            "remote_preflight",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
         try:
             remote = self._core_connector.connect_profile(
-                profile_id,
+                started.profile_id,
                 started.connection_generation,
             )
-            negotiated = self._exact_core_version(remote, profile_id)
+            context.check_cancelled()
+            context.checkpoint(
+                "negotiating_core",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=True,
+            )
+            negotiated = self._exact_core_version(remote, started.profile_id)
             self._reactivate_saved_project(started)
         except DesktopReleaseProviderV2Error as exc:
             self._abort_profile_transport(started)
             failed = self._store.fail_profile_connection(
-                profile_id,
+                started.profile_id,
                 connection_generation=started.connection_generation,
                 failure=exc.error,
             )
@@ -810,15 +974,159 @@ class DesktopReleaseProviderV2:
                 "core_connection_failed",
                 abort_transport=True,
             ) from None
+        context.checkpoint(
+            "activating",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
         connected = self._store.complete_profile_connection(
-            profile_id,
+            started.profile_id,
             connection_generation=started.connection_generation,
             core_version=negotiated,
         )
         self._publish_profile(connected)
-        return _completed_operation("host_key_review", key, started.updated_at)
+        return self._profile_lifecycle_result(connected)
 
-    def _create_project(self, arguments: Mapping[str, object]) -> core_v2.ProjectV2:
+    def _run_native_workspace_prepare(
+        self,
+        context: LifecycleExecutionContextV2,
+    ) -> local_v2.LifecycleNativeWorkspaceResultV2:
+        request = context.request
+        if type(request) is not LifecycleNativeWorkspacePrepareRequestV2:
+            raise TypeError("native-workspace lifecycle request has the wrong type")
+        context.checkpoint(
+            "preparing_native_workspace",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        authority = self._require_workspace_import_store().inspect(
+            request.native_workspace_id
+        )
+        import_ref = authority.import_ref
+        if request.native_journal_sha256 != import_ref.content_sha256:
+            raise WorkspaceImportIntegrityError(
+                "native workspace lifecycle authority changed"
+            )
+        return local_v2.LifecycleNativeWorkspaceResultV2(
+            result_kind="native_workspace",
+            import_id=import_ref.import_id,
+            content_sha256=import_ref.content_sha256,
+            byte_size=import_ref.byte_size,
+            entry_count=import_ref.entry_count,
+            extracted_byte_size=import_ref.extracted_byte_size,
+            display_name=request.display_name,
+        )
+
+    def _run_project_create(
+        self,
+        context: LifecycleExecutionContextV2,
+    ) -> local_v2.LifecycleProjectResultV2:
+        persisted = context.request
+        if type(persisted) is not LifecycleProjectCreateRequestV2:
+            raise TypeError("project-create lifecycle request has the wrong type")
+        request = persisted.request
+        profile = self._connected_profile(
+            request.profile_id,
+            request.profile_connection_generation,
+        )
+        if persisted.resource_generation != profile.connection_generation:
+            raise _generation_changed(profile.profile_id)
+        desktop_project_id = persisted.project_id
+        context.checkpoint(
+            "remote_preflight",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        activation = self._bridge.activate_project(
+            desktop_project_id,
+            request,
+            idempotency_key=context.idempotency_key,
+        )
+        context.check_cancelled()
+        project = getattr(activation, "project", None)
+        if type(project) is not core_v2.ProjectV2:
+            raise _provider_error(
+                "core_authority_invalid",
+                "The remote OpenEvo Daemon returned invalid project authority.",
+                status=502,
+                action="install_repair_daemon",
+                affected_resource_id=desktop_project_id,
+            )
+        native_import_id = (
+            native_import_id_for_action(context.idempotency_key)
+            if request.config.workspace.kind == "native_folder_snapshot"
+            else None
+        )
+        if native_import_id is not None:
+            project = self._materialize_native_workspace(
+                desktop_project_id=desktop_project_id,
+                profile_connection_generation=profile.connection_generation,
+                project=project,
+                import_id=native_import_id,
+                action_id=context.idempotency_key,
+                lifecycle_context=context,
+            )
+        self._checkpoint_lifecycle_forward(
+            context,
+            "verifying_project",
+            cancellable=True,
+        )
+        self._checkpoint_lifecycle_forward(
+            context,
+            "activating",
+            cancellable=False,
+        )
+        self._store.bind_active_project(
+            profile.profile_id,
+            connection_generation=profile.connection_generation,
+            project_id=project.project_id,
+        )
+        return local_v2.LifecycleProjectResultV2(
+            result_kind="project",
+            project_id=project.project_id,
+        )
+
+    def _run_project_activate(
+        self,
+        context: LifecycleExecutionContextV2,
+    ) -> local_v2.LifecycleProjectResultV2:
+        request = context.request
+        if type(request) is not LifecycleProjectActivateRequestV2:
+            raise TypeError("project-activate lifecycle request has the wrong type")
+        context.checkpoint(
+            "verifying_project",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        _activation, _desktop_id, _profile_generation, project = (
+            self._active_authority(request.project_id)
+        )
+        self._require_project_cas(project, request.resource_generation, request.if_match)
+        head = project.active_project_head
+        if head is None or (
+            request.request.expected_project_head_id != head.project_head_id
+            or request.request.expected_project_head_manifest_sha256
+            != head.manifest_sha256
+        ):
+            raise _resource_changed(
+                "project",
+                request.project_id,
+                action="correct_project",
+            )
+        context.checkpoint(
+            "activating",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
+        return local_v2.LifecycleProjectResultV2(
+            result_kind="project",
+            project_id=project.project_id,
+        )
+
+    def _create_project(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
         request = _argument(arguments, "request", local_v2.ProjectCreateV2)
         generation = _integer_argument(arguments, "resource_generation")
         key = _string_argument(arguments, "idempotency_key")
@@ -834,34 +1142,22 @@ class DesktopReleaseProviderV2:
             desktop_project_id = project_id_for_native_import(native_import_id)
         else:
             desktop_project_id = _desktop_project_id(profile.profile_id, key)
-        activation = self._bridge.activate_project(
-            desktop_project_id,
-            request,
+        return self._lifecycle_executor.reserve(
+            LifecycleOperationReservationV2(
+                kind="project_create",
+                resource={
+                    "resource_kind": "project",
+                    "resource_id": desktop_project_id,
+                },
+                request=LifecycleProjectCreateRequestV2(
+                    request_kind="project_create",
+                    project_id=desktop_project_id,
+                    request=request,
+                    resource_generation=generation,
+                ),
+            ),
             idempotency_key=key,
         )
-        project = getattr(activation, "project", None)
-        if type(project) is not core_v2.ProjectV2:
-            raise _provider_error(
-                "core_authority_invalid",
-                "The remote OpenEvo Daemon returned invalid project authority.",
-                status=502,
-                action="install_repair_daemon",
-                affected_resource_id=desktop_project_id,
-            )
-        self._store.bind_active_project(
-            profile.profile_id,
-            connection_generation=profile.connection_generation,
-            project_id=project.project_id,
-        )
-        if native_import_id is not None:
-            project = self._materialize_native_workspace(
-                desktop_project_id=desktop_project_id,
-                profile_connection_generation=profile.connection_generation,
-                project=project,
-                import_id=native_import_id,
-                action_id=key,
-            )
-        return project
 
     def _materialize_native_workspace(
         self,
@@ -871,6 +1167,7 @@ class DesktopReleaseProviderV2:
         project: core_v2.ProjectV2,
         import_id: str,
         action_id: str,
+        lifecycle_context: LifecycleExecutionContextV2 | None = None,
     ) -> core_v2.ProjectV2:
         if project.active_project_head is not None:
             self._release_completed_native_import(import_id, desktop_project_id)
@@ -926,6 +1223,16 @@ class DesktopReleaseProviderV2:
                 affected_resource_id=project.project_id,
             )
         if upload.state == "open":
+            if lifecycle_context is not None:
+                lifecycle_context.checkpoint(
+                    "creating_remote_project",
+                    local_v2.LifecycleProgressBytesV2(
+                        kind="bytes",
+                        completed=upload.accepted_byte_size,
+                        total=import_ref.byte_size,
+                    ),
+                    cancellable=True,
+                )
             with store.resolve(import_ref, ownership=expected_ownership) as stream:
                 stream.seek(upload.accepted_byte_size)
                 while upload.next_chunk_index < upload.chunk_count:
@@ -950,6 +1257,16 @@ class DesktopReleaseProviderV2:
                         ),
                     )
                     self._validate_workspace_upload(upload, project, create)
+                    if lifecycle_context is not None:
+                        lifecycle_context.checkpoint(
+                            "creating_remote_project",
+                            local_v2.LifecycleProgressBytesV2(
+                                kind="bytes",
+                                completed=upload.accepted_byte_size,
+                                total=import_ref.byte_size,
+                            ),
+                            cancellable=True,
+                        )
                     if upload.state != "open" and (
                         upload.next_chunk_index != upload.chunk_count
                     ):
@@ -975,10 +1292,40 @@ class DesktopReleaseProviderV2:
             self._validate_workspace_upload(upload, project, create)
         if upload.state != "finalized" or upload.workspace_snapshot is None:
             raise _core_authority_invalid(project.project_id)
-        refreshed = self._bridge.get_project(
-            desktop_project_id,
-            profile_connection_generation,
-        )
+        if lifecycle_context is not None:
+            lifecycle_context.checkpoint(
+                "creating_remote_project",
+                local_v2.LifecycleProgressBytesV2(
+                    kind="bytes",
+                    completed=import_ref.byte_size,
+                    total=import_ref.byte_size,
+                ),
+                cancellable=True,
+            )
+        if lifecycle_context is not None:
+            self._checkpoint_lifecycle_forward(
+                lifecycle_context,
+                "verifying_project",
+                cancellable=True,
+            )
+        refreshed: core_v2.ProjectV2 | None = None
+        last_read_failure: DesktopCoreBridgeErrorV2 | None = None
+        for _attempt in range(1_200):
+            try:
+                refreshed = self._bridge.get_project(
+                    desktop_project_id,
+                    profile_connection_generation,
+                )
+                break
+            except DesktopCoreBridgeErrorV2 as exc:
+                if lifecycle_context is None or not exc.error.retryable:
+                    raise
+                last_read_failure = exc
+                if lifecycle_context.cancellation_event.wait(0.05):
+                    lifecycle_context.check_cancelled()
+        if refreshed is None:
+            assert last_read_failure is not None
+            raise last_read_failure
         if (
             refreshed.project_id != project.project_id
             or refreshed.config != project.config
@@ -1094,7 +1441,10 @@ class DesktopReleaseProviderV2:
             idempotency_key=key,
         )
 
-    def _activate_project(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
+    def _activate_project(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
         project_id = _string_argument(arguments, "project_id")
         request = _argument(arguments, "request", local_v2.ProjectActionV2)
         generation = _integer_argument(arguments, "resource_generation")
@@ -1110,7 +1460,20 @@ class DesktopReleaseProviderV2:
             or request.expected_project_head_manifest_sha256 != head.manifest_sha256
         ):
             raise _resource_changed("project", project_id, action="correct_project")
-        return _completed_operation("project_activate", key, project.updated_at)
+        return self._lifecycle_executor.reserve(
+            LifecycleOperationReservationV2(
+                kind="project_activate",
+                resource={"resource_kind": "project", "resource_id": project_id},
+                request=LifecycleProjectActivateRequestV2(
+                    request_kind="project_activate",
+                    project_id=project_id,
+                    request=request,
+                    resource_generation=generation,
+                    if_match=if_match,
+                ),
+            ),
+            idempotency_key=key,
+        )
 
     def _project_capabilities(
         self,
@@ -1238,7 +1601,7 @@ class DesktopReleaseProviderV2:
             raise _core_authority_invalid(task_id)
         return task
 
-    def _cancel_task(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
+    def _cancel_task(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
         task_id, task, request, generation, if_match, key, desktop_id, profile_generation = (
             self._task_action_arguments(arguments)
         )
@@ -1256,7 +1619,7 @@ class DesktopReleaseProviderV2:
             idempotency_key=key,
         )
         del generation
-        return _local_operation(operation, "task_cancel")
+        return operation
 
     def _retry_task(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
         task_id, task, request, _generation, _if_match, key, desktop_id, profile_generation = (
@@ -1377,7 +1740,7 @@ class DesktopReleaseProviderV2:
             raise _core_authority_invalid(transition_id)
         return transition
 
-    def _retry_transition(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
+    def _retry_transition(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
         transition_id, request, key, desktop_id, generation = (
             self._transition_action_arguments(arguments)
         )
@@ -1390,7 +1753,7 @@ class DesktopReleaseProviderV2:
             ),
             idempotency_key=key,
         )
-        return _local_operation(operation, "transition_retry")
+        return operation
 
     def _replace_transition(self, arguments: Mapping[str, object]) -> object:
         _argument(arguments, "request", local_v2.TransitionReplaceV2)
@@ -1405,7 +1768,7 @@ class DesktopReleaseProviderV2:
             action="correct_project",
         )
 
-    def _abandon_transition(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
+    def _abandon_transition(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
         transition_id, request, key, desktop_id, generation = (
             self._transition_action_arguments(arguments)
         )
@@ -1418,7 +1781,7 @@ class DesktopReleaseProviderV2:
             ),
             idempotency_key=key,
         )
-        return _local_operation(operation, "transition_abandon")
+        return operation
 
     def _get_artifact(self, arguments: Mapping[str, object]) -> core_v2.ArtifactV2:
         artifact_id = _string_argument(arguments, "artifact_id")
@@ -1483,7 +1846,7 @@ class DesktopReleaseProviderV2:
             after=after,
         )
 
-    def _restart_service(self, arguments: Mapping[str, object]) -> local_v2.LocalOperationV2:
+    def _restart_service(self, arguments: Mapping[str, object]) -> core_v2.OperationV2:
         service_id = _string_argument(arguments, "service_id")
         request = _argument(arguments, "request", local_v2.ServiceRestartV2)
         resource_generation = _integer_argument(arguments, "resource_generation")
@@ -1513,7 +1876,7 @@ class DesktopReleaseProviderV2:
             if_match=if_match,
             idempotency_key=key,
         )
-        return _local_operation(operation, "service_restart")
+        return operation
 
     def _create_diagnostic(self, arguments: Mapping[str, object]) -> core_v2.DiagnosticV2:
         request = _argument(arguments, "request", local_v2.DiagnosticRequestV2)
@@ -1675,6 +2038,97 @@ class DesktopReleaseProviderV2:
             affected_resource_id=resource_id,
         )
 
+    def _configure_lifecycle_observers(self) -> None:
+        output_observer = self._lifecycle_executor.observe_output
+        progress_observer = self._lifecycle_executor.observe_progress
+        set_output = getattr(self._lifecycle, "set_output_observer", None)
+        if callable(set_output):
+            set_output(output_observer)
+        for authority in (self._core_connector, self._bridge):
+            set_progress = getattr(authority, "set_progress_observer", None)
+            if callable(set_progress):
+                set_progress(progress_observer)
+
+    def _profile_for_lifecycle(
+        self,
+        profile_id: str,
+        connection_generation: int,
+    ) -> local_v2.RemoteWorkspaceProfileV2:
+        profile = self._store.get_profile(profile_id)
+        if (
+            not isinstance(profile, local_v2.RemoteWorkspaceProfileV2)
+            or profile.connection_generation != connection_generation
+        ):
+            raise _generation_changed(profile_id)
+        return profile
+
+    @staticmethod
+    def _profile_lifecycle_result(
+        profile: local_v2.RemoteWorkspaceProfileV2,
+    ) -> local_v2.LifecycleProfileResultV2:
+        return local_v2.LifecycleProfileResultV2(
+            result_kind="profile",
+            profile_id=profile.profile_id,
+            connection_generation=profile.connection_generation,
+        )
+
+    @staticmethod
+    def _checkpoint_lifecycle_forward(
+        context: LifecycleExecutionContextV2,
+        phase: local_v2.LifecyclePhaseV2,
+        *,
+        cancellable: bool,
+    ) -> None:
+        target_index = local_v2.LIFECYCLE_PHASES.index(phase)
+        if context.operation.phase_index > target_index:
+            context.check_cancelled()
+            return
+        context.checkpoint(
+            phase,
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=cancellable,
+        )
+
+    def _publish_reserved_profile(self, profile_id: str) -> None:
+        profile = self._store.get_profile(profile_id)
+        if isinstance(profile, local_v2.RemoteWorkspaceProfileV2):
+            self._publish_profile(profile)
+
+    @staticmethod
+    def _map_lifecycle_error(
+        exc: BaseException,
+        work: LifecycleOperationWorkV2,
+    ) -> local_v2.DesktopErrorV2:
+        if isinstance(exc, DesktopReleaseProviderV2Error):
+            return exc.error
+        if isinstance(exc, DesktopCoreBridgeErrorV2):
+            error = exc.error
+            if error.affected_resource_id is None:
+                error = error.model_copy(
+                    update={
+                        "affected_resource_id": work.operation.resource.resource_id
+                    }
+                )
+            return error
+        if isinstance(
+            exc,
+            (WorkspaceImportIntegrityError, WorkspaceImportNotFoundError),
+        ):
+            return local_v2.DesktopErrorV2(
+                code="workspace_import_invalid",
+                summary="The selected native workspace snapshot is unavailable.",
+                retryable=False,
+                action="correct_project",
+                affected_resource_id=work.operation.resource.resource_id,
+            )
+        return local_v2.DesktopErrorV2(
+            code="lifecycle_operation_failed",
+            summary="The lifecycle operation could not be completed.",
+            retryable=True,
+            action="retry",
+            affected_resource_id=work.operation.resource.resource_id,
+        )
+
     @staticmethod
     def _require_project_cas(
         project: core_v2.ProjectV2,
@@ -1705,6 +2159,24 @@ class DesktopReleaseProviderV2:
             )
         )
 
+    def _publish_lifecycle_operation(
+        self,
+        operation: local_v2.LifecycleOperationV2,
+    ) -> None:
+        self._event_broker.publish(
+            local_v2.LifecycleOperationEventPayloadV2(
+                payload_kind="lifecycle_operation_changed",
+                operation_id=operation.operation_id,
+                kind=operation.kind,
+                status=operation.status,
+                phase=operation.phase,
+                etag=operation.etag,
+                log_sequence_high_watermark=(
+                    operation.log_sequence_high_watermark
+                ),
+            )
+        )
+
     def _observe_ssh_prompt(
         self,
         profile_id: str,
@@ -1723,6 +2195,14 @@ class DesktopReleaseProviderV2:
         )
         if updated is not None:
             self._publish_profile(updated)
+            if observation.state == "pending":
+                self._lifecycle_executor.observe_progress(
+                    "waiting_for_user",
+                    local_v2.LifecycleProgressIndeterminateV2(
+                        kind="indeterminate"
+                    ),
+                    True,
+                )
 
     def _exact_core_version(
         self,

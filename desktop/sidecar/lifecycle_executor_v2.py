@@ -94,6 +94,10 @@ class LifecycleExecutionContextV2:
         return self._work.request
 
     @property
+    def idempotency_key(self) -> str:
+        return self._work.idempotency_key
+
+    @property
     def cancellation_event(self) -> threading.Event:
         return self._cancellation_event
 
@@ -124,6 +128,7 @@ class LifecycleExecutionContextV2:
             self._work = LifecycleOperationWorkV2(
                 operation=updated,
                 request=self._work.request,
+                idempotency_key=self._work.idempotency_key,
                 cancellation_requested=False,
             )
         self._publish(updated)
@@ -184,6 +189,7 @@ class LifecycleExecutionContextV2:
             self._work = LifecycleOperationWorkV2(
                 operation=updated,
                 request=latest.request,
+                idempotency_key=latest.idempotency_key,
                 cancellation_requested=latest.cancellation_requested,
             )
         self._publish(updated)
@@ -311,6 +317,34 @@ class DesktopLifecycleExecutorV2:
                 self._condition.notify_all()
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=self._close_timeout_seconds)
+
+    def observe_progress(
+        self,
+        phase: m.LifecyclePhaseV2,
+        progress: m.LifecycleProgressV2 | None,
+        cancellable: bool,
+    ) -> None:
+        """Route an owned bridge checkpoint to the active persisted operation."""
+
+        with self._condition:
+            context = self._active_context
+        if context is not None:
+            try:
+                context.checkpoint(phase, progress, cancellable=cancellable)
+            except (_LifecycleCancelled, _LifecycleExecutorStopping):
+                # Progress callbacks can run inside transport exception
+                # projection. The runner observes the durable interruption at
+                # its next explicit checkpoint without converting it to a
+                # transport failure.
+                return
+
+    def observe_output(self, source: LifecycleLogSourceV2, chunk: bytes) -> None:
+        """Route owned SSH/Daemon bytes to the active operation sanitizer."""
+
+        with self._condition:
+            context = self._active_context
+        if context is not None:
+            context.output_observer(source, chunk)
 
     def __enter__(self) -> DesktopLifecycleExecutorV2:
         self.start()

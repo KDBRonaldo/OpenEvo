@@ -302,6 +302,7 @@ class LifecycleOperationReservationV2(_StrictModel):
 class LifecycleOperationWorkV2(_StrictModel):
     operation: m.LifecycleOperationV2
     request: LifecycleRequestV2
+    idempotency_key: Annotated[str, Field(min_length=16, max_length=256)]
     cancellation_requested: bool
 
 
@@ -1050,6 +1051,7 @@ class DesktopProviderStoreV2:
             operation="getLifecycleOperationWorkV2",
         ) as connection:
             return self._lifecycle_work_from_row(
+                connection,
                 self._require_lifecycle_operation_row(connection, operation_id)
             )
 
@@ -1137,7 +1139,7 @@ class DesktopProviderStoreV2:
                     connection,
                     cast(str, typed_row["operation_id"]),
                 )
-            return self._lifecycle_work_from_row(cast(sqlite3.Row, row))
+            return self._lifecycle_work_from_row(connection, cast(sqlite3.Row, row))
 
     def advance_lifecycle_operation(
         self,
@@ -1539,7 +1541,10 @@ class DesktopProviderStoreV2:
                 raise ProviderCapacityConfigurationV2Error(
                     "persisted lifecycle operations exceed configured capacity"
                 )
-            return tuple(self._lifecycle_work_from_row(cast(sqlite3.Row, row)) for row in rows)
+            return tuple(
+                self._lifecycle_work_from_row(connection, cast(sqlite3.Row, row))
+                for row in rows
+            )
 
     def create_system_profile(
         self,
@@ -2250,6 +2255,17 @@ class DesktopProviderStoreV2:
 
         recovered: list[m.RemoteWorkspaceProfileV2] = []
         with self._transaction(write=True, operation="reconcileProcessRestartV2") as connection:
+            lifecycle_owned_profiles = {
+                cast(str, row[0])
+                for row in connection.execute(
+                    """
+                    SELECT resource_id
+                    FROM lifecycle_operations
+                    WHERE resource_kind = 'profile'
+                      AND status IN ('queued', 'running')
+                    """
+                ).fetchall()
+            }
             rows = connection.execute(
                 f"SELECT {_PROFILE_SELECT_COLUMNS} FROM profiles ORDER BY profile_id"
             ).fetchall()
@@ -2259,6 +2275,7 @@ class DesktopProviderStoreV2:
                 if (
                     not isinstance(current, m.RemoteWorkspaceProfileV2)
                     or current.connection_state == "disconnected"
+                    or current.profile_id in lifecycle_owned_profiles
                 ):
                     continue
                 current_version = cast(int, row["resource_version"])
@@ -3740,11 +3757,35 @@ class DesktopProviderStoreV2:
 
     def _lifecycle_work_from_row(
         self,
+        connection: sqlite3.Connection,
         row: sqlite3.Row,
     ) -> LifecycleOperationWorkV2:
+        idempotency = connection.execute(
+            """
+            SELECT CASE WHEN length(CAST(idempotency_key AS BLOB)) BETWEEN 16 AND 256
+                        THEN idempotency_key END AS idempotency_key,
+                   length(CAST(idempotency_key AS BLOB)) AS idempotency_key_bytes,
+                   request_sha256
+            FROM lifecycle_idempotency_records
+            WHERE principal = ? AND action = 'reserve'
+              AND resource_scope = 'lifecycle_operations' AND operation_id = ?
+            """,
+            (LOCAL_PRINCIPAL, row["operation_id"]),
+        ).fetchone()
+        if (
+            idempotency is None
+            or type(idempotency["idempotency_key_bytes"]) is not int
+            or not 16 <= idempotency["idempotency_key_bytes"] <= 256
+            or type(idempotency["idempotency_key"]) is not str
+            or len(idempotency["idempotency_key"].encode("utf-8"))
+            != idempotency["idempotency_key_bytes"]
+            or not hmac.compare_digest(idempotency["request_sha256"], row["request_sha256"])
+        ):
+            raise ProviderDataV2Error("lifecycle reservation replay authority is invalid")
         return LifecycleOperationWorkV2(
             operation=self._lifecycle_operation_from_row(row),
             request=self._lifecycle_request_from_row(row),
+            idempotency_key=idempotency["idempotency_key"],
             cancellation_requested=bool(row["cancellation_requested"]),
         )
 

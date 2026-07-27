@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 from threading import Event, Thread
+import time
 
 from fastapi.testclient import TestClient
 import pytest
@@ -277,6 +278,42 @@ def _create_profile(client: TestClient) -> dict[str, object]:
     return response.json()
 
 
+def _wait_lifecycle_operation(
+    client: TestClient,
+    operation: dict[str, object],
+    *,
+    timeout: float = 3.0,
+) -> dict[str, object]:
+    operation_id = str(operation["operation_id"])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        response = client.get(
+            f"/desktop/v2/operations/{operation_id}",
+            headers=_headers(),
+        )
+        assert response.status_code == 200, response.text
+        current = response.json()
+        if current["status"] in {"succeeded", "failed", "cancelled"}:
+            return current
+        time.sleep(0.01)
+    raise AssertionError("lifecycle operation did not become terminal")
+
+
+def _wait_store_lifecycle_operation(
+    store: DesktopProviderStoreV2,
+    operation_id: str,
+    *,
+    timeout: float = 3.0,
+) -> local_v2.LifecycleOperationV2:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        current = store.get_lifecycle_operation(operation_id)
+        if current.status in {"succeeded", "failed", "cancelled"}:
+            return current
+        time.sleep(0.01)
+    raise AssertionError("stored lifecycle operation did not become terminal")
+
+
 def _changed_key_review(profile_id: str, generation: int) -> PendingSystemHostKeyReview:
     return PendingSystemHostKeyReview(
         review_id="host-key-review-1",
@@ -535,6 +572,8 @@ def test_profile_connect_uses_literal_alias_and_exact_generation(
         assert response.status_code == 202, response.text
         operation = response.json()
         assert operation["kind"] == "profile_connect"
+        assert operation["status"] in {"queued", "running"}
+        operation = _wait_lifecycle_operation(client, operation)
         assert operation["status"] == "succeeded"
 
         connected = client.get(
@@ -605,8 +644,10 @@ def test_profile_connect_preserves_typed_daemon_bootstrap_failure(
             },
         )
 
-        assert response.status_code == 504, response.text
-        assert response.json() == {
+        assert response.status_code == 202, response.text
+        operation = _wait_lifecycle_operation(client, response.json())
+        assert operation["status"] == "failed"
+        assert operation["failure"] == {
             "schema_version": "2",
             "code": "daemon_bootstrap_timeout",
             "summary": "The OpenEvo Daemon operation exceeded its deadline.",
@@ -712,7 +753,8 @@ def test_profile_connect_retry_is_durable_and_does_not_repeat_ssh(tmp_path: Path
             json=body,
         )
         assert first.status_code == second.status_code == 202
-        assert first.content == second.content
+        assert first.json()["operation_id"] == second.json()["operation_id"]
+        assert _wait_lifecycle_operation(client, first.json())["status"] == "succeeded"
         assert lifecycle.calls == [("connect", "gpu-lab", 2)]
     finally:
         client.close()
@@ -744,6 +786,10 @@ def test_old_connect_replay_after_a_new_generation_never_reopens_ssh(
             json=connect_body,
         )
         assert connected_response.status_code == 202, connected_response.text
+        assert (
+            _wait_lifecycle_operation(client, connected_response.json())["status"]
+            == "succeeded"
+        )
         connected = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -762,6 +808,10 @@ def test_old_connect_replay_after_a_new_generation_never_reopens_ssh(
             },
         )
         assert disconnected_response.status_code == 202, disconnected_response.text
+        assert (
+            _wait_lifecycle_operation(client, disconnected_response.json())["status"]
+            == "succeeded"
+        )
         calls_before_replay = list(lifecycle.calls)
 
         stale_replay = client.post(
@@ -769,8 +819,11 @@ def test_old_connect_replay_after_a_new_generation_never_reopens_ssh(
             headers=connect_headers,
             json=connect_body,
         )
-        assert stale_replay.status_code == 412, stale_replay.text
-        assert stale_replay.json()["code"] == "profile_generation_changed"
+        assert stale_replay.status_code == 202, stale_replay.text
+        assert (
+            stale_replay.json()["operation_id"]
+            == connected_response.json()["operation_id"]
+        )
         assert lifecycle.calls == calls_before_replay
     finally:
         client.close()
@@ -822,6 +875,10 @@ def test_concurrent_exact_connect_retry_has_one_system_ssh_owner(
         lifecycle.connect_release.set()
         first.join(2)
         second.join(2)
+        assert len(results) == 2
+        operation_id = results[0].operation_id
+        assert results[1].operation_id == operation_id
+        assert _wait_store_lifecycle_operation(store, operation_id).status == "succeeded"
         provider.close()
         store.close()
 
@@ -910,8 +967,10 @@ def test_changed_system_host_key_is_reviewed_then_reconnected_exactly(
             ),
             json={"schema_version": "2", "expected_connection_generation": 1},
         )
-        assert failed.status_code == 409, failed.text
-        assert failed.json() == {
+        assert failed.status_code == 202, failed.text
+        failed_operation = _wait_lifecycle_operation(client, failed.json())
+        assert failed_operation["status"] == "failed"
+        assert failed_operation["failure"] == {
             "schema_version": "2",
             "code": "ssh_host_key_changed",
             "summary": "The configured server identity changed and requires review.",
@@ -953,8 +1012,8 @@ def test_changed_system_host_key_is_reviewed_then_reconnected_exactly(
             ),
             json={"schema_version": "2", "expected_connection_generation": 1},
         )
-        assert replay.status_code == 409
-        assert replay.content == failed.content
+        assert replay.status_code == 202
+        assert replay.json()["operation_id"] == failed_operation["operation_id"]
         assert lifecycle.calls == [("connect", "gpu-lab", 2)]
         assert connector.calls == []
 
@@ -976,6 +1035,7 @@ def test_changed_system_host_key_is_reviewed_then_reconnected_exactly(
             },
         )
         assert accepted.status_code == 202, accepted.text
+        assert _wait_lifecycle_operation(client, accepted.json())["status"] == "succeeded"
         connected = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1018,7 +1078,9 @@ def test_changed_system_host_key_rejection_is_terminal_and_exactly_replayable(
             ),
             json={"schema_version": "2", "expected_connection_generation": 1},
         )
-        assert blocked.status_code == 409
+        assert blocked.status_code == 202
+        blocked_operation = _wait_lifecycle_operation(client, blocked.json())
+        assert blocked_operation["status"] == "failed"
         pending = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1050,7 +1112,8 @@ def test_changed_system_host_key_rejection_is_terminal_and_exactly_replayable(
         )
 
         assert rejected.status_code == replay.status_code == 202
-        assert rejected.content == replay.content
+        assert rejected.json()["operation_id"] == replay.json()["operation_id"]
+        assert _wait_lifecycle_operation(client, rejected.json())["status"] == "succeeded"
         terminal = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1097,9 +1160,11 @@ def test_incompatible_daemon_fails_closed_and_exact_retry_never_reopens_ssh(
             json=body,
         )
 
-        assert failed.status_code == replay.status_code == 409
-        assert failed.content == replay.content
-        assert failed.json()["code"] == "core_release_incompatible"
+        assert failed.status_code == replay.status_code == 202
+        terminal = _wait_lifecycle_operation(client, failed.json())
+        assert terminal["status"] == "failed"
+        assert replay.json()["operation_id"] == terminal["operation_id"]
+        assert terminal["failure"]["code"] == "core_release_incompatible"
         current = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()

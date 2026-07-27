@@ -592,6 +592,16 @@ class SystemOpenSshRemoteLifecycleV2:
                 )
             self._prompt_observer = observer
 
+    def set_output_observer(self, observer: LifecycleRawOutputObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("system OpenSSH output observer is invalid")
+        with self._state:
+            if self._closed or self._active is not None or self._output_observer is not None:
+                raise RemoteConnectionFailedError(
+                    "The system SSH output observer cannot be changed."
+                )
+            self._output_observer = observer
+
     def connect(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
         self._validate_connect_profile(profile)
         with self._transition:

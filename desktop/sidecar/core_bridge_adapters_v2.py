@@ -328,6 +328,16 @@ class DesktopCoreSshBridgeAdapterV2:
     def __repr__(self) -> str:
         return "DesktopCoreSshBridgeAdapterV2(<private>)"
 
+    def set_progress_observer(self, observer: LifecycleProgressObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("Core SSH lifecycle progress observer is invalid")
+        with self._lock:
+            if self._progress_observer is observer:
+                return
+            if self._authority is not None or self._progress_observer is not None:
+                raise RuntimeError("Core SSH lifecycle progress observer cannot be changed")
+            self._progress_observer = observer
+
     def ensure_core(
         self,
         profile_id: str,

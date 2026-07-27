@@ -183,6 +183,7 @@ def test_executor_persists_progress_sanitized_logs_and_terminal_result(
     changed: list[tuple[str, str, int]] = []
 
     def run(context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        assert context.idempotency_key == "progress-project-create-0001"
         context.checkpoint(
             "transferring",
             m.LifecycleProgressBytesV2(kind="bytes", completed=5, total=10),
