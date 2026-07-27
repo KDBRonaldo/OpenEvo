@@ -19,6 +19,7 @@ import pytest
 
 from openevo import __version__
 from openevo.backend import launcher
+from openevo.backend import runtime_identity
 from openevo.backend import service
 from openevo.backend.contracts.v2.provider import RELEASE_DAEMON_FEATURE_FLAGS_V2
 from openevo.backend.contracts.v2.snapshots import (
@@ -53,6 +54,17 @@ RELEASE_B = CoreReleaseIdentity(
     registry_digest="e" * 64,
     framework_lock_sha256="f" * 64,
     source_commit=SOURCE_COMMIT,
+)
+PUBLISHED_V019_RELEASE = CoreReleaseIdentity(
+    digest="a7e838f5041c5fbd9414f156034791463fd1590caa183066281cf9d07d276298",
+    registry_digest="0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874",
+    framework_lock_sha256="c603f9951bf3234d3ee2b1e648650d162f289c9f724b8417452c0119f0ab2406",
+    source_commit="54650e477a76dd07b0a511ad5450c3b8ea615556",
+)
+PUBLISHED_V019_DAEMON = CoreDaemonBundleIdentity(
+    bundle_sha256="58787c1ff65b3659b2386659843820dc2cca752d99f44e4869cb4065606c0294",
+    canonical_manifest_sha256=("ec9a11829eadd298adcbf2c7d467b426a38ad62d5ce283d7068a0b78dfdc4287"),
+    lifecycle_compatibility=16,
 )
 DAEMON_A = CoreDaemonBundleIdentity(
     bundle_sha256="2" * 64,
@@ -134,6 +146,8 @@ DAEMON_V16 = CoreDaemonBundleIdentity(
     canonical_manifest_sha256="b" * 64,
     lifecycle_compatibility=16,
 )
+
+_REAL_AUTHENTICATED_STATUS_PROOF = service._authenticated_status_proof
 
 
 class FakeController:
@@ -1191,6 +1205,264 @@ def test_release_status_proof_requires_the_complete_production_v2_identity(
             require_production_v2=True,
         )
     assert exc_info.value.code is CoreServiceErrorCode.STATUS_INVALID
+
+
+def test_observation_accepts_exact_published_v019_daemon_predecessor(
+    tmp_path: Path,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    (root / "state").mkdir(mode=0o700)
+    generation = "3" * 32
+    port = 8765
+    bearer = "B" * 64
+    launcher_process = controller.capture(4000)
+    application_process = controller.capture(5000)
+    version = {
+        "api_name": "openevo-core-control-api",
+        "build_channel": "release",
+        "build_id": "4b42bb11dcd5b3aa66d9de112b101e3f248c6d4e722956f16588f1b288e0559c",
+        "contracts": [
+            {
+                "access": "mutation",
+                "api_major": 2,
+                "event_schema_sha256": (
+                    "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+                ),
+                "mutation_compatible": True,
+                "openapi_sha256": (
+                    "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+                ),
+                "schema_version": "2",
+            }
+        ],
+        "feature_flags": [
+            "atomic_successor_v2",
+            "event_replay_v2",
+            "project_genesis_v2",
+            "project_heads_v2",
+            "task_admission_v2",
+            "task_execution_v2",
+            "verified_capabilities",
+            "verified_registry",
+            "workspace_snapshots_v2",
+        ],
+        "feature_set_sha256": ("ba514a0165727757d147ab09d9ee934a0c0eab2411ec5e2244d49237146d3f56"),
+        "mutation_compatible": True,
+        "mutation_major": 2,
+        "preferred_major": 2,
+        "provider_kind": "openevo_daemon",
+        "registry_sha256": PUBLISHED_V019_RELEASE.registry_digest,
+        "release_version": "0.1.9",
+        "runtime_contract_sha256": (
+            "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+        ),
+        "schema_version": "2",
+        "source_commit": PUBLISHED_V019_RELEASE.source_commit,
+        "supported_majors": [2],
+    }
+    status = {
+        "checked_at": "2026-07-27T18:34:41.849413Z",
+        "registry_sha256": PUBLISHED_V019_RELEASE.registry_digest,
+        "release_version": "0.1.9",
+        "schema_version": "2",
+        "source_commit": PUBLISHED_V019_RELEASE.source_commit,
+        "status": "ready",
+    }
+
+    def fetch(_host: str, _port: int, path: str, **_kwargs: object) -> object:
+        return version if path == "/version" else status
+
+    monkeypatch.setattr(service, "_fetch_json", fetch)
+    status_proof = _REAL_AUTHENTICATED_STATUS_PROOF(
+        port=port,
+        bearer=bearer,
+        release=PUBLISHED_V019_RELEASE,
+        generation=generation,
+        deadline=time.monotonic() + 1,
+        require_production_v2=False,
+    )
+    ready = {
+        "schema_version": 2,
+        "generation": generation,
+        "release_identity": PUBLISHED_V019_RELEASE.digest,
+        "registry_digest": PUBLISHED_V019_RELEASE.registry_digest,
+        "status_proof": status_proof,
+        "bundle_sha256": PUBLISHED_V019_DAEMON.bundle_sha256,
+        "canonical_manifest_sha256": PUBLISHED_V019_DAEMON.canonical_manifest_sha256,
+        "lifecycle_compatibility": PUBLISHED_V019_DAEMON.lifecycle_compatibility,
+    }
+    ledger = {
+        "schema_version": 5,
+        "state": "running",
+        "release_identity": PUBLISHED_V019_RELEASE.digest,
+        "registry_digest": PUBLISHED_V019_RELEASE.registry_digest,
+        "framework_lock_sha256": PUBLISHED_V019_RELEASE.framework_lock_sha256,
+        "source_commit": PUBLISHED_V019_RELEASE.source_commit,
+        "pid": launcher_process.pid,
+        "boot_id": launcher_process.boot_id,
+        "start_time_ticks": launcher_process.start_time_ticks,
+        "application_pid": application_process.pid,
+        "application_boot_id": application_process.boot_id,
+        "application_start_time_ticks": application_process.start_time_ticks,
+        "port": port,
+        "generation": generation,
+        "ready_sha256": hashlib.sha256(service.canonical_json_bytes(ready)).hexdigest(),
+        "bundle_sha256": PUBLISHED_V019_DAEMON.bundle_sha256,
+        "canonical_manifest_sha256": PUBLISHED_V019_DAEMON.canonical_manifest_sha256,
+        "lifecycle_compatibility": PUBLISHED_V019_DAEMON.lifecycle_compatibility,
+    }
+    assert service._is_exact_published_v019_predecessor_ledger(ledger)
+    for field, drifted in (
+        ("release_identity", "0" * 64),
+        ("registry_digest", "0" * 64),
+        ("framework_lock_sha256", "0" * 64),
+        ("source_commit", "0" * 40),
+        ("bundle_sha256", "0" * 64),
+        ("canonical_manifest_sha256", "0" * 64),
+        ("lifecycle_compatibility", 15),
+    ):
+        changed_ledger = {**ledger, field: drifted}
+        assert not service._is_exact_published_v019_predecessor_ledger(changed_ledger)
+    assert service._is_v0110_published_v019_upgrade(
+        ledger,
+        release=RELEASE_A,
+        candidate=DAEMON_V16,
+    )
+    assert not service._is_v0110_published_v019_upgrade(
+        ledger,
+        release=PUBLISHED_V019_RELEASE,
+        candidate=DAEMON_V16,
+    )
+    assert not service._is_v0110_published_v019_upgrade(
+        ledger,
+        release=RELEASE_A,
+        candidate=PUBLISHED_V019_DAEMON,
+    )
+    assert not service._is_v0110_published_v019_upgrade(
+        ledger,
+        release=RELEASE_A,
+        candidate=DAEMON_V15,
+    )
+    floor = service._floor_from_ledger(ledger)
+    assert service._is_exact_published_v019_predecessor_floor(floor)
+    assert service._is_v0110_published_v019_upgrade(
+        floor,
+        release=RELEASE_A,
+        candidate=DAEMON_V16,
+    )
+    service._require_floor_compatibility(
+        floor,
+        DAEMON_V16,
+        allow_equal_replacement=True,
+    )
+    with pytest.raises(CoreServiceError) as floor_exc:
+        service._require_floor_compatibility(floor, DAEMON_V16)
+    assert floor_exc.value.code is CoreServiceErrorCode.UPDATE_REQUIRED
+
+    def seed_private_file(name: str, payload: bytes) -> None:
+        descriptor = os.open(root / name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            os.write(descriptor, payload)
+        finally:
+            os.close(descriptor)
+
+    seed_private_file("bearer-token", (bearer + "\n").encode("ascii"))
+    seed_private_file("ready.json", service.canonical_json_bytes(ready) + b"\n")
+    seed_private_file("service.json", service.canonical_json_bytes(ledger) + b"\n")
+
+    monkeypatch.setattr(
+        service,
+        "_authenticated_status_proof",
+        _REAL_AUTHENTICATED_STATUS_PROOF,
+    )
+    predecessor = service.observe_core_service_predecessor(
+        service_root=root,
+        process_controller=controller,
+    )
+
+    assert predecessor == CoreServicePredecessor.running(
+        generation=generation,
+        release_identity=PUBLISHED_V019_RELEASE.digest,
+        bundle_sha256=PUBLISHED_V019_DAEMON.bundle_sha256,
+        canonical_manifest_sha256=(PUBLISHED_V019_DAEMON.canonical_manifest_sha256),
+        lifecycle_compatibility=PUBLISHED_V019_DAEMON.lifecycle_compatibility,
+    )
+
+    with pytest.raises(CoreServiceError) as strict_exc:
+        _REAL_AUTHENTICATED_STATUS_PROOF(
+            port=port,
+            bearer=bearer,
+            release=PUBLISHED_V019_RELEASE,
+            generation=generation,
+            deadline=time.monotonic() + 1,
+            require_production_v2=True,
+        )
+    assert strict_exc.value.code is CoreServiceErrorCode.STATUS_INVALID
+
+    published_authority = service._ProductionV2DiscoveryAuthority.PUBLISHED_V019_PREDECESSOR
+    for field, drifted in (
+        ("release_version", "0.1.8"),
+        ("release_version", "0.1.11"),
+        ("build_id", "0" * 64),
+        ("runtime_contract_sha256", "0" * 64),
+    ):
+        original = version[field]
+        version[field] = drifted
+        try:
+            with pytest.raises(CoreServiceError) as drift_exc:
+                _REAL_AUTHENTICATED_STATUS_PROOF(
+                    port=port,
+                    bearer=bearer,
+                    release=PUBLISHED_V019_RELEASE,
+                    generation=generation,
+                    deadline=time.monotonic() + 1,
+                    require_production_v2=True,
+                    production_v2_authority=published_authority,
+                )
+            assert drift_exc.value.code is CoreServiceErrorCode.STATUS_INVALID
+        finally:
+            version[field] = original
+
+    def publish_noreplace(directory_fd: int, source: str, destination: str) -> None:
+        os.link(
+            source,
+            destination,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        os.unlink(source, dir_fd=directory_fd)
+
+    monkeypatch.setattr(runtime_identity, "_rename_noreplace", publish_noreplace)
+    monkeypatch.setattr(service, "_authenticated_status_proof", lambda **_kwargs: "9" * 64)
+    if not hasattr(os, "pipe2"):
+
+        def pipe2(_flags: int) -> tuple[int, int]:
+            read_descriptor, write_descriptor = os.pipe()
+            os.set_inheritable(read_descriptor, False)
+            os.set_inheritable(write_descriptor, False)
+            return read_descriptor, write_descriptor
+
+        monkeypatch.setattr(service.os, "pipe2", pipe2, raising=False)
+    replacement = ensure_core_service(
+        service_root=root,
+        framework_lock=tmp_path / "framework-lock.json",
+        source_commit=SOURCE_COMMIT,
+        port=port,
+        replace_mismatched=True,
+        expected_predecessor=predecessor,
+        daemon_bundle_identity=DAEMON_V16,
+        process_controller=controller,
+    )
+
+    assert replacement.release_identity == RELEASE_A.digest
+    assert replacement.generation != generation
+    assert replacement.bundle_sha256 == DAEMON_V16.bundle_sha256
+    assert replacement.lifecycle_compatibility == DAEMON_V16.lifecycle_compatibility
+    assert controller.terminated == [application_process, launcher_process]
 
 
 def test_release_launcher_ready_payload_binds_v2_contract_and_runtime() -> None:
