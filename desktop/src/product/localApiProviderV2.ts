@@ -10,7 +10,6 @@ import {
 } from "../api/v2/client";
 import {
   canonicalJsonV2,
-  compareUtcTimestampsV2,
   lifecycleOperationV2Schema,
   opaqueIdV2Schema,
   scienceProjectConfigV2Schema,
@@ -55,6 +54,12 @@ import {
   type MutationKindV2,
   type PendingMutationIntentV2,
 } from "./mutationIntentJournalV2";
+import {
+  CoreOperationControllerV2,
+  LifecycleOperationControllerV2,
+  isLifecycleTerminalV2,
+  type LifecycleOperationStateV2,
+} from "./lifecycleOperationsV2";
 
 const PAGE_LIMIT = 100;
 const MAX_COLLECTION_PAGES = 100;
@@ -93,6 +98,8 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private readonly reconnectDelaysMs: readonly number[];
   private readonly providerStreamInstance: string;
   private readonly mutationIntents: MutationIntentCoordinatorV2;
+  private readonly lifecycleOperations: LifecycleOperationControllerV2;
+  private readonly coreOperations: CoreOperationControllerV2;
   private readonly listeners = new Set<(signal: ProductSubscriptionSignalV2) => void>();
   private readonly replay = new DesktopEventReplayAuthorityV2();
   private refreshSequence = 0;
@@ -110,6 +117,8 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     this.featureFlags = Object.freeze([...options.featureFlags]);
     this.providerStreamInstance = opaqueIdV2Schema.parse(options.providerStreamInstance);
     this.mutationIntents = new MutationIntentCoordinatorV2(options.native);
+    this.lifecycleOperations = new LifecycleOperationControllerV2(options.client);
+    this.coreOperations = new CoreOperationControllerV2(options.client, () => this.activeCoreAuthorityV2());
     this.fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
     this.reconnectDelaysMs = options.reconnectDelaysMs ?? DEFAULT_RECONNECT_DELAYS_MS;
   }
@@ -119,17 +128,19 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     try {
       await this.mutationIntents.initialize();
       const loaded = await this.loadSnapshot();
+      await this.lifecycleOperations.synchronize(loaded.state.pending_operations);
       if (sequence !== this.refreshSequence) {
         return { status: "stale", stream: { status: "stale", epoch: this.epoch, reason: "refresh_pending" } };
       }
       this.epoch += 1;
-      const snapshot: DesktopProductSnapshotV2 = {
+      let snapshot: DesktopProductSnapshotV2 = {
         ...loaded,
-        activeOperation: this.activeOperation,
+        activeOperation: latestLifecycleOperationV2(this.lifecycleOperations.list())?.operation ?? this.activeOperation,
         stream: { status: "fresh", epoch: this.epoch, lastEventId: this.replay.lastEventId },
       };
       this.snapshot = snapshot;
-      await this.mutationIntents.reconcile(snapshot);
+      await this.reconcilePendingOperationsV2(snapshot);
+      snapshot = this.snapshot ?? snapshot;
       this.waitingForRefresh = false;
       this.ensureEventStream();
       return { status: "fresh", snapshot };
@@ -297,6 +308,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `profile:${profileId}`,
       request,
       authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      operationAuthority: "lifecycle",
       send: (actionId) => this.client.connectProfile(profileId, request, {
         resourceGeneration: profile.connection_generation,
         ifMatch: profile.etag,
@@ -320,6 +332,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `profile:${profileId}`,
       request,
       authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      operationAuthority: "lifecycle",
       send: (actionId) => this.client.disconnectProfile(profileId, request, {
         resourceGeneration: profile.connection_generation,
         ifMatch: profile.etag,
@@ -349,6 +362,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `profile:${profileId}`,
       request,
       authority: { resource_generation: profile.connection_generation, etag: profile.etag },
+      operationAuthority: "lifecycle",
       send: (actionId) => this.client.reviewProfileHostKey(profileId, request, {
         resourceGeneration: profile.connection_generation,
         ifMatch: profile.etag,
@@ -356,6 +370,69 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }),
     });
     return this.observeOperation(dispatched.value);
+  }
+
+  listLifecycleOperations(): readonly LifecycleOperationStateV2[] {
+    return this.lifecycleOperations.list();
+  }
+
+  async getLifecycleOperation(operationId: string): Promise<LifecycleOperationV2> {
+    return this.lifecycleOperations.refresh(opaqueIdV2Schema.parse(operationId));
+  }
+
+  async loadLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2> {
+    const id = opaqueIdV2Schema.parse(operationId);
+    if (this.lifecycleOperations.get(id) === null) await this.lifecycleOperations.refresh(id);
+    return this.lifecycleOperations.loadLogs(id);
+  }
+
+  async cancelLifecycleOperation(operationId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2> {
+    const snapshot = this.requireIntent(intent);
+    const id = opaqueIdV2Schema.parse(operationId);
+    const current = this.lifecycleOperations.get(id)?.operation ?? await this.lifecycleOperations.refresh(id);
+    const request = { schema_version: "2", expected_operation_id: id } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "lifecycle_cancel",
+      resourceScope: `lifecycle_operation:${id}`,
+      request,
+      authority: { resource_generation: 0, etag: current.etag },
+      send: (actionId) => this.lifecycleOperations.cancel(id, actionId),
+    });
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
+    return this.observeOperation(dispatched.value);
+  }
+
+  listMutationIntents(): readonly PendingMutationIntentV2[] {
+    return this.mutationIntents.list();
+  }
+
+  async resumeMutationIntent(actionId: string): Promise<void> {
+    const action = actionIdV2(actionId);
+    const entry = this.mutationIntents.list().find((candidate) => candidate.action_id === action);
+    if (entry === undefined) return;
+    if (entry.accepted_operation_id === null) {
+      throw new MutationIntentConflictV2(
+        "Return to the original action to retry this exact unresolved mutation",
+        entry,
+      );
+    }
+    if (isDesktopLifecycleMutationV2(entry.mutation_kind)) {
+      const operation = await this.lifecycleOperations.refresh(entry.accepted_operation_id);
+      if (!isLifecycleTerminalV2(operation)) {
+        await this.lifecycleOperations.pollUntilTerminal(operation.operation_id);
+      }
+    } else {
+      const operation = await this.coreOperations.refresh(entry.accepted_operation_id);
+      if (!isCoreOperationTerminalV2(operation)) {
+        await this.coreOperations.pollUntilTerminal(operation.operation_id);
+      }
+    }
+    const refreshed = await this.refresh();
+    if (refreshed.status !== "fresh") {
+      throw new DesktopContractErrorV2("Mutation reconciliation could not refresh authoritative Desktop state");
+    }
   }
 
   async selectNativeWorkspace(intent: NativeWorkspaceSelectionIntentV2): Promise<NativeWorkspaceSourceV2> {
@@ -382,6 +459,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       authority: { resource_generation: profile.connection_generation, etag: profile.etag },
       chainStep: "native_workspace_prepare",
       includeStreamAuthority: false,
+      operationAuthority: "lifecycle",
       send: async (actionId) => lifecycleOperationV2Schema.parse(await this.native.selectProjectSource({
         ...intent,
         actionId,
@@ -395,10 +473,12 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const terminal = await this.waitForLifecycleTerminal(this.observeOperation(operation));
     if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "native_workspace") {
       await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
+      await this.acknowledgeLifecycleTerminalV2(terminal);
       throw lifecycleTerminalError(terminal, "Native workspace preparation did not succeed");
     }
     await this.mutationIntents.markTerminalObserved(dispatched.entry.action_id, terminal.operation_id);
     await this.mutationIntents.advanceNativeProjectChain(dispatched.entry.action_id, terminal.operation_id);
+    await this.acknowledgeLifecycleTerminalV2(terminal);
     return { kind: "native_folder_snapshot", display_name: terminal.result.display_name };
   }
 
@@ -427,6 +507,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       authority: { resource_generation: profile.connection_generation, etag: profile.etag },
       chainStep: nativeProjectChain ? "project_create" : "single",
       includeStreamAuthority: !nativeProjectChain,
+      operationAuthority: "lifecycle",
       send: (actionId) => this.client.createProject(request, {
         resourceGeneration: profile.connection_generation,
         idempotencyKey: actionId,
@@ -436,6 +517,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     const terminal = await this.waitForLifecycleTerminal(operation);
     if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "project") {
       await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
+      await this.acknowledgeLifecycleTerminalV2(terminal);
       throw lifecycleTerminalError(terminal, "Remote project creation did not succeed");
     }
     const projectId = terminal.result.project_id;
@@ -446,6 +528,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     }
     if (nativeProjectChain) await this.native.settleProjectSource(dispatched.entry.action_id, "adopt");
     await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
+    await this.acknowledgeLifecycleTerminalV2(terminal);
     this.invalidate();
     return project;
   }
@@ -500,6 +583,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `project:${projectId}`,
       request,
       authority: { resource_generation: head.generation, etag: project.etag },
+      operationAuthority: "lifecycle",
       send: (actionId) => this.client.activateProject(projectId, request, {
         resourceGeneration: head.generation,
         ifMatch: project.etag,
@@ -604,6 +688,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `task:${taskId}`,
       request,
       authority: mutation,
+      operationAuthority: "core",
       send: (actionId) => this.client.cancelTask(taskId, request, {
         resourceGeneration: mutation.resource_generation,
         ifMatch: mutation.etag,
@@ -631,6 +716,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         idempotencyKey: actionId,
       }),
     });
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
     return this.observeOperation(dispatched.value);
   }
 
@@ -658,6 +744,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `transition:${transitionId}`,
       request,
       authority,
+      operationAuthority: "core",
       send: (actionId) => this.client.retryTransition(transitionId, request, {
         resourceGeneration: authority.resource_generation,
         ifMatch: authority.etag,
@@ -688,6 +775,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         idempotencyKey: actionId,
       }),
     });
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
     return this.observeOperation(dispatched.value);
   }
 
@@ -703,6 +791,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `transition:${transitionId}`,
       request,
       authority,
+      operationAuthority: "core",
       send: (actionId) => this.client.abandonTransition(transitionId, request, {
         resourceGeneration: authority.resource_generation,
         ifMatch: authority.etag,
@@ -738,9 +827,63 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope: `service:${serviceId}`,
       request,
       authority: { resource_generation: profile.connection_generation, etag: service.etag },
+      operationAuthority: "core",
       send: (actionId) => this.client.restartService(serviceId, request, {
         resourceGeneration: profile.connection_generation,
         ifMatch: service.etag,
+        idempotencyKey: actionId,
+      }),
+    });
+    return this.observeOperation(dispatched.value);
+  }
+
+  async getCoreOperation(operationId: string): Promise<OperationV2> {
+    return this.coreOperations.refresh(opaqueIdV2Schema.parse(operationId));
+  }
+
+  async cancelCoreOperation(operationId: string, intent: ProductMutationIntentV2): Promise<OperationV2> {
+    const snapshot = this.requireIntent(intent);
+    const id = opaqueIdV2Schema.parse(operationId);
+    const current = this.coreOperations.get(id) ?? await this.coreOperations.refresh(id);
+    const authority = this.activeCoreAuthorityV2();
+    if (authority === null) throw new DesktopContractErrorV2("Core cancellation requires an active project tunnel");
+    const request = { schema_version: "2", expected_operation_id: id } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "core_operation_cancel",
+      resourceScope: `core_operation:${id}`,
+      request,
+      authority: { resource_generation: authority.resourceGeneration, etag: current.etag },
+      send: (actionId) => this.coreOperations.cancel(id, actionId),
+    });
+    await this.completeDirectMutationV2(dispatched.entry, dispatched.value);
+    return this.observeOperation(dispatched.value);
+  }
+
+  async loadServiceLogs(serviceId: string, options?: ListRequestOptionsV2) {
+    const id = opaqueIdV2Schema.parse(serviceId);
+    if (!this.requireSnapshot().services.some((service) => service.service_id === id)) {
+      throw new DesktopContractErrorV2("Service logs reference an unknown active service");
+    }
+    return this.client.serviceLogs(id, options);
+  }
+
+  async cleanupCaches(intent: ProductMutationIntentV2): Promise<OperationV2> {
+    const snapshot = this.requireIntent(intent);
+    const authority = this.activeCoreAuthorityV2();
+    if (authority === null) throw new DesktopContractErrorV2("Cache cleanup requires an active project tunnel");
+    const request = { schema_version: "2", scope: "safe_unreferenced" } as const;
+    const dispatched = await this.dispatchMutationV2({
+      snapshot,
+      intent,
+      mutationKind: "cache_cleanup",
+      resourceScope: `maintenance:${snapshot.state.active_project_id ?? "none"}`,
+      request,
+      authority: { resource_generation: authority.resourceGeneration, etag: null },
+      operationAuthority: "core",
+      send: (actionId) => this.client.cleanupCaches(request, {
+        resourceGeneration: authority.resourceGeneration,
         idempotencyKey: actionId,
       }),
     });
@@ -900,6 +1043,150 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return { transition, project };
   }
 
+  private activeCoreAuthorityV2(): { readonly key: string; readonly resourceGeneration: number } | null {
+    const snapshot = this.snapshot;
+    if (snapshot === null || snapshot.state.active_profile_id === null || snapshot.state.active_project_id === null) {
+      return null;
+    }
+    const profile = snapshot.profiles.find((candidate) => candidate.profile_id === snapshot.state.active_profile_id);
+    const project = snapshot.projects.find((candidate) => candidate.project_id === snapshot.state.active_project_id);
+    if (profile?.profile_kind !== "system_openssh" || profile.connection_state !== "connected" || project === undefined) {
+      return null;
+    }
+    const head = project.active_project_head;
+    return {
+      key: canonicalJsonV2({
+        profile_id: profile.profile_id,
+        connection_generation: profile.connection_generation,
+        project_id: project.project_id,
+        project_head_id: head?.project_head_id ?? null,
+        project_head_manifest_sha256: head?.manifest_sha256 ?? null,
+      }),
+      resourceGeneration: profile.connection_generation,
+    };
+  }
+
+  private async reconcilePendingOperationsV2(snapshot: DesktopProductSnapshotV2): Promise<void> {
+    const entries = [...this.mutationIntents.list()];
+    const acknowledged = new Set<string>();
+    for (const entry of entries) {
+      if (entry.accepted_operation_id === null) {
+        await this.reconcileReservedCancellationV2(entry);
+        continue;
+      }
+      if (isDesktopLifecycleMutationV2(entry.mutation_kind)) {
+        const operation = this.lifecycleOperations.get(entry.accepted_operation_id)?.operation
+          ?? await this.lifecycleOperations.refresh(entry.accepted_operation_id);
+        if (isLifecycleTerminalV2(operation)) {
+          await this.reconcileLifecycleTerminalV2(entry, operation, snapshot);
+          acknowledged.add(operation.operation_id);
+        }
+      } else if (isCoreOperationMutationV2(entry.mutation_kind)) {
+        const operation = this.coreOperations.get(entry.accepted_operation_id)
+          ?? await this.coreOperations.refresh(entry.accepted_operation_id);
+        if (isCoreOperationTerminalV2(operation)) {
+          if (entry.state === "accepted") {
+            await this.mutationIntents.markTerminalObserved(entry.action_id, operation.operation_id);
+          }
+          await this.mutationIntents.clearTerminalObserved(entry.action_id, operation.operation_id);
+        }
+      }
+    }
+
+    const retained = this.mutationIntents.list();
+    const currentOperationIds = new Set(retained.flatMap((entry) => [
+      ...(entry.accepted_operation_id === null ? [] : [entry.accepted_operation_id]),
+      ...entry.completed_operation_ids,
+    ]));
+    for (const state of this.lifecycleOperations.list()) {
+      if (!isLifecycleTerminalV2(state.operation)) continue;
+      if (acknowledged.has(state.operation.operation_id)) continue;
+      if (!currentOperationIds.has(state.operation.operation_id)) {
+        await this.validateLifecycleResultV2(state.operation, snapshot);
+      }
+      await this.acknowledgeLifecycleTerminalV2(state.operation);
+    }
+  }
+
+  private async reconcileReservedCancellationV2(entry: PendingMutationIntentV2): Promise<void> {
+    if (entry.state !== "reserved") return;
+    if (entry.mutation_kind === "lifecycle_cancel" && entry.resource_scope.startsWith("lifecycle_operation:")) {
+      const operationId = opaqueIdV2Schema.parse(entry.resource_scope.slice("lifecycle_operation:".length));
+      const operation = this.lifecycleOperations.get(operationId)?.operation
+        ?? await this.lifecycleOperations.refresh(operationId);
+      if (isLifecycleTerminalV2(operation)) {
+        await this.completeDirectMutationV2(entry, operation);
+      }
+    }
+    if (entry.mutation_kind === "core_operation_cancel" && entry.resource_scope.startsWith("core_operation:")) {
+      const operationId = opaqueIdV2Schema.parse(entry.resource_scope.slice("core_operation:".length));
+      const operation = this.coreOperations.get(operationId) ?? await this.coreOperations.refresh(operationId);
+      if (isCoreOperationTerminalV2(operation)) {
+        await this.completeDirectMutationV2(entry, operation);
+      }
+    }
+  }
+
+  private async reconcileLifecycleTerminalV2(
+    entry: PendingMutationIntentV2,
+    operation: LifecycleOperationV2,
+    snapshot: DesktopProductSnapshotV2,
+  ): Promise<void> {
+    await this.validateLifecycleResultV2(operation, snapshot);
+    if (entry.state === "accepted") {
+      await this.mutationIntents.markTerminalObserved(entry.action_id, operation.operation_id);
+    }
+    if (entry.mutation_kind === "project_create"
+      && entry.chain_step === "native_workspace_prepare"
+      && operation.status === "succeeded") {
+      await this.mutationIntents.advanceNativeProjectChain(entry.action_id, operation.operation_id);
+    } else {
+      await this.mutationIntents.clearTerminalObserved(entry.action_id, operation.operation_id);
+    }
+    await this.acknowledgeLifecycleTerminalV2(operation);
+  }
+
+  private async validateLifecycleResultV2(
+    operation: LifecycleOperationV2,
+    snapshot: DesktopProductSnapshotV2,
+  ): Promise<void> {
+    if (operation.status !== "succeeded") return;
+    const result = operation.result;
+    if (result === null) throw new DesktopContractErrorV2("Succeeded lifecycle operation has no result authority");
+    if (result.result_kind === "profile") {
+      const profile = await this.client.getProfile(result.profile_id);
+      if (profile.profile_kind !== "system_openssh"
+        || profile.connection_generation !== result.connection_generation) {
+        throw new DesktopContractErrorV2("Lifecycle profile result is absent from authoritative refresh");
+      }
+      return;
+    }
+    if (result.result_kind === "project") {
+      const project = await this.client.getProject(result.project_id);
+      if (project.project_id !== result.project_id
+        || (operation.kind === "project_activate" && snapshot.state.active_project_id !== result.project_id)) {
+        throw new DesktopContractErrorV2("Lifecycle project result is absent from authoritative refresh");
+      }
+    }
+  }
+
+  private async acknowledgeLifecycleTerminalV2(operation: LifecycleOperationV2): Promise<void> {
+    if (!isLifecycleTerminalV2(operation)) return;
+    try {
+      await this.client.acknowledgeLifecycleOperation(operation.operation_id, {
+        schema_version: "2",
+        expected_operation_id: operation.operation_id,
+        expected_terminal_status: operation.status,
+      }, {
+        resourceGeneration: 0,
+        ifMatch: operation.etag,
+        idempotencyKey: `lifecycle-ack-${operation.operation_id}`,
+      });
+    } catch (error) {
+      if (isDeterministicMutationRejectionV2(error)) throw error;
+    }
+  }
+
   private async dispatchMutationV2<T>(input: {
     readonly snapshot: DesktopProductSnapshotV2;
     readonly intent: ProductMutationIntentV2;
@@ -909,6 +1196,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     readonly authority: Readonly<Record<string, unknown>>;
     readonly chainStep?: MutationChainStepV2;
     readonly includeStreamAuthority?: boolean;
+    readonly operationAuthority?: "lifecycle" | "core";
     readonly send: (actionId: string) => Promise<T>;
   }): Promise<{ readonly entry: PendingMutationIntentV2; readonly value: T }> {
     const stream = input.snapshot.stream;
@@ -935,8 +1223,13 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     }
     try {
       const value = await input.send(entry.action_id);
-      const operationId = operationIdOfV2(value);
-      if (operationId !== null) await this.mutationIntents.bindAcceptedOperation(entry.action_id, operationId);
+      if (input.operationAuthority !== undefined) {
+        const operationId = operationIdOfV2(value);
+        if (operationId === null) {
+          throw new DesktopContractErrorV2(`${input.operationAuthority} mutation did not return operation authority`);
+        }
+        await this.mutationIntents.bindAcceptedOperation(entry.action_id, operationId);
+      }
       return { entry, value };
     } catch (error) {
       if (isDeterministicMutationRejectionV2(error)) {
@@ -965,20 +1258,16 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   }
 
   private observeOperation<T extends LocalOperationV2 | LifecycleOperationV2 | OperationV2>(operation: T): T {
+    if ("phase" in operation) this.lifecycleOperations.observe(operation as LifecycleOperationV2);
+    if ("progress_completed" in operation) this.coreOperations.observe(operation as OperationV2);
     this.activeOperation = operation;
     this.invalidate();
     return operation;
   }
 
   private async waitForLifecycleTerminal(initial: LifecycleOperationV2): Promise<LifecycleOperationV2> {
-    let current = initial;
-    while (!isLifecycleTerminal(current)) {
-      await delayV2(250);
-      const next = await this.client.getLifecycleOperation(current.operation_id);
-      assertLifecycleObservationDoesNotRegress(current, next);
-      current = this.observeOperation(next);
-    }
-    return current;
+    this.lifecycleOperations.observe(initial);
+    return this.lifecycleOperations.pollUntilTerminal(initial.operation_id);
   }
 
   private invalidate(): void {
@@ -1077,6 +1366,11 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
               try {
                 const observation = this.replay.observe(parsed.envelope);
                 if (observation.kind === "accepted") {
+                  if (observation.event.payload.payload_kind === "lifecycle_operation_changed") {
+                    const operation = await this.lifecycleOperations.refresh(observation.event.payload.operation_id);
+                    await this.lifecycleOperations.loadLogs(operation.operation_id);
+                    this.activeOperation = operation;
+                  }
                   this.waitingForRefresh = true;
                   this.emit({ kind: "snapshot_changed" });
                   controller.abort();
@@ -1187,12 +1481,6 @@ function requireProjectHead(project: ProjectV2) {
   return project.active_project_head;
 }
 
-function isLifecycleTerminal(operation: LifecycleOperationV2): boolean {
-  return operation.status === "succeeded"
-    || operation.status === "failed"
-    || operation.status === "cancelled";
-}
-
 function operationIdOfV2(value: unknown): string | null {
   if (typeof value !== "object" || value === null || !("operation_id" in value)) return null;
   const operationId = (value as { readonly operation_id?: unknown }).operation_id;
@@ -1208,41 +1496,36 @@ function lifecycleTerminalError(operation: LifecycleOperationV2, fallback: strin
   return new DesktopContractErrorV2(operation.failure?.summary ?? fallback);
 }
 
-function assertLifecycleObservationDoesNotRegress(
-  previous: LifecycleOperationV2,
-  next: LifecycleOperationV2,
-): void {
-  if (next.operation_id !== previous.operation_id
-    || next.kind !== previous.kind
-    || JSON.stringify(next.resource) !== JSON.stringify(previous.resource)
-    || next.request_sha256 !== previous.request_sha256
-    || next.created_at !== previous.created_at) {
-    throw new DesktopContractErrorV2("Lifecycle operation identity changed while being observed");
-  }
-  if (isLifecycleTerminal(previous) && JSON.stringify(next) !== JSON.stringify(previous)) {
-    throw new DesktopContractErrorV2("Terminal lifecycle operation changed");
-  }
-  if (next.phase_index < previous.phase_index
-    || next.log_sequence_high_watermark < previous.log_sequence_high_watermark
-    || compareUtcTimestampsV2(next.updated_at, previous.updated_at) < 0) {
-    throw new DesktopContractErrorV2("Lifecycle operation progress regressed");
-  }
-  if (previous.status === "running" && next.status === "queued") {
-    throw new DesktopContractErrorV2("Lifecycle operation status regressed");
-  }
-  if (previous.progress?.kind === next.progress?.kind
-    && previous.progress !== null
-    && next.progress !== null
-    && previous.progress.kind !== "indeterminate"
-    && next.progress.kind !== "indeterminate"
-    && (next.progress.total !== previous.progress.total
-      || next.progress.completed < previous.progress.completed)) {
-    throw new DesktopContractErrorV2("Lifecycle operation measurable progress regressed");
-  }
+function latestLifecycleOperationV2(
+  states: readonly LifecycleOperationStateV2[],
+): LifecycleOperationStateV2 | null {
+  return states.at(-1) ?? null;
 }
 
-function delayV2(milliseconds: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+function isDesktopLifecycleMutationV2(kind: MutationKindV2): boolean {
+  return [
+    "profile_connect",
+    "profile_disconnect",
+    "host_key_review",
+    "project_create",
+    "project_activate",
+  ].includes(kind);
+}
+
+function isCoreOperationMutationV2(kind: MutationKindV2): boolean {
+  return [
+    "task_cancel",
+    "transition_retry",
+    "transition_abandon",
+    "service_restart",
+    "cache_cleanup",
+  ].includes(kind);
+}
+
+function isCoreOperationTerminalV2(operation: OperationV2): boolean {
+  return operation.status === "succeeded"
+    || operation.status === "failed"
+    || operation.status === "cancelled";
 }
 
 function actionIdV2(value: string): string {

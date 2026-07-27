@@ -163,10 +163,14 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     taskTimeline: vi.fn(),
     taskArtifacts: vi.fn(),
     getTransition: vi.fn(),
+    getProfile: vi.fn(),
+    getProject: vi.fn(),
     createProfile: vi.fn(),
     createProject: vi.fn(),
     connectProfile: vi.fn(),
     getLifecycleOperation: vi.fn(),
+    lifecycleOperationLogs: vi.fn(),
+    acknowledgeLifecycleOperation: vi.fn(),
     eventStreamRequest: vi.fn(),
   } as unknown as DesktopApiClientV2;
   return client;
@@ -201,9 +205,10 @@ describe("Desktop v2 product provider", () => {
     const coordinatedMethods = [
       "rescanSshHosts", "createProfile", "renameProfile", "deleteProfile", "rebindProfile",
       "connectProfile", "disconnectProfile", "reviewHostKey", "selectNativeWorkspace",
+      "cancelLifecycleOperation",
       "createProject", "updateProject", "activateProject", "validateProject", "submitTask",
       "cancelTask", "retryTask", "retryTransition", "replaceTransition", "abandonTransition",
-      "restartService", "createDiagnostic",
+      "restartService", "cancelCoreOperation", "cleanupCaches", "createDiagnostic",
     ] as const;
     for (const method of coordinatedMethods) {
       const start = source.indexOf(`  async ${method}(`);
@@ -592,5 +597,93 @@ describe("Desktop v2 product provider", () => {
     }));
     expect(native.settleProjectSource).toHaveBeenCalledWith(actionId, "adopt");
     expect(native.journalValue()).toBeNull();
+  });
+
+  it("recovers a terminal lifecycle operation, clears native intent first, and acknowledges once", async () => {
+    const disconnected = profile();
+    const connected = profile({
+      connection_generation: 5,
+      connection_state: "connected",
+      etag: `"${"d".repeat(64)}"`,
+      updated_at: "2026-07-23T06:00:01Z",
+    });
+    const running = lifecycleOperation();
+    const terminal = {
+      ...running,
+      status: "succeeded" as const,
+      phase: "finalizing" as const,
+      phase_index: 16,
+      progress: null,
+      cancellable: false,
+      result: {
+        result_kind: "profile" as const,
+        profile_id: connected.profile_id,
+        connection_generation: connected.connection_generation,
+      },
+      updated_at: "2026-07-23T06:00:01Z",
+      finished_at: "2026-07-23T06:00:01Z",
+      etag: `"${"e".repeat(64)}"`,
+    };
+    const native = nativeFixture();
+    const client = clientFixture([disconnected]);
+    vi.mocked(client.connectProfile).mockResolvedValue(running);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const first = await provider.refresh();
+    if (first.status !== "fresh") throw new Error("fixture refresh failed");
+    await provider.connectProfile(disconnected.profile_id, {
+      actionId: "connect-profile-recovery-0001",
+      streamEpoch: first.snapshot.stream.epoch,
+    });
+
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([connected]),
+      pending_operations: [{
+        schema_version: "2",
+        operation_id: terminal.operation_id,
+        kind: terminal.kind,
+        resource: terminal.resource,
+        request_sha256: terminal.request_sha256,
+        status: terminal.status,
+        phase: terminal.phase,
+        phase_index: terminal.phase_index,
+        phase_total: terminal.phase_total,
+        log_sequence_high_watermark: terminal.log_sequence_high_watermark,
+        updated_at: terminal.updated_at,
+        etag: terminal.etag,
+      }],
+      updated_at: terminal.updated_at,
+    });
+    vi.mocked(client.listProfiles).mockResolvedValue({
+      schema_version: "2",
+      items: [connected],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.getLifecycleOperation).mockResolvedValue(terminal);
+    vi.mocked(client.lifecycleOperationLogs).mockResolvedValue({
+      schema_version: "2",
+      operation_id: terminal.operation_id,
+      dropped_before_sequence: 0,
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.getProfile).mockResolvedValue(connected);
+    vi.mocked(client.acknowledgeLifecycleOperation).mockImplementation(async () => {
+      native.callOrder.push("acknowledge");
+    });
+
+    const recovered = await provider.refresh();
+
+    expect(recovered.status).toBe("fresh");
+    expect(native.journalValue()).toBeNull();
+    expect(client.acknowledgeLifecycleOperation).toHaveBeenCalledTimes(1);
+    const lastCas = native.callOrder.lastIndexOf("journal-cas");
+    expect(lastCas).toBeLessThan(native.callOrder.indexOf("acknowledge"));
   });
 });

@@ -30,6 +30,7 @@ const MUTATION_KINDS: &[&str] = &[
     "project_update",
     "project_activate",
     "project_validate",
+    "lifecycle_cancel",
     "task_submit",
     "task_cancel",
     "task_retry",
@@ -37,6 +38,7 @@ const MUTATION_KINDS: &[&str] = &[
     "transition_replace",
     "transition_abandon",
     "service_restart",
+    "core_operation_cancel",
     "diagnostic_create",
     "cache_cleanup",
 ];

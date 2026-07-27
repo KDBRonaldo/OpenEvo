@@ -41,6 +41,7 @@ export const mutationKindV2Schema = z.enum([
   "project_update",
   "project_activate",
   "project_validate",
+  "lifecycle_cancel",
   "task_submit",
   "task_cancel",
   "task_retry",
@@ -48,6 +49,7 @@ export const mutationKindV2Schema = z.enum([
   "transition_replace",
   "transition_abandon",
   "service_restart",
+  "core_operation_cancel",
   "diagnostic_create",
   "cache_cleanup",
 ]);
