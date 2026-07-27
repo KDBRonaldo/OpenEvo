@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import re
+import tomllib
 from pathlib import Path
+import re
 
 
 def test_release_workflows_pin_the_uv_toolchain() -> None:
@@ -51,7 +52,7 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     macos_job, benchmark_job = remaining_jobs.split("  terminal-bench-tests:", maxsplit=1)
     assert "python -m pip install -e ." in python_job
     assert "python -m pip install -e benchmarks/terminal_bench" not in python_job
-    assert "python -m pip install pytest pytest-asyncio ruff build twine wheel" in python_job
+    assert "python -m pip install pytest pytest-asyncio ruff==0.15.12 build twine wheel" in python_job
     assert "ruff check src tests scripts" in python_job
     assert "benchmarks/terminal_bench/tests" not in python_job
     assert "smoke_terminal_bench_package.py" not in python_job
@@ -123,10 +124,20 @@ def test_openevo_python_workflow_runs_focused_regressions() -> None:
     assert "needs:" not in benchmark_job
     assert "python -m pip install -e ." in benchmark_job
     assert "python -m pip install -e benchmarks/terminal_bench" in benchmark_job
+    assert "python -m pip install pytest ruff==0.15.12 build" in benchmark_job
     assert "ruff check benchmarks/terminal_bench" in benchmark_job
     assert "benchmarks/terminal_bench/tests" in benchmark_job
     assert "smoke_terminal_bench_package.py" in benchmark_job
     assert "-q" in text
+
+
+def test_terminal_bench_requires_the_exact_current_core_release() -> None:
+    root = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
+    benchmark = tomllib.loads(
+        Path("benchmarks/terminal_bench/pyproject.toml").read_text(encoding="utf-8")
+    )
+
+    assert f"openevo=={root['project']['version']}" in benchmark["project"]["dependencies"]
 
 
 def test_runtime_docker_candidate_gate_requires_real_docker_and_probe_image() -> None:

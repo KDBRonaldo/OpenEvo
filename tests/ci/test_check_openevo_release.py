@@ -4300,6 +4300,7 @@ def _desktop_state_payload() -> dict[str, object]:
         "profiles": [],
         "active_profile_id": None,
         "active_project_id": None,
+        "pending_operations": [],
         "last_event_id": None,
         "updated_at": "2026-07-15T00:00:00Z",
     }
