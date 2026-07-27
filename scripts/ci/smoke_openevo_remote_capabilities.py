@@ -106,7 +106,7 @@ def smoke(
         )
         execution_mode = "codex_subscription_transcript"
         payload = sidecar_smoke._read_json(
-            f"{base_url}/v1/capabilities?execution_mode={execution_mode}",
+            f"{base_url}/v2/capabilities?execution_mode={execution_mode}",
             headers=headers,
         )
         sidecar_smoke._assert_capabilities(

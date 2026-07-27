@@ -2389,7 +2389,11 @@ def test_remote_capability_smoke_cleanup_is_bound_to_attachment_generation(
             assert timeout_seconds == 1.0
 
         @staticmethod
-        def _read_json(_url: str, *, headers: dict[str, str]) -> dict[str, str]:
+        def _read_json(url: str, *, headers: dict[str, str]) -> dict[str, str]:
+            assert url == (
+                "http://127.0.0.1:43117/v2/capabilities"
+                "?execution_mode=codex_subscription_transcript"
+            )
             assert headers == {"Authorization": "Bearer secret"}
             return {"registry_digest": "d" * 64}
 
