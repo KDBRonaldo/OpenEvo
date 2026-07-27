@@ -387,6 +387,7 @@ def _smoke_project_reservation() -> LifecycleOperationReservationV2:
         request=LifecycleProjectCreateRequestV2(
             request_kind="project_create",
             project_id=SMOKE_PROJECT_ID,
+            action_id="desktop-smoke-project-action-0001",
             request=request,
             resource_generation=1,
         ),

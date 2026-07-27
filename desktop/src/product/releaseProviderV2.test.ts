@@ -15,7 +15,7 @@ import {
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-const OPENAPI = "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a";
+const OPENAPI = "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760";
 const EVENTS = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
 const FEATURE_DIGEST = "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 

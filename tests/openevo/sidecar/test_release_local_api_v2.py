@@ -380,6 +380,16 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
         operation_id = started.json()["operation_id"]
         assert lifecycle.connect_started.wait(2)
 
+        by_action = client.get(
+            "/desktop/v2/operations/by-action",
+            params={
+                "action_id": "observable-connect-profile-key-1",
+                "kind": "profile_connect",
+            },
+            headers=_headers(),
+        )
+        assert by_action.status_code == 200, by_action.text
+        assert by_action.json()["operation_id"] == operation_id
         assert client.get(f"/desktop/v2/operations/{operation_id}").status_code == 401
         running = client.get(f"/desktop/v2/operations/{operation_id}", headers=_headers())
         assert running.status_code == 200, running.text
@@ -430,6 +440,13 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
             "daemon starting",
             "daemon ready",
         ]
+        incremental = client.get(
+            f"/desktop/v2/operations/{operation_id}/logs",
+            params={"after_sequence": 3, "limit": 100},
+            headers=_headers(),
+        )
+        assert incremental.status_code == 200, incremental.text
+        assert [item["sequence"] for item in incremental.json()["items"]] == [4]
         expired = client.get(
             f"/desktop/v2/operations/{operation_id}/logs",
             params={"after": old_cursor},

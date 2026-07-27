@@ -8,7 +8,7 @@ import {
 } from "../api/v2/schemas";
 import type {
   DesktopApiClientV2,
-  ListRequestOptionsV2,
+  LifecycleLogRequestOptionsV2,
 } from "../api/v2/client";
 
 const MAX_LOG_TAIL = 200;
@@ -132,15 +132,25 @@ export class LifecycleOperationControllerV2 {
     if (current === undefined) {
       throw new LifecycleOperationContractErrorV2("Lifecycle logs reference an unobserved operation");
     }
+    if (mode === "preserve" && current.hasNewerLogs && current.logs.length > 0) {
+      return current;
+    }
     let pages: Awaited<ReturnType<LifecycleTransportV2["lifecycleOperationLogs"]>>[];
     try {
-      pages = await this.fetchLogPages(operationId);
+      pages = mode === "older"
+        ? await this.fetchAllLogPages(operationId)
+        : await this.fetchRecentLogPages(current, mode);
     } catch (error) {
       if (!isCursorExpiredV2(error)) throw error;
-      pages = await this.fetchLogPages(operationId);
+      pages = mode === "older"
+        ? await this.fetchAllLogPages(operationId)
+        : await this.fetchRecentLogPages(current, mode);
     }
     const bySequence = new Map<number, LifecycleLogEntryV2>();
-    let droppedBeforeSequence = 0;
+    if (mode !== "older") {
+      for (const entry of current.logs) bySequence.set(entry.sequence, entry);
+    }
+    let droppedBeforeSequence = current.droppedBeforeSequence;
     for (const page of pages) {
       if (page.operation_id !== operationId) {
         throw new LifecycleOperationContractErrorV2("Lifecycle log page belongs to another operation");
@@ -166,13 +176,6 @@ export class LifecycleOperationControllerV2 {
         ?? current.operation.log_sequence_high_watermark + 1;
       const older = retainedLogs.filter((entry) => entry.sequence < firstVisibleSequence).slice(-MAX_LOG_TAIL);
       logs = older.length === 0 ? current.logs : older;
-    } else if (mode === "preserve" && current.hasNewerLogs && current.logs.length > 0) {
-      const firstVisibleSequence = current.logs[0]!.sequence;
-      const lastVisibleSequence = current.logs.at(-1)!.sequence;
-      const preserved = retainedLogs.filter((entry) => (
-        entry.sequence >= firstVisibleSequence && entry.sequence <= lastVisibleSequence
-      )).slice(-MAX_LOG_TAIL);
-      logs = preserved.length === 0 ? retainedLogs.slice(-MAX_LOG_TAIL) : preserved;
     } else {
       logs = retainedLogs.slice(-MAX_LOG_TAIL);
     }
@@ -182,10 +185,10 @@ export class LifecycleOperationControllerV2 {
       operation: current.operation,
       logs: Object.freeze([...logs]),
       droppedBeforeSequence,
-      hasOlderLogs: firstSequence !== null
-        && retainedLogs.some((entry) => entry.sequence < firstSequence),
-      hasNewerLogs: lastSequence !== null
-        && retainedLogs.some((entry) => entry.sequence > lastSequence),
+      hasOlderLogs: firstSequence !== null && firstSequence > droppedBeforeSequence + 1,
+      hasNewerLogs: lastSequence === null
+        ? current.operation.log_sequence_high_watermark > droppedBeforeSequence
+        : lastSequence < current.operation.log_sequence_high_watermark,
     });
     if (canonicalJsonV2(current.logs) === canonicalJsonV2(next.logs)
       && current.droppedBeforeSequence === next.droppedBeforeSequence
@@ -234,10 +237,37 @@ export class LifecycleOperationControllerV2 {
     return operation;
   }
 
-  private async fetchLogPages(operationId: string) {
+  private async fetchRecentLogPages(
+    current: LifecycleOperationStateV2,
+    mode: "preserve" | "latest",
+  ) {
+    const operationId = current.operation.operation_id;
+    const floor = Math.max(
+      current.droppedBeforeSequence,
+      current.operation.log_sequence_high_watermark - MAX_LOG_TAIL,
+    );
+    const lastVisible = current.logs.at(-1)?.sequence ?? floor;
+    const afterSequence = mode === "preserve" ? Math.max(floor, lastVisible) : floor;
     const pages: Awaited<ReturnType<LifecycleTransportV2["lifecycleOperationLogs"]>>[] = [];
     const cursors = new Set<string>();
-    let options: ListRequestOptionsV2 = { limit: 100 };
+    let options: LifecycleLogRequestOptionsV2 = { limit: 100, afterSequence };
+    for (let pageIndex = 0; pageIndex < 2; pageIndex += 1) {
+      const page = await this.transport.lifecycleOperationLogs(operationId, options);
+      pages.push(page);
+      if (!page.has_more) return pages;
+      if (page.next_cursor === null || cursors.has(page.next_cursor)) {
+        throw new LifecycleOperationContractErrorV2("Lifecycle log pagination cursor cycled");
+      }
+      cursors.add(page.next_cursor);
+      options = { limit: 100, after: page.next_cursor };
+    }
+    return pages;
+  }
+
+  private async fetchAllLogPages(operationId: string) {
+    const pages: Awaited<ReturnType<LifecycleTransportV2["lifecycleOperationLogs"]>>[] = [];
+    const cursors = new Set<string>();
+    let options: LifecycleLogRequestOptionsV2 = { limit: 100 };
     for (let pageIndex = 0; pageIndex < MAX_LOG_PAGES; pageIndex += 1) {
       const page = await this.transport.lifecycleOperationLogs(operationId, options);
       pages.push(page);

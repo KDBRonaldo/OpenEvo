@@ -67,6 +67,7 @@ EXPECTED_OPERATIONS = {
     ("post", "/desktop/v2/profiles/{profile_id}/connect"),
     ("post", "/desktop/v2/profiles/{profile_id}/disconnect"),
     ("post", "/desktop/v2/profiles/{profile_id}/host-key/review"),
+    ("get", "/desktop/v2/operations/by-action"),
     ("get", "/desktop/v2/operations/{operation_id}"),
     ("get", "/desktop/v2/operations/{operation_id}/logs"),
     ("post", "/desktop/v2/operations/{operation_id}/cancel"),
@@ -908,7 +909,7 @@ def test_desktop_v2_snapshots_are_exact_and_frozen() -> None:
     assert hashlib.sha256(openapi).hexdigest() == DESKTOP_OPENAPI_SHA256
     assert hashlib.sha256(events).hexdigest() == DESKTOP_EVENTS_SCHEMA_SHA256
     assert DESKTOP_OPENAPI_SHA256 == (
-        "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a"
+        "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760"
     )
     assert DESKTOP_EVENTS_SCHEMA_SHA256 == (
         "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"

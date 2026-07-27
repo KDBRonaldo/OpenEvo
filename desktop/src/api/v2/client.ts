@@ -70,6 +70,7 @@ import {
   type LifecycleAcknowledgeV2,
   type LifecycleCancelV2,
   type LifecycleLogPageV2,
+  type LifecycleOperationKindV2,
   type LifecycleOperationV2,
   type LocalOperationV2,
   type OperationV2,
@@ -137,6 +138,10 @@ export interface ListRequestOptionsV2 {
   readonly after?: string;
 }
 
+export interface LifecycleLogRequestOptionsV2 extends ListRequestOptionsV2 {
+  readonly afterSequence?: number;
+}
+
 export interface TaskListRequestOptionsV2 extends ListRequestOptionsV2 {
   readonly projectId?: string;
 }
@@ -177,6 +182,11 @@ const listRequestOptionsV2Schema = z.object({
   limit: z.number().int().min(1).max(100).optional(),
   after: z.string().min(1).max(512).optional(),
 }).strict();
+const lifecycleLogRequestOptionsV2Schema = listRequestOptionsV2Schema.extend({
+  afterSequence: z.number().int().safe().min(0).optional(),
+}).strict().refine(
+  (value) => value.after === undefined || value.afterSequence === undefined,
+);
 const taskListRequestOptionsV2Schema = listRequestOptionsV2Schema.extend({
   projectId: opaqueIdV2Schema.optional(),
 }).strict();
@@ -229,8 +239,9 @@ export interface DesktopApiClientV2 {
   getProject(projectId: string): Promise<ProjectV2>;
   updateProject(projectId: string, input: ProjectPatchV2, options: ResourceMutationRequestOptionsV2): Promise<ProjectV2>;
   activateProject(projectId: string, input: ProjectActionV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
+  getLifecycleOperationByAction(actionId: string, kind: LifecycleOperationKindV2): Promise<LifecycleOperationV2>;
   getLifecycleOperation(operationId: string): Promise<LifecycleOperationV2>;
-  lifecycleOperationLogs(operationId: string, options?: ListRequestOptionsV2): Promise<LifecycleLogPageV2>;
+  lifecycleOperationLogs(operationId: string, options?: LifecycleLogRequestOptionsV2): Promise<LifecycleLogPageV2>;
   cancelLifecycleOperation(operationId: string, input: LifecycleCancelV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
   acknowledgeLifecycleOperation(operationId: string, input: LifecycleAcknowledgeV2, options: ResourceMutationRequestOptionsV2): Promise<void>;
   projectCapabilities(projectId: string): Promise<ProjectCapabilityProjectionV2>;
@@ -582,6 +593,15 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
     activateProject: (projectId, input, mutation) => resourceAction(
       `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/activate`, input, projectActionV2Schema, lifecycleOperationV2Schema, mutation,
     ),
+    getLifecycleOperationByAction: (actionId, kind) => {
+      const action = idempotencyKeyV2Schema.parse(actionId);
+      return request(
+        "GET",
+        `${DESKTOP_API_V2_PREFIX}/operations/by-action?action_id=${encodeURIComponent(action)}&kind=${encodeURIComponent(kind)}`,
+        lifecycleOperationV2Schema,
+        200,
+      );
+    },
     getLifecycleOperation: async (operationId) => assertIdentity(
       await request("GET", `${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}`, lifecycleOperationV2Schema, 200),
       "operation_id",
@@ -591,7 +611,10 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
     lifecycleOperationLogs: async (operationId, listOptions) => assertIdentity(
       await request(
         "GET",
-        withListQuery(`${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}/logs`, listOptions),
+        withLifecycleLogQuery(
+          `${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}/logs`,
+          listOptions,
+        ),
         lifecycleLogPageV2Schema,
         200,
       ),
@@ -903,6 +926,21 @@ function withListQuery(path: string, input?: ListRequestOptionsV2): string {
   const query = new URLSearchParams();
   if (options.limit !== undefined) query.set("limit", String(options.limit));
   if (options.after !== undefined) query.set("after", options.after);
+  return query.size === 0 ? path : `${path}?${query.toString()}`;
+}
+
+function withLifecycleLogQuery(
+  path: string,
+  input?: LifecycleLogRequestOptionsV2,
+): string {
+  if (input === undefined) return path;
+  const options = lifecycleLogRequestOptionsV2Schema.parse(input);
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.after !== undefined) query.set("after", options.after);
+  if (options.afterSequence !== undefined) {
+    query.set("after_sequence", String(options.afterSequence));
+  }
   return query.size === 0 ? path : `${path}?${query.toString()}`;
 }
 

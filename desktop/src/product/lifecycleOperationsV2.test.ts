@@ -101,11 +101,13 @@ function coreOperation(overrides: Partial<OperationV2> = {}): OperationV2 {
 }
 
 describe("lifecycle operation controller v2", () => {
-  it("discovers pending operations, fetches authoritative logs, and retains a 200-line tail", async () => {
+  it("discovers pending operations with a bounded 200-line tail read", async () => {
     const operation = lifecycle({ log_sequence_high_watermark: 250 });
     const transport = {
       getLifecycleOperation: vi.fn().mockResolvedValue(operation),
-      lifecycleOperationLogs: vi.fn(async (_operationId: string, options?: { after?: string }) => {
+      lifecycleOperationLogs: vi.fn(async (_operationId: string, options?: { after?: string; afterSequence?: number }) => {
+        if (options?.after === "cursor-150") return logPage(operation.operation_id, 151, 250, null);
+        if (options?.afterSequence === 50) return logPage(operation.operation_id, 51, 150, "cursor-150");
         if (options?.after === "cursor-100") return logPage(operation.operation_id, 101, 200, "cursor-200");
         if (options?.after === "cursor-200") return logPage(operation.operation_id, 201, 250, null);
         return logPage(operation.operation_id, 1, 100, "cursor-100");
@@ -124,6 +126,12 @@ describe("lifecycle operation controller v2", () => {
     expect(observed.droppedBeforeSequence).toBe(0);
     expect(observed.hasOlderLogs).toBe(true);
     expect(observed.hasNewerLogs).toBe(false);
+    expect(transport.lifecycleOperationLogs).toHaveBeenCalledTimes(2);
+    expect(transport.lifecycleOperationLogs).toHaveBeenNthCalledWith(
+      1,
+      operation.operation_id,
+      { limit: 100, afterSequence: 50 },
+    );
 
     const older = await controller.loadOlderLogs(operation.operation_id);
     expect(older.logs.map((entry) => entry.sequence)).toEqual(

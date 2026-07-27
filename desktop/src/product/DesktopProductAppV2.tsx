@@ -445,7 +445,7 @@ export function DesktopProductAppV2({
           onCreated={async () => {
             await refresh();
             setProjectOpen(false);
-            setActionStatus("Project created on the connected OpenEvo Daemon.");
+            setActionStatus("Project creation started. Progress and process logs remain available in Operations.");
           }}
           onError={(error) => setActionError(userMessageV2(error))}
         />
@@ -679,6 +679,7 @@ function NewProjectDialogV2({
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState("Research workspace");
   const [selectedSourceDisplayName, setSelectedSourceDisplayName] = useState<string | null>(null);
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
+  const closedRef = useRef(false);
   const dialogRef = useDialogBoundary(onClose);
   const baseDraftValid = displayName.trim() !== "" && title.trim() !== "" && objective.trim() !== "";
   const valid = baseDraftValid
@@ -686,6 +687,7 @@ function NewProjectDialogV2({
 
   const chooseFolder = async (): Promise<void> => {
     const actionId = actionIdV2("select-workspace");
+    setSourceActionId(actionId);
     onBusy(true);
     try {
       const config = scienceProjectConfig(
@@ -709,11 +711,18 @@ function NewProjectDialogV2({
           etag: profile.etag,
         },
       });
+      if (closedRef.current) {
+        await provider.settleNativeWorkspace(actionId, "discard").catch(() => {});
+        return;
+      }
       setWorkspaceKind("native_folder_snapshot");
       setSelectedSourceDisplayName(source.display_name);
-      setSourceActionId(actionId);
     } catch (error) {
-      onError(error);
+      await provider.settleNativeWorkspace(actionId, "discard").catch(() => {});
+      if (!closedRef.current) {
+        setSourceActionId(null);
+        onError(error);
+      }
     } finally {
       onBusy(false);
     }
@@ -739,7 +748,11 @@ function NewProjectDialogV2({
   };
 
   const close = async (): Promise<void> => {
-    if (sourceActionId !== null) await provider.settleNativeWorkspace(sourceActionId, "discard").catch(() => {});
+    closedRef.current = true;
+    if (sourceActionId !== null) {
+      await provider.cancelNativeWorkspace(sourceActionId).catch(() => {});
+      await provider.settleNativeWorkspace(sourceActionId, "discard").catch(() => {});
+    }
     onClose();
   };
 
@@ -760,7 +773,7 @@ function NewProjectDialogV2({
           </section>
           <section className="form-section"><h3>Execution</h3><div className="agent-note"><ShieldCheck size={17} /><span>Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort</span></div></section>
         </div>
-        <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()} disabled={busy}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button></div>
+        <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button></div>
       </section>
     </div>
   );

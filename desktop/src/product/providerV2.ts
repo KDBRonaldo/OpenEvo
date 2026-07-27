@@ -119,7 +119,7 @@ export interface DesktopProductProviderV2 {
   selectNativeWorkspace(intent: NativeWorkspaceSelectionIntentV2): Promise<NativeWorkspaceSourceV2>;
   cancelNativeWorkspace(actionId: string): Promise<void>;
   settleNativeWorkspace(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
-  createProject(draft: ProjectDraftV2, intent: ProductMutationIntentV2): Promise<ProjectV2>;
+  createProject(draft: ProjectDraftV2, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   updateProject(projectId: string, displayName: string, config: ScienceProjectConfigV2, intent: ProductMutationIntentV2): Promise<ProjectV2>;
   activateProject(projectId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   loadProjectCapabilities(projectId: string): Promise<ProjectCapabilityProjectionV2>;

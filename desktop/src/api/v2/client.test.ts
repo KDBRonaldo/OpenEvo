@@ -10,7 +10,7 @@ import {
   type FetchLikeV2,
 } from "./client";
 
-const OPENAPI = "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a";
+const OPENAPI = "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760";
 const EVENTS = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
 const FEATURES = [
   "core_control_v2",
@@ -256,11 +256,13 @@ describe("Desktop Local API v2 client", () => {
     };
     const fetch = vi.fn<FetchLikeV2>()
       .mockResolvedValueOnce(jsonResponse(operation))
+      .mockResolvedValueOnce(jsonResponse(operation))
       .mockResolvedValueOnce(jsonResponse(logPage))
       .mockResolvedValueOnce(jsonResponse(operation, 202))
       .mockResolvedValueOnce(new Response(null, { status: 204 }));
     const client = fixtureClient(fetch);
 
+    await client.getLifecycleOperationByAction("connect-profile-action-0001", "profile_connect");
     await client.getLifecycleOperation(operation.operation_id);
     await client.lifecycleOperationLogs(operation.operation_id, { limit: 25, after: "cursor/value+1" });
     await client.cancelLifecycleOperation(operation.operation_id, {
@@ -273,9 +275,10 @@ describe("Desktop Local API v2 client", () => {
       expected_terminal_status: "cancelled",
     }, { resourceGeneration: 7, ifMatch: ETAG, idempotencyKey: "ack-lifecycle-operation-0001" });
 
-    expect(String(fetch.mock.calls[1]?.[0])).toContain("after=cursor%2Fvalue%2B1");
-    expect(new Headers(fetch.mock.calls[2]?.[1]?.headers).get("If-Match")).toBe(ETAG);
-    expect(fetch.mock.calls[3]?.[1]?.method).toBe("POST");
+    expect(String(fetch.mock.calls[0]?.[0])).toContain("operations/by-action?action_id=connect-profile-action-0001&kind=profile_connect");
+    expect(String(fetch.mock.calls[2]?.[0])).toContain("after=cursor%2Fvalue%2B1");
+    expect(new Headers(fetch.mock.calls[3]?.[1]?.headers).get("If-Match")).toBe(ETAG);
+    expect(fetch.mock.calls[4]?.[1]?.method).toBe("POST");
   });
 
   it("uses tunnel-only Core operation, service log, and cache cleanup routes", async () => {

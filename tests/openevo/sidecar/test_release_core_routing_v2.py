@@ -15,7 +15,11 @@ from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar.contracts.v2 import models as local_v2
 from desktop.sidecar.core_bridge_v2 import DesktopCoreBridgeErrorV2
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
-from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
+from desktop.sidecar.provider_store_v2 import (
+    DesktopProviderStoreV2,
+    LifecycleNativeWorkspacePrepareRequestV2,
+    LifecycleOperationReservationV2,
+)
 from desktop.sidecar.release_app import create_release_desktop_local_api_v2_app
 from desktop.sidecar.release_provider_v2 import DesktopReleaseProviderV2
 from desktop.sidecar.workspace_identity import (
@@ -1373,6 +1377,69 @@ def test_native_project_retry_releases_import_after_remote_finalize(
         provider.close()
         store.close()
         workspace_store.close()
+
+
+def test_native_prepare_and_project_create_have_distinct_action_steps(
+    tmp_path: Path,
+) -> None:
+    action_id = "routing-native-action-chain-0001"
+    provider, store, _lifecycle, _bridge = _provider(tmp_path)
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        profile = _connected_profile(client)
+        import_id = native_import_id_for_action(action_id)
+        prepared = store.reserve_lifecycle_operation(
+            LifecycleOperationReservationV2(
+                kind="native_workspace_prepare",
+                resource={
+                    "resource_kind": "native_workspace",
+                    "resource_id": import_id,
+                },
+                request=LifecycleNativeWorkspacePrepareRequestV2(
+                    request_kind="native_workspace_prepare",
+                    native_workspace_id=import_id,
+                    native_journal_sha256="a" * 64,
+                    display_name="Selected workspace",
+                ),
+            ),
+            idempotency_key=action_id,
+        )
+        request = _project_create(profile)
+        request["config"]["workspace"] = {
+            "kind": "native_folder_snapshot",
+            "display_name": "Selected workspace",
+        }
+
+        created = client.post(
+            "/desktop/v2/projects",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
+                    "Idempotency-Key": action_id,
+                }
+            ),
+            json=request,
+        )
+
+        assert created.status_code == 202, created.text
+        assert created.json()["operation_id"] != prepared.operation_id
+        recovered = client.get(
+            "/desktop/v2/operations/by-action",
+            params={"action_id": action_id, "kind": "project_create"},
+            headers=_headers(),
+        )
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["operation_id"] == created.json()["operation_id"]
+    finally:
+        client.close()
+        provider.close()
+        store.close()
 
 
 def test_active_project_business_surface_routes_to_core_v2_without_ssh(

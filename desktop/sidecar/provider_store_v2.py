@@ -235,8 +235,23 @@ class LifecycleNativeWorkspacePrepareRequestV2(_StrictModel):
 class LifecycleProjectCreateRequestV2(_StrictModel):
     request_kind: Literal["project_create"]
     project_id: m.OpaqueId
+    action_id: Annotated[str, Field(min_length=16, max_length=256)]
     request: m.ProjectCreateV2
     resource_generation: int
+
+    @model_validator(mode="after")
+    def _validate_action_identity(self) -> LifecycleProjectCreateRequestV2:
+        encoded = self.action_id.encode("utf-8")
+        if (
+            self.action_id != self.action_id.strip()
+            or any(
+                ord(character) < 0x20 or ord(character) == 0x7F
+                for character in self.action_id
+            )
+            or not 16 <= len(encoded) <= 256
+        ):
+            raise ValueError("project-create action identity is invalid")
+        return self
 
 
 class LifecycleProjectActivateRequestV2(_StrictModel):
@@ -1041,6 +1056,33 @@ class DesktopProviderStoreV2:
                 self._require_lifecycle_operation_row(connection, operation_id)
             )
 
+    def get_lifecycle_operation_by_action(self, action_id: str) -> m.LifecycleOperationV2:
+        """Resolve a reserved lifecycle operation from its durable action identity."""
+
+        self._validate_idempotency_key(action_id)
+        with self._transaction(
+            write=False,
+            operation="getLifecycleOperationByActionV2",
+        ) as connection:
+            row = connection.execute(
+                """
+                SELECT operation_id
+                FROM lifecycle_idempotency_records
+                WHERE principal = ? AND action = 'reserve'
+                  AND resource_scope = 'lifecycle_operations'
+                  AND idempotency_key = ?
+                """,
+                (LOCAL_PRINCIPAL, action_id),
+            ).fetchone()
+            if row is None:
+                raise ProviderNotFoundV2("lifecycle action was not found")
+            return self._lifecycle_operation_from_row(
+                self._require_lifecycle_operation_row(
+                    connection,
+                    cast(str, row["operation_id"]),
+                )
+            )
+
     def get_lifecycle_operation_work(
         self,
         operation_id: str,
@@ -1269,10 +1311,18 @@ class DesktopProviderStoreV2:
         *,
         limit: int,
         after: str | None,
+        after_sequence: int | None = None,
     ) -> m.LifecycleLogPageV2:
         self._validate_profile_id(operation_id)
         if type(limit) is not int or not 1 <= limit <= m.MAX_LIFECYCLE_LOG_PAGE_ENTRIES:
             raise ProviderContractV2Error("lifecycle log page limit is invalid")
+        if after is not None and after_sequence is not None:
+            raise ProviderContractV2Error("lifecycle log positions are mutually exclusive")
+        if after_sequence is not None and (
+            type(after_sequence) is not int
+            or not 0 <= after_sequence <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+        ):
+            raise ProviderContractV2Error("lifecycle log sequence is invalid")
         with self._transaction(write=False, operation="readLifecycleLogsV2") as connection:
             operation_row = self._require_lifecycle_operation_row(connection, operation_id)
             dropped_before = cast(int, operation_row["dropped_before_sequence"])
@@ -1287,6 +1337,8 @@ class DesktopProviderStoreV2:
                 next_sequence = cast(int, cursor["next_sequence"])
                 if next_sequence <= dropped_before:
                     raise ProviderCursorExpiredV2("lifecycle log cursor was evicted")
+            elif after_sequence is not None:
+                next_sequence = max(dropped_before + 1, after_sequence + 1)
             rows = connection.execute(
                 f"""
                 SELECT {_LIFECYCLE_LOG_SELECT_COLUMNS}

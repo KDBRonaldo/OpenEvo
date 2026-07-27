@@ -9,7 +9,7 @@ function nonEmpty<T>(values: readonly T[], label: string): readonly [T, ...T[]] 
 export const DESKTOP_PRODUCT_RELEASE_CONTRACT: DesktopReleaseContractV2 = Object.freeze({
   releaseVersion: "0.1.10",
   acceptedOpenApiDigests: nonEmpty([
-    "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a",
+    "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760",
   ], "a Desktop v2 OpenAPI digest"),
   acceptedEventSchemaDigests: nonEmpty([
     "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b",

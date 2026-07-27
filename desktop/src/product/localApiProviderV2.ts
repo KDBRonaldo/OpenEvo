@@ -20,6 +20,7 @@ import {
   type DesktopEventEnvelopeV2,
   type DesktopStateV2,
   type DiagnosticV2,
+  type LifecycleOperationKindV2,
   type LifecycleOperationV2,
   type LocalOperationV2,
   type OperationV2,
@@ -471,26 +472,34 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async resumeMutationIntent(actionId: string): Promise<void> {
     const action = actionIdV2(actionId);
-    const entry = this.mutationIntents.list().find((candidate) => candidate.action_id === action);
+    let entry = this.mutationIntents.list().find((candidate) => candidate.action_id === action);
     if (entry === undefined) return;
     if (entry.accepted_operation_id === null) {
-      throw new MutationIntentConflictV2(
-        "Return to the original action to retry this exact unresolved mutation",
-        entry,
-      );
+      const recovered = await this.recoverReservedLifecycleOperationV2(entry);
+      if (recovered === null) {
+        throw new MutationIntentConflictV2(
+          "Return to the original action to retry this exact unresolved mutation",
+          entry,
+        );
+      }
+      entry = recovered.entry;
+    }
+    const operationId = entry.accepted_operation_id;
+    if (operationId === null) {
+      throw new DesktopContractErrorV2("Recovered mutation has no operation authority");
     }
     if (isDesktopLifecycleMutationV2(entry.mutation_kind)) {
-      const operation = await this.lifecycleOperations.refresh(entry.accepted_operation_id);
+      const operation = await this.lifecycleOperations.refresh(operationId);
       if (!isLifecycleTerminalV2(operation)) {
         await this.lifecycleOperations.pollUntilTerminal(operation.operation_id);
       }
     } else if (entry.mutation_kind === "diagnostic_create") {
-      const diagnostic = await this.refreshDiagnosticV2(entry.accepted_operation_id);
+      const diagnostic = await this.refreshDiagnosticV2(operationId);
       if (!isDiagnosticTerminalV2(diagnostic)) {
         await this.pollDiagnosticUntilTerminalV2(diagnostic.diagnostic_id);
       }
     } else {
-      const operation = await this.coreOperations.refresh(entry.accepted_operation_id);
+      const operation = await this.coreOperations.refresh(operationId);
       if (!isCoreOperationTerminalV2(operation)) {
         await this.coreOperations.pollUntilTerminal(operation.operation_id);
       }
@@ -579,24 +588,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
         idempotencyKey: actionId,
       }),
     });
-    const operation = this.observeOperation(dispatched.value);
-    const terminal = await this.waitForLifecycleTerminal(operation);
-    if (terminal.status !== "succeeded" || terminal.result?.result_kind !== "project") {
-      await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
-      await this.acknowledgeLifecycleTerminalV2(terminal);
-      throw lifecycleTerminalError(terminal, "Remote project creation did not succeed");
-    }
-    const projectId = terminal.result.project_id;
-    const projects = await collectPages((options) => this.client.listProjects(options));
-    const project = projects.find((candidate) => candidate.project_id === projectId);
-    if (project === undefined) {
-      throw new DesktopContractErrorV2("Project creation result is absent from remote authority");
-    }
-    if (nativeProjectChain) await this.native.settleProjectSource(dispatched.entry.action_id, "adopt");
-    await this.completeTerminalOperationV2(dispatched.entry, terminal.operation_id);
-    await this.acknowledgeLifecycleTerminalV2(terminal);
-    this.invalidate();
-    return project;
+    return this.observeOperation(dispatched.value);
   }
 
   async updateProject(projectId: string, displayName: string, configInput: ScienceProjectConfigV2, intent: ProductMutationIntentV2) {
@@ -1186,20 +1178,29 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private async reconcilePendingOperationsV2(snapshot: DesktopProductSnapshotV2): Promise<void> {
     const entries = [...this.mutationIntents.list()];
     const acknowledged = new Set<string>();
-    for (const entry of entries) {
+    for (const originalEntry of entries) {
+      let entry = originalEntry;
       if (entry.accepted_operation_id === null) {
-        await this.reconcileReservedCancellationV2(entry);
-        continue;
+        const recovered = await this.recoverReservedLifecycleOperationV2(entry);
+        if (recovered === null) {
+          await this.reconcileReservedCancellationV2(entry);
+          continue;
+        }
+        entry = recovered.entry;
+      }
+      const operationId = entry.accepted_operation_id;
+      if (operationId === null) {
+        throw new DesktopContractErrorV2("Recovered mutation has no operation authority");
       }
       if (isDesktopLifecycleMutationV2(entry.mutation_kind)) {
-        const operation = this.lifecycleOperations.get(entry.accepted_operation_id)?.operation
-          ?? await this.lifecycleOperations.refresh(entry.accepted_operation_id);
+        const operation = this.lifecycleOperations.get(operationId)?.operation
+          ?? await this.lifecycleOperations.refresh(operationId);
         if (isLifecycleTerminalV2(operation)) {
           await this.reconcileLifecycleTerminalV2(entry, operation, snapshot);
           acknowledged.add(operation.operation_id);
         }
       } else if (entry.mutation_kind === "diagnostic_create") {
-        const diagnostic = await this.refreshDiagnosticV2(entry.accepted_operation_id);
+        const diagnostic = await this.refreshDiagnosticV2(operationId);
         if (isDiagnosticTerminalV2(diagnostic)) {
           if (entry.state === "accepted") {
             await this.mutationIntents.markTerminalObserved(entry.action_id, diagnostic.diagnostic_id);
@@ -1207,8 +1208,8 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
           await this.mutationIntents.clearTerminalObserved(entry.action_id, diagnostic.diagnostic_id);
         }
       } else if (isCoreOperationMutationV2(entry.mutation_kind)) {
-        const operation = this.coreOperations.get(entry.accepted_operation_id)
-          ?? await this.coreOperations.refresh(entry.accepted_operation_id);
+        const operation = this.coreOperations.get(operationId)
+          ?? await this.coreOperations.refresh(operationId);
         if (isCoreOperationTerminalV2(operation)) {
           if (entry.state === "accepted") {
             await this.mutationIntents.markTerminalObserved(entry.action_id, operation.operation_id);
@@ -1231,6 +1232,33 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       }
       await this.acknowledgeLifecycleTerminalV2(state.operation);
     }
+  }
+
+  private async recoverReservedLifecycleOperationV2(
+    entry: PendingMutationIntentV2,
+  ): Promise<{
+    readonly entry: PendingMutationIntentV2;
+    readonly operation: LifecycleOperationV2;
+  } | null> {
+    if (entry.state !== "reserved" || !isDesktopLifecycleMutationV2(entry.mutation_kind)) {
+      return null;
+    }
+    let operation: LifecycleOperationV2;
+    try {
+      operation = await this.client.getLifecycleOperationByAction(
+        entry.action_id,
+        expectedLifecycleKindForMutationIntentV2(entry),
+      );
+    } catch (error) {
+      if (error instanceof DesktopApiErrorV2 && error.status === 404) return null;
+      throw error;
+    }
+    assertLifecycleOperationMatchesMutationIntentV2(entry, operation);
+    const accepted = await this.mutationIntents.bindAcceptedOperation(
+      entry.action_id,
+      operation.operation_id,
+    );
+    return { entry: accepted, operation: this.observeOperation(operation) };
   }
 
   private async reconcileReservedCancellationV2(entry: PendingMutationIntentV2): Promise<void> {
@@ -1266,6 +1294,12 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       && operation.status === "succeeded") {
       await this.mutationIntents.advanceNativeProjectChain(entry.action_id, operation.operation_id);
     } else {
+      if (entry.mutation_kind === "project_create" && entry.chain_step === "project_create") {
+        await this.native.settleProjectSource(
+          entry.action_id,
+          operation.status === "succeeded" ? "adopt" : "discard",
+        );
+      }
       await this.mutationIntents.clearTerminalObserved(entry.action_id, operation.operation_id);
     }
     await this.acknowledgeLifecycleTerminalV2(operation);
@@ -1760,6 +1794,50 @@ function isDesktopLifecycleMutationV2(kind: MutationKindV2): boolean {
     "project_create",
     "project_activate",
   ].includes(kind);
+}
+
+function assertLifecycleOperationMatchesMutationIntentV2(
+  entry: PendingMutationIntentV2,
+  operation: LifecycleOperationV2,
+): void {
+  const expectedKind = expectedLifecycleKindForMutationIntentV2(entry);
+  if (operation.kind !== expectedKind) {
+    throw new DesktopContractErrorV2("Lifecycle action lookup returned another mutation kind");
+  }
+  if (["profile_connect", "profile_disconnect", "host_key_review"].includes(entry.mutation_kind)) {
+    const expectedProfileId = entry.resource_scope.startsWith("profile:")
+      ? entry.resource_scope.slice("profile:".length)
+      : null;
+    if (expectedProfileId === null
+      || operation.resource.resource_kind !== "profile"
+      || operation.resource.resource_id !== expectedProfileId) {
+      throw new DesktopContractErrorV2("Lifecycle action lookup returned another profile authority");
+    }
+  }
+  if (entry.mutation_kind === "project_activate") {
+    const expectedProjectId = entry.resource_scope.startsWith("project:")
+      ? entry.resource_scope.slice("project:".length)
+      : null;
+    if (expectedProjectId === null
+      || operation.resource.resource_kind !== "project"
+      || operation.resource.resource_id !== expectedProjectId) {
+      throw new DesktopContractErrorV2("Lifecycle action lookup returned another project authority");
+    }
+  }
+}
+
+function expectedLifecycleKindForMutationIntentV2(
+  entry: PendingMutationIntentV2,
+): LifecycleOperationKindV2 {
+  if (entry.mutation_kind === "project_create") {
+    return entry.chain_step === "native_workspace_prepare"
+      ? "native_workspace_prepare"
+      : "project_create";
+  }
+  if (["profile_connect", "profile_disconnect", "host_key_review", "project_activate"].includes(entry.mutation_kind)) {
+    return entry.mutation_kind as LifecycleOperationKindV2;
+  }
+  throw new DesktopContractErrorV2("Mutation intent is not a Desktop lifecycle operation");
 }
 
 function isCoreOperationMutationV2(kind: MutationKindV2): boolean {

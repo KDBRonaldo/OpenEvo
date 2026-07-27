@@ -80,6 +80,7 @@ IfMatch = Annotated[
 ]
 Limit = Annotated[int, Query(ge=1, le=100)]
 Cursor = Annotated[str | None, Query(min_length=1, max_length=512)]
+ActionId = Annotated[str, Query(min_length=16, max_length=256)]
 LastEventId = Annotated[
     str | None,
     Header(alias="Last-Event-ID", min_length=1, max_length=128),
@@ -367,6 +368,17 @@ def create_desktop_local_v2_contract_app(
         return _contract_only()
 
     @router.get(
+        "/operations/by-action",
+        operation_id="getDesktopLifecycleOperationByActionV2",
+        response_model=m.LifecycleOperationV2,
+    )
+    async def lifecycle_operation_by_action(
+        action_id: ActionId,
+        kind: m.LifecycleOperationKindV2,
+    ) -> Response:
+        return _contract_only()
+
+    @router.get(
         "/operations/{operation_id}",
         operation_id="getDesktopLifecycleOperationV2",
         response_model=m.LifecycleOperationV2,
@@ -383,6 +395,10 @@ def create_desktop_local_v2_contract_app(
         operation_id: ResourceId,
         limit: Limit = 100,
         after: Cursor = None,
+        after_sequence: Annotated[
+            int | None,
+            Query(ge=0, le=m.MAX_JAVASCRIPT_SAFE_INTEGER),
+        ] = None,
     ) -> Response:
         return _contract_only()
 

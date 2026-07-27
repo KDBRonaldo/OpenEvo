@@ -670,7 +670,7 @@ describe("Desktop v2 product renderer", () => {
     expect(cleanupCaches).toHaveBeenCalledWith(expect.objectContaining({ streamEpoch: 1 }));
   });
 
-  it("keeps one project create visibly active beyond 15 seconds without a Local API timeout", async () => {
+  it("closes project setup after HTTP 202 while progress and logs stay visible", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));
     const connected = systemProfile({
@@ -736,7 +736,7 @@ describe("Desktop v2 product renderer", () => {
     const createProject = vi.fn(async () => {
       operationVisible = true;
       listener?.();
-      return new Promise<never>(() => {});
+      return lifecycleState.operation;
     });
     const provider = {
       ...unavailableDesktopProductProviderV2,
@@ -777,7 +777,45 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Materializing workspace snapshot");
     expect(document.body.textContent).toContain("Elapsed 16s");
     expect(document.body.textContent).not.toContain("Desktop Local API request timed out");
-    expect(button("Create project").disabled).toBe(true);
+    expect(document.body.textContent).toContain("Project creation started");
+    expect(Array.from(document.querySelectorAll("button")).some((candidate) => candidate.textContent?.trim() === "Create project")).toBe(false);
+  });
+
+  it("can cancel native workspace preparation while the lifecycle operation is running", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const selectNativeWorkspace = vi.fn(async () => new Promise<never>(() => {}));
+    const cancelNativeWorkspace = vi.fn(async () => {});
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      selectNativeWorkspace,
+      cancelNativeWorkspace,
+      settleNativeWorkspace: vi.fn(async () => {}),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    setTextarea("Task objective", "Prepare a native workspace safely.");
+    await click("Choose folder snapshot");
+    expect(selectNativeWorkspace).toHaveBeenCalledTimes(1);
+    await click("Cancel");
+
+    expect(cancelNativeWorkspace).toHaveBeenCalledWith(expect.any(String));
   });
 });
 

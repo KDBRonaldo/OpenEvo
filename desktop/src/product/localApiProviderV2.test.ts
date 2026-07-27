@@ -175,6 +175,14 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     createProfile: vi.fn(),
     createProject: vi.fn(),
     connectProfile: vi.fn(),
+    getLifecycleOperationByAction: vi.fn().mockRejectedValue(new DesktopApiErrorV2(404, {
+      schema_version: "2",
+      code: "resource_not_found",
+      summary: "The requested local resource was not found.",
+      retryable: false,
+      action: "none",
+      affected_resource_id: null,
+    })),
     getLifecycleOperation: vi.fn(),
     lifecycleOperationLogs: vi.fn(),
     acknowledgeLifecycleOperation: vi.fn(),
@@ -633,6 +641,9 @@ describe("Desktop v2 product provider", () => {
       next_cursor: null,
       has_more: false,
     } as never);
+    vi.mocked(client.getProject).mockResolvedValue({
+      project_id: "project-created-1",
+    } as never);
     const provider = createLocalApiDesktopProductProviderV2({
       client,
       native,
@@ -670,15 +681,123 @@ describe("Desktop v2 product provider", () => {
 
     const secondRefresh = await provider.refresh();
     if (secondRefresh.status !== "fresh") throw new Error("fixture refresh failed");
-    await provider.createProject(draft, {
+    await expect(provider.createProject(draft, {
       actionId,
       streamEpoch: secondRefresh.snapshot.stream.epoch,
-    });
+    })).resolves.toMatchObject({ operation_id: projectOperation.operation_id });
 
     expect(client.createProject).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       idempotencyKey: actionId,
     }));
+    expect(native.settleProjectSource).not.toHaveBeenCalledWith(actionId, "adopt");
+    await expect(provider.refresh()).resolves.toMatchObject({ status: "fresh" });
     expect(native.settleProjectSource).toHaveBeenCalledWith(actionId, "adopt");
+    expect(native.journalValue()).toBeNull();
+  });
+
+  it("returns project creation authority immediately after HTTP 202", async () => {
+    const connected = profile({ connection_state: "connected" });
+    const client = clientFixture([connected]);
+    const accepted = {
+      ...lifecycleOperation(),
+      operation_id: "lifecycle-project-create-running-1",
+      kind: "project_create" as const,
+      resource: { resource_kind: "project" as const, resource_id: "project-running-1" },
+      status: "running" as const,
+      phase: "creating_remote_project" as const,
+      phase_index: 13,
+      started_at: NOW,
+    };
+    vi.mocked(client.createProject).mockResolvedValue(accepted);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(provider.createProject({
+      profileId: connected.profile_id,
+      displayName: "Long project",
+      config: {
+        ...nativeProjectConfig(),
+        workspace: { kind: "scratch" as const, display_name: "Long workspace" },
+      },
+    }, {
+      actionId: "project-create-return-after-202",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    })).resolves.toEqual(accepted);
+    expect(client.getLifecycleOperation).not.toHaveBeenCalled();
+    expect(client.listProjects).not.toHaveBeenCalled();
+  });
+
+  it("recovers a lifecycle operation when its HTTP 202 response was lost", async () => {
+    const connected = profile({ connection_state: "connected" });
+    const native = nativeFixture();
+    const firstClient = clientFixture([connected]);
+    vi.mocked(firstClient.createProject).mockRejectedValue(new TypeError("response connection closed"));
+    const firstProvider = createLocalApiDesktopProductProviderV2({
+      client: firstClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const firstRefresh = await firstProvider.refresh();
+    if (firstRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+    const actionId = "project-create-lost-response-0001";
+    const draft = {
+      profileId: connected.profile_id,
+      displayName: "Recovered project",
+      config: {
+        ...nativeProjectConfig(),
+        workspace: { kind: "scratch" as const, display_name: "Recovered workspace" },
+      },
+    };
+
+    await expect(firstProvider.createProject(draft, {
+      actionId,
+      streamEpoch: firstRefresh.snapshot.stream.epoch,
+    })).rejects.toThrow(/response connection closed/i);
+    expect(JSON.parse(native.journalValue()!)).toMatchObject({
+      entries: [{ action_id: actionId, state: "reserved", accepted_operation_id: null }],
+    });
+
+    const terminal = {
+      ...lifecycleOperation(),
+      operation_id: "lifecycle-project-lost-response-1",
+      kind: "project_create" as const,
+      resource: { resource_kind: "project" as const, resource_id: "project-recovered-1" },
+      status: "succeeded" as const,
+      phase: "finalizing" as const,
+      phase_index: 16,
+      cancellable: false,
+      result: { result_kind: "project" as const, project_id: "project-recovered-1" },
+      finished_at: NOW,
+    };
+    const recoveredClient = clientFixture([connected]);
+    vi.mocked(recoveredClient.getLifecycleOperationByAction).mockResolvedValue(terminal);
+    vi.mocked(recoveredClient.getProject).mockResolvedValue({
+      project_id: "project-recovered-1",
+    } as never);
+    const recoveredProvider = createLocalApiDesktopProductProviderV2({
+      client: recoveredClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    await expect(recoveredProvider.refresh()).resolves.toMatchObject({ status: "fresh" });
+    expect(recoveredClient.getLifecycleOperationByAction).toHaveBeenCalledWith(
+      actionId,
+      "project_create",
+    );
+    expect(recoveredClient.acknowledgeLifecycleOperation).toHaveBeenCalledWith(
+      terminal.operation_id,
+      expect.objectContaining({ expected_terminal_status: "succeeded" }),
+      expect.objectContaining({ ifMatch: terminal.etag }),
+    );
     expect(native.journalValue()).toBeNull();
   });
 

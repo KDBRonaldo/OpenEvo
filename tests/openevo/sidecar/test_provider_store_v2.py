@@ -150,6 +150,7 @@ def _project_reservation(
         request=store_module.LifecycleProjectCreateRequestV2(
             request_kind="project_create",
             project_id=project_id,
+            action_id="lifecycle-project-action-0001",
             request=_project_create_request(),
             resource_generation=3,
         ),

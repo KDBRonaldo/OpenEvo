@@ -47,6 +47,7 @@ from desktop.sidecar.provider_store_v2 import (
     LifecycleProfileDisconnectRequestV2,
     LifecycleProjectActivateRequestV2,
     LifecycleProjectCreateRequestV2,
+    ProviderNotFoundV2,
 )
 from desktop.sidecar.release_capabilities import (
     V0110_RELEASE_AUTHORITY_POLICY,
@@ -227,6 +228,7 @@ _OPERATIONS = frozenset(
         "connectRemoteWorkspaceProfileV2",
         "disconnectRemoteWorkspaceProfileV2",
         "reviewRemoteWorkspaceHostKeyV2",
+        "getDesktopLifecycleOperationByActionV2",
         "getDesktopLifecycleOperationV2",
         "getDesktopLifecycleOperationLogsV2",
         "cancelDesktopLifecycleOperationV2",
@@ -417,6 +419,9 @@ class DesktopReleaseProviderV2:
             "connectRemoteWorkspaceProfileV2": self._connect_profile,
             "disconnectRemoteWorkspaceProfileV2": self._disconnect_profile,
             "reviewRemoteWorkspaceHostKeyV2": self._review_host_key,
+            "getDesktopLifecycleOperationByActionV2": (
+                self._get_lifecycle_operation_by_action
+            ),
             "getDesktopLifecycleOperationV2": self._get_lifecycle_operation,
             "getDesktopLifecycleOperationLogsV2": self._get_lifecycle_logs,
             "cancelDesktopLifecycleOperationV2": self._cancel_lifecycle_operation,
@@ -776,6 +781,22 @@ class DesktopReleaseProviderV2:
     ) -> local_v2.LifecycleOperationV2:
         return self._store.get_lifecycle_operation(_string_argument(arguments, "operation_id"))
 
+    def _get_lifecycle_operation_by_action(
+        self,
+        arguments: Mapping[str, object],
+    ) -> local_v2.LifecycleOperationV2:
+        action_id = _string_argument(arguments, "action_id")
+        kind = _string_argument(arguments, "kind")
+        lookup_key = (
+            _derived_idempotency_key(action_id, "project-create")
+            if kind == "project_create"
+            else action_id
+        )
+        operation = self._store.get_lifecycle_operation_by_action(lookup_key)
+        if operation.kind != kind:
+            raise ProviderNotFoundV2("lifecycle action kind was not found")
+        return operation
+
     def _get_lifecycle_logs(
         self,
         arguments: Mapping[str, object],
@@ -785,10 +806,14 @@ class DesktopReleaseProviderV2:
         after = arguments.get("after")
         if after is not None and type(after) is not str:
             raise TypeError("lifecycle log cursor has the wrong type")
+        after_sequence = arguments.get("after_sequence")
+        if after_sequence is not None and type(after_sequence) is not int:
+            raise TypeError("lifecycle log sequence has the wrong type")
         return self._store.read_lifecycle_logs(
             operation_id,
             limit=limit,
             after=after,
+            after_sequence=after_sequence,
         )
 
     def _cancel_lifecycle_operation(
@@ -1365,6 +1390,7 @@ class DesktopReleaseProviderV2:
         if type(persisted) is not LifecycleProjectCreateRequestV2:
             raise TypeError("project-create lifecycle request has the wrong type")
         request = persisted.request
+        action_id = persisted.action_id
         profile = self._connected_profile(
             request.profile_id,
             request.profile_connection_generation,
@@ -1380,7 +1406,7 @@ class DesktopReleaseProviderV2:
         activation = self._bridge.activate_project(
             desktop_project_id,
             request,
-            idempotency_key=context.idempotency_key,
+            idempotency_key=action_id,
         )
         context.check_cancelled()
         project = getattr(activation, "project", None)
@@ -1393,7 +1419,7 @@ class DesktopReleaseProviderV2:
                 affected_resource_id=desktop_project_id,
             )
         native_import_id = (
-            native_import_id_for_action(context.idempotency_key)
+            native_import_id_for_action(action_id)
             if request.config.workspace.kind == "native_folder_snapshot"
             else None
         )
@@ -1403,7 +1429,7 @@ class DesktopReleaseProviderV2:
                 profile_connection_generation=profile.connection_generation,
                 project=project,
                 import_id=native_import_id,
-                action_id=context.idempotency_key,
+                action_id=action_id,
                 lifecycle_context=context,
             )
         self._checkpoint_lifecycle_forward(
@@ -1491,11 +1517,12 @@ class DesktopReleaseProviderV2:
                 request=LifecycleProjectCreateRequestV2(
                     request_kind="project_create",
                     project_id=desktop_project_id,
+                    action_id=key,
                     request=request,
                     resource_generation=generation,
                 ),
             ),
-            idempotency_key=key,
+            idempotency_key=_derived_idempotency_key(key, "project-create"),
         )
 
     def _materialize_native_workspace(
@@ -2996,6 +3023,16 @@ def _desktop_project_id(profile_id: str, idempotency_key: str) -> str:
 
 
 def _derived_idempotency_key(parent: str, operation: str) -> str:
+    encoded_parent = parent.encode("utf-8")
+    if (
+        parent != parent.strip()
+        or any(
+            ord(character) < 0x20 or ord(character) == 0x7F
+            for character in parent
+        )
+        or not 16 <= len(encoded_parent) <= 256
+    ):
+        raise ValueError("parent action identity is invalid")
     digest = hashlib.sha256(
         b"openevo-desktop-derived-action-v2\0"
         + parent.encode("utf-8")
