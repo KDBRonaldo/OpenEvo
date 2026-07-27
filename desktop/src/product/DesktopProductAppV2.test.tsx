@@ -8,6 +8,7 @@ import {
   unavailableDesktopProductProviderV2,
   type DesktopProductProviderV2,
 } from "./providerV2";
+import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
 import { DesktopProductAppV2 } from "./DesktopProductAppV2";
 
 const NOW = "2026-07-23T06:00:00Z";
@@ -336,6 +337,7 @@ describe("Desktop v2 product renderer", () => {
   afterEach(async () => {
     if (root) await act(async () => root?.unmount());
     root = null;
+    vi.useRealTimers();
     document.body.innerHTML = "";
   });
 
@@ -526,6 +528,114 @@ describe("Desktop v2 product renderer", () => {
     expect(button("Retry successor transition")).toBeTruthy();
     expect(provider.submitTask).not.toHaveBeenCalled();
   });
+
+  it("keeps one project create visibly active beyond 15 seconds without a Local API timeout", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const lifecycleState = {
+      operation: {
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        kind: "project_create",
+        resource: { resource_kind: "project", resource_id: "project-pending-1" },
+        request_sha256: DIGEST,
+        status: "running",
+        phase: "creating_remote_project",
+        phase_index: 13,
+        phase_total: 17,
+        progress: { kind: "indeterminate" },
+        cancellable: true,
+        result: null,
+        failure: null,
+        log_sequence_high_watermark: 2,
+        created_at: "2026-07-27T08:00:00Z",
+        started_at: "2026-07-27T08:00:00Z",
+        updated_at: "2026-07-27T08:00:00Z",
+        finished_at: null,
+        etag: ETAG,
+      },
+      logs: [{
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        sequence: 1,
+        occurred_at: "2026-07-27T08:00:00Z",
+        source: "ssh_stdout",
+        text: "Remote project request accepted",
+        truncated: false,
+      }, {
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        sequence: 2,
+        occurred_at: "2026-07-27T08:00:00Z",
+        source: "daemon_stdout",
+        text: "Materializing workspace snapshot",
+        truncated: false,
+      }],
+      droppedBeforeSequence: 0,
+    } satisfies LifecycleOperationStateV2;
+    let operationVisible = false;
+    let listener: (() => void) | null = null;
+    const createProject = vi.fn(async () => {
+      operationVisible = true;
+      listener?.();
+      return new Promise<never>(() => {});
+    });
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      subscribe: vi.fn((next: () => void) => {
+        listener = next;
+        return () => { listener = null; };
+      }),
+      listLifecycleOperations: () => operationVisible ? [lifecycleState] : [],
+      listMutationIntents: () => operationVisible ? [{
+        action_id: "create-project-long-running-0001",
+        mutation_kind: "project_create" as const,
+        resource_scope: "project:new:profile-gpu",
+        request_sha256: DIGEST,
+        authority_sha256: DIGEST,
+        provider_stream_instance: "provider-instance-test",
+        provider_stream_epoch: 1,
+        chain_step: "single" as const,
+        accepted_operation_id: "project-create-long-1",
+        completed_operation_ids: [],
+        state: "accepted" as const,
+        created_at: "2026-07-27T08:00:00Z",
+        updated_at: "2026-07-27T08:00:00Z",
+      }] : [],
+      createProject,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    setTextarea("Task objective", "Create a reproducible result from this workspace.");
+    await click("Create project");
+    await act(async () => vi.advanceTimersByTime(16_000));
+
+    expect(createProject).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Creating or loading the remote project");
+    expect(document.body.textContent).toContain("Remote project request accepted");
+    expect(document.body.textContent).toContain("Materializing workspace snapshot");
+    expect(document.body.textContent).toContain("Elapsed 16s");
+    expect(document.body.textContent).not.toContain("Desktop Local API request timed out");
+    expect(button("Create project").disabled).toBe(true);
+  });
 });
 
 async function render(provider: DesktopProductProviderV2): Promise<Root> {
@@ -570,5 +680,17 @@ function setInput(label: string, value: string): void {
     setter?.call(input, value);
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+function setTextarea(label: string, value: string): void {
+  const labels = [...document.querySelectorAll<HTMLLabelElement>("label")];
+  const owner = labels.find((candidate) => candidate.textContent?.includes(label));
+  const input = owner?.querySelector<HTMLTextAreaElement>("textarea");
+  if (!input) throw new Error(`textarea not found: ${label}`);
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }

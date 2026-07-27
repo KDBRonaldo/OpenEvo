@@ -88,6 +88,9 @@ export class LifecycleOperationControllerV2 {
   observe(operation: LifecycleOperationV2): LifecycleOperationV2 {
     const previous = this.states.get(operation.operation_id);
     if (previous !== undefined) assertLifecycleOperationDoesNotRegressV2(previous.operation, operation);
+    if (previous !== undefined && canonicalJsonV2(previous.operation) === canonicalJsonV2(operation)) {
+      return previous.operation;
+    }
     this.states.set(operation.operation_id, Object.freeze({
       operation,
       logs: previous?.logs ?? Object.freeze([]),
@@ -144,6 +147,10 @@ export class LifecycleOperationControllerV2 {
       logs: Object.freeze(logs),
       droppedBeforeSequence,
     });
+    if (canonicalJsonV2(current.logs) === canonicalJsonV2(next.logs)
+      && current.droppedBeforeSequence === next.droppedBeforeSequence) {
+      return current;
+    }
     this.states.set(operationId, next);
     this.emit();
     return next;
@@ -165,6 +172,7 @@ export class LifecycleOperationControllerV2 {
   async pollUntilTerminal(
     operationId: string,
     signal?: AbortSignal,
+    onObservation?: (operation: LifecycleOperationV2) => void | Promise<void>,
   ): Promise<LifecycleOperationV2> {
     let operation = this.states.get(operationId)?.operation;
     if (operation === undefined) operation = await this.refresh(operationId);
@@ -175,6 +183,8 @@ export class LifecycleOperationControllerV2 {
       if (signal?.aborted) throw abortErrorV2();
       const before = progressFingerprintV2(operation);
       operation = await this.refresh(operationId);
+      await this.loadLogs(operationId);
+      await onObservation?.(operation);
       delayIndex = progressFingerprintV2(operation) === before
         ? Math.min(delayIndex + 1, POLL_DELAYS_MS.length - 1)
         : 0;

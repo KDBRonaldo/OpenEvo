@@ -102,6 +102,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private readonly coreOperations: CoreOperationControllerV2;
   private readonly listeners = new Set<(signal: ProductSubscriptionSignalV2) => void>();
   private readonly replay = new DesktopEventReplayAuthorityV2();
+  private readonly lifecyclePolls = new Map<string, Promise<void>>();
   private refreshSequence = 0;
   private epoch = 0;
   private snapshot: DesktopProductSnapshotV2 | null = null;
@@ -129,6 +130,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       await this.mutationIntents.initialize();
       const loaded = await this.loadSnapshot();
       await this.lifecycleOperations.synchronize(loaded.state.pending_operations);
+      for (const state of this.lifecycleOperations.list()) this.ensureLifecyclePollingV2(state.operation);
       if (sequence !== this.refreshSequence) {
         return { status: "stale", stream: { status: "stale", epoch: this.epoch, reason: "refresh_pending" } };
       }
@@ -373,7 +375,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   }
 
   listLifecycleOperations(): readonly LifecycleOperationStateV2[] {
-    return this.lifecycleOperations.list();
+    const pendingIds = new Set(this.snapshot?.state.pending_operations.map((operation) => operation.operation_id) ?? []);
+    const unresolvedIds = new Set(this.mutationIntents.list().flatMap((entry) => [
+      ...(entry.accepted_operation_id === null ? [] : [entry.accepted_operation_id]),
+      ...entry.completed_operation_ids,
+    ]));
+    return this.lifecycleOperations.list().filter((state) => pendingIds.has(state.operation.operation_id)
+      || unresolvedIds.has(state.operation.operation_id)
+      || !isLifecycleTerminalV2(state.operation));
   }
 
   async getLifecycleOperation(operationId: string): Promise<LifecycleOperationV2> {
@@ -1258,11 +1267,37 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   }
 
   private observeOperation<T extends LocalOperationV2 | LifecycleOperationV2 | OperationV2>(operation: T): T {
-    if ("phase" in operation) this.lifecycleOperations.observe(operation as LifecycleOperationV2);
+    if ("phase" in operation) {
+      const lifecycle = this.lifecycleOperations.observe(operation as LifecycleOperationV2);
+      this.ensureLifecyclePollingV2(lifecycle);
+    }
     if ("progress_completed" in operation) this.coreOperations.observe(operation as OperationV2);
     this.activeOperation = operation;
     this.invalidate();
     return operation;
+  }
+
+  private ensureLifecyclePollingV2(operation: LifecycleOperationV2): void {
+    if (isLifecycleTerminalV2(operation) || this.lifecyclePolls.has(operation.operation_id)) return;
+    const polling = this.lifecycleOperations.pollUntilTerminal(
+      operation.operation_id,
+      undefined,
+      async (observed) => {
+        this.activeOperation = observed;
+        if (this.snapshot !== null) this.snapshot = { ...this.snapshot, activeOperation: observed };
+        this.emit({ kind: "snapshot_changed" });
+      },
+    ).then(async (terminal) => {
+      this.activeOperation = terminal;
+      await this.lifecycleOperations.loadLogs(terminal.operation_id);
+      this.emit({ kind: "snapshot_changed" });
+    }).catch((error) => {
+      const apiError = apiErrorOfV2(error);
+      this.emit({ kind: "stream_error", error: apiError });
+    }).finally(() => {
+      this.lifecyclePolls.delete(operation.operation_id);
+    });
+    this.lifecyclePolls.set(operation.operation_id, polling);
   }
 
   private async waitForLifecycleTerminal(initial: LifecycleOperationV2): Promise<LifecycleOperationV2> {

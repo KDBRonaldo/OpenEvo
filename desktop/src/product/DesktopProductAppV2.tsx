@@ -32,6 +32,10 @@ import type {
 import { OpenEvoMark } from "../components/OpenEvoMark";
 import { SampleScientificProjectView } from "./ScientificProjectSample";
 import {
+  LifecycleOperationPanelV2,
+  lifecycleOperationPanelModelV2,
+} from "./LifecycleOperationPanelV2";
+import {
   SAMPLE_SCIENTIFIC_PROJECT,
   SAMPLE_SCIENTIFIC_PROJECTS,
   sampleScientificProject,
@@ -166,6 +170,8 @@ export function DesktopProductAppV2({
   const selectedSample = sampleScientificProject(selectedSampleId);
   const generation = activeProject?.active_project_head?.generation
     ?? selectedSample.activeProjectHeadGeneration;
+  const lifecycleStates = provider.listLifecycleOperations();
+  const mutationIntents = provider.listMutationIntents();
 
   const runProject = async (project: ProjectV2): Promise<void> => {
     if (project.state !== "ready") return;
@@ -304,6 +310,38 @@ export function DesktopProductAppV2({
           )}
         </main>
       </div>
+
+      {lifecycleStates.length > 0 ? (
+        <aside className="v2-global-operations" aria-label="Active operations">
+          <div className="v2-global-operations-heading">
+            <strong>{lifecycleStates.length} operation{lifecycleStates.length === 1 ? "" : "s"}</strong>
+            <span>Work continues safely if this panel or Desktop is closed.</span>
+          </div>
+          <div className="v2-global-operation-list">
+            {lifecycleStates.map((state) => {
+              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === state.operation.operation_id
+                || candidate.completed_operation_ids.includes(state.operation.operation_id));
+              return (
+                <LifecycleOperationPanelV2
+                  key={state.operation.operation_id}
+                  model={lifecycleOperationPanelModelV2(state, undefined, { unresolvedMutation: intent !== undefined })}
+                  onCancel={state.operation.cancellable ? () => act(
+                    () => provider.cancelLifecycleOperation(
+                      state.operation.operation_id,
+                      intentFor(snapshot, "cancel-lifecycle"),
+                    ),
+                    "Lifecycle cancellation requested.",
+                  ).then(() => undefined) : undefined}
+                  onLoadOlder={() => provider.loadLifecycleLogs(state.operation.operation_id).then(() => {
+                    setSnapshot((current) => current === null ? null : { ...current });
+                  })}
+                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
+                />
+              );
+            })}
+          </div>
+        </aside>
+      ) : null}
 
       {connectionOpen ? (
         <RemoteWorkspaceSetupV2
