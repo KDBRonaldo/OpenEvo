@@ -1313,10 +1313,22 @@ def test_tauri_bundles_exact_native_askpass_external_binary() -> None:
 def test_native_askpass_source_keeps_linux_clippy_portable() -> None:
     helper = Path("desktop/src-tauri/src/askpass.rs").read_text(encoding="utf-8")
 
-    assert "libc::S_IFMT as u32" not in helper
-    assert "libc::S_IFREG as u32" not in helper
-    assert "u32::from(libc::S_IFMT)" in helper
-    assert "u32::from(libc::S_IFREG)" in helper
+    assert (
+        '#[cfg(target_os = "linux")]\n'
+        "const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT;"
+    ) in helper
+    assert (
+        '#[cfg(target_os = "linux")]\n'
+        "const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG;"
+    ) in helper
+    assert (
+        '#[cfg(target_os = "macos")]\n'
+        "const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;"
+    ) in helper
+    assert (
+        '#[cfg(target_os = "macos")]\n'
+        "const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;"
+    ) in helper
     assert (
         '#[cfg(any(test, target_os = "macos"))]\n'
         "    pub fn new(value: Vec<u8>) -> Self {"
