@@ -442,6 +442,11 @@ class DesktopCoreSshBridgeAdapterV2:
                 cancellable=True,
             )
             self._require_same_transport(profile_id, profile_connection_generation, transport)
+            self._observe_progress(
+                "starting_daemon",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=False,
+            )
             if (
                 self._bootstrap.replace_mismatched
                 and predecessor.state != "absent"
@@ -467,14 +472,9 @@ class DesktopCoreSshBridgeAdapterV2:
                         action="retry",
                     )
             self._observe_progress(
-                "starting_daemon",
-                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-                cancellable=True,
-            )
-            self._observe_progress(
                 "waiting_for_daemon",
                 local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-                cancellable=True,
+                cancellable=False,
             )
             remote, service = transport.ensure_daemon_bundle(
                 staged,

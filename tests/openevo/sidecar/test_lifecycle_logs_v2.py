@@ -150,6 +150,33 @@ def test_sanitizer_redacts_arbitrary_absolute_posix_paths() -> None:
     assert "https://example.test/public/path" in rendered
 
 
+def test_sanitizer_redacts_home_relative_host_paths() -> None:
+    entries: list[tuple[str, str, bool]] = []
+    sanitizer = LifecycleOutputSanitizerV2(
+        lambda source, text, truncated: entries.append((source, text, truncated))
+    )
+
+    sanitizer.feed(
+        "ssh_stderr",
+        (
+            "identity=~/.ssh/openevo_ed25519 "
+            "other=~researcher/.config/openevo/settings.json "
+            "env=$HOME/.ssh/config braced=${HOME}/.ssh/known_hosts\n"
+        ).encode(),
+    )
+    sanitizer.flush()
+
+    rendered = "".join(text for _source, text, _truncated in entries)
+    for host_path in (
+        "~/.ssh/openevo_ed25519",
+        "~researcher/.config/openevo/settings.json",
+        "$HOME/.ssh/config",
+        "${HOME}/.ssh/known_hosts",
+    ):
+        assert host_path not in rendered
+    assert rendered.count("[REDACTED_HOST_PATH]") == 4
+
+
 def test_bounded_subprocess_observer_receives_only_stream_and_bytes() -> None:
     observed: list[tuple[str, bytes]] = []
     command_canary = "argv-must-not-be-observed"

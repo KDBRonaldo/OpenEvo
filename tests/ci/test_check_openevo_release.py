@@ -3758,7 +3758,11 @@ def test_tauri_macos_config_declares_unreleased_dmg_target() -> None:
     assert "let program = source.to_path_buf();" in main
     assert "fd_execution_path()" not in macos_bundle_launch_test
     assert "assert_eq!(launch.program, fixture.path());" in macos_bundle_launch_test
-    assert "let packaged_fixture = SidecarFixture::from_existing(&raw_path);" in packaged_sidecar_smoke
+    assert "OPENEVO_PACKAGED_ASKPASS_PATH is required" in packaged_sidecar_smoke
+    assert (
+        "SidecarFixture::from_existing_pair(&raw_path, &raw_askpass_path)"
+        in packaged_sidecar_smoke
+    )
     assert "let path = packaged_fixture.path().to_path_buf();" in packaged_sidecar_smoke
     assert "fn sanitize_pyinstaller_launch_environment(" in main
     assert 'command.env(PYINSTALLER_RESET_ENVIRONMENT, "1")' in main
