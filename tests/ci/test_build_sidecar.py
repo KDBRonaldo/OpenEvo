@@ -1230,6 +1230,42 @@ def test_native_askpass_helper_build_uses_locked_targeted_cargo(
     assert json.loads(observed[0][2]["TAURI_CONFIG"]) == {"bundle": {"externalBin": []}}
 
 
+def test_native_askpass_helper_build_detaches_cargo_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    tauri_root = tmp_path / "desktop/src-tauri"
+    tauri_root.mkdir(parents=True)
+    cargo_target = tmp_path / "cargo-target"
+    cargo_alias: Path | None = None
+
+    def fake_run(command, *, check, cwd, env):
+        nonlocal cargo_alias
+        assert check is True
+        release = cargo_target / "aarch64-apple-darwin/release"
+        cargo_alias = release / "deps/openevo_ssh_askpass"
+        _write_thin_mach_o(cargo_alias)
+        built = release / builder.ASKPASS_NAME
+        os.link(cargo_alias, built)
+        assert built.stat().st_nlink == 2
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    built = builder._build_native_askpass_helper(
+        tauri_root,
+        cargo_target=cargo_target,
+        target_triple="aarch64-apple-darwin",
+    )
+
+    assert cargo_alias is not None
+    assert built.read_bytes() == cargo_alias.read_bytes()
+    assert built.stat().st_nlink == 1
+    assert cargo_alias.stat().st_nlink == 1
+    assert stat.S_IMODE(built.stat().st_mode) == 0o755
+
+
 def test_sidecar_build_metadata_binds_exact_native_askpass_helper(tmp_path: Path) -> None:
     builder = _load_builder()
     path = tmp_path / "sidecar-build-metadata.json"

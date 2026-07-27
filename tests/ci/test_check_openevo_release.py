@@ -2215,6 +2215,16 @@ def test_release_smoke_workflow_splits_macos_packaging_from_linux_core() -> None
 
     assert 'node-version: "22"' in linux_job
     assert "dtolnay/rust-toolchain@stable" in linux_job
+    assert "name: Install Linux Tauri dependencies" in linux_job
+    for package in (
+        "libayatana-appindicator3-dev",
+        "libgtk-3-dev",
+        "libwebkit2gtk-4.1-dev",
+    ):
+        assert package in linux_job
+    assert linux_job.index("name: Install Linux Tauri dependencies") < linux_job.index(
+        "name: Build executable Linux packaged sidecar fixture"
+    )
     assert "npm ci" in linux_job
     assert "openevo-core-service ensure" not in linux_job
     assert "openevo-core-service consume-attachment" not in linux_job
