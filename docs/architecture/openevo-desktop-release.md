@@ -73,7 +73,8 @@ The repository currently provides:
   framework before the sidecar can publish Local API readiness. On macOS the
   sidecar builder therefore replaces only the generated outer sidecar signature
   with plain ad-hoc signing before archive verification and publication. The
-  Tauri release overlay sets `hardenedRuntime=false`. Neither layer grants
+  Tauri base bundle and release overlay both set `hardenedRuntime=false`, so
+  the documented local DMG loop and exact candidate share this policy. Neither layer grants
   `com.apple.security.cs.disable-library-validation` or any other entitlement.
   The mounted-DMG and detached-copy gates use exact `/usr/bin/codesign`
   inspection to require `Signature=adhoc`, no Team identifier, the sole
@@ -849,6 +850,22 @@ disconnected and does not claim a surviving tunnel. It only reconciles
 nonterminal reservations, writing
 their cancelled operation and idempotency response together. SSH success alone
 reports `core_not_started`, not an online Core.
+
+### 0.1.10 retained Core authority recovery
+
+The private Core bridge store distinguishes a persisted observation from live
+mutation authority. It may decode an exact `0.1.9` predecessor mapping only
+when that record still has the complete current v2 contract, feature, event,
+OpenAPI, runtime-contract, and verified-registry shape. The historical record
+cannot be committed, replayed as a no-op write, or used to authorize a remote
+operation. Any other historical release or contract drift fails startup closed.
+
+On reconnect, Desktop opens the saved Core project through its active SSH
+tunnel and independently negotiates the exact current `0.1.10` Daemon. Only
+after that live negotiation and project-intent verification does it append a
+successor mapping generation. It does not call project creation again. Thus an
+upgrade preserves the Core project identity while replacing historical
+observation evidence; all new writes remain current-release-only.
 
 ### 0.1.9 system OpenSSH composition
 

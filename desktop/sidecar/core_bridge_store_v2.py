@@ -27,6 +27,10 @@ from desktop.sidecar.core_bridge_v2 import (
     core_project_mapping_document_v2,
     core_project_mapping_sha256_v2,
 )
+from desktop.sidecar.release_capabilities import (
+    ReleaseAuthorityNegotiationError,
+    negotiate_core_v2_mutation,
+)
 from openevo.backend.contracts.v2 import models as core_v2
 
 
@@ -325,6 +329,18 @@ class DesktopCoreBridgeStoreV2:
             expected_previous is not None and type(expected_previous) is not CoreProjectMappingV2
         ):
             raise TypeError("Core mapping CAS requires exact v2 mapping models")
+        try:
+            current_authority = negotiate_core_v2_mutation(
+                mapping.core_version.model_dump(mode="json")
+            )
+        except ReleaseAuthorityNegotiationError as exc:
+            raise CoreBridgeStoreDataV2Error(
+                "Core mapping does not carry current release authority"
+            ) from exc
+        if current_authority != mapping.core_version:
+            raise CoreBridgeStoreDataV2Error(
+                "Core mapping current release authority changed during normalization"
+            )
         document = _mapping_bytes(mapping)
         digest = hashlib.sha256(document).hexdigest()
         with self._transaction(write=True) as connection:
@@ -1328,10 +1344,23 @@ def _validate_mapping_transition(
                 "initial Core mapping does not prove its generation-zero head"
             )
         return
-    stable_owner = (
+    stable_project_owner = (
         previous.desktop_project_id,
         previous.profile_id,
         previous.core_project_id,
+        previous.core_project.created_at,
+    )
+    current_project_owner = (
+        current.desktop_project_id,
+        current.profile_id,
+        current.core_project_id,
+        current.core_project.created_at,
+    )
+    authority_upgrade = (
+        previous.daemon_release_version == "0.1.9"
+        and current.daemon_release_version == "0.1.10"
+    )
+    stable_daemon_authority = (
         previous.daemon_release_version,
         previous.daemon_build_id,
         previous.daemon_source_commit,
@@ -1340,12 +1369,8 @@ def _validate_mapping_transition(
         previous.daemon_registry_sha256,
         previous.daemon_runtime_contract_sha256,
         previous.core_version,
-        previous.core_project.created_at,
     )
-    current_owner = (
-        current.desktop_project_id,
-        current.profile_id,
-        current.core_project_id,
+    current_daemon_authority = (
         current.daemon_release_version,
         current.daemon_build_id,
         current.daemon_source_commit,
@@ -1354,10 +1379,11 @@ def _validate_mapping_transition(
         current.daemon_registry_sha256,
         current.daemon_runtime_contract_sha256,
         current.core_version,
-        current.core_project.created_at,
     )
-    if stable_owner != current_owner or (
-        current.profile_connection_generation < previous.profile_connection_generation
+    if (
+        stable_project_owner != current_project_owner
+        or (not authority_upgrade and stable_daemon_authority != current_daemon_authority)
+        or current.profile_connection_generation < previous.profile_connection_generation
     ):
         raise CoreBridgeStoreConflictV2("Core mapping successor rewrites durable owner authority")
     old_head = previous.active_project_head

@@ -34,6 +34,7 @@ from desktop.sidecar.release_capabilities import (
     negotiate_core_v2_mutation,
     negotiate_desktop_v2_mutation,
     negotiate_v0110_mutation_authority,
+    validate_persisted_core_v2_authority,
     validate_v0110_release_composition,
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
@@ -370,6 +371,22 @@ def test_v0110_core_negotiation_rejects_v1_missing_registry_and_digest_drift() -
     contracts[1] = {**contracts[1], "openapi_sha256": "f" * 64}
     with pytest.raises(ReleaseAuthorityNegotiationError, match="Core OpenAPI"):
         negotiate_core_v2_mutation(payload)
+
+
+def test_persisted_core_authority_accepts_only_exact_v019_predecessor_observation() -> None:
+    historical = {**_v0110_core_discovery(), "release_version": "0.1.9"}
+
+    assert validate_persisted_core_v2_authority(historical).release_version == "0.1.9"
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="release identity"):
+        negotiate_core_v2_mutation(historical)
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="persisted"):
+        validate_persisted_core_v2_authority(
+            {**historical, "release_version": "0.1.8"}
+        )
+    contracts = cast(list[dict[str, object]], historical["contracts"])
+    contracts[1] = {**contracts[1], "event_schema_sha256": "f" * 64}
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="event schema"):
+        validate_persisted_core_v2_authority(historical)
 
 
 @pytest.mark.parametrize(

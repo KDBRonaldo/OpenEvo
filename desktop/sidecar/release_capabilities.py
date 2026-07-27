@@ -249,9 +249,11 @@ def negotiate_desktop_v2_mutation(
     return version
 
 
-def negotiate_core_v2_mutation(
+def _validate_core_v2_authority(
     payload: Mapping[str, object],
     *,
+    allowed_release_versions: tuple[str, ...],
+    release_identity_error: str,
     policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
 ) -> VersionResponseV2:
     registry_identity = payload.get("registry_sha256")
@@ -267,8 +269,11 @@ def negotiate_core_v2_mutation(
         raise ReleaseAuthorityNegotiationError(
             "Core v2 discovery is invalid or lacks verified authority."
         ) from exc
-    if version.release_version != policy.release_version or version.build_channel != "release":
-        raise ReleaseAuthorityNegotiationError("Core release identity is incompatible.")
+    if (
+        version.release_version not in allowed_release_versions
+        or version.build_channel != "release"
+    ):
+        raise ReleaseAuthorityNegotiationError(release_identity_error)
     v2_offer = next(
         (offer for offer in version.contracts if offer.api_major == policy.core_mutation_api_major),
         None,
@@ -284,6 +289,41 @@ def negotiate_core_v2_mutation(
     if not version.mutation_compatible:
         raise ReleaseAuthorityNegotiationError("Core v2 is not mutation-compatible.")
     return version
+
+
+def negotiate_core_v2_mutation(
+    payload: Mapping[str, object],
+    *,
+    policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
+) -> VersionResponseV2:
+    """Require the exact current Core authority before any live mutation."""
+
+    return _validate_core_v2_authority(
+        payload,
+        allowed_release_versions=(policy.release_version,),
+        release_identity_error="Core release identity is incompatible.",
+        policy=policy,
+    )
+
+
+def validate_persisted_core_v2_authority(
+    payload: Mapping[str, object],
+    *,
+    policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
+) -> VersionResponseV2:
+    """Validate a durable observation without granting it live mutation authority.
+
+    v0.1.10 may recover an exact v0.1.9 predecessor observation so it can
+    reconnect to the same Core project and replace that observation with the
+    currently negotiated authority.  No other historical release is accepted.
+    """
+
+    return _validate_core_v2_authority(
+        payload,
+        allowed_release_versions=(policy.release_version, "0.1.9"),
+        release_identity_error="Core persisted release identity is incompatible.",
+        policy=policy,
+    )
 
 
 def validate_v0110_release_composition(

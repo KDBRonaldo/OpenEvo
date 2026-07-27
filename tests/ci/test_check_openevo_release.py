@@ -3814,6 +3814,7 @@ def test_unsigned_macos_release_disables_incompatible_hardened_runtime() -> None
     )
 
     assert base_config["bundle"]["macOS"]["signingIdentity"] == "-"
+    assert base_config["bundle"]["macOS"]["hardenedRuntime"] is False
     assert release_config["bundle"]["macOS"]["hardenedRuntime"] is False
     assert "entitlements" not in base_config["bundle"]["macOS"]
     assert "entitlements" not in release_config["bundle"]["macOS"]

@@ -852,6 +852,13 @@ restart reconciles the same authority through the existing remote lifecycle and
 Core bridge ledgers; it does not issue a replacement create merely because the
 original caller disappeared.
 
+Retained Core bridge state follows the same split. An exact `0.1.9` mapping is
+readable only as predecessor evidence; it never grants live mutation authority.
+Reconnect must negotiate an exact current `0.1.10` Daemon over the active
+project tunnel, verify the existing Core project, and append one successor
+mapping generation without another project-create request. Older releases or
+any v2 contract/feature/digest drift remain startup-fatal.
+
 The lifecycle contract covers all implemented Desktop-owned long work:
 
 - profile connect and disconnect;
@@ -872,6 +879,8 @@ candidate installed in `/Applications`:
 
 - retained `0.1.9` provider schema-v2 state migrates to schema v3 without losing
   profiles or projects;
+- retained `0.1.9` Core bridge mappings recover read-only, then advance exactly
+  once under live `0.1.10` authority without another Core project create;
 - the project-create reservation is returned in less than 15 seconds while the
   terminal operation lasts more than 15 seconds;
 - at least two ordered real phases and actual sanitized SSH/Daemon stdout or

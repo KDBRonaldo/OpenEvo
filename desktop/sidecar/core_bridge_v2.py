@@ -29,7 +29,7 @@ from desktop.sidecar.core_client_v2 import (
 )
 from desktop.sidecar.release_capabilities import (
     ReleaseAuthorityNegotiationError,
-    negotiate_core_v2_mutation,
+    validate_persisted_core_v2_authority,
 )
 from openevo.backend.contracts.v2 import models as core_v2
 
@@ -219,7 +219,9 @@ class CoreProjectMappingV2:
         project = self.core_project
         version = self.core_version
         try:
-            negotiated = negotiate_core_v2_mutation(version.model_dump(mode="json"))
+            negotiated = validate_persisted_core_v2_authority(
+                version.model_dump(mode="json")
+            )
         except ReleaseAuthorityNegotiationError as exc:
             raise ValueError("Core mapping version is not release authority") from exc
         if negotiated != version:
@@ -766,6 +768,7 @@ class DesktopCoreBridgeV2:
                 config=request.config,
             )
             self._observe_lifecycle_progress("creating_remote_project", cancellable=True)
+            bootstrap_version: core_v2.VersionResponseV2 | None
             if previous is None:
                 connection, bootstrap_version = self._bootstrap_project(
                     desktop_project_id=desktop_project_id,
@@ -786,13 +789,13 @@ class DesktopCoreBridgeV2:
                     project_id=previous.core_project_id,
                     session_id=tunnel.session_id,
                 )
-                bootstrap_version = previous.core_version
+                bootstrap_version = None
             client = self._new_client(connection, deadline)
             native_workspace = request.config.workspace.kind == "native_folder_snapshot"
             if not native_workspace:
                 self._observe_lifecycle_progress("verifying_project", cancellable=True)
             version = self._call_core(client.version)
-            if version != bootstrap_version:
+            if bootstrap_version is not None and version != bootstrap_version:
                 raise _bridge_error(
                     "core_authority_changed",
                     "The negotiated Core authority changed during project activation.",
