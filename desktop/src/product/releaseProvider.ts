@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { z } from "zod";
 import type { DesktopApiClientV2, FetchLikeV2 } from "../api/v2/client";
 import {
   createDesktopApiClientV2,
@@ -18,6 +19,40 @@ import type {
   NativeWorkspaceSelectionIntentV2,
 } from "./providerV2";
 import { DESKTOP_PRODUCT_RELEASE_CONTRACT } from "./releaseContract";
+
+const nativeStartupStatusV2Schema = z.object({
+  schema_version: z.literal("2"),
+  startup_epoch: z.number().int().safe().min(0),
+  status: z.enum(["idle", "running", "succeeded", "failed", "cancelled"]),
+  phase: z.enum([
+    "validating_bundle",
+    "spawning_sidecar",
+    "handing_off_descriptors",
+    "waiting_for_local_api",
+    "negotiating_contract",
+    "ready",
+  ]),
+  phase_index: z.number().int().min(0).max(5),
+  phase_total: z.literal(6),
+  elapsed_milliseconds: z.number().int().safe().min(0),
+  cancellable: z.boolean(),
+  failure: z.object({
+    code: z.string().regex(/^[a-z][a-z0-9_]{2,63}$/),
+    message: z.string().min(1).max(768).refine((value) => !/[\u0000-\u001f\u007f]/.test(value)),
+  }).strict().nullable(),
+}).strict().superRefine((value, context) => {
+  if ((value.status === "running") !== value.cancellable) {
+    context.addIssue({ code: "custom", path: ["cancellable"], message: "native startup cancellability differs from running state" });
+  }
+  if ((value.status === "failed") !== (value.failure !== null)) {
+    context.addIssue({ code: "custom", path: ["failure"], message: "native startup failure differs from failed state" });
+  }
+  if ((value.status === "succeeded") !== (value.phase === "ready")) {
+    context.addIssue({ code: "custom", path: ["phase"], message: "native startup ready phase differs from success" });
+  }
+});
+
+export type NativeStartupStatusV2 = z.infer<typeof nativeStartupStatusV2Schema>;
 
 export interface ReleaseNativeBridgeV2 {
   bootstrap(): Promise<unknown>;
@@ -133,6 +168,10 @@ const tauriNativeBridge: ReleaseNativeBridgeV2 = {
 
 export async function stopReleaseDesktopProductProvider(): Promise<void> {
   await tauriNativeBridge.stop();
+}
+
+export async function getReleaseDesktopStartupStatus(): Promise<NativeStartupStatusV2> {
+  return nativeStartupStatusV2Schema.parse(await invoke("sidecar_startup_status"));
 }
 
 export async function reportReleaseDesktopReady(): Promise<void> {

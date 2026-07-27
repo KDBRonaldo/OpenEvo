@@ -8,6 +8,7 @@ import {
 } from "./releaseContract";
 import {
   createReleaseDesktopProductProvider,
+  getReleaseDesktopStartupStatus,
   reportReleaseDesktopReady,
 } from "./releaseProvider";
 
@@ -107,6 +108,41 @@ describe("v0.1.10 release provider", () => {
       eventSchemaSha256: EVENTS,
       releaseVersion: "0.1.10",
     });
+  });
+
+  it("reads only the closed native startup progress projection", async () => {
+    invokeMock.mockResolvedValue({
+      schema_version: "2",
+      startup_epoch: 4,
+      status: "running",
+      phase: "waiting_for_local_api",
+      phase_index: 3,
+      phase_total: 6,
+      elapsed_milliseconds: 16_000,
+      cancellable: true,
+      failure: null,
+    });
+
+    await expect(getReleaseDesktopStartupStatus()).resolves.toMatchObject({
+      status: "running",
+      phase: "waiting_for_local_api",
+      elapsed_milliseconds: 16_000,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("sidecar_startup_status");
+
+    invokeMock.mockResolvedValueOnce({
+      schema_version: "2",
+      startup_epoch: 4,
+      status: "running",
+      phase: "waiting_for_local_api",
+      phase_index: 3,
+      phase_total: 6,
+      elapsed_milliseconds: 16_000,
+      cancellable: true,
+      failure: null,
+      stderr: "private output",
+    });
+    await expect(getReleaseDesktopStartupStatus()).rejects.toThrow();
   });
 
   it("negotiates only v2 before exposing a v2 provider", async () => {

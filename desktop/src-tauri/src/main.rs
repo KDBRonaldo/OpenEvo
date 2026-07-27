@@ -1613,6 +1613,80 @@ struct LifecycleStatus {
     url: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeStartupPhaseV2 {
+    ValidatingBundle,
+    SpawningSidecar,
+    HandingOffDescriptors,
+    WaitingForLocalApi,
+    NegotiatingContract,
+    Ready,
+}
+
+impl NativeStartupPhaseV2 {
+    fn index(self) -> u8 {
+        match self {
+            Self::ValidatingBundle => 0,
+            Self::SpawningSidecar => 1,
+            Self::HandingOffDescriptors => 2,
+            Self::WaitingForLocalApi => 3,
+            Self::NegotiatingContract => 4,
+            Self::Ready => 5,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ValidatingBundle => "validating_bundle",
+            Self::SpawningSidecar => "spawning_sidecar",
+            Self::HandingOffDescriptors => "handing_off_descriptors",
+            Self::WaitingForLocalApi => "waiting_for_local_api",
+            Self::NegotiatingContract => "negotiating_contract",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeStartupProgressStatusV2 {
+    Idle,
+    Running,
+    Succeeded,
+}
+
+struct NativeStartupProgressV2 {
+    startup_epoch: u64,
+    status: NativeStartupProgressStatusV2,
+    phase: NativeStartupPhaseV2,
+    started_at: Option<Instant>,
+    finished_elapsed: Option<Duration>,
+}
+
+impl Default for NativeStartupProgressV2 {
+    fn default() -> Self {
+        Self {
+            startup_epoch: 0,
+            status: NativeStartupProgressStatusV2::Idle,
+            phase: NativeStartupPhaseV2::ValidatingBundle,
+            started_at: None,
+            finished_elapsed: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeStartupStatusV2 {
+    schema_version: &'static str,
+    startup_epoch: u64,
+    status: &'static str,
+    phase: &'static str,
+    phase_index: u8,
+    phase_total: u8,
+    elapsed_milliseconds: u64,
+    cancellable: bool,
+    failure: Option<NativeHostError>,
+}
+
 struct SidecarBootstrapState {
     session_credential: SessionCredential,
     readiness_credential: ReadinessCredential,
@@ -1715,6 +1789,7 @@ struct DesktopHostStateInner {
     start_task_error: Mutex<Option<NativeHostError>>,
     cancellation_epoch: AtomicU64,
     launch_state: AtomicU64,
+    startup_progress: Mutex<NativeStartupProgressV2>,
     shutdown_requested: AtomicBool,
     active_picker: Mutex<Option<Arc<NativePickerOperation>>>,
     cancelled_picker_actions: Mutex<VecDeque<String>>,
@@ -1748,6 +1823,7 @@ impl Default for DesktopHostState {
             start_task_error: Mutex::new(None),
             cancellation_epoch: AtomicU64::new(0),
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
+            startup_progress: Mutex::new(NativeStartupProgressV2::default()),
             shutdown_requested: AtomicBool::new(false),
             active_picker: Mutex::new(None),
             cancelled_picker_actions: Mutex::new(VecDeque::new()),
@@ -5411,6 +5487,98 @@ fn startup_cancelled(state: &DesktopHostState, initial_epoch: u64) -> bool {
         || phase == LaunchPhase::Cancelled
 }
 
+fn begin_native_startup_progress(state: &DesktopHostState, startup_epoch: u64) -> HostResult<()> {
+    let mut progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    *progress = NativeStartupProgressV2 {
+        startup_epoch,
+        status: NativeStartupProgressStatusV2::Running,
+        phase: NativeStartupPhaseV2::ValidatingBundle,
+        started_at: Some(Instant::now()),
+        finished_elapsed: None,
+    };
+    Ok(())
+}
+
+fn update_native_startup_progress(
+    state: &DesktopHostState,
+    startup_epoch: u64,
+    phase: NativeStartupPhaseV2,
+) -> HostResult<()> {
+    let mut progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    if progress.startup_epoch != startup_epoch
+        || progress.status != NativeStartupProgressStatusV2::Running
+        || phase.index() < progress.phase.index()
+    {
+        return Err(sidecar_state_error());
+    }
+    progress.phase = phase;
+    Ok(())
+}
+
+fn finish_native_startup_progress(state: &DesktopHostState, startup_epoch: u64) -> HostResult<()> {
+    let mut progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    if progress.startup_epoch != startup_epoch
+        || progress.status != NativeStartupProgressStatusV2::Running
+    {
+        return Err(sidecar_state_error());
+    }
+    progress.phase = NativeStartupPhaseV2::Ready;
+    progress.status = NativeStartupProgressStatusV2::Succeeded;
+    progress.finished_elapsed = progress.started_at.map(|started| started.elapsed());
+    Ok(())
+}
+
+fn sidecar_startup_status_inner(state: &DesktopHostState) -> HostResult<NativeStartupStatusV2> {
+    let progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    let elapsed = progress
+        .finished_elapsed
+        .or_else(|| progress.started_at.map(|started| started.elapsed()))
+        .unwrap_or_default();
+    let (launch_epoch, launch_phase) =
+        decode_launch_state(state.launch_state.load(Ordering::Acquire));
+    let startup_running = state.startup_in_progress.load(Ordering::Acquire);
+    let (status, failure) = match progress.status {
+        NativeStartupProgressStatusV2::Idle => ("idle", None),
+        NativeStartupProgressStatusV2::Succeeded => ("succeeded", None),
+        NativeStartupProgressStatusV2::Running if startup_running => ("running", None),
+        NativeStartupProgressStatusV2::Running
+            if launch_epoch != progress.startup_epoch || launch_phase == LaunchPhase::Cancelled =>
+        {
+            ("cancelled", None)
+        }
+        NativeStartupProgressStatusV2::Running => (
+            "failed",
+            Some(NativeHostError::new(
+                "sidecar_startup_failed",
+                "OpenEvo Desktop could not finish local service startup.",
+            )),
+        ),
+    };
+    Ok(NativeStartupStatusV2 {
+        schema_version: "2",
+        startup_epoch: progress.startup_epoch,
+        status,
+        phase: progress.phase.as_str(),
+        phase_index: progress.phase.index(),
+        phase_total: 6,
+        elapsed_milliseconds: elapsed.as_millis().min(u64::MAX as u128) as u64,
+        cancellable: status == "running",
+        failure,
+    })
+}
+
 fn sidecar_start_cancelled_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_start_cancelled",
@@ -6057,6 +6225,7 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         Some(epoch) => StartupClaim::acquire_expected(state, epoch)?,
         None => StartupClaim::acquire(state)?,
     };
+    begin_native_startup_progress(state, startup_epoch)?;
     let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     if let Some(managed) = sidecar.as_mut() {
         if managed.lifecycle == ManagedLifecycle::CleanupPending {
@@ -6084,6 +6253,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
                     check_sidecar_session_binding(port, session_token.expose())
                 })();
                 if validation.is_ok() {
+                    update_native_startup_progress(
+                        state,
+                        startup_epoch,
+                        NativeStartupPhaseV2::NegotiatingContract,
+                    )?;
                     state.desktop_logs.record_startup_stage(
                         DesktopLogSource::Native,
                         DesktopStartupStage::LocalApi,
@@ -6093,7 +6267,9 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
                         None,
                         None,
                     );
-                    return managed.bootstrap_context();
+                    let context = managed.bootstrap_context()?;
+                    finish_native_startup_progress(state, startup_epoch)?;
+                    return Ok(context);
                 }
                 managed.mark_cleanup_pending();
                 if cleanup_managed_sidecar_with(control, managed).is_err() {
@@ -6130,6 +6306,7 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         None,
         None,
     );
+    update_native_startup_progress(state, startup_epoch, NativeStartupPhaseV2::SpawningSidecar)?;
     let mut credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
     let parent_liveness_writer = prepared.take_parent_liveness_writer()?;
@@ -6182,6 +6359,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         None,
         None,
     );
+    update_native_startup_progress(
+        state,
+        startup_epoch,
+        NativeStartupPhaseV2::HandingOffDescriptors,
+    )?;
     if let Err(error) = finalize_state_owned_private_executable(state) {
         return Err(fail_state_owned_startup(state, control, error));
     }
@@ -6200,6 +6382,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         None,
         None,
     );
+    update_native_startup_progress(
+        state,
+        startup_epoch,
+        NativeStartupPhaseV2::WaitingForLocalApi,
+    )?;
     let validated_contract = match wait_for_state_owned_sidecar_ready(
         state,
         control,
@@ -6211,6 +6398,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         Ok(contract) => contract,
         Err(error) => return Err(fail_state_owned_startup(state, control, error)),
     };
+    update_native_startup_progress(
+        state,
+        startup_epoch,
+        NativeStartupPhaseV2::NegotiatingContract,
+    )?;
     if let Err(error) = retain_sidecar_release_identity(state, &validated_contract) {
         return Err(fail_state_owned_startup(state, control, error));
     }
@@ -6233,7 +6425,10 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         negotiated_contract: validated_contract.negotiated,
     };
     match publish_sidecar_gated(state, startup_epoch, bootstrap) {
-        Ok(context) => Ok(context),
+        Ok(context) => {
+            finish_native_startup_progress(state, startup_epoch)?;
+            Ok(context)
+        }
         Err(error) => Err(fail_state_owned_startup(state, control, error)),
     }
 }
@@ -6549,6 +6744,13 @@ fn mutation_intent_journal_conflict_error() -> NativeHostError {
 #[tauri::command]
 fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     host_status_inner(&state)
+}
+
+#[tauri::command]
+fn sidecar_startup_status(
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<NativeStartupStatusV2> {
+    sidecar_startup_status_inner(&state)
 }
 
 #[tauri::command]
@@ -7506,6 +7708,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             host_status,
+            sidecar_startup_status,
             sidecar_bootstrap_context,
             read_run_retry_recovery,
             write_run_retry_recovery,
@@ -7569,6 +7772,60 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn native_startup_status_reports_closed_monotonic_progress() {
+        let state = DesktopHostState::default();
+        state.startup_in_progress.store(true, Ordering::Release);
+        begin_native_startup_progress(&state, 7).unwrap();
+        update_native_startup_progress(&state, 7, NativeStartupPhaseV2::WaitingForLocalApi)
+            .unwrap();
+
+        let running = sidecar_startup_status_inner(&state).unwrap();
+        assert_eq!(running.schema_version, "2");
+        assert_eq!(running.startup_epoch, 7);
+        assert_eq!(running.status, "running");
+        assert_eq!(running.phase, "waiting_for_local_api");
+        assert_eq!(running.phase_index, 3);
+        assert_eq!(running.phase_total, 6);
+        assert!(running.cancellable);
+        assert!(running.failure.is_none());
+        assert!(
+            update_native_startup_progress(&state, 7, NativeStartupPhaseV2::SpawningSidecar,)
+                .is_err()
+        );
+
+        finish_native_startup_progress(&state, 7).unwrap();
+        state.startup_in_progress.store(false, Ordering::Release);
+        let complete = sidecar_startup_status_inner(&state).unwrap();
+        assert_eq!(complete.status, "succeeded");
+        assert_eq!(complete.phase, "ready");
+        assert!(!complete.cancellable);
+        assert!(complete.failure.is_none());
+    }
+
+    #[test]
+    fn native_startup_status_classifies_failed_and_cancelled_epochs_without_process_output() {
+        let failed_state = DesktopHostState::default();
+        begin_native_startup_progress(&failed_state, 0).unwrap();
+        let failed = sidecar_startup_status_inner(&failed_state).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.failure.as_ref().unwrap().code,
+            "sidecar_startup_failed"
+        );
+        assert!(!failed.failure.as_ref().unwrap().message.contains('/'));
+
+        let cancelled_state = DesktopHostState::default();
+        begin_native_startup_progress(&cancelled_state, 0).unwrap();
+        cancelled_state.launch_state.store(
+            encode_launch_state(1, LaunchPhase::Cancelled),
+            Ordering::Release,
+        );
+        let cancelled = sidecar_startup_status_inner(&cancelled_state).unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.failure.is_none());
+    }
 
     fn test_temp_root(temp: &TempDir) -> PathBuf {
         fs::canonicalize(temp.path()).unwrap()
