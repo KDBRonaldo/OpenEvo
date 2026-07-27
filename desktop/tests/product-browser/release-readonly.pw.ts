@@ -350,7 +350,11 @@ test("the packaged release recovers pending lifecycle progress and process logs"
   expect(observation.unexpectedCalls).toEqual([]);
   expect(observation.httpCalls).toEqual(expect.arrayContaining([
     { method: "GET", path: `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}`, authenticated: true },
-    { method: "GET", path: `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100`, authenticated: true },
+    {
+      method: "GET",
+      path: `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100&after_sequence=0`,
+      authenticated: true,
+    },
   ]));
   expect(observation.httpCalls.every(({ method }) => method === "GET")).toBe(true);
   await page.goto("about:blank");
@@ -532,8 +536,19 @@ async function installReleaseSidecarContract(
       return json(route, pendingLifecycleOperation());
     }
     if (options.lifecycleOperation === true
-      && path === `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100`) {
+      && path === `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100&after_sequence=0`) {
       return json(route, pendingLifecycleLogs());
+    }
+    if (options.lifecycleOperation === true
+      && path === `/desktop/v2/operations/${LIFECYCLE_OPERATION_ID}/logs?limit=100&after_sequence=3`) {
+      return json(route, {
+        schema_version: "2",
+        operation_id: LIFECYCLE_OPERATION_ID,
+        dropped_before_sequence: 0,
+        items: [],
+        next_cursor: null,
+        has_more: false,
+      });
     }
     return rejectUnexpectedRoute(route, observation, `${method} ${path}`);
   });
