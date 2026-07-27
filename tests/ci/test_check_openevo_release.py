@@ -2765,6 +2765,22 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert 'current_state="$current_root/state-v2"' in shipped_app_smoke
     assert 'current_provider_state="$current_state/provider-v2"' in shipped_app_smoke
     assert 'current_native_state="$current_root/native-state-v2"' in shipped_app_smoke
+    assert (
+        'current_mutation_intent="$current_native_state/.02b78cf9e16a4d13"'
+        in shipped_app_smoke
+    )
+    assert (
+        'current_mutation_lock="$current_native_state/.9ce2b4f77d1848f1"'
+        in shipped_app_smoke
+    )
+    assert (
+        'current_run_retry="$current_native_state/.7f3d8b24c1a94762"'
+        in shipped_app_smoke
+    )
+    assert (
+        'current_run_retry_lock="$current_native_state/.c41d73e981bf4a56"'
+        in shipped_app_smoke
+    )
     assert 'legacy_native_retry="$current_root/.7f3d8b24c1a94762"' in shipped_app_smoke
     assert 'legacy_native_lock="$current_root/.c41d73e981bf4a56"' in shipped_app_smoke
     assert "intentionally corrupt Preview database" in shipped_app_smoke
@@ -2779,7 +2795,15 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )
     assert 'test -f "$current_provider_state/provider-v2.lock"' in shipped_app_smoke
     assert 'test ! -e "$current_state/provider.sqlite3"' in shipped_app_smoke
-    assert shipped_app_smoke.count('test ! -e "$current_native_state"') == 2
+    assert shipped_app_smoke.count('test ! -e "$current_native_state"') == 1
+    assert 'test -d "$current_native_state"' in shipped_app_smoke
+    assert 'test -f "$current_mutation_lock"' in shipped_app_smoke
+    assert 'test ! -e "$current_mutation_intent"' in shipped_app_smoke
+    assert 'test ! -e "$current_run_retry"' in shipped_app_smoke
+    assert 'test ! -e "$current_run_retry_lock"' in shipped_app_smoke
+    assert 'test "$(stat -f \'%Lp\' "$current_native_state")" = 700' in shipped_app_smoke
+    assert 'test "$(stat -f \'%Lp\' "$current_mutation_lock")" = 600' in shipped_app_smoke
+    assert 'test "$(stat -f \'%z\' "$current_mutation_lock")" = 0' in shipped_app_smoke
     assert 'cmp "$legacy_native_retry" "$RUNNER_TEMP/legacy-native-retry"' in shipped_app_smoke
     assert 'cmp "$legacy_native_lock" "$RUNNER_TEMP/legacy-native-lock"' in shipped_app_smoke
     assert shipped_app_smoke.count('dmg="candidate-artifacts/OpenEvo-Desktop-') == 1
