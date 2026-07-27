@@ -94,7 +94,7 @@ def test_real_science_validator_tracks_release_candidate_schema() -> None:
     )
 
 
-def test_real_science_release_path_is_v2_system_openssh_only() -> None:
+def test_real_science_release_path_is_v2_system_openssh_with_v3_lifecycle_evidence() -> None:
     root = Path(__file__).resolve().parents[2]
     runner = (root / "scripts/e2e/desktop_real_science_e2e.py").read_text(
         encoding="utf-8"
@@ -107,7 +107,16 @@ def test_real_science_release_path_is_v2_system_openssh_only() -> None:
     assert "--ssh-host-alias" in runner
     assert "/desktop/v1/" not in runner
     assert "ssh_agent" not in runner
-    assert '"schema_version": "2"' in validator
+    assert _load_real_science_validator_module().EVIDENCE_SCHEMA_IDENTITY == {
+        "schema_version": "3"
+    }
+    for marker in (
+        "lifecycle_evidence",
+        "reservation_latency_ms",
+        "relaunch_recovery_verified",
+        "require_renderer_secret_canary_absence",
+    ):
+        assert marker in validator
 
 
 def _load_framework_wheel_smoke_module():
@@ -258,7 +267,7 @@ def test_sidecar_smoke_launches_process_and_checks_assets(tmp_path: Path) -> Non
     helper.write_bytes(b"packaged askpass helper fixture")
     helper.chmod(0o755)
 
-    smoke.smoke_sidecar(sidecar, timeout_seconds=5)
+    smoke.smoke_sidecar(sidecar, timeout_seconds=5, exercise_lifecycle=False)
 
 
 def test_sidecar_smoke_rejects_unreviewed_openapi_digest() -> None:
@@ -2544,6 +2553,8 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "tests/ci/test_build_sidecar.py",
         "tests/ci/test_openevo_release_candidate.py",
         "tests/ci/test_openevo_release_evidence.py",
+        "tests/ci/test_smoke_openevo_desktop_sidecar.py",
+        "tests/ci/test_smoke_openevo_desktop_launchservices.py",
         "tests/openevo/sidecar/test_core_bridge_store_v2.py::test_release_evidence_summary_requires_one_applied_project_create",
         "tests/openevo/remote/test_system_executables.py",
         "tests/openevo/remote/test_host_keys.py",
@@ -2870,7 +2881,12 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
         "Agent-system pass@1 rescue count: pending.",
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-        "Credential-canary verification for release assets: pending.",
+        "Project creation is reserved as a durable operation",
+        "All implemented long-running workflows",
+        "sanitized SSH and Daemon stdout/stderr",
+        "Exact-candidate publication requires a generated secret canary",
+        "Full release-asset and privacy qualification remains pending.",
+        "Existing duplicate projects from v0.1.9 are preserved",
         "Current local Desktop data under ~/Library/Application Support/org.openevo.desktop",
         "Legacy Preview data under ~/.openevo/desktop is preserved without being read",
         "org.openevo.desktop",

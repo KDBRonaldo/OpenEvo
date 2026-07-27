@@ -14,13 +14,16 @@ import pytest
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_launchservices.py"
 )
-RELEASE_OPENAPI_SHA256 = "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
-RELEASE_EVENT_SCHEMA_SHA256 = "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
+RELEASE_OPENAPI_SHA256 = "4cd120dab0797e223ba892b0382fd61f8e4156318df9ab6676236c201191a98a"
+RELEASE_EVENT_SCHEMA_SHA256 = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
 RELEASE_FEATURE_FLAGS = [
     "core_control_v2",
     "daemon_bundle_v2",
     "event_replay_v2",
     "host_key_review",
+    "lifecycle_operations_v2",
+    "lifecycle_process_logs_v2",
+    "mutation_idempotency_v2",
     "native_askpass",
     "system_openssh_profiles",
     "task_admission_v2",
@@ -51,7 +54,7 @@ def _version_payload() -> dict[str, object]:
         "mutation_major": 2,
         "openapi_sha256": RELEASE_OPENAPI_SHA256,
         "event_schema_sha256": RELEASE_EVENT_SCHEMA_SHA256,
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "build_id": "a" * 64,
         "source_commit": "b" * 40,
         "build_channel": "release",
@@ -172,7 +175,7 @@ def test_app_roots_uses_exact_process_paths_not_command_text(tmp_path: Path) -> 
 def test_validate_version_accepts_closed_v2_release() -> None:
     smoke = _load_module()
 
-    smoke.validate_version(_version_payload(), "0.1.9")
+    smoke.validate_version(_version_payload(), "0.1.10")
 
 
 def test_validate_version_rejects_malformed_release_provider() -> None:
@@ -181,7 +184,7 @@ def test_validate_version_rejects_malformed_release_provider() -> None:
     payload["provider_kind"] = "test_provider"
 
     with pytest.raises(smoke.SmokeFailure, match="expected release provider"):
-        smoke.validate_version(payload, "0.1.9")
+        smoke.validate_version(payload, "0.1.10")
 
 
 def test_validate_version_rejects_unbound_feature_set() -> None:
@@ -190,7 +193,7 @@ def test_validate_version_rejects_unbound_feature_set() -> None:
     payload["feature_set_sha256"] = "c" * 64
 
     with pytest.raises(smoke.SmokeFailure, match="malformed"):
-        smoke.validate_version(payload, "0.1.9")
+        smoke.validate_version(payload, "0.1.10")
 
 
 def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) -> None:
@@ -225,7 +228,7 @@ def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) ->
             "result": "failed",
             "code": "python_shared_library_validation_failed",
             "duration_bucket": "under_1s",
-            "product_version": "0.1.9",
+            "product_version": "0.1.10",
             "source_commit": None,
             "exit_code": None,
             "signal": None,
@@ -245,7 +248,7 @@ def test_launchservices_reads_only_new_closed_startup_failure(tmp_path: Path) ->
             "result": None,
             "code": "unknown_2_sha256_" + "a" * 64,
             "duration_bucket": None,
-            "product_version": "0.1.9",
+            "product_version": "0.1.10",
             "source_commit": "b" * 40,
             "exit_code": None,
             "signal": None,
@@ -285,7 +288,7 @@ def test_launchservices_rejects_open_v2_startup_envelopes(tmp_path: Path) -> Non
         "result": "failed",
         "code": "python_shared_library_validation_failed",
         "duration_bucket": "under_1s",
-        "product_version": "0.1.9",
+        "product_version": "0.1.10",
         "source_commit": None,
         "exit_code": None,
         "signal": None,
@@ -409,11 +412,11 @@ def test_successful_smoke_writes_closed_non_sensitive_evidence(
             return True
 
     evidence_path = tmp_path / "evidence.json"
-    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.9-aarch64.dmg"
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.10-aarch64.dmg"
     source_dmg.write_bytes(b"candidate dmg")
     evidence = smoke.smoke_launchservices(
         app,
-        expected_version="0.1.9",
+        expected_version="0.1.10",
         timeout_seconds=2,
         evidence_out=evidence_path,
         source_dmg=source_dmg,
@@ -499,11 +502,11 @@ def test_smoke_retries_owned_listener_until_version_is_ready(
             return True
 
     system = System()
-    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.9-aarch64.dmg"
+    source_dmg = tmp_path / "OpenEvo-Desktop-0.1.10-aarch64.dmg"
     source_dmg.write_bytes(b"candidate dmg")
     smoke.smoke_launchservices(
         app,
-        expected_version="0.1.9",
+        expected_version="0.1.10",
         timeout_seconds=2,
         evidence_out=tmp_path / "evidence.json",
         source_dmg=source_dmg,

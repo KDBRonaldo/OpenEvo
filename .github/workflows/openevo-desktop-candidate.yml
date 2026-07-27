@@ -229,6 +229,8 @@ jobs:
             tests/ci/test_openevo_release_evidence.py \
             tests/ci/test_desktop_real_science_e2e.py \
             tests/ci/test_validate_desktop_real_science_e2e.py \
+            tests/ci/test_smoke_openevo_desktop_sidecar.py \
+            tests/ci/test_smoke_openevo_desktop_launchservices.py \
             tests/ci/test_desktop_system_ssh_integration.py \
             tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \

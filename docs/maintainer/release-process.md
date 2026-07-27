@@ -100,7 +100,7 @@ all three text-evolution targets, next-session artifact reuse, and packaged
 renderer observability. It retains the non-gating Preview boundary and is not a
 G1-G12 candidate.
 
-Version `0.1.9` is the current public immutable unsigned exhibition Preview,
+Version `0.1.9` is the latest public immutable unsigned exhibition Preview,
 published on July 27, 2026 from source
 `54650e477a76dd07b0a511ad5450c3b8ea615556`, candidate run `30212086910`, and
 publication run `30214520279` under tag
@@ -120,6 +120,21 @@ Project Heads, exact Task-2 Runtime Context reuse, and live Desktop v2 renderer
 observability. It remains unsigned, unnotarized, non-gating, and not a G1-G12
 candidate; the clean-host matrix, both execution modes, protected performance,
 and the remaining External Beta gates are still open.
+
+Version `0.1.10` is the active immutable Preview release target. It keeps the
+`0.1.9` System OpenSSH alias authority and repairs the project-create timeout by
+reserving a durable lifecycle operation before remote work begins. Exact retry,
+renderer reload, SSE reconnect, and sidecar relaunch must preserve the same
+action and operation identities and reconcile to one Core project, one mapping,
+and one applied mutation. The shared progress surface covers all implemented
+long-running work: Desktop-owned profile/host-key/Daemon/native-workspace/project
+lifecycles, native startup, and Core-owned Tasks, successor transitions,
+services, diagnostics, and maintenance operations. Actual sanitized SSH and
+Daemon stdout/stderr may be shown; commands, environment values, credentials,
+tokens, Core endpoints, and absolute host paths may not. Existing duplicate
+projects created by ambiguous `0.1.9` retries are preserved and may be manually
+ignored; migration never deletes them. This paragraph is release intent until
+the guarded publisher completes and immutable identities are recorded.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
@@ -341,15 +356,23 @@ This Playwright result proves only the source-bound packaged Desktop interaction
 and viewport contract represented by those browser tests. It is not evidence
 of a real Codex Subscription science run. Release notes must describe Codex
 Subscription support as packaged and declared while the release remains a
-draft. A public v0.1.9 Preview additionally requires candidate-bound evidence
+draft. A public v0.1.10 Preview additionally requires candidate-bound evidence
 for the exact packaged macOS Desktop sidecar and askpass helper, a
 `system_openssh` workspace selected from the user's literal SSH-config aliases,
 a supported remote OpenEvo Daemon/Core v2, subscription-authenticated Codex
 with transcript capture, two completed immutable Tasks, three typed Evolution
 Revision outputs per successor, an adjacent generation-0 -> generation-1 ->
 generation-2 Project Head chain, Task-2 Runtime Context reuse, and
-packaged-renderer v2 observation. Without that evidence, neither a Preview nor
-a packaging candidate may say that a real Codex Subscription Task was
+packaged-renderer v2 observation. It also requires one project-create lifecycle
+whose reservation completes below the renderer deadline, whose terminal work
+lasts more than 15 seconds, whose ordered phases and sanitized SSH/Daemon log
+sources are rendered, and whose authority survives an SSE reconnect and
+sidecar relaunch without a second create request. Post-shutdown evidence must
+show one Core project, one mapping, and one applied mutation for the stable
+action ID, and a generated secret canary must be absent from lifecycle payloads,
+renderer text, screenshot bytes, support output, and the evidence document.
+Without that evidence, neither a Preview nor a packaging candidate may say
+that a real Codex Subscription Task or the lifecycle timeout repair was
 validated.
 
 The exact-candidate run is performed on the macOS release host after the draft
@@ -377,7 +400,7 @@ post-candidate policy relaxation.
 
 The current rehearsal's dependency and security summaries and Core descriptor
 use schema version 2 for those closed contracts. The release candidate manifest
-uses version 9, with explicit Developer ID, ad-hoc bundle signature,
+uses version 10, with explicit Developer ID, ad-hoc bundle signature,
 notarization, quarantine-removal, Rust-toolchain, and closed unsigned macOS
 code-signing-policy fields. For the unsigned Preview, the policy requires plain
 ad-hoc signing with hardened runtime disabled and rejects the

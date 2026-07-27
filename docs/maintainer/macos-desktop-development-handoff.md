@@ -1,7 +1,7 @@
 # macOS Desktop Development Handoff
 
-Status: completed `0.1.9` handoff; retained as the startup-incident and release
-record
+Status: completed `0.1.9` startup handoff; `0.1.10` lifecycle-recovery release
+validation in progress
 
 Last updated: 2026-07-27
 
@@ -32,6 +32,14 @@ into this startup repair.
 The immutable `0.1.9` Preview recorded in section 11.2 completed this objective
 within the explicitly limited Preview support profile. The remaining External
 Beta and unsupported-flow gaps listed there remain open.
+
+The first real post-release project creation then exposed a separate `0.1.9`
+defect: the renderer stopped waiting after 15 seconds while the sidecar kept
+creating the remote project, and a retry used a new mutation identity. The
+`0.1.10` objective is therefore broader than raising a timeout. Every
+implemented long-running workflow must expose durable authority, progress,
+logs, restart recovery, cancellation where safe, and exact idempotent retry.
+Section 11.3 records that release target and its acceptance boundary.
 
 Do not change the implementation or behavior of any evolution algorithm while
 repairing Desktop packaging, startup, diagnostics, or remote control.
@@ -106,6 +114,13 @@ through the sealed native askpass surface. It does not copy a key, password, or
 passphrase into renderer, Local API, argv, logs, diagnostics, or OpenEvo state.
 A changed key remains a separate blocking review and must not be approved merely
 because `ssh evolab` previously worked.
+
+For `0.1.10`, Desktop may display actual SSH and Daemon child stdout/stderr in
+the operation panel after terminal-control stripping, bounding, and mandatory
+sanitization. It still must not expose the child command line, environment,
+credentials, tokens, Core endpoint, askpass values, or absolute host paths.
+Log text never establishes success; the durable operation and remote Core
+authority do.
 
 As of this handoff, the remote container has the required first-release profile:
 
@@ -242,7 +257,7 @@ Do not update lockfiles merely because a newer local tool is available. Any
 intentional dependency or toolchain update needs its own reviewed change and
 release evidence.
 
-## 4. Current Public Release
+## 4. Current Public Release And Active Target
 
 The current public artifact is the immutable unsigned `0.1.9` Preview:
 
@@ -262,6 +277,15 @@ incident below; its mounted-DMG and copied-app smokes did not reproduce the
 real Tahoe startup failure. Version `0.1.9` adds exact-candidate Mac and remote
 evidence, but remains a non-gating Preview rather than proof of the complete
 External Beta contract or G1-G12.
+
+The active target is `0.1.10`. It remains an unsigned, unnotarized Apple Silicon
+Preview for macOS 12 or later and the documented Linux `x86_64` Docker
+user-container remote profile. It retains the System OpenSSH configured-alias
+authority, permits UID 0 only inside the already existing approved user
+container, migrates retained provider schema-v2 state to schema v3, and adds
+durable lifecycle operations plus a shared progress/log surface for all
+implemented long-running work. It is not public until the guarded candidate,
+installed-app real-science, evidence-signing, and publication workflows finish.
 
 ## 5. Reproduced User Failure
 
@@ -809,3 +833,60 @@ adapter evolution, Task artifact-content collection, a complete clean-host and
 network matrix, Developer ID signing/notarization, and the final Tauri-to-remote
 single-process E2E remain unsupported or unproven. Local Mac execution remains
 deferred to `0.2.0`; the remaining G1-G12 External Beta gates are still open.
+
+### 11.3 `0.1.10` lifecycle-recovery release target
+
+The user-visible trigger was `Desktop Local API request timed out` while
+creating a project. The remote create later succeeded, so retrying minted a
+second action and could create a duplicate project. Existing duplicate
+`0.1.9` projects are intentionally preserved and may be manually ignored;
+Desktop migration does not delete them.
+
+`0.1.10` changes project creation to a prompt HTTP 202 reservation backed by a
+durable lifecycle operation. The renderer's native mutation-intent journal
+retains the exact action ID across ambiguous HTTP results, WebView reload,
+application restart, and explicit retry. The sidecar persists the exact request,
+operation phase, progress, bounded logs, cancellation state, terminal result,
+and acknowledgement handshake before or atomically with external work. A
+restart reconciles the same authority through the existing remote lifecycle and
+Core bridge ledgers; it does not issue a replacement create merely because the
+original caller disappeared.
+
+The lifecycle contract covers all implemented Desktop-owned long work:
+
+- profile connect and disconnect;
+- host-key review continuation;
+- remote preflight, transfer, Daemon install/upgrade/verification/start/readiness,
+  tunnel opening, and Core negotiation;
+- native-workspace traversal, archive preparation, transfer, and adoption; and
+- project creation and activation.
+
+Native app/sidecar startup occurs before the Local API, so Tauri exposes its
+own closed startup status. Core-owned Tasks, successor transitions, service
+restarts, diagnostics, and maintenance operations retain Core authority and are
+rendered by the same long-operation panel without a Desktop shadow operation.
+Fast bounded CRUD and SSH-catalog parsing remain synchronous.
+
+Release acceptance must prove all of the following against the exact downloaded
+candidate installed in `/Applications`:
+
+- retained `0.1.9` provider schema-v2 state migrates to schema v3 without losing
+  profiles or projects;
+- the project-create reservation is returned in less than 15 seconds while the
+  terminal operation lasts more than 15 seconds;
+- at least two ordered real phases and actual sanitized SSH/Daemon stdout or
+  stderr are visible with a progress bar and elapsed time;
+- one SSE reconnect and one sidecar relaunch retain the exact operation and
+  action identities without another create request;
+- post-shutdown authority contains exactly one Core project, one Desktop/Core
+  mapping, and one applied create mutation for that action;
+- a generated secret canary is absent from Local API pages, rendered text,
+  screenshots, support output, and evidence;
+- two real subscription Tasks still prove generation 0 -> 1 -> 2, three textual
+  evolution outputs per successor, and Task-2 Runtime Context reuse; and
+- profile disconnect and complete local process-group cleanup succeed.
+
+The immutable source commit, candidate/publication runs, tag, DMG SHA-256,
+installed binary identities, signed evidence digests, and final result remain
+blank until those gates actually complete. Do not convert this target section
+into a completion claim early.

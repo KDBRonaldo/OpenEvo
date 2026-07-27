@@ -75,7 +75,12 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
     assert "Self-Deployed Reference mode: unavailable in this Preview." in notes
     assert "openevo-science-runtime-0.1.1-linux-amd64.tar.gz" in notes
     assert "Managed Science runtime source asset ID: 481361975." in notes
-    assert "Credential-canary verification for release assets: pending." in notes
+    assert "Project creation is reserved as a durable operation" in notes
+    assert "All implemented long-running workflows" in notes
+    assert "sanitized SSH and Daemon stdout/stderr" in notes
+    assert "generated secret canary" in notes
+    assert "Full release-asset and privacy qualification remains pending." in notes
+    assert "Existing duplicate projects from v0.1.9 are preserved" in notes
     assert "Current local Desktop data under ~/Library/Application Support" in notes
     assert "Legacy Preview data under ~/.openevo/desktop is preserved without being read" in notes
     assert "org.openevo.desktop" in notes
@@ -854,7 +859,8 @@ def test_managed_runtime_source_binds_prerelease_asset_and_download(
         "Agent-system pass@1 rescue count: pending.",
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-        "Credential-canary verification for release assets: pending.",
+        "Exact-candidate publication requires a generated secret canary",
+        "Full release-asset and privacy qualification remains pending.",
         "## Install, Upgrade, And Uninstall",
         "Install:",
         "Upgrade:",

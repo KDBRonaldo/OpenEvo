@@ -11,7 +11,7 @@ an adjacent successor Project Head chain against a remote host.
 Use focused tests for ordinary changes and broaden the suite when touching
 shared contracts.
 
-Version `0.1.9` is the current unsigned, non-gating Preview. Its real mounted
+Version `0.1.9` is the current public unsigned, non-gating Preview. Its real mounted
 and copied DMG, Tahoe-compatible packaged sidecar, native askpass helper,
 System OpenSSH alias path, packaged renderer, self-contained Daemon Bundle,
 managed runtime, startup diagnostics, and immutable asset roundtrip are current
@@ -20,6 +20,19 @@ real remote Codex subscription Tasks, all three text-evolution targets,
 adjacent successor Project Heads, next-session Runtime Context reuse, and live
 Desktop v2 renderer observability. It is still not G2, G3, G12, or full
 External Beta evidence. Earlier Preview releases remain historical evidence.
+
+Version `0.1.10` is the active Preview release target. In addition to retaining
+the `0.1.9` system-OpenSSH and two-Task path, it must prove that project creation
+returns a durable operation reservation before the renderer's bounded Local API
+deadline, continues for more than 15 seconds, survives an SSE reconnect and one
+sidecar relaunch, and reconciles to exactly one Core project, one Desktop/Core
+mapping, and one applied create mutation. The same shared operation presentation
+must cover every implemented long-running authority: Desktop-owned profile,
+host-key, Daemon, native-workspace, and project lifecycle work; native startup;
+and Core-owned Tasks, successor transitions, services, diagnostics, and
+maintenance operations. Lifecycle output may include actual sanitized SSH and
+Daemon stdout/stderr. Commands, environment values, credentials, tokens, Core
+endpoints, and absolute host paths remain forbidden.
 
 ## Focused Tests
 
@@ -90,7 +103,7 @@ become a zombie before observer installation, proving that Darwin's kqueue plus
 non-reaping `ps` snapshot closes the registration gap. These rules model the
 production ownership lifecycle without weakening its fail-closed checks.
 
-The v0.1.9 system-OpenSSH gate is
+The v0.1.10 system-OpenSSH gate is
 `scripts/ci/run_desktop_system_ssh_integration.py --require-complete`. It is a
 required macOS candidate step and fails when the Apple `sshd`, SSH tools, C
 compiler, loopback fixture, askpass broker, or any asserted workflow is
@@ -170,6 +183,16 @@ identities verify; checksums match; and every declared asset passes a
 clean-directory download roundtrip. A separate Subscription rehearsal is valid
 only when its canonical evidence records the exact Preview bytes, remote Docker
 execution, and preinstalled, signed-in Codex identity used on the host.
+
+For `0.1.10`, the packaged-sidecar smoke also starts from an exact retained
+provider schema-v2 fixture, requires packaged migration to schema v3 without
+losing the profile, relaunches with a recoverable lifecycle operation and
+sanitized process-log entry, and proves exact replay does not create a second
+operation. The signed real-science rehearsal—not this injected smoke—must supply
+the real SSH/Daemon output, sub-15-second reservation, longer-than-15-second
+terminal duration, SSE reconnect, sidecar relaunch, renderer-visible phase/log
+proof, generated secret-canary absence, and exactly-one remote mutation
+evidence.
 
 Preview evidence must record the exact source, tag, assets, checksums, and
 known missing gates. It must identify unsigned/not-notarized status and the
