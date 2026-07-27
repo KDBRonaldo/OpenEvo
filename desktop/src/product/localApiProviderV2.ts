@@ -57,6 +57,11 @@ export interface LocalApiNativeBridgeV2 {
   selectProjectSource(intent: NativeWorkspaceSelectionIntentV2): Promise<unknown>;
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
+  readMutationIntentJournalV2(): Promise<string | null>;
+  compareAndSwapMutationIntentJournalV2(
+    expectedValue: string | null,
+    newValue: string | null,
+  ): Promise<void>;
 }
 
 export interface LocalApiDesktopProductProviderOptionsV2 {

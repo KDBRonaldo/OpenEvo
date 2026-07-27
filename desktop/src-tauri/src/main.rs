@@ -25,11 +25,16 @@ use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
 
 mod desktop_log;
+mod mutation_intent_journal_v2;
 mod private_json_journal;
 
 use desktop_log::{
     DesktopDiagnosticLogV2, DesktopEnvironmentSummaryV2, DesktopLogLevel, DesktopLogSource,
     DesktopLogStore, DesktopLogTailV1, DesktopStartupResult, DesktopStartupStage,
+};
+use mutation_intent_journal_v2::{
+    validate_mutation_intent_journal_transition, validate_mutation_intent_journal_value,
+    MUTATION_INTENT_JOURNAL_MAX_BYTES,
 };
 #[cfg(test)]
 use private_json_journal::PrivateJsonJournalRoot;
@@ -158,6 +163,9 @@ const RUN_RETRY_RECOVERY_TEMP_PREFIX: &str = ".7f3d8b24c1a94762.tmp.";
 const RUN_RETRY_RECOVERY_LOCK_FILE_NAME: &str = ".c41d73e981bf4a56";
 const RUN_RETRY_RECOVERY_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MUTATION_INTENT_JOURNAL_FILE_NAME: &str = ".02b78cf9e16a4d13";
+const MUTATION_INTENT_JOURNAL_TEMP_PREFIX: &str = ".02b78cf9e16a4d13.tmp.";
+const MUTATION_INTENT_JOURNAL_LOCK_FILE_NAME: &str = ".9ce2b4f77d1848f1";
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -1699,6 +1707,7 @@ struct DesktopHostStateInner {
     startup_diagnostics: Arc<StartupDiagnosticSink>,
     desktop_logs: Arc<DesktopLogStore>,
     run_retry_recovery: Mutex<()>,
+    mutation_intent_journal: Mutex<()>,
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
     startup_in_progress: AtomicBool,
@@ -1731,6 +1740,7 @@ impl Default for DesktopHostState {
             startup_diagnostics: Arc::new(StartupDiagnosticSink::new(Arc::clone(&desktop_logs))),
             desktop_logs,
             run_retry_recovery: Mutex::new(()),
+            mutation_intent_journal: Mutex::new(()),
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
             startup_in_progress: AtomicBool::new(false),
@@ -6471,6 +6481,71 @@ fn run_retry_recovery_conflict_error() -> NativeHostError {
     )
 }
 
+fn mutation_intent_journal() -> PrivateJsonJournal {
+    PrivateJsonJournal::new(PrivateJsonJournalPolicy {
+        file_name: MUTATION_INTENT_JOURNAL_FILE_NAME,
+        temp_prefix: MUTATION_INTENT_JOURNAL_TEMP_PREFIX,
+        lock_file_name: MUTATION_INTENT_JOURNAL_LOCK_FILE_NAME,
+        max_bytes: MUTATION_INTENT_JOURNAL_MAX_BYTES,
+        lock_timeout: RUN_RETRY_RECOVERY_LOCK_TIMEOUT,
+        lock_poll_interval: RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL,
+        unavailable_error: mutation_intent_journal_unavailable_error,
+        too_large_error: mutation_intent_journal_too_large_error,
+        conflict_error: mutation_intent_journal_conflict_error,
+    })
+}
+
+fn mutation_intent_journal_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join(RUN_RETRY_RECOVERY_DIRECTORY_NAME))
+        .map_err(|_| mutation_intent_journal_unavailable_error())
+}
+
+fn read_mutation_intent_journal_at(path: &Path) -> HostResult<Option<String>> {
+    let value = mutation_intent_journal().read(path)?;
+    if let Some(value) = value.as_deref() {
+        validate_mutation_intent_journal_value(value)?;
+    }
+    Ok(value)
+}
+
+fn compare_and_swap_mutation_intent_journal_at(
+    state: &DesktopHostState,
+    path: &Path,
+    expected_value: Option<&str>,
+    new_value: Option<&str>,
+) -> HostResult<()> {
+    validate_mutation_intent_journal_transition(expected_value, new_value)?;
+    mutation_intent_journal().compare_and_swap(
+        &state.mutation_intent_journal,
+        path,
+        expected_value,
+        new_value,
+    )
+}
+
+fn mutation_intent_journal_unavailable_error() -> NativeHostError {
+    NativeHostError::new(
+        "mutation_intent_journal_unavailable",
+        "OpenEvo Desktop could not securely access saved mutation retry state.",
+    )
+}
+
+fn mutation_intent_journal_too_large_error() -> NativeHostError {
+    NativeHostError::new(
+        "mutation_intent_journal_too_large",
+        "OpenEvo Desktop could not save mutation retry state because it is too large.",
+    )
+}
+
+fn mutation_intent_journal_conflict_error() -> NativeHostError {
+    NativeHostError::new(
+        "mutation_intent_journal_conflict",
+        "Saved mutation retry state changed before this update could be applied.",
+    )
+}
+
 #[tauri::command]
 fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     host_status_inner(&state)
@@ -6505,6 +6580,33 @@ fn write_run_retry_recovery(
         &root,
         expected_value.as_deref(),
         value.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn read_mutation_intent_journal_v2(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<Option<String>> {
+    let root = mutation_intent_journal_root_path(&app)?;
+    mutation_intent_journal().transaction(&state.mutation_intent_journal, &root, || {
+        read_mutation_intent_journal_at(&root)
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn compare_and_swap_mutation_intent_journal_v2(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+    expected_value: Option<String>,
+    new_value: Option<String>,
+) -> HostResult<()> {
+    let root = mutation_intent_journal_root_path(&app)?;
+    compare_and_swap_mutation_intent_journal_at(
+        &state,
+        &root,
+        expected_value.as_deref(),
+        new_value.as_deref(),
     )
 }
 
@@ -7407,6 +7509,8 @@ fn main() {
             sidecar_bootstrap_context,
             read_run_retry_recovery,
             write_run_retry_recovery,
+            read_mutation_intent_journal_v2,
+            compare_and_swap_mutation_intent_journal_v2,
             get_desktop_log_tail,
             reveal_desktop_log_directory,
             export_desktop_diagnostics,
@@ -7480,6 +7584,68 @@ mod tests {
 
     fn run_retry_recovery_lock_target(root: &Path) -> PathBuf {
         root.join(RUN_RETRY_RECOVERY_LOCK_FILE_NAME)
+    }
+
+    fn valid_mutation_intent_journal_value(revision: u64) -> String {
+        serde_json::json!({
+            "schema_version": "2",
+            "revision": revision,
+            "entries": [{
+                "action_id": "mutation-action-native-0001",
+                "mutation_kind": "profile_connect",
+                "resource_scope": "profile:profile-lab",
+                "request_sha256": "aa".repeat(32),
+                "authority_sha256": "bb".repeat(32),
+                "provider_stream_instance": "provider-instance-1",
+                "provider_stream_epoch": 1,
+                "chain_step": "single",
+                "accepted_operation_id": null,
+                "completed_operation_ids": [],
+                "state": "reserved",
+                "created_at": "2026-07-27T08:00:00Z",
+                "updated_at": "2026-07-27T08:00:00Z"
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn mutation_intent_journal_v2_roundtrips_with_exact_native_cas() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let state = DesktopHostState::default();
+        let value = valid_mutation_intent_journal_value(1);
+
+        assert_eq!(read_mutation_intent_journal_at(&root).unwrap(), None);
+        compare_and_swap_mutation_intent_journal_at(&state, &root, None, Some(&value)).unwrap();
+        assert_eq!(
+            read_mutation_intent_journal_at(&root).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        assert_eq!(
+            compare_and_swap_mutation_intent_journal_at(&state, &root, None, Some(&value))
+                .unwrap_err()
+                .code,
+            "mutation_intent_journal_conflict"
+        );
+        compare_and_swap_mutation_intent_journal_at(&state, &root, Some(&value), None).unwrap();
+        assert_eq!(read_mutation_intent_journal_at(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn mutation_intent_journal_v2_rejects_invalid_value_before_native_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let state = DesktopHostState::default();
+        let invalid = r#"{"schema_version":"2","revision":1,"entries":[],"password":"canary"}"#;
+
+        assert_eq!(
+            compare_and_swap_mutation_intent_journal_at(&state, &root, None, Some(invalid))
+                .unwrap_err()
+                .code,
+            "mutation_intent_journal_invalid"
+        );
+        assert_eq!(read_mutation_intent_journal_at(&root).unwrap(), None);
     }
 
     #[test]

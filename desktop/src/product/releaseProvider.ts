@@ -25,6 +25,11 @@ export interface ReleaseNativeBridgeV2 {
   selectProjectSource(intent: NativeWorkspaceSelectionIntentV2): Promise<unknown>;
   cancelProjectSource(actionId: string): Promise<unknown>;
   settleProjectSource(actionId: string, outcome: "adopt" | "discard"): Promise<unknown>;
+  readMutationIntentJournalV2(): Promise<string | null>;
+  compareAndSwapMutationIntentJournalV2(
+    expectedValue: string | null,
+    newValue: string | null,
+  ): Promise<void>;
 }
 
 export interface ReleaseProviderAdapterContextV2 {
@@ -120,6 +125,11 @@ const tauriNativeBridge: ReleaseNativeBridgeV2 = {
     actionId,
     outcome,
   }),
+  readMutationIntentJournalV2: () => invoke("read_mutation_intent_journal_v2"),
+  compareAndSwapMutationIntentJournalV2: (expectedValue, newValue) => invoke(
+    "compare_and_swap_mutation_intent_journal_v2",
+    { expectedValue, newValue },
+  ),
 };
 
 export async function stopReleaseDesktopProductProvider(): Promise<void> {
@@ -185,6 +195,10 @@ export async function createReleaseDesktopProductProvider(
       },
       settleProjectSource: async (actionId, outcome) => {
         await native.settleProjectSource(actionId, outcome);
+      },
+      readMutationIntentJournalV2: () => native.readMutationIntentJournalV2(),
+      compareAndSwapMutationIntentJournalV2: async (expectedValue, newValue) => {
+        await native.compareAndSwapMutationIntentJournalV2(expectedValue, newValue);
       },
     },
   };

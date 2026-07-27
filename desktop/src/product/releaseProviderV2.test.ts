@@ -56,6 +56,8 @@ function native(value: unknown = bootstrap()) {
     selectProjectSource: vi.fn(),
     cancelProjectSource: vi.fn(),
     settleProjectSource: vi.fn(),
+    readMutationIntentJournalV2: vi.fn().mockResolvedValue(null),
+    compareAndSwapMutationIntentJournalV2: vi.fn(),
   };
 }
 
@@ -162,6 +164,34 @@ describe("v0.1.10 release provider", () => {
       "begin_sidecar_start",
       "sidecar_bootstrap_context",
     ]);
+  });
+
+  it("binds mutation retry journal reads and CAS writes to the exact native commands", async () => {
+    const journal = "{\"schema_version\":\"2\",\"revision\":1,\"entries\":[]}";
+    invokeMock.mockImplementation((command?: string) => {
+      if (command === "begin_sidecar_start") return Promise.resolve();
+      if (command === "sidecar_bootstrap_context") return Promise.resolve(bootstrap());
+      if (command === "read_mutation_intent_journal_v2") return Promise.resolve(journal);
+      if (command === "compare_and_swap_mutation_intent_journal_v2") return Promise.resolve();
+      return Promise.resolve(undefined);
+    });
+    const fetch = vi.fn<FetchLikeV2>().mockResolvedValue(new Response(JSON.stringify(version()), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const adapterFactory = vi.fn(async (context) => {
+      expect(await context.native.readMutationIntentJournalV2()).toBe(journal);
+      await context.native.compareAndSwapMutationIntentJournalV2(journal, null);
+      return unavailableDesktopProductProviderV2;
+    });
+
+    await createReleaseDesktopProductProvider({ fetch, adapterFactory, reportStage: vi.fn() });
+
+    expect(invokeMock).toHaveBeenCalledWith("read_mutation_intent_journal_v2");
+    expect(invokeMock).toHaveBeenCalledWith("compare_and_swap_mutation_intent_journal_v2", {
+      expectedValue: journal,
+      newValue: null,
+    });
   });
 
   it("fails closed when the native background start request is explicitly rejected", async () => {

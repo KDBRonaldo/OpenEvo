@@ -156,6 +156,8 @@ function nativeFixture(
     selectProjectSource: vi.fn().mockResolvedValue(selected),
     cancelProjectSource: vi.fn(),
     settleProjectSource: vi.fn(),
+    readMutationIntentJournalV2: vi.fn().mockResolvedValue(null),
+    compareAndSwapMutationIntentJournalV2: vi.fn(),
   };
 }
 
