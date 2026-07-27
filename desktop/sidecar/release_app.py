@@ -53,6 +53,7 @@ from desktop.sidecar.provider_store_v2 import (
     ProviderCapacityV2Error,
     ProviderConflictV2,
     ProviderContractV2Error,
+    ProviderCursorExpiredV2,
     ProviderIdempotencyConflictV2,
     ProviderNotFoundV2,
     ProviderPreconditionFailedV2,
@@ -74,7 +75,7 @@ from desktop.sidecar.release_provider_v2 import (
 )
 from desktop.sidecar.release_capabilities import (
     RELEASE_EXECUTION_MODE_CAPABILITIES_V1,
-    validate_v019_release_composition,
+    validate_v0110_release_composition,
 )
 from desktop.sidecar.release_runtime import (
     DesktopReleaseCoreRuntimeV1,
@@ -128,6 +129,11 @@ ErrorCategory = Literal[
     "maintenance",
 ]
 
+_SENSITIVE_ENVIRONMENT_NAME = re.compile(
+    r"(?i)(?:api[_-]?key|token|secret|password|passwd|private[_-]?key|"
+    r"credential|capability)"
+)
+
 _TAURI_RELEASE_ORIGINS = ("tauri://localhost", "http://tauri.localhost")
 _TAURI_RELEASE_METHODS = ("GET", "POST", "PATCH", "DELETE")
 _TAURI_RELEASE_HEADERS = (
@@ -164,6 +170,20 @@ def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
         cleanup()
     except BaseException:
         pass
+
+
+def _lifecycle_secret_canaries(
+    session_token: str,
+    environment: Mapping[str, str],
+) -> tuple[str, ...]:
+    values = {session_token}
+    for name, value in environment.items():
+        if _SENSITIVE_ENVIRONMENT_NAME.search(name) is None or not value:
+            continue
+        if len(value.encode("utf-8")) > 65_536 or "\x00" in value:
+            raise ValueError("sensitive process environment value is outside log-redaction bounds")
+        values.add(value)
+    return tuple(sorted(values, key=lambda item: (-len(item), item)))
 
 
 def _error_response(
@@ -363,10 +383,10 @@ def create_release_desktop_local_api_app(
 ) -> FastAPI:
     """Create the frozen 0.1.8 Local API v1 provider and own its durable store."""
 
-    if build_version == "0.1.9":
+    if build_version == "0.1.10":
         # The v1 provider must never become a mutation fallback merely because the
         # package version advanced. Task 21 supplies the separate v2 provider.
-        validate_v019_release_composition(
+        validate_v0110_release_composition(
             provider_kind="desktop_sidecar",
             local_api_major=1,
             core_transport="active_project_ssh_tunnel",
@@ -860,7 +880,7 @@ def create_packaged_release_desktop_local_api_v2_app(
     startup_phase: Callable[[str], None] | None = None,
     close_on_shutdown: bool = True,
 ) -> FastAPI:
-    """Compose the complete v0.1.9 Local API around system OpenSSH and Core v2."""
+    """Compose the complete v0.1.10 Local API around system OpenSSH and Core v2."""
 
     if type(system_ssh_askpass_helper) is not AskpassHelperAuthority:
         raise TypeError("packaged Local API v2 requires the sealed askpass helper")
@@ -971,6 +991,11 @@ def create_packaged_release_desktop_local_api_v2_app(
             build_channel=build_channel,
             instance_id=instance_id,
             clock=clock,
+            lifecycle_secret_canaries=_lifecycle_secret_canaries(
+                session_token,
+                environment,
+            ),
+            lifecycle_forbidden_paths=(str(root), str(home_path)),
             own_resources=True,
         )
         if startup_phase is not None:
@@ -1006,7 +1031,7 @@ def create_release_desktop_local_api_v2_app(
     provider: DesktopReleaseProviderV2,
     close_on_shutdown: bool = True,
 ) -> FastAPI:
-    """Mount the packaged 0.1.9 provider on Local API v2 only."""
+    """Mount the packaged 0.1.10 provider on Local API v2 only."""
 
     if (
         type(session_token) is not str
@@ -1018,7 +1043,7 @@ def create_release_desktop_local_api_v2_app(
         raise TypeError("Local API v2 requires the exact release provider")
     if type(close_on_shutdown) is not bool:
         raise TypeError("shutdown ownership must be boolean")
-    validate_v019_release_composition(
+    validate_v0110_release_composition(
         provider_kind="desktop_sidecar",
         local_api_major=2,
         core_transport="active_project_ssh_tunnel",
@@ -1037,13 +1062,9 @@ def create_release_desktop_local_api_v2_app(
         path = request.url.path
         if path == "/desktop/v2" or path.startswith("/desktop/v2/"):
             header_name = DESKTOP_SESSION_HEADER.lower().encode("ascii")
-            candidates = [
-                value for name, value in request.scope["headers"] if name == header_name
-            ]
+            candidates = [value for name, value in request.scope["headers"] if name == header_name]
             candidate = candidates[0] if len(candidates) == 1 else b""
-            if len(candidates) != 1 or not hmac.compare_digest(
-                candidate, encoded_session_token
-            ):
+            if len(candidates) != 1 or not hmac.compare_digest(candidate, encoded_session_token):
                 return _v2_error_response(
                     status_code=401,
                     code="desktop_session_invalid",
@@ -1081,6 +1102,14 @@ def create_release_desktop_local_api_v2_app(
         exc: ProviderStoreV2Error,
     ) -> JSONResponse:
         del request
+        if isinstance(exc, ProviderCursorExpiredV2):
+            return _v2_error_response(
+                status_code=410,
+                code="lifecycle_log_cursor_expired",
+                summary="The lifecycle log cursor is outside the retained window.",
+                retryable=True,
+                action="retry",
+            )
         if isinstance(exc, ProviderNotFoundV2):
             return _v2_error_response(
                 status_code=404,
@@ -1093,11 +1122,7 @@ def create_release_desktop_local_api_v2_app(
             generation = "generation" in str(exc).lower()
             return _v2_error_response(
                 status_code=412,
-                code=(
-                    "profile_generation_changed"
-                    if generation
-                    else "etag_precondition_failed"
-                ),
+                code=("profile_generation_changed" if generation else "etag_precondition_failed"),
                 summary=(
                     "The remote-workspace profile generation changed."
                     if generation

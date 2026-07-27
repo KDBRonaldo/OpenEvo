@@ -1,6 +1,6 @@
 # Release Desktop Real-Science E2E
 
-This maintainer-only gate runs the exact v0.1.9 macOS Desktop composition
+This maintainer-only gate runs the exact v0.1.10 macOS Desktop composition
 against a real remote science workspace. It is part of #163. It is not a
 user-facing CLI and never calls Core Control directly.
 
@@ -77,17 +77,25 @@ Local API v2:
 1. Launch the sidecar and askpass helper directly from the candidate app bundle
    using the native listener/executable FD handoff and one bounded credential
    frame.
-2. Negotiate the strict `/version` v2 identity for release `0.1.9`, require
+2. Negotiate the strict `/version` v2 identity for release `0.1.10`, require
    mutation major 2 and Core major 2, reject the legacy shell route, and prove
    authenticated/unauthenticated `/desktop/v2/state` behavior.
 3. Read `/desktop/v2/ssh-hosts`, select the requested literal alias, create one
-   `system_openssh` profile, and connect it. No manual connection fields are
-   sent.
-4. Create one generation-zero scratch project with all evolution targets
-   disabled. Fetch capabilities through that project's active Core tunnel,
-   then patch the same project to enable `text_memory` and `skill_bundle` with
-   their supported remote effective defaults and `agent_system` with the
-   supported Core-owned `auto` resolver.
+   `system_openssh` profile, and connect it through a durable lifecycle
+   operation. No manual connection fields are sent.
+4. Reserve one cold generation-zero scratch-project lifecycle with all
+   evolution targets disabled. Require HTTP 202 and an authoritative operation
+   within the bounded renderer deadline, then require the remote work to remain
+   active for more than 15 seconds. Observe at least two ordered phases and
+   actual sanitized `ssh_*` or `daemon_*` output through the lifecycle log
+   route. Force one SSE reconnect and one packaged-sidecar relaunch, resume the
+   same operation ID without issuing another create request, and require one
+   successful project result. After shutdown, verify exactly one Core project,
+   one Desktop/Core mapping, and one applied `create_project_v2` mutation for
+   the stable action ID. Fetch capabilities through that project's active Core
+   tunnel, then patch the same project to enable `text_memory` and
+   `skill_bundle` with their supported remote effective defaults and
+   `agent_system` with the supported Core-owned `auto` resolver.
 5. Validate the project against the exact remote registry before each Task.
 6. Submit two immutable Tasks. For each Task, verify its admission and
    authoritative attempt, required v2 timeline event types, exact predecessor
@@ -106,19 +114,26 @@ Local API v2:
    groups. macOS uses a non-reaping `kqueue` process-exit observer so the group
    leader remains authoritative until descendants have been closed.
 
-v0.1.9 intentionally does not call the unavailable v2 Task-artifact collection
+v0.1.10 intentionally does not call the unavailable v2 Task-artifact collection
 endpoint during ordinary refresh or release verification. Artifact content,
-host paths, logs, SSH commands, backend tokens, and Core URLs are not exposed to
-the renderer or used as fallback evidence. The committed Evolution Revision's
-typed `artifact_count` is the v0.1.9 output boundary.
+SSH commands, process environments, backend tokens, Core URLs, and absolute
+host paths are not exposed to the renderer or used as fallback evidence. The
+lifecycle log route is the narrow exception for process output: it may carry
+bounded, terminal-control-stripped, sanitized SSH and Daemon stdout/stderr, but
+never command lines or environment values and never as success authority. The
+committed Evolution Revision's typed `artifact_count` remains the Task-output
+boundary.
 
 ## Evidence and privacy policy
 
 The output is canonical JSON, mode `0600`, and at most 128 KiB. Its schema is
-v2 and uses a closed field allowlist. It records only candidate asset
+v3 and uses a closed field allowlist. It records only candidate asset
 digests/sizes, closed Desktop/Core identities, Project Head composition digests,
 Task/admission/attempt/transition digests and counts, required timeline event
-types, successor-reuse booleans, renderer observations, and cleanup results.
+types, successor-reuse booleans, renderer observations, lifecycle reservation
+and duration buckets, ordered phases, process-log source/digest proof, stable
+action/operation identity, SSE/relaunch recovery, exactly-one project/mapping/
+mutation counts, generated secret-canary absence, and cleanup results.
 
 It does not retain:
 
@@ -127,13 +142,16 @@ It does not retain:
 - Desktop session, native handoff/readiness, mutation, Core bearer, password,
   passphrase, private-key, or Codex authentication values;
 - opaque raw project/Task/admission/attempt/transition IDs;
-- host paths, task objective, transcript, log messages, artifact content, or
-  runtime file content.
+- host paths, task objective, transcript, lifecycle log messages, artifact
+  content, or runtime file content.
 
 The renderer screenshot masks the alias, raw IDs, and objective before it is
-retained. Failure evidence contains only a bounded stage, typed code, optional
-HTTP status, partial allowlisted observations, and cleanup state. A nominally
-passing run becomes failed if ownership cleanup is incomplete.
+retained. A generated canary is placed only where the gate can detect an
+accidental leak; publication fails if it appears in lifecycle payloads,
+renderer text, screenshot bytes, support output, or evidence. Failure evidence
+contains only a bounded stage, typed code, optional HTTP status, partial
+allowlisted observations, and cleanup state. A nominally passing run becomes
+failed if ownership cleanup is incomplete.
 
 ## Sign and publish
 

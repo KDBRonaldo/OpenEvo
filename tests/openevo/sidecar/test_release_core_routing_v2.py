@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
+from contextlib import contextmanager
 import hashlib
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
+import time
 
 from fastapi.testclient import TestClient
 import pytest
@@ -13,7 +16,14 @@ from desktop.sidecar.contracts.v1 import WorkspaceImportRefV1
 from desktop.sidecar.contracts.v2 import models as local_v2
 from desktop.sidecar.core_bridge_v2 import DesktopCoreBridgeErrorV2
 from desktop.sidecar.event_broker_v2 import DesktopEventBrokerV2
-from desktop.sidecar.provider_store_v2 import DesktopProviderStoreV2
+from desktop.sidecar.provider_store_v2 import (
+    DesktopProviderStoreV2,
+    LifecycleNativeWorkspacePrepareRequestV2,
+    LifecycleOperationAdvanceV2,
+    LifecycleOperationReservationV2,
+    LifecycleProjectActivateRequestV2,
+    LifecycleProjectCreateRequestV2,
+)
 from desktop.sidecar.release_app import create_release_desktop_local_api_v2_app
 from desktop.sidecar.release_provider_v2 import DesktopReleaseProviderV2
 from desktop.sidecar.workspace_identity import (
@@ -25,6 +35,8 @@ from desktop.sidecar.workspace_imports import (
     WorkspaceImportNotFoundError,
     WorkspaceImportStore,
 )
+from desktop.sidecar.native_workspace import NativeWorkspaceArchiveCancelled
+import desktop.sidecar.release_provider_v2 as release_provider_module
 from openevo.backend.contracts.v2 import models as core_v2
 from tests.openevo.sidecar.test_core_bridge_v2 import _capabilities, _task
 from tests.openevo.sidecar.test_core_bridge_store_v2 import _mapping
@@ -35,6 +47,7 @@ from tests.openevo.sidecar.test_release_local_api_v2 import (
     _Catalog,
     _CoreConnector,
     _Lifecycle,
+    _wait_lifecycle_operation,
 )
 
 
@@ -49,6 +62,8 @@ class _RoutingBridge:
         self.project: core_v2.ProjectV2 | None = None
         self.upload: core_v2.WorkspaceUploadSessionV2 | None = None
         self.mapping = None
+        self.activation_started: Event | None = None
+        self.activation_release: Event | None = None
 
     def activate_project(
         self,
@@ -66,15 +81,16 @@ class _RoutingBridge:
                 idempotency_key,
             )
         )
+        if self.activation_started is not None and self.activation_release is not None:
+            self.activation_started.set()
+            assert self.activation_release.wait(16)
         if self.project is None:
             if request.config.workspace.kind == "native_folder_snapshot":
                 self.project = core_v2.ProjectV2(
                     project_id="project-1",
                     display_name=request.display_name,
                     config=request.config,
-                    project_config_sha256=core_v2.project_config_sha256_for(
-                        request.config
-                    ),
+                    project_config_sha256=core_v2.project_config_sha256_for(request.config),
                     active_project_head=None,
                     admission_etag=None,
                     state="not_ready",
@@ -115,9 +131,7 @@ class _RoutingBridge:
         desktop_project_id: str,
         profile_connection_generation: int,
     ) -> core_v2.ProjectV2:
-        self.calls.append(
-            ("get_project", desktop_project_id, profile_connection_generation)
-        )
+        self.calls.append(("get_project", desktop_project_id, profile_connection_generation))
         if self.fail_reads:
             raise DesktopCoreBridgeErrorV2(
                 503,
@@ -393,9 +407,7 @@ class _RoutingBridge:
         profile_connection_generation: int,
         task_id: str,
     ) -> core_v2.TaskV2:
-        self.calls.append(
-            ("get_task", desktop_project_id, profile_connection_generation, task_id)
-        )
+        self.calls.append(("get_task", desktop_project_id, profile_connection_generation, task_id))
         return _task()
 
     def append_task_attempt(
@@ -425,9 +437,7 @@ class _RoutingBridge:
             task_admission_id=task.admission.task_admission_id,
             admission_sha256=task.admission.admission_sha256,
             project_id=task.project_id,
-            predecessor_project_head_id=(
-                task.admission.predecessor_project_head.project_head_id
-            ),
+            predecessor_project_head_id=(task.admission.predecessor_project_head.project_head_id),
             created_at="2026-07-23T11:00:01Z",
         )
 
@@ -544,9 +554,7 @@ class _RoutingBridge:
         self.calls.append(
             ("list_project_heads", desktop_project_id, profile_connection_generation)
         )
-        return core_v2.ProjectHeadPageV2(
-            items=[_head()], has_more=False, next_cursor=None
-        )
+        return core_v2.ProjectHeadPageV2(items=[_head()], has_more=False, next_cursor=None)
 
     def get_transition(
         self,
@@ -647,12 +655,8 @@ class _RoutingBridge:
         limit: int,
         after: str | None,
     ) -> core_v2.ServicePageV2:
-        self.calls.append(
-            ("list_services", desktop_project_id, profile_connection_generation)
-        )
-        return core_v2.ServicePageV2(
-            items=[_service()], has_more=False, next_cursor=None
-        )
+        self.calls.append(("list_services", desktop_project_id, profile_connection_generation))
+        return core_v2.ServicePageV2(items=[_service()], has_more=False, next_cursor=None)
 
     def get_service(
         self,
@@ -687,6 +691,94 @@ class _RoutingBridge:
             )
         )
         return _operation("operation-service-restart", "service_restart")
+
+    def service_logs(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+        service_id: str,
+        *,
+        limit: int,
+        after: str | None,
+    ) -> core_v2.LogPageV2:
+        self.calls.append(
+            (
+                "service_logs",
+                desktop_project_id,
+                profile_connection_generation,
+                service_id,
+                limit,
+                after,
+            )
+        )
+        return core_v2.LogPageV2(
+            items=[
+                core_v2.LogEntryV2(
+                    sequence=1,
+                    occurred_at="2026-07-23T11:00:00Z",
+                    stream="stdout",
+                    message="daemon ready",
+                )
+            ],
+            has_more=False,
+            next_cursor=None,
+        )
+
+    def get_operation(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+        operation_id: str,
+    ) -> core_v2.OperationV2:
+        self.calls.append(
+            (
+                "get_operation",
+                desktop_project_id,
+                profile_connection_generation,
+                operation_id,
+            )
+        )
+        return _operation(operation_id, "service_restart")
+
+    def cancel_operation(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+        operation_id: str,
+        *,
+        if_match: str,
+        idempotency_key: str,
+    ) -> core_v2.OperationV2:
+        self.calls.append(
+            (
+                "cancel_operation",
+                desktop_project_id,
+                profile_connection_generation,
+                operation_id,
+                if_match,
+                idempotency_key,
+            )
+        )
+        return _operation(operation_id, "service_restart")
+
+    def cache_cleanup(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+        request: core_v2.CacheCleanupRequestV2,
+        *,
+        idempotency_key: str,
+    ) -> core_v2.OperationV2:
+        self.calls.append(
+            (
+                "cache_cleanup",
+                desktop_project_id,
+                profile_connection_generation,
+                request,
+                idempotency_key,
+            )
+        )
+        return _operation("operation-cache-cleanup", "cache_cleanup")
 
     def create_diagnostic(
         self,
@@ -837,7 +929,7 @@ def _provider(
         bridge_store=bridge,
         workspace_import_store=workspace_import_store,
         event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
-        build_version="0.1.9",
+        build_version="0.1.10",
         source_commit=SOURCE_COMMIT,
         build_channel="release",
         instance_id="routing-instance-v2",
@@ -881,9 +973,8 @@ def _connected_profile(client: TestClient) -> dict[str, object]:
         json={"schema_version": "2", "expected_connection_generation": 1},
     )
     assert connected.status_code == 202, connected.text
-    return client.get(
-        f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
-    ).json()
+    assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
+    return client.get(f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()).json()
 
 
 def _project_create(profile: dict[str, object]) -> dict[str, object]:
@@ -914,16 +1005,16 @@ def test_project_create_and_read_use_only_generation_bound_core_v2(
             "/desktop/v2/projects",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        profile["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                     "Idempotency-Key": "routing-create-project-01",
                 }
             ),
             json=_project_create(profile),
         )
-        assert created.status_code == 201, created.text
-        assert created.json()["project_id"] == "project-1"
+        assert created.status_code == 202, created.text
+        terminal = _wait_lifecycle_operation(client, created.json())
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == "project-1"
         assert bridge.calls[0][0] == "activate_project"
         assert bridge.calls[0][2:] == (
             profile["profile_id"],
@@ -938,6 +1029,291 @@ def test_project_create_and_read_use_only_generation_bound_core_v2(
         assert bridge.calls[-1][0] == "get_project"
         assert lifecycle.calls == ssh_calls
     finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_running_project_create_waits_for_reconnect_after_sidecar_restart(
+    tmp_path: Path,
+) -> None:
+    first_provider, first_store, _first_lifecycle, _first_bridge = _provider(tmp_path)
+    first_client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=first_provider,
+            close_on_shutdown=False,
+        )
+    )
+    profile = _connected_profile(first_client)
+    first_client.close()
+    first_provider.close()
+
+    action_id = "routing-restart-project-create-0001"
+    project_id = "desktop-project-restart-1"
+    request = local_v2.ProjectCreateV2.model_validate(_project_create(profile))
+    operation = first_store.reserve_lifecycle_operation(
+        LifecycleOperationReservationV2(
+            kind="project_create",
+            resource={"resource_kind": "project", "resource_id": project_id},
+            request=LifecycleProjectCreateRequestV2(
+                request_kind="project_create",
+                project_id=project_id,
+                action_id=action_id,
+                request=request,
+                resource_generation=request.profile_connection_generation,
+            ),
+        ),
+        idempotency_key="routing-restart-project-reservation-0001",
+    )
+    claimed = first_store.claim_next_lifecycle_operation()
+    assert claimed is not None and claimed.operation.operation_id == operation.operation_id
+    first_store.advance_lifecycle_operation(
+        LifecycleOperationAdvanceV2(
+            operation_id=operation.operation_id,
+            expected_etag=claimed.operation.etag,
+            phase="creating_remote_project",
+            progress=local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=False,
+        )
+    )
+    first_store.close()
+
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    recovered_profiles = reopened.reconcile_process_restart()
+    assert len(recovered_profiles) == 1
+    disconnected = recovered_profiles[0]
+    lifecycle = _Lifecycle()
+    bridge = _RoutingBridge()
+    provider = DesktopReleaseProviderV2(
+        store=reopened,
+        catalog=_Catalog(),
+        lifecycle=lifecycle,
+        core_connector=_CoreConnector(),
+        bridge=bridge,
+        bridge_store=bridge,
+        workspace_import_store=None,
+        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        build_version="0.1.10",
+        source_commit=SOURCE_COMMIT,
+        build_channel="release",
+        instance_id="routing-restart-instance-v2",
+        clock=lambda: NOW,
+        own_resources=False,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if reopened.get_lifecycle_operation(operation.operation_id).status == "running":
+                break
+            time.sleep(0.01)
+        assert reopened.get_lifecycle_operation(operation.operation_id).status == "running"
+        assert bridge.calls == []
+
+        connected = client.post(
+            f"/desktop/v2/profiles/{disconnected.profile_id}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(disconnected.connection_generation),
+                    "If-Match": disconnected.etag,
+                    "Idempotency-Key": "routing-restart-connect-profile-0001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": disconnected.connection_generation,
+            },
+        )
+        assert connected.status_code == 202, connected.text
+        assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
+        terminal = _wait_lifecycle_operation(
+            client,
+            {"operation_id": operation.operation_id},
+        )
+
+        assert terminal["status"] == "succeeded"
+        assert [call[0] for call in bridge.calls] == ["activate_project"]
+        assert bridge.calls[0][3] == disconnected.connection_generation + 1
+        assert bridge.calls[0][4] == action_id
+    finally:
+        client.close()
+        provider.close()
+        reopened.close()
+
+
+def test_running_project_activate_waits_for_reconnect_after_sidecar_restart(
+    tmp_path: Path,
+) -> None:
+    first_provider, first_store, _first_lifecycle, bridge = _provider(tmp_path)
+    first_client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=first_provider,
+            close_on_shutdown=False,
+        )
+    )
+    profile = _connected_profile(first_client)
+    created = first_client.post(
+        "/desktop/v2/projects",
+        headers=_headers(
+            **{
+                "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
+                "Idempotency-Key": "routing-activate-restart-create-project-0001",
+            }
+        ),
+        json=_project_create(profile),
+    )
+    assert created.status_code == 202, created.text
+    assert _wait_lifecycle_operation(first_client, created.json())["status"] == "succeeded"
+    project = bridge.project
+    assert project is not None and project.active_project_head is not None
+    first_client.close()
+    first_provider.close()
+
+    head = project.active_project_head
+    operation = first_store.reserve_lifecycle_operation(
+        LifecycleOperationReservationV2(
+            kind="project_activate",
+            resource={"resource_kind": "project", "resource_id": project.project_id},
+            request=LifecycleProjectActivateRequestV2(
+                request_kind="project_activate",
+                project_id=project.project_id,
+                request=local_v2.ProjectActionV2(
+                    expected_project_head_id=head.project_head_id,
+                    expected_project_head_manifest_sha256=head.manifest_sha256,
+                ),
+                resource_generation=head.generation,
+                if_match=project.etag,
+            ),
+        ),
+        idempotency_key="routing-activate-restart-reservation-0001",
+    )
+    claimed = first_store.claim_next_lifecycle_operation()
+    assert claimed is not None and claimed.operation.operation_id == operation.operation_id
+    first_store.close()
+
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    recovered_profiles = reopened.reconcile_process_restart()
+    assert len(recovered_profiles) == 1
+    disconnected = recovered_profiles[0]
+    lifecycle = _Lifecycle()
+    recovered_provider = DesktopReleaseProviderV2(
+        store=reopened,
+        catalog=_Catalog(),
+        lifecycle=lifecycle,
+        core_connector=_CoreConnector(),
+        bridge=bridge,
+        bridge_store=bridge,
+        workspace_import_store=None,
+        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        build_version="0.1.10",
+        source_commit=SOURCE_COMMIT,
+        build_channel="release",
+        instance_id="routing-activate-restart-instance-v2",
+        clock=lambda: NOW,
+        own_resources=False,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=recovered_provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        deadline = time.monotonic() + 1
+        while time.monotonic() < deadline:
+            if reopened.get_lifecycle_operation(operation.operation_id).status == "running":
+                break
+            time.sleep(0.01)
+        assert reopened.get_lifecycle_operation(operation.operation_id).status == "running"
+
+        connected = client.post(
+            f"/desktop/v2/profiles/{disconnected.profile_id}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(disconnected.connection_generation),
+                    "If-Match": disconnected.etag,
+                    "Idempotency-Key": "routing-activate-restart-connect-profile-0001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": disconnected.connection_generation,
+            },
+        )
+        assert connected.status_code == 202, connected.text
+        assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
+        terminal = _wait_lifecycle_operation(
+            client,
+            {"operation_id": operation.operation_id},
+        )
+
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == project.project_id
+        assert bridge.active_activation is not None
+        assert (
+            bridge.active_activation.profile_connection_generation
+            == disconnected.connection_generation + 1
+        )
+    finally:
+        client.close()
+        recovered_provider.close()
+        reopened.close()
+
+
+def test_project_create_returns_before_a_sixteen_second_bridge_activation(
+    tmp_path: Path,
+) -> None:
+    provider, store, _lifecycle, bridge = _provider(tmp_path)
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    bridge.activation_started = Event()
+    bridge.activation_release = Event()
+    try:
+        profile = _connected_profile(client)
+        headers = _headers(
+            **{
+                "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
+                "Idempotency-Key": "routing-slow-project-create-01",
+            }
+        )
+        before = time.monotonic()
+        created = client.post(
+            "/desktop/v2/projects",
+            headers=headers,
+            json=_project_create(profile),
+        )
+        elapsed = time.monotonic() - before
+
+        assert created.status_code == 202, created.text
+        assert elapsed < 0.5
+        assert bridge.activation_started.wait(2)
+        replay = client.post(
+            "/desktop/v2/projects",
+            headers=headers,
+            json=_project_create(profile),
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["operation_id"] == created.json()["operation_id"]
+        assert len([call for call in bridge.calls if call[0] == "activate_project"]) == 1
+        bridge.activation_release.set()
+        terminal = _wait_lifecycle_operation(client, created.json())
+        assert terminal["status"] == "succeeded"
+    finally:
+        bridge.activation_release.set()
         client.close()
         provider.close()
         store.close()
@@ -960,15 +1336,14 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             "/desktop/v2/projects",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        profile["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                     "Idempotency-Key": "reconnect-create-project-01",
                 }
             ),
             json=_project_create(profile),
         )
-        assert created.status_code == 201, created.text
+        assert created.status_code == 202, created.text
+        assert _wait_lifecycle_operation(client, created.json())["status"] == "succeeded"
         bound = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -978,9 +1353,7 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        bound["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(bound["connection_generation"]),
                     "If-Match": str(bound["etag"]),
                     "Idempotency-Key": "reconnect-disconnect-profile-1",
                 }
@@ -991,6 +1364,7 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             },
         )
         assert disconnected.status_code == 202, disconnected.text
+        assert _wait_lifecycle_operation(client, disconnected.json())["status"] == "succeeded"
         offline = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1002,9 +1376,7 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             f"/desktop/v2/profiles/{profile['profile_id']}/connect",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        offline["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(offline["connection_generation"]),
                     "If-Match": str(offline["etag"]),
                     "Idempotency-Key": "reconnect-connect-profile-02",
                 }
@@ -1015,6 +1387,7 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
             },
         )
         assert reconnected.status_code == 202, reconnected.text
+        assert _wait_lifecycle_operation(client, reconnected.json())["status"] == "succeeded"
         online = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
@@ -1070,15 +1443,14 @@ def test_stale_project_create_and_core_failure_never_fall_back_to_ssh(
             "/desktop/v2/projects",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        profile["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                     "Idempotency-Key": "routing-create-project-02",
                 }
             ),
             json=_project_create(profile),
         )
-        assert created.status_code == 201, created.text
+        assert created.status_code == 202, created.text
+        assert _wait_lifecycle_operation(client, created.json())["status"] == "succeeded"
         bridge.fail_reads = True
         failed = client.get("/desktop/v2/projects/project-1", headers=_headers())
         assert failed.status_code == 503, failed.text
@@ -1140,17 +1512,17 @@ def test_native_project_streams_verified_private_import_to_core_v2_only(
             "/desktop/v2/projects",
             headers=_headers(
                 **{
-                    "X-OpenEvo-Resource-Generation": str(
-                        profile["connection_generation"]
-                    ),
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                     "Idempotency-Key": action_id,
                 }
             ),
             json=request,
         )
 
-        assert created.status_code == 201, created.text
-        assert created.json()["state"] == "ready"
+        assert created.status_code == 202, created.text
+        terminal = _wait_lifecycle_operation(client, created.json())
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == "project-1"
         assert [call[0] for call in bridge.calls] == [
             "activate_project",
             "create_workspace_upload",
@@ -1166,6 +1538,100 @@ def test_native_project_streams_verified_private_import_to_core_v2_only(
         provider.close()
         store.close()
         workspace_store.close()
+
+
+def test_native_workspace_prepare_resumes_without_reselection_after_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = tmp_path / "selected-workspace"
+    selected.mkdir()
+    (selected / "input.txt").write_text("workspace input\n", encoding="utf-8")
+    selected_stat = selected.stat()
+    workspace_root = tmp_path / "workspace-imports"
+    first_workspace_store = WorkspaceImportStore(workspace_root)
+    provider, store, _lifecycle, _bridge = _provider(
+        tmp_path,
+        workspace_import_store=first_workspace_store,
+    )
+    started = Event()
+    original_prepare = release_provider_module.prepare_native_workspace
+
+    @contextmanager
+    def interrupted_prepare(*_args: object, **kwargs: object):
+        cancel_check = kwargs["cancel_check"]
+        assert callable(cancel_check)
+        started.set()
+        while not cancel_check():
+            time.sleep(0.01)
+        raise NativeWorkspaceArchiveCancelled("sidecar stopped")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        release_provider_module,
+        "prepare_native_workspace",
+        interrupted_prepare,
+    )
+    action_id = "routing-native-restart-prepare-0001"
+    operation = provider.reserve_native_workspace_prepare(
+        action_id=action_id,
+        selected_path=str(selected),
+        selected_device=selected_stat.st_dev,
+        selected_inode=selected_stat.st_ino,
+        cancellation_token="a" * 64,
+        project_id=None,
+    )
+    assert started.wait(1)
+    provider.close()
+    assert store.get_lifecycle_operation(operation.operation_id).status == "running"
+    store.close()
+    first_workspace_store.close()
+
+    monkeypatch.setattr(
+        release_provider_module,
+        "prepare_native_workspace",
+        original_prepare,
+    )
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    second_workspace_store = WorkspaceImportStore(workspace_root)
+    lifecycle = _Lifecycle()
+    bridge = _RoutingBridge()
+    recovered_provider = DesktopReleaseProviderV2(
+        store=reopened,
+        catalog=_Catalog(),
+        lifecycle=lifecycle,
+        core_connector=_CoreConnector(),
+        bridge=bridge,
+        bridge_store=bridge,
+        workspace_import_store=second_workspace_store,
+        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        build_version="0.1.10",
+        source_commit=SOURCE_COMMIT,
+        build_channel="release",
+        instance_id="routing-native-restart-instance-v2",
+        clock=lambda: NOW,
+        own_resources=False,
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=recovered_provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        terminal = _wait_lifecycle_operation(
+            client,
+            {"operation_id": operation.operation_id},
+        )
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["result_kind"] == "native_workspace"
+        assert str(selected) not in str(terminal)
+    finally:
+        client.close()
+        recovered_provider.close()
+        reopened.close()
+        second_workspace_store.close()
 
 
 def test_native_project_retry_releases_import_after_remote_finalize(
@@ -1214,9 +1680,7 @@ def test_native_project_retry_releases_import_after_remote_finalize(
         }
         headers = _headers(
             **{
-                "X-OpenEvo-Resource-Generation": str(
-                    profile["connection_generation"]
-                ),
+                "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
                 "Idempotency-Key": action_id,
             }
         )
@@ -1224,15 +1688,23 @@ def test_native_project_retry_releases_import_after_remote_finalize(
 
         failed = client.post("/desktop/v2/projects", headers=headers, json=request)
 
-        assert failed.status_code == 503, failed.text
-        assert failed.json()["code"] == "core_temporarily_unavailable"
+        assert failed.status_code == 202, failed.text
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not any(
+            call[0] == "get_project" for call in bridge.calls
+        ):
+            time.sleep(0.01)
+        assert any(call[0] == "get_project" for call in bridge.calls)
         assert workspace_store.inspect(import_id).pending
 
         bridge.fail_reads = False
         retried = client.post("/desktop/v2/projects", headers=headers, json=request)
 
-        assert retried.status_code == 201, retried.text
-        assert retried.json()["state"] == "ready"
+        assert retried.status_code == 202, retried.text
+        assert retried.json()["operation_id"] == failed.json()["operation_id"]
+        terminal = _wait_lifecycle_operation(client, retried.json())
+        assert terminal["status"] == "succeeded"
+        assert terminal["result"]["project_id"] == "project-1"
         with pytest.raises(WorkspaceImportNotFoundError):
             workspace_store.inspect(import_id)
     finally:
@@ -1240,6 +1712,69 @@ def test_native_project_retry_releases_import_after_remote_finalize(
         provider.close()
         store.close()
         workspace_store.close()
+
+
+def test_native_prepare_and_project_create_have_distinct_action_steps(
+    tmp_path: Path,
+) -> None:
+    action_id = "routing-native-action-chain-0001"
+    provider, store, _lifecycle, _bridge = _provider(tmp_path)
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        profile = _connected_profile(client)
+        import_id = native_import_id_for_action(action_id)
+        prepared = store.reserve_lifecycle_operation(
+            LifecycleOperationReservationV2(
+                kind="native_workspace_prepare",
+                resource={
+                    "resource_kind": "native_workspace",
+                    "resource_id": import_id,
+                },
+                request=LifecycleNativeWorkspacePrepareRequestV2(
+                    request_kind="native_workspace_prepare",
+                    native_workspace_id=import_id,
+                    native_journal_sha256="a" * 64,
+                    display_name="Selected workspace",
+                ),
+            ),
+            idempotency_key=action_id,
+        )
+        request = _project_create(profile)
+        request["config"]["workspace"] = {
+            "kind": "native_folder_snapshot",
+            "display_name": "Selected workspace",
+        }
+
+        created = client.post(
+            "/desktop/v2/projects",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
+                    "Idempotency-Key": action_id,
+                }
+            ),
+            json=request,
+        )
+
+        assert created.status_code == 202, created.text
+        assert created.json()["operation_id"] != prepared.operation_id
+        recovered = client.get(
+            "/desktop/v2/operations/by-action",
+            params={"action_id": action_id, "kind": "project_create"},
+            headers=_headers(),
+        )
+        assert recovered.status_code == 200, recovered.text
+        assert recovered.json()["operation_id"] == created.json()["operation_id"]
+    finally:
+        client.close()
+        provider.close()
+        store.close()
 
 
 def test_active_project_business_surface_routes_to_core_v2_without_ssh(
@@ -1265,9 +1800,15 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             ),
             json=_project_create(profile),
         )
-        assert create.status_code == 201, create.text
+        assert create.status_code == 202, create.text
+        assert _wait_lifecycle_operation(client, create.json())["status"] == "succeeded"
         ssh_calls = list(lifecycle.calls)
-        project = create.json()
+        project_response = client.get(
+            "/desktop/v2/projects/project-1",
+            headers=_headers(),
+        )
+        assert project_response.status_code == 200, project_response.text
+        project = project_response.json()
         head = project["active_project_head"]
         project_headers = _headers(
             **{
@@ -1365,7 +1906,7 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             json=task_action,
         )
         assert cancelled.status_code == 202, cancelled.text
-        assert cancelled.json()["kind"] == "task_cancel"
+        assert cancelled.json()["kind"] == "attempt_cancel"
         retried = client.post(
             "/desktop/v2/tasks/task-1/retry",
             headers={**task_headers, "Idempotency-Key": "routing-task-retry-001"},
@@ -1431,6 +1972,43 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
         assert restarted.status_code == 202, restarted.text
         assert restarted.json()["kind"] == "service_restart"
 
+        core_operation = client.get(
+            "/desktop/v2/core-operations/operation-service-restart",
+            headers=_headers(),
+        )
+        assert core_operation.status_code == 200, core_operation.text
+        assert core_operation.json()["operation_id"] == "operation-service-restart"
+        cancelled_operation = client.post(
+            "/desktop/v2/core-operations/operation-service-restart/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "2",
+                    "If-Match": core_operation.json()["etag"],
+                    "Idempotency-Key": "routing-core-operation-cancel-1",
+                }
+            ),
+        )
+        assert cancelled_operation.status_code == 202, cancelled_operation.text
+        assert cancelled_operation.json()["operation_id"] == core_operation.json()["operation_id"]
+        service_logs = client.get(
+            "/desktop/v2/services/service-daemon/logs?limit=25",
+            headers=_headers(),
+        )
+        assert service_logs.status_code == 200, service_logs.text
+        assert service_logs.json()["items"][0]["message"] == "daemon ready"
+        cache_cleanup = client.post(
+            "/desktop/v2/maintenance/cache-cleanup",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "2",
+                    "Idempotency-Key": "routing-cache-cleanup-0001",
+                }
+            ),
+            json={"schema_version": "2", "scope": "safe_unreferenced"},
+        )
+        assert cache_cleanup.status_code == 202, cache_cleanup.text
+        assert cache_cleanup.json()["kind"] == "cache_cleanup"
+
         diagnostic = client.post(
             "/desktop/v2/diagnostics",
             headers=_headers(
@@ -1448,9 +2026,10 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             },
         )
         assert diagnostic.status_code == 202, diagnostic.text
-        assert client.get(
-            "/desktop/v2/diagnostics/diagnostic-1", headers=_headers()
-        ).status_code == 200
+        assert (
+            client.get("/desktop/v2/diagnostics/diagnostic-1", headers=_headers()).status_code
+            == 200
+        )
 
         called = {str(call[0]) for call in bridge.calls}
         assert {
@@ -1477,6 +2056,10 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             "list_services",
             "get_service",
             "restart_service",
+            "get_operation",
+            "cancel_operation",
+            "service_logs",
+            "cache_cleanup",
             "create_diagnostic",
             "get_diagnostic",
         } <= called

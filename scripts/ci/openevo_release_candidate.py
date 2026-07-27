@@ -18,7 +18,7 @@ from zipfile import BadZipFile, ZipFile
 
 
 MANIFEST_NAME = "release-candidate.json"
-RELEASE_CANDIDATE_SCHEMA_VERSION = 9
+RELEASE_CANDIDATE_SCHEMA_VERSION = 10
 CORE_DESCRIPTOR_NAME = "core-install-artifact.json"
 CHECKSUMS_NAME = "SHA256SUMS"
 MANAGED_RUNTIME_SOURCE_NAME = "managed-runtime-source.json"
@@ -169,6 +169,13 @@ CANDIDATE_WORKFLOW_RUN_KEYS = {
     "status",
 }
 
+LIFECYCLE_PROCESS_LOG_SOURCES = (
+    "daemon_stderr",
+    "daemon_stdout",
+    "ssh_stderr",
+    "ssh_stdout",
+)
+
 
 class CandidateError(RuntimeError):
     pass
@@ -191,6 +198,74 @@ def _is_regular_file(path: Path) -> bool:
 
 def _canonical_json(payload: object) -> bytes:
     return (json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+
+
+def _desktop_contract_manifest(version: str) -> dict[str, object]:
+    try:
+        contract = json.loads(
+            (REPO_ROOT / "desktop/release-contract.json").read_text(encoding="utf-8")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CandidateError("Desktop release contract is unreadable") from exc
+    policy = contract.get("v0110") if type(contract) is dict else None
+    if type(policy) is not dict:
+        raise CandidateError("Desktop v0.1.10 release contract is unavailable")
+    openapi = policy.get("accepted_desktop_openapi_digests")
+    events = policy.get("accepted_desktop_event_schema_digests")
+    features = policy.get("required_desktop_feature_flags")
+    if (
+        policy.get("release_version") != "0.1.10"
+        or policy.get("desktop_local_mutation_major") != 2
+        or type(openapi) is not list
+        or len(openapi) != 1
+        or type(openapi[0]) is not str
+        or DIGEST_PATTERN.fullmatch(openapi[0]) is None
+        or type(events) is not list
+        or len(events) != 1
+        or type(events[0]) is not str
+        or DIGEST_PATTERN.fullmatch(events[0]) is None
+        or type(features) is not list
+        or features != sorted(set(features))
+        or not all(type(flag) is str and flag for flag in features)
+        or not {
+            "lifecycle_operations_v2",
+            "lifecycle_process_logs_v2",
+            "mutation_idempotency_v2",
+        }.issubset(features)
+    ):
+        raise CandidateError("Desktop v0.1.10 release contract is invalid")
+    feature_set_sha256 = hashlib.sha256(
+        json.dumps(features, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode(
+            "ascii"
+        )
+    ).hexdigest()
+    return {
+        "release_version": version,
+        "mutation_major": 2,
+        "openapi_sha256": openapi[0],
+        "event_schema_sha256": events[0],
+        "feature_flags": features,
+        "feature_set_sha256": feature_set_sha256,
+    }
+
+
+def _lifecycle_evidence_requirements() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "operation_kind": "project_create",
+        "reservation_status": 202,
+        "maximum_reservation_latency_ms": 15_000,
+        "minimum_terminal_duration_ms": 15_000,
+        "minimum_ordered_phase_count": 2,
+        "allowed_process_log_sources": list(LIFECYCLE_PROCESS_LOG_SOURCES),
+        "require_sse_reconnect": True,
+        "require_relaunch_recovery": True,
+        "require_stable_action_id": True,
+        "require_single_core_project": True,
+        "require_single_applied_mutation": True,
+        "require_secret_canary_absence": True,
+        "require_renderer_secret_canary_absence": True,
+    }
 
 
 def _write_new(path: Path, payload: bytes) -> None:
@@ -766,7 +841,11 @@ def render_candidate_release_notes(
             "",
             "Codex subscription transcript mode: packaged and declared in this Preview.",
             "Candidate-bound real Codex Subscription science E2E: required before public Preview publication.",
-            "A public Preview carrying these notes has passed the separate signed publication gate for the exact packaged macOS sidecar and askpass helper, a System OpenSSH remote workspace, a verified OpenEvo Daemon/Core v2, subscription-authenticated Codex with transcript capture, two immutable science Tasks, adjacent successor Project Heads, next-Task Runtime Context reuse, three Evolution Revision outputs per successor, and Desktop v2 renderer observability. A candidate that has not passed that gate is not public.",
+            "A public Preview carrying these notes has passed the separate signed publication gate for the exact packaged macOS sidecar and askpass helper, a System OpenSSH remote workspace, a verified OpenEvo Daemon/Core v2, subscription-authenticated Codex with transcript capture, two immutable science Tasks, adjacent successor Project Heads, next-Task Runtime Context reuse, three Evolution Revision outputs per successor, Desktop v2 renderer observability, and one durable project-create lifecycle across SSE reconnect and sidecar relaunch. A candidate that has not passed that gate is not public.",
+            "Project creation is reserved as a durable operation before remote work begins; the Desktop Local API returns promptly, and an exact retry or relaunch reuses the same action, operation, Core project, mapping, and applied mutation.",
+            "All implemented long-running workflows use authoritative progress surfaces: Desktop-owned system OpenSSH, Daemon, native-workspace, and project lifecycles; native app startup; and Core-owned Tasks, successor transitions, services, diagnostics, and maintenance operations.",
+            "Lifecycle panels show fixed phases, measured or indeterminate progress, elapsed time, and sanitized SSH and Daemon stdout/stderr. Command lines, environments, credentials, tokens, Core endpoints, and absolute host paths are not exposed.",
+            "Supported remote profile: Linux x86-64 in the documented Docker user-container boundary, including UID 0 inside that existing container, with a writable home, Docker Engine access, and a pre-authenticated Codex subscription.",
             "Self-Deployed Reference mode: unavailable in this Preview.",
             "The shipped Desktop release authority blocks saving or running that mode; its Core-side reference architecture is not a Desktop product claim.",
             f"Managed Science runtime archive: {MANAGED_RUNTIME_ARCHIVE_NAME}.",
@@ -781,6 +860,7 @@ def render_candidate_release_notes(
             "PyPI is not used for this release.",
             "Only the declared architecture was built.",
             "The interactive Privacy & Security allow flow is not automated; command-line quarantine removal is validated.",
+            "Existing duplicate projects from v0.1.9 are preserved and may be manually ignored; migration does not delete remote project data.",
             "This unsigned Preview does not satisfy the benchmark, full secret-canary/privacy, Developer ID signing, notarization, or final External Beta gates. The public Preview science E2E claim is limited to the separately signed publication evidence described above.",
             "",
             "## Validation Results",
@@ -795,14 +875,14 @@ def render_candidate_release_notes(
             "## Security And Privacy",
             "",
             "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-            "Credential-canary verification for release assets: pending.",
-            "This workflow does not claim credential-free assets until the separate secret-canary gate passes.",
+            "Exact-candidate publication requires a generated secret canary to remain absent from lifecycle API pages, rendered text, screenshots, support logs, and evidence while sanitized SSH and Daemon process output is displayed.",
+            "Full release-asset and privacy qualification remains pending.",
             "Diagnostics sharing is explicit. Science data can be sent to the remote server and harness or model provider selected by the user. The full secret-canary/privacy release gate remains pending.",
             "",
             "## Install, Upgrade, And Uninstall",
             "",
             'Install: copy OpenEvo Desktop to Applications, run `xattr -dr com.apple.quarantine "/Applications/OpenEvo Desktop.app"`, then open it. This workflow validates synthetic browser quarantine, that documented removal command, the ad-hoc app signature, and launch; the interactive Privacy & Security UI remains unvalidated.',
-            "Upgrade: this Preview has no automatic updater; quit the app and replace it with a newer reviewed DMG. OpenEvo Daemon upgrade compatibility is not proven by this packaging-only Preview.",
+            "Upgrade: this Preview has no automatic updater; quit the app and replace it with a newer reviewed DMG. Provider schema-v2 state migrates to schema v3 without deleting retained profiles or projects. A public Preview carrying these notes has passed the release-matched Daemon/Core lifecycle gate; an unpublished candidate by itself has not.",
             "Uninstall: quit OpenEvo Desktop and remove it from Applications. Current local Desktop data under ~/Library/Application Support/org.openevo.desktop, including run-retry recovery state, is retained unless deleted separately. Legacy Preview data under ~/.openevo/desktop is preserved without being read and is also retained unless deleted separately. OpenEvo Daemon state, task data, model downloads, and runtime caches are also retained.",
             "",
         )
@@ -1718,7 +1798,9 @@ def create_candidate_manifest(
             "manifest_sha256": _sha256(paths["daemon_manifest"]),
             "release_identity": daemon_manifest["release"]["identity"],
         },
+        "desktop_contract": _desktop_contract_manifest(version),
         "files": files,
+        "lifecycle_evidence": _lifecycle_evidence_requirements(),
         "macos": {
             "architecture": architecture,
             "minimum_system_version": MINIMUM_MACOS_VERSION,
@@ -1767,6 +1849,8 @@ def _validate_candidate_manifest(
         "managed_runtime",
         "core",
         "daemon",
+        "desktop_contract",
+        "lifecycle_evidence",
         "files",
     }
     if type(manifest) is not dict or set(manifest) != required_keys:
@@ -1778,6 +1862,8 @@ def _validate_candidate_manifest(
     managed_runtime = manifest.get("managed_runtime")
     core = manifest.get("core")
     daemon = manifest.get("daemon")
+    desktop_contract = manifest.get("desktop_contract")
+    lifecycle_evidence = manifest.get("lifecycle_evidence")
     files = manifest.get("files")
     if manifest.get("schema_version") != RELEASE_CANDIDATE_SCHEMA_VERSION:
         raise CandidateError("candidate manifest schema version is invalid")
@@ -1787,6 +1873,10 @@ def _validate_candidate_manifest(
         raise CandidateError("candidate source commit does not match the expected checkout")
     if type(version) is not str or not version:
         raise CandidateError("candidate version is invalid")
+    if desktop_contract != _desktop_contract_manifest(version):
+        raise CandidateError("candidate Desktop lifecycle contract is invalid")
+    if lifecycle_evidence != _lifecycle_evidence_requirements():
+        raise CandidateError("candidate lifecycle evidence requirements are invalid")
     if release != {
         "app_bundle_signature": "adhoc",
         "channel": "unsigned-preview",

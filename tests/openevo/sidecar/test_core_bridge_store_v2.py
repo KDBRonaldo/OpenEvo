@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import hashlib
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -11,6 +13,7 @@ from desktop.sidecar.core_bridge_store_v2 import (
     CoreBridgeStoreConflictV2,
     CoreBridgeStoreDataV2Error,
     CoreBridgeStoreStateV2Error,
+    DATABASE_FILENAME,
     DesktopCoreBridgeStoreV2,
     OWNER_LOCK_FILENAME,
 )
@@ -102,6 +105,31 @@ def _successor(previous: CoreProjectMappingV2) -> CoreProjectMappingV2:
     )
 
 
+def _rewrite_single_mapping_release(root: Path, release_version: str) -> None:
+    database = root / DATABASE_FILENAME
+    with sqlite3.connect(database) as connection:
+        for table in ("mappings", "mapping_history"):
+            rows = connection.execute(
+                f"SELECT rowid, document_json FROM {table}"
+            ).fetchall()
+            assert len(rows) == 1
+            rowid, encoded = rows[0]
+            document = json.loads(bytes(encoded))
+            document["daemon_release_version"] = release_version
+            document["core_version"]["release_version"] = release_version
+            canonical = json.dumps(
+                document,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            connection.execute(
+                f"UPDATE {table} SET document_sha256 = ?, document_json = ? WHERE rowid = ?",
+                (hashlib.sha256(canonical).hexdigest(), canonical, rowid),
+            )
+
+
 def test_mapping_binds_distinct_v2_authorities_and_has_no_generic_revision() -> None:
     mapping = _mapping()
     assert mapping.active_project_head is not None
@@ -111,6 +139,35 @@ def test_mapping_binds_distinct_v2_authorities_and_has_no_generic_revision() -> 
         replace(mapping, core_project_id="other-project")
     with pytest.raises((TypeError, ValueError)):
         replace(mapping, daemon_registry_sha256="f" * 64)
+
+
+def test_store_recovers_exact_v019_mapping_only_as_historical_authority(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "core-bridge-v2"
+    root.mkdir(mode=0o700)
+    with DesktopCoreBridgeStoreV2(root) as store:
+        store.commit_mapping(_mapping(), expected_previous=None)
+    _rewrite_single_mapping_release(root, "0.1.9")
+
+    with DesktopCoreBridgeStoreV2(root) as store:
+        historical = store.load_mapping("desktop-project-1")
+        assert historical is not None
+        assert historical.daemon_release_version == "0.1.9"
+        assert historical.core_version.release_version == "0.1.9"
+        with pytest.raises(CoreBridgeStoreDataV2Error, match="current release"):
+            store.commit_mapping(historical, expected_previous=None)
+
+
+def test_store_rejects_nonpredecessor_historical_mapping_release(tmp_path: Path) -> None:
+    root = tmp_path / "core-bridge-v2"
+    root.mkdir(mode=0o700)
+    with DesktopCoreBridgeStoreV2(root) as store:
+        store.commit_mapping(_mapping(), expected_previous=None)
+    _rewrite_single_mapping_release(root, "0.1.8")
+
+    with pytest.raises(CoreBridgeStoreDataV2Error, match="stored Core mapping"):
+        DesktopCoreBridgeStoreV2(root)
 
 
 def test_store_uses_private_separate_namespace_and_atomic_mapping_history(
@@ -198,6 +255,49 @@ def test_mutation_replay_ledger_has_exact_state_machine(tmp_path: Path) -> None:
         )
         with pytest.raises(CoreBridgeStoreConflictV2):
             store.reserve_mutation(replace(prepared, request_sha256="c" * 64))
+
+
+def test_release_evidence_summary_requires_one_applied_project_create(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "state"
+    root.mkdir(mode=0o700)
+    mapping = _mapping()
+    action_id = "release-project-create-action"
+    prepared = CoreBridgeMutationV2(
+        desktop_project_id=mapping.desktop_project_id,
+        profile_id=mapping.profile_id,
+        profile_connection_generation=mapping.profile_connection_generation,
+        operation="create_project_v2",
+        resource_scope="projects",
+        idempotency_key=action_id,
+        request_sha256="a" * 64,
+        state=CoreBridgeMutationStateV2.PREPARED,
+        response_sha256=None,
+        response_resource_id=None,
+    )
+    with DesktopCoreBridgeStoreV2(root) as store:
+        store.commit_mapping(mapping, expected_previous=None)
+        store.reserve_mutation(prepared)
+        store.mark_mutation_applied(
+            prepared,
+            response_sha256="b" * 64,
+            response_resource_id=mapping.core_project_id,
+        )
+
+        assert store.release_evidence_summary(
+            core_project_id=mapping.core_project_id,
+            action_id=action_id,
+        ) == {
+            "project_mapping_count": 1,
+            "applied_create_project_mutation_count": 1,
+        }
+
+        with pytest.raises(CoreBridgeStoreDataV2Error, match="release evidence"):
+            store.release_evidence_summary(
+                core_project_id=mapping.core_project_id,
+                action_id="different-release-action",
+            )
 
 
 def test_startup_rejects_tampered_mapping_and_path_replacement(tmp_path: Path) -> None:

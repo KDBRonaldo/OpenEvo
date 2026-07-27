@@ -54,6 +54,10 @@ _SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 _WHEEL_FILENAME = re.compile(r"[A-Za-z0-9_.+-]+\.whl\Z", re.ASCII)
 _DAEMON_BUNDLE_FILENAME = "openevo-daemon-linux-x86_64"
 _DAEMON_MANIFEST_FILENAME = "openevo-daemon-bundle.json"
+LifecycleProgressObserverV2 = Callable[
+    [local_v2.LifecyclePhaseV2, local_v2.LifecycleProgressV2 | None, bool],
+    None,
+]
 
 
 class _CoreSshTransport(Protocol):
@@ -303,13 +307,18 @@ class DesktopCoreSshBridgeAdapterV2:
         self,
         lifecycle: GenerationBoundRemoteLifecycleV2,
         bootstrap: CoreBootstrapConfigV2,
+        *,
+        progress_observer: LifecycleProgressObserverV2 | None = None,
     ) -> None:
         if type(bootstrap) is not CoreBootstrapConfigV2:
             raise TypeError("bootstrap must be an exact CoreBootstrapConfigV2")
         if not callable(getattr(lifecycle, "active_transport", None)):
             raise TypeError("lifecycle lacks generation-bound active transport")
+        if progress_observer is not None and not callable(progress_observer):
+            raise TypeError("Core SSH lifecycle progress observer is invalid")
         self._lifecycle = lifecycle
         self._bootstrap = bootstrap
+        self._progress_observer = progress_observer
         self._lock = threading.RLock()
         self._generation = 0
         self._authority: _AttachmentAuthority | None = None
@@ -318,6 +327,16 @@ class DesktopCoreSshBridgeAdapterV2:
 
     def __repr__(self) -> str:
         return "DesktopCoreSshBridgeAdapterV2(<private>)"
+
+    def set_progress_observer(self, observer: LifecycleProgressObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("Core SSH lifecycle progress observer is invalid")
+        with self._lock:
+            if self._progress_observer is observer:
+                return
+            if self._authority is not None or self._progress_observer is not None:
+                raise RuntimeError("Core SSH lifecycle progress observer cannot be changed")
+            self._progress_observer = observer
 
     def ensure_core(
         self,
@@ -340,14 +359,48 @@ class DesktopCoreSshBridgeAdapterV2:
         )
         manifest_path = Path(daemon.local_path).with_name(_DAEMON_MANIFEST_FILENAME)
         try:
+            manifest_size = manifest_path.stat().st_size
+        except OSError:
+            raise _adapter_error(
+                "daemon_release_assets_unavailable",
+                "This Desktop build does not contain the sealed Daemon manifest.",
+                status=409,
+                action="install_repair_daemon",
+                affected_resource_id=profile_id,
+            ) from None
+        transfer_total = daemon.byte_size + manifest_size + runtime.byte_size
+        self._observe_progress(
+            "remote_preflight",
+            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+            cancellable=True,
+        )
+        self._observe_progress(
+            "transferring",
+            local_v2.LifecycleProgressBytesV2(
+                kind="bytes",
+                completed=0,
+                total=transfer_total,
+            ),
+            cancellable=True,
+        )
+        try:
             staged = transport.stage_daemon_bundle(
                 bundle_path=daemon.local_path,
                 bundle_sha256=daemon.sha256,
                 bundle_size=daemon.byte_size,
                 manifest_path=str(manifest_path),
                 manifest_sha256=daemon.manifest_sha256,
-                manifest_size=manifest_path.stat().st_size,
+                manifest_size=manifest_size,
                 timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+            )
+            self._observe_progress(
+                "transferring",
+                local_v2.LifecycleProgressBytesV2(
+                    kind="bytes",
+                    completed=daemon.byte_size + manifest_size,
+                    total=transfer_total,
+                ),
+                cancellable=True,
             )
             _verify_staged_daemon(daemon, staged)
             self._require_same_transport(profile_id, profile_connection_generation, transport)
@@ -374,7 +427,26 @@ class DesktopCoreSshBridgeAdapterV2:
                 aliases=MANAGED_RUNTIME_ARCHIVE_RELEASE.aliases,
                 timeout_seconds=min(_remaining(deadline), _MAX_MANAGED_RUNTIME_SECONDS),
             )
+            self._observe_progress(
+                "transferring",
+                local_v2.LifecycleProgressBytesV2(
+                    kind="bytes",
+                    completed=transfer_total,
+                    total=transfer_total,
+                ),
+                cancellable=True,
+            )
+            self._observe_progress(
+                "verifying",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=True,
+            )
             self._require_same_transport(profile_id, profile_connection_generation, transport)
+            self._observe_progress(
+                "starting_daemon",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=False,
+            )
             if (
                 self._bootstrap.replace_mismatched
                 and predecessor.state != "absent"
@@ -399,6 +471,11 @@ class DesktopCoreSshBridgeAdapterV2:
                         retryable=True,
                         action="retry",
                     )
+            self._observe_progress(
+                "waiting_for_daemon",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=False,
+            )
             remote, service = transport.ensure_daemon_bundle(
                 staged,
                 expected_predecessor=predecessor,
@@ -444,6 +521,17 @@ class DesktopCoreSshBridgeAdapterV2:
             bearer_token=remote.bearer_token,
             bearer_identity=bearer_identity,
         )
+
+    def _observe_progress(
+        self,
+        phase: local_v2.LifecyclePhaseV2,
+        progress: local_v2.LifecycleProgressV2 | None,
+        *,
+        cancellable: bool,
+    ) -> None:
+        observer = self._progress_observer
+        if observer is not None:
+            observer(phase, progress, cancellable)
 
     def open_tunnel(
         self,
@@ -1184,6 +1272,7 @@ __all__ = (
     "CoreBootstrapConfigV2",
     "DesktopCoreSshBridgeAdapterV2",
     "GenerationBoundRemoteLifecycleV2",
+    "LifecycleProgressObserverV2",
     "SealedCoreBootstrapAssetV2",
     "SealedDaemonBundleV2",
     "SealedManagedRuntimeArchiveV2",

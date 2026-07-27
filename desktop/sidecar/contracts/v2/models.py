@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 import hashlib
 import json
 from typing import Annotated, Literal, TypeAlias
@@ -15,6 +16,9 @@ MAX_JAVASCRIPT_SAFE_INTEGER = (1 << 53) - 1
 MAX_PROFILE_COUNT = 100
 MAX_HOST_HINTS = 512
 MAX_CATALOG_WARNINGS = 64
+MAX_LIFECYCLE_OPERATION_COUNT = 16
+MAX_LIFECYCLE_LOG_PAGE_ENTRIES = 100
+MAX_LIFECYCLE_LOG_ENTRY_BYTES = 16 * 1024
 
 
 class StrictModel(BaseModel):
@@ -371,11 +375,392 @@ class DesktopHealthV2(StrictModel):
     checked_at: UtcTimestamp
 
 
+LifecycleOperationKindV2: TypeAlias = Literal[
+    "profile_connect",
+    "profile_disconnect",
+    "host_key_review",
+    "native_workspace_prepare",
+    "project_create",
+    "project_activate",
+]
+LifecycleOperationStatusV2: TypeAlias = Literal[
+    "queued",
+    "running",
+    "succeeded",
+    "failed",
+    "cancelled",
+]
+LifecyclePhaseV2: TypeAlias = Literal[
+    "validation",
+    "queued",
+    "resolving_system_openssh",
+    "connecting",
+    "waiting_for_user",
+    "remote_preflight",
+    "transferring",
+    "verifying",
+    "starting_daemon",
+    "waiting_for_daemon",
+    "opening_project_tunnel",
+    "negotiating_core",
+    "preparing_native_workspace",
+    "creating_remote_project",
+    "verifying_project",
+    "activating",
+    "finalizing",
+]
+LIFECYCLE_PHASES: tuple[LifecyclePhaseV2, ...] = (
+    "validation",
+    "queued",
+    "resolving_system_openssh",
+    "connecting",
+    "waiting_for_user",
+    "remote_preflight",
+    "transferring",
+    "verifying",
+    "starting_daemon",
+    "waiting_for_daemon",
+    "opening_project_tunnel",
+    "negotiating_core",
+    "preparing_native_workspace",
+    "creating_remote_project",
+    "verifying_project",
+    "activating",
+    "finalizing",
+)
+
+
+class LifecycleProgressIndeterminateV2(StrictModel):
+    kind: Literal["indeterminate"]
+
+
+class LifecycleProgressBytesV2(StrictModel):
+    kind: Literal["bytes"]
+    completed: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    total: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+
+    @model_validator(mode="after")
+    def _completed_not_past_total(self) -> LifecycleProgressBytesV2:
+        if self.completed > self.total:
+            raise ValueError("completed bytes exceed total")
+        return self
+
+
+class LifecycleProgressItemsV2(StrictModel):
+    kind: Literal["items"]
+    completed: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    total: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+
+    @model_validator(mode="after")
+    def _completed_not_past_total(self) -> LifecycleProgressItemsV2:
+        if self.completed > self.total:
+            raise ValueError("completed items exceed total")
+        return self
+
+
+LifecycleProgressV2: TypeAlias = Annotated[
+    LifecycleProgressIndeterminateV2
+    | LifecycleProgressBytesV2
+    | LifecycleProgressItemsV2,
+    Field(discriminator="kind"),
+]
+
+
+class LifecycleProfileResourceRefV2(StrictModel):
+    resource_kind: Literal["profile"]
+    resource_id: OpaqueId
+
+
+class LifecycleNativeWorkspaceResourceRefV2(StrictModel):
+    resource_kind: Literal["native_workspace"]
+    resource_id: OpaqueId
+
+
+class LifecycleProjectResourceRefV2(StrictModel):
+    resource_kind: Literal["project"]
+    resource_id: OpaqueId
+
+
+LifecycleResourceRefV2: TypeAlias = Annotated[
+    LifecycleProfileResourceRefV2
+    | LifecycleNativeWorkspaceResourceRefV2
+    | LifecycleProjectResourceRefV2,
+    Field(discriminator="resource_kind"),
+]
+
+
+class LifecycleProfileResultV2(StrictModel):
+    result_kind: Literal["profile"]
+    profile_id: OpaqueId
+    connection_generation: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+
+
+class LifecycleNativeWorkspaceResultV2(StrictModel):
+    result_kind: Literal["native_workspace"]
+    import_id: OpaqueId
+    content_sha256: Digest
+    byte_size: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    entry_count: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    extracted_byte_size: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    display_name: DisplayName
+
+
+class LifecycleProjectResultV2(StrictModel):
+    result_kind: Literal["project"]
+    project_id: OpaqueId
+
+
+LifecycleResultV2: TypeAlias = Annotated[
+    LifecycleProfileResultV2
+    | LifecycleNativeWorkspaceResultV2
+    | LifecycleProjectResultV2,
+    Field(discriminator="result_kind"),
+]
+
+
+def _expected_lifecycle_resource_kind(kind: LifecycleOperationKindV2) -> str:
+    if kind in {"profile_connect", "profile_disconnect", "host_key_review"}:
+        return "profile"
+    if kind == "native_workspace_prepare":
+        return "native_workspace"
+    return "project"
+
+
+def _validate_lifecycle_identity(
+    *,
+    kind: LifecycleOperationKindV2,
+    resource: LifecycleResourceRefV2,
+    result: LifecycleResultV2 | None,
+) -> None:
+    expected_kind = _expected_lifecycle_resource_kind(kind)
+    if resource.resource_kind != expected_kind:
+        raise ValueError("operation kind and resource kind do not match")
+    if result is None:
+        return
+    if result.result_kind != expected_kind:
+        raise ValueError("operation resource and result kind do not match")
+    if kind == "project_create":
+        # The reserved resource is the Desktop bridge identity available
+        # before remote mutation. Core issues the authoritative project ID only
+        # when that idempotent mutation succeeds.
+        return
+    result_resource_id = {
+        "profile": getattr(result, "profile_id", None),
+        "native_workspace": getattr(result, "import_id", None),
+        "project": getattr(result, "project_id", None),
+    }[expected_kind]
+    if result_resource_id != resource.resource_id:
+        raise ValueError("operation result belongs to another resource")
+
+
+def _validate_lifecycle_phase(
+    *,
+    phase: LifecyclePhaseV2,
+    phase_index: int,
+    phase_total: int,
+) -> None:
+    if phase_total != len(LIFECYCLE_PHASES):
+        raise ValueError("lifecycle phase total differs from the fixed phase plan")
+    if LIFECYCLE_PHASES[phase_index] != phase:
+        raise ValueError("lifecycle phase index differs from the fixed phase plan")
+
+
+def _parse_utc_timestamp(value: UtcTimestamp) -> datetime:
+    try:
+        return datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise ValueError("lifecycle timestamp is not a real UTC instant") from exc
+
+
+class LifecycleOperationRefV2(StrictModel):
+    schema_version: Literal["2"] = "2"
+    operation_id: OpaqueId
+    kind: LifecycleOperationKindV2
+    resource: LifecycleResourceRefV2
+    request_sha256: Digest
+    status: LifecycleOperationStatusV2
+    phase: LifecyclePhaseV2
+    phase_index: int = Field(ge=0, le=len(LIFECYCLE_PHASES) - 1)
+    phase_total: int = Field(ge=1, le=len(LIFECYCLE_PHASES))
+    log_sequence_high_watermark: int = Field(
+        ge=0,
+        le=MAX_JAVASCRIPT_SAFE_INTEGER,
+    )
+    updated_at: UtcTimestamp
+    etag: ETag
+
+    @model_validator(mode="after")
+    def _bind_identity_and_phase(self) -> LifecycleOperationRefV2:
+        _validate_lifecycle_identity(kind=self.kind, resource=self.resource, result=None)
+        _validate_lifecycle_phase(
+            phase=self.phase,
+            phase_index=self.phase_index,
+            phase_total=self.phase_total,
+        )
+        return self
+
+    @classmethod
+    def from_operation(
+        cls,
+        operation: LifecycleOperationV2,
+    ) -> LifecycleOperationRefV2:
+        return cls(
+            operation_id=operation.operation_id,
+            kind=operation.kind,
+            resource=operation.resource,
+            request_sha256=operation.request_sha256,
+            status=operation.status,
+            phase=operation.phase,
+            phase_index=operation.phase_index,
+            phase_total=operation.phase_total,
+            log_sequence_high_watermark=operation.log_sequence_high_watermark,
+            updated_at=operation.updated_at,
+            etag=operation.etag,
+        )
+
+
+class LifecycleOperationV2(StrictModel):
+    schema_version: Literal["2"] = "2"
+    operation_id: OpaqueId
+    kind: LifecycleOperationKindV2
+    resource: LifecycleResourceRefV2
+    request_sha256: Digest
+    status: LifecycleOperationStatusV2
+    phase: LifecyclePhaseV2
+    phase_index: int = Field(ge=0, le=len(LIFECYCLE_PHASES) - 1)
+    phase_total: int = Field(ge=1, le=len(LIFECYCLE_PHASES))
+    progress: LifecycleProgressV2 | None
+    cancellable: bool
+    result: LifecycleResultV2 | None
+    failure: DesktopErrorV2 | None
+    log_sequence_high_watermark: int = Field(
+        ge=0,
+        le=MAX_JAVASCRIPT_SAFE_INTEGER,
+    )
+    created_at: UtcTimestamp
+    started_at: UtcTimestamp | None
+    updated_at: UtcTimestamp
+    finished_at: UtcTimestamp | None
+    etag: ETag
+
+    @model_validator(mode="after")
+    def _bind_lifecycle_authority(self) -> LifecycleOperationV2:
+        _validate_lifecycle_identity(
+            kind=self.kind,
+            resource=self.resource,
+            result=self.result,
+        )
+        _validate_lifecycle_phase(
+            phase=self.phase,
+            phase_index=self.phase_index,
+            phase_total=self.phase_total,
+        )
+        if self.status == "succeeded":
+            if self.result is None:
+                raise ValueError("succeeded operation requires a typed result")
+            if self.failure is not None:
+                raise ValueError("succeeded operation cannot retain a failure")
+            if self.phase != "finalizing":
+                raise ValueError("succeeded operation requires the final lifecycle phase")
+        elif self.status == "failed":
+            if self.failure is None:
+                raise ValueError("failed operation requires a typed failure")
+            if self.result is not None:
+                raise ValueError("failed operation cannot retain a result")
+        elif self.result is not None or self.failure is not None:
+            raise ValueError("result and failure are terminal status fields")
+
+        terminal = self.status in {"succeeded", "failed", "cancelled"}
+        if terminal != (self.finished_at is not None):
+            raise ValueError("finished timestamp must match terminal status")
+        if terminal and self.cancellable:
+            raise ValueError("terminal operation cannot remain cancellable")
+        if self.status == "queued" and self.started_at is not None:
+            raise ValueError("queued operation cannot have a started timestamp")
+        if self.status == "running" and self.started_at is None:
+            raise ValueError("running operation requires a started timestamp")
+        timestamps = [_parse_utc_timestamp(self.created_at)]
+        if self.started_at is not None:
+            timestamps.append(_parse_utc_timestamp(self.started_at))
+        timestamps.append(_parse_utc_timestamp(self.updated_at))
+        if timestamps != sorted(timestamps):
+            raise ValueError("lifecycle timestamps cannot regress")
+        if self.finished_at is not None:
+            finished_at = _parse_utc_timestamp(self.finished_at)
+            if finished_at != timestamps[-1]:
+                raise ValueError(
+                    "terminal timestamp must equal the immutable update timestamp"
+                )
+        return self
+
+
+class LifecycleLogEntryV2(StrictModel):
+    schema_version: Literal["2"] = "2"
+    operation_id: OpaqueId
+    sequence: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    occurred_at: UtcTimestamp
+    source: Literal[
+        "desktop",
+        "ssh_stdout",
+        "ssh_stderr",
+        "daemon_stdout",
+        "daemon_stderr",
+    ]
+    text: Annotated[str, StringConstraints(min_length=1)]
+    truncated: bool
+
+    @model_validator(mode="after")
+    def _bounded_safe_text(self) -> LifecycleLogEntryV2:
+        if len(self.text.encode("utf-8")) > MAX_LIFECYCLE_LOG_ENTRY_BYTES:
+            raise ValueError("lifecycle log text exceeds the UTF-8 byte limit")
+        if any(
+            (ord(character) < 0x20 and character not in {"\n", "\t"})
+            or 0x7F <= ord(character) <= 0x9F
+            for character in self.text
+        ):
+            raise ValueError("lifecycle log text contains a prohibited control character")
+        return self
+
+
+class LifecycleLogPageV2(CursorPageV2):
+    schema_version: Literal["2"] = "2"
+    operation_id: OpaqueId
+    dropped_before_sequence: int = Field(ge=0, le=MAX_JAVASCRIPT_SAFE_INTEGER)
+    items: list[LifecycleLogEntryV2] = Field(
+        max_length=MAX_LIFECYCLE_LOG_PAGE_ENTRIES
+    )
+
+    @model_validator(mode="after")
+    def _bind_log_entries(self) -> LifecycleLogPageV2:
+        sequences = [item.sequence for item in self.items]
+        if any(item.operation_id != self.operation_id for item in self.items):
+            raise ValueError("lifecycle log entry belongs to another operation")
+        if sequences != sorted(set(sequences)):
+            raise ValueError("lifecycle log sequences must be unique and ascending")
+        if any(sequence <= self.dropped_before_sequence for sequence in sequences):
+            raise ValueError("lifecycle log entry is at or before the dropped boundary")
+        return self
+
+
+class LifecycleCancelV2(StrictModel):
+    schema_version: Literal["2"] = "2"
+    expected_operation_id: OpaqueId
+
+
+class LifecycleAcknowledgeV2(StrictModel):
+    schema_version: Literal["2"] = "2"
+    expected_operation_id: OpaqueId
+    expected_terminal_status: Literal["succeeded", "failed", "cancelled"]
+
+
 class DesktopStateV2(StrictModel):
     schema_version: Literal["2"] = "2"
     profiles: list[RemoteProfileV2] = Field(max_length=MAX_PROFILE_COUNT)
     active_profile_id: OpaqueId | None
     active_project_id: OpaqueId | None
+    pending_operations: list[LifecycleOperationRefV2] = Field(
+        max_length=MAX_LIFECYCLE_OPERATION_COUNT
+    )
     last_event_id: OpaqueId | None
     updated_at: UtcTimestamp
 
@@ -384,6 +769,9 @@ class DesktopStateV2(StrictModel):
         profile_ids = {profile.profile_id for profile in self.profiles}
         if self.active_profile_id is not None and self.active_profile_id not in profile_ids:
             raise ValueError("active profile is absent from state")
+        operation_ids = [operation.operation_id for operation in self.pending_operations]
+        if len(operation_ids) != len(set(operation_ids)):
+            raise ValueError("pending lifecycle operation IDs must be unique")
         return self
 
 
@@ -440,6 +828,9 @@ DesktopLogPageV2 = core.LogPageV2
 DesktopTaskContextV2 = core.TaskContextV2
 DesktopTaskPageV2 = core.TaskPageV2
 CoreTaskSubmitRequestV2 = core.TaskSubmitRequestV2
+DesktopCoreOperationV2 = core.OperationV2
+DesktopServiceLogPageV2 = core.LogPageV2
+DesktopCacheCleanupRequestV2 = core.CacheCleanupRequestV2
 
 
 class ProjectCreateV2(StrictModel):
@@ -625,11 +1016,25 @@ class DiagnosticEventPayloadV2(StrictModel):
     status: Literal["queued", "running", "ready", "failed"]
 
 
+class LifecycleOperationEventPayloadV2(StrictModel):
+    payload_kind: Literal["lifecycle_operation_changed"]
+    operation_id: OpaqueId
+    kind: LifecycleOperationKindV2
+    status: LifecycleOperationStatusV2
+    phase: LifecyclePhaseV2
+    etag: ETag
+    log_sequence_high_watermark: int = Field(
+        ge=0,
+        le=MAX_JAVASCRIPT_SAFE_INTEGER,
+    )
+
+
 DesktopEventPayloadV2: TypeAlias = Annotated[
     HostCatalogEventPayloadV2
     | ProfileEventPayloadV2
     | CoreAuthorityEventPayloadV2
-    | DiagnosticEventPayloadV2,
+    | DiagnosticEventPayloadV2
+    | LifecycleOperationEventPayloadV2,
     Field(discriminator="payload_kind"),
 ]
 
@@ -644,6 +1049,7 @@ class DesktopEventEnvelopeV2(StrictModel):
         "profile_connection_changed",
         "core_authority_changed",
         "diagnostic_changed",
+        "lifecycle_operation_changed",
     ]
     payload_sha256: Digest
     payload: DesktopEventPayloadV2
@@ -671,6 +1077,7 @@ class DesktopSseFrameV2(StrictModel):
         "profile_connection_changed",
         "core_authority_changed",
         "diagnostic_changed",
+        "lifecycle_operation_changed",
     ]
     data: DesktopEventEnvelopeV2
     retry: int | None = Field(default=None, ge=1000, le=60_000)
@@ -692,6 +1099,8 @@ __all__ = [
     "DesktopArtifactContentV2",
     "DesktopArtifactPageV2",
     "DesktopArtifactV2",
+    "DesktopCacheCleanupRequestV2",
+    "DesktopCoreOperationV2",
     "DesktopDiagnosticV2",
     "DesktopErrorV2",
     "DesktopEventEnvelopeV2",
@@ -700,6 +1109,7 @@ __all__ = [
     "DesktopProjectV2",
     "DesktopProjectPageV2",
     "DesktopServicePageV2",
+    "DesktopServiceLogPageV2",
     "DesktopServiceV2",
     "DesktopSseFrameV2",
     "DesktopStateV2",
@@ -714,6 +1124,28 @@ __all__ = [
     "EvolutionRevisionRefV2",
     "HostKeyReviewRequestV2",
     "LegacyExplicitProfileV2",
+    "LifecycleAcknowledgeV2",
+    "LifecycleCancelV2",
+    "LifecycleLogEntryV2",
+    "LifecycleLogPageV2",
+    "LifecycleNativeWorkspaceResourceRefV2",
+    "LifecycleNativeWorkspaceResultV2",
+    "LifecycleOperationEventPayloadV2",
+    "LifecycleOperationKindV2",
+    "LifecycleOperationRefV2",
+    "LifecycleOperationStatusV2",
+    "LifecycleOperationV2",
+    "LifecyclePhaseV2",
+    "LifecycleProfileResourceRefV2",
+    "LifecycleProfileResultV2",
+    "LifecycleProgressBytesV2",
+    "LifecycleProgressIndeterminateV2",
+    "LifecycleProgressItemsV2",
+    "LifecycleProgressV2",
+    "LifecycleProjectResourceRefV2",
+    "LifecycleProjectResultV2",
+    "LifecycleResourceRefV2",
+    "LifecycleResultV2",
     "LocalOperationV2",
     "ProfileConnectionActionV2",
     "ProfileDisplayNamePatchV2",

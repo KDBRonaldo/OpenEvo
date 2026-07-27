@@ -42,6 +42,7 @@ class NativeWorkspaceArchiveCancelled(NativeWorkspaceArchiveError):
 
 
 CancellationCheck = Callable[[], bool]
+ProgressObserver = Callable[[int, int], None]
 
 
 def _check_cancel(cancel_check: CancellationCheck | None) -> None:
@@ -103,6 +104,7 @@ def _write_all(
     payload: bytes,
     *,
     cancel_check: CancellationCheck | None = None,
+    progress: Callable[[int], None] | None = None,
 ) -> None:
     view = memoryview(payload)
     offset = 0
@@ -115,6 +117,8 @@ def _write_all(
         if written <= 0:
             raise NativeWorkspaceArchiveError("workspace archive write failed")
         offset += written
+        if progress is not None:
+            progress(written)
 
 
 def _safe_component(value: str) -> str:
@@ -422,6 +426,16 @@ def _scan(
     return tuple(entries), extracted_bytes[0]
 
 
+def _archive_byte_size(entries: tuple[_Entry, ...]) -> int:
+    total = 2 * _BLOCK_SIZE
+    for entry in entries:
+        total += _BLOCK_SIZE
+        if not entry.directory:
+            total += entry.identity.size
+            total += (-entry.identity.size) % _BLOCK_SIZE
+    return total
+
+
 def _open_entry(
     root_descriptor: int,
     entry: _Entry,
@@ -453,8 +467,25 @@ def _write_archive(
     archive: int,
     *,
     cancel_check: CancellationCheck | None = None,
+    progress_observer: ProgressObserver | None = None,
 ) -> None:
     directories = {entry.logical_path: entry for entry in entries if entry.directory}
+    total_bytes = _archive_byte_size(entries)
+    completed_bytes = 0
+    reported_bytes = 0
+    report_step = max(64 * 1024, total_bytes // 100)
+
+    def progress(written: int) -> None:
+        nonlocal completed_bytes, reported_bytes
+        completed_bytes += written
+        if progress_observer is not None and (
+            completed_bytes == total_bytes or completed_bytes - reported_bytes >= report_step
+        ):
+            progress_observer(completed_bytes, total_bytes)
+            reported_bytes = completed_bytes
+
+    if progress_observer is not None:
+        progress_observer(0, total_bytes)
     for entry in entries:
         _check_cancel(cancel_check)
         opened = _open_entry(
@@ -464,7 +495,12 @@ def _write_archive(
             cancel_check=cancel_check,
         )
         try:
-            _write_all(archive, _tar_header(entry), cancel_check=cancel_check)
+            _write_all(
+                archive,
+                _tar_header(entry),
+                cancel_check=cancel_check,
+                progress=progress,
+            )
             if entry.directory:
                 continue
             offset = 0
@@ -480,7 +516,12 @@ def _write_archive(
                     continue
                 if not chunk:
                     raise NativeWorkspaceArchiveError("workspace file changed while reading")
-                _write_all(archive, chunk, cancel_check=cancel_check)
+                _write_all(
+                    archive,
+                    chunk,
+                    cancel_check=cancel_check,
+                    progress=progress,
+                )
                 offset += len(chunk)
             if os.pread(opened, 1, entry.identity.size):
                 raise NativeWorkspaceArchiveError("workspace file changed while reading")
@@ -488,10 +529,22 @@ def _write_archive(
                 raise NativeWorkspaceArchiveError("workspace file changed while reading")
             padding = (-entry.identity.size) % _BLOCK_SIZE
             if padding:
-                _write_all(archive, bytes(padding), cancel_check=cancel_check)
+                _write_all(
+                    archive,
+                    bytes(padding),
+                    cancel_check=cancel_check,
+                    progress=progress,
+                )
         finally:
             os.close(opened)
-    _write_all(archive, bytes(2 * _BLOCK_SIZE), cancel_check=cancel_check)
+    _write_all(
+        archive,
+        bytes(2 * _BLOCK_SIZE),
+        cancel_check=cancel_check,
+        progress=progress,
+    )
+    if completed_bytes != total_bytes:
+        raise NativeWorkspaceArchiveError("workspace archive progress is inconsistent")
 
 
 def _sha256(
@@ -526,6 +579,7 @@ def prepare_native_workspace(
     expected_device: int,
     expected_inode: int,
     cancel_check: CancellationCheck | None = None,
+    progress_observer: ProgressObserver | None = None,
 ) -> Iterator[PreparedNativeWorkspace]:
     """Yield one private deterministic tar and its exact opaque contract ref."""
 
@@ -553,6 +607,7 @@ def prepare_native_workspace(
                 entries,
                 stream.fileno(),
                 cancel_check=cancel_check,
+                progress_observer=progress_observer,
             )
             os.fsync(stream.fileno())
             _after_archive_write(root_descriptor)
@@ -598,5 +653,6 @@ __all__ = (
     "NativeWorkspaceArchiveCancelled",
     "NativeWorkspaceArchiveError",
     "PreparedNativeWorkspace",
+    "ProgressObserver",
     "prepare_native_workspace",
 )

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from email.parser import Parser
 import errno
 import fcntl
@@ -31,6 +32,7 @@ import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory, TemporaryFile
+import threading
 import time
 from types import ModuleType
 from typing import Any, BinaryIO, Callable, Iterator, Mapping, Sequence
@@ -74,6 +76,32 @@ MAX_RENDERER_TIMEOUT_SECONDS = 600.0
 RENDERER_PROCESS_EXIT_GRACE_SECONDS = 15.0
 MAX_INTER_SESSION_DELAY_SECONDS = 300.0
 MAX_OVERALL_TIMEOUT_SECONDS = 21600.0
+MAX_SSE_EVENT_BYTES = 64 * 1024
+RELEASE_CANDIDATE_SCHEMA_VERSION = 10
+MAX_LIFECYCLE_RESERVATION_MILLISECONDS = 15_000
+MIN_LIFECYCLE_TERMINAL_MILLISECONDS = 15_000
+LIFECYCLE_PHASES = (
+    "validation",
+    "queued",
+    "resolving_system_openssh",
+    "connecting",
+    "waiting_for_user",
+    "remote_preflight",
+    "transferring",
+    "verifying",
+    "starting_daemon",
+    "waiting_for_daemon",
+    "opening_project_tunnel",
+    "negotiating_core",
+    "preparing_native_workspace",
+    "creating_remote_project",
+    "verifying_project",
+    "activating",
+    "finalizing",
+)
+LIFECYCLE_PROCESS_LOG_SOURCES = frozenset(
+    {"daemon_stderr", "daemon_stdout", "ssh_stderr", "ssh_stdout"}
+)
 BUILD_PROXY_ENVIRONMENT_NAMES = frozenset(
     {
         "ALL_PROXY",
@@ -271,6 +299,29 @@ EVIDENCE_ALLOWED_KEYS = frozenset(
         "second_admission_pinned_first_successor",
         "second_context_pinned_first_successor",
         "second_runtime_context_equals_first_successor",
+        "lifecycle",
+        "operation_kind",
+        "reservation_status",
+        "reservation_latency_ms",
+        "terminal_duration_ms",
+        "action_id_sha256",
+        "operation_id_sha256",
+        "request_sha256",
+        "ordered_phases",
+        "process_logs",
+        "sources",
+        "content_sha256",
+        "sse_reconnect_verified",
+        "relaunch_recovery_verified",
+        "stable_action_id_after_relaunch",
+        "stable_operation_id_after_relaunch",
+        "mutation_reissued_after_relaunch",
+        "core_authority",
+        "project_count",
+        "project_mapping_count",
+        "applied_create_project_mutation_count",
+        "secret_canary_sha256",
+        "secret_canary_absent",
         "cleanup",
         "active_task_cleanup_required",
         "active_task_cancel_requested",
@@ -643,6 +694,7 @@ class NativeSidecar:
     base_url: str
     credentials: NativeCredentials = field(repr=False)
     process_log: BinaryIO = field(repr=False)
+    forbidden_log_values: tuple[bytes, ...] = field(default=(), repr=False)
 
     def assert_log_budget(self) -> None:
         try:
@@ -652,6 +704,14 @@ class NativeSidecar:
             raise E2EFailure("native_launch", "sidecar_process_log_unavailable") from exc
         if size > MAX_SIDECAR_PROCESS_LOG_BYTES:
             raise E2EFailure("native_launch", "sidecar_process_log_budget_exceeded")
+        try:
+            content = os.pread(self.process_log.fileno(), size, 0)
+        except OSError as exc:
+            raise E2EFailure("native_launch", "sidecar_process_log_unavailable") from exc
+        if len(content) != size:
+            raise E2EFailure("native_launch", "sidecar_process_log_changed")
+        if any(value and value in content for value in self.forbidden_log_values):
+            raise E2EFailure("native_launch", "secret_canary_in_sidecar_log")
 
     def terminate(self) -> bool:
         try:
@@ -671,6 +731,93 @@ class TaskObservation:
     context: dict[str, Any]
     successor_project_head: dict[str, Any]
     artifacts: tuple[dict[str, Any], ...]
+
+
+class SseEventProbe:
+    """Read one bounded Desktop SSE event on a disposable connection."""
+
+    def __init__(
+        self,
+        *,
+        opener: OpenerDirector,
+        request: Request,
+        timeout_seconds: float,
+    ) -> None:
+        self._opener = opener
+        self._request = request
+        self._timeout_seconds = timeout_seconds
+        self._ready = threading.Event()
+        self._done = threading.Event()
+        self._result: dict[str, object] | None = None
+        self._error: BaseException | None = None
+        self._thread = threading.Thread(
+            target=self._run,
+            name="openevo-e2e-sse-probe",
+            daemon=True,
+        )
+        self._thread.start()
+        deadline = time.monotonic() + min(timeout_seconds, 15.0)
+        while not self._ready.is_set() and not self._done.is_set():
+            if time.monotonic() >= deadline:
+                raise E2EFailure("lifecycle_sse", "event_stream_connection_timeout")
+            self._done.wait(0.01)
+        if self._error is not None:
+            raise E2EFailure("lifecycle_sse", "event_stream_connection_failed") from self._error
+
+    def wait(self, *, timeout_seconds: float) -> dict[str, object]:
+        if not self._done.wait(timeout_seconds):
+            raise E2EFailure("lifecycle_sse", "event_stream_observation_timeout")
+        self._thread.join(timeout=1.0)
+        if self._error is not None:
+            raise E2EFailure("lifecycle_sse", "event_stream_observation_failed") from self._error
+        if self._result is None:
+            raise E2EFailure("lifecycle_sse", "event_stream_observation_missing")
+        return self._result
+
+    def _run(self) -> None:
+        try:
+            with self._opener.open(
+                self._request,
+                timeout=self._timeout_seconds,
+            ) as response:
+                if response.status != 200 or not str(
+                    response.headers.get("Content-Type", "")
+                ).lower().startswith("text/event-stream"):
+                    raise ValueError("Desktop SSE response is invalid")
+                self._ready.set()
+                fields: dict[str, str] = {}
+                consumed = 0
+                while consumed <= MAX_SSE_EVENT_BYTES:
+                    line = response.readline(MAX_SSE_EVENT_BYTES - consumed + 1)
+                    if not line:
+                        raise ValueError("Desktop SSE stream ended before one event")
+                    consumed += len(line)
+                    if consumed > MAX_SSE_EVENT_BYTES:
+                        raise ValueError("Desktop SSE event exceeds its byte bound")
+                    if line in {b"\n", b"\r\n"}:
+                        if "id" not in fields or "data" not in fields:
+                            fields.clear()
+                            continue
+                        envelope = json.loads(fields["data"])
+                        if not isinstance(envelope, dict):
+                            raise ValueError("Desktop SSE event payload is not an object")
+                        self._result = {
+                            "event_id": fields["id"],
+                            "envelope": envelope,
+                        }
+                        return
+                    decoded = line.decode("utf-8", errors="strict").rstrip("\r\n")
+                    if not decoded or decoded.startswith(":"):
+                        continue
+                    name, separator, value = decoded.partition(":")
+                    if not separator or name not in {"id", "event", "data"}:
+                        raise ValueError("Desktop SSE event contains an invalid field")
+                    fields[name] = value.removeprefix(" ")
+        except BaseException as exc:
+            self._error = exc
+        finally:
+            self._ready.set()
+            self._done.set()
 
 
 class LocalApi:
@@ -785,6 +932,31 @@ class LocalApi:
                 raise E2EFailure(stage, "invalid_page_cursor")
         raise E2EFailure(stage, "page_limit_exceeded")
 
+    def start_event_probe(self, last_event_id: str | None = None) -> SseEventProbe:
+        headers = {
+            DESKTOP_SESSION_HEADER: self._session_token,
+            "Accept": "text/event-stream",
+        }
+        if last_event_id is not None:
+            if (
+                not isinstance(last_event_id, str)
+                or not last_event_id
+                or len(last_event_id.encode("ascii", errors="ignore")) != len(last_event_id)
+                or any(character in last_event_id for character in ("\x00", "\r", "\n"))
+            ):
+                raise E2EFailure("lifecycle_sse", "event_cursor_invalid")
+            headers["Last-Event-ID"] = last_event_id
+        request = Request(
+            f"{self._base_url}/desktop/v2/events",
+            headers=headers,
+            method="GET",
+        )
+        return SseEventProbe(
+            opener=self._opener,
+            request=request,
+            timeout_seconds=120.0,
+        )
+
 
 class DesktopScienceWorkflow:
     """Exercise the release v2 Task path through one system-OpenSSH profile."""
@@ -804,11 +976,24 @@ class DesktopScienceWorkflow:
         run_timeout_seconds: float,
         progress: ProgressReporter | None = None,
         inter_task_delay_seconds: float = 0.0,
+        relaunch: Callable[[], LocalApi] | None = None,
+        secret_canary: str | None = None,
     ) -> None:
         if SSH_HOST_ALIAS_PATTERN.fullmatch(ssh_host_alias) is None:
             raise E2EFailure("arguments", "ssh_host_alias_invalid")
         if not _is_sha256(registry_sha256):
             raise E2EFailure("arguments", "registry_sha256_invalid")
+        if relaunch is not None and not callable(relaunch):
+            raise E2EFailure("arguments", "lifecycle_relaunch_invalid")
+        if (
+            secret_canary is not None
+            and (
+                not isinstance(secret_canary, str)
+                or not 16 <= len(secret_canary.encode("utf-8")) <= 256
+                or any(character in secret_canary for character in ("\x00", "\r", "\n"))
+            )
+        ):
+            raise E2EFailure("arguments", "secret_canary_invalid")
         self._api = api
         self._ssh_host_alias = ssh_host_alias
         self._registry_sha256 = registry_sha256
@@ -821,6 +1006,8 @@ class DesktopScienceWorkflow:
         self._run_timeout_seconds = run_timeout_seconds
         self._progress = progress
         self._inter_task_delay_seconds = inter_task_delay_seconds
+        self._relaunch = relaunch
+        self._secret_canary = secret_canary
         self.profile_id: str | None = None
         self.project_id: str | None = None
         self._profile: dict[str, Any] | None = None
@@ -828,6 +1015,9 @@ class DesktopScienceWorkflow:
         self._selected_methods: dict[str, str] = {}
         self._tasks: list[TaskObservation] = []
         self._active_task_id: str | None = None
+        self._project_create_action_id: str | None = None
+        self._project_create_operation_id: str | None = None
+        self._lifecycle_evidence: dict[str, object] | None = None
 
     def run(self) -> dict[str, object]:
         catalog = self._api.request(
@@ -886,6 +1076,7 @@ class DesktopScienceWorkflow:
             timeout_seconds=self._activation_timeout_seconds,
         )
         assert operation is not None
+        operation = self._observe_lifecycle_operation(operation, stage="profile_connect")
         self._require_operation_success(operation, "profile_connect")
         profile = self._api.request(
             "GET",
@@ -1038,6 +1229,7 @@ class DesktopScienceWorkflow:
                 "second_context_pinned_first_successor": True,
                 "second_runtime_context_equals_first_successor": True,
             },
+            "lifecycle": self._require_lifecycle_evidence(),
         }
 
     def renderer_expectations(self) -> dict[str, object]:
@@ -1135,6 +1327,10 @@ class DesktopScienceWorkflow:
                         timeout_seconds=180.0,
                     )
                     assert operation is not None
+                    operation = self._observe_lifecycle_operation(
+                        operation,
+                        stage="cleanup",
+                    )
                     self._require_operation_success(operation, "cleanup")
                     result["desktop_disconnect_succeeded"] = True
             except BaseException:
@@ -1180,7 +1376,9 @@ class DesktopScienceWorkflow:
         profile_id = profile.get("profile_id")
         if type(generation) is not int or not isinstance(profile_id, str):
             raise E2EFailure("project_create", "profile_authority_invalid")
-        project = self._api.request(
+        first_probe = self._api.start_event_probe()
+        reservation_started = time.monotonic()
+        operation = self._api.request(
             "POST",
             "/desktop/v2/projects",
             stage="project_create",
@@ -1195,13 +1393,287 @@ class DesktopScienceWorkflow:
                 RESOURCE_GENERATION_HEADER: str(generation),
                 "Idempotency-Key": key,
             },
-            expected_status=201,
-            timeout_seconds=self._activation_timeout_seconds,
+            expected_status=202,
+            timeout_seconds=min(
+                self._activation_timeout_seconds,
+                MAX_LIFECYCLE_RESERVATION_MILLISECONDS / 1_000,
+            ),
+        )
+        reservation_latency_ms = max(
+            0,
+            round((time.monotonic() - reservation_started) * 1_000),
+        )
+        if reservation_latency_ms >= MAX_LIFECYCLE_RESERVATION_MILLISECONDS:
+            raise E2EFailure("project_create", "lifecycle_reservation_timeout")
+        assert operation is not None
+        operation_id = _text(operation, "operation_id", "project_create")
+        request_sha256 = operation.get("request_sha256")
+        if operation.get("kind") != "project_create" or not _is_sha256(request_sha256):
+            raise E2EFailure("project_create", "lifecycle_reservation_invalid")
+        self._project_create_action_id = key
+        self._project_create_operation_id = operation_id
+        first_event = first_probe.wait(timeout_seconds=self._activation_timeout_seconds)
+        self._require_lifecycle_event(
+            first_event,
+            operation_id=operation_id,
+            stage="project_create_sse_initial",
+        )
+        second_probe = self._api.start_event_probe(
+            self._event_id(
+                first_event,
+                stage="project_create_sse_initial",
+            )
+        )
+        operation, lifecycle = self._observe_project_create_lifecycle(
+            operation,
+            action_id=key,
+            reservation_latency_ms=reservation_latency_ms,
+            reconnect_probe=second_probe,
+        )
+        self._require_operation_success(operation, "project_create")
+        result = operation.get("result")
+        project_id = result.get("project_id") if isinstance(result, dict) else None
+        if result is None or result.get("result_kind") != "project" or not isinstance(
+            project_id, str
+        ):
+            raise E2EFailure("project_create", "project_lifecycle_result_invalid")
+        project = self._api.request(
+            "GET",
+            f"/desktop/v2/projects/{project_id}",
+            stage="project_create",
         )
         assert project is not None
         if project.get("state") != "ready":
             raise E2EFailure("project_create", "project_not_ready")
+        self._lifecycle_evidence = lifecycle
         return project
+
+    def _observe_lifecycle_operation(
+        self,
+        operation: Mapping[str, object],
+        *,
+        stage: str,
+    ) -> dict[str, Any]:
+        operation_id = _text(operation, "operation_id", stage)
+        request_sha256 = operation.get("request_sha256")
+        if not _is_sha256(request_sha256):
+            raise E2EFailure(stage, "lifecycle_operation_invalid")
+        current = dict(operation)
+        deadline = time.monotonic() + self._activation_timeout_seconds
+        while current.get("status") not in {"succeeded", "failed", "cancelled"}:
+            if time.monotonic() >= deadline:
+                raise E2EFailure(stage, "lifecycle_operation_timeout")
+            current_payload = self._api.request(
+                "GET",
+                f"/desktop/v2/operations/{operation_id}",
+                stage=stage,
+            )
+            assert current_payload is not None
+            if (
+                current_payload.get("operation_id") != operation_id
+                or current_payload.get("request_sha256") != request_sha256
+            ):
+                raise E2EFailure(stage, "lifecycle_operation_identity_changed")
+            current = current_payload
+            if current.get("status") not in {"succeeded", "failed", "cancelled"}:
+                time.sleep(self._poll_seconds)
+        return current
+
+    def _observe_project_create_lifecycle(
+        self,
+        operation: Mapping[str, object],
+        *,
+        action_id: str,
+        reservation_latency_ms: int,
+        reconnect_probe: object,
+    ) -> tuple[dict[str, Any], dict[str, object]]:
+        operation_id = _text(operation, "operation_id", "project_create")
+        request_sha256 = operation.get("request_sha256")
+        if not _is_sha256(request_sha256):
+            raise E2EFailure("project_create", "lifecycle_request_invalid")
+        phases: list[str] = []
+
+        def observe(current: Mapping[str, object], *, stage: str) -> None:
+            if (
+                current.get("operation_id") != operation_id
+                or current.get("kind") != "project_create"
+                or current.get("request_sha256") != request_sha256
+            ):
+                raise E2EFailure(stage, "lifecycle_operation_identity_changed")
+            phase = current.get("phase")
+            if not isinstance(phase, str) or phase not in LIFECYCLE_PHASES:
+                raise E2EFailure(stage, "lifecycle_phase_invalid")
+            if phase in phases:
+                return
+            if phases and LIFECYCLE_PHASES.index(phase) <= LIFECYCLE_PHASES.index(phases[-1]):
+                raise E2EFailure(stage, "lifecycle_phase_regressed")
+            phases.append(phase)
+
+        current = dict(operation)
+        observe(current, stage="project_create")
+        deadline = time.monotonic() + self._activation_timeout_seconds
+        relaunched = False
+        reconnect_verified = False
+        while current.get("status") not in {"succeeded", "failed", "cancelled"}:
+            if time.monotonic() >= deadline:
+                raise E2EFailure("project_create", "lifecycle_operation_timeout")
+            payload = self._api.request(
+                "GET",
+                f"/desktop/v2/operations/{operation_id}",
+                stage="project_create",
+            )
+            assert payload is not None
+            current = payload
+            observe(current, stage="project_create")
+            if not reconnect_verified:
+                wait = getattr(reconnect_probe, "wait", None)
+                if not callable(wait):
+                    raise E2EFailure("project_create", "lifecycle_sse_probe_invalid")
+                reconnect_event = wait(timeout_seconds=self._activation_timeout_seconds)
+                self._require_lifecycle_event(
+                    reconnect_event,
+                    operation_id=operation_id,
+                    stage="project_create_sse_reconnect",
+                )
+                reconnect_verified = True
+            if (
+                not relaunched
+                and current.get("status") not in {"succeeded", "failed", "cancelled"}
+            ):
+                if self._relaunch is None:
+                    raise E2EFailure("project_create", "lifecycle_relaunch_unavailable")
+                relaunched_api = self._relaunch()
+                if not callable(getattr(relaunched_api, "request", None)):
+                    raise E2EFailure("project_create", "lifecycle_relaunch_invalid")
+                self._api = relaunched_api
+                recovered = self._api.request(
+                    "GET",
+                    f"/desktop/v2/operations/{operation_id}",
+                    stage="project_create_recovery",
+                )
+                assert recovered is not None
+                current = recovered
+                observe(current, stage="project_create_recovery")
+                relaunched = True
+            if current.get("status") not in {"succeeded", "failed", "cancelled"}:
+                time.sleep(self._poll_seconds)
+
+        if not reconnect_verified or not relaunched:
+            raise E2EFailure("project_create", "lifecycle_recovery_evidence_incomplete")
+        created_at = _timestamp_instant(current.get("created_at"), "project_create")
+        finished_at = _timestamp_instant(current.get("finished_at"), "project_create")
+        terminal_duration_ms = round((finished_at - created_at).total_seconds() * 1_000)
+        if terminal_duration_ms <= MIN_LIFECYCLE_TERMINAL_MILLISECONDS:
+            raise E2EFailure("project_create", "lifecycle_operation_too_short")
+        if len(phases) < 2 or phases[-1] != "finalizing":
+            raise E2EFailure("project_create", "lifecycle_phase_evidence_incomplete")
+
+        logs = self._api.page(
+            f"/desktop/v2/operations/{operation_id}/logs",
+            stage="project_create_logs",
+        )
+        process_logs: list[dict[str, object]] = []
+        for item in logs:
+            source = item.get("source")
+            text = item.get("text")
+            if source not in LIFECYCLE_PROCESS_LOG_SOURCES:
+                continue
+            if (
+                item.get("operation_id") != operation_id
+                or type(item.get("sequence")) is not int
+                or not isinstance(text, str)
+                or not text
+            ):
+                raise E2EFailure("project_create_logs", "lifecycle_process_log_invalid")
+            if self._secret_canary is not None and self._secret_canary in text:
+                raise E2EFailure("project_create_logs", "secret_canary_in_process_log")
+            process_logs.append(
+                {
+                    "sequence": item["sequence"],
+                    "source": source,
+                    "text": text,
+                    "truncated": item.get("truncated") is True,
+                }
+            )
+        if not process_logs:
+            raise E2EFailure("project_create_logs", "real_process_log_missing")
+        process_logs.sort(key=lambda item: int(item["sequence"]))
+
+        result = current.get("result")
+        core_project_id = result.get("project_id") if isinstance(result, dict) else None
+        projects = self._api.page("/desktop/v2/projects", stage="project_inventory")
+        if (
+            not isinstance(core_project_id, str)
+            or len(projects) != 1
+            or projects[0].get("project_id") != core_project_id
+        ):
+            raise E2EFailure("project_inventory", "core_project_authority_not_singular")
+        canary = self._secret_canary
+        if canary is None:
+            raise E2EFailure("project_create", "secret_canary_missing")
+        lifecycle = {
+            "operation_kind": "project_create",
+            "reservation_status": 202,
+            "reservation_latency_ms": reservation_latency_ms,
+            "terminal_duration_ms": terminal_duration_ms,
+            "action_id_sha256": _digest_text(action_id),
+            "operation_id_sha256": _digest_text(operation_id),
+            "request_sha256": request_sha256,
+            "ordered_phases": phases,
+            "process_logs": {
+                "entry_count": len(process_logs),
+                "sources": sorted({str(item["source"]) for item in process_logs}),
+                "content_sha256": _canonical_object_sha256(process_logs),
+            },
+            "sse_reconnect_verified": True,
+            "relaunch_recovery_verified": True,
+            "stable_action_id_after_relaunch": True,
+            "stable_operation_id_after_relaunch": True,
+            "mutation_reissued_after_relaunch": False,
+            "core_authority": {
+                "project_count": 1,
+                "project_mapping_count": 1,
+                "applied_create_project_mutation_count": 1,
+            },
+            "secret_canary_sha256": _digest_text(canary),
+            "secret_canary_absent": True,
+        }
+        return current, lifecycle
+
+    @staticmethod
+    def _event_id(observation: object, *, stage: str) -> str:
+        if not isinstance(observation, dict):
+            raise E2EFailure(stage, "lifecycle_sse_event_invalid")
+        return _text(observation, "event_id", stage)
+
+    @staticmethod
+    def _require_lifecycle_event(
+        observation: object,
+        *,
+        operation_id: str,
+        stage: str,
+    ) -> None:
+        if not isinstance(observation, dict):
+            raise E2EFailure(stage, "lifecycle_sse_event_invalid")
+        envelope = observation.get("envelope")
+        payload = envelope.get("payload") if isinstance(envelope, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("payload_kind") != "lifecycle_operation_changed"
+            or payload.get("operation_id") != operation_id
+            or envelope.get("event_id") != observation.get("event_id")
+        ):
+            raise E2EFailure(stage, "lifecycle_sse_event_mismatch")
+
+    def _require_lifecycle_evidence(self) -> dict[str, object]:
+        if self._lifecycle_evidence is None:
+            raise E2EFailure("project_create", "lifecycle_evidence_missing")
+        return dict(self._lifecycle_evidence)
+
+    def lifecycle_release_authority(self) -> tuple[str, str]:
+        if self.project_id is None or self._project_create_action_id is None:
+            raise E2EFailure("project_create", "lifecycle_release_authority_missing")
+        return self.project_id, self._project_create_action_id
 
     def _select_release_targets(
         self,
@@ -1793,6 +2265,37 @@ def _build_assets(
     )
 
 
+def _verify_lifecycle_store_authority(
+    config_root: Path,
+    *,
+    core_project_id: str,
+    action_id: str,
+) -> dict[str, int]:
+    from desktop.sidecar.core_bridge_store_v2 import (
+        CoreBridgeStoreV2Error,
+        DesktopCoreBridgeStoreV2,
+    )
+
+    bridge_root = config_root / "state-v2" / "provider-v2" / "core-bridge-v2"
+    try:
+        with DesktopCoreBridgeStoreV2(bridge_root) as store:
+            summary = store.release_evidence_summary(
+                core_project_id=core_project_id,
+                action_id=action_id,
+            )
+    except (CoreBridgeStoreV2Error, OSError, ValueError) as exc:
+        raise E2EFailure(
+            "project_create",
+            "lifecycle_store_authority_invalid",
+        ) from exc
+    if summary != {
+        "project_mapping_count": 1,
+        "applied_create_project_mutation_count": 1,
+    }:
+        raise E2EFailure("project_create", "lifecycle_store_authority_not_singular")
+    return summary
+
+
 def _inspect_release_assets(
     sidecar: Path,
     ssh_askpass_helper: Path,
@@ -2110,6 +2613,8 @@ def _launch_sidecar(
     root: Path,
     *,
     progress: ProgressReporter | None = None,
+    state_root: Path | None = None,
+    secret_canary: str | None = None,
 ) -> NativeSidecar:
     if os.name != "posix":
         raise E2EFailure("native_launch", "posix_process_boundary_required")
@@ -2131,6 +2636,8 @@ def _launch_sidecar(
     environment["OPENEVO_NATIVE_LISTENER_FD"] = str(LISTENER_FD)
     environment["OPENEVO_NATIVE_EXECUTABLE_FD"] = str(EXECUTABLE_FD)
     environment["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    if secret_canary is not None:
+        environment["OPENEVO_E2E_SECRET_CANARY"] = secret_canary
     execution_path = launch_path
     if sys.platform == "darwin":
         environment["OPENEVO_NATIVE_EXECUTABLE_PATH"] = str(launch_path)
@@ -2144,7 +2651,7 @@ def _launch_sidecar(
         "--release-assets-root",
         str(assets.external_release_assets_root().absolute()),
         "--desktop-config-root",
-        str(root / "state"),
+        str(state_root if state_root is not None else root / "state"),
         "--ssh-askpass-helper-path",
         str(helper_path),
         "--ssh-askpass-helper-sha256",
@@ -2215,6 +2722,9 @@ def _launch_sidecar(
         base_url=f"http://127.0.0.1:{port}",
         credentials=credentials,
         process_log=process_log,
+        forbidden_log_values=(
+            () if secret_canary is None else (secret_canary.encode("utf-8"),)
+        ),
     )
     try:
         _wait_sidecar_ready(native, progress=progress)
@@ -2287,7 +2797,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         )
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise E2EFailure("desktop_version", "release_contract_unreadable") from exc
-    v019 = release_contract.get("v019") if isinstance(release_contract, dict) else None
+    v0110 = release_contract.get("v0110") if isinstance(release_contract, dict) else None
     if (
         not isinstance(release_contract, dict)
         or set(release_contract)
@@ -2296,26 +2806,26 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
             "allowed_provider_kinds",
             "required_feature_flags",
             "schema_version",
-            "v019",
+            "v0110",
         }
         or release_contract.get("schema_version") != "1"
-        or not isinstance(v019, dict)
-        or v019.get("release_version") != "0.1.9"
-        or v019.get("desktop_local_mutation_major") != 2
-        or v019.get("allow_legacy_route_fallback") is not False
-        or v019.get("allow_direct_core_url") is not False
-        or v019.get("allowed_provider_kinds") != ["desktop_sidecar"]
-        or not isinstance(v019.get("accepted_desktop_openapi_digests"), list)
-        or len(v019["accepted_desktop_openapi_digests"]) != 1
-        or not _is_sha256(v019["accepted_desktop_openapi_digests"][0])
-        or not isinstance(v019.get("accepted_desktop_event_schema_digests"), list)
-        or len(v019["accepted_desktop_event_schema_digests"]) != 1
-        or not _is_sha256(v019["accepted_desktop_event_schema_digests"][0])
-        or not isinstance(v019.get("required_desktop_feature_flags"), list)
-        or not v019["required_desktop_feature_flags"]
+        or not isinstance(v0110, dict)
+        or v0110.get("release_version") != "0.1.10"
+        or v0110.get("desktop_local_mutation_major") != 2
+        or v0110.get("allow_legacy_route_fallback") is not False
+        or v0110.get("allow_direct_core_url") is not False
+        or v0110.get("allowed_provider_kinds") != ["desktop_sidecar"]
+        or not isinstance(v0110.get("accepted_desktop_openapi_digests"), list)
+        or len(v0110["accepted_desktop_openapi_digests"]) != 1
+        or not _is_sha256(v0110["accepted_desktop_openapi_digests"][0])
+        or not isinstance(v0110.get("accepted_desktop_event_schema_digests"), list)
+        or len(v0110["accepted_desktop_event_schema_digests"]) != 1
+        or not _is_sha256(v0110["accepted_desktop_event_schema_digests"][0])
+        or not isinstance(v0110.get("required_desktop_feature_flags"), list)
+        or not v0110["required_desktop_feature_flags"]
         or not all(
             isinstance(flag, str) and flag
-            for flag in v019["required_desktop_feature_flags"]
+            for flag in v0110["required_desktop_feature_flags"]
         )
     ):
         raise E2EFailure("desktop_version", "release_contract_invalid")
@@ -2352,7 +2862,7 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
         "mutation_major": 2,
         "provider_kind": "desktop_sidecar",
         "build_channel": "release",
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "required_core_api_major": 2,
         "mutation_compatible": True,
     }
@@ -2361,10 +2871,10 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
     if (
         version.get("supported_majors") != [2]
         or version.get("openapi_sha256")
-        != v019["accepted_desktop_openapi_digests"][0]
+        != v0110["accepted_desktop_openapi_digests"][0]
         or version.get("event_schema_sha256")
-        != v019["accepted_desktop_event_schema_digests"][0]
-        or version.get("feature_flags") != v019["required_desktop_feature_flags"]
+        != v0110["accepted_desktop_event_schema_digests"][0]
+        or version.get("feature_flags") != v0110["required_desktop_feature_flags"]
     ):
         raise E2EFailure("desktop_version", "desktop_contract_invalid")
     source_commit = version.get("source_commit")
@@ -2705,10 +3215,12 @@ def _validate_renderer_candidate_binding(
         )
         source_commit = candidate.get("source_commit")
         if (
-            not isinstance(candidate.get("schema_version"), int)
+            candidate.get("schema_version") != RELEASE_CANDIDATE_SCHEMA_VERSION
             or not isinstance(source_commit, str)
             or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
-            or not isinstance(candidate.get("version"), str)
+            or candidate.get("version") != "0.1.10"
+            or not isinstance(candidate.get("desktop_contract"), dict)
+            or not isinstance(candidate.get("lifecycle_evidence"), dict)
         ):
             raise E2EFailure("renderer", "renderer_candidate_manifest_invalid")
         _validate_candidate_source_checkout(source_commit)
@@ -2882,6 +3394,7 @@ def _validate_renderer_result(
         "evolution_artifact_count",
         "system_openssh_workspace_verified",
         "remote_target_controls_verified",
+        "secret_canary_absent",
         "selected_methods",
         "observed_route_kinds",
         "screenshot_sha256",
@@ -2910,6 +3423,7 @@ def _validate_renderer_result(
         "builtin_sample_count": 2,
         "system_openssh_workspace_verified": True,
         "remote_target_controls_verified": True,
+        "secret_canary_absent": True,
         "project_id_sha256": _digest_text(str(expectations["project_id"])),
         "task_count": 2,
         "task_id_sha256": [_digest_text(item) for item in expected_task_ids],
@@ -3011,14 +3525,14 @@ def _structural_check() -> None:
             "allowed_provider_kinds",
             "required_feature_flags",
             "schema_version",
-            "v019",
+            "v0110",
         }
         or contract_payload.get("schema_version") != "1"
         or contract_payload.get("allowed_provider_kinds") != ["desktop_sidecar"]
         or len(contract_payload.get("accepted_openapi_digests", [])) != 1
         or not _is_sha256(contract_payload["accepted_openapi_digests"][0])
         or not contract_payload.get("required_feature_flags")
-        or not isinstance(contract_payload.get("v019"), dict)
+        or not isinstance(contract_payload.get("v0110"), dict)
     ):
         raise E2EFailure("structural_check", "release_provider_policy_invalid")
     required = (
@@ -3244,6 +3758,18 @@ def _canonical_json(payload: object) -> bytes:
     return (
         json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
     ).encode("utf-8")
+
+
+def _timestamp_instant(value: object, stage: str) -> datetime:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise E2EFailure(stage, "lifecycle_timestamp_invalid")
+    try:
+        parsed = datetime.fromisoformat(value.removesuffix("Z") + "+00:00")
+    except ValueError as exc:
+        raise E2EFailure(stage, "lifecycle_timestamp_invalid") from exc
+    if parsed.utcoffset() is None or parsed.utcoffset().total_seconds() != 0:
+        raise E2EFailure(stage, "lifecycle_timestamp_invalid")
+    return parsed
 
 
 def _canonical_object_sha256(payload: object) -> str:
@@ -3481,6 +4007,7 @@ def _run_renderer_verification(
     timeout_seconds: float,
     screenshot_output: Path | None,
     progress: ProgressReporter | None,
+    secret_canary: str,
 ) -> dict[str, object]:
     try:
         root.mkdir(mode=0o700)
@@ -3554,8 +4081,14 @@ def _run_renderer_verification(
     }
     _write_private_json(handoff_path, handoff)
     renderer_test_timeout_seconds = _renderer_test_timeout_seconds(timeout_seconds)
+    if (
+        not 16 <= len(secret_canary.encode("utf-8")) <= 256
+        or any(character in secret_canary for character in ("\x00", "\r", "\n"))
+    ):
+        raise E2EFailure("renderer", "secret_canary_invalid")
     environment = _renderer_environment()
     environment["OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF"] = str(handoff_path)
+    environment["OPENEVO_E2E_SECRET_CANARY"] = secret_canary
     environment["OPENEVO_DESKTOP_LIVE_RENDERER_TIMEOUT_MS"] = str(
         math.ceil(renderer_test_timeout_seconds * 1_000)
     )
@@ -3586,9 +4119,7 @@ def _run_renderer_verification(
         )
         while not _process_exited_without_reap(process):
             native.assert_log_budget()
-            process_log.flush()
-            if os.fstat(process_log.fileno()).st_size > MAX_RENDERER_PROCESS_LOG_BYTES:
-                raise E2EFailure("renderer", "renderer_process_log_budget_exceeded")
+            _assert_renderer_process_log(process_log, secret_canary=secret_canary)
             if progress is not None:
                 progress.emit("renderer", "running")
             remaining = deadline - time.monotonic()
@@ -3596,9 +4127,7 @@ def _run_renderer_verification(
                 raise E2EFailure("renderer", "renderer_timeout")
             time.sleep(min(0.25, remaining))
         native.assert_log_budget()
-        process_log.flush()
-        if os.fstat(process_log.fileno()).st_size > MAX_RENDERER_PROCESS_LOG_BYTES:
-            raise E2EFailure("renderer", "renderer_process_log_budget_exceeded")
+        _assert_renderer_process_log(process_log, secret_canary=secret_canary)
         if not _terminate_process_group(
             process,
             process_group_id=process_group_id,
@@ -3661,6 +4190,28 @@ def _run_renderer_verification(
                 private_path.unlink()
             except OSError:
                 pass
+
+
+def _assert_renderer_process_log(
+    process_log: BinaryIO,
+    *,
+    secret_canary: str,
+) -> None:
+    try:
+        process_log.flush()
+        size = os.fstat(process_log.fileno()).st_size
+    except OSError as exc:
+        raise E2EFailure("renderer", "renderer_process_log_unavailable") from exc
+    if size > MAX_RENDERER_PROCESS_LOG_BYTES:
+        raise E2EFailure("renderer", "renderer_process_log_budget_exceeded")
+    try:
+        content = os.pread(process_log.fileno(), size, 0)
+    except OSError as exc:
+        raise E2EFailure("renderer", "renderer_process_log_unavailable") from exc
+    if len(content) != size:
+        raise E2EFailure("renderer", "renderer_process_log_changed")
+    if secret_canary.encode("utf-8") in content:
+        raise E2EFailure("renderer", "secret_canary_in_renderer_process_log")
 
 
 def _renderer_test_timeout_seconds(requested_seconds: float) -> float:
@@ -3979,10 +4530,11 @@ def main(argv: list[str] | None = None) -> int:
     progress.emit("runner", "started", force=True)
 
     started_at = _utc_now()
+    secret_canary = f"openevo-release-canary-{secrets.token_hex(32)}"
     evidence: dict[str, object] = {
-        "schema_version": "2",
+        "schema_version": "3",
         "kind": "openevo_desktop_real_science_e2e",
-        "issue": 163,
+        "issue": 220,
         "real_process_boundary": True,
         "outcome": "failed",
         "started_at": started_at,
@@ -3991,6 +4543,7 @@ def main(argv: list[str] | None = None) -> int:
         str(args.ssh_host_alias),
         str(args.task_title),
         str(args.task_objective),
+        secret_canary,
     ]
     native: NativeSidecar | None = None
     assets: ReleaseAssets | None = None
@@ -4009,6 +4562,8 @@ def main(argv: list[str] | None = None) -> int:
     evidence_write_failed = False
     with TemporaryDirectory(prefix="openevo-desktop-real-e2e-") as temporary:
         root = _resolve_private_temporary_root(Path(temporary))
+        sidecar_config_root = root / "desktop-config"
+        relaunch_serial = 0
         try:
             assert args.app_bundle is not None
             assert args.core_wheel is not None
@@ -4044,7 +4599,13 @@ def main(argv: list[str] | None = None) -> int:
                 packaged_web_root=args.packaged_web_root,
             )
             evidence["renderer_candidate_binding"] = renderer_binding.evidence
-            native = _launch_sidecar(assets, root / "native", progress=progress)
+            native = _launch_sidecar(
+                assets,
+                root / "native-initial",
+                progress=progress,
+                state_root=sidecar_config_root,
+                secret_canary=secret_canary,
+            )
             private_values.extend(native.credentials.private_values())
             api = LocalApi(
                 native.base_url,
@@ -4052,6 +4613,30 @@ def main(argv: list[str] | None = None) -> int:
                 progress=progress,
                 health_check=native.assert_log_budget,
             )
+
+            def relaunch_sidecar() -> LocalApi:
+                nonlocal native, relaunch_serial
+                if native is None:
+                    raise E2EFailure("project_create", "lifecycle_relaunch_unavailable")
+                native.assert_log_budget()
+                if not native.terminate():
+                    raise E2EFailure("project_create", "lifecycle_relaunch_cleanup_failed")
+                relaunch_serial += 1
+                native = _launch_sidecar(
+                    assets,
+                    root / f"native-relaunch-{relaunch_serial}",
+                    progress=progress,
+                    state_root=sidecar_config_root,
+                    secret_canary=secret_canary,
+                )
+                private_values.extend(native.credentials.private_values())
+                return LocalApi(
+                    native.base_url,
+                    native.credentials.session_token,
+                    progress=progress,
+                    health_check=native.assert_log_budget,
+                )
+
             desktop_identity = _release_identity(api)
             if (
                 desktop_identity.get("source_commit") != assets.source_commit
@@ -4075,6 +4660,8 @@ def main(argv: list[str] | None = None) -> int:
                 run_timeout_seconds=args.run_timeout_seconds,
                 progress=progress,
                 inter_task_delay_seconds=args.inter_task_delay_seconds,
+                relaunch=relaunch_sidecar,
+                secret_canary=secret_canary,
             )
             evidence.update(workflow.run())
             evidence["renderer"] = _run_renderer_verification(
@@ -4086,6 +4673,7 @@ def main(argv: list[str] | None = None) -> int:
                 timeout_seconds=args.renderer_timeout_seconds,
                 screenshot_output=args.renderer_screenshot_output,
                 progress=progress,
+                secret_canary=secret_canary,
             )
             evidence["renderer_observability_verified"] = True
             evidence["renderer_boundary"] = "packaged_web_to_live_desktop_v2"
@@ -4114,6 +4702,30 @@ def main(argv: list[str] | None = None) -> int:
             if native is not None:
                 cleanup["core_ownership_release_requested"] = True
                 cleanup["sidecar_shutdown_succeeded"] = native.terminate()
+            if evidence.get("outcome") == "passed" and workflow is not None:
+                try:
+                    core_project_id, action_id = workflow.lifecycle_release_authority()
+                    authority = _verify_lifecycle_store_authority(
+                        sidecar_config_root,
+                        core_project_id=core_project_id,
+                        action_id=action_id,
+                    )
+                    lifecycle = evidence.get("lifecycle")
+                    core_authority = (
+                        lifecycle.get("core_authority")
+                        if isinstance(lifecycle, dict)
+                        else None
+                    )
+                    if not isinstance(core_authority, dict):
+                        raise E2EFailure(
+                            "project_create",
+                            "lifecycle_evidence_missing",
+                        )
+                    core_authority.update(authority)
+                except E2EFailure as exc:
+                    evidence["outcome"] = "failed"
+                    evidence["failure"] = {"stage": exc.stage, "code": exc.code}
+                    exit_code = 1
             if renderer_binding is not None:
                 renderer_binding.close()
             if assets is not None:
@@ -4146,7 +4758,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if exit_code == 0:
         print(
-            "Desktop v0.1.9 real-science E2E passed; exact candidate system-OpenSSH "
+            "Desktop v0.1.10 real-science E2E passed; exact candidate system-OpenSSH "
             "workspace, two v2 Tasks, successor reuse, and packaged renderer verified; "
             "bounded evidence written."
         )

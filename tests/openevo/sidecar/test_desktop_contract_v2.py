@@ -9,6 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
+from desktop.sidecar.contracts.v2 import models as desktop_models
 from desktop.sidecar.contracts.v2.app import create_desktop_local_v2_contract_app
 from desktop.sidecar.contracts.v2.canonical import (
     DESKTOP_EVENTS_SCHEMA_SHA256,
@@ -66,6 +67,13 @@ EXPECTED_OPERATIONS = {
     ("post", "/desktop/v2/profiles/{profile_id}/connect"),
     ("post", "/desktop/v2/profiles/{profile_id}/disconnect"),
     ("post", "/desktop/v2/profiles/{profile_id}/host-key/review"),
+    ("get", "/desktop/v2/operations/by-action"),
+    ("get", "/desktop/v2/operations/{operation_id}"),
+    ("get", "/desktop/v2/operations/{operation_id}/logs"),
+    ("post", "/desktop/v2/operations/{operation_id}/cancel"),
+    ("post", "/desktop/v2/operations/{operation_id}/acknowledge"),
+    ("get", "/desktop/v2/core-operations/{operation_id}"),
+    ("post", "/desktop/v2/core-operations/{operation_id}/cancel"),
     ("get", "/desktop/v2/projects"),
     ("post", "/desktop/v2/projects"),
     ("get", "/desktop/v2/projects/{project_id}"),
@@ -94,6 +102,8 @@ EXPECTED_OPERATIONS = {
     ("get", "/desktop/v2/artifacts/{artifact_id}/diff"),
     ("get", "/desktop/v2/services"),
     ("post", "/desktop/v2/services/{service_id}/restart"),
+    ("get", "/desktop/v2/services/{service_id}/logs"),
+    ("post", "/desktop/v2/maintenance/cache-cleanup"),
     ("post", "/desktop/v2/diagnostics"),
     ("get", "/desktop/v2/diagnostics/{diagnostic_id}"),
     ("get", "/desktop/v2/events"),
@@ -215,6 +225,53 @@ def _walk(value: object) -> Iterator[object]:
     elif isinstance(value, list):
         for child in value:
             yield from _walk(child)
+
+
+def _lifecycle_resource(
+    resource_kind: str = "profile",
+    resource_id: str = "profile-1",
+) -> dict[str, Any]:
+    return {
+        "resource_kind": resource_kind,
+        "resource_id": resource_id,
+    }
+
+
+def _lifecycle_operation(
+    *,
+    kind: str = "profile_connect",
+    resource: dict[str, Any] | None = None,
+    status: str = "running",
+    phase: str = "connecting",
+    phase_index: int = 3,
+    progress: dict[str, Any] | None = None,
+    result: dict[str, Any] | None = None,
+    failure: dict[str, Any] | None = None,
+    started_at: str | None = "2026-07-27T00:00:01Z",
+    finished_at: str | None = None,
+    cancellable: bool = True,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "2",
+        "operation_id": "operation-1",
+        "kind": kind,
+        "resource": resource or _lifecycle_resource(),
+        "request_sha256": "a" * 64,
+        "status": status,
+        "phase": phase,
+        "phase_index": phase_index,
+        "phase_total": 17,
+        "progress": progress or {"kind": "indeterminate"},
+        "cancellable": cancellable,
+        "result": result,
+        "failure": failure,
+        "log_sequence_high_watermark": 2,
+        "created_at": "2026-07-27T00:00:00Z",
+        "started_at": started_at,
+        "updated_at": finished_at or "2026-07-27T00:00:02Z",
+        "finished_at": finished_at,
+        "etag": '"' + ("b" * 64) + '"',
+    }
 
 
 def test_system_openssh_profile_create_has_only_alias_authority() -> None:
@@ -382,6 +439,220 @@ def test_desktop_errors_expose_only_typed_bounded_actions() -> None:
             _json_model(DesktopErrorV2, {**error, field: "forbidden"})
 
 
+def test_lifecycle_operation_is_closed_and_binds_kind_resource_and_result() -> None:
+    model = desktop_models.LifecycleOperationV2
+    running = _json_model(model, _lifecycle_operation())
+    assert running.kind == "profile_connect"
+    assert running.resource.resource_kind == "profile"
+    assert running.progress.kind == "indeterminate"
+    fractional = _lifecycle_operation()
+    fractional["started_at"] = "2026-07-27T00:00:00.1Z"
+    fractional["updated_at"] = "2026-07-27T00:00:00.2Z"
+    assert _json_model(model, fractional).status == "running"
+
+    with pytest.raises(ValidationError):
+        _json_model(model, {**_lifecycle_operation(), "ssh_command": "ssh evolab"})
+
+    succeeded = _lifecycle_operation(
+        status="succeeded",
+        phase="finalizing",
+        phase_index=16,
+        progress={"kind": "items", "completed": 4, "total": 4},
+        result={
+            "result_kind": "profile",
+            "profile_id": "profile-1",
+            "connection_generation": 4,
+        },
+        started_at="2026-07-27T00:00:01Z",
+        finished_at="2026-07-27T00:00:03Z",
+        cancellable=False,
+    )
+    assert _json_model(model, succeeded).result.result_kind == "profile"
+
+    with pytest.raises(ValidationError, match="result"):
+        _json_model(model, {**succeeded, "status": "running", "finished_at": None})
+    with pytest.raises(ValidationError, match="failure"):
+        _json_model(
+            model,
+            {
+                **_lifecycle_operation(),
+                "status": "failed",
+                "cancellable": False,
+                "finished_at": "2026-07-27T00:00:03Z",
+            },
+        )
+    with pytest.raises(ValidationError, match="resource"):
+        _json_model(
+            model,
+            _lifecycle_operation(
+                kind="project_create",
+                resource=_lifecycle_resource("profile", "profile-1"),
+            ),
+        )
+    with pytest.raises(ValidationError, match="resource"):
+        _json_model(
+            model,
+            {
+                **succeeded,
+                "result": {
+                    "result_kind": "profile",
+                    "profile_id": "profile-2",
+                    "connection_generation": 4,
+                },
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"kind": "bytes", "completed": 2, "total": 1},
+        {"kind": "items", "completed": -1, "total": 1},
+        {
+            "kind": "bytes",
+            "completed": 0,
+            "total": (1 << 53),
+        },
+    ],
+)
+def test_lifecycle_progress_rejects_regressing_or_oversized_values(
+    progress: dict[str, Any],
+) -> None:
+    with pytest.raises(ValidationError):
+        _json_model(
+            desktop_models.LifecycleOperationV2,
+            _lifecycle_operation(progress=progress),
+        )
+
+    with pytest.raises(ValidationError, match="phase"):
+        _json_model(
+            desktop_models.LifecycleOperationV2,
+            _lifecycle_operation(phase_index=2),
+        )
+
+
+def test_lifecycle_log_page_binds_operation_sequences_and_utf8_budget() -> None:
+    entry = {
+        "schema_version": "2",
+        "operation_id": "operation-1",
+        "sequence": 3,
+        "occurred_at": "2026-07-27T00:00:03Z",
+        "source": "ssh_stdout",
+        "text": "Preparing remote workspace\n",
+        "truncated": False,
+    }
+    page = {
+        "schema_version": "2",
+        "operation_id": "operation-1",
+        "dropped_before_sequence": 2,
+        "items": [entry, {**entry, "sequence": 4, "source": "daemon_stderr"}],
+        "next_cursor": "cursor-1",
+        "has_more": True,
+    }
+    parsed = _json_model(desktop_models.LifecycleLogPageV2, page)
+    assert [item.sequence for item in parsed.items] == [3, 4]
+
+    with pytest.raises(ValidationError, match="operation"):
+        _json_model(
+            desktop_models.LifecycleLogPageV2,
+            {**page, "items": [{**entry, "operation_id": "operation-2"}]},
+        )
+    with pytest.raises(ValidationError, match="ascending"):
+        _json_model(
+            desktop_models.LifecycleLogPageV2,
+            {**page, "items": [{**entry, "sequence": 4}, entry]},
+        )
+    with pytest.raises(ValidationError, match="dropped"):
+        _json_model(
+            desktop_models.LifecycleLogPageV2,
+            {**page, "items": [{**entry, "sequence": 2}]},
+        )
+    with pytest.raises(ValidationError, match="UTF-8"):
+        _json_model(
+            desktop_models.LifecycleLogEntryV2,
+            {**entry, "text": "界" * 5462},
+        )
+    with pytest.raises(ValidationError, match="control"):
+        _json_model(
+            desktop_models.LifecycleLogEntryV2,
+            {**entry, "text": "unsafe\x1b[31moutput"},
+        )
+
+
+def test_desktop_state_binds_unique_pending_lifecycle_operation_refs() -> None:
+    operation = _json_model(
+        desktop_models.LifecycleOperationV2,
+        _lifecycle_operation(),
+    )
+    reference = desktop_models.LifecycleOperationRefV2.from_operation(operation)
+    state = {
+        "schema_version": "2",
+        "profiles": [_profile()],
+        "active_profile_id": "profile-1",
+        "active_project_id": "project-1",
+        "pending_operations": [reference.model_dump(mode="json")],
+        "last_event_id": "event-1",
+        "updated_at": "2026-07-27T00:00:02Z",
+    }
+    assert _json_model(desktop_models.DesktopStateV2, state).pending_operations == [
+        reference
+    ]
+
+    with pytest.raises(ValidationError, match="unique"):
+        _json_model(
+            desktop_models.DesktopStateV2,
+            {**state, "pending_operations": [state["pending_operations"][0]] * 2},
+        )
+    malformed = dict(state["pending_operations"][0])
+    malformed["resource"] = _lifecycle_resource("project", "project-1")
+    with pytest.raises(ValidationError, match="resource"):
+        _json_model(
+            desktop_models.DesktopStateV2,
+            {**state, "pending_operations": [malformed]},
+        )
+
+
+def test_lifecycle_event_is_log_free_invalidation_only() -> None:
+    payload = {
+        "payload_kind": "lifecycle_operation_changed",
+        "operation_id": "operation-1",
+        "kind": "profile_connect",
+        "status": "running",
+        "phase": "connecting",
+        "etag": '"' + ("b" * 64) + '"',
+        "log_sequence_high_watermark": 2,
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    envelope = {
+        "schema_version": "2",
+        "event_id": "event-1",
+        "sequence": 1,
+        "occurred_at": "2026-07-27T00:00:02Z",
+        "event_type": "lifecycle_operation_changed",
+        "payload_sha256": hashlib.sha256(encoded).hexdigest(),
+        "payload": payload,
+    }
+    parsed = _json_model(desktop_models.DesktopEventEnvelopeV2, envelope)
+    assert parsed.payload.operation_id == "operation-1"
+    payload_schema = desktop_models.LifecycleOperationEventPayloadV2.model_json_schema()
+    assert "text" not in payload_schema["properties"]
+    assert "message" not in payload_schema["properties"]
+    with pytest.raises(ValidationError):
+        _json_model(
+            desktop_models.DesktopEventEnvelopeV2,
+            {
+                **envelope,
+                "payload": {**payload, "text": "raw child output"},
+            },
+        )
+
+
 def test_local_contract_projects_all_distinct_core_v2_authorities() -> None:
     assert ProjectHeadRefV2.model_fields["project_head_id"]
     assert EvolutionRevisionRefV2.model_fields["evolution_revision_id"]
@@ -507,6 +778,64 @@ def test_desktop_v2_schema_has_no_forbidden_renderer_authority_fields() -> None:
     assert not (keys & forbidden_exact)
 
 
+def _response_schema_ref(
+    schema: dict[str, Any],
+    method: str,
+    path: str,
+    status: int,
+) -> str:
+    return schema["paths"][path][method]["responses"][str(status)]["content"][
+        "application/json"
+    ]["schema"]["$ref"]
+
+
+def test_long_lifecycle_and_core_operation_routes_keep_separate_authority() -> None:
+    schema = desktop_openapi_document()
+    lifecycle_routes = {
+        ("post", "/desktop/v2/profiles/{profile_id}/connect"),
+        ("post", "/desktop/v2/profiles/{profile_id}/disconnect"),
+        ("post", "/desktop/v2/profiles/{profile_id}/host-key/review"),
+        ("post", "/desktop/v2/projects"),
+        ("post", "/desktop/v2/projects/{project_id}/activate"),
+    }
+    for method, path in lifecycle_routes:
+        assert _response_schema_ref(schema, method, path, 202).endswith(
+            "/LifecycleOperationV2"
+        )
+
+    assert _response_schema_ref(
+        schema,
+        "get",
+        "/desktop/v2/operations/{operation_id}",
+        200,
+    ).endswith("/LifecycleOperationV2")
+    assert _response_schema_ref(
+        schema,
+        "get",
+        "/desktop/v2/operations/{operation_id}/logs",
+        200,
+    ).endswith("/LifecycleLogPageV2")
+
+    for method, path, status in (
+        ("get", "/desktop/v2/core-operations/{operation_id}", 200),
+        ("post", "/desktop/v2/core-operations/{operation_id}/cancel", 202),
+        ("post", "/desktop/v2/tasks/{task_id}/cancel", 202),
+        ("post", "/desktop/v2/transitions/{transition_id}/retry", 202),
+        ("post", "/desktop/v2/transitions/{transition_id}/abandon", 202),
+        ("post", "/desktop/v2/services/{service_id}/restart", 202),
+        ("post", "/desktop/v2/maintenance/cache-cleanup", 202),
+    ):
+        assert _response_schema_ref(schema, method, path, status).endswith(
+            "/OperationV2"
+        )
+    assert _response_schema_ref(
+        schema,
+        "get",
+        "/desktop/v2/services/{service_id}/logs",
+        200,
+    ).endswith("/LogPageV2")
+
+
 def test_desktop_v2_route_inventory_is_exact_and_authenticated() -> None:
     app = create_desktop_local_v2_contract_app()
     schema = app.openapi()
@@ -558,6 +887,19 @@ def test_mutation_routes_require_idempotency_and_resource_generation() -> None:
         assert "Idempotency-Key" in required_headers, (method, path)
         assert "X-OpenEvo-Resource-Generation" in required_headers, (method, path)
 
+    for path in (
+        "/desktop/v2/operations/{operation_id}/cancel",
+        "/desktop/v2/operations/{operation_id}/acknowledge",
+        "/desktop/v2/core-operations/{operation_id}/cancel",
+    ):
+        parameters = schema["paths"][path]["post"].get("parameters", [])
+        required_headers = {
+            item["name"]
+            for item in parameters
+            if item["in"] == "header" and item.get("required")
+        }
+        assert "If-Match" in required_headers, path
+
 
 def test_desktop_v2_snapshots_are_exact_and_frozen() -> None:
     openapi = canonical_json_bytes(desktop_openapi_document())
@@ -567,10 +909,10 @@ def test_desktop_v2_snapshots_are_exact_and_frozen() -> None:
     assert hashlib.sha256(openapi).hexdigest() == DESKTOP_OPENAPI_SHA256
     assert hashlib.sha256(events).hexdigest() == DESKTOP_EVENTS_SCHEMA_SHA256
     assert DESKTOP_OPENAPI_SHA256 == (
-        "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
+        "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760"
     )
     assert DESKTOP_EVENTS_SCHEMA_SHA256 == (
-        "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
+        "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
     )
 
 

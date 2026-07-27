@@ -3938,6 +3938,23 @@ pre.json {
   border-bottom: 1px solid var(--line);
 }
 
+.v2-service-list > .v2-service-observation {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+}
+
+.v2-service-observation > div:first-child {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.v2-service-observation > .lifecycle-operation-panel,
+.v2-task-card > .lifecycle-operation-panel {
+  margin-top: 12px;
+}
+
 .v2-service-list strong,
 .v2-service-list small {
   display: block;
@@ -3946,6 +3963,264 @@ pre.json {
 .v2-service-list small {
   margin-top: 2px;
   color: var(--muted);
+}
+
+.lifecycle-operation-panel {
+  display: grid;
+  gap: 13px;
+  padding: 14px;
+  border: 1px solid var(--line-strong);
+  border-left: 3px solid var(--blue);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: 0 8px 28px rgb(25 43 34 / 7%);
+}
+
+.v2-global-operations {
+  position: fixed;
+  z-index: 70;
+  right: 18px;
+  bottom: 18px;
+  display: grid;
+  width: min(440px, calc(100vw - 36px));
+  max-height: min(720px, calc(100vh - 36px));
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--surface-soft);
+  box-shadow: 0 22px 70px rgb(20 28 23 / 24%);
+}
+
+.v2-global-operations-heading {
+  display: grid;
+  gap: 2px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.v2-global-operations-heading strong {
+  font-size: 11px;
+}
+
+.v2-global-operations-heading span {
+  color: var(--muted);
+  font-size: 9px;
+}
+
+.v2-global-operation-list {
+  display: grid;
+  gap: 10px;
+  padding: 10px;
+  overflow: auto;
+}
+
+.lifecycle-operation-panel.status-succeeded {
+  border-left-color: var(--accent);
+}
+
+.lifecycle-operation-panel.status-failed,
+.lifecycle-operation-panel.status-cancelled {
+  border-left-color: var(--danger);
+}
+
+.lifecycle-operation-head,
+.lifecycle-progress-label,
+.lifecycle-meta,
+.lifecycle-log-head,
+.lifecycle-operation-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.lifecycle-operation-head h3 {
+  margin: 2px 0 0;
+  font-size: 14px;
+}
+
+.lifecycle-status {
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: var(--blue);
+  background: var(--blue-soft);
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.lifecycle-status.status-succeeded {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.lifecycle-status.status-failed,
+.lifecycle-status.status-cancelled {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.lifecycle-live-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.lifecycle-progress-stack,
+.lifecycle-subprogress {
+  display: grid;
+  gap: 6px;
+}
+
+.lifecycle-progress-label,
+.lifecycle-subprogress,
+.lifecycle-meta {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.lifecycle-operation-panel progress {
+  width: 100%;
+  height: 8px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  accent-color: var(--accent);
+}
+
+.lifecycle-subprogress {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.lifecycle-subprogress progress:not([value]) {
+  animation: lifecycle-progress-pulse 1.4s ease-in-out infinite;
+}
+
+.lifecycle-meta code {
+  max-width: 52%;
+  overflow: hidden;
+  color: var(--subtle);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lifecycle-failure {
+  display: grid;
+  gap: 3px;
+  padding: 9px 10px;
+  border: 1px solid #edcaca;
+  border-radius: 6px;
+  color: var(--danger);
+  background: var(--danger-soft);
+  font-size: 11px;
+}
+
+.lifecycle-failure span {
+  color: var(--muted);
+}
+
+.lifecycle-log-section {
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: #151b18;
+}
+
+.lifecycle-log-head {
+  min-height: 34px;
+  padding: 0 10px;
+  border-bottom: 1px solid #303934;
+  color: #eef5f1;
+  font-size: 10px;
+}
+
+.lifecycle-log-head .text-button {
+  color: #a9d9c8;
+}
+
+.lifecycle-log-notice {
+  margin: 0;
+  padding: 7px 10px;
+  color: #e8c982;
+  background: #2c2719;
+  font-size: 10px;
+}
+
+.lifecycle-log-viewport {
+  display: grid;
+  max-height: 270px;
+  margin: 0;
+  padding: 6px 0;
+  overflow: auto;
+  color: #d8e3dd;
+  list-style: none;
+  font: 10px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.lifecycle-log-viewport li {
+  display: grid;
+  grid-template-columns: 34px 78px minmax(0, 1fr) auto;
+  gap: 7px;
+  align-items: start;
+  min-width: 0;
+  padding: 2px 10px;
+}
+
+.lifecycle-log-sequence {
+  color: #819188;
+  text-align: right;
+}
+
+.lifecycle-log-source {
+  color: #9fc9ba;
+}
+
+.lifecycle-log-source.source-ssh_stderr,
+.lifecycle-log-source.source-daemon_stderr,
+.lifecycle-log-truncated {
+  color: #efb5a8;
+}
+
+.lifecycle-log-viewport pre {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font: inherit;
+}
+
+.lifecycle-log-truncated {
+  white-space: nowrap;
+}
+
+.lifecycle-log-empty {
+  display: block !important;
+  color: #87958d;
+}
+
+.lifecycle-operation-actions {
+  justify-content: flex-end;
+  flex-wrap: wrap;
+}
+
+@keyframes lifecycle-progress-pulse {
+  0%, 100% { opacity: 0.55; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lifecycle-subprogress progress:not([value]) {
+    animation: none;
+  }
 }
 
 @media (max-width: 1100px) {
@@ -3962,11 +4237,27 @@ pre.json {
   .v2-authority-grid,
   .v2-task-authority,
   .v2-target-list > article,
-  .v2-source-choice {
+  .v2-source-choice,
+  .v2-service-observation > div:first-child {
     grid-template-columns: minmax(0, 1fr);
   }
 
   .v2-modal-backdrop {
     padding: 10px;
+  }
+
+  .lifecycle-log-viewport li {
+    grid-template-columns: 28px 68px minmax(0, 1fr);
+  }
+
+  .lifecycle-log-truncated {
+    grid-column: 3;
+  }
+
+  .v2-global-operations {
+    right: 10px;
+    bottom: 10px;
+    width: calc(100vw - 20px);
+    max-height: calc(100vh - 20px);
   }
 }

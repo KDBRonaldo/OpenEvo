@@ -62,7 +62,7 @@ def _app_bundle_smoke() -> dict[str, object]:
         "mach_o": {},
         "launch_origin": "mounted_dmg",
         "source_dmg": {
-            "filename": "OpenEvo-Desktop-0.1.9-aarch64.dmg",
+            "filename": "OpenEvo-Desktop-0.1.10-aarch64.dmg",
             "sha256": _digest("desktop_dmg"),
         },
         "binary_sha256": {
@@ -75,19 +75,19 @@ def _app_bundle_smoke() -> dict[str, object]:
 def _candidate() -> tuple[dict[str, object], bytes]:
     smoke_bytes = _canonical_bytes(_app_bundle_smoke())
     files = [
-        ("core_wheel", "openevo-0.1.9-py3-none-any.whl", 1001),
+        ("core_wheel", "openevo-0.1.10-py3-none-any.whl", 1001),
         ("framework_lock", "framework-lock.json", 1002),
         ("daemon_bundle", "openevo-daemon-linux-x86_64", 1003),
         ("daemon_manifest", "openevo-daemon-bundle.json", 1004),
-        ("desktop_dmg", "OpenEvo-Desktop-0.1.9-aarch64.dmg", 1005),
+        ("desktop_dmg", "OpenEvo-Desktop-0.1.10-aarch64.dmg", 1005),
         ("packaged_web_manifest", "packaged-web-manifest.json", 1006),
         ("playwright_evidence", "playwright-candidate-evidence.json", 1007),
         ("app_bundle_smoke", "app-bundle-smoke.json", len(smoke_bytes)),
     ]
     candidate = {
-        "schema_version": 9,
+        "schema_version": 10,
         "source_commit": SOURCE,
-        "version": "0.1.9",
+        "version": "0.1.10",
         "release": {
             "app_bundle_signature": "adhoc",
             "channel": "unsigned-preview",
@@ -124,6 +124,46 @@ def _candidate() -> tuple[dict[str, object], bytes]:
         },
         "core": {},
         "daemon": {},
+        "desktop_contract": {
+            "release_version": "0.1.10",
+            "mutation_major": 2,
+            "openapi_sha256": "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760",
+            "event_schema_sha256": "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b",
+            "feature_flags": [
+                "core_control_v2",
+                "daemon_bundle_v2",
+                "event_replay_v2",
+                "host_key_review",
+                "lifecycle_operations_v2",
+                "lifecycle_process_logs_v2",
+                "mutation_idempotency_v2",
+                "native_askpass",
+                "system_openssh_profiles",
+                "task_admission_v2",
+            ],
+            "feature_set_sha256": "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda",
+        },
+        "lifecycle_evidence": {
+            "schema_version": 1,
+            "operation_kind": "project_create",
+            "reservation_status": 202,
+            "maximum_reservation_latency_ms": 15000,
+            "minimum_terminal_duration_ms": 15000,
+            "minimum_ordered_phase_count": 2,
+            "allowed_process_log_sources": [
+                "daemon_stderr",
+                "daemon_stdout",
+                "ssh_stderr",
+                "ssh_stdout",
+            ],
+            "require_sse_reconnect": True,
+            "require_relaunch_recovery": True,
+            "require_stable_action_id": True,
+            "require_single_core_project": True,
+            "require_single_applied_mutation": True,
+            "require_secret_canary_absence": True,
+            "require_renderer_secret_canary_absence": True,
+        },
         "files": [
             {
                 "role": role,
@@ -204,15 +244,15 @@ def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str
         "skill_bundle": "reference_skill_bundle",
         "text_memory": "reference_text_memory",
     }
-    release_contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))["v019"]
+    release_contract = json.loads(Path("desktop/release-contract.json").read_text(encoding="utf-8"))["v0110"]
     features = release_contract["required_desktop_feature_flags"]
     feature_digest = hashlib.sha256(
         json.dumps(features, ensure_ascii=True, separators=(",", ":"), sort_keys=True).encode("ascii")
     ).hexdigest()
     return {
-        "schema_version": "2",
+        "schema_version": "3",
         "kind": "openevo_desktop_real_science_e2e",
-        "issue": 163,
+        "issue": 220,
         "real_process_boundary": True,
         "outcome": "passed",
         "started_at": "2026-07-26T01:00:00Z",
@@ -224,7 +264,7 @@ def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str
                 "byte_size": roles["core_wheel"]["byte_size"],
                 "filename": roles["core_wheel"]["filename"],
                 "distribution": "openevo",
-                "version": "0.1.9",
+                "version": "0.1.10",
             },
             "framework_lock": {
                 "sha256": roles["framework_lock"]["sha256"],
@@ -245,7 +285,7 @@ def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str
         },
         "renderer_candidate_binding": {
             "source_commit": SOURCE,
-            "candidate_version": "0.1.9",
+            "candidate_version": "0.1.10",
             "release_candidate_manifest_sha256": candidate_digest,
             "desktop_dmg_sha256": roles["desktop_dmg"]["sha256"],
             "app_bundle_smoke_sha256": roles["app_bundle_smoke"]["sha256"],
@@ -261,7 +301,7 @@ def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str
         },
         "desktop": {
             "source_commit": SOURCE,
-            "release_version": "0.1.9",
+            "release_version": "0.1.10",
             "mutation_major": 2,
             "openapi_sha256": release_contract["accepted_desktop_openapi_digests"][0],
             "event_schema_sha256": release_contract["accepted_desktop_event_schema_digests"][0],
@@ -319,6 +359,40 @@ def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str
             "second_context_pinned_first_successor": True,
             "second_runtime_context_equals_first_successor": True,
         },
+        "lifecycle": {
+            "operation_kind": "project_create",
+            "reservation_status": 202,
+            "reservation_latency_ms": 250,
+            "terminal_duration_ms": 16250,
+            "action_id_sha256": _digest("project-create-action"),
+            "operation_id_sha256": _digest("project-create-operation"),
+            "request_sha256": _digest("project-create-request"),
+            "ordered_phases": [
+                "queued",
+                "remote_preflight",
+                "creating_remote_project",
+                "verifying_project",
+                "activating",
+                "finalizing",
+            ],
+            "process_logs": {
+                "entry_count": 2,
+                "sources": ["daemon_stdout", "ssh_stderr"],
+                "content_sha256": _digest("bounded-process-logs"),
+            },
+            "sse_reconnect_verified": True,
+            "relaunch_recovery_verified": True,
+            "stable_action_id_after_relaunch": True,
+            "stable_operation_id_after_relaunch": True,
+            "mutation_reissued_after_relaunch": False,
+            "core_authority": {
+                "project_count": 1,
+                "project_mapping_count": 1,
+                "applied_create_project_mutation_count": 1,
+            },
+            "secret_canary_sha256": _digest("secret-canary"),
+            "secret_canary_absent": True,
+        },
         "renderer": {
             "schema_version": "2",
             "kind": "openevo_desktop_live_renderer_observability",
@@ -336,6 +410,7 @@ def _payload(candidate: Mapping[str, object], candidate_digest: str) -> dict[str
             "evolution_artifact_count": 3,
             "system_openssh_workspace_verified": True,
             "remote_target_controls_verified": True,
+            "secret_canary_absent": True,
             "selected_methods": methods,
             "observed_route_kinds": ["desktop_v2", "packaged_web"],
             "screenshot_sha256": _digest("screenshot"),
@@ -396,18 +471,18 @@ def _rewrite_evidence(fixture: dict[str, object], payload: dict[str, object]) ->
     fixture["evidence_digest"] = hashlib.sha256(content).hexdigest()
 
 
-def test_exact_candidate_two_task_v2_evidence_passes(tmp_path: Path) -> None:
+def test_exact_candidate_two_task_v3_evidence_passes(tmp_path: Path) -> None:
     module = _load_validator()
     fixture = _fixture(module, tmp_path)
 
     assert _validate(module, fixture)["outcome"] == "passed"
 
 
-def test_schema_v1_real_science_evidence_is_rejected(tmp_path: Path) -> None:
+def test_schema_v2_real_science_evidence_is_rejected(tmp_path: Path) -> None:
     module = _load_validator()
     fixture = _fixture(module, tmp_path)
     payload = copy.deepcopy(fixture["payload"])
-    payload["schema_version"] = "1"
+    payload["schema_version"] = "2"
     _rewrite_evidence(fixture, payload)
 
     with pytest.raises(module.EvidenceError, match="schema"):
@@ -433,6 +508,7 @@ def test_candidate_unsigned_macos_policy_change_fails_closed(tmp_path: Path) -> 
         (("reuse", "second_context_pinned_first_successor"), False),
         (("remote", "connection_authority"), "manual"),
         (("renderer", "desktop_api_major"), 1),
+        (("renderer", "secret_canary_absent"), False),
         (("project", "selected_methods", "agent_system"), "concrete"),
         (("tasks", 1, "predecessor_project_head", "generation"), 0),
         (("project", "active_project_head", "evolution_revision", "artifact_count"), 2),
@@ -453,6 +529,62 @@ def test_incomplete_v2_release_claim_fails_closed(
     _rewrite_evidence(fixture, payload)
 
     with pytest.raises(module.EvidenceError):
+        _validate(module, fixture)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        (("lifecycle", "reservation_latency_ms"), 15000),
+        (("lifecycle", "terminal_duration_ms"), 15000),
+        (("lifecycle", "ordered_phases"), ["finalizing"]),
+        (("lifecycle", "process_logs", "sources"), ["desktop"]),
+        (("lifecycle", "sse_reconnect_verified"), False),
+        (("lifecycle", "relaunch_recovery_verified"), False),
+        (("lifecycle", "stable_action_id_after_relaunch"), False),
+        (("lifecycle", "stable_operation_id_after_relaunch"), False),
+        (("lifecycle", "mutation_reissued_after_relaunch"), True),
+        (("lifecycle", "core_authority", "project_count"), 2),
+        (("lifecycle", "core_authority", "project_mapping_count"), 2),
+        (
+            (
+                "lifecycle",
+                "core_authority",
+                "applied_create_project_mutation_count",
+            ),
+            2,
+        ),
+        (("lifecycle", "secret_canary_absent"), False),
+    ],
+)
+def test_incomplete_v3_lifecycle_claim_fails_closed(
+    tmp_path: Path,
+    path: tuple[object, ...],
+    value: object,
+) -> None:
+    module = _load_validator()
+    fixture = _fixture(module, tmp_path)
+    payload = copy.deepcopy(fixture["payload"])
+    owner: object = payload
+    for segment in path[:-1]:
+        owner = owner[segment]  # type: ignore[index]
+    owner[path[-1]] = value  # type: ignore[index]
+    _rewrite_evidence(fixture, payload)
+
+    with pytest.raises(module.EvidenceError, match="lifecycle"):
+        _validate(module, fixture)
+
+
+def test_candidate_lifecycle_contract_mutation_fails_closed(tmp_path: Path) -> None:
+    module = _load_validator()
+    fixture = _fixture(module, tmp_path)
+    candidate = copy.deepcopy(fixture["candidate"])
+    candidate["lifecycle_evidence"]["minimum_terminal_duration_ms"] = 0
+    content = _canonical_bytes(candidate)
+    fixture["candidate_path"].write_bytes(content)
+    fixture["candidate_digest"] = hashlib.sha256(content).hexdigest()
+
+    with pytest.raises(module.EvidenceError, match="lifecycle"):
         _validate(module, fixture)
 
 

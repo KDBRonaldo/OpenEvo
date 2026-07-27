@@ -8,15 +8,16 @@ import {
 } from "./releaseContract";
 import {
   createReleaseDesktopProductProvider,
+  getReleaseDesktopStartupStatus,
   reportReleaseDesktopReady,
 } from "./releaseProvider";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke: invokeMock }));
 
-const OPENAPI = "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
-const EVENTS = "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
-const FEATURE_DIGEST = "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
+const OPENAPI = "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760";
+const EVENTS = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
+const FEATURE_DIGEST = "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 
 function version() {
   return {
@@ -27,7 +28,7 @@ function version() {
     mutation_major: 2,
     openapi_sha256: OPENAPI,
     event_schema_sha256: EVENTS,
-    release_version: "0.1.9",
+    release_version: "0.1.10",
     build_id: "a".repeat(64),
     source_commit: "abcdef1",
     build_channel: "release",
@@ -56,15 +57,17 @@ function native(value: unknown = bootstrap()) {
     selectProjectSource: vi.fn(),
     cancelProjectSource: vi.fn(),
     settleProjectSource: vi.fn(),
+    readMutationIntentJournalV2: vi.fn().mockResolvedValue(null),
+    compareAndSwapMutationIntentJournalV2: vi.fn(),
   };
 }
 
-describe("v0.1.9 release provider", () => {
+describe("v0.1.10 release provider", () => {
   beforeEach(() => invokeMock.mockReset());
 
   it("pins the exact Desktop v2 contract and event schema", () => {
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT).toMatchObject({
-      releaseVersion: "0.1.9",
+      releaseVersion: "0.1.10",
       acceptedOpenApiDigests: [OPENAPI],
       acceptedEventSchemaDigests: [EVENTS],
       allowedProviderKinds: ["desktop_sidecar"],
@@ -74,21 +77,24 @@ describe("v0.1.9 release provider", () => {
       "daemon_bundle_v2",
       "event_replay_v2",
       "host_key_review",
+      "lifecycle_operations_v2",
+      "lifecycle_process_logs_v2",
+      "mutation_idempotency_v2",
       "native_askpass",
       "system_openssh_profiles",
       "task_admission_v2",
     ]);
     expect(DESKTOP_PRODUCT_RELEASE_CONTRACT).toMatchObject({
-      releaseVersion: releaseManifest.v019.release_version,
-      acceptedOpenApiDigests: releaseManifest.v019.accepted_desktop_openapi_digests,
-      acceptedEventSchemaDigests: releaseManifest.v019.accepted_desktop_event_schema_digests,
-      requiredFeatureFlags: releaseManifest.v019.required_desktop_feature_flags,
+      releaseVersion: releaseManifest.v0110.release_version,
+      acceptedOpenApiDigests: releaseManifest.v0110.accepted_desktop_openapi_digests,
+      acceptedEventSchemaDigests: releaseManifest.v0110.accepted_desktop_event_schema_digests,
+      requiredFeatureFlags: releaseManifest.v0110.required_desktop_feature_flags,
     });
     expect(CORE_PRODUCT_RELEASE_CONTRACT).toMatchObject({
-      releaseVersion: releaseManifest.v019.release_version,
-      acceptedOpenApiDigests: releaseManifest.v019.accepted_core_openapi_digests,
-      acceptedEventSchemaDigests: releaseManifest.v019.accepted_core_event_schema_digests,
-      requiredFeatureFlags: releaseManifest.v019.required_core_feature_flags,
+      releaseVersion: releaseManifest.v0110.release_version,
+      acceptedOpenApiDigests: releaseManifest.v0110.accepted_core_openapi_digests,
+      acceptedEventSchemaDigests: releaseManifest.v0110.accepted_core_event_schema_digests,
+      requiredFeatureFlags: releaseManifest.v0110.required_core_feature_flags,
     });
   });
 
@@ -100,8 +106,43 @@ describe("v0.1.9 release provider", () => {
     expect(invokeMock).toHaveBeenCalledWith("renderer_ready", {
       openapiSha256: OPENAPI,
       eventSchemaSha256: EVENTS,
-      releaseVersion: "0.1.9",
+      releaseVersion: "0.1.10",
     });
+  });
+
+  it("reads only the closed native startup progress projection", async () => {
+    invokeMock.mockResolvedValue({
+      schema_version: "2",
+      startup_epoch: 4,
+      status: "running",
+      phase: "waiting_for_local_api",
+      phase_index: 3,
+      phase_total: 6,
+      elapsed_milliseconds: 16_000,
+      cancellable: true,
+      failure: null,
+    });
+
+    await expect(getReleaseDesktopStartupStatus()).resolves.toMatchObject({
+      status: "running",
+      phase: "waiting_for_local_api",
+      elapsed_milliseconds: 16_000,
+    });
+    expect(invokeMock).toHaveBeenCalledWith("sidecar_startup_status");
+
+    invokeMock.mockResolvedValueOnce({
+      schema_version: "2",
+      startup_epoch: 4,
+      status: "running",
+      phase: "waiting_for_local_api",
+      phase_index: 3,
+      phase_total: 6,
+      elapsed_milliseconds: 16_000,
+      cancellable: true,
+      failure: null,
+      stderr: "private output",
+    });
+    await expect(getReleaseDesktopStartupStatus()).rejects.toThrow();
   });
 
   it("negotiates only v2 before exposing a v2 provider", async () => {
@@ -159,6 +200,34 @@ describe("v0.1.9 release provider", () => {
       "begin_sidecar_start",
       "sidecar_bootstrap_context",
     ]);
+  });
+
+  it("binds mutation retry journal reads and CAS writes to the exact native commands", async () => {
+    const journal = "{\"schema_version\":\"2\",\"revision\":1,\"entries\":[]}";
+    invokeMock.mockImplementation((command?: string) => {
+      if (command === "begin_sidecar_start") return Promise.resolve();
+      if (command === "sidecar_bootstrap_context") return Promise.resolve(bootstrap());
+      if (command === "read_mutation_intent_journal_v2") return Promise.resolve(journal);
+      if (command === "compare_and_swap_mutation_intent_journal_v2") return Promise.resolve();
+      return Promise.resolve(undefined);
+    });
+    const fetch = vi.fn<FetchLikeV2>().mockResolvedValue(new Response(JSON.stringify(version()), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const adapterFactory = vi.fn(async (context) => {
+      expect(await context.native.readMutationIntentJournalV2()).toBe(journal);
+      await context.native.compareAndSwapMutationIntentJournalV2(journal, null);
+      return unavailableDesktopProductProviderV2;
+    });
+
+    await createReleaseDesktopProductProvider({ fetch, adapterFactory, reportStage: vi.fn() });
+
+    expect(invokeMock).toHaveBeenCalledWith("read_mutation_intent_journal_v2");
+    expect(invokeMock).toHaveBeenCalledWith("compare_and_swap_mutation_intent_journal_v2", {
+      expectedValue: journal,
+      newValue: null,
+    });
   });
 
   it("fails closed when the native background start request is explicitly rejected", async () => {

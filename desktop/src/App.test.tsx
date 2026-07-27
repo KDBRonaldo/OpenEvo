@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DesktopApiError } from "./api/v1/client";
 import { AppShell, ReleaseDesktopProductShell } from "./App";
 import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./product/fixtureProvider";
+import type { NativeStartupStatusV2 } from "./product/releaseProvider";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 
@@ -73,6 +74,7 @@ describe("ReleaseDesktopProductShell", () => {
       await act(async () => root?.unmount());
       root = null;
     }
+    vi.useRealTimers();
     document.body.innerHTML = "";
     delete (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__;
   });
@@ -108,6 +110,38 @@ describe("ReleaseDesktopProductShell", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
+  });
+
+  it("shows native startup checkpoints, elapsed time, and safe cancellation", async () => {
+    const pending = deferred<FixtureDesktopProductProvider>();
+    const stop = vi.fn(async () => {});
+    const getStartupStatus = vi.fn(async (): Promise<NativeStartupStatusV2> => ({
+      schema_version: "2",
+      startup_epoch: 3,
+      status: "running",
+      phase: "waiting_for_local_api",
+      phase_index: 3,
+      phase_total: 6,
+      elapsed_milliseconds: 16_000,
+      cancellable: true,
+      failure: null,
+    }));
+
+    root = await renderReleaseShell(
+      () => pending.promise,
+      stop,
+      vi.fn(async () => {}),
+      vi.fn(),
+      getStartupStatus,
+    );
+    await vi.waitFor(() => expect(getStartupStatus).toHaveBeenCalled());
+
+    expect(document.body.textContent).toContain("Waiting for the Desktop Local API");
+    expect(document.body.textContent).toContain("Checkpoint 4 of 6");
+    expect(document.body.textContent).toContain("Elapsed 16s");
+    expect(document.body.textContent).toContain("Native startup output remains available through Diagnostics.");
+    await act(async () => button("Cancel operation").click());
+    expect(stop.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
   it("keeps both renderer-owned samples interactive while the first provider snapshot is pending", async () => {
@@ -423,6 +457,17 @@ describe("ReleaseDesktopProductShell", () => {
       vi.fn(async () => {}),
       vi.fn(async () => {}),
       vi.fn(),
+      vi.fn(async (): Promise<NativeStartupStatusV2> => ({
+        schema_version: "2",
+        startup_epoch: 1,
+        status: "succeeded",
+        phase: "ready",
+        phase_index: 5,
+        phase_total: 6,
+        elapsed_milliseconds: 25,
+        cancellable: false,
+        failure: null,
+      })),
     );
 
     expect(document.body.textContent).toContain("Research brief");
@@ -679,6 +724,7 @@ async function renderReleaseShell(
   stopProvider?: () => Promise<void>,
   reportReady?: () => Promise<void>,
   reportStage?: (stage: string) => Promise<void> | void,
+  getStartupStatus?: () => Promise<NativeStartupStatusV2>,
 ): Promise<Root> {
   const container = document.createElement("div");
   document.body.appendChild(container);
@@ -691,6 +737,7 @@ async function renderReleaseShell(
           stopProvider={stopProvider}
           reportStage={reportStage}
           reportReady={reportReady}
+          getStartupStatus={getStartupStatus}
         />
       </MemoryRouter>,
     );

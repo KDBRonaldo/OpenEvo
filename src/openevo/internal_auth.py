@@ -445,6 +445,10 @@ def verified_private_file_sha256(path: os.PathLike[str], *, max_bytes: int) -> s
     flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
     try:
         fd = os.open(path, flags)
+    except PermissionError as exc:
+        raise InternalAuthError(
+            "internal identity file is outside private-file policy"
+        ) from exc
     except OSError as exc:
         raise InternalAuthError("internal identity file could not be opened safely") from exc
     try:

@@ -4,6 +4,8 @@ import {
   artifactDiffV2Schema,
   artifactPageV2Schema,
   artifactV2Schema,
+  cacheCleanupRequestV2Schema,
+  coreOperationV2Schema,
   desktopBootstrapContextV2Schema,
   desktopErrorV2Schema,
   desktopHealthV2Schema,
@@ -14,6 +16,10 @@ import {
   etagV2Schema,
   evolutionRevisionRefV2Schema,
   hostKeyReviewRequestV2Schema,
+  lifecycleAcknowledgeV2Schema,
+  lifecycleCancelV2Schema,
+  lifecycleLogPageV2Schema,
+  lifecycleOperationV2Schema,
   localOperationV2Schema,
   opaqueIdV2Schema,
   profileConnectionActionV2Schema,
@@ -51,6 +57,7 @@ import {
   type ArtifactDiffV2,
   type ArtifactPageV2,
   type ArtifactV2,
+  type CacheCleanupRequestV2,
   type DesktopBootstrapContextV2,
   type DesktopErrorV2,
   type DesktopHealthV2,
@@ -60,7 +67,13 @@ import {
   type DiagnosticV2,
   type EvolutionRevisionRefV2,
   type HostKeyReviewRequestV2,
+  type LifecycleAcknowledgeV2,
+  type LifecycleCancelV2,
+  type LifecycleLogPageV2,
+  type LifecycleOperationKindV2,
+  type LifecycleOperationV2,
   type LocalOperationV2,
+  type OperationV2,
   type ProfileConnectionActionV2,
   type ProfileDisplayNamePatchV2,
   type ProfileRebindV2,
@@ -90,6 +103,7 @@ import {
   type TimelinePageV2,
   type SuccessorTransitionV2,
 } from "./schemas";
+import { logPageV2Schema, type LogPageV2 } from "./logs";
 
 export const DESKTOP_API_V2_PREFIX = "/desktop/v2";
 export const DESKTOP_SESSION_HEADER = "X-OpenEvo-Desktop-Session";
@@ -99,9 +113,6 @@ export const IF_MATCH_HEADER = "If-Match";
 export const LAST_EVENT_ID_HEADER = "Last-Event-ID";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-// The sidecar allows first-connect Daemon/runtime preparation to consume 15 minutes.
-// Keep a bounded HTTP margin so that its typed terminal error reaches the renderer.
-const REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS = 930_000;
 const MAX_RESPONSE_BYTES = 1_048_576;
 
 export type FetchLikeV2 = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
@@ -125,6 +136,10 @@ export interface DesktopClientOptionsV2 {
 export interface ListRequestOptionsV2 {
   readonly limit?: number;
   readonly after?: string;
+}
+
+export interface LifecycleLogRequestOptionsV2 extends ListRequestOptionsV2 {
+  readonly afterSequence?: number;
 }
 
 export interface TaskListRequestOptionsV2 extends ListRequestOptionsV2 {
@@ -167,6 +182,11 @@ const listRequestOptionsV2Schema = z.object({
   limit: z.number().int().min(1).max(100).optional(),
   after: z.string().min(1).max(512).optional(),
 }).strict();
+const lifecycleLogRequestOptionsV2Schema = listRequestOptionsV2Schema.extend({
+  afterSequence: z.number().int().safe().min(0).optional(),
+}).strict().refine(
+  (value) => value.after === undefined || value.afterSequence === undefined,
+);
 const taskListRequestOptionsV2Schema = listRequestOptionsV2Schema.extend({
   projectId: opaqueIdV2Schema.optional(),
 }).strict();
@@ -211,20 +231,25 @@ export interface DesktopApiClientV2 {
   updateProfile(profileId: string, input: ProfileDisplayNamePatchV2, options: ResourceMutationRequestOptionsV2): Promise<RemoteProfileV2>;
   deleteProfile(profileId: string, options: ResourceMutationRequestOptionsV2): Promise<void>;
   rebindProfile(profileId: string, input: ProfileRebindV2, options: ResourceMutationRequestOptionsV2): Promise<RemoteWorkspaceProfileV2>;
-  connectProfile(profileId: string, input: ProfileConnectionActionV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
-  disconnectProfile(profileId: string, input: ProfileConnectionActionV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
-  reviewProfileHostKey(profileId: string, input: HostKeyReviewRequestV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
+  connectProfile(profileId: string, input: ProfileConnectionActionV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
+  disconnectProfile(profileId: string, input: ProfileConnectionActionV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
+  reviewProfileHostKey(profileId: string, input: HostKeyReviewRequestV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
   listProjects(options?: ListRequestOptionsV2): Promise<ProjectPageV2>;
-  createProject(input: ProjectCreateV2, options: MutationRequestOptionsV2): Promise<ProjectV2>;
+  createProject(input: ProjectCreateV2, options: MutationRequestOptionsV2): Promise<LifecycleOperationV2>;
   getProject(projectId: string): Promise<ProjectV2>;
   updateProject(projectId: string, input: ProjectPatchV2, options: ResourceMutationRequestOptionsV2): Promise<ProjectV2>;
-  activateProject(projectId: string, input: ProjectActionV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
+  activateProject(projectId: string, input: ProjectActionV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
+  getLifecycleOperationByAction(actionId: string, kind: LifecycleOperationKindV2): Promise<LifecycleOperationV2>;
+  getLifecycleOperation(operationId: string): Promise<LifecycleOperationV2>;
+  lifecycleOperationLogs(operationId: string, options?: LifecycleLogRequestOptionsV2): Promise<LifecycleLogPageV2>;
+  cancelLifecycleOperation(operationId: string, input: LifecycleCancelV2, options: ResourceMutationRequestOptionsV2): Promise<LifecycleOperationV2>;
+  acknowledgeLifecycleOperation(operationId: string, input: LifecycleAcknowledgeV2, options: ResourceMutationRequestOptionsV2): Promise<void>;
   projectCapabilities(projectId: string): Promise<ProjectCapabilityProjectionV2>;
   validateProject(projectId: string, input: ProjectValidationRequestV2, options: ResourceMutationRequestOptionsV2): Promise<ProjectValidationV2>;
   listTasks(options?: TaskListRequestOptionsV2): Promise<TaskPageV2>;
   submitTask(input: TaskSubmitRequestV2, options: MutationRequestOptionsV2): Promise<TaskV2>;
   getTask(taskId: string): Promise<TaskV2>;
-  cancelTask(taskId: string, input: TaskActionV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
+  cancelTask(taskId: string, input: TaskActionV2, options: ResourceMutationRequestOptionsV2): Promise<OperationV2>;
   retryTask(taskId: string, input: TaskActionV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
   taskTimeline(taskId: string, options?: ListRequestOptionsV2): Promise<TimelinePageV2>;
   taskContext(taskId: string): Promise<TaskContextV2>;
@@ -233,14 +258,18 @@ export interface DesktopApiClientV2 {
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;
   getRuntimeContext(runtimeContextSnapshotId: string): Promise<RuntimeContextSnapshotRefV2>;
   getTransition(transitionId: string): Promise<SuccessorTransitionV2>;
-  retryTransition(transitionId: string, input: z.input<typeof transitionActionV2Schema>, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
+  retryTransition(transitionId: string, input: z.input<typeof transitionActionV2Schema>, options: ResourceMutationRequestOptionsV2): Promise<OperationV2>;
   replaceTransition(transitionId: string, input: z.input<typeof transitionReplaceV2Schema>, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
-  abandonTransition(transitionId: string, input: z.input<typeof transitionActionV2Schema>, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
+  abandonTransition(transitionId: string, input: z.input<typeof transitionActionV2Schema>, options: ResourceMutationRequestOptionsV2): Promise<OperationV2>;
   getArtifact(artifactId: string): Promise<ArtifactV2>;
   artifactContent(artifactId: string): Promise<ArtifactContentV2>;
   artifactDiff(artifactId: string, options?: ArtifactDiffRequestOptionsV2): Promise<ArtifactDiffV2>;
   listServices(options?: ListRequestOptionsV2): Promise<ServicePageV2>;
-  restartService(serviceId: string, input: ServiceRestartV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
+  restartService(serviceId: string, input: ServiceRestartV2, options: ResourceMutationRequestOptionsV2): Promise<OperationV2>;
+  getCoreOperation(operationId: string): Promise<OperationV2>;
+  cancelCoreOperation(operationId: string, options: ResourceMutationRequestOptionsV2): Promise<OperationV2>;
+  serviceLogs(serviceId: string, options?: ListRequestOptionsV2): Promise<LogPageV2>;
+  cleanupCaches(input: CacheCleanupRequestV2, options: MutationRequestOptionsV2): Promise<OperationV2>;
   createDiagnostic(input: DiagnosticRequestV2, options: MutationRequestOptionsV2): Promise<DiagnosticV2>;
   getDiagnostic(diagnosticId: string): Promise<DiagnosticV2>;
   eventStreamRequest(lastEventId?: string): Promise<EventStreamRequestV2>;
@@ -349,7 +378,6 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       readonly mutation?: MutationRequestOptionsV2;
       readonly ifMatch?: string;
       readonly authenticated?: boolean;
-      readonly timeoutMs?: number;
     } = {},
   ): Promise<z.output<S>> {
     const bootstrap = await context();
@@ -364,7 +392,7 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       headers.set("Content-Type", "application/json");
     }
     try {
-      return await withRequestDeadline(requestOptions.timeoutMs ?? requestTimeoutMs, async (signal) => {
+      return await withRequestDeadline(requestTimeoutMs, async (signal) => {
         const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
           method,
           headers,
@@ -420,19 +448,65 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
     }
   }
 
+  async function postNoContent(
+    path: string,
+    bodyInput: unknown,
+    bodySchema: ZodType,
+    mutation: ResourceMutationRequestOptionsV2,
+  ): Promise<void> {
+    const bootstrap = await context();
+    const headers = requestHeaders(bootstrap, { mutation, ifMatch: mutation.ifMatch });
+    const body = JSON.stringify(bodySchema.parse(bodyInput));
+    if (new TextEncoder().encode(body).byteLength > MAX_RESPONSE_BYTES) {
+      throw new DesktopContractErrorV2("Desktop Local API request body exceeds the byte limit");
+    }
+    headers.set("Content-Type", "application/json");
+    try {
+      await withRequestDeadline(requestTimeoutMs, async (signal) => {
+        const response = await options.fetch(buildUrl(bootstrap.endpoint, path), {
+          method: "POST",
+          headers,
+          body,
+          credentials: "omit",
+          cache: "no-store",
+          redirect: "error",
+          referrerPolicy: "no-referrer",
+          signal,
+        });
+        if (!response.ok) throw await responseError(response);
+        if (response.status !== 204) {
+          throw new DesktopContractErrorV2("Desktop Local API action did not return HTTP 204", {
+            status: response.status,
+          });
+        }
+        const text = await response.text();
+        if (text.length !== 0) {
+          throw new DesktopContractErrorV2("Desktop Local API HTTP 204 response contained a body", {
+            status: 204,
+          });
+        }
+      });
+    } catch (error) {
+      if (isTransportFailure(error)
+        && bootstrapPromise !== null
+        && await promiseResolvedTo(bootstrapPromise, bootstrap)) {
+        bootstrapPromise = null;
+      }
+      throw normalizeTransportFailure(error);
+    }
+  }
+
   const resourceAction = <S extends z.ZodTypeAny>(
     path: string,
     body: unknown,
     bodySchema: ZodType,
     responseSchema: S,
     options: ResourceMutationRequestOptionsV2,
-    timeoutMs?: number,
   ) => request("POST", path, responseSchema, 202, {
     body,
     bodySchema,
     mutation: options,
     ifMatch: options.ifMatch,
-    timeoutMs,
   });
 
   return {
@@ -485,16 +559,16 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       "profile rebind",
     ),
     connectProfile: (profileId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/connect`, input, profileConnectionActionV2Schema, localOperationV2Schema, mutation, REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS,
+      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/connect`, input, profileConnectionActionV2Schema, lifecycleOperationV2Schema, mutation,
     ),
     disconnectProfile: (profileId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/disconnect`, input, profileConnectionActionV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/disconnect`, input, profileConnectionActionV2Schema, lifecycleOperationV2Schema, mutation,
     ),
     reviewProfileHostKey: (profileId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/host-key/review`, input, hostKeyReviewRequestV2Schema, localOperationV2Schema, mutation, REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS,
+      `${DESKTOP_API_V2_PREFIX}/profiles/${segment(profileId)}/host-key/review`, input, hostKeyReviewRequestV2Schema, lifecycleOperationV2Schema, mutation,
     ),
     listProjects: (listOptions) => request("GET", withListQuery(`${DESKTOP_API_V2_PREFIX}/projects`, listOptions), projectPageV2Schema, 200),
-    createProject: (input, mutation) => request("POST", `${DESKTOP_API_V2_PREFIX}/projects`, projectV2Schema, 201, {
+    createProject: (input, mutation) => request("POST", `${DESKTOP_API_V2_PREFIX}/projects`, lifecycleOperationV2Schema, 202, {
       body: input,
       bodySchema: projectCreateV2Schema,
       mutation,
@@ -517,7 +591,54 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       "project update",
     ),
     activateProject: (projectId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/activate`, input, projectActionV2Schema, localOperationV2Schema, mutation, REMOTE_LIFECYCLE_REQUEST_TIMEOUT_MS,
+      `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/activate`, input, projectActionV2Schema, lifecycleOperationV2Schema, mutation,
+    ),
+    getLifecycleOperationByAction: (actionId, kind) => {
+      const action = idempotencyKeyV2Schema.parse(actionId);
+      return request(
+        "GET",
+        `${DESKTOP_API_V2_PREFIX}/operations/by-action?action_id=${encodeURIComponent(action)}&kind=${encodeURIComponent(kind)}`,
+        lifecycleOperationV2Schema,
+        200,
+      );
+    },
+    getLifecycleOperation: async (operationId) => assertIdentity(
+      await request("GET", `${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}`, lifecycleOperationV2Schema, 200),
+      "operation_id",
+      operationId,
+      "lifecycle operation lookup",
+    ),
+    lifecycleOperationLogs: async (operationId, listOptions) => assertIdentity(
+      await request(
+        "GET",
+        withLifecycleLogQuery(
+          `${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}/logs`,
+          listOptions,
+        ),
+        lifecycleLogPageV2Schema,
+        200,
+      ),
+      "operation_id",
+      operationId,
+      "lifecycle operation logs",
+    ),
+    cancelLifecycleOperation: async (operationId, input, mutation) => assertIdentity(
+      await resourceAction(
+        `${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}/cancel`,
+        input,
+        lifecycleCancelV2Schema,
+        lifecycleOperationV2Schema,
+        mutation,
+      ),
+      "operation_id",
+      operationId,
+      "lifecycle operation cancellation",
+    ),
+    acknowledgeLifecycleOperation: (operationId, input, mutation) => postNoContent(
+      `${DESKTOP_API_V2_PREFIX}/operations/${segment(operationId)}/acknowledge`,
+      input,
+      lifecycleAcknowledgeV2Schema,
+      mutation,
     ),
     projectCapabilities: async (projectId) => assertIdentity(
       await request("GET", `${DESKTOP_API_V2_PREFIX}/projects/${segment(projectId)}/capabilities`, projectCapabilityProjectionV2Schema, 200),
@@ -557,7 +678,7 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       "task lookup",
     ),
     cancelTask: (taskId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/cancel`, input, taskActionV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/cancel`, input, taskActionV2Schema, coreOperationV2Schema, mutation,
     ),
     retryTask: (taskId, input, mutation) => resourceAction(
       `${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/retry`, input, taskActionV2Schema, localOperationV2Schema, mutation,
@@ -594,13 +715,13 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       return value;
     },
     retryTransition: (transitionId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/transitions/${segment(transitionId)}/retry`, input, transitionActionV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/transitions/${segment(transitionId)}/retry`, input, transitionActionV2Schema, coreOperationV2Schema, mutation,
     ),
     replaceTransition: (transitionId, input, mutation) => resourceAction(
       `${DESKTOP_API_V2_PREFIX}/transitions/${segment(transitionId)}/replace`, input, transitionReplaceV2Schema, localOperationV2Schema, mutation,
     ),
     abandonTransition: (transitionId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/transitions/${segment(transitionId)}/abandon`, input, transitionActionV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/transitions/${segment(transitionId)}/abandon`, input, transitionActionV2Schema, coreOperationV2Schema, mutation,
     ),
     getArtifact: async (artifactId) => assertIdentity(
       await request("GET", `${DESKTOP_API_V2_PREFIX}/artifacts/${segment(artifactId)}`, artifactV2Schema, 200),
@@ -621,7 +742,38 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
     ),
     listServices: (listOptions) => request("GET", withListQuery(`${DESKTOP_API_V2_PREFIX}/services`, listOptions), servicePageV2Schema, 200),
     restartService: (serviceId, input, mutation) => resourceAction(
-      `${DESKTOP_API_V2_PREFIX}/services/${segment(serviceId)}/restart`, input, serviceRestartV2Schema, localOperationV2Schema, mutation,
+      `${DESKTOP_API_V2_PREFIX}/services/${segment(serviceId)}/restart`, input, serviceRestartV2Schema, coreOperationV2Schema, mutation,
+    ),
+    getCoreOperation: async (operationId) => assertIdentity(
+      await request("GET", `${DESKTOP_API_V2_PREFIX}/core-operations/${segment(operationId)}`, coreOperationV2Schema, 200),
+      "operation_id",
+      operationId,
+      "Core operation lookup",
+    ),
+    cancelCoreOperation: async (operationId, mutation) => assertIdentity(
+      await request(
+        "POST",
+        `${DESKTOP_API_V2_PREFIX}/core-operations/${segment(operationId)}/cancel`,
+        coreOperationV2Schema,
+        202,
+        { mutation, ifMatch: mutation.ifMatch },
+      ),
+      "operation_id",
+      operationId,
+      "Core operation cancellation",
+    ),
+    serviceLogs: (serviceId, listOptions) => request(
+      "GET",
+      withListQuery(`${DESKTOP_API_V2_PREFIX}/services/${segment(serviceId)}/logs`, listOptions),
+      logPageV2Schema,
+      200,
+    ),
+    cleanupCaches: (input, mutation) => request(
+      "POST",
+      `${DESKTOP_API_V2_PREFIX}/maintenance/cache-cleanup`,
+      coreOperationV2Schema,
+      202,
+      { body: input, bodySchema: cacheCleanupRequestV2Schema, mutation },
     ),
     createDiagnostic: (input, mutation) => request("POST", `${DESKTOP_API_V2_PREFIX}/diagnostics`, diagnosticV2Schema, 202, {
       body: input,
@@ -774,6 +926,21 @@ function withListQuery(path: string, input?: ListRequestOptionsV2): string {
   const query = new URLSearchParams();
   if (options.limit !== undefined) query.set("limit", String(options.limit));
   if (options.after !== undefined) query.set("after", options.after);
+  return query.size === 0 ? path : `${path}?${query.toString()}`;
+}
+
+function withLifecycleLogQuery(
+  path: string,
+  input?: LifecycleLogRequestOptionsV2,
+): string {
+  if (input === undefined) return path;
+  const options = lifecycleLogRequestOptionsV2Schema.parse(input);
+  const query = new URLSearchParams();
+  if (options.limit !== undefined) query.set("limit", String(options.limit));
+  if (options.after !== undefined) query.set("after", options.after);
+  if (options.afterSequence !== undefined) {
+    query.set("after_sequence", String(options.afterSequence));
+  }
   return query.size === 0 ? path : `${path}?${query.toString()}`;
 }
 

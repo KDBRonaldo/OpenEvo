@@ -229,6 +229,8 @@ jobs:
             tests/ci/test_openevo_release_evidence.py \
             tests/ci/test_desktop_real_science_e2e.py \
             tests/ci/test_validate_desktop_real_science_e2e.py \
+            tests/ci/test_smoke_openevo_desktop_sidecar.py \
+            tests/ci/test_smoke_openevo_desktop_launchservices.py \
             tests/ci/test_desktop_system_ssh_integration.py \
             tests/openevo/sidecar/test_provider_store.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_provider_store.py::test_standard_sqlite_rollback_journal_recovers_a_crashed_transaction \
@@ -236,6 +238,7 @@ jobs:
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_sqlite_connection_accepts_an_inode_identical_ancestor_alias \
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_open_store_rejects_database_pathname_replacement \
             tests/openevo/sidecar/test_core_bridge_store_v1.py::test_fresh_initial_schema_hot_journal_rolls_back_then_bootstraps \
+            tests/openevo/sidecar/test_core_bridge_store_v2.py::test_release_evidence_summary_requires_one_applied_project_create \
             -q
           uv run python scripts/ci/audit_openevo_identity.py
 
@@ -399,6 +402,7 @@ jobs:
           test -x "$sidecar"
           test -x "$askpass"
           echo "OPENEVO_PACKAGED_SIDECAR_PATH=$sidecar" >> "$GITHUB_ENV"
+          echo "OPENEVO_PACKAGED_ASKPASS_PATH=$askpass" >> "$GITHUB_ENV"
 
       - name: Clean-install and verify final Core wheel, lock, and registry
         run: |
@@ -727,6 +731,9 @@ jobs:
         run: |
           if [ -n "${OPENEVO_PACKAGED_SIDECAR_PATH:-}" ]; then
             rm -f "$OPENEVO_PACKAGED_SIDECAR_PATH"
+          fi
+          if [ -n "${OPENEVO_PACKAGED_ASKPASS_PATH:-}" ]; then
+            rm -f "$OPENEVO_PACKAGED_ASKPASS_PATH"
           fi
           rm -rf \
             .candidate-core \

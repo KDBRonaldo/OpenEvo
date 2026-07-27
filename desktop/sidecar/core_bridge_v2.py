@@ -29,7 +29,7 @@ from desktop.sidecar.core_client_v2 import (
 )
 from desktop.sidecar.release_capabilities import (
     ReleaseAuthorityNegotiationError,
-    negotiate_core_v2_mutation,
+    validate_persisted_core_v2_authority,
 )
 from openevo.backend.contracts.v2 import models as core_v2
 
@@ -219,7 +219,9 @@ class CoreProjectMappingV2:
         project = self.core_project
         version = self.core_version
         try:
-            negotiated = negotiate_core_v2_mutation(version.model_dump(mode="json"))
+            negotiated = validate_persisted_core_v2_authority(
+                version.model_dump(mode="json")
+            )
         except ReleaseAuthorityNegotiationError as exc:
             raise ValueError("Core mapping version is not release authority") from exc
         if negotiated != version:
@@ -599,6 +601,11 @@ class DesktopCoreBridgeV2:
         persistence: DesktopCoreBridgePersistenceV2,
         transport_factory: Callable[[], httpx.BaseTransport] | None = None,
         event_publisher: DesktopEventPublisherV2 | None = None,
+        progress_observer: Callable[
+            [local_v2.LifecyclePhaseV2, local_v2.LifecycleProgressV2 | None, bool],
+            None,
+        ]
+        | None = None,
         timeout: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS,
         activation_timeout: float | None = None,
     ) -> None:
@@ -612,11 +619,14 @@ class DesktopCoreBridgeV2:
             or not 0 < resolved_activation <= MAX_ACTIVATION_TIMEOUT_SECONDS
         ):
             raise ValueError("Core bridge timeouts are outside their finite bounds")
+        if progress_observer is not None and not callable(progress_observer):
+            raise TypeError("Core bridge lifecycle progress observer is invalid")
         self._host_service = host_service
         self._tunnel_factory = tunnel_factory
         self._persistence = persistence
         self._transport_factory = transport_factory
         self._event_publisher = event_publisher
+        self._progress_observer = progress_observer
         self._timeout = float(timeout)
         self._activation_timeout = float(resolved_activation)
         self._lock = threading.RLock()
@@ -642,6 +652,23 @@ class DesktopCoreBridgeV2:
                     action="reconnect",
                 )
         return self
+
+    def set_progress_observer(
+        self,
+        observer: Callable[
+            [local_v2.LifecyclePhaseV2, local_v2.LifecycleProgressV2 | None, bool],
+            None,
+        ],
+    ) -> None:
+        if not callable(observer):
+            raise TypeError("Core bridge lifecycle progress observer is invalid")
+        with self._lock:
+            if self._active is not None or self._progress_observer is not None:
+                raise RuntimeError("Core bridge lifecycle progress observer cannot be changed")
+            set_host_progress = getattr(self._host_service, "set_progress_observer", None)
+            if callable(set_host_progress):
+                set_host_progress(observer)
+            self._progress_observer = observer
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
@@ -717,6 +744,7 @@ class DesktopCoreBridgeV2:
                     action="reconnect",
                 )
             session_id = f"core-session-{secrets.token_hex(20)}"
+            self._observe_lifecycle_progress("opening_project_tunnel", cancellable=True)
             tunnel = self._call_adapter(
                 lambda: self._tunnel_factory.open_tunnel(
                     profile_id=request.profile_id,
@@ -729,6 +757,7 @@ class DesktopCoreBridgeV2:
                 failure_summary="Desktop could not open the active project tunnel.",
             )
             self._validate_tunnel(tunnel, request, session_id)
+            self._observe_lifecycle_progress("negotiating_core", cancellable=True)
             previous = self._call_adapter(
                 lambda: self._persistence.load_mapping(desktop_project_id),
                 failure_code="core_mapping_unavailable",
@@ -738,6 +767,8 @@ class DesktopCoreBridgeV2:
                 display_name=request.display_name,
                 config=request.config,
             )
+            self._observe_lifecycle_progress("creating_remote_project", cancellable=False)
+            bootstrap_version: core_v2.VersionResponseV2 | None
             if previous is None:
                 connection, bootstrap_version = self._bootstrap_project(
                     desktop_project_id=desktop_project_id,
@@ -758,10 +789,13 @@ class DesktopCoreBridgeV2:
                     project_id=previous.core_project_id,
                     session_id=tunnel.session_id,
                 )
-                bootstrap_version = previous.core_version
+                bootstrap_version = None
             client = self._new_client(connection, deadline)
+            native_workspace = request.config.workspace.kind == "native_folder_snapshot"
+            if not native_workspace:
+                self._observe_lifecycle_progress("verifying_project", cancellable=False)
             version = self._call_core(client.version)
-            if version != bootstrap_version:
+            if bootstrap_version is not None and version != bootstrap_version:
                 raise _bridge_error(
                     "core_authority_changed",
                     "The negotiated Core authority changed during project activation.",
@@ -798,6 +832,8 @@ class DesktopCoreBridgeV2:
             if previous is not None and self._same_mapping_authority(previous, mapping):
                 mapping = previous
             else:
+                if not native_workspace:
+                    self._observe_lifecycle_progress("activating", cancellable=False)
                 self._call_adapter(
                     lambda: self._persistence.commit_mapping(
                         mapping,
@@ -806,6 +842,9 @@ class DesktopCoreBridgeV2:
                     failure_code="core_mapping_commit_failed",
                     failure_summary="Desktop could not commit the Core project mapping.",
                 )
+            if previous is not None and self._same_mapping_authority(previous, mapping):
+                if not native_workspace:
+                    self._observe_lifecycle_progress("activating", cancellable=False)
             activation = CoreActivationV2(
                 desktop_project_id=desktop_project_id,
                 profile_id=request.profile_id,
@@ -837,6 +876,8 @@ class DesktopCoreBridgeV2:
                 published = True
             if old is not None:
                 self._retire_or_retain(old, deadline=deadline, suppress_errors=True)
+            if not native_workspace:
+                self._observe_lifecycle_progress("activating", cancellable=False)
             return activation
         except DesktopCoreBridgeErrorV2:
             raise
@@ -859,6 +900,20 @@ class DesktopCoreBridgeV2:
                 if tunnel is not None:
                     self._close_tunnel(tunnel, deadline=deadline, suppress_errors=True)
             self._transition_lock.release()
+
+    def _observe_lifecycle_progress(
+        self,
+        phase: local_v2.LifecyclePhaseV2,
+        *,
+        cancellable: bool,
+    ) -> None:
+        observer = self._progress_observer
+        if observer is not None:
+            observer(
+                phase,
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable,
+            )
 
     def deactivate_project(
         self,

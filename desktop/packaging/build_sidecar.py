@@ -870,6 +870,124 @@ def _target_triple() -> str:
     raise RuntimeError("failed to determine Rust host target triple")
 
 
+def _materialize_private_askpass_helper(executable: Path) -> None:
+    """Detach Cargo's final executable hardlink into one private inode."""
+
+    directory_fd = -1
+    source_fd = -1
+    staging_fd = -1
+    staging_name = f".{executable.name}.private-{secrets.token_hex(16)}"
+    try:
+        directory_fd = os.open(
+            executable.parent,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        )
+        directory = os.fstat(directory_fd)
+        if (
+            not stat.S_ISDIR(directory.st_mode)
+            or directory.st_uid != os.geteuid()
+            or directory.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise RuntimeError("Cargo askpass output directory is not trusted")
+        source_fd = os.open(
+            executable.name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+            dir_fd=directory_fd,
+        )
+        source = os.fstat(source_fd)
+        source_path = os.stat(
+            executable.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        if (
+            not stat.S_ISREG(source.st_mode)
+            or source.st_uid != os.geteuid()
+            or source.st_nlink < 1
+            or source.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or (source.st_dev, source.st_ino) != (source_path.st_dev, source_path.st_ino)
+            or not 0 < source.st_size <= MAX_ASKPASS_BINARY_BYTES
+        ):
+            raise RuntimeError("Cargo askpass output is not a trusted regular file")
+        byte_size, digest = _sha256_fd(source_fd)
+
+        staging_fd = os.open(
+            staging_name,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o700,
+            dir_fd=directory_fd,
+        )
+        while chunk := os.read(source_fd, 1024 * 1024):
+            remaining = memoryview(chunk)
+            while remaining:
+                written = os.write(staging_fd, remaining)
+                if written <= 0:
+                    raise RuntimeError("Cargo askpass private copy stalled")
+                remaining = remaining[written:]
+        os.fchmod(staging_fd, 0o755)
+        os.fsync(staging_fd)
+
+        current_source = os.fstat(source_fd)
+        current_path = os.stat(
+            executable.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        current_size, current_digest = _sha256_fd(source_fd)
+        if (
+            (current_source.st_dev, current_source.st_ino, current_source.st_mtime_ns)
+            != (source.st_dev, source.st_ino, source.st_mtime_ns)
+            or (current_path.st_dev, current_path.st_ino) != (source.st_dev, source.st_ino)
+            or current_source.st_nlink < 1
+            or current_size != byte_size
+            or current_digest != digest
+        ):
+            raise RuntimeError("Cargo askpass output changed while copying")
+
+        staged = os.fstat(staging_fd)
+        staged_path = os.stat(staging_name, dir_fd=directory_fd, follow_symlinks=False)
+        staged_size, staged_digest = _sha256_fd(staging_fd)
+        if (
+            not stat.S_ISREG(staged.st_mode)
+            or staged.st_uid != os.geteuid()
+            or staged.st_nlink != 1
+            or stat.S_IMODE(staged.st_mode) != 0o755
+            or (staged_path.st_dev, staged_path.st_ino) != (staged.st_dev, staged.st_ino)
+            or staged_size != byte_size
+            or staged_digest != digest
+        ):
+            raise RuntimeError("Cargo askpass private copy failed verification")
+
+        os.replace(
+            staging_name,
+            executable.name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+        published = os.stat(
+            executable.name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+        final_size, final_digest = _sha256_fd(staging_fd)
+        if (
+            (published.st_dev, published.st_ino) != (staged.st_dev, staged.st_ino)
+            or published.st_nlink != 1
+            or stat.S_IMODE(published.st_mode) != 0o755
+            or final_size != byte_size
+            or final_digest != digest
+        ):
+            raise RuntimeError("Published Cargo askpass helper failed verification")
+    finally:
+        if staging_fd >= 0:
+            os.close(staging_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
 def _build_native_askpass_helper(
     tauri_root: Path,
     *,
@@ -900,7 +1018,7 @@ def _build_native_askpass_helper(
     built = cargo_target / target_triple / "release" / f"{ASKPASS_NAME}{_platform_extension()}"
     if not built.is_file() or built.is_symlink():
         raise RuntimeError("Cargo did not produce the native askpass helper")
-    built.chmod(0o755)
+    _materialize_private_askpass_helper(built)
     return built
 
 

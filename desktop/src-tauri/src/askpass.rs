@@ -162,9 +162,18 @@ fn system_executable_identity(
     )
 }
 
+#[cfg(target_os = "linux")]
+const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT;
+#[cfg(target_os = "macos")]
+const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;
+#[cfg(target_os = "linux")]
+const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG;
+#[cfg(target_os = "macos")]
+const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;
+
 fn require_trusted_system_executable(metadata: &Metadata) -> Result<(), SystemSshOwnerError> {
     let mode = metadata.mode();
-    if mode & libc::S_IFMT as u32 != libc::S_IFREG as u32
+    if mode & SYSTEM_FILE_TYPE_MASK != SYSTEM_REGULAR_FILE_TYPE
         || metadata.uid() != 0
         || metadata.nlink() != 1
         || mode & 0o022 != 0
@@ -266,6 +275,7 @@ pub enum AskpassError {
 pub struct SecretResponse(Vec<u8>);
 
 impl SecretResponse {
+    #[cfg(any(test, target_os = "macos"))]
     pub fn new(value: Vec<u8>) -> Self {
         Self(value)
     }
@@ -284,6 +294,7 @@ impl Drop for SecretResponse {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]
 pub enum DialogOutcome {
     Secret(SecretResponse),
     Confirm(bool),
@@ -1175,6 +1186,20 @@ mod tests {
         FakeInspector {
             parents: HashMap::from([(300, 200), (200, 1)]),
             paths: HashMap::from([(200, PathBuf::from(SYSTEM_SSH_PATH))]),
+        }
+    }
+
+    #[test]
+    fn portable_system_executable_mode_constants_match_host_libc() {
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT);
+            assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(SYSTEM_FILE_TYPE_MASK, u32::from(libc::S_IFMT));
+            assert_eq!(SYSTEM_REGULAR_FILE_TYPE, u32::from(libc::S_IFREG));
         }
     }
 

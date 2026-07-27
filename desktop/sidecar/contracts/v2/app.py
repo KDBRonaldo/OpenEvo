@@ -80,6 +80,7 @@ IfMatch = Annotated[
 ]
 Limit = Annotated[int, Query(ge=1, le=100)]
 Cursor = Annotated[str | None, Query(min_length=1, max_length=512)]
+ActionId = Annotated[str, Query(min_length=16, max_length=256)]
 LastEventId = Annotated[
     str | None,
     Header(alias="Last-Event-ID", min_length=1, max_length=128),
@@ -324,7 +325,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/profiles/{profile_id}/connect",
         operation_id="connectRemoteWorkspaceProfileV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.LifecycleOperationV2,
         status_code=202,
     )
     async def connect_profile(
@@ -339,7 +340,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/profiles/{profile_id}/disconnect",
         operation_id="disconnectRemoteWorkspaceProfileV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.LifecycleOperationV2,
         status_code=202,
     )
     async def disconnect_profile(
@@ -354,12 +355,99 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/profiles/{profile_id}/host-key/review",
         operation_id="reviewRemoteWorkspaceHostKeyV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.LifecycleOperationV2,
         status_code=202,
     )
     async def review_host_key(
         profile_id: ResourceId,
         request: m.HostKeyReviewRequestV2,
+        resource_generation: ResourceGeneration,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _contract_only()
+
+    @router.get(
+        "/operations/by-action",
+        operation_id="getDesktopLifecycleOperationByActionV2",
+        response_model=m.LifecycleOperationV2,
+    )
+    async def lifecycle_operation_by_action(
+        action_id: ActionId,
+        kind: m.LifecycleOperationKindV2,
+    ) -> Response:
+        return _contract_only()
+
+    @router.get(
+        "/operations/{operation_id}",
+        operation_id="getDesktopLifecycleOperationV2",
+        response_model=m.LifecycleOperationV2,
+    )
+    async def lifecycle_operation(operation_id: ResourceId) -> Response:
+        return _contract_only()
+
+    @router.get(
+        "/operations/{operation_id}/logs",
+        operation_id="getDesktopLifecycleOperationLogsV2",
+        response_model=m.LifecycleLogPageV2,
+    )
+    async def lifecycle_operation_logs(
+        operation_id: ResourceId,
+        limit: Limit = 100,
+        after: Cursor = None,
+        after_sequence: Annotated[
+            int | None,
+            Query(ge=0, le=m.MAX_JAVASCRIPT_SAFE_INTEGER),
+        ] = None,
+    ) -> Response:
+        return _contract_only()
+
+    @router.post(
+        "/operations/{operation_id}/cancel",
+        operation_id="cancelDesktopLifecycleOperationV2",
+        response_model=m.LifecycleOperationV2,
+        status_code=202,
+    )
+    async def cancel_lifecycle_operation(
+        operation_id: ResourceId,
+        request: m.LifecycleCancelV2,
+        resource_generation: ResourceGeneration,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _contract_only()
+
+    @router.post(
+        "/operations/{operation_id}/acknowledge",
+        operation_id="acknowledgeDesktopLifecycleOperationV2",
+        response_model=None,
+        status_code=204,
+    )
+    async def acknowledge_lifecycle_operation(
+        operation_id: ResourceId,
+        request: m.LifecycleAcknowledgeV2,
+        resource_generation: ResourceGeneration,
+        if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _contract_only()
+
+    @router.get(
+        "/core-operations/{operation_id}",
+        operation_id="getDesktopCoreOperationV2",
+        response_model=m.DesktopCoreOperationV2,
+    )
+    async def core_operation(operation_id: ResourceId) -> Response:
+        return _contract_only()
+
+    @router.post(
+        "/core-operations/{operation_id}/cancel",
+        operation_id="cancelDesktopCoreOperationV2",
+        response_model=m.DesktopCoreOperationV2,
+        status_code=202,
+    )
+    async def cancel_core_operation(
+        operation_id: ResourceId,
         resource_generation: ResourceGeneration,
         if_match: IfMatch,
         idempotency_key: IdempotencyKey,
@@ -380,8 +468,8 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/projects",
         operation_id="createDesktopProjectV2",
-        response_model=m.DesktopProjectV2,
-        status_code=201,
+        response_model=m.LifecycleOperationV2,
+        status_code=202,
     )
     async def create_project(
         request: m.ProjectCreateV2,
@@ -415,7 +503,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/projects/{project_id}/activate",
         operation_id="activateDesktopProjectV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.LifecycleOperationV2,
         status_code=202,
     )
     async def activate_project(
@@ -485,7 +573,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/tasks/{task_id}/cancel",
         operation_id="cancelDesktopTaskV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.DesktopCoreOperationV2,
         status_code=202,
     )
     async def cancel_task(
@@ -591,7 +679,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/transitions/{transition_id}/retry",
         operation_id="retryDesktopTransitionV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.DesktopCoreOperationV2,
         status_code=202,
     )
     async def retry_transition(
@@ -621,7 +709,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/transitions/{transition_id}/abandon",
         operation_id="abandonDesktopTransitionV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.DesktopCoreOperationV2,
         status_code=202,
     )
     async def abandon_transition(
@@ -676,7 +764,7 @@ def create_desktop_local_v2_contract_app(
     @router.post(
         "/services/{service_id}/restart",
         operation_id="restartDesktopServiceV2",
-        response_model=m.LocalOperationV2,
+        response_model=m.DesktopCoreOperationV2,
         status_code=202,
     )
     async def restart_service(
@@ -684,6 +772,31 @@ def create_desktop_local_v2_contract_app(
         request: m.ServiceRestartV2,
         resource_generation: ResourceGeneration,
         if_match: IfMatch,
+        idempotency_key: IdempotencyKey,
+    ) -> Response:
+        return _contract_only()
+
+    @router.get(
+        "/services/{service_id}/logs",
+        operation_id="getDesktopServiceLogsV2",
+        response_model=m.DesktopServiceLogPageV2,
+    )
+    async def service_logs(
+        service_id: ResourceId,
+        limit: Limit = 100,
+        after: Cursor = None,
+    ) -> Response:
+        return _contract_only()
+
+    @router.post(
+        "/maintenance/cache-cleanup",
+        operation_id="cleanupDesktopCachesV2",
+        response_model=m.DesktopCoreOperationV2,
+        status_code=202,
+    )
+    async def cache_cleanup(
+        request: m.DesktopCacheCleanupRequestV2,
+        resource_generation: ResourceGeneration,
         idempotency_key: IdempotencyKey,
     ) -> Response:
         return _contract_only()

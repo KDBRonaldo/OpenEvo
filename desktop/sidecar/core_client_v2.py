@@ -30,7 +30,7 @@ from pydantic import BaseModel, ConfigDict, TypeAdapter, ValidationError
 
 from desktop.sidecar.release_capabilities import (
     ReleaseAuthorityNegotiationError,
-    V019_RELEASE_AUTHORITY_POLICY,
+    V0110_RELEASE_AUTHORITY_POLICY,
     negotiate_core_v2_mutation,
 )
 from openevo.backend.contracts.v2 import models as v2
@@ -864,8 +864,8 @@ class CoreControlClientV2:
             _raise_local(CoreClientLocalErrorCodeV2.INVALID_RESPONSE, 502)
         if (
             negotiated != result
-            or CORE_OPENAPI_SHA256 != V019_RELEASE_AUTHORITY_POLICY.core_openapi_sha256
-            or CORE_EVENTS_SCHEMA_SHA256 != V019_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
+            or CORE_OPENAPI_SHA256 != V0110_RELEASE_AUTHORITY_POLICY.core_openapi_sha256
+            or CORE_EVENTS_SCHEMA_SHA256 != V0110_RELEASE_AUTHORITY_POLICY.core_event_schema_sha256
         ):
             _raise_local(CoreClientLocalErrorCodeV2.INVALID_RESPONSE, 502)
         if self._cache.version is not None and self._cache.version != result:

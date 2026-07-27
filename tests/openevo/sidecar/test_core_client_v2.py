@@ -67,7 +67,7 @@ def _version(**updates: object) -> dict[str, object]:
                 "mutation_compatible": True,
             }
         ],
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "build_id": "b" * 64,
         "source_commit": "c" * 40,
         "build_channel": "release",
@@ -206,7 +206,7 @@ def test_version_is_frozen_and_authentication_stays_on_v2_fixed_origin() -> None
             json={
                 "schema_version": "2",
                 "status": "ready",
-                "release_version": "0.1.9",
+                "release_version": "0.1.10",
                 "source_commit": "c" * 40,
                 "registry_sha256": "a" * 64,
                 "checked_at": "2026-07-23T06:00:00Z",
@@ -214,7 +214,7 @@ def test_version_is_frozen_and_authentication_stays_on_v2_fixed_origin() -> None
         )
 
     with _client(handler) as client:
-        assert client.version().release_version == "0.1.9"
+        assert client.version().release_version == "0.1.10"
         assert client.system_status().status == "ready"
     assert "authorization" not in requests[0].headers
     assert requests[1].headers["authorization"] == f"Bearer {_TOKEN}"
@@ -434,7 +434,7 @@ def test_bootstrap_freezes_request_and_binds_core_created_project() -> None:
 def test_capabilities_accept_json_arrays_but_reject_scalar_coercion() -> None:
     payload = {
         "schema_version": "1",
-        "core_version": "0.1.9",
+        "core_version": "0.1.10",
         "registry_digest": "a" * 64,
         "evaluated_profile": {
             "execution_mode": "subscription",

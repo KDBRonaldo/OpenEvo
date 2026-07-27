@@ -58,8 +58,6 @@ def _write_repo_skeleton(repo: Path) -> None:
                     "scaffold",
                     "dry-run",
                     "dry_run",
-                    "stdout",
-                    "stderr",
                     "host path",
                     "host_path",
                     "host-path",
@@ -703,8 +701,6 @@ def test_product_web_build_requires_exact_audited_dist_and_packaged_assets(
         "scaffold",
         "dry-run",
         "dry_run",
-        "stdout",
-        "stderr",
         "host path",
         "host_path",
         "host-path",
@@ -733,6 +729,25 @@ def test_product_web_policy_rejects_every_non_release_provider_kind() -> None:
     assert {"contract_simulator", "scaffold", "dry_run"}.issubset(policy["forbidden_text"])
     schemas = Path("desktop/src/api/v1/schemas.ts").read_text(encoding="utf-8")
     assert '["dry", "run"].join("_")' not in schemas
+
+
+def test_product_web_policy_allows_sanitized_lifecycle_process_log_sources(
+    tmp_path: Path,
+) -> None:
+    builder = _load_builder()
+    repo = tmp_path / "repo"
+    _write_repo_skeleton(repo)
+    lifecycle_sources = "ssh_stdout ssh_stderr daemon_stdout daemon_stderr"
+    _write_product_web(repo / "desktop/dist", javascript=lifecycle_sources)
+    _write_product_web(repo / "desktop/packaging/web", javascript=lifecycle_sources)
+
+    assert len(builder._validate_product_web_build(repo / "desktop")) == 64
+    policy = json.loads(
+        Path("desktop/packaging/product-web-policy.json").read_text(encoding="utf-8")
+    )
+    assert "stdout" not in policy["forbidden_text"]
+    assert "stderr" not in policy["forbidden_text"]
+    assert {"command", "host_path", "host-path"}.issubset(policy["forbidden_text"])
 
 
 def test_packaged_product_graph_excludes_non_release_provider_code() -> None:
@@ -1215,6 +1230,42 @@ def test_native_askpass_helper_build_uses_locked_targeted_cargo(
     assert json.loads(observed[0][2]["TAURI_CONFIG"]) == {"bundle": {"externalBin": []}}
 
 
+def test_native_askpass_helper_build_detaches_cargo_hardlink(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = _load_builder()
+    tauri_root = tmp_path / "desktop/src-tauri"
+    tauri_root.mkdir(parents=True)
+    cargo_target = tmp_path / "cargo-target"
+    cargo_alias: Path | None = None
+
+    def fake_run(command, *, check, cwd, env):
+        nonlocal cargo_alias
+        assert check is True
+        release = cargo_target / "aarch64-apple-darwin/release"
+        cargo_alias = release / "deps/openevo_ssh_askpass"
+        _write_thin_mach_o(cargo_alias)
+        built = release / builder.ASKPASS_NAME
+        os.link(cargo_alias, built)
+        assert built.stat().st_nlink == 2
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+
+    built = builder._build_native_askpass_helper(
+        tauri_root,
+        cargo_target=cargo_target,
+        target_triple="aarch64-apple-darwin",
+    )
+
+    assert cargo_alias is not None
+    assert built.read_bytes() == cargo_alias.read_bytes()
+    assert built.stat().st_nlink == 1
+    assert cargo_alias.stat().st_nlink == 1
+    assert stat.S_IMODE(built.stat().st_mode) == 0o755
+
+
 def test_sidecar_build_metadata_binds_exact_native_askpass_helper(tmp_path: Path) -> None:
     builder = _load_builder()
     path = tmp_path / "sidecar-build-metadata.json"
@@ -1257,6 +1308,41 @@ def test_tauri_bundles_exact_native_askpass_external_binary() -> None:
     assert "NSSecureTextField" in helper
     assert "osascript" not in helper
     assert 'Command::new("sh")' not in helper
+
+
+def test_native_askpass_source_keeps_linux_clippy_portable() -> None:
+    helper = Path("desktop/src-tauri/src/askpass.rs").read_text(encoding="utf-8")
+
+    assert (
+        '#[cfg(target_os = "linux")]\n'
+        "const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT;"
+    ) in helper
+    assert (
+        '#[cfg(target_os = "linux")]\n'
+        "const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG;"
+    ) in helper
+    assert (
+        '#[cfg(target_os = "macos")]\n'
+        "const SYSTEM_FILE_TYPE_MASK: u32 = libc::S_IFMT as u32;"
+    ) in helper
+    assert (
+        '#[cfg(target_os = "macos")]\n'
+        "const SYSTEM_REGULAR_FILE_TYPE: u32 = libc::S_IFREG as u32;"
+    ) in helper
+    assert "assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT as u32);" not in helper
+    assert "assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG as u32);" not in helper
+    assert "assert_eq!(SYSTEM_FILE_TYPE_MASK, libc::S_IFMT);" in helper
+    assert "assert_eq!(SYSTEM_REGULAR_FILE_TYPE, libc::S_IFREG);" in helper
+    assert "assert_eq!(SYSTEM_FILE_TYPE_MASK, u32::from(libc::S_IFMT));" in helper
+    assert "assert_eq!(SYSTEM_REGULAR_FILE_TYPE, u32::from(libc::S_IFREG));" in helper
+    assert (
+        '#[cfg(any(test, target_os = "macos"))]\n'
+        "    pub fn new(value: Vec<u8>) -> Self {"
+    ) in helper
+    assert (
+        '#[cfg_attr(not(any(test, target_os = "macos")), allow(dead_code))]\n'
+        "pub enum DialogOutcome {"
+    ) in helper
 
 
 def test_unsigned_macos_sidecar_rejects_hardened_runtime_after_resigning(

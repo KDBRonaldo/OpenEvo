@@ -11,6 +11,7 @@ import {
 
 const HANDOFF_ENV = "OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF";
 const HANDOFF_PATH = process.env[HANDOFF_ENV];
+const SECRET_CANARY_ENV = "OPENEVO_E2E_SECRET_CANARY";
 const STATIC_ORIGIN = "http://tauri.localhost";
 const MAX_HANDOFF_BYTES = 64 * 1024;
 const MAX_RESULT_BYTES = 64 * 1024;
@@ -82,6 +83,7 @@ const resultSchema = z.object({
   evolution_artifact_count: z.literal(3),
   system_openssh_workspace_verified: z.literal(true),
   remote_target_controls_verified: z.literal(true),
+  secret_canary_absent: z.literal(true),
   selected_methods: z.record(targetSchema, z.string().min(1).max(128).refine(safeText)),
   observed_route_kinds: z.tuple([z.literal("desktop_v2"), z.literal("packaged_web")]),
   screenshot_sha256: sha256Schema,
@@ -90,6 +92,14 @@ const resultSchema = z.object({
 test.skip(!HANDOFF_PATH, `requires ${HANDOFF_ENV}`);
 
 test("packaged renderer observes the live Desktop v2 authority", async ({ page }) => {
+  const secretCanary = process.env[SECRET_CANARY_ENV];
+  assertClosed(
+    typeof secretCanary === "string"
+      && Buffer.byteLength(secretCanary, "utf8") >= 16
+      && Buffer.byteLength(secretCanary, "utf8") <= 256
+      && !/[\u0000\r\n]/.test(secretCanary),
+    "release secret canary is unavailable",
+  );
   const handoff = await readPrivateHandoff(HANDOFF_PATH!);
   await assertOutputDoesNotExist(handoff.result_path);
   await assertOutputDoesNotExist(handoff.screenshot_path);
@@ -181,6 +191,13 @@ test("packaged renderer observes the live Desktop v2 authority", async ({ page }
 
   await page.getByRole("button", { name: "Research", exact: true }).click();
   await expect(taskCards).toHaveCount(2);
+  const renderedSurface = await page.locator("body").evaluate((body) => {
+    const controls = [...body.querySelectorAll("input, textarea, select")]
+      .map((control) => (control as HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement).value);
+    return [body.textContent ?? "", (body as HTMLElement).innerText, ...controls].join("\n");
+  });
+  assertClosed(!renderedSurface.includes(secretCanary), "secret canary reached rendered UI text");
+  assertClosed(!(await page.content()).includes(secretCanary), "secret canary reached serialized renderer DOM");
   const screenshot = await page.screenshot({
     animations: "disabled",
     caret: "hide",
@@ -194,6 +211,7 @@ test("packaged renderer observes the live Desktop v2 authority", async ({ page }
     ],
     maskColor: "#d7dce2",
   });
+  assertClosed(!screenshot.includes(Buffer.from(secretCanary, "utf8")), "secret canary reached screenshot bytes");
 
   const native = await readNativeObservation(page);
   assertClosed(native.rendererReady, "renderer readiness was not acknowledged");
@@ -228,6 +246,7 @@ test("packaged renderer observes the live Desktop v2 authority", async ({ page }
     evolution_artifact_count: 3,
     system_openssh_workspace_verified: true,
     remote_target_controls_verified: true,
+    secret_canary_absent: true,
     selected_methods: selectedMethods,
     observed_route_kinds: [...network.routeKinds].sort(),
     screenshot_sha256: sha256(screenshot),

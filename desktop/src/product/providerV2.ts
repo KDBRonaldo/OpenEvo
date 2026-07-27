@@ -9,7 +9,9 @@ import type {
   DiagnosticV2,
   EvolutionRevisionRefV2,
   HostKeyReviewRequestV2,
+  LifecycleOperationV2,
   LocalOperationV2,
+  OperationV2,
   ProfileDisplayNamePatchV2,
   ProjectCapabilityProjectionV2,
   ProjectCreateV2,
@@ -26,6 +28,11 @@ import type {
   SuccessorTransitionV2,
   TaskV2,
 } from "../api/v2/schemas";
+import type { LogPageV2 } from "../api/v2/logs";
+import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
+import type { PendingMutationIntentV2 } from "./mutationIntentJournalV2";
+
+export type ProductOperationV2 = LocalOperationV2 | LifecycleOperationV2 | OperationV2;
 
 export type ProductStreamStateV2 =
   | { readonly status: "fresh"; readonly epoch: number; readonly lastEventId: string | null }
@@ -45,7 +52,7 @@ export interface DesktopProductSnapshotV2 {
   readonly services: readonly ServiceV2[];
   readonly capability: ProjectCapabilityProjectionV2 | null;
   readonly validation: ProjectValidationV2 | null;
-  readonly activeOperation: LocalOperationV2 | null;
+  readonly activeOperation: ProductOperationV2 | null;
   readonly stream: ProductStreamStateV2;
 }
 
@@ -73,7 +80,12 @@ export interface NativeWorkspaceSourceV2 {
 
 export interface NativeWorkspaceSelectionIntentV2 extends ProductMutationIntentV2 {
   readonly kind: "native_folder_snapshot";
-  readonly projectId?: string;
+  readonly draft: ProjectDraftV2;
+  readonly profileAuthority: {
+    readonly profileId: string;
+    readonly connectionGeneration: number;
+    readonly etag: string;
+  };
 }
 
 export interface ProjectDraftV2 {
@@ -93,30 +105,44 @@ export interface DesktopProductProviderV2 {
   renameProfile(profileId: string, input: ProfileDisplayNamePatchV2, intent: ProductMutationIntentV2): Promise<RemoteProfileV2>;
   deleteProfile(profileId: string, intent: ProductMutationIntentV2): Promise<void>;
   rebindProfile(profileId: string, sshHostAlias: string, intent: ProductMutationIntentV2): Promise<RemoteWorkspaceProfileV2>;
-  connectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
-  disconnectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
-  reviewHostKey(profileId: string, action: HostKeyReviewRequestV2["action"], intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  connectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
+  disconnectProfile(profileId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
+  reviewHostKey(profileId: string, action: HostKeyReviewRequestV2["action"], intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
+  listLifecycleOperations(): readonly LifecycleOperationStateV2[];
+  getLifecycleOperation(operationId: string): Promise<LifecycleOperationV2>;
+  loadLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2>;
+  loadOlderLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2>;
+  loadLatestLifecycleLogs(operationId: string): Promise<LifecycleOperationStateV2>;
+  cancelLifecycleOperation(operationId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
+  listMutationIntents(): readonly PendingMutationIntentV2[];
+  resumeMutationIntent(actionId: string): Promise<void>;
   selectNativeWorkspace(intent: NativeWorkspaceSelectionIntentV2): Promise<NativeWorkspaceSourceV2>;
   cancelNativeWorkspace(actionId: string): Promise<void>;
   settleNativeWorkspace(actionId: string, outcome: "adopt" | "discard"): Promise<void>;
-  createProject(draft: ProjectDraftV2, intent: ProductMutationIntentV2): Promise<ProjectV2>;
+  createProject(draft: ProjectDraftV2, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   updateProject(projectId: string, displayName: string, config: ScienceProjectConfigV2, intent: ProductMutationIntentV2): Promise<ProjectV2>;
-  activateProject(projectId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  activateProject(projectId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2>;
   loadProjectCapabilities(projectId: string): Promise<ProjectCapabilityProjectionV2>;
   validateProject(projectId: string, intent: ProductMutationIntentV2): Promise<ProjectValidationV2>;
   submitTask(projectId: string, intent: ProductMutationIntentV2): Promise<TaskV2>;
-  cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;
   getRuntimeContext(runtimeContextSnapshotId: string): Promise<RuntimeContextSnapshotRefV2>;
-  retryTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  retryTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   replaceTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
-  abandonTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  abandonTransition(transitionId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   getArtifactContent(artifactId: string): Promise<ArtifactContentV2>;
   getArtifactDiff(artifactId: string, previousArtifactId?: string): Promise<ArtifactDiffV2>;
-  restartService(serviceId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  restartService(serviceId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
+  listCoreOperations(): readonly OperationV2[];
+  getCoreOperation(operationId: string): Promise<OperationV2>;
+  cancelCoreOperation(operationId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
+  loadServiceLogs(serviceId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
+  cleanupCaches(intent: ProductMutationIntentV2): Promise<OperationV2>;
   createDiagnostic(input: Omit<DiagnosticRequestV2, "schema_version" | "profile_id" | "profile_connection_generation">, intent: ProductMutationIntentV2): Promise<DiagnosticV2>;
+  listDiagnostics(): readonly DiagnosticV2[];
   getDiagnostic(diagnosticId: string): Promise<DiagnosticV2>;
 }
 
@@ -149,6 +175,14 @@ export const unavailableDesktopProductProviderV2: DesktopProductProviderV2 = {
   connectProfile: unavailable,
   disconnectProfile: unavailable,
   reviewHostKey: unavailable,
+  listLifecycleOperations: () => [],
+  getLifecycleOperation: unavailable,
+  loadLifecycleLogs: unavailable,
+  loadOlderLifecycleLogs: unavailable,
+  loadLatestLifecycleLogs: unavailable,
+  cancelLifecycleOperation: unavailable,
+  listMutationIntents: () => [],
+  resumeMutationIntent: unavailable,
   selectNativeWorkspace: unavailable,
   cancelNativeWorkspace: unavailable,
   settleNativeWorkspace: unavailable,
@@ -169,7 +203,13 @@ export const unavailableDesktopProductProviderV2: DesktopProductProviderV2 = {
   getArtifactContent: unavailable,
   getArtifactDiff: unavailable,
   restartService: unavailable,
+  listCoreOperations: () => [],
+  getCoreOperation: unavailable,
+  cancelCoreOperation: unavailable,
+  loadServiceLogs: unavailable,
+  cleanupCaches: unavailable,
   createDiagnostic: unavailable,
+  listDiagnostics: () => [],
   getDiagnostic: unavailable,
 };
 

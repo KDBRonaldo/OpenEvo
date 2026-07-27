@@ -3022,6 +3022,30 @@ class WorkspaceImportStore:
             )
             os.fsync(root_descriptor)
 
+    def discard_pending_authority(
+        self,
+        import_id: str,
+        *,
+        ownership: WorkspaceImportOwnership,
+    ) -> None:
+        """Discard a pending import using store-derived lease authority."""
+
+        self._require_store_import_id(import_id)
+        self._require_ownership(ownership, operation="discard")
+        try:
+            authority = self.inspect(import_id)
+        except WorkspaceImportNotFoundError:
+            return
+        if authority.ownership != ownership:
+            raise WorkspaceImportIntegrityError("workspace import discard ownership changed")
+        if not authority.pending:
+            return
+        self.discard_pending(
+            authority.import_ref,
+            ownership=ownership,
+            lease_token=self._pending_lease_token(authority.import_ref, ownership),
+        )
+
     @contextmanager
     def resolve(
         self,

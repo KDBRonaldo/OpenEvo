@@ -1,6 +1,6 @@
 # OpenEvo Desktop And Core Contract v2
 
-Status: active implementation contract for the 0.1.9 authority cutover
+Status: active implementation contract for the 0.1.10 lifecycle-authority release
 
 Canonical product and release acceptance remain defined by
 `docs/maintainer/productization/spec.md`. This document fixes the implementation
@@ -8,7 +8,7 @@ boundary for Desktop Local API v2 and Core Control API v2. It does not make an
 unimplemented capability available and does not reduce a canonical gate.
 
 The frozen v1 contract in `desktop-core-contract-v1.md` describes the 0.1.8
-Preview. V1 is read-only migration input in 0.1.9. Release providers and the
+Preview. V1 is read-only migration input in 0.1.10. Release providers and the
 release renderer must not fall back to v1 mutations.
 
 ## Ownership
@@ -137,6 +137,14 @@ POST   /desktop/v2/profiles/{profile_id}/connect
 POST   /desktop/v2/profiles/{profile_id}/disconnect
 POST   /desktop/v2/profiles/{profile_id}/host-key/review
 
+GET    /desktop/v2/operations/by-action
+GET    /desktop/v2/operations/{operation_id}
+GET    /desktop/v2/operations/{operation_id}/logs
+POST   /desktop/v2/operations/{operation_id}/cancel
+POST   /desktop/v2/operations/{operation_id}/acknowledge
+GET    /desktop/v2/core-operations/{operation_id}
+POST   /desktop/v2/core-operations/{operation_id}/cancel
+
 GET    /desktop/v2/projects
 POST   /desktop/v2/projects
 GET    /desktop/v2/projects/{project_id}
@@ -168,6 +176,8 @@ GET    /desktop/v2/artifacts/{artifact_id}/content
 GET    /desktop/v2/artifacts/{artifact_id}/diff
 GET    /desktop/v2/services
 POST   /desktop/v2/services/{service_id}/restart
+GET    /desktop/v2/services/{service_id}/logs
+POST   /desktop/v2/maintenance/cache-cleanup
 POST   /desktop/v2/diagnostics
 GET    /desktop/v2/diagnostics/{diagnostic_id}
 GET    /desktop/v2/events
@@ -181,6 +191,24 @@ All mutations require Desktop session authentication, idempotency, resource
 generation, and `If-Match` where applicable. Lists/logs are bounded and
 cursor-based. SSE events are replayable and bind event ID to canonical payload
 digest.
+
+Profile connect/disconnect, host-key review, native workspace preparation,
+project create, and project activation return durable Desktop lifecycle
+operation authority with HTTP 202. Renderer mutation intent is persisted before
+send. If that response is lost, the renderer resolves the exact operation by
+the original action ID and expected operation kind before it permits any retry.
+Multi-step native project creation derives a distinct sidecar idempotency key
+for each step while retaining one renderer action identity.
+
+Lifecycle operations expose ordered phases, typed progress, a cancellable flag,
+recoverable SSE updates, acknowledgement, and bounded SSH/Daemon process logs.
+Normal refresh reads at most the current 200-entry tail using an observed log
+sequence watermark; older pagination is explicit user action. Logs may contain
+user-visible process output, but the sidecar removes credentials, Desktop/Core
+capabilities, loopback endpoints, and host paths before persistence or API
+projection. Cancellation is accepted only before a durable non-cancellable
+mutation barrier; after that barrier it returns a typed conflict instead of
+reporting an already-applied external mutation as cancelled.
 
 ## Core Control API v2 Identity Model
 

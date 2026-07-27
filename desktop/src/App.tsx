@@ -48,11 +48,17 @@ import {
 } from "./product/providerV2";
 import {
   createReleaseDesktopProductProvider,
+  getReleaseDesktopStartupStatus,
   reportReleaseDesktopBootstrapStage,
   reportReleaseDesktopReady,
   stopReleaseDesktopProductProvider,
   type ReleaseDesktopBootstrapStage,
+  type NativeStartupStatusV2,
 } from "./product/releaseProvider";
+import {
+  LifecycleOperationPanelV2,
+  type OperationPanelModelV2,
+} from "./product/LifecycleOperationPanelV2";
 import {
   exportDesktopDiagnostics,
   getDesktopLogTail,
@@ -400,6 +406,8 @@ function ReleaseStartupSample({
   retrying = false,
   failure = null,
   connectionRequested = false,
+  nativeStartupStatus = null,
+  onCancelStartup,
 }: {
   onRetry: () => void;
   onAddRemoteWorkspace: () => void;
@@ -407,6 +415,8 @@ function ReleaseStartupSample({
   retrying?: boolean;
   failure?: ReleaseDesktopStartupFailure | null;
   connectionRequested?: boolean;
+  nativeStartupStatus?: NativeStartupStatusV2 | null;
+  onCancelStartup?: () => void;
 }) {
   const [workspace, setWorkspace] = useState<ReadonlySampleWorkspace>("research");
   const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
@@ -548,6 +558,12 @@ function ReleaseStartupSample({
             )}
           </div>
           <StartupDiagnostics startupPending={startupPending} />
+          {startupPending && nativeStartupStatus !== null ? (
+            <LifecycleOperationPanelV2
+              model={nativeStartupPanelModelV2(nativeStartupStatus)}
+              onCancel={nativeStartupStatus.cancellable ? onCancelStartup : undefined}
+            />
+          ) : null}
           <div className="initial-sync-sample">
             <SampleScientificProjectView
               workspace={workspace}
@@ -561,16 +577,63 @@ function ReleaseStartupSample({
   );
 }
 
+function nativeStartupPanelModelV2(status: NativeStartupStatusV2): OperationPanelModelV2 {
+  const now = Date.now();
+  const startedAt = new Date(Math.max(0, now - status.elapsed_milliseconds)).toISOString();
+  const phaseLabels: Record<NativeStartupStatusV2["phase"], string> = {
+    validating_bundle: "Verifying the packaged local service",
+    spawning_sidecar: "Starting the local service process",
+    handing_off_descriptors: "Handing off private native descriptors",
+    waiting_for_local_api: "Waiting for the Desktop Local API",
+    negotiating_contract: "Negotiating the exact Desktop contract",
+    ready: "Local service ready",
+  };
+  const panelStatus: OperationPanelModelV2["status"] = status.status === "idle"
+    ? "queued"
+    : status.status === "running"
+      ? "running"
+      : status.status === "succeeded"
+        ? "succeeded"
+        : status.status;
+  return {
+    operationId: `native-startup-${status.startup_epoch}`,
+    title: "Start OpenEvo Desktop local service",
+    status: panelStatus,
+    phaseLabel: phaseLabels[status.phase],
+    checkpointCompleted: Math.min(status.phase_index + 1, status.phase_total),
+    checkpointTotal: status.phase_total,
+    progress: status.status === "running" ? { kind: "indeterminate" } : null,
+    createdAt: startedAt,
+    startedAt: status.status === "idle" ? null : startedAt,
+    finishedAt: ["succeeded", "failed", "cancelled"].includes(status.status)
+      ? new Date(now).toISOString()
+      : null,
+    cancellable: status.cancellable,
+    failure: status.failure === null ? null : {
+      summary: status.failure.message,
+      retryable: true,
+    },
+    logs: [],
+    droppedBeforeSequence: 0,
+    hasOlderLogs: false,
+    hasNewerLogs: false,
+    unresolvedMutation: false,
+    emptyLogMessage: "Native startup output remains available through Diagnostics.",
+  };
+}
+
 export function ReleaseDesktopProductShell({
   createProvider = createReleaseDesktopProductProvider,
   stopProvider = stopReleaseDesktopProductProvider,
   reportStage = reportReleaseDesktopBootstrapStage,
   reportReady = reportReleaseDesktopReady,
+  getStartupStatus = getReleaseDesktopStartupStatus,
 }: {
   createProvider?: () => Promise<DesktopProductProviderAny>;
   stopProvider?: () => Promise<void>;
   reportStage?: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void;
   reportReady?: () => Promise<void>;
+  getStartupStatus?: () => Promise<NativeStartupStatusV2>;
 }) {
   const generation = useRef(0);
   const readinessGeneration = useRef<number | null>(null);
@@ -578,6 +641,7 @@ export function ReleaseDesktopProductShell({
   const startupInFlight = useRef(false);
   const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading", retrying: false });
   const [connectionRequested, setConnectionRequested] = useState(false);
+  const [nativeStartupStatus, setNativeStartupStatus] = useState<NativeStartupStatusV2 | null>(null);
 
   const reportStageBestEffort = useCallback((stage: ReleaseDesktopBootstrapStage): void => {
     try {
@@ -605,6 +669,7 @@ export function ReleaseDesktopProductShell({
     startupInFlight.current = true;
     const requestGeneration = generation.current + 1;
     generation.current = requestGeneration;
+    setNativeStartupStatus(null);
     setStartup({ status: "loading", retrying });
     void enqueueLifecycle(async () => {
       try {
@@ -718,6 +783,29 @@ export function ReleaseDesktopProductShell({
     };
   }, [cancelLifecycle, start]);
 
+  useEffect(() => {
+    if (startup.status !== "loading") return;
+    let disposed = false;
+    let timeout: ReturnType<typeof globalThis.setTimeout> | null = null;
+    const poll = async (): Promise<void> => {
+      try {
+        const status = await getStartupStatus();
+        if (disposed) return;
+        setNativeStartupStatus(status);
+        if (["failed", "cancelled"].includes(status.status)) return;
+      } catch {
+        // Bootstrap remains authoritative; progress projection is best-effort
+        // until the native command is available for this startup epoch.
+      }
+      if (!disposed) timeout = globalThis.setTimeout(() => void poll(), 250);
+    };
+    void poll();
+    return () => {
+      disposed = true;
+      if (timeout !== null) globalThis.clearTimeout(timeout);
+    };
+  }, [getStartupStatus, startup.status]);
+
   if (startup.status === "committing") {
     return (
       <OpenEvoDesktopOnlyShell
@@ -758,6 +846,8 @@ export function ReleaseDesktopProductShell({
       startupPending
       retrying={startup.retrying}
       connectionRequested={connectionRequested}
+      nativeStartupStatus={nativeStartupStatus}
+      onCancelStartup={cancelLifecycle}
     />
   );
 }

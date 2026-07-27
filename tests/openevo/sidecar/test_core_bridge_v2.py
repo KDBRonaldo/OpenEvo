@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 import threading
 
 import httpx
@@ -32,7 +33,7 @@ from tests.openevo.sidecar.test_core_client_v2 import (
 def _capabilities() -> dict[str, object]:
     return {
         "schema_version": "1",
-        "core_version": "0.1.9",
+        "core_version": "0.1.10",
         "registry_digest": "a" * 64,
         "evaluated_profile": {
             "execution_mode": "subscription",
@@ -49,7 +50,7 @@ def _status() -> dict[str, object]:
     return {
         "schema_version": "2",
         "status": "ready",
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "source_commit": "c" * 40,
         "registry_sha256": "a" * 64,
         "checked_at": "2026-07-23T06:00:00Z",
@@ -220,6 +221,30 @@ def _store(tmp_path: Path) -> DesktopCoreBridgeStoreV2:
     return DesktopCoreBridgeStoreV2(root)
 
 
+def _rewrite_single_mapping_release(database: Path, release_version: str) -> None:
+    with sqlite3.connect(database) as connection:
+        for table in ("mappings", "mapping_history"):
+            rows = connection.execute(
+                f"SELECT rowid, document_json FROM {table}"
+            ).fetchall()
+            assert len(rows) == 1
+            rowid, encoded = rows[0]
+            document = json.loads(bytes(encoded))
+            document["daemon_release_version"] = release_version
+            document["core_version"]["release_version"] = release_version
+            canonical = json.dumps(
+                document,
+                ensure_ascii=True,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            connection.execute(
+                f"UPDATE {table} SET document_sha256 = ?, document_json = ? WHERE rowid = ?",
+                (hashlib.sha256(canonical).hexdigest(), canonical, rowid),
+            )
+
+
 def _base_handler(
     requests: list[httpx.Request],
     *,
@@ -282,6 +307,49 @@ def test_activation_bootstraps_only_through_private_project_tunnel_and_persists_
     assert len(tunnels.closed) == 1
 
 
+def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+    observed: list[tuple[str, object, bool]] = []
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(_base_handler(requests)),
+            progress_observer=lambda phase, progress, cancellable: observed.append(
+                (phase, progress, cancellable)
+            ),
+        )
+
+        bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-progress-0001",
+        )
+
+        phases = [phase for phase, _progress, _cancellable in observed]
+        assert phases == [
+            "opening_project_tunnel",
+            "negotiating_core",
+            "creating_remote_project",
+            "verifying_project",
+            "activating",
+        "activating",
+        ]
+        assert [local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases] == sorted(
+            local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases
+        )
+        assert [cancellable for _phase, _progress, cancellable in observed] == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+        ]
+        bridge.close()
+
+
 def test_activation_accepts_exact_initial_native_workspace_authority(
     tmp_path: Path,
 ) -> None:
@@ -293,9 +361,7 @@ def test_activation_accepts_exact_initial_native_workspace_authority(
             host_service=_HostService(),
             tunnel_factory=tunnels,
             persistence=store,
-            transport_factory=lambda: httpx.MockTransport(
-                _base_handler(requests, project=remote)
-            ),
+            transport_factory=lambda: httpx.MockTransport(_base_handler(requests, project=remote)),
         )
 
         activation = bridge.activate_project(
@@ -367,8 +433,7 @@ def test_active_project_list_does_not_enumerate_other_core_projects(
             next_cursor=None,
         )
         assert not any(
-            request.method == "GET" and request.url.path == "/v2/projects"
-            for request in requests
+            request.method == "GET" and request.url.path == "/v2/projects" for request in requests
         )
         bridge.close()
 
@@ -414,6 +479,60 @@ def test_reconnect_reuses_exact_core_project_and_advances_only_connection_mappin
             == post_count
         )
         bridge.close()
+
+
+def test_reconnect_upgrades_v019_historical_mapping_before_current_mutation(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    store = _store(tmp_path)
+    database = store.database_path
+    bridge = DesktopCoreBridgeV2(
+        host_service=_HostService(),
+        tunnel_factory=_TunnelFactory(),
+        persistence=store,
+        transport_factory=lambda: httpx.MockTransport(_base_handler(requests)),
+    )
+    first = bridge.activate_project(
+        "desktop-project-1",
+        _create_request(),
+        idempotency_key="activate-project-0001",
+    )
+    bridge.deactivate_project("desktop-project-1", 3)
+    bridge.close()
+    store.close()
+    _rewrite_single_mapping_release(database, "0.1.9")
+    post_count = sum(
+        request.method == "POST" and request.url.path == "/v2/projects"
+        for request in requests
+    )
+
+    with DesktopCoreBridgeStoreV2(database.parent) as reopened:
+        current = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=reopened,
+            transport_factory=lambda: httpx.MockTransport(_base_handler(requests)),
+        )
+        activation = current.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-project-0002",
+        )
+        history = reopened.load_mapping_history("desktop-project-1")
+
+        assert first.mapping.mapping_generation == 1
+        assert activation.version.release_version == "0.1.10"
+        assert activation.mapping.mapping_generation == 2
+        assert [item.daemon_release_version for item in history] == ["0.1.9", "0.1.10"]
+        assert (
+            sum(
+                request.method == "POST" and request.url.path == "/v2/projects"
+                for request in requests
+            )
+            == post_count
+        )
+        current.close()
 
 
 def test_reconnect_persists_a_bounded_exact_multi_head_successor_proof(

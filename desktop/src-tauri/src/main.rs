@@ -25,11 +25,20 @@ use tauri_plugin_dialog::DialogExt;
 use tempfile::TempDir;
 
 mod desktop_log;
+mod mutation_intent_journal_v2;
+mod private_json_journal;
 
 use desktop_log::{
     DesktopDiagnosticLogV2, DesktopEnvironmentSummaryV2, DesktopLogLevel, DesktopLogSource,
     DesktopLogStore, DesktopLogTailV1, DesktopStartupResult, DesktopStartupStage,
 };
+use mutation_intent_journal_v2::{
+    validate_mutation_intent_journal_transition, validate_mutation_intent_journal_value,
+    MUTATION_INTENT_JOURNAL_MAX_BYTES,
+};
+#[cfg(test)]
+use private_json_journal::PrivateJsonJournalRoot;
+use private_json_journal::{PrivateJsonJournal, PrivateJsonJournalPolicy};
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 compile_error!("OpenEvo Desktop native sidecar FD execution supports only Linux and macOS");
@@ -41,12 +50,12 @@ const RELEASE_ASSETS_DIRECTORY: &str = "openevo-release-assets";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v2";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672";
+    "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760";
 const DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256: &str =
-    "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28";
-const DESKTOP_RELEASE_VERSION: &str = "0.1.9";
+    "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
+const DESKTOP_RELEASE_VERSION: &str = "0.1.10";
 const DESKTOP_FEATURE_SET_SHA256: &str =
-    "026eb1f1eecd219a6bf282f6e0063bf2e19d018619a934487eec3f151b66af9b";
+    "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 const RENDERER_READY_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_READY_V2";
 const RENDERER_STAGE_MARKER: &str = "OPENEVO_DESKTOP_RENDERER_STAGE_V2";
 const RENDERER_STAGE_VOCABULARY: [&str; 20] = [
@@ -146,6 +155,7 @@ const NATIVE_WORKSPACE_CANCEL_GRACE: Duration = Duration::from_secs(3);
 const NATIVE_WORKSPACE_IO_POLL: Duration = Duration::from_millis(50);
 const MAX_PENDING_WORKSPACE_IMPORTS: usize = 64;
 const MAX_CANCELLED_PICKER_ACTIONS: usize = 64;
+const MAX_JAVASCRIPT_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const RUN_RETRY_RECOVERY_MAX_BYTES: usize = 1024 * 1024;
 const RUN_RETRY_RECOVERY_DIRECTORY_NAME: &str = "native-state-v2";
 const RUN_RETRY_RECOVERY_FILE_NAME: &str = ".7f3d8b24c1a94762";
@@ -153,6 +163,9 @@ const RUN_RETRY_RECOVERY_TEMP_PREFIX: &str = ".7f3d8b24c1a94762.tmp.";
 const RUN_RETRY_RECOVERY_LOCK_FILE_NAME: &str = ".c41d73e981bf4a56";
 const RUN_RETRY_RECOVERY_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const MUTATION_INTENT_JOURNAL_FILE_NAME: &str = ".02b78cf9e16a4d13";
+const MUTATION_INTENT_JOURNAL_TEMP_PREFIX: &str = ".02b78cf9e16a4d13.tmp.";
+const MUTATION_INTENT_JOURNAL_LOCK_FILE_NAME: &str = ".9ce2b4f77d1848f1";
 const SIDECAR_TERM_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_KILL_TIMEOUT: Duration = Duration::from_secs(1);
 const SIDECAR_STOP_POLL_INTERVAL: Duration = Duration::from_millis(20);
@@ -1385,16 +1398,22 @@ enum FeatureFlagV2 {
     DaemonBundleV2,
     EventReplayV2,
     HostKeyReview,
+    LifecycleOperationsV2,
+    LifecycleProcessLogsV2,
+    MutationIdempotencyV2,
     NativeAskpass,
     SystemOpensshProfiles,
     TaskAdmissionV2,
 }
 
-const REQUIRED_DESKTOP_FEATURE_FLAGS: [FeatureFlagV2; 7] = [
+const REQUIRED_DESKTOP_FEATURE_FLAGS: [FeatureFlagV2; 10] = [
     FeatureFlagV2::CoreControlV2,
     FeatureFlagV2::DaemonBundleV2,
     FeatureFlagV2::EventReplayV2,
     FeatureFlagV2::HostKeyReview,
+    FeatureFlagV2::LifecycleOperationsV2,
+    FeatureFlagV2::LifecycleProcessLogsV2,
+    FeatureFlagV2::MutationIdempotencyV2,
     FeatureFlagV2::NativeAskpass,
     FeatureFlagV2::SystemOpensshProfiles,
     FeatureFlagV2::TaskAdmissionV2,
@@ -1469,47 +1488,81 @@ struct NativeWorkspaceSelection<'a> {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeWorkspaceImportRefV2 {
+struct NativeLifecycleResourceRefV2 {
+    resource_kind: String,
+    resource_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum NativeLifecycleProgressV2 {
+    Indeterminate,
+    Bytes { completed: u64, total: u64 },
+    Items { completed: u64, total: u64 },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NativeLifecycleResultV2 {
+    result_kind: String,
     import_id: String,
     content_sha256: String,
     byte_size: u64,
     entry_count: u64,
     extracted_byte_size: u64,
+    display_name: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeProjectSourceV2 {
-    kind: String,
-    display_name: String,
-    import_ref: NativeWorkspaceImportRefV2,
+struct NativeLifecycleFailureV2 {
+    schema_version: String,
+    code: String,
+    summary: String,
+    retryable: bool,
+    action: String,
+    affected_resource_id: Option<String>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-struct NativeWorkspaceImportResponseV2 {
+struct NativeLifecycleOperationV2 {
     schema_version: String,
-    source: NativeProjectSourceV2,
-    lease_token: String,
+    operation_id: String,
+    kind: String,
+    resource: NativeLifecycleResourceRefV2,
+    request_sha256: String,
+    status: String,
+    phase: String,
+    phase_index: u8,
+    phase_total: u8,
+    progress: Option<NativeLifecycleProgressV2>,
+    cancellable: bool,
+    result: Option<NativeLifecycleResultV2>,
+    failure: Option<NativeLifecycleFailureV2>,
+    log_sequence_high_watermark: u64,
+    created_at: String,
+    started_at: Option<String>,
+    updated_at: String,
+    finished_at: Option<String>,
+    etag: String,
 }
 
 #[derive(Serialize)]
 struct NativeWorkspaceDiscardRequestV2<'a> {
     schema_version: &'static str,
     action_id: &'a str,
-    import_ref: &'a NativeWorkspaceImportRefV2,
-    lease_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     project_id: Option<&'a str>,
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone)]
 struct PendingNativeWorkspaceImport {
     sidecar_instance: [u8; INSTANCE_ID_BYTES],
     action_id: String,
     project_id: Option<String>,
-    source: NativeProjectSourceV2,
-    lease_token: String,
+    lifecycle: NativeLifecycleOperationV2,
+    operation: Arc<NativePickerOperation>,
 }
 
 struct NativePickerOperation {
@@ -1558,6 +1611,80 @@ struct LifecycleStatus {
     port: Option<u16>,
     pid: Option<u32>,
     url: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeStartupPhaseV2 {
+    ValidatingBundle,
+    SpawningSidecar,
+    HandingOffDescriptors,
+    WaitingForLocalApi,
+    NegotiatingContract,
+    Ready,
+}
+
+impl NativeStartupPhaseV2 {
+    fn index(self) -> u8 {
+        match self {
+            Self::ValidatingBundle => 0,
+            Self::SpawningSidecar => 1,
+            Self::HandingOffDescriptors => 2,
+            Self::WaitingForLocalApi => 3,
+            Self::NegotiatingContract => 4,
+            Self::Ready => 5,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ValidatingBundle => "validating_bundle",
+            Self::SpawningSidecar => "spawning_sidecar",
+            Self::HandingOffDescriptors => "handing_off_descriptors",
+            Self::WaitingForLocalApi => "waiting_for_local_api",
+            Self::NegotiatingContract => "negotiating_contract",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NativeStartupProgressStatusV2 {
+    Idle,
+    Running,
+    Succeeded,
+}
+
+struct NativeStartupProgressV2 {
+    startup_epoch: u64,
+    status: NativeStartupProgressStatusV2,
+    phase: NativeStartupPhaseV2,
+    started_at: Option<Instant>,
+    finished_elapsed: Option<Duration>,
+}
+
+impl Default for NativeStartupProgressV2 {
+    fn default() -> Self {
+        Self {
+            startup_epoch: 0,
+            status: NativeStartupProgressStatusV2::Idle,
+            phase: NativeStartupPhaseV2::ValidatingBundle,
+            started_at: None,
+            finished_elapsed: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct NativeStartupStatusV2 {
+    schema_version: &'static str,
+    startup_epoch: u64,
+    status: &'static str,
+    phase: &'static str,
+    phase_index: u8,
+    phase_total: u8,
+    elapsed_milliseconds: u64,
+    cancellable: bool,
+    failure: Option<NativeHostError>,
 }
 
 struct SidecarBootstrapState {
@@ -1654,6 +1781,7 @@ struct DesktopHostStateInner {
     startup_diagnostics: Arc<StartupDiagnosticSink>,
     desktop_logs: Arc<DesktopLogStore>,
     run_retry_recovery: Mutex<()>,
+    mutation_intent_journal: Mutex<()>,
     spawn_handoff: Mutex<Option<Arc<SpawnHandoff>>>,
     parent_liveness: Mutex<Option<File>>,
     startup_in_progress: AtomicBool,
@@ -1661,6 +1789,7 @@ struct DesktopHostStateInner {
     start_task_error: Mutex<Option<NativeHostError>>,
     cancellation_epoch: AtomicU64,
     launch_state: AtomicU64,
+    startup_progress: Mutex<NativeStartupProgressV2>,
     shutdown_requested: AtomicBool,
     active_picker: Mutex<Option<Arc<NativePickerOperation>>>,
     cancelled_picker_actions: Mutex<VecDeque<String>>,
@@ -1686,6 +1815,7 @@ impl Default for DesktopHostState {
             startup_diagnostics: Arc::new(StartupDiagnosticSink::new(Arc::clone(&desktop_logs))),
             desktop_logs,
             run_retry_recovery: Mutex::new(()),
+            mutation_intent_journal: Mutex::new(()),
             spawn_handoff: Mutex::new(None),
             parent_liveness: Mutex::new(None),
             startup_in_progress: AtomicBool::new(false),
@@ -1693,6 +1823,7 @@ impl Default for DesktopHostState {
             start_task_error: Mutex::new(None),
             cancellation_epoch: AtomicU64::new(0),
             launch_state: AtomicU64::new(encode_launch_state(0, LaunchPhase::Idle)),
+            startup_progress: Mutex::new(NativeStartupProgressV2::default()),
             shutdown_requested: AtomicBool::new(false),
             active_picker: Mutex::new(None),
             cancelled_picker_actions: Mutex::new(VecDeque::new()),
@@ -1854,6 +1985,17 @@ fn cancel_active_picker(
             .expect("active picker disappeared while locked");
         operation.cancel();
         return Ok(Some(operation));
+    }
+    drop(active);
+    if let Some(pending) = state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?
+        .get(action_id)
+        .cloned()
+    {
+        pending.operation.cancel();
+        return Ok(Some(pending.operation));
     }
     let mut cancelled = state
         .cancelled_picker_actions
@@ -4097,7 +4239,7 @@ fn register_native_workspace_source(
     handoff_token: &str,
     selection: NativeWorkspaceSelection<'_>,
     operation: &NativePickerOperation,
-) -> HostResult<NativeWorkspaceImportResponseV2> {
+) -> HostResult<NativeLifecycleOperationV2> {
     if selection.kind != "native_folder_snapshot"
         || selection.action_id.len() < 16
         || selection.action_id.len() > 256
@@ -4147,23 +4289,17 @@ fn register_native_workspace_source(
             workspace_import_error()
         }
     })?;
-    if response.status != 201 {
+    if response.status != 202 {
         return Err(if operation.is_cancelled() {
             workspace_selection_cancelled_error()
         } else {
             workspace_import_error()
         });
     }
-    let pending: NativeWorkspaceImportResponseV2 =
+    let lifecycle: NativeLifecycleOperationV2 =
         serde_json::from_str(&response.body).map_err(|_| workspace_import_error())?;
-    if pending.schema_version != "2"
-        || pending.lease_token.len() != 64
-        || !pending.lease_token.bytes().all(is_lower_hex)
-    {
-        return Err(workspace_import_error());
-    }
-    validate_native_project_source(&pending.source)?;
-    Ok(pending)
+    validate_native_lifecycle_operation(&lifecycle, selection.action_id)?;
+    Ok(lifecycle)
 }
 
 fn cancel_native_workspace_operation(
@@ -4202,8 +4338,6 @@ fn discard_native_workspace_source(
     let body = serde_json::to_vec(&NativeWorkspaceDiscardRequestV2 {
         schema_version: "2",
         action_id: &pending.action_id,
-        import_ref: &pending.source.import_ref,
-        lease_token: &pending.lease_token,
         project_id: pending.project_id.as_deref(),
     })
     .map_err(|_| workspace_import_error())?;
@@ -4223,35 +4357,278 @@ fn discard_native_workspace_source(
     Ok(())
 }
 
-fn validate_native_project_source(source: &NativeProjectSourceV2) -> HostResult<()> {
-    let import = &source.import_ref;
-    let import_suffix = import
-        .import_id
-        .strip_prefix("workspace-import-")
-        .ok_or_else(workspace_import_error)?;
-    if source.kind != "native_folder_snapshot"
-        || source.display_name.is_empty()
-        || source.display_name.len() > 256
-        || source.display_name.trim() != source.display_name
-        || matches!(source.display_name.as_str(), "." | "..")
-        || source.display_name.contains(['/', '\\'])
-        || source
-            .display_name
-            .chars()
-            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
-        || import_suffix.len() != 48
-        || !import_suffix.bytes().all(is_lower_hex)
-        || import.content_sha256.len() != 64
-        || !import.content_sha256.bytes().all(is_lower_hex)
-        || !(1024..=16 * 1024 * 1024 * 1024).contains(&import.byte_size)
-        || !import.byte_size.is_multiple_of(512)
-        || import.entry_count > 100_000
-        || import.extracted_byte_size > 16 * 1024 * 1024 * 1024
-        || (import.entry_count == 0 && import.extracted_byte_size != 0)
+const NATIVE_LIFECYCLE_PHASES: [&str; 17] = [
+    "validation",
+    "queued",
+    "resolving_system_openssh",
+    "connecting",
+    "waiting_for_user",
+    "remote_preflight",
+    "transferring",
+    "verifying",
+    "starting_daemon",
+    "waiting_for_daemon",
+    "opening_project_tunnel",
+    "negotiating_core",
+    "preparing_native_workspace",
+    "creating_remote_project",
+    "verifying_project",
+    "activating",
+    "finalizing",
+];
+
+fn native_import_id_for_action_v2(action_id: &str) -> HostResult<String> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(b"openevo.desktop.native-import.v1\0");
+    hasher.update(action_id.as_bytes());
+    let digest = encode_hex(&hasher.finalize());
+    Ok(format!("workspace-import-{}", &digest[..48]))
+}
+
+fn validate_native_lifecycle_operation(
+    operation: &NativeLifecycleOperationV2,
+    action_id: &str,
+) -> HostResult<()> {
+    let expected_import_id = native_import_id_for_action_v2(action_id)?;
+    if operation.schema_version != "2"
+        || !is_valid_opaque_id_v2(&operation.operation_id)
+        || operation.kind != "native_workspace_prepare"
+        || operation.resource.resource_kind != "native_workspace"
+        || operation.resource.resource_id != expected_import_id
+        || !is_digest_v2(&operation.request_sha256)
+        || operation.phase_total as usize != NATIVE_LIFECYCLE_PHASES.len()
+        || operation.phase_index as usize >= NATIVE_LIFECYCLE_PHASES.len()
+        || NATIVE_LIFECYCLE_PHASES[operation.phase_index as usize] != operation.phase
+        || operation.log_sequence_high_watermark > MAX_JAVASCRIPT_SAFE_INTEGER
+        || !is_etag_v2(&operation.etag)
     {
         return Err(workspace_import_error());
     }
+    match operation.status.as_str() {
+        "queued" | "running" | "succeeded" | "failed" | "cancelled" => {}
+        _ => return Err(workspace_import_error()),
+    }
+    if let Some(progress) = &operation.progress {
+        match progress {
+            NativeLifecycleProgressV2::Indeterminate => {}
+            NativeLifecycleProgressV2::Bytes { completed, total }
+            | NativeLifecycleProgressV2::Items { completed, total } => {
+                if *total == 0 || *total > MAX_JAVASCRIPT_SAFE_INTEGER || *completed > *total {
+                    return Err(workspace_import_error());
+                }
+            }
+        }
+    }
+    let created_at =
+        parse_utc_timestamp_v2(&operation.created_at).ok_or_else(workspace_import_error)?;
+    let started_at = operation
+        .started_at
+        .as_deref()
+        .map(parse_utc_timestamp_v2)
+        .transpose_option()
+        .ok_or_else(workspace_import_error)?;
+    let updated_at =
+        parse_utc_timestamp_v2(&operation.updated_at).ok_or_else(workspace_import_error)?;
+    let finished_at = operation
+        .finished_at
+        .as_deref()
+        .map(parse_utc_timestamp_v2)
+        .transpose_option()
+        .ok_or_else(workspace_import_error)?;
+    let mut timestamps = vec![created_at];
+    if let Some(started) = started_at {
+        timestamps.push(started);
+    }
+    timestamps.push(updated_at);
+    if timestamps.windows(2).any(|pair| pair[0] > pair[1]) {
+        return Err(workspace_import_error());
+    }
+    let terminal = matches!(
+        operation.status.as_str(),
+        "succeeded" | "failed" | "cancelled"
+    );
+    if terminal != finished_at.is_some()
+        || terminal && operation.cancellable
+        || operation.status == "queued" && started_at.is_some()
+        || operation.status == "running" && started_at.is_none()
+        || finished_at.is_some_and(|finished| finished != updated_at)
+    {
+        return Err(workspace_import_error());
+    }
+    match operation.status.as_str() {
+        "succeeded" => {
+            let result = operation
+                .result
+                .as_ref()
+                .ok_or_else(workspace_import_error)?;
+            if operation.failure.is_some()
+                || operation.phase != "finalizing"
+                || !validate_native_lifecycle_result(result, &expected_import_id)
+            {
+                return Err(workspace_import_error());
+            }
+        }
+        "failed" => {
+            let failure = operation
+                .failure
+                .as_ref()
+                .ok_or_else(workspace_import_error)?;
+            if operation.result.is_some() || !validate_native_lifecycle_failure(failure) {
+                return Err(workspace_import_error());
+            }
+        }
+        _ if operation.result.is_some() || operation.failure.is_some() => {
+            return Err(workspace_import_error());
+        }
+        _ => {}
+    }
     Ok(())
+}
+
+trait TransposeOption<T> {
+    fn transpose_option(self) -> Option<Option<T>>;
+}
+
+impl<T> TransposeOption<T> for Option<Option<T>> {
+    fn transpose_option(self) -> Option<Option<T>> {
+        match self {
+            Some(Some(value)) => Some(Some(value)),
+            Some(None) => None,
+            None => Some(None),
+        }
+    }
+}
+
+fn validate_native_lifecycle_result(
+    result: &NativeLifecycleResultV2,
+    expected_import_id: &str,
+) -> bool {
+    result.result_kind == "native_workspace"
+        && result.import_id == expected_import_id
+        && is_digest_v2(&result.content_sha256)
+        && (1..=MAX_JAVASCRIPT_SAFE_INTEGER).contains(&result.byte_size)
+        && result.entry_count <= MAX_JAVASCRIPT_SAFE_INTEGER
+        && result.extracted_byte_size <= MAX_JAVASCRIPT_SAFE_INTEGER
+        && is_valid_display_name_v2(&result.display_name)
+}
+
+fn validate_native_lifecycle_failure(failure: &NativeLifecycleFailureV2) -> bool {
+    failure.schema_version == "2"
+        && is_valid_error_code_v2(&failure.code)
+        && !failure.summary.is_empty()
+        && failure.summary.chars().count() <= 512
+        && matches!(
+            failure.action.as_str(),
+            "retry"
+                | "rescan"
+                | "review_host_key"
+                | "rebind"
+                | "reconnect"
+                | "install_repair_daemon"
+                | "administrator_action"
+                | "correct_project"
+                | "wait_for_successor"
+                | "none"
+        )
+        && failure
+            .affected_resource_id
+            .as_deref()
+            .is_none_or(is_valid_opaque_id_v2)
+}
+
+fn is_valid_opaque_id_v2(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+fn is_valid_error_code_v2(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=128).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn is_digest_v2(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(is_lower_hex)
+}
+
+fn is_etag_v2(value: &str) -> bool {
+    value.len() == 66
+        && value.starts_with('"')
+        && value.ends_with('"')
+        && value.as_bytes()[1..65].iter().copied().all(is_lower_hex)
+}
+
+fn is_valid_display_name_v2(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().count() <= 128
+        && value.trim() == value
+        && !matches!(value, "." | "..")
+        && !value.contains(['/', '\\'])
+        && !value
+            .chars()
+            .any(|character| character <= '\u{1f}' || character == '\u{7f}')
+}
+
+fn parse_utc_timestamp_v2(value: &str) -> Option<(u16, u8, u8, u8, u8, u8, u32)> {
+    let bytes = value.as_bytes();
+    if !(bytes.len() == 20 || (22..=30).contains(&bytes.len()))
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.last() != Some(&b'Z')
+    {
+        return None;
+    }
+    let year = parse_ascii_digits(&bytes[0..4])? as u16;
+    let month = parse_ascii_digits(&bytes[5..7])? as u8;
+    let day = parse_ascii_digits(&bytes[8..10])? as u8;
+    let hour = parse_ascii_digits(&bytes[11..13])? as u8;
+    let minute = parse_ascii_digits(&bytes[14..16])? as u8;
+    let second = parse_ascii_digits(&bytes[17..19])? as u8;
+    let nanos = if bytes.len() == 20 {
+        0
+    } else {
+        if bytes[19] != b'.' {
+            return None;
+        }
+        let digits = &bytes[20..bytes.len() - 1];
+        let fraction = parse_ascii_digits(digits)?;
+        fraction.checked_mul(10_u32.pow((9 - digits.len()) as u32))?
+    };
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if year == 0 || day == 0 || day > max_day || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    Some((year, month, day, hour, minute, second, nanos))
+}
+
+fn parse_ascii_digits(bytes: &[u8]) -> Option<u32> {
+    if bytes.is_empty() || !bytes.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))
+    })
 }
 
 fn remember_pending_workspace_import(
@@ -4264,7 +4641,13 @@ fn remember_pending_workspace_import(
         .map_err(|_| workspace_import_error())?;
     imports.retain(|_, value| value.sidecar_instance == pending.sidecar_instance);
     if let Some(existing) = imports.get(&pending.action_id) {
-        return if existing == &pending {
+        return if existing.sidecar_instance == pending.sidecar_instance
+            && existing.action_id == pending.action_id
+            && existing.project_id == pending.project_id
+            && existing.lifecycle.operation_id == pending.lifecycle.operation_id
+            && existing.lifecycle.resource == pending.lifecycle.resource
+            && Arc::ptr_eq(&existing.operation, &pending.operation)
+        {
             Ok(())
         } else {
             Err(workspace_import_error())
@@ -4275,6 +4658,21 @@ fn remember_pending_workspace_import(
     }
     imports.insert(pending.action_id.clone(), pending);
     Ok(())
+}
+
+fn pending_workspace_import(
+    state: &DesktopHostState,
+    action_id: &str,
+) -> HostResult<Option<PendingNativeWorkspaceImport>> {
+    if !is_valid_native_text(action_id) || action_id.len() < 16 {
+        return Err(workspace_selection_error());
+    }
+    Ok(state
+        .pending_workspace_imports
+        .lock()
+        .map_err(|_| workspace_import_error())?
+        .get(action_id)
+        .cloned())
 }
 
 fn take_pending_workspace_import(
@@ -5089,6 +5487,98 @@ fn startup_cancelled(state: &DesktopHostState, initial_epoch: u64) -> bool {
         || phase == LaunchPhase::Cancelled
 }
 
+fn begin_native_startup_progress(state: &DesktopHostState, startup_epoch: u64) -> HostResult<()> {
+    let mut progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    *progress = NativeStartupProgressV2 {
+        startup_epoch,
+        status: NativeStartupProgressStatusV2::Running,
+        phase: NativeStartupPhaseV2::ValidatingBundle,
+        started_at: Some(Instant::now()),
+        finished_elapsed: None,
+    };
+    Ok(())
+}
+
+fn update_native_startup_progress(
+    state: &DesktopHostState,
+    startup_epoch: u64,
+    phase: NativeStartupPhaseV2,
+) -> HostResult<()> {
+    let mut progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    if progress.startup_epoch != startup_epoch
+        || progress.status != NativeStartupProgressStatusV2::Running
+        || phase.index() < progress.phase.index()
+    {
+        return Err(sidecar_state_error());
+    }
+    progress.phase = phase;
+    Ok(())
+}
+
+fn finish_native_startup_progress(state: &DesktopHostState, startup_epoch: u64) -> HostResult<()> {
+    let mut progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    if progress.startup_epoch != startup_epoch
+        || progress.status != NativeStartupProgressStatusV2::Running
+    {
+        return Err(sidecar_state_error());
+    }
+    progress.phase = NativeStartupPhaseV2::Ready;
+    progress.status = NativeStartupProgressStatusV2::Succeeded;
+    progress.finished_elapsed = progress.started_at.map(|started| started.elapsed());
+    Ok(())
+}
+
+fn sidecar_startup_status_inner(state: &DesktopHostState) -> HostResult<NativeStartupStatusV2> {
+    let progress = state
+        .startup_progress
+        .lock()
+        .map_err(|_| sidecar_state_error())?;
+    let elapsed = progress
+        .finished_elapsed
+        .or_else(|| progress.started_at.map(|started| started.elapsed()))
+        .unwrap_or_default();
+    let (launch_epoch, launch_phase) =
+        decode_launch_state(state.launch_state.load(Ordering::Acquire));
+    let startup_running = state.startup_in_progress.load(Ordering::Acquire);
+    let (status, failure) = match progress.status {
+        NativeStartupProgressStatusV2::Idle => ("idle", None),
+        NativeStartupProgressStatusV2::Succeeded => ("succeeded", None),
+        NativeStartupProgressStatusV2::Running if startup_running => ("running", None),
+        NativeStartupProgressStatusV2::Running
+            if launch_epoch != progress.startup_epoch || launch_phase == LaunchPhase::Cancelled =>
+        {
+            ("cancelled", None)
+        }
+        NativeStartupProgressStatusV2::Running => (
+            "failed",
+            Some(NativeHostError::new(
+                "sidecar_startup_failed",
+                "OpenEvo Desktop could not finish local service startup.",
+            )),
+        ),
+    };
+    Ok(NativeStartupStatusV2 {
+        schema_version: "2",
+        startup_epoch: progress.startup_epoch,
+        status,
+        phase: progress.phase.as_str(),
+        phase_index: progress.phase.index(),
+        phase_total: 6,
+        elapsed_milliseconds: elapsed.as_millis().min(u64::MAX as u128) as u64,
+        cancellable: status == "running",
+        failure,
+    })
+}
+
 fn sidecar_start_cancelled_error() -> NativeHostError {
     NativeHostError::new(
         "sidecar_start_cancelled",
@@ -5735,6 +6225,7 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         Some(epoch) => StartupClaim::acquire_expected(state, epoch)?,
         None => StartupClaim::acquire(state)?,
     };
+    begin_native_startup_progress(state, startup_epoch)?;
     let mut sidecar = lock_sidecar_bounded(state, SIDECAR_STATE_LOCK_TIMEOUT)?;
     if let Some(managed) = sidecar.as_mut() {
         if managed.lifecycle == ManagedLifecycle::CleanupPending {
@@ -5762,6 +6253,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
                     check_sidecar_session_binding(port, session_token.expose())
                 })();
                 if validation.is_ok() {
+                    update_native_startup_progress(
+                        state,
+                        startup_epoch,
+                        NativeStartupPhaseV2::NegotiatingContract,
+                    )?;
                     state.desktop_logs.record_startup_stage(
                         DesktopLogSource::Native,
                         DesktopStartupStage::LocalApi,
@@ -5771,7 +6267,9 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
                         None,
                         None,
                     );
-                    return managed.bootstrap_context();
+                    let context = managed.bootstrap_context()?;
+                    finish_native_startup_progress(state, startup_epoch)?;
+                    return Ok(context);
                 }
                 managed.mark_cleanup_pending();
                 if cleanup_managed_sidecar_with(control, managed).is_err() {
@@ -5808,6 +6306,7 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         None,
         None,
     );
+    update_native_startup_progress(state, startup_epoch, NativeStartupPhaseV2::SpawningSidecar)?;
     let mut credential = NativeInstanceCredential::generate()?;
     let mut prepared = command_from_launch_spec(&launch, &allocated.listener)?;
     let parent_liveness_writer = prepared.take_parent_liveness_writer()?;
@@ -5860,6 +6359,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         None,
         None,
     );
+    update_native_startup_progress(
+        state,
+        startup_epoch,
+        NativeStartupPhaseV2::HandingOffDescriptors,
+    )?;
     if let Err(error) = finalize_state_owned_private_executable(state) {
         return Err(fail_state_owned_startup(state, control, error));
     }
@@ -5878,6 +6382,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         None,
         None,
     );
+    update_native_startup_progress(
+        state,
+        startup_epoch,
+        NativeStartupPhaseV2::WaitingForLocalApi,
+    )?;
     let validated_contract = match wait_for_state_owned_sidecar_ready(
         state,
         control,
@@ -5889,6 +6398,11 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         Ok(contract) => contract,
         Err(error) => return Err(fail_state_owned_startup(state, control, error)),
     };
+    update_native_startup_progress(
+        state,
+        startup_epoch,
+        NativeStartupPhaseV2::NegotiatingContract,
+    )?;
     if let Err(error) = retain_sidecar_release_identity(state, &validated_contract) {
         return Err(fail_state_owned_startup(state, control, error));
     }
@@ -5911,7 +6425,10 @@ fn start_sidecar_inner_with_expected_epoch<C: ProcessControl>(
         negotiated_contract: validated_contract.negotiated,
     };
     match publish_sidecar_gated(state, startup_epoch, bootstrap) {
-        Ok(context) => Ok(context),
+        Ok(context) => {
+            finish_native_startup_progress(state, startup_epoch)?;
+            Ok(context)
+        }
         Err(error) => Err(fail_state_owned_startup(state, control, error)),
     }
 }
@@ -6062,152 +6579,18 @@ fn stop_sidecar_inner_with<C: ProcessControl>(
     Ok(stopped_host_status())
 }
 
-struct RunRetryRecoveryRoot {
-    path: PathBuf,
-    directory: File,
-    device: u64,
-    inode: u64,
-}
-
-struct RunRetryRecoveryProcessLock {
-    root: RunRetryRecoveryRoot,
-    name: CString,
-    file: File,
-    identity: FileIdentity,
-}
-
-impl RunRetryRecoveryProcessLock {
-    fn acquire(path: &Path) -> HostResult<Self> {
-        let root =
-            open_run_retry_recovery_root(path, true)?.ok_or_else(run_retry_recovery_error)?;
-        root.validate()?;
-        let name = run_retry_recovery_lock_name();
-        let previous_identity = run_retry_recovery_identity_at_optional(&root.directory, &name)?;
-        if let Some(identity) = previous_identity.as_ref() {
-            validate_run_retry_recovery_lock_identity(identity)?;
-        }
-        let file = openat_file(
-            root.directory.as_raw_fd(),
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-            0o600,
-        )
-        .map_err(|_| run_retry_recovery_error())?;
-        let identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-        validate_run_retry_recovery_lock_identity(&identity)?;
-        validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
-        if previous_identity.is_some_and(|previous| previous != identity)
-            || run_retry_recovery_identity_at_optional(&root.directory, &name)?.as_ref()
-                != Some(&identity)
-        {
-            return Err(run_retry_recovery_error());
-        }
-        root.validate()?;
-
-        let deadline = Instant::now() + RUN_RETRY_RECOVERY_LOCK_TIMEOUT;
-        loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                break;
-            }
-            let error = std::io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(code) if code == libc::EINTR => continue,
-                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => {
-                    let now = Instant::now();
-                    if now >= deadline {
-                        return Err(run_retry_recovery_error());
-                    }
-                    thread::sleep(
-                        RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL
-                            .min(deadline.saturating_duration_since(now)),
-                    );
-                }
-                _ => return Err(run_retry_recovery_error()),
-            }
-        }
-
-        let lock = Self {
-            root,
-            name,
-            file,
-            identity,
-        };
-        lock.validate()?;
-        Ok(lock)
-    }
-
-    fn validate(&self) -> HostResult<()> {
-        self.root.validate()?;
-        let open_identity = file_identity(&self.file).map_err(|_| run_retry_recovery_error())?;
-        validate_run_retry_recovery_lock_identity(&open_identity)?;
-        validate_anchored_extended_acl(&self.file).map_err(|_| run_retry_recovery_error())?;
-        if open_identity != self.identity
-            || run_retry_recovery_identity_at_optional(&self.root.directory, &self.name)?.as_ref()
-                != Some(&self.identity)
-        {
-            return Err(run_retry_recovery_error());
-        }
-        Ok(())
-    }
-}
-
-impl Drop for RunRetryRecoveryProcessLock {
-    fn drop(&mut self) {
-        unsafe {
-            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
-        }
-    }
-}
-
-impl RunRetryRecoveryRoot {
-    fn validate(&self) -> HostResult<()> {
-        let reopened = open_run_retry_recovery_root(&self.path, false)?
-            .ok_or_else(run_retry_recovery_error)?;
-        let held = file_identity(&self.directory).map_err(|_| run_retry_recovery_error())?;
-        let current = file_identity(&reopened.directory).map_err(|_| run_retry_recovery_error())?;
-        if held.device != self.device
-            || held.inode != self.inode
-            || current.device != self.device
-            || current.inode != self.inode
-        {
-            return Err(run_retry_recovery_error());
-        }
-        validate_run_retry_recovery_root_identity(&held)
-    }
-}
-
-struct RunRetryRecoveryTemp<'a> {
-    directory: &'a File,
-    name: CString,
-    file: File,
-    published: bool,
-}
-
-impl Drop for RunRetryRecoveryTemp<'_> {
-    fn drop(&mut self) {
-        if self.published {
-            return;
-        }
-        let Ok(open_identity) = file_identity(&self.file) else {
-            return;
-        };
-        let Ok(Some(path_identity)) =
-            run_retry_recovery_identity_at_optional(self.directory, &self.name)
-        else {
-            return;
-        };
-        if open_identity == path_identity
-            && open_identity.mode & FILE_TYPE_MASK == REGULAR_FILE_TYPE
-            && open_identity.owner == unsafe { libc::geteuid() }
-            && open_identity.links == 1
-        {
-            let removed =
-                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
-            if removed == 0 {
-                let _ = self.directory.sync_all();
-            }
-        }
-    }
+fn run_retry_recovery_journal() -> PrivateJsonJournal {
+    PrivateJsonJournal::new(PrivateJsonJournalPolicy {
+        file_name: RUN_RETRY_RECOVERY_FILE_NAME,
+        temp_prefix: RUN_RETRY_RECOVERY_TEMP_PREFIX,
+        lock_file_name: RUN_RETRY_RECOVERY_LOCK_FILE_NAME,
+        max_bytes: RUN_RETRY_RECOVERY_MAX_BYTES,
+        lock_timeout: RUN_RETRY_RECOVERY_LOCK_TIMEOUT,
+        lock_poll_interval: RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL,
+        unavailable_error: run_retry_recovery_error,
+        too_large_error: run_retry_recovery_too_large_error,
+        conflict_error: run_retry_recovery_conflict_error,
+    })
 }
 
 fn run_retry_recovery_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
@@ -6221,294 +6604,27 @@ fn run_retry_recovery_root_from_app_data(app_data_dir: &Path) -> PathBuf {
     app_data_dir.join(RUN_RETRY_RECOVERY_DIRECTORY_NAME)
 }
 
-#[cfg(target_os = "linux")]
-fn trusted_run_retry_recovery_root_path(path: &Path) -> PathBuf {
-    path.to_path_buf()
-}
-
-#[cfg(target_os = "macos")]
-fn trusted_run_retry_recovery_root_path(path: &Path) -> PathBuf {
-    macos_trusted_path_alias(path)
-}
-
 fn with_run_retry_recovery_transaction<T>(
     state: &DesktopHostState,
     path: &Path,
     operation: impl FnOnce() -> HostResult<T>,
 ) -> HostResult<T> {
-    let _thread_guard = state
-        .run_retry_recovery
-        .lock()
-        .map_err(|_| run_retry_recovery_error())?;
-    let process_lock = RunRetryRecoveryProcessLock::acquire(path)?;
-    let result = operation();
-    process_lock.validate()?;
-    result
+    run_retry_recovery_journal().transaction(&state.run_retry_recovery, path, operation)
 }
 
+#[cfg(test)]
 fn open_run_retry_recovery_root(
     path: &Path,
     create: bool,
-) -> HostResult<Option<RunRetryRecoveryRoot>> {
-    let trusted_path = trusted_run_retry_recovery_root_path(path);
-    let path = trusted_path.as_path();
-    if !path.is_absolute() {
-        return Err(run_retry_recovery_error());
-    }
-    let mut names = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => names.push(name),
-            _ => return Err(run_retry_recovery_error()),
-        }
-    }
-    if names.is_empty() {
-        return Err(run_retry_recovery_error());
-    }
-
-    let mut current = open_directory(Path::new("/")).map_err(|_| run_retry_recovery_error())?;
-    validate_run_retry_recovery_parent(&current)?;
-    for (index, name) in names.iter().enumerate() {
-        let name = CString::new(name.as_bytes()).map_err(|_| run_retry_recovery_error())?;
-        let is_root = index + 1 == names.len();
-        let next = match openat_file(
-            current.as_raw_fd(),
-            &name,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0,
-        ) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create => {
-                return Ok(None);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let created = unsafe { libc::mkdirat(current.as_raw_fd(), name.as_ptr(), 0o700) };
-                if created == -1 {
-                    let mkdir_error = std::io::Error::last_os_error();
-                    if mkdir_error.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(run_retry_recovery_error());
-                    }
-                } else {
-                    current.sync_all().map_err(|_| run_retry_recovery_error())?;
-                }
-                openat_file(
-                    current.as_raw_fd(),
-                    &name,
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    0,
-                )
-                .map_err(|_| run_retry_recovery_error())?
-            }
-            Err(_) => return Err(run_retry_recovery_error()),
-        };
-        if is_root {
-            validate_run_retry_recovery_root_identity(
-                &file_identity(&next).map_err(|_| run_retry_recovery_error())?,
-            )?;
-        } else {
-            validate_run_retry_recovery_parent(&next)?;
-        }
-        validate_anchored_extended_acl(&next).map_err(|_| run_retry_recovery_error())?;
-        current = next;
-    }
-    let identity = file_identity(&current).map_err(|_| run_retry_recovery_error())?;
-    Ok(Some(RunRetryRecoveryRoot {
-        path: trusted_path,
-        directory: current,
-        device: identity.device,
-        inode: identity.inode,
-    }))
-}
-
-fn validate_run_retry_recovery_parent(directory: &File) -> HostResult<()> {
-    let identity = file_identity(directory).map_err(|_| run_retry_recovery_error())?;
-    let effective_user = unsafe { libc::geteuid() };
-    let root_sticky_boundary = identity.owner == 0 && identity.mode & STICKY_MODE_BIT != 0;
-    if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
-        || (identity.owner != 0 && identity.owner != effective_user)
-        || (identity.mode & 0o022 != 0 && !root_sticky_boundary)
-    {
-        return Err(run_retry_recovery_error());
-    }
-    validate_anchored_extended_acl(directory).map_err(|_| run_retry_recovery_error())
-}
-
-fn validate_run_retry_recovery_root_identity(identity: &FileIdentity) -> HostResult<()> {
-    if identity.mode & FILE_TYPE_MASK != DIRECTORY_FILE_TYPE
-        || identity.owner != unsafe { libc::geteuid() }
-        || identity.mode & 0o777 != 0o700
-    {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn run_retry_recovery_identity_at_optional(
-    directory: &File,
-    name: &CString,
-) -> HostResult<Option<FileIdentity>> {
-    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    let result = unsafe {
-        libc::fstatat(
-            directory.as_raw_fd(),
-            name.as_ptr(),
-            stat.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if result == 0 {
-        return Ok(Some(file_identity_from_stat(unsafe {
-            &stat.assume_init()
-        })));
-    }
-    let error = std::io::Error::last_os_error();
-    if error.kind() == std::io::ErrorKind::NotFound {
-        Ok(None)
-    } else {
-        Err(run_retry_recovery_error())
-    }
-}
-
-fn validate_run_retry_recovery_file_identity(identity: &FileIdentity) -> HostResult<()> {
-    if identity.mode & FILE_TYPE_MASK != REGULAR_FILE_TYPE
-        || identity.owner != unsafe { libc::geteuid() }
-        || identity.mode & 0o777 != 0o600
-        || identity.links != 1
-    {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn validate_run_retry_recovery_lock_identity(identity: &FileIdentity) -> HostResult<()> {
-    validate_run_retry_recovery_file_identity(identity)?;
-    if identity.size != 0 {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn validate_run_retry_recovery_read_identity(identity: &FileIdentity) -> HostResult<()> {
-    validate_run_retry_recovery_file_identity(identity)?;
-    if identity.size > RUN_RETRY_RECOVERY_MAX_BYTES as u64 {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
-}
-
-fn run_retry_recovery_name() -> CString {
-    CString::new(RUN_RETRY_RECOVERY_FILE_NAME).expect("recovery file name has no NUL")
-}
-
-fn run_retry_recovery_lock_name() -> CString {
-    CString::new(RUN_RETRY_RECOVERY_LOCK_FILE_NAME).expect("recovery lock name has no NUL")
-}
-
-fn read_run_retry_recovery_from_root(
-    root: &RunRetryRecoveryRoot,
-    expected_identity: Option<&FileIdentity>,
-) -> HostResult<Option<String>> {
-    root.validate()?;
-    let name = run_retry_recovery_name();
-    let Some(path_identity) = run_retry_recovery_identity_at_optional(&root.directory, &name)?
-    else {
-        return if expected_identity.is_none() {
-            Ok(None)
-        } else {
-            Err(run_retry_recovery_error())
-        };
-    };
-    validate_run_retry_recovery_read_identity(&path_identity)?;
-    if expected_identity.is_some_and(|expected| expected != &path_identity) {
-        return Err(run_retry_recovery_error());
-    }
-    let mut file = openat_file(
-        root.directory.as_raw_fd(),
-        &name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    )
-    .map_err(|_| run_retry_recovery_error())?;
-    let opened_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    if opened_identity != path_identity {
-        return Err(run_retry_recovery_error());
-    }
-    validate_run_retry_recovery_read_identity(&opened_identity)?;
-    validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
-
-    let capacity = usize::try_from(opened_identity.size).map_err(|_| run_retry_recovery_error())?;
-    let mut bytes = Vec::with_capacity(capacity);
-    (&mut file)
-        .take((RUN_RETRY_RECOVERY_MAX_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| run_retry_recovery_error())?;
-    if bytes.len() != capacity || bytes.len() > RUN_RETRY_RECOVERY_MAX_BYTES {
-        return Err(run_retry_recovery_error());
-    }
-    let final_open_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    let final_path_identity = run_retry_recovery_identity_at_optional(&root.directory, &name)?
-        .ok_or_else(run_retry_recovery_error)?;
-    if final_open_identity != opened_identity || final_path_identity != opened_identity {
-        return Err(run_retry_recovery_error());
-    }
-    root.validate()?;
-    String::from_utf8(bytes)
-        .map(Some)
-        .map_err(|_| run_retry_recovery_error())
+) -> HostResult<Option<PrivateJsonJournalRoot>> {
+    run_retry_recovery_journal().open_root(path, create)
 }
 
 fn read_run_retry_recovery_at(path: &Path) -> HostResult<Option<String>> {
-    let Some(root) = open_run_retry_recovery_root(path, false)? else {
-        return Ok(None);
-    };
-    read_run_retry_recovery_from_root(&root, None)
+    run_retry_recovery_journal().read(path)
 }
 
-fn create_run_retry_recovery_temp(
-    root: &RunRetryRecoveryRoot,
-) -> HostResult<RunRetryRecoveryTemp<'_>> {
-    for _ in 0..64 {
-        let mut random = [0_u8; 16];
-        OsRng
-            .try_fill_bytes(&mut random)
-            .map_err(|_| run_retry_recovery_error())?;
-        let name = CString::new(format!(
-            "{RUN_RETRY_RECOVERY_TEMP_PREFIX}{}",
-            encode_hex(&random)
-        ))
-        .expect("recovery temp name has no NUL");
-        let file = match openat_file(
-            root.directory.as_raw_fd(),
-            &name,
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            0o600,
-        ) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return Err(run_retry_recovery_error()),
-        };
-        let temp = RunRetryRecoveryTemp {
-            directory: &root.directory,
-            name,
-            file,
-            published: false,
-        };
-        temp.file
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| run_retry_recovery_error())?;
-        let identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
-        validate_run_retry_recovery_file_identity(&identity)?;
-        if run_retry_recovery_identity_at_optional(&root.directory, &temp.name)?.as_ref()
-            != Some(&identity)
-        {
-            return Err(run_retry_recovery_error());
-        }
-        return Ok(temp);
-    }
-    Err(run_retry_recovery_error())
-}
-
+#[cfg(test)]
 fn write_some_run_retry_recovery_at_with<F>(
     path: &Path,
     value: &str,
@@ -6517,132 +6633,12 @@ fn write_some_run_retry_recovery_at_with<F>(
 where
     F: FnOnce(&mut File) -> HostResult<()>,
 {
-    if value.len() > RUN_RETRY_RECOVERY_MAX_BYTES {
-        return Err(run_retry_recovery_too_large_error());
-    }
-    let root = open_run_retry_recovery_root(path, true)?.ok_or_else(run_retry_recovery_error)?;
-    root.validate()?;
-    let target_name = run_retry_recovery_name();
-    let previous_identity = run_retry_recovery_identity_at_optional(&root.directory, &target_name)?;
-    if let Some(identity) = previous_identity.as_ref() {
-        validate_run_retry_recovery_file_identity(identity)?;
-        read_run_retry_recovery_from_root(&root, Some(identity))?;
-    }
-
-    let mut temp = create_run_retry_recovery_temp(&root)?;
-    temp.file
-        .write_all(value.as_bytes())
-        .map_err(|_| run_retry_recovery_error())?;
-    temp.file.flush().map_err(|_| run_retry_recovery_error())?;
-    temp.file
-        .sync_all()
-        .map_err(|_| run_retry_recovery_error())?;
-    let temp_identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
-    validate_run_retry_recovery_file_identity(&temp_identity)?;
-    if temp_identity.size != value.len() as u64
-        || run_retry_recovery_identity_at_optional(&root.directory, &temp.name)?.as_ref()
-            != Some(&temp_identity)
-        || run_retry_recovery_identity_at_optional(&root.directory, &target_name)?
-            != previous_identity
-    {
-        return Err(run_retry_recovery_error());
-    }
-    root.validate()?;
-    let renamed = unsafe {
-        libc::renameat(
-            root.directory.as_raw_fd(),
-            temp.name.as_ptr(),
-            root.directory.as_raw_fd(),
-            target_name.as_ptr(),
-        )
-    };
-    if renamed == -1 {
-        return Err(run_retry_recovery_error());
-    }
-    temp.published = true;
-    root.directory
-        .sync_all()
-        .map_err(|_| run_retry_recovery_error())?;
-    after_directory_sync(&mut temp.file)?;
-
-    let published_identity = file_identity(&temp.file).map_err(|_| run_retry_recovery_error())?;
-    validate_run_retry_recovery_file_identity(&published_identity)?;
-    if read_run_retry_recovery_from_root(&root, Some(&published_identity))?.as_deref()
-        != Some(value)
-    {
-        return Err(run_retry_recovery_error());
-    }
-    Ok(())
+    run_retry_recovery_journal().write_some_with(path, value, after_directory_sync)
 }
 
-fn write_some_run_retry_recovery_at(path: &Path, value: &str) -> HostResult<()> {
-    write_some_run_retry_recovery_at_with(path, value, |_| Ok(()))
-}
-
-fn same_run_retry_recovery_identity_after_unlink(
-    actual: &FileIdentity,
-    expected: &FileIdentity,
-) -> bool {
-    if expected.links != 1 || actual.links != 0 {
-        return false;
-    }
-    let mut normalized = actual.clone();
-    normalized.links = expected.links;
-    normalized.changed_seconds = expected.changed_seconds;
-    normalized.changed_nanoseconds = expected.changed_nanoseconds;
-    &normalized == expected
-}
-
-fn clear_run_retry_recovery_at(path: &Path) -> HostResult<()> {
-    let Some(root) = open_run_retry_recovery_root(path, false)? else {
-        return Ok(());
-    };
-    root.validate()?;
-    let name = run_retry_recovery_name();
-    let Some(path_identity) = run_retry_recovery_identity_at_optional(&root.directory, &name)?
-    else {
-        return Ok(());
-    };
-    validate_run_retry_recovery_file_identity(&path_identity)?;
-    let file = openat_file(
-        root.directory.as_raw_fd(),
-        &name,
-        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
-        0,
-    )
-    .map_err(|_| run_retry_recovery_error())?;
-    let opened_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    if opened_identity != path_identity {
-        return Err(run_retry_recovery_error());
-    }
-    validate_run_retry_recovery_file_identity(&opened_identity)?;
-    validate_anchored_extended_acl(&file).map_err(|_| run_retry_recovery_error())?;
-    root.validate()?;
-    if run_retry_recovery_identity_at_optional(&root.directory, &name)?.as_ref()
-        != Some(&opened_identity)
-    {
-        return Err(run_retry_recovery_error());
-    }
-    if unsafe { libc::unlinkat(root.directory.as_raw_fd(), name.as_ptr(), 0) } == -1 {
-        return Err(run_retry_recovery_error());
-    }
-    root.directory
-        .sync_all()
-        .map_err(|_| run_retry_recovery_error())?;
-    let unlinked_identity = file_identity(&file).map_err(|_| run_retry_recovery_error())?;
-    if !same_run_retry_recovery_identity_after_unlink(&unlinked_identity, &opened_identity)
-        || run_retry_recovery_identity_at_optional(&root.directory, &name)?.is_some()
-    {
-        return Err(run_retry_recovery_error());
-    }
-    root.validate()
-}
-
+#[cfg(test)]
 fn write_run_retry_recovery_at(path: &Path, value: Option<&str>) -> HostResult<()> {
-    match value {
-        Some(value) => write_some_run_retry_recovery_at(path, value),
-        None => clear_run_retry_recovery_at(path),
-    }
+    run_retry_recovery_journal().write(path, value)
 }
 
 fn compare_and_swap_run_retry_recovery_at(
@@ -6651,17 +6647,12 @@ fn compare_and_swap_run_retry_recovery_at(
     expected_value: Option<&str>,
     value: Option<&str>,
 ) -> HostResult<()> {
-    with_run_retry_recovery_transaction(state, path, || {
-        if expected_value.is_some_and(|expected| expected.len() > RUN_RETRY_RECOVERY_MAX_BYTES)
-            || value.is_some_and(|new_value| new_value.len() > RUN_RETRY_RECOVERY_MAX_BYTES)
-        {
-            return Err(run_retry_recovery_too_large_error());
-        }
-        if read_run_retry_recovery_at(path)?.as_deref() != expected_value {
-            return Err(run_retry_recovery_conflict_error());
-        }
-        write_run_retry_recovery_at(path, value)
-    })
+    run_retry_recovery_journal().compare_and_swap(
+        &state.run_retry_recovery,
+        path,
+        expected_value,
+        value,
+    )
 }
 
 fn run_retry_recovery_error() -> NativeHostError {
@@ -6685,9 +6676,81 @@ fn run_retry_recovery_conflict_error() -> NativeHostError {
     )
 }
 
+fn mutation_intent_journal() -> PrivateJsonJournal {
+    PrivateJsonJournal::new(PrivateJsonJournalPolicy {
+        file_name: MUTATION_INTENT_JOURNAL_FILE_NAME,
+        temp_prefix: MUTATION_INTENT_JOURNAL_TEMP_PREFIX,
+        lock_file_name: MUTATION_INTENT_JOURNAL_LOCK_FILE_NAME,
+        max_bytes: MUTATION_INTENT_JOURNAL_MAX_BYTES,
+        lock_timeout: RUN_RETRY_RECOVERY_LOCK_TIMEOUT,
+        lock_poll_interval: RUN_RETRY_RECOVERY_LOCK_POLL_INTERVAL,
+        unavailable_error: mutation_intent_journal_unavailable_error,
+        too_large_error: mutation_intent_journal_too_large_error,
+        conflict_error: mutation_intent_journal_conflict_error,
+    })
+}
+
+fn mutation_intent_journal_root_path(app: &tauri::AppHandle) -> HostResult<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .map(|path| path.join(RUN_RETRY_RECOVERY_DIRECTORY_NAME))
+        .map_err(|_| mutation_intent_journal_unavailable_error())
+}
+
+fn read_mutation_intent_journal_at(path: &Path) -> HostResult<Option<String>> {
+    let value = mutation_intent_journal().read(path)?;
+    if let Some(value) = value.as_deref() {
+        validate_mutation_intent_journal_value(value)?;
+    }
+    Ok(value)
+}
+
+fn compare_and_swap_mutation_intent_journal_at(
+    state: &DesktopHostState,
+    path: &Path,
+    expected_value: Option<&str>,
+    new_value: Option<&str>,
+) -> HostResult<()> {
+    validate_mutation_intent_journal_transition(expected_value, new_value)?;
+    mutation_intent_journal().compare_and_swap(
+        &state.mutation_intent_journal,
+        path,
+        expected_value,
+        new_value,
+    )
+}
+
+fn mutation_intent_journal_unavailable_error() -> NativeHostError {
+    NativeHostError::new(
+        "mutation_intent_journal_unavailable",
+        "OpenEvo Desktop could not securely access saved mutation retry state.",
+    )
+}
+
+fn mutation_intent_journal_too_large_error() -> NativeHostError {
+    NativeHostError::new(
+        "mutation_intent_journal_too_large",
+        "OpenEvo Desktop could not save mutation retry state because it is too large.",
+    )
+}
+
+fn mutation_intent_journal_conflict_error() -> NativeHostError {
+    NativeHostError::new(
+        "mutation_intent_journal_conflict",
+        "Saved mutation retry state changed before this update could be applied.",
+    )
+}
+
 #[tauri::command]
 fn host_status(state: tauri::State<'_, DesktopHostState>) -> HostResult<HostStatus> {
     host_status_inner(&state)
+}
+
+#[tauri::command]
+fn sidecar_startup_status(
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<NativeStartupStatusV2> {
+    sidecar_startup_status_inner(&state)
 }
 
 #[tauri::command]
@@ -6719,6 +6782,33 @@ fn write_run_retry_recovery(
         &root,
         expected_value.as_deref(),
         value.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn read_mutation_intent_journal_v2(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+) -> HostResult<Option<String>> {
+    let root = mutation_intent_journal_root_path(&app)?;
+    mutation_intent_journal().transaction(&state.mutation_intent_journal, &root, || {
+        read_mutation_intent_journal_at(&root)
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn compare_and_swap_mutation_intent_journal_v2(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, DesktopHostState>,
+    expected_value: Option<String>,
+    new_value: Option<String>,
+) -> HostResult<()> {
+    let root = mutation_intent_journal_root_path(&app)?;
+    compare_and_swap_mutation_intent_journal_at(
+        &state,
+        &root,
+        expected_value.as_deref(),
+        new_value.as_deref(),
     )
 }
 
@@ -7405,11 +7495,20 @@ async fn select_project_source(
     kind: String,
     action_id: String,
     project_id: Option<String>,
-) -> HostResult<NativeProjectSourceV2> {
+) -> HostResult<NativeLifecycleOperationV2> {
     if kind != "native_folder_snapshot" {
         return Err(workspace_selection_error());
     }
     let expected_instance = active_sidecar_instance(&state)?;
+    if let Some(pending) = pending_workspace_import(&state, &action_id)? {
+        if pending.sidecar_instance == expected_instance {
+            if pending.project_id != project_id {
+                return Err(workspace_import_error());
+            }
+            return Ok(pending.lifecycle);
+        }
+        let _ = take_pending_workspace_import(&state, &action_id)?;
+    }
     let picker_claim = PickerClaim::acquire(&state, action_id.clone(), expected_instance)?;
     let operation = picker_claim.operation.clone();
     let selected =
@@ -7452,8 +7551,8 @@ async fn select_project_source(
         sidecar_instance: expected_instance,
         action_id: pending_action_id,
         project_id: pending_project_id,
-        source: response.source.clone(),
-        lease_token: response.lease_token,
+        lifecycle: response.clone(),
+        operation: operation.clone(),
     };
     if let Err(error) = remember_pending_workspace_import(&state, pending.clone()) {
         if let Ok(ActiveSidecarConnection {
@@ -7462,7 +7561,11 @@ async fn select_project_source(
         }) = active_sidecar_connection(&state, expected_instance)
         {
             let _ = tauri::async_runtime::spawn_blocking(move || {
-                discard_native_workspace_source(&mut stream, handoff_token.expose(), &pending)
+                cancel_native_workspace_operation(
+                    &mut stream,
+                    handoff_token.expose(),
+                    &pending.operation,
+                )
             })
             .await;
         }
@@ -7474,22 +7577,19 @@ async fn select_project_source(
             handoff_token,
         }) = active_sidecar_connection(&state, expected_instance)
         {
-            let pending_to_discard = pending.clone();
-            let discard_result = tauri::async_runtime::spawn_blocking(move || {
-                discard_native_workspace_source(
+            let pending_to_cancel = pending.clone();
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                cancel_native_workspace_operation(
                     &mut stream,
                     handoff_token.expose(),
-                    &pending_to_discard,
+                    &pending_to_cancel.operation,
                 )
             })
             .await;
-            if matches!(discard_result, Ok(Ok(()))) {
-                let _ = take_pending_workspace_import(&state, &pending.action_id);
-            }
         }
         return Err(workspace_selection_cancelled_error());
     }
-    Ok(response.source)
+    Ok(response)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -7608,9 +7708,12 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             host_status,
+            sidecar_startup_status,
             sidecar_bootstrap_context,
             read_run_retry_recovery,
             write_run_retry_recovery,
+            read_mutation_intent_journal_v2,
+            compare_and_swap_mutation_intent_journal_v2,
             get_desktop_log_tail,
             reveal_desktop_log_directory,
             export_desktop_diagnostics,
@@ -7670,6 +7773,60 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    #[test]
+    fn native_startup_status_reports_closed_monotonic_progress() {
+        let state = DesktopHostState::default();
+        state.startup_in_progress.store(true, Ordering::Release);
+        begin_native_startup_progress(&state, 7).unwrap();
+        update_native_startup_progress(&state, 7, NativeStartupPhaseV2::WaitingForLocalApi)
+            .unwrap();
+
+        let running = sidecar_startup_status_inner(&state).unwrap();
+        assert_eq!(running.schema_version, "2");
+        assert_eq!(running.startup_epoch, 7);
+        assert_eq!(running.status, "running");
+        assert_eq!(running.phase, "waiting_for_local_api");
+        assert_eq!(running.phase_index, 3);
+        assert_eq!(running.phase_total, 6);
+        assert!(running.cancellable);
+        assert!(running.failure.is_none());
+        assert!(
+            update_native_startup_progress(&state, 7, NativeStartupPhaseV2::SpawningSidecar,)
+                .is_err()
+        );
+
+        finish_native_startup_progress(&state, 7).unwrap();
+        state.startup_in_progress.store(false, Ordering::Release);
+        let complete = sidecar_startup_status_inner(&state).unwrap();
+        assert_eq!(complete.status, "succeeded");
+        assert_eq!(complete.phase, "ready");
+        assert!(!complete.cancellable);
+        assert!(complete.failure.is_none());
+    }
+
+    #[test]
+    fn native_startup_status_classifies_failed_and_cancelled_epochs_without_process_output() {
+        let failed_state = DesktopHostState::default();
+        begin_native_startup_progress(&failed_state, 0).unwrap();
+        let failed = sidecar_startup_status_inner(&failed_state).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.failure.as_ref().unwrap().code,
+            "sidecar_startup_failed"
+        );
+        assert!(!failed.failure.as_ref().unwrap().message.contains('/'));
+
+        let cancelled_state = DesktopHostState::default();
+        begin_native_startup_progress(&cancelled_state, 0).unwrap();
+        cancelled_state.launch_state.store(
+            encode_launch_state(1, LaunchPhase::Cancelled),
+            Ordering::Release,
+        );
+        let cancelled = sidecar_startup_status_inner(&cancelled_state).unwrap();
+        assert_eq!(cancelled.status, "cancelled");
+        assert!(cancelled.failure.is_none());
+    }
+
     fn test_temp_root(temp: &TempDir) -> PathBuf {
         fs::canonicalize(temp.path()).unwrap()
     }
@@ -7684,6 +7841,68 @@ mod tests {
 
     fn run_retry_recovery_lock_target(root: &Path) -> PathBuf {
         root.join(RUN_RETRY_RECOVERY_LOCK_FILE_NAME)
+    }
+
+    fn valid_mutation_intent_journal_value(revision: u64) -> String {
+        serde_json::json!({
+            "schema_version": "2",
+            "revision": revision,
+            "entries": [{
+                "action_id": "mutation-action-native-0001",
+                "mutation_kind": "profile_connect",
+                "resource_scope": "profile:profile-lab",
+                "request_sha256": "aa".repeat(32),
+                "authority_sha256": "bb".repeat(32),
+                "provider_stream_instance": "provider-instance-1",
+                "provider_stream_epoch": 1,
+                "chain_step": "single",
+                "accepted_operation_id": null,
+                "completed_operation_ids": [],
+                "state": "reserved",
+                "created_at": "2026-07-27T08:00:00Z",
+                "updated_at": "2026-07-27T08:00:00Z"
+            }]
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn mutation_intent_journal_v2_roundtrips_with_exact_native_cas() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let state = DesktopHostState::default();
+        let value = valid_mutation_intent_journal_value(1);
+
+        assert_eq!(read_mutation_intent_journal_at(&root).unwrap(), None);
+        compare_and_swap_mutation_intent_journal_at(&state, &root, None, Some(&value)).unwrap();
+        assert_eq!(
+            read_mutation_intent_journal_at(&root).unwrap().as_deref(),
+            Some(value.as_str())
+        );
+        assert_eq!(
+            compare_and_swap_mutation_intent_journal_at(&state, &root, None, Some(&value))
+                .unwrap_err()
+                .code,
+            "mutation_intent_journal_conflict"
+        );
+        compare_and_swap_mutation_intent_journal_at(&state, &root, Some(&value), None).unwrap();
+        assert_eq!(read_mutation_intent_journal_at(&root).unwrap(), None);
+    }
+
+    #[test]
+    fn mutation_intent_journal_v2_rejects_invalid_value_before_native_publish() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = test_run_retry_recovery_root(&temp);
+        let state = DesktopHostState::default();
+        let invalid = r#"{"schema_version":"2","revision":1,"entries":[],"password":"canary"}"#;
+
+        assert_eq!(
+            compare_and_swap_mutation_intent_journal_at(&state, &root, None, Some(invalid))
+                .unwrap_err()
+                .code,
+            "mutation_intent_journal_invalid"
+        );
+        assert_eq!(read_mutation_intent_journal_at(&root).unwrap(), None);
     }
 
     #[test]
@@ -9474,27 +9693,13 @@ mod tests {
             assert!(headers.contains(NATIVE_WORKSPACE_IMPORT_ROUTE));
             write_json_response(
                 &mut accepted,
-                201,
-                serde_json::json!({
-                    "schema_version": "2",
-                    "lease_token": "3c".repeat(32),
-                    "source": {
-                        "kind": "native_folder_snapshot",
-                        "display_name": "study",
-                        "import_ref": {
-                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                            "content_sha256": "2b".repeat(32),
-                            "byte_size": 1024,
-                            "entry_count": 1,
-                            "extracted_byte_size": 4,
-                        }
-                    },
-                }),
+                202,
+                valid_native_workspace_operation("native-source-action-pinned-0001"),
             );
         });
 
         let operation = test_picker_operation("native-source-action-pinned-0001");
-        let source = register_native_workspace_source(
+        let lifecycle = register_native_workspace_source(
             &mut stream,
             handoff_token.expose(),
             NativeWorkspaceSelection {
@@ -9510,7 +9715,11 @@ mod tests {
         .unwrap();
         old_server.join().unwrap();
 
-        assert_eq!(source.source.display_name, "study");
+        assert_eq!(lifecycle.kind, "native_workspace_prepare");
+        assert_eq!(
+            lifecycle.resource.resource_id,
+            test_native_import_id("native-source-action-pinned-0001")
+        );
         assert_eq!(old_port, stream.peer_addr().unwrap().port());
         assert!(matches!(
             replacement_probe.accept(),
@@ -9664,18 +9873,13 @@ mod tests {
                     sidecar_instance: [0x11; INSTANCE_ID_BYTES],
                     action_id,
                     project_id: None,
-                    source: NativeProjectSourceV2 {
-                        kind: "native_folder_snapshot".to_string(),
-                        display_name: "study".to_string(),
-                        import_ref: NativeWorkspaceImportRefV2 {
-                            import_id: format!("workspace-import-{:048x}", index),
-                            content_sha256: format!("{:064x}", index),
-                            byte_size: 1024,
-                            entry_count: 1,
-                            extracted_byte_size: 4,
-                        },
-                    },
-                    lease_token: format!("{:064x}", index),
+                    lifecycle: serde_json::from_value(valid_native_workspace_operation(&format!(
+                        "native-pending-action-{index:04}"
+                    )))
+                    .unwrap(),
+                    operation: Arc::new(test_picker_operation(&format!(
+                        "native-pending-action-{index:04}"
+                    ))),
                 },
             )
             .unwrap();
@@ -9684,16 +9888,11 @@ mod tests {
             sidecar_instance: [0x11; INSTANCE_ID_BYTES],
             action_id: "native-pending-action-overflow".to_string(),
             project_id: None,
-            source: state
-                .pending_workspace_imports
-                .lock()
-                .unwrap()
-                .values()
-                .next()
-                .unwrap()
-                .source
-                .clone(),
-            lease_token: "ff".repeat(32),
+            lifecycle: serde_json::from_value(valid_native_workspace_operation(
+                "native-pending-action-overflow",
+            ))
+            .unwrap(),
+            operation: Arc::new(test_picker_operation("native-pending-action-overflow")),
         };
 
         assert!(remember_pending_workspace_import(&state, overflow).is_err());
@@ -9704,7 +9903,7 @@ mod tests {
     }
 
     #[test]
-    fn native_workspace_discard_uses_the_hidden_lease_route() {
+    fn native_workspace_discard_derives_authority_from_the_hidden_action() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let handoff_token = "8d".repeat(HANDOFF_TOKEN_BYTES);
@@ -9713,18 +9912,11 @@ mod tests {
             sidecar_instance: [0x11; INSTANCE_ID_BYTES],
             action_id: "native-pending-action-discard-0001".to_string(),
             project_id: Some("project-existing-1".to_string()),
-            source: NativeProjectSourceV2 {
-                kind: "native_folder_snapshot".to_string(),
-                display_name: "study".to_string(),
-                import_ref: NativeWorkspaceImportRefV2 {
-                    import_id: format!("workspace-import-{}", "1a".repeat(24)),
-                    content_sha256: "2b".repeat(32),
-                    byte_size: 1024,
-                    entry_count: 1,
-                    extracted_byte_size: 4,
-                },
-            },
-            lease_token: "3c".repeat(32),
+            lifecycle: serde_json::from_value(valid_native_workspace_operation(
+                "native-pending-action-discard-0001",
+            ))
+            .unwrap(),
+            operation: Arc::new(test_picker_operation("native-pending-action-discard-0001")),
         };
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -9736,8 +9928,10 @@ mod tests {
                 .lines()
                 .any(|line| line == format!("{NATIVE_HANDOFF_HEADER}: {expected_token}")));
             let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert_eq!(body["lease_token"], "3c".repeat(32));
             assert_eq!(body["action_id"], "native-pending-action-discard-0001");
+            assert_eq!(body["project_id"], "project-existing-1");
+            assert!(body.get("lease_token").is_none());
+            assert!(body.get("import_ref").is_none());
             assert!(body.get("selected_path").is_none());
             stream
                 .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
@@ -9839,28 +10033,14 @@ mod tests {
             );
             write_json_response(
                 &mut stream,
-                201,
-                serde_json::json!({
-                    "schema_version": "2",
-                    "lease_token": "3c".repeat(32),
-                    "source": {
-                        "kind": "native_folder_snapshot",
-                        "display_name": "study",
-                        "import_ref": {
-                            "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                            "content_sha256": "2b".repeat(32),
-                            "byte_size": 1024,
-                            "entry_count": 1,
-                            "extracted_byte_size": 4,
-                        }
-                    },
-                }),
+                202,
+                valid_native_workspace_operation("native-source-action-0001"),
             );
         });
 
         let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
         let operation = test_picker_operation("native-source-action-0001");
-        let source = register_native_workspace_source(
+        let lifecycle = register_native_workspace_source(
             &mut stream,
             &handoff_token,
             NativeWorkspaceSelection {
@@ -9876,9 +10056,8 @@ mod tests {
         .unwrap();
         server.join().unwrap();
 
-        let renderer_data = serde_json::to_string(&source.source).unwrap();
-        assert_eq!(source.source.display_name, "study");
-        assert!(!renderer_data.contains(&source.lease_token));
+        let renderer_data = serde_json::to_string(&lifecycle).unwrap();
+        assert_eq!(lifecycle.kind, "native_workspace_prepare");
         assert!(!renderer_data.contains("/Users"));
         assert!(!renderer_data.contains("private"));
         assert!(!renderer_data.contains("selected_path"));
@@ -9886,60 +10065,23 @@ mod tests {
 
     #[test]
     fn native_workspace_registration_rejects_open_or_malformed_responses() {
-        for body in [
-            serde_json::json!({
-                "schema_version": "2",
-                "lease_token": "3c".repeat(32),
-                "source": {
-                    "kind": "native_folder_snapshot",
-                    "display_name": "study",
-                    "selected_path": "/private/study",
-                    "import_ref": {
-                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
-                },
-            }),
-            serde_json::json!({
-                "schema_version": "2",
-                "lease_token": "3c".repeat(32),
-                "source": {
-                    "kind": "native_folder_snapshot",
-                    "display_name": "study",
-                    "import_ref": {
-                        "import_id": "workspace-import-not-opaque",
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
-                },
-            }),
-            serde_json::json!({
-                "schema_version": "2",
-                "lease_token": "3c".repeat(32),
-                "source": {
-                    "kind": "native_folder_snapshot",
-                    "display_name": "/Users/researcher/private/study",
-                    "import_ref": {
-                        "import_id": format!("workspace-import-{}", "1a".repeat(24)),
-                        "content_sha256": "2b".repeat(32),
-                        "byte_size": 1024,
-                        "entry_count": 1,
-                        "extracted_byte_size": 4,
-                    }
-                },
-            }),
-        ] {
+        let mut open = valid_native_workspace_operation("native-source-action-0002");
+        open.as_object_mut().unwrap().insert(
+            "selected_path".to_string(),
+            serde_json::json!("/private/study"),
+        );
+        let mut wrong_resource = valid_native_workspace_operation("native-source-action-0002");
+        wrong_resource["resource"]["resource_id"] =
+            serde_json::json!("workspace-import-not-the-action");
+        let mut malformed_status = valid_native_workspace_operation("native-source-action-0002");
+        malformed_status["status"] = serde_json::json!("succeeded");
+        for body in [open, wrong_resource, malformed_status] {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().unwrap();
                 let _ = read_http_request_with_body(&mut stream);
-                write_json_response(&mut stream, 201, body);
+                write_json_response(&mut stream, 202, body);
             });
 
             let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -12101,12 +12243,12 @@ https://user:password@example.invalid/private\n"[..],
             std::env::var_os("OPENEVO_PACKAGED_SIDECAR_PATH")
                 .expect("OPENEVO_PACKAGED_SIDECAR_PATH is required"),
         );
-        #[cfg(target_os = "macos")]
-        let packaged_fixture = SidecarFixture::from_existing(&raw_path);
-        #[cfg(target_os = "macos")]
+        let raw_askpass_path = PathBuf::from(
+            std::env::var_os("OPENEVO_PACKAGED_ASKPASS_PATH")
+                .expect("OPENEVO_PACKAGED_ASKPASS_PATH is required"),
+        );
+        let packaged_fixture = SidecarFixture::from_existing_pair(&raw_path, &raw_askpass_path);
         let path = packaged_fixture.path().to_path_buf();
-        #[cfg(not(target_os = "macos"))]
-        let path = raw_path;
         let state = DesktopHostState::default();
 
         let context = start_sidecar_inner(&state, LaunchPolicy::Release, Some(&path)).unwrap();
@@ -12333,6 +12475,9 @@ https://user:password@example.invalid/private\n"[..],
                 "daemon_bundle_v2",
                 "event_replay_v2",
                 "host_key_review",
+                "lifecycle_operations_v2",
+                "lifecycle_process_logs_v2",
+                "mutation_idempotency_v2",
                 "native_askpass",
                 "system_openssh_profiles",
                 "task_admission_v2"
@@ -12484,6 +12629,44 @@ https://user:password@example.invalid/private\n"[..],
         }
     }
 
+    fn test_native_import_id(action_id: &str) -> String {
+        let digest = Sha256::digest(
+            [
+                b"openevo.desktop.native-import.v1\0".as_slice(),
+                action_id.as_bytes(),
+            ]
+            .concat(),
+        );
+        format!("workspace-import-{}", &encode_hex(&digest)[..48])
+    }
+
+    fn valid_native_workspace_operation(action_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "schema_version": "2",
+            "operation_id": format!("lifecycle-native-{}", &test_native_import_id(action_id)[17..]),
+            "kind": "native_workspace_prepare",
+            "resource": {
+                "resource_kind": "native_workspace",
+                "resource_id": test_native_import_id(action_id),
+            },
+            "request_sha256": "2b".repeat(32),
+            "status": "queued",
+            "phase": "queued",
+            "phase_index": 1,
+            "phase_total": 17,
+            "progress": null,
+            "cancellable": true,
+            "result": null,
+            "failure": null,
+            "log_sequence_high_watermark": 0,
+            "created_at": "2026-07-27T08:00:00Z",
+            "started_at": null,
+            "updated_at": "2026-07-27T08:00:00Z",
+            "finished_at": null,
+            "etag": format!("\"{}\"", "3c".repeat(32)),
+        })
+    }
+
     fn test_bootstrap_state() -> SidecarBootstrapState {
         SidecarBootstrapState {
             session_credential: SessionCredential([0x7c; SESSION_TOKEN_BYTES]),
@@ -12557,6 +12740,19 @@ https://user:password@example.invalid/private\n"[..],
             fs::copy(source, &path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
             Self::write_askpass_helper(&root);
+            Self { root, path }
+        }
+
+        fn from_existing_pair(sidecar: &Path, askpass: &Path) -> Self {
+            let root = unique_test_dir();
+            fs::create_dir(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.join(BUNDLED_SIDECAR_BINARY);
+            fs::copy(sidecar, &path).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            let askpass_path = root.join(BUNDLED_ASKPASS_BINARY);
+            fs::copy(askpass, &askpass_path).unwrap();
+            fs::set_permissions(&askpass_path, fs::Permissions::from_mode(0o755)).unwrap();
             Self { root, path }
         }
 

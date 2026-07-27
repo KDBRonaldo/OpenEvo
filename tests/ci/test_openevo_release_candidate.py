@@ -75,7 +75,12 @@ def test_candidate_release_notes_are_one_canonical_document() -> None:
     assert "Self-Deployed Reference mode: unavailable in this Preview." in notes
     assert "openevo-science-runtime-0.1.1-linux-amd64.tar.gz" in notes
     assert "Managed Science runtime source asset ID: 481361975." in notes
-    assert "Credential-canary verification for release assets: pending." in notes
+    assert "Project creation is reserved as a durable operation" in notes
+    assert "All implemented long-running workflows" in notes
+    assert "sanitized SSH and Daemon stdout/stderr" in notes
+    assert "generated secret canary" in notes
+    assert "Full release-asset and privacy qualification remains pending." in notes
+    assert "Existing duplicate projects from v0.1.9 are preserved" in notes
     assert "Current local Desktop data under ~/Library/Application Support" in notes
     assert "Legacy Preview data under ~/.openevo/desktop is preserved without being read" in notes
     assert "org.openevo.desktop" in notes
@@ -506,7 +511,10 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         == []
     )
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    assert payload["schema_version"] == 9
+    assert payload["schema_version"] == 10
+    assert payload["desktop_contract"] == candidate._desktop_contract_manifest("0.1.0")
+    assert payload["lifecycle_evidence"] == candidate._lifecycle_evidence_requirements()
+    assert payload["lifecycle_evidence"]["require_renderer_secret_canary_absence"] is True
     assert payload["macos"]["ssh_askpass_helper"] == {
         "architecture": "arm64",
         "byte_size": 51,
@@ -587,6 +595,41 @@ def test_candidate_manifest_binds_exact_release_inventory(tmp_path: Path) -> Non
         "python_requires": ">=3.11",
         "supported_platforms": ["linux-x86_64"],
     }
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("desktop_contract", "openapi_sha256", "f" * 64),
+        ("desktop_contract", "feature_flags", []),
+        ("lifecycle_evidence", "maximum_reservation_latency_ms", 0),
+        ("lifecycle_evidence", "minimum_terminal_duration_ms", 0),
+        ("lifecycle_evidence", "require_relaunch_recovery", False),
+        ("lifecycle_evidence", "require_secret_canary_absence", False),
+        ("lifecycle_evidence", "require_renderer_secret_canary_absence", False),
+    ],
+)
+def test_candidate_manifest_rejects_changed_lifecycle_contract(
+    tmp_path: Path,
+    section: str,
+    field: str,
+    value: object,
+) -> None:
+    candidate = _load_module()
+    _write_candidate_inputs(tmp_path)
+    manifest = candidate.create_candidate_manifest(
+        tmp_path,
+        source_commit="8e45af371eef49a86530a849041f7dcf047620ec",
+        version="0.1.0",
+        architecture="aarch64",
+        rust_target="aarch64-apple-darwin",
+        registry_digest="a" * 64,
+    )
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    payload[section][field] = value
+    _write_json(manifest, payload)
+
+    assert candidate.validate_candidate_manifest(manifest)
 
 
 @pytest.mark.parametrize(
@@ -816,7 +859,8 @@ def test_managed_runtime_source_binds_prerelease_asset_and_download(
         "Agent-system pass@1 rescue count: pending.",
         "## Security And Privacy",
         "No analytics, crash reporting, telemetry, or diagnostics upload is enabled by default.",
-        "Credential-canary verification for release assets: pending.",
+        "Exact-candidate publication requires a generated secret canary",
+        "Full release-asset and privacy qualification remains pending.",
         "## Install, Upgrade, And Uninstall",
         "Install:",
         "Upgrade:",

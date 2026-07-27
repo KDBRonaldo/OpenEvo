@@ -5,13 +5,12 @@ const timestamp = z.string().regex(
 );
 const cursor = z.string().min(1).max(512);
 
-// Kept outside the product renderer graph: release UI does not receive raw
-// process streams. This model remains available to dedicated maintainer tools.
+// Renderer-safe Core logs are fetched only through the active project tunnel.
 export const logEntryV2Schema = z.object({
   sequence: z.number().int().safe().min(1),
   occurred_at: timestamp,
   stream: z.enum(["system", "stdout", "stderr", "transcript"]),
-  message: z.string().max(16_384).refine((value) => !/[\u0000-\u001f\u007f]/.test(value)),
+  message: z.string().max(16_384),
 }).strict();
 
 export const logPageV2Schema = z.object({

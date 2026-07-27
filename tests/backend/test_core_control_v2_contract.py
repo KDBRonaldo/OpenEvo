@@ -879,11 +879,11 @@ def _load_release_checker() -> Any:
     return module
 
 
-def _v019_release_contract() -> dict[str, Any]:
+def _v0110_release_contract() -> dict[str, Any]:
     return {
         "schema_version": "1",
-        "v019": {
-            "release_version": "0.1.9",
+        "v0110": {
+            "release_version": "0.1.10",
             "core_control_mutation_major": 2,
             "accepted_core_openapi_digests": [openapi_sha256()],
             "accepted_core_event_schema_digests": [events_schema_sha256()],
@@ -893,7 +893,7 @@ def _v019_release_contract() -> dict[str, Any]:
     }
 
 
-def _write_v019_launcher_fixture(root: Path) -> None:
+def _write_v0110_launcher_fixture(root: Path) -> None:
     launcher = root / "src/openevo/backend/launcher.py"
     launcher.parent.mkdir(parents=True)
     launcher.write_text(
@@ -910,40 +910,40 @@ def _write_v019_launcher_fixture(root: Path) -> None:
     )
 
 
-def test_v019_release_manifest_requires_exact_core_v2_schema_digests(
+def test_v0110_release_manifest_requires_exact_core_v2_schema_digests(
     tmp_path: Path,
 ) -> None:
     checker = _load_release_checker()
     desktop = tmp_path / "desktop"
     desktop.mkdir()
     manifest = desktop / "release-contract.json"
-    manifest.write_text(json.dumps(_v019_release_contract()), encoding="utf-8")
-    _write_v019_launcher_fixture(tmp_path)
+    manifest.write_text(json.dumps(_v0110_release_contract()), encoding="utf-8")
+    _write_v0110_launcher_fixture(tmp_path)
 
-    assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9") == []
+    assert checker.validate_v0110_contract_manifest(tmp_path, expected_version="0.1.10") == []
 
-    payload = _v019_release_contract()
-    payload["v019"]["accepted_core_openapi_digests"] = ["f" * 64]
+    payload = _v0110_release_contract()
+    payload["v0110"]["accepted_core_openapi_digests"] = ["f" * 64]
     manifest.write_text(json.dumps(payload), encoding="utf-8")
     assert "exact generated Core v2 OpenAPI digest" in " ".join(
-        checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9")
+        checker.validate_v0110_contract_manifest(tmp_path, expected_version="0.1.10")
     )
 
 
-def test_v019_release_manifest_forbids_v1_mutation_authority(tmp_path: Path) -> None:
+def test_v0110_release_manifest_forbids_v1_mutation_authority(tmp_path: Path) -> None:
     checker = _load_release_checker()
     desktop = tmp_path / "desktop"
     desktop.mkdir()
     manifest = desktop / "release-contract.json"
-    payload = _v019_release_contract()
-    payload["v019"]["core_control_mutation_major"] = 1
+    payload = _v0110_release_contract()
+    payload["v0110"]["core_control_mutation_major"] = 1
     manifest.write_text(json.dumps(payload), encoding="utf-8")
 
-    errors = checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.9")
+    errors = checker.validate_v0110_contract_manifest(tmp_path, expected_version="0.1.10")
     assert any("must require Core Control API v2 for mutation" in error for error in errors)
 
     # The guard is dormant for the retained 0.1.8 release identity until Task 25.
-    assert checker.validate_v019_contract_manifest(tmp_path, expected_version="0.1.8") == []
+    assert checker.validate_v0110_contract_manifest(tmp_path, expected_version="0.1.8") == []
 
 
 def _feature_set_sha256(features: list[str]) -> str:
@@ -982,7 +982,7 @@ def _core_v2_discovery() -> dict[str, Any]:
                 "mutation_compatible": True,
             },
         ],
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "build_id": "3" * 64,
         "source_commit": "abcdef0",
         "build_channel": "release",

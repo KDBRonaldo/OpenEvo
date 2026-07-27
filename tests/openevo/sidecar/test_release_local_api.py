@@ -30,11 +30,12 @@ from desktop.sidecar.provider_store import (
 import desktop.sidecar.release_app as release_app_module
 from desktop.sidecar.release_capabilities import (
     ReleaseAuthorityNegotiationError,
-    V019_RELEASE_AUTHORITY_POLICY,
+    V0110_RELEASE_AUTHORITY_POLICY,
     negotiate_core_v2_mutation,
     negotiate_desktop_v2_mutation,
-    negotiate_v019_mutation_authority,
-    validate_v019_release_composition,
+    negotiate_v0110_mutation_authority,
+    validate_persisted_core_v2_authority,
+    validate_v0110_release_composition,
 )
 from desktop.sidecar.release_app import create_release_desktop_local_api_app
 from desktop.sidecar.release_runtime import CoreRuntimeSessionBinding
@@ -250,8 +251,8 @@ def _canonical_feature_digest(features: list[str]) -> str:
     ).hexdigest()
 
 
-def _v019_desktop_discovery() -> dict[str, object]:
-    policy = V019_RELEASE_AUTHORITY_POLICY
+def _v0110_desktop_discovery() -> dict[str, object]:
+    policy = V0110_RELEASE_AUTHORITY_POLICY
     features = list(policy.required_desktop_feature_flags)
     return {
         "schema_version": "2",
@@ -261,7 +262,7 @@ def _v019_desktop_discovery() -> dict[str, object]:
         "mutation_major": 2,
         "openapi_sha256": policy.desktop_openapi_sha256,
         "event_schema_sha256": policy.desktop_event_schema_sha256,
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "build_id": "a" * 64,
         "source_commit": SOURCE_COMMIT,
         "build_channel": "release",
@@ -273,8 +274,8 @@ def _v019_desktop_discovery() -> dict[str, object]:
     }
 
 
-def _v019_core_discovery() -> dict[str, object]:
-    policy = V019_RELEASE_AUTHORITY_POLICY
+def _v0110_core_discovery() -> dict[str, object]:
+    policy = V0110_RELEASE_AUTHORITY_POLICY
     features = list(policy.required_core_feature_flags)
     return {
         "schema_version": "2",
@@ -300,7 +301,7 @@ def _v019_core_discovery() -> dict[str, object]:
                 "mutation_compatible": True,
             },
         ],
-        "release_version": "0.1.9",
+        "release_version": "0.1.10",
         "build_id": "b" * 64,
         "source_commit": SOURCE_COMMIT,
         "build_channel": "release",
@@ -313,9 +314,9 @@ def _v019_core_discovery() -> dict[str, object]:
     }
 
 
-def test_v019_release_policy_pins_exact_local_and_core_v2_authority() -> None:
-    policy = V019_RELEASE_AUTHORITY_POLICY
-    assert policy.release_version == "0.1.9"
+def test_v0110_release_policy_pins_exact_local_and_core_v2_authority() -> None:
+    policy = V0110_RELEASE_AUTHORITY_POLICY
+    assert policy.release_version == "0.1.10"
     assert policy.desktop_mutation_api_major == 2
     assert policy.core_mutation_api_major == 2
     assert policy.core_openapi_sha256 == core_openapi_sha256()
@@ -323,18 +324,18 @@ def test_v019_release_policy_pins_exact_local_and_core_v2_authority() -> None:
     assert policy.allow_direct_core_url is False
     assert policy.allow_legacy_route_fallback is False
 
-    assert negotiate_desktop_v2_mutation(_v019_desktop_discovery()).mutation_compatible
-    assert negotiate_core_v2_mutation(_v019_core_discovery()).registry_sha256 == "c" * 64
-    authority = negotiate_v019_mutation_authority(
-        _v019_desktop_discovery(), _v019_core_discovery()
+    assert negotiate_desktop_v2_mutation(_v0110_desktop_discovery()).mutation_compatible
+    assert negotiate_core_v2_mutation(_v0110_core_discovery()).registry_sha256 == "c" * 64
+    authority = negotiate_v0110_mutation_authority(
+        _v0110_desktop_discovery(), _v0110_core_discovery()
     )
     assert authority.desktop_build_id == "a" * 64
     assert authority.core_build_id == "b" * 64
     assert authority.source_commit == SOURCE_COMMIT
 
-    mismatched_core = {**_v019_core_discovery(), "source_commit": "abcdef1"}
+    mismatched_core = {**_v0110_core_discovery(), "source_commit": "abcdef1"}
     with pytest.raises(ReleaseAuthorityNegotiationError, match="source identities"):
-        negotiate_v019_mutation_authority(_v019_desktop_discovery(), mismatched_core)
+        negotiate_v0110_mutation_authority(_v0110_desktop_discovery(), mismatched_core)
 
 
 @pytest.mark.parametrize(
@@ -347,14 +348,14 @@ def test_v019_release_policy_pins_exact_local_and_core_v2_authority() -> None:
         ({"mutation_compatible": False}, "not mutation-compatible"),
     ],
 )
-def test_v019_desktop_negotiation_rejects_nonrelease_authority(
+def test_v0110_desktop_negotiation_rejects_nonrelease_authority(
     override: dict[str, object], message: str
 ) -> None:
     with pytest.raises(ReleaseAuthorityNegotiationError, match=message):
-        negotiate_desktop_v2_mutation({**_v019_desktop_discovery(), **override})
+        negotiate_desktop_v2_mutation({**_v0110_desktop_discovery(), **override})
 
 
-def test_v019_core_negotiation_rejects_v1_missing_registry_and_digest_drift() -> None:
+def test_v0110_core_negotiation_rejects_v1_missing_registry_and_digest_drift() -> None:
     with pytest.raises(ReleaseAuthorityNegotiationError, match="Core v2 discovery"):
         negotiate_core_v2_mutation(
             {
@@ -364,12 +365,28 @@ def test_v019_core_negotiation_rejects_v1_missing_registry_and_digest_drift() ->
             }
         )
     with pytest.raises(ReleaseAuthorityNegotiationError, match="registry"):
-        negotiate_core_v2_mutation({**_v019_core_discovery(), "registry_sha256": None})
-    payload = _v019_core_discovery()
+        negotiate_core_v2_mutation({**_v0110_core_discovery(), "registry_sha256": None})
+    payload = _v0110_core_discovery()
     contracts = cast(list[dict[str, object]], payload["contracts"])
     contracts[1] = {**contracts[1], "openapi_sha256": "f" * 64}
     with pytest.raises(ReleaseAuthorityNegotiationError, match="Core OpenAPI"):
         negotiate_core_v2_mutation(payload)
+
+
+def test_persisted_core_authority_accepts_only_exact_v019_predecessor_observation() -> None:
+    historical = {**_v0110_core_discovery(), "release_version": "0.1.9"}
+
+    assert validate_persisted_core_v2_authority(historical).release_version == "0.1.9"
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="release identity"):
+        negotiate_core_v2_mutation(historical)
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="persisted"):
+        validate_persisted_core_v2_authority(
+            {**historical, "release_version": "0.1.8"}
+        )
+    contracts = cast(list[dict[str, object]], historical["contracts"])
+    contracts[1] = {**contracts[1], "event_schema_sha256": "f" * 64}
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="event schema"):
+        validate_persisted_core_v2_authority(historical)
 
 
 @pytest.mark.parametrize(
@@ -384,7 +401,7 @@ def test_v019_core_negotiation_rejects_v1_missing_registry_and_digest_drift() ->
         {"allow_legacy_route_fallback": True},
     ],
 )
-def test_v019_release_composition_rejects_fallbacks(override: dict[str, object]) -> None:
+def test_v0110_release_composition_rejects_fallbacks(override: dict[str, object]) -> None:
     values: dict[str, object] = {
         "provider_kind": "desktop_sidecar",
         "local_api_major": 2,
@@ -394,10 +411,10 @@ def test_v019_release_composition_rejects_fallbacks(override: dict[str, object])
     }
     values.update(override)
     with pytest.raises(ReleaseAuthorityNegotiationError):
-        validate_v019_release_composition(**values)
+        validate_v0110_release_composition(**values)
 
 
-def test_v019_cannot_start_the_frozen_v1_release_provider(tmp_path: Path) -> None:
+def test_v0110_cannot_start_the_frozen_v1_release_provider(tmp_path: Path) -> None:
     state_root = tmp_path / "state"
     with pytest.raises(ReleaseAuthorityNegotiationError, match="Local API v2"):
         create_release_desktop_local_api_app(
@@ -406,7 +423,7 @@ def test_v019_cannot_start_the_frozen_v1_release_provider(tmp_path: Path) -> Non
             instance_id=INSTANCE_ID,
             readiness_key=READINESS_KEY,
             source_commit=SOURCE_COMMIT,
-            build_version="0.1.9",
+            build_version="0.1.10",
             build_channel="release",
         )
     assert not state_root.exists()

@@ -4,10 +4,12 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DesktopProductSnapshotV2 } from "./providerV2";
+import type { OperationV2 } from "../api/v2/schemas";
 import {
   unavailableDesktopProductProviderV2,
   type DesktopProductProviderV2,
 } from "./providerV2";
+import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
 import { DesktopProductAppV2 } from "./DesktopProductAppV2";
 
 const NOW = "2026-07-23T06:00:00Z";
@@ -21,6 +23,7 @@ function baseSnapshot(overrides: Partial<DesktopProductSnapshotV2> = {}): Deskto
       profiles: [],
       active_profile_id: null,
       active_project_id: null,
+      pending_operations: [],
       last_event_id: null,
       updated_at: NOW,
     },
@@ -238,6 +241,7 @@ function authoritySnapshot(state: "ready" | "not_ready" = "ready"): DesktopProdu
       profiles: [profile] as never,
       active_profile_id: profile.profile_id,
       active_project_id: project.project_id,
+      pending_operations: [],
       last_event_id: null,
       updated_at: NOW,
     },
@@ -334,6 +338,7 @@ describe("Desktop v2 product renderer", () => {
   afterEach(async () => {
     if (root) await act(async () => root?.unmount());
     root = null;
+    vi.useRealTimers();
     document.body.innerHTML = "";
   });
 
@@ -522,7 +527,295 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Next task is not ready");
     expect(button("Validate and run task").disabled).toBe(true);
     expect(button("Retry successor transition")).toBeTruthy();
+    expect(document.body.textContent).toContain("Build successor Project Head");
+    expect(document.body.textContent).toContain("Successor state: failed");
+    expect(document.body.textContent).toContain("2 of 5 items");
     expect(provider.submitTask).not.toHaveBeenCalled();
+  });
+
+  it("renders an active Task through the shared long-operation presentation", async () => {
+    const snapshot = authoritySnapshot();
+    const runningTask = {
+      ...snapshot.tasks[0]!,
+      state: "running" as const,
+      successor_transition: null,
+    };
+    const runningSnapshot: DesktopProductSnapshotV2 = {
+      ...snapshot,
+      tasks: [runningTask],
+      transitions: {},
+    };
+
+    root = await render(providerFixture(runningSnapshot));
+
+    expect(document.body.textContent).toContain("Run science Task");
+    expect(document.body.textContent).toContain("Task state: running");
+    expect(document.body.textContent).toContain("Working — progress is not measurable for this phase");
+  });
+
+  it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {
+    const operation: OperationV2 = {
+      schema_version: "2",
+      operation_id: "core-service-restart-1",
+      kind: "service_restart",
+      status: "running",
+      progress_completed: 2,
+      progress_total: 4,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const cancelCoreOperation = vi.fn(async () => ({
+      ...operation,
+      status: "cancelled" as const,
+      updated_at: "2026-07-23T06:00:01Z",
+    }));
+    const provider = {
+      ...providerFixture(authoritySnapshot()),
+      listCoreOperations: () => [operation],
+      cancelCoreOperation,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+
+    expect(document.body.textContent).toContain("Restart remote service");
+    expect(document.body.textContent).toContain("Core status: running");
+    expect(document.body.textContent).toContain("2 of 4 items");
+    await click("Cancel operation");
+    expect(cancelCoreOperation).toHaveBeenCalledWith(
+      operation.operation_id,
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("keeps diagnostic collection observable as its own Core resource", async () => {
+    const snapshot = authoritySnapshot();
+    const diagnostic = {
+      schema_version: "2" as const,
+      diagnostic_id: "diagnostic-system-1",
+      scope: "system" as const,
+      resource_id: null,
+      status: "running" as const,
+      artifact_id: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const createDiagnostic = vi.fn(async () => diagnostic);
+    const provider = {
+      ...providerFixture(snapshot),
+      listDiagnostics: () => [diagnostic],
+      createDiagnostic,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("System");
+
+    expect(document.body.textContent).toContain("Diagnostic status: running");
+    await click("Collect system diagnostics");
+    expect(createDiagnostic).toHaveBeenCalledWith(
+      { scope: "system", resource_id: null },
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("loads remote service output and starts idempotent safe-cache cleanup", async () => {
+    const base = authoritySnapshot();
+    const service = {
+      schema_version: "2" as const,
+      service_id: "service-daemon-1",
+      kind: "daemon" as const,
+      status: "ready" as const,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const snapshot: DesktopProductSnapshotV2 = { ...base, services: [service] };
+    const loadServiceLogs = vi.fn(async () => ({
+      schema_version: "2" as const,
+      items: [{
+        sequence: 1,
+        occurred_at: NOW,
+        stream: "stdout" as const,
+        message: "Daemon registry is ready",
+      }],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const cleanupCaches = vi.fn(async () => ({
+      schema_version: "2" as const,
+      operation_id: "core-cache-cleanup-1",
+      kind: "cache_cleanup" as const,
+      status: "queued" as const,
+      progress_completed: 0,
+      progress_total: 0,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    }));
+    const provider = {
+      ...providerFixture(snapshot),
+      loadServiceLogs,
+      cleanupCaches,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("System");
+    await click("View logs");
+
+    expect(document.body.textContent).toContain("Daemon registry is ready");
+    expect(document.body.textContent).toContain("Service output");
+    await click("Clean safe caches");
+    expect(cleanupCaches).toHaveBeenCalledWith(expect.objectContaining({ streamEpoch: 1 }));
+  });
+
+  it("closes project setup after HTTP 202 while progress and logs stay visible", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const lifecycleState = {
+      operation: {
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        kind: "project_create",
+        resource: { resource_kind: "project", resource_id: "project-pending-1" },
+        request_sha256: DIGEST,
+        status: "running",
+        phase: "creating_remote_project",
+        phase_index: 13,
+        phase_total: 17,
+        progress: { kind: "indeterminate" },
+        cancellable: true,
+        result: null,
+        failure: null,
+        log_sequence_high_watermark: 2,
+        created_at: "2026-07-27T08:00:00Z",
+        started_at: "2026-07-27T08:00:00Z",
+        updated_at: "2026-07-27T08:00:00Z",
+        finished_at: null,
+        etag: ETAG,
+      },
+      logs: [{
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        sequence: 1,
+        occurred_at: "2026-07-27T08:00:00Z",
+        source: "ssh_stdout",
+        text: "Remote project request accepted",
+        truncated: false,
+      }, {
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        sequence: 2,
+        occurred_at: "2026-07-27T08:00:00Z",
+        source: "daemon_stdout",
+        text: "Materializing workspace snapshot",
+        truncated: false,
+      }],
+      droppedBeforeSequence: 0,
+      hasOlderLogs: false,
+      hasNewerLogs: false,
+    } satisfies LifecycleOperationStateV2;
+    let operationVisible = false;
+    let listener: (() => void) | null = null;
+    const createProject = vi.fn(async () => {
+      operationVisible = true;
+      listener?.();
+      return lifecycleState.operation;
+    });
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      subscribe: vi.fn((next: () => void) => {
+        listener = next;
+        return () => { listener = null; };
+      }),
+      listLifecycleOperations: () => operationVisible ? [lifecycleState] : [],
+      listMutationIntents: () => operationVisible ? [{
+        action_id: "create-project-long-running-0001",
+        mutation_kind: "project_create" as const,
+        resource_scope: "project:new:profile-gpu",
+        request_sha256: DIGEST,
+        authority_sha256: DIGEST,
+        provider_stream_instance: "provider-instance-test",
+        provider_stream_epoch: 1,
+        chain_step: "single" as const,
+        accepted_operation_id: "project-create-long-1",
+        completed_operation_ids: [],
+        state: "accepted" as const,
+        created_at: "2026-07-27T08:00:00Z",
+        updated_at: "2026-07-27T08:00:00Z",
+      }] : [],
+      createProject,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    setTextarea("Task objective", "Create a reproducible result from this workspace.");
+    await click("Create project");
+    await act(async () => vi.advanceTimersByTime(16_000));
+
+    expect(createProject).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Creating or loading the remote project");
+    expect(document.body.textContent).toContain("Remote project request accepted");
+    expect(document.body.textContent).toContain("Materializing workspace snapshot");
+    expect(document.body.textContent).toContain("Elapsed 16s");
+    expect(document.body.textContent).not.toContain("Desktop Local API request timed out");
+    expect(document.body.textContent).toContain("Project creation started");
+    expect(Array.from(document.querySelectorAll("button")).some((candidate) => candidate.textContent?.trim() === "Create project")).toBe(false);
+  });
+
+  it("can cancel native workspace preparation while the lifecycle operation is running", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const selectNativeWorkspace = vi.fn(async () => new Promise<never>(() => {}));
+    const cancelNativeWorkspace = vi.fn(async () => {});
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      selectNativeWorkspace,
+      cancelNativeWorkspace,
+      settleNativeWorkspace: vi.fn(async () => {}),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    setTextarea("Task objective", "Prepare a native workspace safely.");
+    await click("Choose folder snapshot");
+    expect(selectNativeWorkspace).toHaveBeenCalledTimes(1);
+    await click("Cancel");
+
+    expect(cancelNativeWorkspace).toHaveBeenCalledWith(expect.any(String));
   });
 });
 
@@ -568,5 +861,17 @@ function setInput(label: string, value: string): void {
     setter?.call(input, value);
     input.dispatchEvent(new Event("input", { bubbles: true }));
     input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+}
+
+function setTextarea(label: string, value: string): void {
+  const labels = [...document.querySelectorAll<HTMLLabelElement>("label")];
+  const owner = labels.find((candidate) => candidate.textContent?.includes(label));
+  const input = owner?.querySelector<HTMLTextAreaElement>("textarea");
+  if (!input) throw new Error(`textarea not found: ${label}`);
+  act(() => {
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }

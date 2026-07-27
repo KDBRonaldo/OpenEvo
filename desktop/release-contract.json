@@ -16,7 +16,7 @@
     "maintenance"
   ],
   "schema_version": "1",
-  "v019": {
+  "v0110": {
     "accepted_core_event_schema_digests": [
       "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
     ],
@@ -24,10 +24,10 @@
       "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
     ],
     "accepted_desktop_event_schema_digests": [
-      "bc1dbc7b3bf7a68e02ba87adf35bd75f511382bf665afc33cae436110d8aea28"
+      "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
     ],
     "accepted_desktop_openapi_digests": [
-      "987116bff9919930af0177567b4e2a549b3acc2e4dcf1780a1bccccc6530f672"
+      "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760"
     ],
     "allow_direct_core_url": false,
     "allow_legacy_route_fallback": false,
@@ -44,7 +44,7 @@
       "scaffold",
       "source_sidecar"
     ],
-    "release_version": "0.1.9",
+    "release_version": "0.1.10",
     "require_registry_identity": true,
     "required_core_feature_flags": [
       "atomic_successor_v2",
@@ -62,6 +62,9 @@
       "daemon_bundle_v2",
       "event_replay_v2",
       "host_key_review",
+      "lifecycle_operations_v2",
+      "lifecycle_process_logs_v2",
+      "mutation_idempotency_v2",
       "native_askpass",
       "system_openssh_profiles",
       "task_admission_v2"

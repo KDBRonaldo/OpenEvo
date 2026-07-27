@@ -16,14 +16,14 @@ import posixpath
 import re
 import secrets
 import signal
-import shutil
 import socket
+import sqlite3
 import stat
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import time
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
 from urllib.request import build_opener, ProxyHandler, Request
@@ -47,7 +47,20 @@ from openevo_startup_diagnostics import (  # noqa: E402
 from desktop.sidecar.contracts.v2.models import (  # noqa: E402
     DesktopStateV2,
     DesktopVersionV2,
+    LifecycleProgressIndeterminateV2,
+    ProjectCreateV2,
+    RemoteWorkspaceProfileV2,
+    SshTrustStateV2,
 )
+from desktop.sidecar import provider_store_v2 as provider_store_v2  # noqa: E402
+from desktop.sidecar.provider_store_v2 import (  # noqa: E402
+    DesktopProviderStoreV2,
+    LifecycleLogAppendV2,
+    LifecycleOperationAdvanceV2,
+    LifecycleOperationReservationV2,
+    LifecycleProjectCreateRequestV2,
+)
+from openevo.backend.contracts.v2.models import ScienceProjectConfigV2  # noqa: E402
 from openevo.deployment.ssh import (  # noqa: E402
     _SubprocessExitObserver,
     _confirm_owned_process_group_disappeared,
@@ -80,6 +93,10 @@ NATIVE_ARCHIVE_FD = 4
 NATIVE_GUARD_MIN_FD = 64
 NATIVE_SIDECAR_BASENAME = "openevo-desktop-sidecar"
 NATIVE_ASKPASS_BASENAME = "openevo-ssh-askpass"
+SMOKE_V019_PROFILE_ID = "profile-v019-packaged-smoke"
+SMOKE_PROJECT_ID = "project-v010-restart-smoke"
+SMOKE_LIFECYCLE_ACTION_ID = "v010-sidecar-smoke-project-create-0001"
+SMOKE_LIFECYCLE_LOG_TEXT = "OpenSSH smoke worker reached remote preflight"
 STARTUP_DIAGNOSTIC_SCAN_MAX_BYTES = 32 * 1024
 STARTUP_DIAGNOSTIC_MAX_LINES = 8
 _STARTUP_DIAGNOSTIC_PATTERN = re.compile(
@@ -176,10 +193,10 @@ def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
         "allowed_provider_kinds",
         "required_feature_flags",
         "schema_version",
-        "v019",
+        "v0110",
     }:
         raise RuntimeError("Desktop release contract does not use the closed schema")
-    policy = payload.get("v019")
+    policy = payload.get("v0110")
     digests = policy.get("accepted_desktop_openapi_digests") if type(policy) is dict else None
     event_digests = (
         policy.get("accepted_desktop_event_schema_digests")
@@ -199,7 +216,7 @@ def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
         or len(event_digests) != 1
         or type(event_digests[0]) is not str
         or re.fullmatch(r"[0-9a-f]{64}", event_digests[0]) is None
-        or release_version != "0.1.9"
+        or release_version != "0.1.10"
         or provider_kinds != ["desktop_sidecar"]
         or type(features) is not list
         or not features
@@ -221,6 +238,259 @@ def _load_release_contract() -> tuple[str, str, str, tuple[str, ...]]:
 
 class SmokeFailure(RuntimeError):
     """Raised when the packaged sidecar cannot serve the Desktop shell."""
+
+
+class _LifecycleSmokeAuthority(NamedTuple):
+    operation_id: str
+    request_sha256: str
+
+
+def _provider_state_root(config_root: Path) -> Path:
+    return config_root / "state-v2" / "provider-v2"
+
+
+def _v019_smoke_profile() -> RemoteWorkspaceProfileV2:
+    timestamp = "2026-07-23T04:00:00.000000Z"
+    return RemoteWorkspaceProfileV2(
+        profile_id=SMOKE_V019_PROFILE_ID,
+        display_name="Retained v0.1.9 smoke profile",
+        ssh_host_alias="v019-packaged-smoke",
+        catalog_generation=1,
+        connection_generation=1,
+        connection_state="disconnected",
+        prompt=None,
+        trust=SshTrustStateV2(
+            connection_generation=1,
+            state="unverified",
+            review_id=None,
+            review_sha256=None,
+            key_fingerprints=[],
+            repair_support="not_needed",
+        ),
+        failure=None,
+        active_project_id=None,
+        core_api_major=None,
+        core_openapi_sha256=None,
+        core_event_schema_sha256=None,
+        core_registry_sha256=None,
+        created_at=timestamp,
+        updated_at=timestamp,
+        etag=DesktopProviderStoreV2._etag("profile", SMOKE_V019_PROFILE_ID, 1),
+    )
+
+
+def _prepare_v019_provider_state(config_root: Path) -> None:
+    """Write one exact schema-v2 profile for packaged v0.1.10 migration smoke."""
+
+    provider_root = _provider_state_root(config_root)
+    try:
+        provider_root.mkdir(parents=True, mode=0o700)
+        os.chmod(config_root, 0o700)
+        os.chmod(config_root / "state-v2", 0o700)
+        os.chmod(provider_root, 0o700)
+    except OSError as exc:
+        raise SmokeFailure("v0.1.9 smoke state root could not be created") from exc
+    database = provider_root / provider_store_v2.DATABASE_FILENAME
+    if database.exists():
+        raise SmokeFailure("v0.1.9 smoke state already exists")
+    try:
+        database.touch(mode=0o600)
+        os.chmod(database, 0o600)
+        profile = _v019_smoke_profile()
+        timestamp = profile.created_at
+        with sqlite3.connect(database) as connection:
+            connection.execute("BEGIN EXCLUSIVE")
+            for statement in (
+                *provider_store_v2._SCHEMA_V1_STATEMENTS,
+                *provider_store_v2._SCHEMA_V2_ADDITIONS,
+            ):
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO schema_metadata VALUES (1, ?, 2, ?, ?)",
+                (
+                    provider_store_v2.STORE_NAMESPACE,
+                    provider_store_v2.EXPECTED_SCHEMA_V2_SHA256,
+                    timestamp,
+                ),
+            )
+            connection.executemany(
+                "INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+                ((1, timestamp), (2, timestamp)),
+            )
+            connection.execute(
+                """
+                INSERT INTO profiles(
+                    profile_id, profile_kind, document_json, resource_version,
+                    legacy_source_ref_sha256, legacy_source_document_sha256,
+                    rebound_from_sha256, created_at, updated_at
+                ) VALUES (?, 'system_openssh', ?, 1, NULL, NULL, NULL, ?, ?)
+                """,
+                (
+                    profile.profile_id,
+                    provider_store_v2._canonical_json_bytes(profile),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO idempotency_records(
+                    principal, operation, resource_scope, idempotency_key,
+                    request_sha256, response_kind, response_resource_version,
+                    response_json, created_at
+                ) VALUES (?, 'createSystemOpenSshProfileV2', 'profiles', ?, ?,
+                          'profile', 1, ?, ?)
+                """,
+                (
+                    provider_store_v2.LOCAL_PRINCIPAL,
+                    "v019-retained-profile-create-0001",
+                    "9" * 64,
+                    provider_store_v2._canonical_json_bytes(profile),
+                    timestamp,
+                ),
+            )
+            connection.execute("PRAGMA user_version = 2")
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        raise SmokeFailure("v0.1.9 smoke state could not be written") from exc
+
+
+def _smoke_project_reservation() -> LifecycleOperationReservationV2:
+    config = ScienceProjectConfigV2.model_validate(
+        {
+            "task": {
+                "title": "Packaged lifecycle recovery smoke",
+                "objective": "Prove exact retry after one Desktop restart.",
+            },
+            "workspace": {"kind": "scratch", "display_name": "Smoke scratch"},
+            "execution": {
+                "mode": "codex_subscription_transcript",
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+                "harness_id": "codex",
+                "codex_model": "gpt-5.5",
+                "reasoning_effort": "high",
+                "token_limit": 32768,
+                "task_network_allow_internet": False,
+            },
+            "evolution": {"targets": {}},
+        }
+    )
+    request = ProjectCreateV2(
+        profile_id=SMOKE_V019_PROFILE_ID,
+        profile_connection_generation=1,
+        display_name="Packaged lifecycle recovery smoke",
+        config=config,
+    )
+    return LifecycleOperationReservationV2(
+        kind="project_create",
+        resource={"resource_kind": "project", "resource_id": SMOKE_PROJECT_ID},
+        request=LifecycleProjectCreateRequestV2(
+            request_kind="project_create",
+            project_id=SMOKE_PROJECT_ID,
+            action_id="desktop-smoke-project-action-0001",
+            request=request,
+            resource_generation=1,
+        ),
+    )
+
+
+def _prime_recoverable_lifecycle(config_root: Path) -> _LifecycleSmokeAuthority:
+    provider_root = _provider_state_root(config_root)
+    try:
+        with DesktopProviderStoreV2(provider_root) as store:
+            if store.schema_fingerprint != provider_store_v2.EXPECTED_SCHEMA_V3_SHA256:
+                raise SmokeFailure("packaged sidecar did not migrate provider state to v3")
+            if [profile.profile_id for profile in store.list_profiles()] != [
+                SMOKE_V019_PROFILE_ID
+            ]:
+                raise SmokeFailure("packaged sidecar did not retain v0.1.9 profile state")
+            operation = store.reserve_lifecycle_operation(
+                _smoke_project_reservation(),
+                idempotency_key=SMOKE_LIFECYCLE_ACTION_ID,
+            )
+            work = store.claim_next_lifecycle_operation()
+            if work is None or work.operation.operation_id != operation.operation_id:
+                raise SmokeFailure("lifecycle smoke operation could not be claimed")
+            advanced = store.advance_lifecycle_operation(
+                LifecycleOperationAdvanceV2(
+                    operation_id=work.operation.operation_id,
+                    expected_etag=work.operation.etag,
+                    phase="remote_preflight",
+                    progress=LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                    cancellable=True,
+                )
+            )
+            logged = store.append_lifecycle_log(
+                LifecycleLogAppendV2(
+                    operation_id=advanced.operation_id,
+                    source="ssh_stderr",
+                    text=SMOKE_LIFECYCLE_LOG_TEXT,
+                    truncated=False,
+                )
+            )
+            return _LifecycleSmokeAuthority(
+                operation_id=logged.operation_id,
+                request_sha256=logged.request_sha256,
+            )
+    except SmokeFailure:
+        raise
+    except (OSError, provider_store_v2.ProviderStoreV2Error, ValidationError) as exc:
+        raise SmokeFailure("recoverable lifecycle smoke state could not be primed") from exc
+
+
+def _verify_exact_lifecycle_replay(
+    config_root: Path,
+    authority: _LifecycleSmokeAuthority,
+) -> Any:
+    try:
+        with DesktopProviderStoreV2(_provider_state_root(config_root)) as store:
+            replay = store.reserve_lifecycle_operation(
+                _smoke_project_reservation(),
+                idempotency_key=SMOKE_LIFECYCLE_ACTION_ID,
+            )
+            pending = store.list_pending_lifecycle_operations()
+    except (OSError, provider_store_v2.ProviderStoreV2Error, ValidationError) as exc:
+        raise SmokeFailure("lifecycle smoke replay could not be verified") from exc
+    if (
+        replay.operation_id != authority.operation_id
+        or replay.request_sha256 != authority.request_sha256
+        or [item.operation_id for item in pending] != [authority.operation_id]
+    ):
+        raise SmokeFailure("lifecycle exact replay created another operation")
+    return replay
+
+
+def _assert_recovered_lifecycle_http(
+    operation: dict[str, Any],
+    logs: dict[str, Any],
+    authority: _LifecycleSmokeAuthority,
+) -> None:
+    if (
+        operation.get("operation_id") != authority.operation_id
+        or operation.get("request_sha256") != authority.request_sha256
+        or operation.get("kind") != "project_create"
+    ):
+        raise SmokeFailure("recovered lifecycle operation identity changed")
+    if (
+        operation.get("status") != "running"
+        or operation.get("phase") != "remote_preflight"
+        or operation.get("cancellable") is not True
+    ):
+        raise SmokeFailure("recovered lifecycle operation did not wait for reconnect")
+    items = logs.get("items")
+    if logs.get("operation_id") != authority.operation_id or not isinstance(items, list):
+        raise SmokeFailure("recovered lifecycle log authority changed")
+    expected = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and item.get("operation_id") == authority.operation_id
+        and item.get("source") == "ssh_stderr"
+        and item.get("text") == SMOKE_LIFECYCLE_LOG_TEXT
+        and item.get("truncated") is False
+    ]
+    if len(expected) != 1:
+        raise SmokeFailure("recovered lifecycle log was absent or duplicated")
 
 
 class _AssetParser(HTMLParser):
@@ -363,6 +633,97 @@ def _force_kill_anchored_process_group(
     process.wait(timeout=10)
 
 
+def _stage_native_launch_copy(
+    source: Path,
+    *,
+    parent: Path,
+    basename: str,
+    mode: int,
+) -> Path:
+    if mode not in {0o500, 0o755}:
+        raise SmokeFailure("native launch copy mode is invalid")
+    source_fd = -1
+    destination_fd = -1
+    destination: Path | None = None
+    launch_root: Path | None = None
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        source_fd = os.open(source, os.O_RDONLY | os.O_CLOEXEC | nofollow)
+        source_metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(source_metadata.st_mode) or source_metadata.st_size <= 0:
+            raise SmokeFailure("native launch source metadata is invalid")
+        for _ in range(16):
+            candidate_root = parent / f".native-launch-{secrets.token_hex(12)}"
+            try:
+                candidate_root.mkdir(mode=0o700)
+            except FileExistsError:
+                continue
+            launch_root = candidate_root
+            destination = launch_root / basename
+            destination_fd = os.open(
+                destination,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | nofollow,
+                0o600,
+            )
+            break
+        if destination is None or destination_fd < 0:
+            raise SmokeFailure("native launch copy could not be allocated")
+        while True:
+            chunk = os.read(source_fd, 1024 * 1024)
+            if not chunk:
+                break
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    raise SmokeFailure("native launch copy write failed")
+                offset += written
+        os.fchmod(destination_fd, mode)
+        os.fsync(destination_fd)
+        destination_metadata = os.fstat(destination_fd)
+        if (
+            not stat.S_ISREG(destination_metadata.st_mode)
+            or destination_metadata.st_nlink != 1
+            or destination_metadata.st_size != source_metadata.st_size
+            or stat.S_IMODE(destination_metadata.st_mode) != mode
+        ):
+            raise SmokeFailure("native launch copy metadata is invalid")
+        return destination
+    except SmokeFailure:
+        if destination is not None:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        if launch_root is not None:
+            try:
+                launch_root.rmdir()
+            except OSError:
+                pass
+        raise
+    except OSError as exc:
+        if destination is not None:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        if launch_root is not None:
+            try:
+                launch_root.rmdir()
+            except OSError:
+                pass
+        raise SmokeFailure("native launch copy could not be staged") from exc
+    finally:
+        if destination_fd >= 0:
+            os.close(destination_fd)
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
 def _launch_native_sidecar(
     sidecar: Path,
     *,
@@ -389,14 +750,20 @@ def _launch_native_sidecar(
             or not 0 < helper_metadata.st_size <= 16 * 1024 * 1024
         ):
             raise SmokeFailure("packaged SSH askpass helper metadata is invalid")
-    launch_path = config_root.parent / NATIVE_SIDECAR_BASENAME
-    shutil.copyfile(sidecar, launch_path)
-    launch_path.chmod(0o500)
+    launch_path = _stage_native_launch_copy(
+        sidecar,
+        parent=config_root.parent,
+        basename=NATIVE_SIDECAR_BASENAME,
+        mode=0o500,
+    )
     helper_launch_path: Path | None = None
     if helper_source is not None:
-        helper_launch_path = config_root.parent / NATIVE_ASKPASS_BASENAME
-        shutil.copyfile(helper_source, helper_launch_path)
-        helper_launch_path.chmod(0o755)
+        helper_launch_path = _stage_native_launch_copy(
+            helper_source,
+            parent=config_root.parent,
+            basename=NATIVE_ASKPASS_BASENAME,
+            mode=0o755,
+        )
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.bind(("127.0.0.1", 0))
     listener.listen(128)
@@ -719,7 +1086,12 @@ def _assert_release_version(payload: dict[str, Any]) -> None:
         raise SmokeFailure("packaged sidecar returned an invalid release contract")
 
 
-def _assert_desktop_state(payload: dict[str, Any]) -> None:
+def _assert_desktop_state(
+    payload: dict[str, Any],
+    *,
+    expected_profile_id: str | None = None,
+    expected_operation_id: str | None = None,
+) -> DesktopStateV2:
     try:
         state = DesktopStateV2.model_validate_json(
             json.dumps(payload, separators=(",", ":"), sort_keys=True)
@@ -730,8 +1102,13 @@ def _assert_desktop_state(payload: dict[str, Any]) -> None:
         state.schema_version != "2"
         or state.active_profile_id is not None
         or state.active_project_id is not None
+        or [profile.profile_id for profile in state.profiles]
+        != ([] if expected_profile_id is None else [expected_profile_id])
+        or [operation.operation_id for operation in state.pending_operations]
+        != ([] if expected_operation_id is None else [expected_operation_id])
     ):
         raise SmokeFailure("packaged sidecar state does not bind the release contract")
+    return state
 
 
 def _terminate(
@@ -778,112 +1155,159 @@ def smoke_sidecar(
     sidecar: Path,
     *,
     timeout_seconds: float,
+    exercise_lifecycle: bool = True,
 ) -> None:
     if not sidecar.is_file():
         raise SmokeFailure(f"sidecar executable does not exist: {sidecar}")
 
     with TemporaryDirectory(prefix="openevo-sidecar-smoke-") as temporary_root:
-        root = Path(temporary_root)
-        (
-            process,
-            base_url,
-            credentials,
-            process_group_id,
-            exit_observer,
-        ) = _launch_native_sidecar(
+        config_root = Path(temporary_root) / "config"
+        if exercise_lifecycle:
+            _prepare_v019_provider_state(config_root)
+        _smoke_sidecar_instance(
             sidecar,
-            config_root=root / "config",
+            config_root=config_root,
+            timeout_seconds=timeout_seconds,
+            expected_profile_id=(
+                SMOKE_V019_PROFILE_ID if exercise_lifecycle else None
+            ),
         )
-        try:
-            deadline = time.monotonic() + timeout_seconds
-            while time.monotonic() < deadline:
-                try:
-                    exited = exit_observer.exited()
-                except Exception:
-                    raise SmokeFailure("native sidecar exit observation failed") from None
-                if exited:
-                    raise SmokeFailure(
-                        _process_failure(
-                            process,
-                            process_group_id=process_group_id,
-                            exit_observer=exit_observer,
-                        )
-                    )
-                try:
-                    challenge = secrets.token_hex(32)
-                    health = _read_json(
-                        f"{base_url}/openevo-native/health",
-                        headers={NATIVE_CHALLENGE_HEADER: challenge},
-                    )
-                    domain = (
-                        f"{NATIVE_SIDECAR_PROTOCOL}\0{credentials.instance_id}\0{challenge}"
-                    ).encode("ascii")
-                    expected_proof = hmac.new(
-                        credentials.readiness_key,
-                        domain,
-                        hashlib.sha256,
-                    ).hexdigest()
-                    if health == {
-                        "service": "openevo-sidecar",
-                        "status": "ok",
-                        "protocol": NATIVE_SIDECAR_PROTOCOL,
-                        "instance_id": credentials.instance_id,
-                        "instance_proof": expected_proof,
-                    }:
-                        break
-                except SmokeFailure:
-                    time.sleep(0.25)
-            else:
-                raise SmokeFailure(f"sidecar did not become healthy within {timeout_seconds}s")
+        if exercise_lifecycle:
+            authority = _prime_recoverable_lifecycle(config_root)
+            _smoke_sidecar_instance(
+                sidecar,
+                config_root=config_root,
+                timeout_seconds=timeout_seconds,
+                expected_profile_id=SMOKE_V019_PROFILE_ID,
+                lifecycle_authority=authority,
+            )
+            replay = _verify_exact_lifecycle_replay(config_root, authority)
+            if (
+                replay.status != "running"
+                or replay.phase != "remote_preflight"
+                or not replay.cancellable
+            ):
+                raise SmokeFailure("recovered lifecycle replay did not wait for reconnect")
 
-            _assert_release_version(_read_json(f"{base_url}/version"))
 
-            session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
+def _smoke_sidecar_instance(
+    sidecar: Path,
+    *,
+    config_root: Path,
+    timeout_seconds: float,
+    expected_profile_id: str | None,
+    lifecycle_authority: _LifecycleSmokeAuthority | None = None,
+) -> None:
+    (
+        process,
+        base_url,
+        credentials,
+        process_group_id,
+        exit_observer,
+    ) = _launch_native_sidecar(sidecar, config_root=config_root)
+    try:
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            try:
+                exited = exit_observer.exited()
+            except Exception:
+                raise SmokeFailure("native sidecar exit observation failed") from None
+            if exited:
+                raise SmokeFailure(
+                    _process_failure(
+                        process,
+                        process_group_id=process_group_id,
+                        exit_observer=exit_observer,
+                    )
+                )
+            try:
+                challenge = secrets.token_hex(32)
+                health = _read_json(
+                    f"{base_url}/openevo-native/health",
+                    headers={NATIVE_CHALLENGE_HEADER: challenge},
+                )
+                domain = (
+                    f"{NATIVE_SIDECAR_PROTOCOL}\0{credentials.instance_id}\0{challenge}"
+                ).encode("ascii")
+                expected_proof = hmac.new(
+                    credentials.readiness_key,
+                    domain,
+                    hashlib.sha256,
+                ).hexdigest()
+                if health == {
+                    "service": "openevo-sidecar",
+                    "status": "ok",
+                    "protocol": NATIVE_SIDECAR_PROTOCOL,
+                    "instance_id": credentials.instance_id,
+                    "instance_proof": expected_proof,
+                }:
+                    break
+            except SmokeFailure:
+                time.sleep(0.25)
+        else:
+            raise SmokeFailure(f"sidecar did not become healthy within {timeout_seconds}s")
+
+        _assert_release_version(_read_json(f"{base_url}/version"))
+
+        session_headers = {DESKTOP_SESSION_HEADER: credentials.session_token}
+        _assert_desktop_state(
+            _read_json(
+                f"{base_url}/desktop/v2/state",
+                headers=session_headers,
+            ),
+            expected_profile_id=expected_profile_id,
+            expected_operation_id=(
+                None if lifecycle_authority is None else lifecycle_authority.operation_id
+            ),
+        )
+        if lifecycle_authority is not None:
+            operation = _read_json(
+                f"{base_url}/desktop/v2/operations/{lifecycle_authority.operation_id}",
+                headers=session_headers,
+            )
+            logs = _read_json(
+                f"{base_url}/desktop/v2/operations/{lifecycle_authority.operation_id}/logs?limit=100",
+                headers=session_headers,
+            )
+            _assert_recovered_lifecycle_http(operation, logs, lifecycle_authority)
             _assert_desktop_state(
                 _read_json(
                     f"{base_url}/desktop/v2/state",
                     headers=session_headers,
-                )
+                ),
+                expected_profile_id=expected_profile_id,
+                expected_operation_id=lifecycle_authority.operation_id,
             )
-            _read_url(
-                f"{base_url}/desktop/v2/state",
-                expected_status=401,
-            )
-            _read_url(
-                f"{base_url}/openevo-native/session",
-                headers=session_headers,
-                expected_status=204,
-            )
-            _read_url(
-                f"{base_url}/openevo-native/session",
-                expected_status=403,
-            )
-            _read_url(
-                f"{base_url}/openevo-api/desktop/shell",
-                expected_status=404,
-            )
-            _read_url(
-                f"{base_url}/desktop/v1/state",
-                headers=session_headers,
-                expected_status=404,
-            )
+        _read_url(f"{base_url}/desktop/v2/state", expected_status=401)
+        _read_url(
+            f"{base_url}/openevo-native/session",
+            headers=session_headers,
+            expected_status=204,
+        )
+        _read_url(f"{base_url}/openevo-native/session", expected_status=403)
+        _read_url(f"{base_url}/openevo-api/desktop/shell", expected_status=404)
+        _read_url(
+            f"{base_url}/desktop/v1/state",
+            headers=session_headers,
+            expected_status=404,
+        )
 
-            index_html = _read_url(f"{base_url}/openevo").decode("utf-8")
-            assets = _asset_references(index_html)
-            if not assets:
-                raise SmokeFailure("/openevo did not reference any packaged assets")
-            for asset in assets:
-                _read_url(f"{base_url}/{asset}")
+        index_html = _read_url(f"{base_url}/openevo").decode("utf-8")
+        assets = _asset_references(index_html)
+        if not assets:
+            raise SmokeFailure("/openevo did not reference any packaged assets")
+        for asset in assets:
+            _read_url(f"{base_url}/{asset}")
+    finally:
+        assert process.stdout is not None
+        try:
+            _terminate(
+                process,
+                process_group_id=process_group_id,
+                exit_observer=exit_observer,
+            )
         finally:
-            assert process.stdout is not None
-            try:
-                _terminate(
-                    process,
-                    process_group_id=process_group_id,
-                    exit_observer=exit_observer,
-                )
-            finally:
-                process.stdout.close()
+            process.stdout.close()
 
 
 def _process_failure(

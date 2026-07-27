@@ -21,6 +21,7 @@ import {
   useState,
 } from "react";
 import { DesktopApiErrorV2 } from "../api/v2/client";
+import type { LogEntryV2 } from "../api/v2/logs";
 import type {
   ProjectV2,
   RemoteProfileV2,
@@ -31,6 +32,15 @@ import type {
 } from "../api/v2/schemas";
 import { OpenEvoMark } from "../components/OpenEvoMark";
 import { SampleScientificProjectView } from "./ScientificProjectSample";
+import {
+  LifecycleOperationPanelV2,
+  coreOperationPanelModelV2,
+  diagnosticPanelModelV2,
+  lifecycleOperationPanelModelV2,
+  servicePanelModelV2,
+  taskPanelModelV2,
+  transitionPanelModelV2,
+} from "./LifecycleOperationPanelV2";
 import {
   SAMPLE_SCIENTIFIC_PROJECT,
   SAMPLE_SCIENTIFIC_PROJECTS,
@@ -69,6 +79,7 @@ export function DesktopProductAppV2({
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [projectOpen, setProjectOpen] = useState(false);
+  const [serviceLogs, setServiceLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
   const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
     SAMPLE_SCIENTIFIC_PROJECT.id,
   );
@@ -166,6 +177,11 @@ export function DesktopProductAppV2({
   const selectedSample = sampleScientificProject(selectedSampleId);
   const generation = activeProject?.active_project_head?.generation
     ?? selectedSample.activeProjectHeadGeneration;
+  const lifecycleStates = provider.listLifecycleOperations();
+  const coreOperations = provider.listCoreOperations();
+  const diagnostics = provider.listDiagnostics();
+  const mutationIntents = provider.listMutationIntents();
+  const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
 
   const runProject = async (project: ProjectV2): Promise<void> => {
     if (project.state !== "ready") return;
@@ -261,6 +277,7 @@ export function DesktopProductAppV2({
               project={activeProject}
               tasks={snapshot.tasks}
               transitions={snapshot.transitions}
+              timelines={snapshot.timelines}
               busy={busy}
               onRun={() => void runProject(activeProject)}
               onCancelTask={(task) => void act(
@@ -300,10 +317,104 @@ export function DesktopProductAppV2({
                 () => provider.restartService(serviceId, intentFor(snapshot, "restart-service")),
                 "Service restart requested.",
               )}
+              serviceLogs={serviceLogs}
+              onLoadServiceLogs={async (serviceId) => {
+                setBusy(true);
+                setActionError(null);
+                try {
+                  const page = await provider.loadServiceLogs(serviceId, { limit: 100 });
+                  setServiceLogs((current) => ({ ...current, [serviceId]: page.items }));
+                } catch (error) {
+                  setActionError(userMessageV2(error));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              onCleanupCaches={() => void act(
+                () => provider.cleanupCaches(intentFor(snapshot, "cleanup-caches")),
+                "Safe remote cache cleanup requested.",
+              )}
+              onCreateDiagnostic={() => void act(
+                () => provider.createDiagnostic(
+                  { scope: "system", resource_id: null },
+                  intentFor(snapshot, "collect-system-diagnostic"),
+                ),
+                "System diagnostic collection requested.",
+              )}
             />
           )}
         </main>
       </div>
+
+      {visibleOperationCount > 0 ? (
+        <aside className="v2-global-operations" aria-label="Active operations">
+          <div className="v2-global-operations-heading">
+            <strong>{visibleOperationCount} operation{visibleOperationCount === 1 ? "" : "s"}</strong>
+            <span>Work continues safely if this panel or Desktop is closed.</span>
+          </div>
+          <div className="v2-global-operation-list">
+            {lifecycleStates.map((state) => {
+              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === state.operation.operation_id
+                || candidate.completed_operation_ids.includes(state.operation.operation_id));
+              return (
+                <LifecycleOperationPanelV2
+                  key={state.operation.operation_id}
+                  model={lifecycleOperationPanelModelV2(state, undefined, { unresolvedMutation: intent !== undefined })}
+                  onCancel={state.operation.cancellable ? () => act(
+                    () => provider.cancelLifecycleOperation(
+                      state.operation.operation_id,
+                      intentFor(snapshot, "cancel-lifecycle"),
+                    ),
+                    "Lifecycle cancellation requested.",
+                  ).then(() => undefined) : undefined}
+                  onLoadOlder={() => provider.loadOlderLifecycleLogs(state.operation.operation_id).then(() => {
+                    setSnapshot((current) => current === null ? null : { ...current });
+                  })}
+                  onLoadLatest={() => provider.loadLatestLifecycleLogs(state.operation.operation_id).then(() => {
+                    setSnapshot((current) => current === null ? null : { ...current });
+                  })}
+                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
+                />
+              );
+            })}
+            {coreOperations.map((operation) => {
+              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === operation.operation_id
+                || candidate.completed_operation_ids.includes(operation.operation_id));
+              return (
+                <LifecycleOperationPanelV2
+                  key={operation.operation_id}
+                  model={{
+                    ...coreOperationPanelModelV2(operation),
+                    unresolvedMutation: intent !== undefined,
+                  }}
+                  onCancel={["queued", "running"].includes(operation.status) ? () => act(
+                    () => provider.cancelCoreOperation(
+                      operation.operation_id,
+                      intentFor(snapshot, "cancel-core-operation"),
+                    ),
+                    "Core operation cancellation requested.",
+                  ).then(() => undefined) : undefined}
+                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
+                />
+              );
+            })}
+            {diagnostics.map((diagnostic) => {
+              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === diagnostic.diagnostic_id
+                || candidate.completed_operation_ids.includes(diagnostic.diagnostic_id));
+              return (
+                <LifecycleOperationPanelV2
+                  key={diagnostic.diagnostic_id}
+                  model={{
+                    ...diagnosticPanelModelV2(diagnostic),
+                    unresolvedMutation: intent !== undefined,
+                  }}
+                  onResume={intent === undefined ? undefined : () => provider.resumeMutationIntent(intent.action_id).then(() => refresh()).then(() => undefined)}
+                />
+              );
+            })}
+          </div>
+        </aside>
+      ) : null}
 
       {connectionOpen ? (
         <RemoteWorkspaceSetupV2
@@ -334,7 +445,7 @@ export function DesktopProductAppV2({
           onCreated={async () => {
             await refresh();
             setProjectOpen(false);
-            setActionStatus("Project created on the connected OpenEvo Daemon.");
+            setActionStatus("Project creation started. Progress and process logs remain available in Operations.");
           }}
           onError={(error) => setActionError(userMessageV2(error))}
         />
@@ -566,25 +677,52 @@ function NewProjectDialogV2({
   const [objective, setObjective] = useState("");
   const [workspaceKind, setWorkspaceKind] = useState<"scratch" | "native_folder_snapshot">("scratch");
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState("Research workspace");
+  const [selectedSourceDisplayName, setSelectedSourceDisplayName] = useState<string | null>(null);
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
+  const closedRef = useRef(false);
   const dialogRef = useDialogBoundary(onClose);
-  const valid = displayName.trim() !== "" && title.trim() !== "" && objective.trim() !== ""
+  const baseDraftValid = displayName.trim() !== "" && title.trim() !== "" && objective.trim() !== "";
+  const valid = baseDraftValid
     && (workspaceKind === "scratch" || sourceActionId !== null);
 
   const chooseFolder = async (): Promise<void> => {
     const actionId = actionIdV2("select-workspace");
+    setSourceActionId(actionId);
     onBusy(true);
     try {
+      const config = scienceProjectConfig(
+        title,
+        objective,
+        "native_folder_snapshot",
+        workspaceDisplayName,
+      );
       const source = await provider.selectNativeWorkspace({
         kind: "native_folder_snapshot",
         actionId,
         streamEpoch: snapshot.stream.epoch,
+        draft: {
+          profileId: profile.profile_id,
+          displayName: displayName.trim(),
+          config,
+        },
+        profileAuthority: {
+          profileId: profile.profile_id,
+          connectionGeneration: profile.connection_generation,
+          etag: profile.etag,
+        },
       });
+      if (closedRef.current) {
+        await provider.settleNativeWorkspace(actionId, "discard").catch(() => {});
+        return;
+      }
       setWorkspaceKind("native_folder_snapshot");
-      setWorkspaceDisplayName(source.display_name);
-      setSourceActionId(actionId);
+      setSelectedSourceDisplayName(source.display_name);
     } catch (error) {
-      onError(error);
+      await provider.settleNativeWorkspace(actionId, "discard").catch(() => {});
+      if (!closedRef.current) {
+        setSourceActionId(null);
+        onError(error);
+      }
     } finally {
       onBusy(false);
     }
@@ -593,22 +731,7 @@ function NewProjectDialogV2({
   const create = async (): Promise<void> => {
     if (!valid) return;
     const actionId = workspaceKind === "native_folder_snapshot" ? sourceActionId! : actionIdV2("create-project");
-    const config: ScienceProjectConfigV2 = {
-      schema_version: "2",
-      task: { title: title.trim(), objective: objective.trim() },
-      workspace: { kind: workspaceKind, display_name: workspaceDisplayName.trim() },
-      execution: {
-        mode: "codex_subscription_transcript",
-        capture_mode: "transcript",
-        token_level_metrics_available: false,
-        harness_id: "codex",
-        codex_model: "gpt-5.3-codex-spark",
-        reasoning_effort: "high",
-        token_limit: 32_000,
-        task_network_allow_internet: true,
-      },
-      evolution: { targets: {} },
-    };
+    const config = scienceProjectConfig(title, objective, workspaceKind, workspaceDisplayName);
     onBusy(true);
     try {
       await provider.createProject({
@@ -616,7 +739,6 @@ function NewProjectDialogV2({
         displayName: displayName.trim(),
         config,
       }, { actionId, streamEpoch: snapshot.stream.epoch });
-      if (workspaceKind === "native_folder_snapshot") await provider.settleNativeWorkspace(actionId, "adopt");
       await onCreated();
     } catch (error) {
       onError(error);
@@ -626,7 +748,11 @@ function NewProjectDialogV2({
   };
 
   const close = async (): Promise<void> => {
-    if (sourceActionId !== null) await provider.cancelNativeWorkspace(sourceActionId).catch(() => {});
+    closedRef.current = true;
+    if (sourceActionId !== null) {
+      await provider.cancelNativeWorkspace(sourceActionId).catch(() => {});
+      await provider.settleNativeWorkspace(sourceActionId, "discard").catch(() => {});
+    }
     onClose();
   };
 
@@ -636,18 +762,18 @@ function NewProjectDialogV2({
         <div className="drawer-head"><div><span className="panel-kicker">Remote project</span><h2 id="new-project-title">Create science project</h2></div><button type="button" className="icon-button" aria-label="Close project setup" onClick={() => void close()}><X size={18} /></button></div>
         <div className="drawer-content">
           <section className="form-section">
-            <label>Project name<input maxLength={256} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
-            <label>Task title<input maxLength={256} value={title} onChange={(event) => setTitle(event.target.value)} /></label>
-            <label>Task objective<textarea rows={7} maxLength={65_536} value={objective} onChange={(event) => setObjective(event.target.value)} placeholder="Describe the scientific result the agent should produce." /></label>
+            <label>Project name<input maxLength={256} value={displayName} disabled={sourceActionId !== null} onChange={(event) => setDisplayName(event.target.value)} /></label>
+            <label>Task title<input maxLength={256} value={title} disabled={sourceActionId !== null} onChange={(event) => setTitle(event.target.value)} /></label>
+            <label>Task objective<textarea rows={7} maxLength={65_536} value={objective} disabled={sourceActionId !== null} onChange={(event) => setObjective(event.target.value)} placeholder="Describe the scientific result the agent should produce." /></label>
           </section>
           <section className="form-section">
             <h3>Workspace snapshot</h3>
-            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} onClick={() => void chooseFolder()}><FolderOpen size={15} /> Choose folder snapshot</button></div>
-            <p className="form-help">{workspaceKind === "native_folder_snapshot" ? workspaceDisplayName : "Core will create an immutable empty Workspace Snapshot."}</p>
+            <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null} onClick={() => void chooseFolder()}><FolderOpen size={15} /> Choose folder snapshot</button></div>
+            <p className="form-help">{workspaceKind === "native_folder_snapshot" ? selectedSourceDisplayName ?? "Preparing selected workspace…" : "Core will create an immutable empty Workspace Snapshot."}</p>
           </section>
           <section className="form-section"><h3>Execution</h3><div className="agent-note"><ShieldCheck size={17} /><span>Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort</span></div></section>
         </div>
-        <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()} disabled={busy}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button></div>
+        <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button></div>
       </section>
     </div>
   );
@@ -657,6 +783,7 @@ function ResearchWorkspaceV2({
   project,
   tasks,
   transitions,
+  timelines,
   busy,
   onRun,
   onCancelTask,
@@ -667,6 +794,7 @@ function ResearchWorkspaceV2({
   readonly project: ProjectV2;
   readonly tasks: readonly TaskV2[];
   readonly transitions: Readonly<Record<string, SuccessorTransitionV2>>;
+  readonly timelines: DesktopProductSnapshotV2["timelines"];
   readonly busy: boolean;
   readonly onRun: () => void;
   readonly onCancelTask: (task: TaskV2) => void;
@@ -689,7 +817,7 @@ function ResearchWorkspaceV2({
         <div className="panel-heading"><div><span className="panel-kicker">Immutable history</span><h2>Tasks and infrastructure Attempts</h2></div><span className="muted-pill">{projectTasks.length} Task{projectTasks.length === 1 ? "" : "s"}</span></div>
         {projectTasks.length === 0 ? <p className="v2-empty-copy">No admitted Task yet. Project edits remain drafts until validation and admission succeed.</p> : <div className="v2-task-list">{projectTasks.map((task) => {
           const transition = task.successor_transition ? transitions[task.successor_transition.successor_transition_id] : null;
-          return <TaskAuthorityCardV2 key={task.task_id} task={task} transition={transition ?? null} busy={busy} onCancel={() => onCancelTask(task)} onRetry={() => onRetryTask(task)} onRetryTransition={() => transition && onRetryTransition(transition)} onAbandonTransition={() => transition && onAbandonTransition(transition)} />;
+          return <TaskAuthorityCardV2 key={task.task_id} task={task} transition={transition ?? null} timeline={timelines[task.task_id] ?? []} busy={busy} onCancel={() => onCancelTask(task)} onRetry={() => onRetryTask(task)} onRetryTransition={() => transition && onRetryTransition(transition)} onAbandonTransition={() => transition && onAbandonTransition(transition)} />;
         })}</div>}
       </section>
     </div>
@@ -712,6 +840,7 @@ function AuthorityCardsV2({ project }: { readonly project: ProjectV2 }) {
 function TaskAuthorityCardV2({
   task,
   transition,
+  timeline,
   busy,
   onCancel,
   onRetry,
@@ -720,6 +849,7 @@ function TaskAuthorityCardV2({
 }: {
   readonly task: TaskV2;
   readonly transition: SuccessorTransitionV2 | null;
+  readonly timeline: DesktopProductSnapshotV2["timelines"][string];
   readonly busy: boolean;
   readonly onCancel: () => void;
   readonly onRetry: () => void;
@@ -732,8 +862,17 @@ function TaskAuthorityCardV2({
       <div className="v2-profile-card-head"><div><strong>Task {task.task_id}</strong><span>{task.state.replaceAll("_", " ")}</span></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <div className="v2-task-authority"><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
       <div className="v2-attempt-list">{task.attempts.map((attempt) => <div key={attempt.attempt_id}><strong>Attempt {attempt.ordinal}</strong><code>{attempt.attempt_id}</code>{attempt.attempt_id === task.authoritative_attempt_id ? <span className="muted-pill">authoritative</span> : null}</div>)}</div>
+      {!["completed", "closed"].includes(task.state) ? (
+        <LifecycleOperationPanelV2
+          model={taskPanelModelV2(task, timeline)}
+          onCancel={active ? onCancel : undefined}
+        />
+      ) : null}
+      {transition !== null && transition.state !== "committed" ? (
+        <LifecycleOperationPanelV2 model={transitionPanelModelV2(transition, timeline)} />
+      ) : null}
       {transition ? <div className="v2-transition"><div><span>Successor Transition</span><strong>{transition.transition.successor_transition_id}</strong><small>Expected Project Head generation {transition.transition.expected_successor_generation}</small></div><span className={`state-pill ${transition.state}`}>{transition.state}</span>{transition.error ? <p>{transition.error.message}</p> : null}{transition.state === "failed" ? <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Abandon evolution result</button></div> : null}</div> : null}
-      <div className="v2-card-actions">{active ? <button type="button" className="secondary-button" disabled={busy} onClick={onCancel}>Cancel Task</button> : null}{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
+      <div className="v2-card-actions">{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
     </article>
   );
 }
@@ -790,17 +929,54 @@ function SystemWorkspaceV2({
   busy,
   onOpenConnections,
   onRestartService,
+  serviceLogs,
+  onLoadServiceLogs,
+  onCleanupCaches,
+  onCreateDiagnostic,
 }: {
   readonly snapshot: DesktopProductSnapshotV2;
   readonly activeProfile: RemoteProfileV2 | null;
   readonly busy: boolean;
   readonly onOpenConnections: () => void;
   readonly onRestartService: (serviceId: string) => void;
+  readonly serviceLogs: Readonly<Record<string, readonly LogEntryV2[]>>;
+  readonly onLoadServiceLogs: (serviceId: string) => void | Promise<void>;
+  readonly onCleanupCaches: () => void;
+  readonly onCreateDiagnostic: () => void;
 }) {
   return (
     <div className="v2-workspace-stack">
       <section className="product-panel task-panel"><div className="panel-heading"><div><span className="panel-kicker">Connection owner</span><h2>System OpenSSH workspace</h2></div><button type="button" className="secondary-button" onClick={onOpenConnections}>Manage workspaces</button></div>{activeProfile && activeProfile.profile_kind === "system_openssh" ? <div className="v2-system-summary"><div><span>Display name</span><strong>{activeProfile.display_name}</strong></div><div><span>SSH alias</span><code>{activeProfile.ssh_host_alias}</code></div><div><span>Connection generation</span><strong>{activeProfile.connection_generation}</strong></div><div><span>Core API</span><strong>{activeProfile.core_api_major === 2 ? "v2 verified" : "Not connected"}</strong></div></div> : <p className="v2-empty-copy">No active remote workspace.</p>}</section>
-      <section className="product-panel task-panel"><div className="panel-heading"><div><span className="panel-kicker">Active project tunnel</span><h2>Remote services</h2></div></div>{snapshot.services.length === 0 ? <p className="v2-empty-copy">Services appear only after a compatible Daemon and active project tunnel are verified.</p> : <div className="v2-service-list">{snapshot.services.map((service) => <div key={service.service_id}><span><strong>{service.kind}</strong><small>{service.service_id}</small></span><span className={`state-pill ${service.status}`}>{service.status}</span><button type="button" className="secondary-button" disabled={busy} onClick={() => onRestartService(service.service_id)}>Restart</button></div>)}</div>}</section>
+      <section className="product-panel task-panel">
+        <div className="panel-heading">
+          <div><span className="panel-kicker">Active project tunnel</span><h2>Remote services</h2></div>
+          <div className="v2-card-actions">
+            <button type="button" className="secondary-button" disabled={busy || activeProfile === null} onClick={onCreateDiagnostic}>Collect system diagnostics</button>
+            <button type="button" className="secondary-button" disabled={busy || activeProfile === null} onClick={onCleanupCaches}>Clean safe caches</button>
+          </div>
+        </div>
+        {snapshot.services.length === 0 ? (
+          <p className="v2-empty-copy">Services appear only after a compatible Daemon and active project tunnel are verified.</p>
+        ) : (
+          <div className="v2-service-list">
+            {snapshot.services.map((service) => (
+              <div key={service.service_id} className="v2-service-observation">
+                <div>
+                  <span><strong>{service.kind}</strong><small>{service.service_id}</small></span>
+                  <span className={`state-pill ${service.status}`}>{service.status}</span>
+                  <div className="v2-card-actions">
+                    <button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadServiceLogs(service.service_id)}>View logs</button>
+                    <button type="button" className="secondary-button" disabled={busy} onClick={() => onRestartService(service.service_id)}>Restart</button>
+                  </div>
+                </div>
+                {serviceLogs[service.service_id] === undefined ? null : (
+                  <LifecycleOperationPanelV2 model={servicePanelModelV2(service, serviceLogs[service.service_id]!)} />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
     </div>
   );
 }
@@ -846,6 +1022,30 @@ function useDialogBoundary(onClose: () => void) {
 
 function isConnectedProfile(profile: RemoteProfileV2): profile is RemoteWorkspaceProfileV2 {
   return profile.profile_kind === "system_openssh" && profile.connection_state === "connected";
+}
+
+function scienceProjectConfig(
+  title: string,
+  objective: string,
+  workspaceKind: "scratch" | "native_folder_snapshot",
+  workspaceDisplayName: string,
+): ScienceProjectConfigV2 {
+  return {
+    schema_version: "2",
+    task: { title: title.trim(), objective: objective.trim() },
+    workspace: { kind: workspaceKind, display_name: workspaceDisplayName.trim() },
+    execution: {
+      mode: "codex_subscription_transcript",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      harness_id: "codex",
+      codex_model: "gpt-5.3-codex-spark",
+      reasoning_effort: "high",
+      token_limit: 32_000,
+      task_network_allow_internet: true,
+    },
+    evolution: { targets: {} },
+  };
 }
 
 function intentFor(snapshot: DesktopProductSnapshotV2, prefix: string): ProductMutationIntentV2 {
