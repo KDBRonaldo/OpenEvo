@@ -6464,7 +6464,7 @@ async def test_handle_run_prepends_rendered_memory_to_agent_instruction(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_handle_run_prepends_agent_system_before_memory(tmp_path, monkeypatch):
+async def test_handle_run_stages_agent_system_without_prepending_it(tmp_path, monkeypatch):
     class InstructionHarness(RunStepHarness):
         def __init__(self, agent_spec: AgentSpec) -> None:
             super().__init__(agent_spec)
@@ -6482,7 +6482,6 @@ async def test_handle_run_prepends_agent_system_before_memory(tmp_path, monkeypa
                 "rendered_text": "Prefer repository-local conventions.",
                 "target_path": "AGENTS.md",
             },
-            "memory": {"rendered_text": "Always preserve parser precedence."},
         }
     )
     manager = GatewayNodeManager.__new__(GatewayNodeManager)
@@ -6512,12 +6511,7 @@ async def test_handle_run_prepends_agent_system_before_memory(tmp_path, monkeypa
 
     await manager._handle_run(managed)
 
-    assert harness.instructions == [
-        (
-            "Use the following evolved agent system instructions for this task:\n"
-            "Prefer repository-local conventions.\n\n"
-            "Use the following long-term memory for this task:\n"
-            "Always preserve parser precedence.\n\n"
-            "Task:\nDo work."
-        )
-    ]
+    assert (tmp_path / "AGENTS.md").read_text(encoding="utf-8") == (
+        "Prefer repository-local conventions."
+    )
+    assert harness.instructions == ["Do work."]

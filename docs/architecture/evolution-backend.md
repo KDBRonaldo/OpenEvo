@@ -323,8 +323,9 @@ existing fallback ordering apply only when no exact list is supplied.
 `agent_system` artifact 的 manifest 可以声明 `target_path`，例如 `AGENTS.md` 或
 `.openhands/microagents/repo.md`。注册时会规范化并校验这个路径：必须是 allowlist
 中的 harness instruction 相对路径，不能为空、不能是绝对路径，也不能包含 `..`。
-Gateway 会在 runtime workdir 下写出这个相对路径，并把同一段文本 prepend 到
-instruction，保证不理解这些文件约定的 harness 也能消费。
+Gateway 会在 runtime workdir 下写出这个相对路径，但不会把同一段文本 prepend 到 task
+instruction。受支持的 harness 必须原生加载对应 target；Core 不再为不理解该文件约定的
+harness 提供 prompt fallback。
 
 Parametric memory 会优先使用 artifact manifest 中的 `adapter_id` 作为 serving
 adapter name；如果旧 artifact 没有这个字段，则回退到 artifact name。

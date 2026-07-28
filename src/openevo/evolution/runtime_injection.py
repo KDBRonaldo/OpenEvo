@@ -262,19 +262,13 @@ def receipt_from_runtime_readback(
 
 
 def instruction_with_evolution_context(instruction: str, context: Mapping[str, Any]) -> str:
-    agent_system = str((context.get("agent_system") or {}).get("rendered_text") or "").strip()
     memory = str((context.get("memory") or {}).get("rendered_text") or "").strip()
-    if not agent_system and not memory:
+    if not memory:
         return instruction
-    parts: list[str] = []
-    if agent_system:
-        parts.append(
-            f"Use the following evolved agent system instructions for this task:\n{agent_system}"
-        )
-    if memory:
-        parts.append(f"Use the following long-term memory for this task:\n{memory}")
-    parts.append(f"Task:\n{instruction}")
-    return "\n\n".join(parts)
+    return (
+        f"Use the following long-term memory for this task:\n{memory}\n\n"
+        f"Task:\n{instruction}"
+    )
 
 
 def _ordered_text_section(

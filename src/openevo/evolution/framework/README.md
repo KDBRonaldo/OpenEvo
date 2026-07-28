@@ -126,8 +126,10 @@ budgets. Only equal source IDs plus equal text are deduplicated; derived target
 files are checked under a two-copy projection budget and combined output under
 a three-copy budget. Source MIME is checked against the descriptor allowlist,
 and renderer JSON is bounded to the worst-case escaped representation of one
-1 MiB contribution. Skill bundles require root `SKILL.md` and canonical ranked
-renderer order. Adapter fallback identity is recomputed from the trusted
+1 MiB contribution. Text memory emits an instruction plus `memory.md`;
+agent-system emits canonical and native harness instruction files without a
+task-prompt instruction. Skill bundles require root `SKILL.md` and canonical
+ranked renderer order. Adapter fallback identity is recomputed from the trusted
 artifact snapshot by the validator rather than accepted from handler output.
 
 Release reflector schemas require an explicit model and `codex_cli`; direct API

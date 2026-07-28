@@ -54,6 +54,10 @@ canonical file:
 
 It may also write a safe relative target such as `AGENTS.md`, `CLAUDE.md`,
 `GEMINI.md`, or `.openhands/microagents/*.md` into the runtime workdir.
+Core writes these targets before starting the harness and does not prepend
+agent-system text to the task instruction. The supported harness must discover
+and consume its native target; the canonical file and environment bindings are
+not a prompt fallback.
 
 ## Env Vars
 

@@ -296,7 +296,7 @@ def test_skill_bundle_requires_root_skill_markdown() -> None:
         )
 
 
-def test_agent_system_merges_targets_and_preserves_global_ranked_instruction(
+def test_agent_system_merges_native_targets_without_prompt_instruction(
     builtin_snapshot,
 ) -> None:
     artifacts = []
@@ -321,8 +321,10 @@ def test_agent_system_merges_targets_and_preserves_global_ranked_instruction(
     handler_input = _input("agent_system", tuple(artifacts))
     output = agent_system_handler(handler_input, _services(*payloads))
 
-    assert output.instructions[0].text == "First\n\nSecond\n\nThird"
+    assert output.instructions == ()
     assert output.staged_payloads[0].destination_relative_path == "agent_system.md"
+    assert output.staged_payloads[0].text == "First\n\nSecond\n\nThird"
+    assert output.renderer.source_contribution_ids == ("agent_system_file",)
     target_payloads = output.staged_payloads[1:]
     assert [(item.destination_relative_path, item.text) for item in target_payloads] == [
         ("AGENTS.md", "First\n\nThird"),

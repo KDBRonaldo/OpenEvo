@@ -283,11 +283,6 @@ def agent_system_handler(
 
     artifact_ids = tuple(artifact.artifact_id for artifact, _ in selected)
     markdown = "\n\n".join(text for _, text in selected)
-    instruction = InstructionContribution(
-        contribution_id="agent_system_instruction",
-        source_artifact_ids=artifact_ids,
-        text=markdown,
-    )
     canonical = InlineTextPayloadContribution(
         contribution_id="agent_system_file",
         source_artifact_ids=artifact_ids,
@@ -340,13 +335,12 @@ def agent_system_handler(
         target_id="agent_system",
         handler_id="agent_system_handler",
         artifact_ids=artifact_ids,
-        instructions=(instruction,),
         staged_payloads=(canonical, *targets),
         environment=tuple(environment),
         renderer=RendererPayload(
             kind="markdown",
             title="Agent system",
-            source_contribution_ids=(instruction.contribution_id,),
+            source_contribution_ids=(canonical.contribution_id,),
             data=MarkdownRendererData(markdown=markdown),
         ),
     )

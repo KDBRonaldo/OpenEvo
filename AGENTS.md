@@ -316,7 +316,8 @@ Runtime 消费：
 - Gateway 尝试写入 runtime workdir 下的 `target_path`。
 - 设置 `OPENEVO_AGENT_SYSTEM_FILE`、`OPENEVO_AGENT_SYSTEM_TARGET` 和
   `OPENEVO_AGENT_SYSTEM_TARGETS`。
-- 将 rendered agent-system text prepend 到 agent instruction。
+- 不把 rendered agent-system text prepend 到 task instruction；受支持的 harness 必须从
+  workdir 下的 native instruction target（例如 Codex 的 `AGENTS.md`）消费它。
 
 ### `parametric_memory`
 
