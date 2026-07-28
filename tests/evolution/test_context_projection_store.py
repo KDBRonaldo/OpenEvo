@@ -619,8 +619,6 @@ def test_store_materializes_all_builtin_carriers_through_verified_registry(
         adapter.artifact_id,
     )
     assert response.instruction == (
-        "Use the following evolved agent system instructions for this task:\n"
-        "Apply the evolved parser procedure.\n\n"
         "Use the following long-term memory for this task:\n"
         "Remember the verified parser invariant."
     )

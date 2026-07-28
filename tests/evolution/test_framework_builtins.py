@@ -21,6 +21,7 @@ from openevo.evolution.framework.builtins import (
     load_verified_builtin_registry,
 )
 from openevo.evolution.framework.contracts import (
+    ContributionKind,
     EvolutionExecutionProfile,
     Exposure,
     ImplementationIdentity,
@@ -220,15 +221,17 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
         assert descriptor.renderer_contract_version == "1"
         assert descriptor.contribution_contract_version == "2"
         expected_preambles = {
-            "agent_system_handler": (
-                "Use the following evolved agent system instructions for this task:"
-            ),
             "text_memory_handler": ("Use the following long-term memory for this task:"),
         }
         assert descriptor.instruction_preamble == expected_preambles.get(
             descriptor.id,
             "",
         )
+        if descriptor.id == "agent_system_handler":
+            assert set(descriptor.allowed_contribution_kinds) == {
+                ContributionKind.STAGED_PAYLOAD,
+                ContributionKind.ENVIRONMENT,
+            }
         module_name, attribute_name = _entry_point_parts(descriptor.implementation_ref.entry_point)
         assert module_name == BUILTIN_HANDLERS_MODULE
         assert not attribute_name.startswith("_")

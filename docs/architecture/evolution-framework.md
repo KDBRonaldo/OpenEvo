@@ -457,15 +457,18 @@ existing allowlist. Contributions contain neither commands nor final host paths.
 
 Within a target, its handler performs the current semantic merge first: memory
 and agent-system text keep current clipping/concatenation, skills/adapters keep
-their count/order, and subscription suppresses adapters. It emits each final
-destination once. Contribution provenance and renderer order must preserve the
-ranked artifact sequence; only projections with exactly equal source artifact
-IDs and text are charged once. Canonical renderer text and all instructions
-must each remain within the source budget. Derived target-file projections are
-charged independently under a two-times checked projection budget, while the
-combined instruction/file output remains capped at three times the source
-character and UTF-8 byte budgets. Existing clipping remains character-based,
-while a separate 1 MiB UTF-8 byte limit bounds resource use.
+their count/order, and subscription suppresses adapters. Memory emits an
+instruction plus its canonical file; agent-system emits canonical and native
+harness instruction files but no task-prompt instruction. Each final
+destination is emitted once. Contribution provenance and renderer order must
+preserve the ranked artifact sequence; only projections with exactly equal
+source artifact IDs and text are charged once. Canonical renderer text and
+memory instructions must each remain within the source budget. Derived
+target-file projections are charged independently under a two-times checked
+projection budget, while combined instruction/file output remains capped at
+three times the source character and UTF-8 byte budgets. Existing clipping
+remains character-based, while a separate 1 MiB UTF-8 byte limit bounds
+resource use.
 Core resolves logical scopes to final runtime roots before checking context-wide
 destination/environment conflicts, and binds adapters to the requested base
 model and actual runtime application limit. Missing or empty adapter manifest

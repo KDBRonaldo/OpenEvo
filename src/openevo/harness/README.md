@@ -83,7 +83,9 @@ This removes `CODEX_HOME/memories/` and `CODEX_HOME/memories_*.sqlite*` during
 harness setup, while leaving auth and config files such as `auth.json` and
 `config.toml` in place. OpenEvo textual memory remains separate: selected
 `text_memory` artifacts are staged as `OPENEVO_MEMORY_FILE` and prepended to the
-agent instruction.
+agent instruction. Evolved agent-system text follows a different path: Core
+stages `AGENTS.md` in the runtime workdir before Codex starts, and does not
+prepend that text to the task instruction.
 
 ## The harness contract
 

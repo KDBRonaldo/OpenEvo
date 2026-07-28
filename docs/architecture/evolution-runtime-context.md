@@ -131,7 +131,7 @@ sequenceDiagram
     G->>RT: write AGENTS.md / harness-specific text target
     G->>G: adapter_merge_spec 写入 session metadata
     G->>H: setup(runtime)，harness env 中包含 OPENEVO_SKILLS_DIR
-    G->>H: run_steps(agent-system/memory-prefixed instruction)
+    G->>H: run_steps(memory-prefixed instruction; agent system 由 native target 加载)
     H->>P: LLM request
     P->>P: 读取 session adapter_merge_spec
     P->>M: 带 engine-specific adapter model 的请求
@@ -155,12 +155,9 @@ sequenceDiagram
 | `/openevo/session/evolution/skills/` | `OPENEVO_SKILLS_DIR` | staged skill bundle directories |
 | `/openevo/session/evolution/adapters.json` | `OPENEVO_ADAPTER_MERGE_SPEC` | custom runtimes/tools 可读取的 adapter merge spec |
 
-`agent_system` 和自然语言 memory 也会被 prepend 到 agent instruction：
+`text_memory` 仍会被 prepend 到 agent instruction：
 
 ```text
-Use the following evolved agent system instructions for this task:
-<rendered agent system>
-
 Use the following long-term memory for this task:
 <rendered memory>
 
@@ -168,7 +165,10 @@ Task:
 <original task instruction>
 ```
 
-文件/env 路径仍然保留，方便自定义 harness 直接读取 memory 或 agent system 文本。
+`agent_system` 不进入 task instruction。Gateway 必须在 harness 启动前写好
+`AGENTS.md` 等 allowlisted target，由受支持的 harness 原生发现和加载。Canonical
+`agent_system.md` 与 env 路径继续保留用于 readback、provenance 和自定义 runtime
+集成，但不构成 prompt fallback。
 
 ## Agent System Text Updates
 
@@ -192,7 +192,8 @@ Backend 注册和 Gateway staging 都会拒绝空路径、绝对路径、包含 
 allowlist 外的相对路径，避免 evolution artifact 覆盖任意 workdir 文件。一个 context
 可以包含多个 `agent_system.targets`；gateway 会分别写出对应目标，并把拼接后的文本写到
 `OPENEVO_AGENT_SYSTEM_FILE`。即使所有 harness target 都因为安全校验失败被跳过，
-canonical `agent_system.md` 仍会被写出并且 instruction prepend 仍然生效。
+canonical `agent_system.md` 仍会被写出，但 task instruction 不会回退到 agent-system
+prepend；没有可消费 native target 的运行不能声称已应用该 agent system。
 
 ## Skill Bundle Staging
 
