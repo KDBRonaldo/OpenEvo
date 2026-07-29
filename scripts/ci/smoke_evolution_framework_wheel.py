@@ -33,6 +33,7 @@ EXPECTED_METHOD_IDS = frozenset(
         "skill_bundle_reflector",
         "text_memory",
         "text_memory_expel_reflector",
+        "text_memory_memevolve",
         "text_memory_reflector",
     }
 )
