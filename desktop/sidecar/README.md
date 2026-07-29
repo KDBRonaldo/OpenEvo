@@ -33,6 +33,17 @@ database inode, size budgets, and the canonical closed documents it reads. A
 committed mutation and its idempotency response are one transaction, so a retry
 after process loss returns the original profile or draft without duplicating it.
 
+Process-restart reconciliation never treats a stale SSH control socket as live.
+It invalidates each process-owned connected profile to a new disconnected
+generation. When a queued or running project-create/project-activate operation
+depends on that profile, the same SQLite transaction reserves one deterministic
+`profile_connect` prerequisite and advances the profile to `connecting`. The
+single lifecycle executor defers the original project operation, reconnects
+through system OpenSSH, and then resumes the exact persisted project request and
+action identity; it does not issue another project mutation. A restart while the
+prerequisite is pending resumes that same prerequisite, while an explicitly
+disconnected profile is not reconnected automatically.
+
 The retained v1 `provider.sqlite3` is opened only through a shared owner lock and
 SQLite read-only/query-only mode after exact root, file, schema, and inode
 validation. Import reads lengths before bounded cells and applies one aggregate
