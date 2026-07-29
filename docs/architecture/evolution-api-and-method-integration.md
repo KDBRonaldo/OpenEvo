@@ -539,38 +539,27 @@ adapter selection，不做物理权重合并。Parametric memory 只适用于 pr
 auth 下启用 `evolution.targets.parametric_memory`，context resolver 也会在 request 的
 agent settings 或 metadata 标记 subscription auth 时跳过 `parametric_memory` artifacts。
 
-内置 reference worker 提供两条 parametric-memory 方法：
+内置 `parametric_memory_sd_lora` 是 self-deployed 模式下的实验性 continual-learning
+method。它从当前 task 的成功 trajectories 训练一个新 SD-LoRA component，并把至多一个
+上一代 SD-LoRA artifact 的 frozen components 一并折叠成单个 cumulative PEFT adapter。
+下一 session 因而只选择一个 adapter；Core 不维护 task router，也不按 task 猜测 adapter。
 
-- `parametric_memory_register`：注册已有 adapter URI，不负责训练；
-- `parametric_memory_lora_sft`：从 successful trajectories 导出 SFT JSONL，调用外部 trainer，
-  并注册 trainer 产出的 adapter 目录。
+训练由 Daemon-owned fixed subprocess service 执行。Method config 只包含 closed、bounded
+hyperparameters，以及 exact `base_model`/`model_revision`；不接受 shell command、API
+endpoint、credential 或任意 trainer plugin。Daemon 需要安装
+`openevo[parametric-memory]` 并具有 CUDA，launcher 才会发布
+`sd_lora_continual_trainer` capability。模型 forward/backward 全部在本地执行；生成训练
+trajectory 的任务推理仍使用 OpenEvo 已有 harness，例如内置 Codex subscription harness，
+不新增模型 API。不过 subscription session 本身不能加载训练出的 adapter，因此该 method
+只在 self-deployed execution profile 中可启用。
 
-两条方法都会要求 `base_model`，并确保 `compatibility.base_model` 包含该模型；如果调用方没有
-显式设置 compatibility，method 会自动写入 `[base_model]`。`parametric_memory_lora_sft`
-的 trainer contract 是：
+Artifact 同时包含标准 PEFT adapter 和 SD-LoRA decomposition state。后一部分记录 exact
+base model revision、target modules、每代 rank、A/B tensors、learned coefficients 和完整
+tensor inventory；下一代训练会重新验证并冻结旧 components，只训练新 component 与共享
+coefficients。当前实现是 research/internal capability，尚不属于 External Beta release
+acceptance；完整 successor readiness、serving preparation 和 run-owner activation 仍遵循
+项目级 cross-session contract，不能由 method 自行绕过。
 
-- `job.config.trainer.command` 指向可执行 trainer；
-- `job.config.trainer.args` 必须包含 `{training_dataset}` 和 `{adapter_dir}` 占位符；
-- `job.config.trainer.timeout_seconds` 默认 600 秒；
-- `job.config.training_projection` 默认 `{"type": "full_trace"}`；也可以设为
-  `{"type": "response_tail", "response_tail_chars": N}`，在保留 prompt messages 的同时只把
-  assistant response 尾部导出到 SFT JSONL，用于避免长工具输出 transcript 掩盖最终成功动作。
-  其他 benchmark-specific 或 harness-specific projection 必须作为 release-excluded
-  maintainer automation 实现，不能成为 Core/Desktop public contract。进入 Core 的结果仍必须是
-  普通 dataset、job config 和 artifact lineage，并且必须显式记录 projection policy、输入来源、
-  redaction evidence、compatibility 和是否允许消费 failed/zero-reward records；
-- trainer 执行前会清理旧 adapter 目录；
-- 默认 `adapter_format=lora` 时，adapter 目录必须包含 `adapter_config.json`。
-
-使用 chat-template trainer 时，trainer 还必须保证第一个 generated response token 参与
-loss。不要分别 tokenize 完整 conversation 和 generation prefix 后仅按 prefix token 数切
-mask；BPE 可能把 prompt 末尾 token 和 response 开头 token 合并。推荐做法是 render full
-text 和 generation prefix，确认 full 以 prefix 开头，再分别用 `add_special_tokens=False`
-tokenize prefix 与 suffix，拼接 token ids，并只 mask prefix ids。对 Qwen/vLLM tool-use
-records，trainer 必须把 record-level `tools` 传给 `tokenizer.apply_chat_template`，使训练
-格式和 runtime 的 `qwen3_xml` parser 一致。默认 `full_trace` projection 也会保留
-assistant `tool_calls` 空文本消息，并把 trace-level `tools` 写入 SFT JSONL 行，供这类
-trainer 复用。
 
 Benchmark-specific task-local builders, local evaluation adapters, serving-time adapter
 rewrite helpers, and package-specific guard flags are maintainer automation outside
@@ -580,9 +569,8 @@ registered `parametric_memory` artifacts, compatibility metadata, and runtime in
 evidence. Such automation must not be documented as a Core Backend command, Desktop
 feature, or ordinary-user workflow.
 
-Reference worker 只定义训练编排和 artifact contract；具体 LoRA trainer、serving backend
-的 adapter 加载方式，以及长训练过程中的续约/heartbeat 扩展，应由本地 inference/training
-infrastructure 提供。
+Serving backend 仍负责加载 cumulative PEFT adapter。Worker 的既有 heartbeat 机制覆盖
+Daemon trainer subprocess 的长任务；method 不引入独立调度 API。
 
 ## Context Resolver
 

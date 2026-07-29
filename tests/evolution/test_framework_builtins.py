@@ -46,6 +46,7 @@ from openevo.evolution.framework.support import (
     evaluate_method_support,
 )
 from openevo.evolution.models import WorkerClaimInputArtifact, WorkerClaimedJob
+from openevo.evolution.parametric import sd_lora
 from tests.framework_testkit import verify_distribution_install_for_test
 
 
@@ -69,8 +70,9 @@ METHOD_IDS = {
     "agent_system_pareto_reflector",
     "agent_system_gepa_reflector",
     "parametric_memory_register",
-    "parametric_memory_lora_sft",
+    "parametric_memory_sd_lora",
 }
+CONTEXT_METHOD_IDS = {"text_memory_memevolve", "parametric_memory_sd_lora"}
 PROTECTED_METHOD_IDS = {
     "text_memory_expel_reflector",
     "skill_bundle_reflector",
@@ -90,6 +92,7 @@ REFLECTOR_METHOD_IDS = {
 
 METHODS_MODULE = "openevo.evolution.methods"
 MEMEVOLVE_MODULE = "openevo.evolution.memevolve"
+SD_LORA_MODULE = "openevo.evolution.parametric.sd_lora"
 BUILTINS_MODULE = "openevo.evolution.framework.builtins"
 BUILTIN_HANDLERS_MODULE = "openevo.evolution.framework.builtin_handlers"
 
@@ -165,6 +168,8 @@ def _method_entry_point(identity: ImplementationIdentity) -> Callable:
         return getattr(methods, attribute_name)
     if module_name == MEMEVOLVE_MODULE:
         return getattr(memevolve, attribute_name)
+    if module_name == SD_LORA_MODULE:
+        return getattr(sd_lora, attribute_name)
     raise AssertionError(f"unexpected method module: {module_name}")
 
 
@@ -192,10 +197,16 @@ def test_builtin_catalog_is_complete_frozen_and_has_expected_defaults(
     assert snapshot.methods["text_memory_memevolve"].invocation_abi.value == (
         "method_context_v1"
     )
+    assert snapshot.methods["parametric_memory_sd_lora"].invocation_abi.value == (
+        "method_context_v1"
+    )
 
     assert snapshot.targets["text_memory"].default_method_id == ("text_memory_expel_reflector")
     assert snapshot.targets["skill_bundle"].default_method_id == ("skill_bundle_reflector")
     assert snapshot.targets["agent_system"].default_method_id == ("agent_system_gepa_reflector")
+    assert snapshot.targets["parametric_memory"].default_method_id == (
+        "parametric_memory_sd_lora"
+    )
     auto_resolver = snapshot.targets["agent_system"].selection_resolvers
     assert len(auto_resolver) == 1
     assert auto_resolver[0].selection_value == "auto"
@@ -218,9 +229,12 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
 ) -> None:
     for method_id, descriptor in snapshot.methods.items():
         assert descriptor.implementation_ref is not None
-        expected_module = (
-            MEMEVOLVE_MODULE if method_id == "text_memory_memevolve" else METHODS_MODULE
-        )
+        if method_id == "text_memory_memevolve":
+            expected_module = MEMEVOLVE_MODULE
+        elif method_id == "parametric_memory_sd_lora":
+            expected_module = SD_LORA_MODULE
+        else:
+            expected_module = METHODS_MODULE
         assert descriptor.implementation_ref.entry_point == f"{expected_module}:{method_id}"
 
     target_anchor_names: set[str] = set()
@@ -274,10 +288,26 @@ def test_builtin_output_and_protected_method_contracts(
         "prior_target_artifacts",
     ]
     assert register_bindings[0].min_count == 0
-    assert (
-        "constrained_trainer_contract"
-        in snapshot.methods["parametric_memory_lora_sft"].runtime_requirements
+    sd_lora_descriptor = snapshot.methods["parametric_memory_sd_lora"]
+    assert sd_lora_descriptor.invocation_abi.value == "method_context_v1"
+    assert tuple(mode.value for mode in sd_lora_descriptor.execution_modes) == (
+        "self_deployed",
     )
+    assert sd_lora_descriptor.runtime_requirements == (
+        "adapter_serving",
+        "gpu",
+        "sd_lora_continual_trainer",
+    )
+    assert sd_lora_descriptor.input_bindings[0].binding_id == "current_dataset"
+    assert sd_lora_descriptor.input_bindings[0].max_count == 1
+    assert sd_lora_descriptor.input_bindings[1].max_count == 1
+    assert sd_lora_descriptor.config_schema["properties"]["model_revision"] == {
+        "type": "string",
+        "minLength": 40,
+        "maxLength": 64,
+    }
+    assert "parametric_memory_lora_sft" not in methods.METHOD_REGISTRY
+    assert "parametric_memory_lora_sft" not in methods.METHOD_METADATA
 
     for method_id in PROTECTED_METHOD_IDS:
         descriptor = snapshot.methods[method_id]
@@ -467,11 +497,11 @@ def test_gepa_descriptor_and_legacy_adapter_keep_caller_dataset_order(
     assert observed == [*dataset_ids, "prior-agent-system"]
 
 
-def test_incomplete_lora_method_remains_unavailable_with_legacy_runtime_caps(
+def test_sd_lora_requires_the_exact_daemon_training_profile(
     snapshot: RegistrySnapshot,
 ) -> None:
     support = evaluate_method_support(
-        snapshot.methods["parametric_memory_lora_sft"],
+        snapshot.methods["parametric_memory_sd_lora"],
         EvolutionExecutionProfile(
             execution_mode="self_deployed",
             capture_mode="transcript",
@@ -481,7 +511,22 @@ def test_incomplete_lora_method_remains_unavailable_with_legacy_runtime_caps(
     )
 
     assert support.overall is MethodSupportOverall.UNAVAILABLE
-    assert support.runtime.missing_requirements == ("constrained_trainer_contract",)
+    assert support.runtime.missing_requirements == ("gpu", "sd_lora_continual_trainer")
+
+    available = evaluate_method_support(
+        snapshot.methods["parametric_memory_sd_lora"],
+        EvolutionExecutionProfile(
+            execution_mode="self_deployed",
+            capture_mode="transcript",
+            harness_id="codex",
+            runtime_capabilities=(
+                "adapter_serving",
+                "gpu",
+                "sd_lora_continual_trainer",
+            ),
+        ),
+    )
+    assert available.overall is MethodSupportOverall.SUPPORTED
 
 
 def test_load_builtin_method_handles_returns_exact_verified_callables(
@@ -503,9 +548,10 @@ def test_load_builtin_method_handles_returns_exact_verified_callables(
         for descriptor in snapshot.methods.values()
         if descriptor.implementation_ref is not None
     }
-    for method_id in set(METHOD_IDS) - {"text_memory_memevolve"}:
+    for method_id in METHOD_IDS - CONTEXT_METHOD_IDS:
         assert handles[method_id] is methods.METHOD_REGISTRY[method_id]
     assert handles["text_memory_memevolve"] is memevolve.text_memory_memevolve
+    assert handles["parametric_memory_sd_lora"] is sd_lora.parametric_memory_sd_lora
 
 
 @pytest.mark.parametrize("failure", ["missing", "extra"])
@@ -532,7 +578,7 @@ def test_load_builtin_method_handles_rejects_wrong_callable_identity(
     snapshot: RegistrySnapshot,
 ) -> None:
     def verified_loader(identity: ImplementationIdentity) -> Callable:
-        _, attribute_name = _entry_point_parts(identity.implementation.entry_point)
+        module_name, attribute_name = _entry_point_parts(identity.implementation.entry_point)
         if attribute_name == "text_memory":
             return methods.text_memory_reflector
         return _method_entry_point(identity)

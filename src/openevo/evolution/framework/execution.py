@@ -7,7 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Protocol, TypeAlias, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, TypeAlias, runtime_checkable
 
 from pydantic import Field, field_validator, model_validator
 
@@ -28,6 +28,9 @@ from .contracts import (
     canonical_digest,
     canonical_json,
 )
+
+if TYPE_CHECKING:
+    from openevo.evolution.parametric.contracts import CoreParametricTrainer
 
 
 CORE_CONFIG_RESERVED_KEYS = frozenset(
@@ -361,6 +364,7 @@ class MethodExecutionEnvelope(_Contract):
 @dataclass(frozen=True, slots=True)
 class MethodExecutionServices:
     harness: CoreHarnessService
+    parametric_trainer: CoreParametricTrainer | None = None
 
 
 @dataclass(frozen=True, slots=True)

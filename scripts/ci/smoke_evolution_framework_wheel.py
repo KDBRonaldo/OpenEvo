@@ -27,7 +27,7 @@ EXPECTED_METHOD_IDS = frozenset(
         "agent_system_history_reflector",
         "agent_system_pareto_reflector",
         "agent_system_reflector",
-        "parametric_memory_lora_sft",
+        "parametric_memory_sd_lora",
         "parametric_memory_register",
         "skill_bundle",
         "skill_bundle_reflector",

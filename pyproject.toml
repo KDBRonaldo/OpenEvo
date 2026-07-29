@@ -33,6 +33,14 @@ swebench = [
     "swebench",
     "datasets",
 ]
+parametric-memory = [
+    "accelerate>=1.0,<2",
+    "bitsandbytes>=0.44; platform_system == 'Linux' and platform_machine == 'x86_64'",
+    "peft>=0.13,<1",
+    "safetensors>=0.4,<1",
+    "torch>=2.4",
+    "transformers>=4.45,<6",
+]
 
 [project.scripts]
 openevo-backend = "openevo.backend.launcher:main"
