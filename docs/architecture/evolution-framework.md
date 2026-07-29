@@ -128,8 +128,9 @@ base-class mutation bypass cannot alter later normalization or stored identity.
 ## A2.2 Built-In Catalog
 
 `openevo.evolution.framework.builtins` registers four targets, four handler
-descriptors, and all twelve current legacy method callables. Target descriptors
-retain non-executable identity anchors. Handler descriptors point to the four
+descriptors, twelve legacy method callables, and the context-only
+`text_memory_memevolve` method. Target descriptors retain non-executable identity
+anchors. Handler descriptors point to the four
 pure callables in `builtin_handlers`; release loading verifies their exact wheel
 inventory, entry point, signature, identity, and distribution attestation before
 sealing them in `VerifiedExecutableRegistry.handler_handles`. The internal projection
@@ -143,12 +144,15 @@ have not yet cut over.
 | `skill_bundle` | `skill_bundle_reflector` | Desktop | `file_bundle` |
 | `parametric_memory` | `parametric_memory_register` | internal | `adapter` |
 
-All current `METHOD_REGISTRY` keys have exactly one method descriptor whose
+All current `METHOD_REGISTRY` keys have exactly one legacy-ABI descriptor whose
 entry point is `openevo.evolution.methods:<method_id>`. The A2.2
-`load_builtin_method_handles` check remains an anti-drift test. Production
-plan-bound jobs now dispatch from `VerifiedExecutableRegistry.method_handles`;
-they never fall back to `METHOD_REGISTRY`. The legacy table remains only for
-unplanned benchmark jobs until their A2.5 migration.
+`load_builtin_method_handles` check remains an anti-drift test for exactly that
+legacy subset. `text_memory_memevolve` is loaded from the independently verified
+`openevo.evolution.memevolve:text_memory_memevolve` entry point and is absent from
+both legacy method tables. Production plan-bound jobs dispatch from
+`VerifiedExecutableRegistry.method_handles`; they never fall back to
+`METHOD_REGISTRY`. The legacy table remains only for unplanned benchmark jobs
+until their A2.5 migration.
 
 Only the three performance-protected methods are Desktop-exposed in the A2.2
 catalog, and they remain `experimental` until the release performance gates
@@ -318,6 +322,33 @@ web-search features disabled. It accepts only a completed bounded JSON
 transcript, redacts credential values from errors and the final text, and
 scrubs the staged credential before removing the private run tree. No host path
 is returned as a transcript reference.
+
+### MemEvolve Declarative Adaptation
+
+`text_memory_memevolve` is an experimental `method_context_v1` method available
+for Codex transcript or token-level runs in subscription and self-deployed
+execution profiles. It receives ordered dataset artifacts plus optional prior
+`text_memory`, and all model calls go through `CoreHarnessService`; it accepts no
+endpoint, API key, command, or host model path.
+
+For each configured candidate, the method independently analyzes trajectory
+evidence and prior memory, then asks Codex for one static Markdown candidate.
+It rejects generated `BaseMemoryProvider` implementations and validates output
+and forbidden literals before a final Codex evidence judge selects one candidate.
+The method registers exactly one `text_memory` artifact with method-derived
+`quality`, full input lineage, and an explicit
+`adaptation_scope=declarative_text_memory_v1` / `paper_equivalent=false`
+manifest.
+
+This is not a faithful reproduction of the upstream MemEvolve runtime. The
+upstream algorithm generates executable providers with retrieval, online
+ingestion, management, simulation validation, and task-executed Pareto
+tournaments. OpenEvo neither executes LLM-generated Python in the Daemon nor
+runs candidate methods inside the immutable source task. Performance reports
+must therefore call this the OpenEvo declarative adaptation and must not compare
+its score as though it were the upstream paper implementation. A faithful
+future design requires a separately reviewed closed declarative provider ABI
+and successor-session candidate evaluation contract.
 
 This Codex implementation currently supports model selection and timeout. A
 method request that selects another harness or supplies `temperature` or

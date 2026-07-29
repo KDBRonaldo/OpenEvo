@@ -1,6 +1,7 @@
-"""Deterministic descriptors for OpenEvo's existing evolution implementations.
+"""Deterministic descriptors for OpenEvo's built-in evolution implementations.
 
-A2.2 catalogs the legacy method callables without changing worker dispatch.
+Legacy methods retain their behavior-preserving dispatch during A2 migration.
+New methods use the context ABI and are loaded only from verified entry points.
 Targets retain non-executable identity anchors; target handlers are verified
 callables used by the A2.4 runtime projection boundary.
 """
@@ -39,7 +40,7 @@ from .descriptors import (
     EvolutionTargetDescriptor,
     TargetHandlerDescriptor,
 )
-from .execution import EvolutionMethodHandle, LegacyEvolutionMethod, MethodInputBinding
+from .execution import EvolutionMethodHandle, MethodInputBinding
 from .handlers import EvolutionTargetHandler
 from .loading import (
     DescriptorImplementationAnchor,
@@ -53,6 +54,7 @@ BUILTIN_METHOD_IDS = (
     "text_memory",
     "text_memory_reflector",
     "text_memory_expel_reflector",
+    "text_memory_memevolve",
     "skill_bundle",
     "skill_bundle_reflector",
     "agent_system",
@@ -65,6 +67,7 @@ BUILTIN_METHOD_IDS = (
 )
 
 _METHODS_MODULE = "openevo.evolution.methods"
+_MEMEVOLVE_MODULE = "openevo.evolution.memevolve"
 _BUILTINS_MODULE = "openevo.evolution.framework.builtins"
 _BUILTIN_HANDLERS_MODULE = "openevo.evolution.framework.builtin_handlers"
 _BOTH_EXECUTION_MODES = (
@@ -326,6 +329,35 @@ def _reflector_schema(
     )
 
 
+def _memevolve_schema() -> dict[str, Any]:
+    return _closed_object(
+        {
+            "candidate_count": {
+                "type": "integer",
+                "minimum": 2,
+                "maximum": 5,
+            },
+            "max_records": _positive_integer(maximum=100),
+            "reflector_llm": _closed_object(
+                {
+                    "model": _string(),
+                    "provider": {
+                        "type": "string",
+                        "enum": ["codex_cli"],
+                    },
+                    "timeout_seconds": {
+                        "type": "number",
+                        "exclusiveMinimum": 0.0,
+                        "maximum": 86_400.0,
+                    },
+                },
+                required=("model", "provider"),
+            ),
+        },
+        required=("reflector_llm",),
+    )
+
+
 def _agent_system_fields() -> dict[str, dict[str, Any]]:
     return {
         "target_path": _string(),
@@ -581,13 +613,15 @@ def _method(
     exposure: Exposure = Exposure.MAINTAINER,
     runtime_requirements: tuple[str, ...] = (),
     project_config_injections: tuple[ProjectConfigInjection, ...] = (),
+    invocation_abi: MethodInvocationABI = MethodInvocationABI.LEGACY_WORKER_JOB_V1,
+    implementation_module: str = _METHODS_MODULE,
 ) -> EvolutionMethodDescriptor:
     return EvolutionMethodDescriptor(
         id=method_id,
         display_name=display_name,
         description=description,
         target_id=target_id,
-        invocation_abi=MethodInvocationABI.LEGACY_WORKER_JOB_V1,
+        invocation_abi=invocation_abi,
         execution_modes=execution_modes,
         capture_modes=_TEXT_AND_TOKEN_CAPTURE,
         supported_harness_ids=_CODEX,
@@ -599,7 +633,7 @@ def _method(
         project_config_injections=project_config_injections,
         exposure=exposure,
         maturity=Maturity.EXPERIMENTAL,
-        implementation_ref=identity.ref(f"{_METHODS_MODULE}:{method_id}"),
+        implementation_ref=identity.ref(f"{implementation_module}:{method_id}"),
     )
 
 
@@ -646,6 +680,27 @@ def _method_descriptors(
             config_schema=_reflector_schema(record_limit_name="max_records"),
             exposure=Exposure.DESKTOP,
             project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
+        ),
+        _method(
+            identity,
+            method_id="text_memory_memevolve",
+            display_name="MemEvolve textual adaptation",
+            description=(
+                "Evolve and select declarative Markdown memory candidates without "
+                "executing generated provider code."
+            ),
+            target_id="text_memory",
+            execution_modes=_BOTH_EXECUTION_MODES,
+            input_bindings=(
+                _ordered_dataset_inputs(),
+                _prior_target("text_memory"),
+            ),
+            output_artifact_types=("text_memory",),
+            config_schema=_memevolve_schema(),
+            default_config={"candidate_count": 3, "max_records": 20},
+            project_config_injections=_REFLECTOR_LLM_PROJECT_CONFIG_INJECTIONS,
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+            implementation_module=_MEMEVOLVE_MODULE,
         ),
         _method(
             identity,
@@ -853,8 +908,8 @@ def load_builtin_method_handles(
     snapshot: RegistrySnapshot,
     *,
     verified_loader: Callable[[ImplementationIdentity], object],
-) -> Mapping[str, LegacyEvolutionMethod]:
-    """Verify catalog entry points while legacy dispatch remains authoritative."""
+) -> Mapping[str, EvolutionMethodHandle]:
+    """Load context methods and preserve anti-drift checks for legacy dispatch."""
 
     expected = set(BUILTIN_METHOD_IDS)
     actual_descriptors = set(snapshot.methods)
@@ -868,21 +923,34 @@ def load_builtin_method_handles(
         identity = snapshot.identity_for(DescriptorKind.METHOD, method_id)
         loaded_handles[method_id] = verified_loader(identity)
 
+    legacy_method_ids = {
+        method_id
+        for method_id, descriptor in snapshot.methods.items()
+        if descriptor.invocation_abi is MethodInvocationABI.LEGACY_WORKER_JOB_V1
+    }
+
     from openevo.evolution.methods import METHOD_REGISTRY
 
     actual_registry = set(METHOD_REGISTRY)
-    if actual_registry != expected:
-        missing = sorted(expected - actual_registry)
-        extra = sorted(actual_registry - expected)
+    if actual_registry != legacy_method_ids:
+        missing = sorted(legacy_method_ids - actual_registry)
+        extra = sorted(actual_registry - legacy_method_ids)
         raise ValueError(f"built-in method key mismatch; missing={missing!r}, extra={extra!r}")
 
-    handles: dict[str, LegacyEvolutionMethod] = {}
+    handles: dict[str, EvolutionMethodHandle] = {}
     for method_id in BUILTIN_METHOD_IDS:
         loaded = loaded_handles[method_id]
-        expected_callable = METHOD_REGISTRY[method_id]
-        if loaded is not expected_callable:
-            raise ValueError(f"built-in method callable identity mismatch for {method_id!r}")
-        handles[method_id] = expected_callable
+        if not callable(loaded):
+            raise ValueError(f"built-in method entry point is not callable for {method_id!r}")
+        if method_id in legacy_method_ids:
+            expected_callable = METHOD_REGISTRY[method_id]
+            if loaded is not expected_callable:
+                raise ValueError(
+                    f"built-in method callable identity mismatch for {method_id!r}"
+                )
+            handles[method_id] = expected_callable
+        else:
+            handles[method_id] = loaded
     return MappingProxyType(handles)
 
 
