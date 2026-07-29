@@ -10,6 +10,7 @@ import pytest
 from desktop.sidecar.contracts.v2.models import (
     CoreAuthorityEventPayloadV2,
     HostCatalogEventPayloadV2,
+    LifecycleOperationEventPayloadV2,
 )
 from desktop.sidecar.event_broker_v2 import (
     DesktopEventBrokerClosedError,
@@ -104,6 +105,37 @@ def test_slow_subscriber_is_sealed_on_gap_without_unbounded_queue() -> None:
 
     asyncio.run(consume())
     assert broker.subscriber_count == 0
+    broker.close()
+
+
+def test_lifecycle_operation_payload_is_published_to_live_subscriber() -> None:
+    broker = DesktopEventBrokerV2(
+        clock=_clock,
+        event_id_factory=lambda: "lifecycle-token",
+    )
+    subscription = broker.subscribe()
+    payload = LifecycleOperationEventPayloadV2(
+        payload_kind="lifecycle_operation_changed",
+        operation_id="operation-1",
+        kind="project_create",
+        status="running",
+        phase="creating_remote_project",
+        etag='"' + ("a" * 64) + '"',
+        log_sequence_high_watermark=3,
+    )
+
+    event = broker.publish(payload)
+
+    async def consume() -> bytes:
+        try:
+            return await subscription.__anext__()
+        finally:
+            await subscription.aclose()
+
+    frame = asyncio.run(consume())
+    assert event.event_type == "lifecycle_operation_changed"
+    assert event.payload == payload
+    assert b"event: lifecycle_operation_changed" in frame
     broker.close()
 
 

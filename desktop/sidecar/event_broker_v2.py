@@ -40,6 +40,7 @@ _PAYLOAD_TYPES = (
     m.ProfileEventPayloadV2,
     m.CoreAuthorityEventPayloadV2,
     m.DiagnosticEventPayloadV2,
+    m.LifecycleOperationEventPayloadV2,
 )
 _PAYLOAD_ADAPTER = TypeAdapter(m.DesktopEventPayloadV2)
 
