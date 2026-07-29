@@ -670,6 +670,19 @@ def _canonical_json_bytes(value: object) -> bytes:
         raise ProviderContractV2Error("value is not canonical JSON data") from exc
 
 
+def _restart_profile_reconnect_key(
+    parent_operation_id: str,
+    invalidated_connection_generation: int,
+) -> str:
+    digest = hashlib.sha256(
+        b"openevo-desktop-restart-profile-reconnect-v2\0"
+        + parent_operation_id.encode("utf-8", errors="strict")
+        + b"\0"
+        + str(invalidated_connection_generation).encode("ascii")
+    ).hexdigest()
+    return f"desktop-v2-{digest}"
+
+
 def _schema_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
     row = connection.execute(
         """
@@ -938,116 +951,131 @@ class DesktopProviderStoreV2:
         """Atomically reserve one closed long operation and its local authority."""
 
         validated = self._validate_model(LifecycleOperationReservationV2, request)
-        self._validate_idempotency_key(idempotency_key)
-        request_document = _canonical_json_bytes(validated.request)
-        if len(request_document) > MAX_LIFECYCLE_REQUEST_BYTES:
-            raise ProviderCapacityV2Error("lifecycle request exceeds its byte bound")
-        request_sha256 = hashlib.sha256(_canonical_json_bytes(validated)).hexdigest()
-        resource_scope = "lifecycle_operations"
         with self._transaction(
             write=True,
             operation="reserveLifecycleOperationV2",
         ) as connection:
-            replay = connection.execute(
-                """
-                SELECT request_sha256, operation_id
-                FROM lifecycle_idempotency_records
-                WHERE principal = ? AND action = 'reserve'
-                  AND resource_scope = ? AND idempotency_key = ?
-                """,
-                (LOCAL_PRINCIPAL, resource_scope, idempotency_key),
-            ).fetchone()
-            if replay is not None:
-                if not hmac.compare_digest(replay["request_sha256"], request_sha256):
-                    raise ProviderIdempotencyConflictV2(
-                        "lifecycle idempotency key was reused for another request"
-                    )
-                return self._lifecycle_operation_from_row(
-                    self._require_lifecycle_operation_row(
-                        connection,
-                        cast(str, replay["operation_id"]),
-                    )
+            return self._reserve_lifecycle_operation_in_transaction(
+                connection,
+                validated,
+                idempotency_key=idempotency_key,
+            )
+
+    def _reserve_lifecycle_operation_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        request: LifecycleOperationReservationV2,
+        *,
+        idempotency_key: str,
+    ) -> m.LifecycleOperationV2:
+        """Reserve closed lifecycle authority inside an existing write transaction."""
+
+        self._validate_idempotency_key(idempotency_key)
+        request_document = _canonical_json_bytes(request.request)
+        if len(request_document) > MAX_LIFECYCLE_REQUEST_BYTES:
+            raise ProviderCapacityV2Error("lifecycle request exceeds its byte bound")
+        request_sha256 = hashlib.sha256(_canonical_json_bytes(request)).hexdigest()
+        resource_scope = "lifecycle_operations"
+        replay = connection.execute(
+            """
+            SELECT request_sha256, operation_id
+            FROM lifecycle_idempotency_records
+            WHERE principal = ? AND action = 'reserve'
+              AND resource_scope = ? AND idempotency_key = ?
+            """,
+            (LOCAL_PRINCIPAL, resource_scope, idempotency_key),
+        ).fetchone()
+        if replay is not None:
+            if not hmac.compare_digest(replay["request_sha256"], request_sha256):
+                raise ProviderIdempotencyConflictV2(
+                    "lifecycle idempotency key was reused for another request"
                 )
-
-            recoverable_count = cast(
-                int,
-                connection.execute(
-                    """
-                    SELECT count(*)
-                    FROM lifecycle_operations AS operation
-                    LEFT JOIN lifecycle_reconciliation_acknowledgements AS acknowledgement
-                      ON acknowledgement.operation_id = operation.operation_id
-                    WHERE operation.status IN ('queued', 'running')
-                       OR acknowledgement.operation_id IS NULL
-                    """
-                ).fetchone()[0],
-            )
-            if recoverable_count >= self._max_lifecycle_operations:
-                raise ProviderCapacityV2Error("lifecycle operation capacity is full")
-
-            if validated.kind in {
-                "profile_connect",
-                "profile_disconnect",
-                "host_key_review",
-            }:
-                self._transition_profile_for_lifecycle(connection, validated.request)
-                _lifecycle_reservation_checkpoint("after_profile_transition")
-
-            operation_id = self._new_id("operation")
-            timestamp = self._timestamp()
-            version = 1
-            etag = self._etag("lifecycle_operation", operation_id, version)
-            phase_plan = _canonical_json_bytes(list(m.LIFECYCLE_PHASES))
-            progress = _canonical_json_bytes({"kind": "indeterminate"})
-            connection.execute(
-                """
-                INSERT INTO lifecycle_operations(
-                    operation_id, kind, resource_kind, resource_id,
-                    request_sha256, request_json, phase_plan_json,
-                    status, phase, phase_index, phase_total, progress_json,
-                    cancellable, result_json, failure_json,
-                    log_sequence_high_watermark, dropped_before_sequence,
-                    log_byte_count, cancellation_requested, resource_version,
-                    created_at, started_at, updated_at, finished_at, etag
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', 1, 17, ?,
-                    1, NULL, NULL, 0, 0, 0, 0, ?, ?, NULL, ?, NULL, ?
-                )
-                """,
-                (
-                    operation_id,
-                    validated.kind,
-                    validated.resource.resource_kind,
-                    validated.resource.resource_id,
-                    request_sha256,
-                    request_document,
-                    phase_plan,
-                    progress,
-                    version,
-                    timestamp,
-                    timestamp,
-                    etag,
-                ),
-            )
-            connection.execute(
-                """
-                INSERT INTO lifecycle_idempotency_records(
-                    principal, action, resource_scope, idempotency_key,
-                    request_sha256, operation_id, created_at
-                ) VALUES (?, 'reserve', ?, ?, ?, ?, ?)
-                """,
-                (
-                    LOCAL_PRINCIPAL,
-                    resource_scope,
-                    idempotency_key,
-                    request_sha256,
-                    operation_id,
-                    timestamp,
-                ),
-            )
             return self._lifecycle_operation_from_row(
-                self._require_lifecycle_operation_row(connection, operation_id)
+                self._require_lifecycle_operation_row(
+                    connection,
+                    cast(str, replay["operation_id"]),
+                )
             )
+
+        recoverable_count = cast(
+            int,
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM lifecycle_operations AS operation
+                LEFT JOIN lifecycle_reconciliation_acknowledgements AS acknowledgement
+                  ON acknowledgement.operation_id = operation.operation_id
+                WHERE operation.status IN ('queued', 'running')
+                   OR acknowledgement.operation_id IS NULL
+                """
+            ).fetchone()[0],
+        )
+        if recoverable_count >= self._max_lifecycle_operations:
+            raise ProviderCapacityV2Error("lifecycle operation capacity is full")
+
+        if request.kind in {
+            "profile_connect",
+            "profile_disconnect",
+            "host_key_review",
+        }:
+            self._transition_profile_for_lifecycle(connection, request.request)
+            _lifecycle_reservation_checkpoint("after_profile_transition")
+
+        operation_id = self._new_id("operation")
+        timestamp = self._timestamp()
+        version = 1
+        etag = self._etag("lifecycle_operation", operation_id, version)
+        phase_plan = _canonical_json_bytes(list(m.LIFECYCLE_PHASES))
+        progress = _canonical_json_bytes({"kind": "indeterminate"})
+        connection.execute(
+            """
+            INSERT INTO lifecycle_operations(
+                operation_id, kind, resource_kind, resource_id,
+                request_sha256, request_json, phase_plan_json,
+                status, phase, phase_index, phase_total, progress_json,
+                cancellable, result_json, failure_json,
+                log_sequence_high_watermark, dropped_before_sequence,
+                log_byte_count, cancellation_requested, resource_version,
+                created_at, started_at, updated_at, finished_at, etag
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', 1, 17, ?,
+                1, NULL, NULL, 0, 0, 0, 0, ?, ?, NULL, ?, NULL, ?
+            )
+            """,
+            (
+                operation_id,
+                request.kind,
+                request.resource.resource_kind,
+                request.resource.resource_id,
+                request_sha256,
+                request_document,
+                phase_plan,
+                progress,
+                version,
+                timestamp,
+                timestamp,
+                etag,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO lifecycle_idempotency_records(
+                principal, action, resource_scope, idempotency_key,
+                request_sha256, operation_id, created_at
+            ) VALUES (?, 'reserve', ?, ?, ?, ?, ?)
+            """,
+            (
+                LOCAL_PRINCIPAL,
+                resource_scope,
+                idempotency_key,
+                request_sha256,
+                operation_id,
+                timestamp,
+            ),
+        )
+        return self._lifecycle_operation_from_row(
+            self._require_lifecycle_operation_row(connection, operation_id)
+        )
 
     def get_lifecycle_operation(self, operation_id: str) -> m.LifecycleOperationV2:
         self._validate_profile_id(operation_id)
@@ -1094,7 +1122,7 @@ class DesktopProviderStoreV2:
         ) as connection:
             return self._lifecycle_work_from_row(
                 connection,
-                self._require_lifecycle_operation_row(connection, operation_id)
+                self._require_lifecycle_operation_row(connection, operation_id),
             )
 
     def list_pending_lifecycle_operations(
@@ -2330,10 +2358,23 @@ class DesktopProviderStoreV2:
             return updated
 
     def reconcile_process_restart(self) -> tuple[m.RemoteWorkspaceProfileV2, ...]:
-        """Invalidate process-local SSH/Core authority while retaining project intent."""
+        """Invalidate process authority and durably reclaim interrupted project work."""
 
         recovered: list[m.RemoteWorkspaceProfileV2] = []
         with self._transaction(write=True, operation="reconcileProcessRestartV2") as connection:
+            project_rows = connection.execute(
+                f"""
+                SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+                FROM lifecycle_operations
+                WHERE kind IN ('project_create', 'project_activate')
+                  AND status IN ('queued', 'running')
+                ORDER BY created_at, operation_id
+                """
+            ).fetchall()
+            project_work = tuple(
+                self._lifecycle_work_from_row(connection, cast(sqlite3.Row, row))
+                for row in project_rows
+            )
             lifecycle_owned_profiles = {
                 cast(str, row[0])
                 for row in connection.execute(
@@ -2393,7 +2434,56 @@ class DesktopProviderStoreV2:
                 )
                 self._update_profile(connection, recovered_profile, version=version)
                 recovered.append(recovered_profile)
+                parent = self._restart_project_reconnect_parent(
+                    recovered_profile,
+                    project_work,
+                )
+                if parent is not None:
+                    reconnect = LifecycleOperationReservationV2(
+                        kind="profile_connect",
+                        resource={
+                            "resource_kind": "profile",
+                            "resource_id": recovered_profile.profile_id,
+                        },
+                        request=LifecycleProfileConnectRequestV2(
+                            request_kind="profile_connect",
+                            profile_id=recovered_profile.profile_id,
+                            request=m.ProfileConnectionActionV2(
+                                expected_connection_generation=(
+                                    recovered_profile.connection_generation
+                                )
+                            ),
+                            resource_generation=recovered_profile.connection_generation,
+                            if_match=recovered_profile.etag,
+                        ),
+                    )
+                    self._reserve_lifecycle_operation_in_transaction(
+                        connection,
+                        reconnect,
+                        idempotency_key=_restart_profile_reconnect_key(
+                            parent.operation.operation_id,
+                            recovered_profile.connection_generation,
+                        ),
+                    )
         return tuple(recovered)
+
+    @staticmethod
+    def _restart_project_reconnect_parent(
+        profile: m.RemoteWorkspaceProfileV2,
+        pending: tuple[LifecycleOperationWorkV2, ...],
+    ) -> LifecycleOperationWorkV2 | None:
+        for work in pending:
+            request = work.request
+            if isinstance(request, LifecycleProjectCreateRequestV2):
+                if request.request.profile_id == profile.profile_id:
+                    return work
+                continue
+            if (
+                isinstance(request, LifecycleProjectActivateRequestV2)
+                and profile.active_project_id == request.project_id
+            ):
+                return work
+        return None
 
     def bind_active_project(
         self,

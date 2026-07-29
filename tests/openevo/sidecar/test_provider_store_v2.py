@@ -760,6 +760,112 @@ def test_post_commit_interruption_replays_without_duplicate_mutation(
         reopened.close()
 
 
+def test_restart_atomically_reserves_project_profile_reconnect_prerequisite(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="restart-reclaim-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(expected_connection_generation=1),
+        action="connect",
+        resource_generation=1,
+        if_match=created.etag,
+        idempotency_key="restart-reclaim-profile-connect-0001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    project_id = "desktop-project-restart-reclaim"
+    request = contract_models.ProjectCreateV2(
+        profile_id=connected.profile_id,
+        profile_connection_generation=connected.connection_generation,
+        display_name="Restart reclaim",
+        config=_science_config(),
+    )
+    project_operation = store.reserve_lifecycle_operation(
+        store_module.LifecycleOperationReservationV2(
+            kind="project_create",
+            resource={"resource_kind": "project", "resource_id": project_id},
+            request=store_module.LifecycleProjectCreateRequestV2(
+                request_kind="project_create",
+                project_id=project_id,
+                action_id="restart-reclaim-project-action-0001",
+                request=request,
+                resource_generation=connected.connection_generation,
+            ),
+        ),
+        idempotency_key="restart-reclaim-project-reserve-0001",
+    )
+    claimed = store.claim_next_lifecycle_operation()
+    assert claimed is not None
+    assert claimed.operation.operation_id == project_operation.operation_id
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    monkeypatch.setattr(
+        store_module,
+        "_lifecycle_reservation_checkpoint",
+        lambda stage: (
+            (_ for _ in ()).throw(RuntimeError("restart reservation interrupted"))
+            if stage == "after_profile_transition"
+            else None
+        ),
+    )
+    with pytest.raises(RuntimeError, match="restart reservation interrupted"):
+        reopened.reconcile_process_restart()
+    assert reopened.get_profile(created.profile_id) == connected
+    assert [item.operation.operation_id for item in reopened.reconcile_lifecycle_operations()] == [
+        project_operation.operation_id
+    ]
+
+    monkeypatch.setattr(
+        store_module,
+        "_lifecycle_reservation_checkpoint",
+        lambda _stage: None,
+    )
+    recovered = reopened.reconcile_process_restart()
+    assert len(recovered) == 1
+    invalidated = recovered[0]
+    assert invalidated.connection_state == "disconnected"
+    assert invalidated.connection_generation == connected.connection_generation + 1
+
+    current = reopened.get_profile(created.profile_id)
+    assert current.connection_state == "connecting"
+    assert current.connection_generation == invalidated.connection_generation + 1
+    work = reopened.reconcile_lifecycle_operations()
+    assert {item.operation.kind for item in work} == {"project_create", "profile_connect"}
+    assert len(work) == 2
+    reconnect = next(item for item in work if item.operation.kind == "profile_connect")
+    assert isinstance(reconnect.request, store_module.LifecycleProfileConnectRequestV2)
+    assert reconnect.request.profile_id == created.profile_id
+    assert reconnect.request.resource_generation == invalidated.connection_generation
+    assert reconnect.request.request.expected_connection_generation == (
+        invalidated.connection_generation
+    )
+    assert reconnect.request.if_match == invalidated.etag
+    reconnect_operation_id = reconnect.operation.operation_id
+    reopened.close()
+
+    restarted_again = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        assert restarted_again.reconcile_process_restart() == ()
+        assert {
+            item.operation.operation_id
+            for item in restarted_again.reconcile_lifecycle_operations()
+        } == {project_operation.operation_id, reconnect_operation_id}
+    finally:
+        restarted_again.close()
+
+
 def test_capacity_is_bounded_but_exact_retry_survives_full_store(
     tmp_path: Path,
 ) -> None:

@@ -210,6 +210,16 @@ projection. Cancellation is accepted only before a durable non-cancellable
 mutation barrier; after that barrier it returns a typed conflict instead of
 reporting an already-applied external mutation as cancelled.
 
+Sidecar restart invalidates process-local SSH/Core authority before lifecycle
+execution resumes. If a queued or running project create/activation owns work on
+the invalidated profile, that same recovery transaction reserves a deterministic
+durable profile-connect prerequisite bound to the parent operation and the new
+disconnected generation. The executor defers the parent, completes the
+prerequisite through system OpenSSH, and resumes the same parent operation and
+Core mutation identity without requiring a second renderer action. An already
+pending profile lifecycle operation is resumed instead of duplicated, and an
+explicitly disconnected profile is never inferred to be restart-owned.
+
 ## Core Control API v2 Identity Model
 
 V2 has no generic `revision` resource or field. It uses these distinct closed

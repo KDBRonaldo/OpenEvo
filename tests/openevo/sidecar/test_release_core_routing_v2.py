@@ -1034,7 +1034,7 @@ def test_project_create_and_read_use_only_generation_bound_core_v2(
         store.close()
 
 
-def test_running_project_create_waits_for_reconnect_after_sidecar_restart(
+def test_running_project_create_reconnects_and_resumes_after_sidecar_restart(
     tmp_path: Path,
 ) -> None:
     first_provider, first_store, _first_lifecycle, _first_bridge = _provider(tmp_path)
@@ -1109,36 +1109,15 @@ def test_running_project_create_waits_for_reconnect_after_sidecar_restart(
         )
     )
     try:
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if reopened.get_lifecycle_operation(operation.operation_id).status == "running":
-                break
-            time.sleep(0.01)
-        assert reopened.get_lifecycle_operation(operation.operation_id).status == "running"
-        assert bridge.calls == []
-
-        connected = client.post(
-            f"/desktop/v2/profiles/{disconnected.profile_id}/connect",
-            headers=_headers(
-                **{
-                    "X-OpenEvo-Resource-Generation": str(disconnected.connection_generation),
-                    "If-Match": disconnected.etag,
-                    "Idempotency-Key": "routing-restart-connect-profile-0001",
-                }
-            ),
-            json={
-                "schema_version": "2",
-                "expected_connection_generation": disconnected.connection_generation,
-            },
-        )
-        assert connected.status_code == 202, connected.text
-        assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
         terminal = _wait_lifecycle_operation(
             client,
             {"operation_id": operation.operation_id},
         )
 
         assert terminal["status"] == "succeeded"
+        assert lifecycle.calls == [
+            ("connect", disconnected.ssh_host_alias, disconnected.connection_generation + 1)
+        ]
         assert [call[0] for call in bridge.calls] == ["activate_project"]
         assert bridge.calls[0][3] == disconnected.connection_generation + 1
         assert bridge.calls[0][4] == action_id
@@ -1148,7 +1127,7 @@ def test_running_project_create_waits_for_reconnect_after_sidecar_restart(
         reopened.close()
 
 
-def test_running_project_activate_waits_for_reconnect_after_sidecar_restart(
+def test_running_project_activate_reconnects_and_resumes_after_sidecar_restart(
     tmp_path: Path,
 ) -> None:
     first_provider, first_store, _first_lifecycle, bridge = _provider(tmp_path)
@@ -1228,29 +1207,6 @@ def test_running_project_activate_waits_for_reconnect_after_sidecar_restart(
         )
     )
     try:
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline:
-            if reopened.get_lifecycle_operation(operation.operation_id).status == "running":
-                break
-            time.sleep(0.01)
-        assert reopened.get_lifecycle_operation(operation.operation_id).status == "running"
-
-        connected = client.post(
-            f"/desktop/v2/profiles/{disconnected.profile_id}/connect",
-            headers=_headers(
-                **{
-                    "X-OpenEvo-Resource-Generation": str(disconnected.connection_generation),
-                    "If-Match": disconnected.etag,
-                    "Idempotency-Key": "routing-activate-restart-connect-profile-0001",
-                }
-            ),
-            json={
-                "schema_version": "2",
-                "expected_connection_generation": disconnected.connection_generation,
-            },
-        )
-        assert connected.status_code == 202, connected.text
-        assert _wait_lifecycle_operation(client, connected.json())["status"] == "succeeded"
         terminal = _wait_lifecycle_operation(
             client,
             {"operation_id": operation.operation_id},
@@ -1258,6 +1214,9 @@ def test_running_project_activate_waits_for_reconnect_after_sidecar_restart(
 
         assert terminal["status"] == "succeeded"
         assert terminal["result"]["project_id"] == project.project_id
+        assert lifecycle.calls == [
+            ("connect", disconnected.ssh_host_alias, disconnected.connection_generation + 1)
+        ]
         assert bridge.active_activation is not None
         assert (
             bridge.active_activation.profile_connection_generation
