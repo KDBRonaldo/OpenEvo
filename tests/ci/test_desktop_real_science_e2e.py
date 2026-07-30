@@ -1131,6 +1131,221 @@ def test_release_negotiation_is_v2_only_and_session_authenticated() -> None:
     assert api.calls[-1][1]["authenticated"] is False
 
 
+def test_relaunch_negotiates_current_instance_and_rejects_release_drift() -> None:
+    module = _load_runner()
+
+    class FakeApi:
+        def __init__(self, payload: dict[str, object]) -> None:
+            self.payload = payload
+
+        def request(self, _method: str, route: str, **kwargs: object):
+            if route == "/version":
+                return dict(self.payload)
+            if route == "/desktop/v2/state" and kwargs.get("authenticated") is not False:
+                return {"schema_version": "2"}
+            return {}
+
+    initial_payload = _version_payload()
+    initial_identity = module._release_identity(FakeApi(initial_payload))
+    relaunched_payload = dict(initial_payload)
+    relaunched_payload["build_id"] = _digest("relaunched-build-id")
+
+    current_identity = module._release_identity_after_relaunch(
+        FakeApi(relaunched_payload),
+        previous_identity=initial_identity,
+    )
+
+    assert current_identity["build_id"] == relaunched_payload["build_id"]
+    assert current_identity["build_id"] != initial_identity["build_id"]
+
+    drifted_payload = dict(relaunched_payload)
+    drifted_payload["source_commit"] = "e" * 40
+    with pytest.raises(
+        module.E2EFailure,
+        match="desktop_relaunch_release_identity_mismatch",
+    ):
+        module._release_identity_after_relaunch(
+            FakeApi(drifted_payload),
+            previous_identity=initial_identity,
+        )
+
+    with pytest.raises(
+        module.E2EFailure,
+        match="desktop_relaunch_instance_identity_unchanged",
+    ):
+        module._release_identity_after_relaunch(
+            FakeApi(initial_payload),
+            previous_identity=initial_identity,
+        )
+
+    incomplete_previous_identity = dict(initial_identity)
+    incomplete_previous_identity.pop("build_id")
+    with pytest.raises(
+        module.E2EFailure,
+        match="desktop_relaunch_release_identity_mismatch",
+    ):
+        module._release_identity_after_relaunch(
+            FakeApi(relaunched_payload),
+            previous_identity=incomplete_previous_identity,
+        )
+
+
+def test_main_relaunch_binds_evidence_and_renderer_to_current_instance(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_runner()
+    args = _candidate_arguments(module, tmp_path)
+    args.output = tmp_path / "evidence.json"
+    initial_payload = _version_payload()
+    relaunched_payload = dict(initial_payload)
+    relaunched_payload["build_id"] = _digest("main-relaunched-build-id")
+    observed_routes: list[tuple[str, str]] = []
+    written_evidence: dict[str, object] = {}
+    renderer_identities: list[dict[str, object]] = []
+
+    class FakeParser:
+        def parse_args(self, _argv: list[str] | None):
+            return args
+
+    class FakeProgress:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def emit(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def stop_deadline_enforcement(self) -> None:
+            pass
+
+    class FakeNative:
+        def __init__(self, serial: int) -> None:
+            self.base_url = f"http://127.0.0.1:{41000 + serial}"
+            self.credentials = SimpleNamespace(
+                session_token="test-session-token",
+                private_values=lambda: [],
+            )
+
+        def assert_log_budget(self) -> None:
+            pass
+
+        def terminate(self) -> bool:
+            return True
+
+    natives = [FakeNative(0), FakeNative(1)]
+    launch_sequence = list(natives)
+
+    class FakeLocalApi:
+        def __init__(self, base_url: str, _session_token: str, **_kwargs: object) -> None:
+            self.base_url = base_url
+
+        def request(self, _method: str, route: str, **kwargs: object):
+            observed_routes.append((self.base_url, route))
+            if route == "/version":
+                payload = (
+                    initial_payload
+                    if self.base_url == natives[0].base_url
+                    else relaunched_payload
+                )
+                return dict(payload)
+            if route == "/desktop/v2/state" and kwargs.get("authenticated") is not False:
+                return {"schema_version": "2"}
+            return {}
+
+    assets = SimpleNamespace(
+        source_commit=initial_payload["source_commit"],
+        registry_digest=_digest("registry"),
+        evidence={},
+        verify_unchanged=lambda: None,
+        close=lambda: None,
+    )
+    renderer_binding = SimpleNamespace(
+        source_commit=initial_payload["source_commit"],
+        evidence={},
+        verify_unchanged=lambda: None,
+        close=lambda: None,
+    )
+
+    class FakeWorkflow:
+        def __init__(self, _api: object, **kwargs: object) -> None:
+            relaunch = kwargs.get("relaunch")
+            assert callable(relaunch)
+            self._relaunch: Callable[[], object] = relaunch
+
+        def run(self) -> dict[str, object]:
+            relaunched_api = self._relaunch()
+            assert isinstance(relaunched_api, FakeLocalApi)
+            assert relaunched_api.base_url == natives[1].base_url
+            return {"lifecycle": {"core_authority": {}}}
+
+        def cleanup(self) -> dict[str, bool]:
+            return {
+                "active_task_cleanup_required": False,
+                "active_task_cancel_requested": False,
+                "active_task_terminal": True,
+                "active_task_cleanup_succeeded": True,
+                "desktop_disconnect_succeeded": True,
+            }
+
+        def lifecycle_release_authority(self) -> tuple[str, str]:
+            return "core-project", "desktop-action"
+
+    def run_renderer_verification(**kwargs: object) -> dict[str, object]:
+        identity = kwargs.get("desktop_identity")
+        assert isinstance(identity, dict)
+        renderer_identities.append(dict(identity))
+        if identity["build_id"] == initial_payload["build_id"]:
+            raise module.E2EFailure("renderer", "stale_renderer_build_identity")
+        assert kwargs.get("native") is natives[1]
+        return {"outcome": "passed"}
+
+    def write_evidence(
+        _output: Path,
+        payload: dict[str, object],
+        **_kwargs: object,
+    ) -> None:
+        written_evidence.update(payload)
+
+    monkeypatch.setattr(module, "_parser", lambda: FakeParser())
+    monkeypatch.setattr(module, "_validate_runtime_arguments", lambda _args: None)
+    monkeypatch.setattr(module.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(module.signal, "setitimer", lambda *_args: None)
+    monkeypatch.setattr(module, "ProgressReporter", FakeProgress)
+    monkeypatch.setattr(
+        module,
+        "_inspect_release_assets",
+        lambda *_args, **_kwargs: assets,
+    )
+    monkeypatch.setattr(
+        module,
+        "_validate_renderer_candidate_binding",
+        lambda **_kwargs: renderer_binding,
+    )
+    monkeypatch.setattr(
+        module,
+        "_launch_sidecar",
+        lambda *_args, **_kwargs: launch_sequence.pop(0),
+    )
+    monkeypatch.setattr(module, "LocalApi", FakeLocalApi)
+    monkeypatch.setattr(module, "DesktopScienceWorkflow", FakeWorkflow)
+    monkeypatch.setattr(module, "_run_renderer_verification", run_renderer_verification)
+    monkeypatch.setattr(
+        module,
+        "_verify_lifecycle_store_authority",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(module, "_write_evidence", write_evidence)
+
+    assert module.main([]) == 0
+    assert renderer_identities == [written_evidence["desktop"]]
+    assert renderer_identities[0]["build_id"] == relaunched_payload["build_id"]
+    assert renderer_identities[0]["build_id"] != initial_payload["build_id"]
+    assert [url for url, route in observed_routes if route == "/version"] == [
+        natives[0].base_url,
+        natives[1].base_url,
+    ]
+
+
 def test_release_negotiation_rejects_non_v2_provider() -> None:
     module = _load_runner()
 

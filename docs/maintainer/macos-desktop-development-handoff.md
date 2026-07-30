@@ -887,6 +887,10 @@ candidate installed in `/Applications`:
   stderr are visible with a progress bar and elapsed time;
 - one SSE reconnect and one sidecar relaunch retain the exact operation and
   action identities without another create request;
+- after that relaunch, the release runner repeats strict `/version` and Desktop
+  session negotiation, requires unchanged candidate composition plus a new
+  instance-bound `build_id`, and gives only that current identity to the
+  packaged renderer;
 - post-shutdown authority contains exactly one Core project, one Desktop/Core
   mapping, and one applied create mutation for that action;
 - a generated secret canary is absent from Local API pages, rendered text,

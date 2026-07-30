@@ -2943,6 +2943,28 @@ def _release_identity(api: LocalApi) -> dict[str, object]:
     }
 
 
+def _release_identity_after_relaunch(
+    api: LocalApi,
+    *,
+    previous_identity: Mapping[str, object],
+) -> dict[str, object]:
+    current_identity = _release_identity(api)
+    stable_keys = set(current_identity) - {"build_id"}
+    if set(previous_identity) != set(current_identity) or any(
+        previous_identity.get(key) != current_identity[key] for key in stable_keys
+    ):
+        raise E2EFailure(
+            "desktop_version",
+            "desktop_relaunch_release_identity_mismatch",
+        )
+    if previous_identity.get("build_id") == current_identity["build_id"]:
+        raise E2EFailure(
+            "desktop_version",
+            "desktop_relaunch_instance_identity_unchanged",
+        )
+    return current_identity
+
+
 def _write_evidence(
     output: Path,
     payload: Mapping[str, object],
@@ -4615,7 +4637,7 @@ def main(argv: list[str] | None = None) -> int:
             )
 
             def relaunch_sidecar() -> LocalApi:
-                nonlocal native, relaunch_serial
+                nonlocal desktop_identity, native, relaunch_serial
                 if native is None:
                     raise E2EFailure("project_create", "lifecycle_relaunch_unavailable")
                 native.assert_log_budget()
@@ -4630,12 +4652,18 @@ def main(argv: list[str] | None = None) -> int:
                     secret_canary=secret_canary,
                 )
                 private_values.extend(native.credentials.private_values())
-                return LocalApi(
+                relaunched_api = LocalApi(
                     native.base_url,
                     native.credentials.session_token,
                     progress=progress,
                     health_check=native.assert_log_budget,
                 )
+                desktop_identity = _release_identity_after_relaunch(
+                    relaunched_api,
+                    previous_identity=desktop_identity,
+                )
+                evidence["desktop"] = desktop_identity
+                return relaunched_api
 
             desktop_identity = _release_identity(api)
             if (
@@ -4664,6 +4692,7 @@ def main(argv: list[str] | None = None) -> int:
                 secret_canary=secret_canary,
             )
             evidence.update(workflow.run())
+            evidence["desktop"] = desktop_identity
             evidence["renderer"] = _run_renderer_verification(
                 native=native,
                 workflow=workflow,

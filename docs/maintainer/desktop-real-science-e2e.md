@@ -1,8 +1,9 @@
 # Release Desktop Real-Science E2E
 
 This maintainer-only gate runs the exact v0.1.10 macOS Desktop composition
-against a real remote science workspace. It is part of #163. It is not a
-user-facing CLI and never calls Core Control directly.
+against a real remote science workspace. It is part of #163 and the lifecycle
+release blocker #220. It is not a user-facing CLI and never calls Core Control
+directly.
 
 ## Required environment
 
@@ -96,6 +97,14 @@ Local API v2:
    tunnel, then patch the same project to enable `text_memory` and
    `skill_bundle` with their supported remote effective defaults and
    `agent_system` with the supported Core-owned `auto` resolver.
+   Immediately after the required sidecar relaunch, repeat the complete
+   `/version` and Desktop-session negotiation against the new process. Every
+   release-composition field must equal the initial candidate identity, while
+   the instance-bound `build_id` must change. After that negotiation succeeds,
+   the runner records the accepted current identity and pins its new `build_id`
+   into the packaged-renderer handoff; a pre-relaunch bootstrap identity is
+   never reused. A failed renegotiation retains only the last verified identity
+   plus its closed failure code as evidence.
 5. Validate the project against the exact remote registry before each Task.
 6. Submit two immutable Tasks. For each Task, verify its admission and
    authoritative attempt, required v2 timeline event types, exact predecessor
