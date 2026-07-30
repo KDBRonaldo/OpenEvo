@@ -537,6 +537,11 @@ self-deployed inference，且只在下一 task/session 生效。
 - worker 从 verified dataset payload 读取成功 trace 的 prompt/response messages；
 - Daemon 通过固定 Python module command 启动 trainer，不接受用户 command、shell、endpoint
   或 credential；
+- 一个 artifact root 只能由一个 trainer service 持有；service 串行化 GPU training，并要求
+  trainer 进程只看到一个 `CUDA_VISIBLE_DEVICES` device；
+- trainer 使用独立 process group、Linux parent-death signal、closed environment 和
+  core/file/open-file/CPU resource limits。active receipt 绑定 boot ID、PID、process group、
+  session 和进程 start time，service 重启时只终止 identity 仍完全匹配的遗留进程；
 - 旧 A/B components 冻结，新 A/B component 和共享 coefficients 参与训练；
 - 输出前把所有 components 折叠成一个标准 PEFT adapter，同时保存可继续训练的
   `openevo_sd_lora_state.json` 和 `openevo_sd_lora_state.safetensors`；
@@ -544,12 +549,14 @@ self-deployed inference，且只在下一 task/session 生效。
 
 输出是一个 `parametric_memory` artifact。Manifest 将其声明为
 `routing_mode=single_cumulative_adapter`，并绑定 exact model revision、component/rank
-inventory、source datasets、prior artifact 和训练统计。它不声称内部 training reward 是
-held-out performance。
+inventory、source datasets、prior artifact、实际 trainer wall time 和 peak allocated GPU
+memory。它不声称 training loss 或这些 resource metrics 是 held-out performance。
 
 该方法要求 Daemon 安装 `openevo[parametric-memory]`、CUDA 可用，并由 launcher 发布
 `adapter_serving`、`gpu`、`sd_lora_continual_trainer`。它是 internal/experimental research
-capability，不属于当前 External Beta release acceptance。
+capability，不属于当前 External Beta release acceptance。多 GPU host 应在启动 Daemon 时用
+`CUDA_VISIBLE_DEVICES` 选择一个 device；supervisor 只把这个选择透传给 closed child
+environment，trainer capability 仍要求最终恰好一个 CUDA device 可见。
 
 
 ## Maintainer Worker Options
@@ -588,11 +595,15 @@ python -m openevo.evolution.cli worker
 uv run python -m openevo.evolution.cli worker --capability text_memory,skill_bundle,agent_system,agent_system_reflector,agent_system_history_reflector,agent_system_pareto_reflector,text_memory_expel_reflector,parametric_memory_sd_lora
 ```
 
-Worker 在 method 运行期间每隔 claim lease 的三分之一续租。Store 会持久化 claim 请求的
-`lease_seconds`，每次 heartbeat 都从当前时间续租相同 duration；短 lease 不会被放大成 600 秒。
+Worker 在 method 运行期间每隔 claim lease 的三分之一续租，间隔最多为 5 秒。Store 会持久化
+claim 请求的 `lease_seconds`，每次 heartbeat 都从当前时间续租相同 duration；短 lease 不会被
+放大成 600 秒。
 旧 active job 的 NULL duration 会从原 `updated_at`/`lease_expires_at` 区间安全推导并持久化，
-无法得到正 duration 时拒绝续租。线程在 method 成功或异常后都会停止并 join；heartbeat 失败会阻止 complete。这样
-长时间运行的 trainer 不会因为只有开始/结束 heartbeat 而被另一 worker 重新 claim。
+无法得到正 duration 时拒绝续租。线程在 method 成功或异常后都会停止并 join；heartbeat 失败
+会设置 method cancellation signal，SD-LoRA service 随即终止整个 trainer process group，并阻止
+complete。configured timeout 走同一 process-group termination 路径。这样长时间运行的 trainer
+不会因为只有开始/结束 heartbeat 而被另一 worker 重新 claim，也不会在 lease ownership 丢失后
+继续训练。
 
 ## 添加 Research Method
 

@@ -80,6 +80,7 @@ class InferenceClient:
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(self._LIVENESS_TIMEOUT_SECONDS, connect=30),
+                trust_env=False,
             )
         return self._client
 

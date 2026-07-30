@@ -145,6 +145,27 @@ def test_training_data_rejects_surrogates_as_a_contract_error() -> None:
         normalize_chat_messages([{"role": "assistant", "content": "bad\ud800"}])
 
 
+def test_training_data_projects_empty_gateway_tool_calls_only_for_raw_text() -> None:
+    assert normalize_chat_messages(
+        [{"role": "assistant", "content": "Plain gateway response.", "tool_calls": []}]
+    ) == [{"role": "assistant", "content": "Plain gateway response."}]
+
+    with pytest.raises(ValueError, match="requires content"):
+        normalize_chat_messages(
+            [{"role": "assistant", "content": "", "tool_calls": []}]
+        )
+
+    with pytest.raises(ValueError, match="non-empty bounded list"):
+        normalize_training_example(
+            {
+                "messages": [
+                    {"role": "user", "content": "Question"},
+                    {"role": "assistant", "content": "Answer", "tool_calls": []},
+                ]
+            }
+        )
+
+
 def test_cumulative_adapter_exactly_matches_sd_lora_forward_rule() -> None:
     torch = pytest.importorskip("torch")
     prior_a = torch.tensor([[1.0, 2.0]])

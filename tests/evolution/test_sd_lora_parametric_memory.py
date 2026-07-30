@@ -67,6 +67,7 @@ def _dataset(
     *,
     successful_text: str = "Run focused tests and inspect their output.",
     tool_call_trace: bool = False,
+    gateway_empty_tool_calls: bool = False,
 ) -> WorkerClaimInputArtifact:
     dataset_dir = artifact_root / "datasets" / identity
     dataset_dir.mkdir(mode=0o700, parents=True)
@@ -140,7 +141,13 @@ def _dataset(
     else:
         successful_trace = {
             "prompt_messages": [{"content": "Repair the repository.", "role": "user"}],
-            "response_messages": [{"content": successful_text, "role": "assistant"}],
+            "response_messages": [
+                {
+                    "content": successful_text,
+                    "role": "assistant",
+                    **({"tool_calls": []} if gateway_empty_tool_calls else {}),
+                }
+            ],
         }
     records = [
         {
@@ -291,7 +298,13 @@ class _FakeTrainer:
         self.requests: list[SdLoraTrainingRequest] = []
         self.training_records: list[list[dict[str, object]]] = []
 
-    def train_sd_lora(self, request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
+    def train_sd_lora(
+        self,
+        request: SdLoraTrainingRequest,
+        *,
+        cancellation=None,
+    ) -> SdLoraTrainingResult:
+        assert cancellation is None or not cancellation.is_set()
         request = SdLoraTrainingRequest.model_validate(request)
         self.requests.append(request)
         work_dir = Path(request.work_dir)
@@ -346,6 +359,8 @@ class _FakeTrainer:
             training_record_count=request.training_record_count,
             steps_completed=2,
             training_loss=0.25,
+            training_time_seconds=1.5,
+            gpu_peak_memory_bytes=1024,
             source_dataset_artifact_ids=request.source_dataset_artifact_ids,
             prior_parametric_memory_artifact_id=(request.prior_parametric_memory_artifact_id),
         )
@@ -361,6 +376,8 @@ class _FakeTrainer:
             training_record_count=request.training_record_count,
             steps_completed=2,
             training_loss=0.25,
+            training_time_seconds=1.5,
+            gpu_peak_memory_bytes=1024,
             task_index=component_count - 1,
             component_count=component_count,
             effective_rank=component_count * request.config.rank,
@@ -370,8 +387,13 @@ class _FakeTrainer:
 
 
 class _TamperedStateTrainer(_FakeTrainer):
-    def train_sd_lora(self, request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
-        result = super().train_sd_lora(request)
+    def train_sd_lora(
+        self,
+        request: SdLoraTrainingRequest,
+        *,
+        cancellation=None,
+    ) -> SdLoraTrainingResult:
+        result = super().train_sd_lora(request, cancellation=cancellation)
         state_weights = Path(request.work_dir) / result.state_weights_path
         state_weights.write_bytes(state_weights.read_bytes() + b"tampered")
         state_weights.chmod(0o600)
@@ -455,6 +477,8 @@ def test_sd_lora_publishes_one_cumulative_adapter_across_generations(
     assert first.manifest["component_count"] == 1
     assert first.manifest["paper_equivalent"] is False
     assert first.manifest["base_model"] == "Qwen/Qwen3-0.6B"
+    assert first.manifest["training_time_seconds"] == 1.5
+    assert first.manifest["gpu_peak_memory_bytes"] == 1024
     assert first.compatibility["base_model"] == ["Qwen/Qwen3-0.6B"]
     assert first.scores["heldout_reward_delta"] == 0.1
     assert first.scores["quality"] == pytest.approx(0.8)
@@ -549,6 +573,32 @@ def test_sd_lora_preserves_generic_tool_calls_from_codex_style_trajectories(
     ]
 
 
+def test_sd_lora_accepts_plain_gateway_response_with_empty_tool_calls(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
+    trainer = _FakeTrainer()
+
+    parametric_memory_sd_lora(
+        _context(
+            artifact_root,
+            trainer,
+            _dataset(
+                artifact_root,
+                "gateway-plain",
+                gateway_empty_tool_calls=True,
+            ),
+        )
+    )
+
+    [record] = trainer.training_records[0]
+    assert record["messages"][-1] == {
+        "content": "Run focused tests and inspect their output.",
+        "role": "assistant",
+    }
+
+
 def test_sd_lora_rejects_trainer_state_weight_tampering(tmp_path: Path) -> None:
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir(mode=0o700)
@@ -563,7 +613,7 @@ def test_sd_lora_rejects_trainer_state_weight_tampering(tmp_path: Path) -> None:
             )
         )
     request = trainer.requests[0]
-    assert not (Path(request.work_dir) / request.training_data_path).exists()
+    assert not Path(request.work_dir).exists()
 
 
 def test_sd_lora_crosses_plan_store_worker_and_artifact_publication(

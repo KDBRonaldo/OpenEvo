@@ -365,6 +365,16 @@ class MethodExecutionEnvelope(_Contract):
 class MethodExecutionServices:
     harness: CoreHarnessService
     parametric_trainer: CoreParametricTrainer | None = None
+    cancellation: MethodCancellationSignal | None = None
+
+
+@runtime_checkable
+class MethodCancellationSignal(Protocol):
+    """Read-only cancellation signal supplied by the Core run owner."""
+
+    def is_set(self) -> bool: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -466,6 +476,7 @@ __all__ = [
     "InputBindingSource",
     "LegacyEvolutionMethod",
     "MAX_HARNESS_OUTPUT_TOKENS",
+    "MethodCancellationSignal",
     "MethodExecutionContext",
     "MethodExecutionEnvelope",
     "MethodExecutionServices",

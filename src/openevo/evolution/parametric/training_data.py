@@ -172,13 +172,20 @@ def normalize_chat_messages(value: Any, *, strict: bool = False) -> list[dict[st
         for key, label in (("name", "message name"), ("tool_call_id", "tool call ID")):
             if message.get(key) is not None:
                 item[key] = _identity(message[key], label=label)
-        if message.get("tool_calls") is not None:
+        raw_tool_calls = message.get("tool_calls")
+        if raw_tool_calls is not None:
             if role != "assistant":
                 raise ValueError("only assistant messages may contain tool_calls")
-            item["tool_calls"] = _normalize_tool_calls(
-                message["tool_calls"],
-                strict=strict,
-            )
+            # Gateway chat-completion responses may retain the provider's
+            # explicit empty list on an otherwise ordinary text response. It
+            # carries no training signal, so drop it while projecting raw
+            # trajectories. Canonical trainer JSONL remains closed and rejects
+            # the same shape through the strict validator below.
+            if strict or raw_tool_calls != []:
+                item["tool_calls"] = _normalize_tool_calls(
+                    raw_tool_calls,
+                    strict=strict,
+                )
         if not content and "tool_calls" not in item:
             raise ValueError("chat message requires content or assistant tool_calls")
         if strict and item != message:

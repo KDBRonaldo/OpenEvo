@@ -120,10 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     with EvolutionWorkerClient(
         args.base_url,
         headers=(internal_identity.request_headers() if internal_identity is not None else None),
-    ) as client:
+    ) as client, SubprocessSdLoraTrainerService(artifact_root) as parametric_trainer:
         method_services = MethodExecutionServices(
             harness=CodexSubscriptionHarnessService(),
-            parametric_trainer=SubprocessSdLoraTrainerService(artifact_root),
+            parametric_trainer=parametric_trainer,
         )
         if internal_identity is not None:
             client.register_internal_worker(

@@ -202,6 +202,8 @@ class SdLoraTrainingResult(_Contract):
     training_record_count: int = Field(ge=1, le=100_000)
     steps_completed: int = Field(ge=1, le=1_000_000)
     training_loss: float
+    training_time_seconds: float = Field(gt=0.0, le=86_400.0)
+    gpu_peak_memory_bytes: int = Field(ge=1, le=16 * 1024 * 1024 * 1024 * 1024)
     task_index: int = Field(ge=0, lt=MAX_SD_LORA_COMPONENTS)
     component_count: int = Field(ge=1, le=MAX_SD_LORA_COMPONENTS)
     effective_rank: int = Field(ge=1, le=MAX_SD_LORA_EFFECTIVE_RANK)
@@ -224,8 +226,10 @@ class SdLoraTrainingResult(_Contract):
             raise ValueError("SD-LoRA task index must identify the newest component")
         if len(self.coefficients) != self.component_count:
             raise ValueError("SD-LoRA result requires one coefficient per component")
-        if not math.isfinite(self.training_loss):
-            raise ValueError("training_loss must be finite")
+        if not math.isfinite(self.training_loss) or not math.isfinite(
+            self.training_time_seconds
+        ):
+            raise ValueError("training loss and time must be finite")
         if any(not math.isfinite(value) for value in self.coefficients):
             raise ValueError("SD-LoRA coefficients must be finite")
         return self
@@ -271,6 +275,8 @@ class SdLoraStateManifest(_Contract):
     training_record_count: int = Field(ge=1, le=100_000)
     steps_completed: int = Field(ge=1, le=1_000_000)
     training_loss: float
+    training_time_seconds: float = Field(gt=0.0, le=86_400.0)
+    gpu_peak_memory_bytes: int = Field(ge=1, le=16 * 1024 * 1024 * 1024 * 1024)
     source_dataset_artifact_ids: tuple[str, ...]
     prior_parametric_memory_artifact_id: str | None = None
     upstream_repository: str = "https://github.com/WuYichen-97/SD-Lora-CL"
@@ -319,16 +325,30 @@ class SdLoraStateManifest(_Contract):
             raise ValueError("SD-LoRA state modules must be non-empty and unique")
         if not self.source_dataset_artifact_ids:
             raise ValueError("SD-LoRA state requires source dataset lineage")
-        if not math.isfinite(self.training_loss):
-            raise ValueError("SD-LoRA state training loss must be finite")
+        if not math.isfinite(self.training_loss) or not math.isfinite(
+            self.training_time_seconds
+        ):
+            raise ValueError("SD-LoRA state training loss and time must be finite")
         return self
+
+
+@runtime_checkable
+class TrainerCancellationSignal(Protocol):
+    def is_set(self) -> bool: ...
+
+    def wait(self, timeout: float | None = None) -> bool: ...
 
 
 @runtime_checkable
 class CoreParametricTrainer(Protocol):
     """Daemon-owned training capability exposed to verified context methods."""
 
-    def train_sd_lora(self, request: SdLoraTrainingRequest) -> SdLoraTrainingResult: ...
+    def train_sd_lora(
+        self,
+        request: SdLoraTrainingRequest,
+        *,
+        cancellation: TrainerCancellationSignal | None = None,
+    ) -> SdLoraTrainingResult: ...
 
 
 __all__ = [
@@ -347,4 +367,5 @@ __all__ = [
     "SdLoraStateModule",
     "SdLoraTrainingRequest",
     "SdLoraTrainingResult",
+    "TrainerCancellationSignal",
 ]

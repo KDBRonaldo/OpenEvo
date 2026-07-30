@@ -36,11 +36,10 @@ The `openevo-terminal-bench` entrypoint provides:
   dataset/job preparation through Core contracts.
 - `terminal-bench-per-task-evolution` and `terminal-bench-group-evolution` for the
   existing task cadence and reporting workflow.
-- `terminal-bench-parametric-memory-job`,
-  `terminal-bench-task-local-parametric-memory-job`,
-  `terminal-bench-local-success-replay-parametric-memory-job`, and
-  `terminal-bench-local-parametric-memory-eval` for the unchanged WIP parametric
-  automation.
+- `terminal-bench-continual-memory-eval` for the controlled base vs ordinary
+  sequential-LoRA vs SD-LoRA task-stream experiment. It invokes model inference
+  only through Core `CodexHarness` and Gateway, trains user adapters on the
+  daemon profile, and never accepts an arbitrary trainer command.
 
 Example dry-run plan:
 
@@ -54,6 +53,60 @@ openevo-terminal-bench terminal-bench-per-task-evolution \
   --dry-run \
   --output /tmp/tb21-plan/plan.json
 ```
+
+Continual-memory dry run:
+
+```bash
+openevo-terminal-bench terminal-bench-continual-memory-eval \
+  --task-root /root/datasets/terminal-bench-2-1/tasks \
+  --task-id password-recovery \
+  --training-trial password-recovery=/path/to/successful/trial \
+  --run-root /tmp/tb21-continual \
+  --model Qwen/Qwen3-4B-Instruct-2507 \
+  --model-revision cdbee75f17c01a7cc42f958dc650907174af0554 \
+  --codex-version 0.144.1 \
+  --gpu 3 \
+  --dry-run \
+  --output /tmp/tb21-continual/plan.json
+```
+
+## Continual-Memory Evaluation
+
+The continual-memory command is a maintainer experiment, not a second OpenEvo
+inference API. It requires:
+
+- one ordered `--task-id` and successful `TASK_ID=TRIAL_DIR` training trial per
+  task;
+- an exact immutable Hugging Face model revision available to the local vLLM
+  and trainer environments;
+- one CUDA device visible to both the Daemon-owned trainer and vLLM;
+- a Linux Codex native binary whose `--version` exactly matches
+  `--codex-version`; and
+- a Harbor Docker daemon that can reach the Gateway address selected by
+  `--gateway-advertise-host` or unambiguously auto-detected from the host.
+
+The benchmark hashes the host Codex binary and its bundled `rg`, uploads those
+fixed payloads into each isolated Harbor task container, and verifies their
+hashes and version before execution. Task inference then follows
+`CodexHarness -> Gateway -> local vLLM`; adapter training does not call a model
+API. The supplied training trials are read only as successful trajectory data
+and must not expose verifier answers or other benchmark-private data.
+
+For an ordered stream of `N` tasks, the command runs the base model once on all
+tasks, then evaluates every ordinary sequential-LoRA generation and every
+SD-LoRA generation on all tasks. This produces `N + 2N^2` Harbor attempts. The
+report includes the full reward matrices, average accuracy, average incremental
+accuracy, backward transfer, forgetting, adapter bytes, training time, and peak
+allocated GPU memory. Ordinary LoRA and SD-LoRA use the same task order,
+examples, base model revision, target modules, rank per generation, optimizer,
+and training budget; their cumulative adapter sizes can differ and are reported
+explicitly.
+
+A small run with one attempt per task is an infrastructure and numerical smoke,
+not a performance claim. Performance evidence requires the predeclared task
+stream, repeated attempts or another justified uncertainty protocol, and the
+complete task-level report retained with the exact model, Codex, image, and
+artifact identities.
 
 ## Frozen Gate Data
 

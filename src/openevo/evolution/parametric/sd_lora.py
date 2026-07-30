@@ -239,6 +239,23 @@ def _discard_consumed_training_inputs(
         os.close(directory_fd)
 
 
+def _discard_failed_work_dir(work_dir: Path) -> None:
+    if not shutil.rmtree.avoids_symlink_attacks:
+        raise RuntimeError("safe recursive cleanup is unavailable")
+    parent_fd = os.open(
+        work_dir.parent,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+    )
+    try:
+        try:
+            shutil.rmtree(work_dir.name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
 def _private_work_dir(artifact_root: Path, job_id: str, lease_id: str) -> Path:
     root = Path(os.path.abspath(artifact_root))
     if not root.is_dir():
@@ -309,6 +326,8 @@ def _validated_output_state(
         "target_module_suffixes": request.config.target_modules,
         "training_record_count": result.training_record_count,
         "steps_completed": result.steps_completed,
+        "training_time_seconds": result.training_time_seconds,
+        "gpu_peak_memory_bytes": result.gpu_peak_memory_bytes,
         "source_dataset_artifact_ids": request.source_dataset_artifact_ids,
         "prior_parametric_memory_artifact_id": (request.prior_parametric_memory_artifact_id),
     }
@@ -328,7 +347,12 @@ def _train_and_validate_output(
     trainer: Any,
     request: SdLoraTrainingRequest,
 ) -> tuple[SdLoraTrainingResult, Path]:
-    result = SdLoraTrainingResult.model_validate(trainer.train_sd_lora(request))
+    result = SdLoraTrainingResult.model_validate(
+        trainer.train_sd_lora(
+            request,
+            cancellation=context.services.cancellation,
+        )
+    )
     if result.request_id != request.request_id:
         raise ValueError("SD-LoRA trainer returned a result for a different request")
     if result.training_record_count != request.training_record_count:
@@ -394,12 +418,16 @@ def parametric_memory_sd_lora(
         context.job.lease_id,
     )
     training_path = work_dir / "training.jsonl"
-    _write_private_jsonl(training_path, examples)
     prior_path: Path | None = None
-    prior_artifact = prior_artifacts[0] if prior_artifacts else None
-    if prior_artifact is not None:
-        prior_path = work_dir / "prior_adapter"
-        _copy_prior_adapter(context, prior_artifact, prior_path)
+    try:
+        _write_private_jsonl(training_path, examples)
+        prior_artifact = prior_artifacts[0] if prior_artifacts else None
+        if prior_artifact is not None:
+            prior_path = work_dir / "prior_adapter"
+            _copy_prior_adapter(context, prior_artifact, prior_path)
+    except Exception:
+        _discard_failed_work_dir(work_dir)
+        raise
 
     identity = hashlib.sha256(
         (
@@ -428,9 +456,13 @@ def parametric_memory_sd_lora(
         config=config,
     )
     try:
-        result, adapter_dir = _train_and_validate_output(context, trainer, request)
-    finally:
-        _discard_consumed_training_inputs(work_dir, training_path, prior_path)
+        try:
+            result, adapter_dir = _train_and_validate_output(context, trainer, request)
+        finally:
+            _discard_consumed_training_inputs(work_dir, training_path, prior_path)
+    except Exception:
+        _discard_failed_work_dir(work_dir)
+        raise
 
     compatibility = _core_mapping(context, "compatibility")
     configured_models = compatibility.get("base_model")
@@ -479,6 +511,8 @@ def parametric_memory_sd_lora(
         "training_record_count": len(examples),
         "steps_completed": result.steps_completed,
         "training_loss": result.training_loss,
+        "training_time_seconds": result.training_time_seconds,
+        "gpu_peak_memory_bytes": result.gpu_peak_memory_bytes,
         "quality_metric": "inverse_training_loss_proxy_not_heldout",
         "source_dataset_artifact_ids": [artifact.artifact_id for artifact in datasets],
         "prior_parametric_memory_artifact_id": (
@@ -489,8 +523,8 @@ def parametric_memory_sd_lora(
         "training_config": config.model_dump(mode="json"),
     }
     core_config = context.envelope.core_config()
-    return [
-        ArtifactRegisterRequest(
+    try:
+        artifact = ArtifactRegisterRequest(
             type=ArtifactType.PARAMETRIC_MEMORY,
             name=str(core_config.get("name") or adapter_id),
             uri=adapter_dir.resolve().as_uri(),
@@ -501,7 +535,10 @@ def parametric_memory_sd_lora(
             tags=tags,
             promoted=bool(core_config.get("promoted", False)),
         )
-    ]
+    except Exception:
+        _discard_failed_work_dir(work_dir)
+        raise
+    return [artifact]
 
 
 __all__ = ["parametric_memory_sd_lora"]

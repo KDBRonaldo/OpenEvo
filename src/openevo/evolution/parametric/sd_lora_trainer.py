@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import math
 import os
 import random
+import resource
+import signal
 import stat
+import sys
+import time
 from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
@@ -36,6 +41,54 @@ from .training_data import (
 
 _MAX_REQUEST_BYTES = 1024 * 1024
 _STATE_KEY_PREFIX = "components"
+_PARENT_PID_ENV = "OPENEVO_SD_LORA_PARENT_PID"
+_PR_SET_PDEATHSIG = 1
+_MAX_OUTPUT_FILE_BYTES = 16 * 1024 * 1024 * 1024
+_MAX_OPEN_FILES = 1024
+
+
+def _install_parent_death_signal() -> None:
+    raw_parent = os.environ.pop(_PARENT_PID_ENV, None)
+    if raw_parent is None or not raw_parent.isdecimal() or int(raw_parent) <= 1:
+        raise RuntimeError("SD-LoRA trainer parent identity is unavailable")
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError("SD-LoRA trainer requires Linux parent-death signaling")
+    expected_parent = int(raw_parent)
+    if os.getppid() != expected_parent:
+        raise RuntimeError("SD-LoRA trainer parent changed before startup")
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signal.SIGKILL)
+        raise RuntimeError("SD-LoRA trainer parent changed during startup")
+
+
+def _apply_resource_limits(timeout_seconds: float) -> None:
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    file_hard = resource.getrlimit(resource.RLIMIT_FSIZE)[1]
+    file_limit = (
+        _MAX_OUTPUT_FILE_BYTES
+        if file_hard == resource.RLIM_INFINITY
+        else min(_MAX_OUTPUT_FILE_BYTES, file_hard)
+    )
+    resource.setrlimit(resource.RLIMIT_FSIZE, (file_limit, file_limit))
+    nofile_hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
+    nofile_limit = (
+        _MAX_OPEN_FILES
+        if nofile_hard == resource.RLIM_INFINITY
+        else min(_MAX_OPEN_FILES, nofile_hard)
+    )
+    resource.setrlimit(resource.RLIMIT_NOFILE, (nofile_limit, nofile_limit))
+    cpu_hard = resource.getrlimit(resource.RLIMIT_CPU)[1]
+    requested_cpu = max(1, math.ceil(timeout_seconds) + 60)
+    cpu_limit = (
+        requested_cpu
+        if cpu_hard == resource.RLIM_INFINITY
+        else min(requested_cpu, cpu_hard)
+    )
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
 
 
 def _stable_file_identity(value: os.stat_result) -> tuple[int, ...]:
@@ -583,7 +636,21 @@ def _compose_cumulative_weights(
     return merged
 
 
+def _initialize_cuda_runtime(
+    torch: Any,
+    *,
+    component_name: str = "SD-LoRA parametric-memory training",
+) -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+        raise RuntimeError(f"{component_name} requires exactly one visible CUDA device")
+    # CUDA 13 may report devices before creating the primary context required
+    # by the allocator's peak-memory accounting API.
+    torch.cuda.init()
+    torch.cuda.reset_peak_memory_stats()
+
+
 def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
+    training_started = time.monotonic()
     (
         torch,
         LoraConfig,
@@ -594,8 +661,7 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         tokenizer_dependencies,
     ) = _dependencies()
     AutoTokenizer, BitsAndBytesConfig = tokenizer_dependencies
-    if not torch.cuda.is_available():
-        raise RuntimeError("SD-LoRA parametric-memory training requires a CUDA device")
+    _initialize_cuda_runtime(torch)
     torch.manual_seed(request.config.seed)
     torch.cuda.manual_seed_all(request.config.seed)
     random.seed(request.config.seed)
@@ -831,6 +897,14 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
     state_weights_path = output_dir / SD_LORA_STATE_WEIGHTS
     save_file(state_tensors, str(state_weights_path))
     state_weights_size, state_weights_digest = _sha256_file(state_weights_path)
+    training_time_seconds = time.monotonic() - training_started
+    gpu_peak_memory_bytes = int(torch.cuda.max_memory_allocated())
+    if (
+        not math.isfinite(training_time_seconds)
+        or training_time_seconds <= 0.0
+        or gpu_peak_memory_bytes < 1
+    ):
+        raise RuntimeError("SD-LoRA trainer produced invalid resource accounting")
     state_manifest = SdLoraStateManifest(
         adapter_id=request.adapter_id,
         base_model=request.config.base_model,
@@ -853,6 +927,8 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         training_record_count=request.training_record_count,
         steps_completed=steps_completed,
         training_loss=training_loss,
+        training_time_seconds=training_time_seconds,
+        gpu_peak_memory_bytes=gpu_peak_memory_bytes,
         source_dataset_artifact_ids=request.source_dataset_artifact_ids,
         prior_parametric_memory_artifact_id=(request.prior_parametric_memory_artifact_id),
     )
@@ -873,6 +949,8 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         training_record_count=request.training_record_count,
         steps_completed=steps_completed,
         training_loss=training_loss,
+        training_time_seconds=training_time_seconds,
+        gpu_peak_memory_bytes=gpu_peak_memory_bytes,
         task_index=component_count - 1,
         component_count=component_count,
         effective_rank=effective_rank,
@@ -889,6 +967,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _install_parent_death_signal()
     args = _parser().parse_args(argv)
     os.umask(0o077)
     request_name = validate_relative_path(args.request)
@@ -906,6 +985,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("SD-LoRA trainer request work directory does not match cwd")
     if request_bytes != (canonical_json(request.model_dump(mode="json")) + "\n").encode("utf-8"):
         raise ValueError("SD-LoRA trainer request bytes are not canonical")
+    _apply_resource_limits(request.config.timeout_seconds)
     result = _train(request)
     _write_private_json(response_path, result.model_dump(mode="json"))
     return 0
@@ -915,4 +995,9 @@ if __name__ == "__main__":
     raise SystemExit(main())
 
 
-__all__ = ["_compose_cumulative_weights", "main"]
+__all__ = [
+    "_apply_resource_limits",
+    "_compose_cumulative_weights",
+    "_install_parent_death_signal",
+    "main",
+]

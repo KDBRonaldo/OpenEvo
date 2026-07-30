@@ -553,10 +553,19 @@ trajectory 的任务推理仍使用 OpenEvo 已有 harness，例如内置 Codex 
 不新增模型 API。不过 subscription session 本身不能加载训练出的 adapter，因此该 method
 只在 self-deployed execution profile 中可启用。
 
+每个 artifact root 只有一个 Daemon trainer service owner，且一次只运行一个 GPU training。
+子进程必须只看到一个 CUDA device，并运行在独立 process group、closed environment、Linux
+parent-death signal 和 bounded resource limits 下。Daemon 持久化绑定 boot/process/session/start
+identity 的 active receipt；重启恢复只清理 receipt 与当前进程 identity 完全一致的遗留 trainer。
+Method timeout 或 worker heartbeat/lease failure 会取消 method 并终止整个 process group。
+多 GPU host 通过 Daemon 启动环境中的 `CUDA_VISIBLE_DEVICES` 选择一个 device；supervisor 的
+closed child environment 只透传该 GPU selection，不透传 provider/API credentials。
+
 Artifact 同时包含标准 PEFT adapter 和 SD-LoRA decomposition state。后一部分记录 exact
 base model revision、target modules、每代 rank、A/B tensors、learned coefficients 和完整
 tensor inventory；下一代训练会重新验证并冻结旧 components，只训练新 component 与共享
-coefficients。当前实现是 research/internal capability，尚不属于 External Beta release
+coefficients。Artifact 还记录实际 training wall time 和 peak allocated GPU memory；这些指标与
+training loss 都不是 held-out reward。当前实现是 research/internal capability，尚不属于 External Beta release
 acceptance；完整 successor readiness、serving preparation 和 run-owner activation 仍遵循
 项目级 cross-session contract，不能由 method 自行绕过。
 
@@ -569,8 +578,8 @@ registered `parametric_memory` artifacts, compatibility metadata, and runtime in
 evidence. Such automation must not be documented as a Core Backend command, Desktop
 feature, or ordinary-user workflow.
 
-Serving backend 仍负责加载 cumulative PEFT adapter。Worker 的既有 heartbeat 机制覆盖
-Daemon trainer subprocess 的长任务；method 不引入独立调度 API。
+Serving backend 仍负责加载 cumulative PEFT adapter。Worker 最多每 5 秒 heartbeat 一次，并把
+lease ownership failure 传播为 trainer cancellation；method 不引入独立调度 API。
 
 ## Context Resolver
 

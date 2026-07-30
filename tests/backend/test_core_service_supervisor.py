@@ -435,6 +435,18 @@ def _ensure_subscription_binding(
     )
 
 
+def test_controlled_service_environment_preserves_gpu_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "3")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-cross-service-boundary")
+
+    environment = supervisor_module._controlled_environment()
+
+    assert environment["CUDA_VISIBLE_DEVICES"] == "3"
+    assert "OPENAI_API_KEY" not in environment
+
+
 @pytest.mark.parametrize(
     "codex_model",
     [

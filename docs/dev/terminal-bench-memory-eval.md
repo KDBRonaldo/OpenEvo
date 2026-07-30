@@ -8,8 +8,11 @@ Terminal Bench 2.1.
 > routing configurations below are retired and are not accepted by the current
 > Core registry. Current parametric-memory development uses the internal
 > `parametric_memory_sd_lora` method, a fixed Daemon-owned trainer, and one
-> cumulative PEFT adapter. Use the architecture documents for current contracts;
-> use this note only to interpret earlier Terminal Bench runs.
+> cumulative PEFT adapter. See
+> [Terminal Bench 2.1 Continual Parametric-Memory Evaluation](terminal-bench-continual-memory-eval.md)
+> for the current command and evidence. Use the architecture documents for
+> current contracts; use the remainder of this note only to interpret earlier
+> Terminal Bench runs.
 
 ## Method Choices
 

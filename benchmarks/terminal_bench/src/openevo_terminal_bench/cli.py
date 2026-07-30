@@ -8,51 +8,33 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 from openevo.evolution.agent_system import DEFAULT_AGENT_SYSTEM_TARGET_PATH
-from openevo.evolution.methods import (
-    METHOD_REGISTRY,
-    _parametric_memory_training_projection,
-    run_method,
-)
+from openevo.evolution.methods import METHOD_REGISTRY
 from openevo.evolution.models import (
     DatasetCreateRequest,
     EventIngestRequest,
     JobCreateRequest,
-    WorkerClaimedJob,
 )
+from openevo.evolution.parametric.contracts import SdLoraMethodConfig
 from openevo.evolution.store import EvolutionStore
 from openevo_terminal_bench.bridge import build_terminal_bench_events
-from openevo_terminal_bench.local_parametric import (
-    ADAPTER_KEY_REWRITE_CHOICES,
-    ADAPTER_KEY_REWRITE_NONE,
-    DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
-    DEFAULT_LOCAL_MODEL,
-    DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
-    DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
-    DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
-    DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
-    DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
-    DEFAULT_VLLM_GENERATION_CONFIG,
-    DEFAULT_VLLM_EXECUTABLE,
-    LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES,
-    run_local_parametric_memory_eval,
-    run_local_parametric_memory_eval_dry_run,
+from openevo_terminal_bench.continual_memory import (
+    DEFAULT_AGENT_TIMEOUT_SECONDS,
+    DEFAULT_GATEWAY_PORT,
+    DEFAULT_LOCAL_MODEL as DEFAULT_CONTINUAL_MODEL,
+    DEFAULT_MAX_MODEL_LENGTH,
+    DEFAULT_VLLM_EXECUTABLE as DEFAULT_CONTINUAL_VLLM_EXECUTABLE,
+    DEFAULT_VLLM_PORT,
+    parse_continual_tasks,
+    run_continual_memory_eval,
+    run_continual_memory_eval_dry_run,
 )
 from openevo_terminal_bench.per_task import (
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     TerminalBenchTaskGroup,
-    _run_worker_once_local,
     run_group_evolution,
     run_group_evolution_dry_run,
     run_per_task_evolution,
     run_per_task_evolution_dry_run,
-)
-from openevo_terminal_bench.task_local_parametric import (
-    LocalSuccessReplayTrial,
-    build_local_success_replay_parametric_job_payload,
-    build_local_success_replay_sft_records,
-    build_task_local_parametric_job_payload,
-    build_task_local_sft_records,
-    select_task_local_candidates,
 )
 
 
@@ -211,480 +193,6 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not derive forbidden literals from structured protected metadata.",
     )
-    tb_parametric_job = subparsers.add_parser(
-        "terminal-bench-parametric-memory-job",
-        help="Ingest Terminal Bench results and create a parametric-memory LoRA SFT job.",
-    )
-    tb_parametric_job.add_argument(
-        "--input",
-        action="append",
-        default=[],
-        help="Terminal Bench trial or job directory to ingest. Can be repeated.",
-    )
-    tb_parametric_job.add_argument(
-        "--dataset-artifact-id",
-        action="append",
-        default=[],
-        help="Existing dataset artifact id to use as job input. Can be repeated.",
-    )
-    tb_parametric_job.add_argument("--db", default=".openevo/evolution/evolution.db")
-    tb_parametric_job.add_argument("--artifact-root", default=".openevo/evolution")
-    tb_parametric_job.add_argument("--dataset-name")
-    tb_parametric_job.add_argument("--purpose", default="parametric_memory_lora_sft")
-    tb_parametric_job.add_argument("--policy-version")
-    tb_parametric_job.add_argument("--rollout-step", type=int)
-    tb_parametric_job.add_argument("--status", action="append", default=["COMPLETED"])
-    tb_parametric_job.add_argument("--output", help="Output JSON summary path. Defaults to stdout.")
-    tb_parametric_job.add_argument("--max-transcript-chars", type=int, default=60000)
-    tb_parametric_job.add_argument("--max-verifier-stdout-chars", type=int, default=12000)
-    tb_parametric_job.add_argument("--base-model", required=True)
-    tb_parametric_job.add_argument(
-        "--adapter-id",
-        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
-    )
-    tb_parametric_job.add_argument("--adapter-format", default="lora")
-    tb_parametric_job.add_argument("--trainer-command", required=True)
-    tb_parametric_job.add_argument("--trainer-arg", action="append", default=[])
-    tb_parametric_job.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
-    tb_parametric_job.add_argument(
-        "--training-projection",
-        choices=[
-            "full_trace",
-            "response_tail",
-            "terminal_bench_final_actions",
-            "terminal_bench_tool_call_policy",
-            "terminal_bench_corrective_tool_call_policy",
-            "terminal_bench_password_recovery_shorttarget_recipe",
-        ],
-        default="full_trace",
-        help="Projection applied when exporting traces to SFT JSONL.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-response-tail-chars",
-        type=int,
-        help="Response tail size used with --training-projection response_tail.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-final-action-max-events",
-        type=int,
-        default=8,
-        help=(
-            "Maximum completed command/message events to keep with "
-            "--training-projection terminal_bench_final_actions."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-final-action-output-chars",
-        type=int,
-        default=2000,
-        help=(
-            "Maximum command output excerpt length with "
-            "--training-projection terminal_bench_final_actions."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-tool-call-max-commands",
-        type=int,
-        default=1,
-        help=(
-            "Maximum tb_exec commands to export with --training-projection "
-            "terminal_bench_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-tool-call-command-contains",
-        action="append",
-        default=[],
-        help=(
-            "Substring filter for commands exported with terminal_bench_tool_call_policy. "
-            "Can be repeated."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-tool-call-exclude-command-contains",
-        action="append",
-        default=[],
-        help=(
-            "Substring exclusion filter for commands exported with "
-            "terminal_bench_tool_call_policy. Can be repeated."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-tool-call-derive-password-recovery-command",
-        action="store_true",
-        help=(
-            "Derive a direct tb_exec write command from password-recovery successful "
-            "transcripts when using terminal_bench_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-input-contains",
-        action="append",
-        default=[],
-        help=(
-            "Substring that must appear in a compact real LLM-call prefix exported "
-            "with terminal_bench_corrective_tool_call_policy. Can be repeated."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-max-examples",
-        type=int,
-        default=64,
-        help=(
-            "Maximum real LLM-call prefixes to export per trace with "
-            "terminal_bench_corrective_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-max-input-tool-messages",
-        type=int,
-        help=(
-            "Keep only the last N tool-result input messages in each real prefix "
-            "exported with terminal_bench_corrective_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-strip-input-tool-result-payload",
-        action="store_true",
-        help=(
-            "Strip appended Tool result payload sections from tool-result input "
-            "messages exported with terminal_bench_corrective_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-max-input-tool-content-chars",
-        type=int,
-        help=(
-            "Maximum characters to keep in each tool-result input message exported "
-            "with terminal_bench_corrective_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-target-command",
-        help=(
-            "Target tb_exec command for terminal_bench_corrective_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-target-task-id",
-        default="terminal-bench-task",
-        help=(
-            "Target task_id argument for terminal_bench_corrective_tool_call_policy."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-corrective-stage-json",
-        action="append",
-        default=[],
-        help=(
-            "JSON object for one terminal_bench_corrective_tool_call_policy stage. "
-            "Can be repeated and takes precedence over the single target-command flags."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-target-command",
-        help=(
-            "Target tb_exec command for "
-            "terminal_bench_password_recovery_shorttarget_recipe."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-target-task-id",
-        default="terminal-bench-task",
-        help=(
-            "Target task_id argument for "
-            "terminal_bench_password_recovery_shorttarget_recipe."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-read-task-input-contains",
-        action="append",
-        default=[],
-        help=(
-            "Substring filter for the read-task recipe stage. Defaults to the "
-            "Terminal Bench Harbor marker when omitted. Can be repeated."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-after-read-input-contains",
-        action="append",
-        default=[],
-        help=(
-            "Substring filter for the after-read recipe stage. Defaults to "
-            "recovered_passwords.txt when omitted. Can be repeated."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-correction-input-contains",
-        action="append",
-        default=[],
-        help=(
-            "Substring filter enabling the optional correction recipe stage. "
-            "Can be repeated."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-read-task-max-examples",
-        type=int,
-        default=1,
-        help="Maximum read-task recipe examples to export per trace.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-after-read-max-examples",
-        type=int,
-        default=1,
-        help="Maximum after-read recipe examples to export per trace.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-after-read-repeat",
-        type=int,
-        default=6,
-        help="Repeat count for each after-read recipe example.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-correction-max-examples",
-        type=int,
-        default=1,
-        help="Maximum optional correction recipe examples to export per trace.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-correction-repeat",
-        type=int,
-        default=1,
-        help="Repeat count for each optional correction recipe example.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-max-input-tool-messages",
-        type=int,
-        help="Keep only the last N tool-result input messages in recipe stages.",
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-strip-input-tool-result-payload",
-        action="store_true",
-        help=(
-            "Strip appended Tool result payload sections from tool-result input "
-            "messages in recipe stages."
-        ),
-    )
-    tb_parametric_job.add_argument(
-        "--training-recipe-max-input-tool-content-chars",
-        type=int,
-        help="Maximum characters to keep in each tool-result input message in recipe stages.",
-    )
-    tb_parametric_job.add_argument("--run-worker", action="store_true")
-    tb_parametric_job.add_argument("--job-name")
-    tb_parametric_job.add_argument("--priority", type=int, default=100)
-    tb_parametric_job.add_argument("--max-records", type=int)
-    tb_task_local_parametric_job = subparsers.add_parser(
-        "terminal-bench-task-local-parametric-memory-job",
-        help=(
-            "Build task-local Terminal Bench SFT records from a trajectory pool "
-            "and create a parametric-memory LoRA worker job payload."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument("--trajectory-pool", required=True)
-    tb_task_local_parametric_job.add_argument("--task-id", action="append", default=[])
-    tb_task_local_parametric_job.add_argument("--output-root", required=True)
-    tb_task_local_parametric_job.add_argument("--dataset-name")
-    tb_task_local_parametric_job.add_argument("--base-model", default=DEFAULT_LOCAL_MODEL)
-    tb_task_local_parametric_job.add_argument(
-        "--adapter-id",
-        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
-    )
-    tb_task_local_parametric_job.add_argument("--trainer-command", required=True)
-    tb_task_local_parametric_job.add_argument("--trainer-arg", action="append", default=[])
-    tb_task_local_parametric_job.add_argument(
-        "--trainer-timeout-seconds",
-        type=float,
-        default=3600.0,
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--command-contains",
-        action="append",
-        default=[],
-        help="Required substring for successful Codex command targets. Can be repeated.",
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--exclude-command-contains",
-        action="append",
-        default=[],
-        help="Excluded substring for successful Codex command targets. Can be repeated.",
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--target-command",
-        help=(
-            "Explicit tb_exec command to supervise instead of selecting one "
-            "from successful Codex command_execution events. Use this for "
-            "successful trajectories that completed via file_change."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--max-records-per-task",
-        type=int,
-        default=16,
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--target-repeat",
-        type=int,
-        default=1,
-        help=(
-            "Repeat the selected final tb_exec target this many times in the "
-            "task-local SFT dataset. Only supported with --target-mode final."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--prompt-style",
-        choices=["direct_solver", "live_replay", "synthetic_correction"],
-        default="direct_solver",
-        help=(
-            "Prompt shape for task-local SFT records. live_replay uses failed "
-            "EvoLab llm_calls prefixes when available; direct_solver uses a "
-            "synthetic Terminal-Bench local direct-solver prefix; "
-            "synthetic_correction keeps the older compact correction prompt."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--target-mode",
-        choices=["final", "sequence"],
-        default="final",
-        help=(
-            "Target construction for task-local SFT records. final keeps the "
-            "single selected successful tb_exec target; sequence creates "
-            "progressive next-command records through that target."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--target-exec-timeout-seconds",
-        type=int,
-        help=(
-            "Optional timeout_seconds value to include in every supervised "
-            "task-local tb_exec target. Use this to align SFT records with the "
-            "runtime tb_exec schema when local models drift into malformed "
-            "optional timeout arguments."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--include-tool-schema-lock",
-        action="store_true",
-        help=(
-            "Also export a short direct-solver record after tb_read_task whose "
-            "target is a complete tb_exec call. This is useful when local "
-            "adapters drift into malformed tool arguments."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--tool-schema-lock-repeat",
-        type=int,
-        default=1,
-        help=(
-            "Repeat the optional tool-schema-lock record this many times. "
-            "Requires --include-tool-schema-lock."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--include-run-tests-correction",
-        action="store_true",
-        help=(
-            "For live_replay final-target records, also export a correction "
-            "record whose prefix includes a failed tb_run_tests tool result and "
-            "whose target is the selected successful tb_exec command."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--include-collect-result-correction",
-        action="store_true",
-        help=(
-            "For live_replay final-target records, also export a correction "
-            "record whose prefix includes a failed tb_collect_result result and "
-            "whose target is the selected successful tb_exec command."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--include-tb-exec-failure-correction",
-        action="store_true",
-        help=(
-            "For live_replay final-target records, also export a correction "
-            "record whose prefix includes a failed tb_exec result and whose "
-            "target is the selected successful tb_exec command."
-        ),
-    )
-    tb_task_local_parametric_job.add_argument(
-        "--artifact-root",
-        help="Artifact root used only when --run-worker is set.",
-    )
-    tb_task_local_parametric_job.add_argument("--run-worker", action="store_true")
-    tb_task_local_parametric_job.add_argument("--output", help="Output JSON path. Defaults to stdout.")
-    tb_local_success_replay_job = subparsers.add_parser(
-        "terminal-bench-local-success-replay-parametric-memory-job",
-        help=(
-            "Build Terminal Bench parametric-memory LoRA job payloads from "
-            "successful local Harbor llm_calls.jsonl trajectories."
-        ),
-    )
-    tb_local_success_replay_job.add_argument(
-        "--success-trial-dir",
-        action="append",
-        default=[],
-        required=True,
-    )
-    tb_local_success_replay_job.add_argument(
-        "--task-id",
-        action="append",
-        default=[],
-        required=True,
-    )
-    tb_local_success_replay_job.add_argument("--output-root", required=True)
-    tb_local_success_replay_job.add_argument("--dataset-name")
-    tb_local_success_replay_job.add_argument(
-        "--base-model",
-        default=DEFAULT_LOCAL_MODEL,
-    )
-    tb_local_success_replay_job.add_argument(
-        "--adapter-id",
-        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
-    )
-    tb_local_success_replay_job.add_argument("--trainer-command", required=True)
-    tb_local_success_replay_job.add_argument(
-        "--trainer-arg",
-        action="append",
-        default=[],
-    )
-    tb_local_success_replay_job.add_argument(
-        "--trainer-timeout-seconds",
-        type=float,
-        default=3600.0,
-    )
-    tb_local_success_replay_job.add_argument(
-        "--allowed-tool",
-        action="append",
-        default=[],
-        help=(
-            "Allowed output tool name. Defaults to tb_read_task, tb_exec, and "
-            "tb_run_tests when omitted. Can be repeated."
-        ),
-    )
-    tb_local_success_replay_job.add_argument("--require-tool-name")
-    tb_local_success_replay_job.add_argument(
-        "--exclude-if-input-contains",
-        action="append",
-        default=[],
-    )
-    tb_local_success_replay_job.add_argument(
-        "--exclude-if-output-contains",
-        action="append",
-        default=[],
-    )
-    tb_local_success_replay_job.add_argument("--max-records", type=int)
-    tb_local_success_replay_job.add_argument("--max-records-per-trial", type=int)
-    tb_local_success_replay_job.add_argument(
-        "--artifact-root",
-        help="Artifact root used only when --run-worker is set.",
-    )
-    tb_local_success_replay_job.add_argument("--run-worker", action="store_true")
-    tb_local_success_replay_job.add_argument(
-        "--output",
-        help="Output JSON path. Defaults to stdout.",
-    )
     tb_per_task = subparsers.add_parser(
         "terminal-bench-per-task-evolution",
         help="Run or plan per-task Terminal Bench evolution.",
@@ -786,215 +294,75 @@ def build_parser() -> argparse.ArgumentParser:
     tb_group.add_argument("--verifier-env", action="append", default=[])
     tb_group.add_argument("--dry-run", action="store_true")
     tb_group.add_argument("--output", required=True)
-    tb_local_parametric = subparsers.add_parser(
-        "terminal-bench-local-parametric-memory-eval",
-        help="Run or plan local Terminal Bench parametric-memory evaluation.",
+    tb_continual = subparsers.add_parser(
+        "terminal-bench-continual-memory-eval",
+        help=(
+            "Run base, ordinary sequential LoRA, and SD-LoRA through Core "
+            "CodexHarness and Gateway on one ordered Terminal-Bench task stream."
+        ),
     )
-    tb_local_parametric.add_argument("--task-root", required=True)
-    tb_local_parametric.add_argument("--task-id", action="append", default=[], required=True)
-    tb_local_parametric.add_argument("--run-root", required=True)
-    tb_local_parametric.add_argument(
+    tb_continual.add_argument("--task-root", required=True)
+    tb_continual.add_argument("--task-id", action="append", required=True)
+    tb_continual.add_argument(
+        "--training-trial",
+        action="append",
+        required=True,
+        help="Successful training trial in TASK_ID=TRIAL_DIR form.",
+    )
+    tb_continual.add_argument("--run-root", required=True)
+    tb_continual.add_argument(
         "--terminal-bench-package-root",
         default=str(DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT),
     )
-    tb_local_parametric.add_argument("--model", default=DEFAULT_LOCAL_MODEL)
-    tb_local_parametric.add_argument("--adapter-path", required=True)
-    tb_local_parametric.add_argument(
-        "--adapter-id",
-        default=DEFAULT_LOCAL_PARAMETRIC_ADAPTER_ID,
+    tb_continual.add_argument("--model", default=DEFAULT_CONTINUAL_MODEL)
+    tb_continual.add_argument("--model-revision", required=True)
+    tb_continual.add_argument("--codex-version", required=True)
+    tb_continual.add_argument("--gpu", default="3")
+    tb_continual.add_argument(
+        "--vllm-executable",
+        default=DEFAULT_CONTINUAL_VLLM_EXECUTABLE,
     )
-    tb_local_parametric.add_argument(
-        "--adapter-key-rewrite",
-        choices=ADAPTER_KEY_REWRITE_CHOICES,
-        default=ADAPTER_KEY_REWRITE_NONE,
-        help=(
-            "Optional serving-time adapter key rewrite. Use "
-            "qwen3_5_vllm_language_model for Qwen3.5/Qwen3.6 PEFT adapters "
-            "served by vLLM --language-model-only, where train-time layer keys "
-            "must be rewritten under language_model.layers.*. The older "
-            "qwen3_5_moe_vllm_language_model alias is still accepted."
-        ),
-    )
-    tb_local_parametric.add_argument("--adapter-artifact-id")
-    tb_local_parametric.add_argument("--server-url")
-    tb_local_parametric.add_argument("--server-port", type=int, default=8000)
-    tb_local_parametric.add_argument("--vllm-executable", default=DEFAULT_VLLM_EXECUTABLE)
-    tb_local_parametric.add_argument("--gpu", action="append", default=[])
-    tb_local_parametric.add_argument("--n-attempts", type=int, default=1)
-    tb_local_parametric.add_argument(
-        "--timeout-multiplier",
-        type=float,
-        help="Optional Harbor task timeout multiplier for local parametric eval jobs.",
-    )
-    tb_local_parametric.add_argument(
-        "--agent-timeout-multiplier",
-        type=float,
-        help=(
-            "Optional Harbor agent execution timeout multiplier for local "
-            "parametric eval jobs. Harbor treats this as overriding "
-            "--timeout-multiplier for the agent phase."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--max-output-tokens",
+    tb_continual.add_argument("--vllm-port", type=int, default=DEFAULT_VLLM_PORT)
+    tb_continual.add_argument("--gateway-port", type=int, default=DEFAULT_GATEWAY_PORT)
+    tb_continual.add_argument("--gateway-advertise-host")
+    tb_continual.add_argument(
+        "--max-model-length",
         type=int,
-        default=DEFAULT_LOCAL_PARAMETRIC_MAX_OUTPUT_TOKENS,
-        help="Maximum output tokens per local Terminal Bench solver completion.",
+        default=DEFAULT_MAX_MODEL_LENGTH,
     )
-    tb_local_parametric.add_argument(
-        "--context-window-tokens",
+    tb_continual.add_argument(
+        "--agent-timeout-seconds",
         type=int,
-        default=DEFAULT_LOCAL_PARAMETRIC_CONTEXT_WINDOW_TOKENS,
-        help=(
-            "Serving context window used for local parametric-memory evaluation "
-            "and managed vLLM --max-model-len."
-        ),
+        default=DEFAULT_AGENT_TIMEOUT_SECONDS,
     )
-    tb_local_parametric.add_argument(
-        "--context-reserve-tokens",
-        type=int,
-        default=DEFAULT_LOCAL_PARAMETRIC_CONTEXT_RESERVE_TOKENS,
-        help=(
-            "Maximum solver output budget reserved inside the context window. "
-            "--max-output-tokens is clamped to this value."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--solver-temperature",
-        type=float,
-        default=DEFAULT_LOCAL_PARAMETRIC_SOLVER_TEMPERATURE,
-        help=(
-            "Temperature passed to the Terminal Bench EvoLab solver. The "
-            "local parametric-memory runner defaults to 0.0 for deterministic "
-            "adapter evaluation."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--vllm-generation-config",
-        default=DEFAULT_VLLM_GENERATION_CONFIG,
-        help=(
-            "Value passed to managed vLLM --generation-config. The default "
-            "'vllm' prevents model generation_config.json from overriding "
-            "sampling defaults."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--tool-result-prompt-max-chars",
-        type=int,
-        help=(
-            "Optional maximum tool-result characters that the Terminal Bench "
-            "EvoLab agent may add back into the model prompt."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--exec-timeout-cap-seconds",
-        type=int,
-        help=(
-            "Optional EVOLAB_TB_EXEC_TIMEOUT_CAP_SECONDS value for local "
-            "Terminal Bench task execution."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--exec-timeout-min-seconds",
-        type=int,
-        help=(
-            "Optional EVOLAB_TB_EXEC_TIMEOUT_MIN_SECONDS value for compatible "
-            "Terminal Bench packages that should raise explicit short "
-            "tb_exec timeout requests."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--max-subagent-runtime-seconds",
-        type=int,
-        help=(
-            "Optional EVOLAB_TB_MAX_SUBAGENT_RUNTIME_SECONDS value for "
-            "compatible Terminal Bench EvoLab direct-solver packages."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--artifact-path-guard",
-        choices=LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD_CHOICES,
-        default=DEFAULT_LOCAL_PARAMETRIC_ARTIFACT_PATH_GUARD,
-        help=(
-            "Terminal Bench local parametric eval artifact-path guard mode. "
-            "off records no guard env, audit asks the task package to report "
-            "tb_exec path mismatches, and repair asks it to repair supported "
-            "mismatches before execution."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--required-artifact-path",
+    tb_continual.add_argument("--rank", type=int, default=8)
+    tb_continual.add_argument(
+        "--target-module",
         action="append",
         default=[],
-        help=(
-            "Required task artifact path for the artifact-path guard, e.g. "
-            "/app/out.txt. Can be repeated."
-        ),
     )
-    tb_local_parametric.add_argument("--manage-server", action="store_true")
-    tb_local_parametric.add_argument("--server-timeout-seconds", type=float, default=600.0)
-    tb_local_parametric.add_argument(
-        "--auth-mode",
-        choices=["local", "proxy", "subscription"],
-        default="local",
+    tb_continual.add_argument("--learning-rate", type=float, default=2.0e-4)
+    tb_continual.add_argument("--epochs", type=int, default=1)
+    tb_continual.add_argument("--max-steps", type=int)
+    tb_continual.add_argument("--max-length", type=int, default=2048)
+    tb_continual.add_argument("--max-records", type=int, default=256)
+    tb_continual.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    tb_continual.add_argument("--load-in-4bit", action="store_true")
+    tb_continual.add_argument(
+        "--no-gradient-checkpointing",
+        action="store_true",
     )
-    tb_local_parametric.add_argument("--verifier-env", action="append", default=[])
-    tb_local_parametric.add_argument(
-        "--agent-env",
-        action="append",
-        default=[],
-        help=(
-            "Terminal-Bench EvoLab agent environment override in KEY=VALUE form. "
-            "Only EVOLAB_TB_* package knobs are accepted by the local "
-            "parametric-memory runner."
-        ),
-    )
-    tb_local_parametric.add_argument(
-        "--verifier-python-install-mirror",
-        help=(
-            "Optional UV_PYTHON_INSTALL_MIRROR value for Terminal Bench verifier "
-            "uvx Python downloads."
-        ),
-    )
-    tb_local_parametric.add_argument("--dry-run", action="store_true")
-    tb_local_parametric.add_argument("--output", required=True)
+    tb_continual.add_argument("--seed", type=int, default=1993)
+    tb_continual.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
+    tb_continual.add_argument("--verifier-env", action="append", default=[])
+    tb_continual.add_argument("--dry-run", action="store_true")
+    tb_continual.add_argument("--output", required=True)
     return parser
-
-
-def _normalize_cli_argv(argv: list[str]) -> list[str]:
-    trainer_arg_commands = {
-        "terminal-bench-parametric-memory-job",
-        "terminal-bench-task-local-parametric-memory-job",
-        "terminal-bench-local-success-replay-parametric-memory-job",
-    }
-    if not argv or argv[0] not in trainer_arg_commands:
-        return list(argv)
-    normalized: list[str] = []
-    index = 0
-    while index < len(argv):
-        item = argv[index]
-        if item == "--trainer-arg" and index + 1 < len(argv):
-            normalized.append(f"--trainer-arg={argv[index + 1]}")
-            index += 2
-            continue
-        normalized.append(item)
-        index += 1
-    return normalized
-
-
-def _json_object(value: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(value)
-    except json.JSONDecodeError as exc:
-        raise ValueError("expected valid JSON object") from exc
-    if not isinstance(parsed, dict):
-        raise ValueError("expected JSON object")
-    return parsed
 
 
 def main(argv: list[str] | None = None) -> int:
     raw_argv = sys.argv[1:] if argv is None else argv
-    args = build_parser().parse_args(_normalize_cli_argv(raw_argv))
+    args = build_parser().parse_args(raw_argv)
     if args.command == "terminal-bench-events":
         events = build_terminal_bench_events(
             args.input,
@@ -1070,93 +438,63 @@ def main(argv: list[str] | None = None) -> int:
         payload = _create_terminal_bench_text_memory_job(args)
         _write_json_output(payload, args.output)
         return 0
-    if args.command == "terminal-bench-parametric-memory-job":
-        payload = _create_terminal_bench_parametric_memory_job(args)
-        _write_json_output(payload, args.output)
-        return 0
-    if args.command == "terminal-bench-task-local-parametric-memory-job":
-        payload = _create_terminal_bench_task_local_parametric_memory_job(args)
-        _write_json_output(payload, args.output)
-        return 0
-    if args.command == "terminal-bench-local-success-replay-parametric-memory-job":
-        payload = _create_terminal_bench_local_success_replay_parametric_memory_job(
-            args
+    if args.command == "terminal-bench-continual-memory-eval":
+        tasks = parse_continual_tasks(args.task_id, args.training_trial)
+        config = SdLoraMethodConfig(
+            base_model=args.model,
+            model_revision=args.model_revision,
+            rank=args.rank,
+            target_modules=tuple(
+                args.target_module or ("q_proj", "k_proj", "v_proj", "o_proj")
+            ),
+            learning_rate=args.learning_rate,
+            epochs=args.epochs,
+            max_steps=args.max_steps,
+            max_length=args.max_length,
+            max_records=args.max_records,
+            gradient_accumulation_steps=args.gradient_accumulation_steps,
+            load_in_4bit=args.load_in_4bit,
+            gradient_checkpointing=not args.no_gradient_checkpointing,
+            seed=args.seed,
+            timeout_seconds=args.trainer_timeout_seconds,
         )
-        _write_json_output(payload, args.output)
-        return 0
-    if args.command == "terminal-bench-local-parametric-memory-eval":
-        if args.auth_mode == "subscription":
-            raise ValueError("parametric_memory requires local or proxy auth")
-        verifier_env = _local_parametric_verifier_env(
-            args.verifier_env,
-            python_install_mirror=args.verifier_python_install_mirror,
-        )
-        agent_env = _parse_key_value_entries(args.agent_env)
-        server_url = _local_parametric_server_url(args.server_url, args.server_port)
         if args.dry_run:
-            payload = run_local_parametric_memory_eval_dry_run(
+            payload = run_continual_memory_eval_dry_run(
+                tasks=tasks,
                 task_root=Path(args.task_root),
-                task_ids=args.task_id,
                 run_root=Path(args.run_root),
                 model=args.model,
-                adapter_path=Path(args.adapter_path),
-                adapter_id=args.adapter_id,
-                server_url=server_url,
-                n_attempts=args.n_attempts,
-                timeout_multiplier=args.timeout_multiplier,
-                agent_timeout_multiplier=args.agent_timeout_multiplier,
-                max_output_tokens=args.max_output_tokens,
-                context_window_tokens=args.context_window_tokens,
-                context_reserve_tokens=args.context_reserve_tokens,
-                solver_temperature=args.solver_temperature,
-                vllm_generation_config=args.vllm_generation_config,
-                tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
-                exec_timeout_cap_seconds=args.exec_timeout_cap_seconds,
-                exec_timeout_min_seconds=args.exec_timeout_min_seconds,
-                max_subagent_runtime_seconds=args.max_subagent_runtime_seconds,
-                manage_server=args.manage_server,
-                verifier_env=verifier_env,
-                agent_env=agent_env,
-                auth_mode=args.auth_mode,
-                adapter_key_rewrite=args.adapter_key_rewrite,
-                artifact_path_guard=args.artifact_path_guard,
-                required_artifact_paths=args.required_artifact_path,
+                model_revision=args.model_revision,
+                gpu=args.gpu,
+                codex_version=args.codex_version,
+                config=config,
+                terminal_bench_package_root=Path(args.terminal_bench_package_root),
+                vllm_executable=args.vllm_executable,
+                vllm_port=args.vllm_port,
+                gateway_port=args.gateway_port,
+                gateway_advertise_host=args.gateway_advertise_host,
+                maximum_model_length=args.max_model_length,
+                agent_timeout_seconds=args.agent_timeout_seconds,
             )
             _write_json_output(payload, args.output)
             return 0
-        payload = run_local_parametric_memory_eval(
+        payload = run_continual_memory_eval(
+            tasks=tasks,
             task_root=Path(args.task_root),
-            task_ids=args.task_id,
             run_root=Path(args.run_root),
-            terminal_bench_package_root=Path(args.terminal_bench_package_root),
             model=args.model,
-            adapter_path=Path(args.adapter_path),
-            adapter_id=args.adapter_id,
-            adapter_artifact_id=args.adapter_artifact_id,
-            server_url=server_url,
-            n_attempts=args.n_attempts,
-            timeout_multiplier=args.timeout_multiplier,
-            agent_timeout_multiplier=args.agent_timeout_multiplier,
-            max_output_tokens=args.max_output_tokens,
-            context_window_tokens=args.context_window_tokens,
-            context_reserve_tokens=args.context_reserve_tokens,
-            solver_temperature=args.solver_temperature,
-            vllm_generation_config=args.vllm_generation_config,
-            tool_result_prompt_max_chars=args.tool_result_prompt_max_chars,
-            exec_timeout_cap_seconds=args.exec_timeout_cap_seconds,
-            exec_timeout_min_seconds=args.exec_timeout_min_seconds,
-            max_subagent_runtime_seconds=args.max_subagent_runtime_seconds,
-            verifier_env=verifier_env,
-            agent_env=agent_env,
-            manage_server=args.manage_server,
-            server_timeout_seconds=args.server_timeout_seconds,
+            model_revision=args.model_revision,
+            gpu=args.gpu,
+            codex_version=args.codex_version,
+            config=config,
+            terminal_bench_package_root=Path(args.terminal_bench_package_root),
             vllm_executable=args.vllm_executable,
-            gpus=args.gpu or None,
-            port=args.server_port,
-            auth_mode=args.auth_mode,
-            adapter_key_rewrite=args.adapter_key_rewrite,
-            artifact_path_guard=args.artifact_path_guard,
-            required_artifact_paths=args.required_artifact_path,
+            vllm_port=args.vllm_port,
+            gateway_port=args.gateway_port,
+            gateway_advertise_host=args.gateway_advertise_host,
+            maximum_model_length=args.max_model_length,
+            agent_timeout_seconds=args.agent_timeout_seconds,
+            verifier_env=_parse_key_value_entries(args.verifier_env),
         )
         _write_json_output(payload, args.output)
         return 0
@@ -1499,460 +837,6 @@ def _create_terminal_bench_text_memory_job(args: argparse.Namespace) -> dict[str
     }
 
 
-def _create_terminal_bench_parametric_memory_job(args: argparse.Namespace) -> dict[str, Any]:
-    if not args.input and not args.dataset_artifact_id:
-        raise ValueError(
-            "terminal-bench-parametric-memory-job requires --input or --dataset-artifact-id"
-        )
-    if args.input and not args.dataset_name:
-        raise ValueError(
-            "terminal-bench-parametric-memory-job requires --dataset-name with --input"
-        )
-    if args.input and not args.policy_version:
-        raise ValueError(
-            "terminal-bench-parametric-memory-job requires --policy-version with --input"
-        )
-
-    missing_placeholders = [
-        placeholder
-        for placeholder in ("{training_dataset}", "{adapter_dir}")
-        if not any(placeholder in str(arg) for arg in args.trainer_arg)
-    ]
-    if missing_placeholders:
-        raise ValueError(
-            "terminal-bench-parametric-memory-job trainer args require "
-            "{training_dataset} and {adapter_dir} placeholders"
-        )
-
-    store = EvolutionStore(db_path=Path(args.db), artifact_root=Path(args.artifact_root))
-    store.initialize()
-
-    events: list[EventIngestRequest] = []
-    for input_path in args.input:
-        events.extend(
-            build_terminal_bench_events(
-                input_path,
-                max_transcript_chars=args.max_transcript_chars,
-                max_verifier_stdout_chars=args.max_verifier_stdout_chars,
-                include_llm_calls=(
-                    args.training_projection
-                    in {
-                        "terminal_bench_corrective_tool_call_policy",
-                        "terminal_bench_password_recovery_shorttarget_recipe",
-                    }
-                ),
-                policy_version=args.policy_version,
-                rollout_step=args.rollout_step,
-            )
-        )
-
-    ingested_events = []
-    for event in events:
-        response = store.ingest_event(event)
-        ingested_events.append(
-            {
-                "event_id": response.event_id,
-                "ingested": response.ingested,
-                "duplicate": response.duplicate,
-                "task_id": event.task_id,
-                "session_id": event.session_id,
-            }
-        )
-
-    dataset_payload: dict[str, Any] | None = None
-    input_artifact_ids = list(args.dataset_artifact_id)
-    if events:
-        dataset = store.create_dataset(
-            DatasetCreateRequest(
-                name=args.dataset_name,
-                purpose=args.purpose,
-                query={
-                    "event_types": ["openevo.session_completed"],
-                    "status": args.status,
-                    "policy_version": args.policy_version,
-                },
-            )
-        )
-        dataset_payload = {
-            "dataset_id": dataset.dataset_id,
-            "artifact_id": dataset.artifact_id,
-            "name": args.dataset_name,
-            "purpose": args.purpose,
-            "event_count": dataset.event_count,
-            "trace_count": dataset.trace_count,
-            "manifest_uri": _artifact_uri(store, dataset.artifact_id),
-        }
-        input_artifact_ids.append(dataset.artifact_id)
-
-    method = "parametric_memory_lora_sft"
-    config: dict[str, Any] = {
-        "name": args.job_name or "Terminal Bench parametric-memory LoRA SFT",
-        "base_model": args.base_model,
-        "output_adapter_id": args.adapter_id,
-        "adapter_format": args.adapter_format,
-        "trainer": {
-            "command": args.trainer_command,
-            "args": list(args.trainer_arg),
-            "timeout_seconds": args.trainer_timeout_seconds,
-        },
-        "compatibility": {
-            "agent_harness": ["terminal-bench-harbor"],
-            "task_tags": _terminal_bench_task_tags(store, input_artifact_ids, events),
-            "base_model": [args.base_model],
-        },
-        "scores": {"quality": 0.0},
-        "promoted": False,
-    }
-    if args.max_records is not None:
-        config["max_records"] = args.max_records
-    if args.training_projection == "response_tail":
-        if args.training_response_tail_chars is None:
-            raise ValueError(
-                "terminal-bench-parametric-memory-job requires "
-                "--training-response-tail-chars with response_tail projection"
-            )
-        config["training_projection"] = {
-            "type": "response_tail",
-            "response_tail_chars": args.training_response_tail_chars,
-        }
-    if args.training_projection == "terminal_bench_final_actions":
-        config["training_projection"] = {
-            "type": "terminal_bench_final_actions",
-            "max_events": args.training_final_action_max_events,
-            "max_output_chars": args.training_final_action_output_chars,
-        }
-    if args.training_projection == "terminal_bench_tool_call_policy":
-        config["training_projection"] = {
-            "type": "terminal_bench_tool_call_policy",
-            "max_commands": args.training_tool_call_max_commands,
-            "command_contains": list(args.training_tool_call_command_contains),
-            "exclude_command_contains": list(
-                args.training_tool_call_exclude_command_contains
-            ),
-            "derive_password_recovery_command": (
-                args.training_tool_call_derive_password_recovery_command
-            ),
-        }
-    if args.training_projection == "terminal_bench_corrective_tool_call_policy":
-        if args.training_corrective_stage_json:
-            config["training_projection"] = _parametric_memory_training_projection(
-                {
-                    "type": "terminal_bench_corrective_tool_call_policy",
-                    "stages": [
-                        _json_object(stage_json)
-                        for stage_json in args.training_corrective_stage_json
-                    ],
-                }
-            )
-        elif not args.training_corrective_target_command:
-            raise ValueError(
-                "terminal-bench-parametric-memory-job requires "
-                "--training-corrective-target-command with "
-                "terminal_bench_corrective_tool_call_policy"
-            )
-        else:
-            config["training_projection"] = {
-                "type": "terminal_bench_corrective_tool_call_policy",
-                "input_contains": list(args.training_corrective_input_contains),
-                "max_examples": args.training_corrective_max_examples,
-                "target_tool_call": {
-                    "name": "tb_exec",
-                    "arguments": {
-                        "task_id": args.training_corrective_target_task_id,
-                        "command": args.training_corrective_target_command,
-                    },
-                },
-            }
-            if args.training_corrective_max_input_tool_messages is not None:
-                config["training_projection"]["max_input_tool_messages"] = (
-                    args.training_corrective_max_input_tool_messages
-                )
-            if args.training_corrective_strip_input_tool_result_payload:
-                config["training_projection"]["strip_input_tool_result_payload"] = True
-            if args.training_corrective_max_input_tool_content_chars is not None:
-                config["training_projection"]["max_input_tool_content_chars"] = (
-                    args.training_corrective_max_input_tool_content_chars
-                )
-    if args.training_projection == "terminal_bench_password_recovery_shorttarget_recipe":
-        if not args.training_recipe_target_command:
-            raise ValueError(
-                "terminal-bench-parametric-memory-job requires "
-                "--training-recipe-target-command with "
-                "terminal_bench_password_recovery_shorttarget_recipe"
-            )
-        recipe_projection: dict[str, Any] = {
-            "type": "terminal_bench_password_recovery_shorttarget_recipe",
-            "target_command": args.training_recipe_target_command,
-            "target_task_id": args.training_recipe_target_task_id,
-            "read_task_max_examples": args.training_recipe_read_task_max_examples,
-            "after_read_max_examples": args.training_recipe_after_read_max_examples,
-            "after_read_repeat": args.training_recipe_after_read_repeat,
-            "correction_input_contains": list(
-                args.training_recipe_correction_input_contains
-            ),
-            "correction_max_examples": args.training_recipe_correction_max_examples,
-            "correction_repeat": args.training_recipe_correction_repeat,
-        }
-        if args.training_recipe_read_task_input_contains:
-            recipe_projection["read_task_input_contains"] = list(
-                args.training_recipe_read_task_input_contains
-            )
-        if args.training_recipe_after_read_input_contains:
-            recipe_projection["after_read_input_contains"] = list(
-                args.training_recipe_after_read_input_contains
-            )
-        if args.training_recipe_max_input_tool_messages is not None:
-            recipe_projection["max_input_tool_messages"] = (
-                args.training_recipe_max_input_tool_messages
-            )
-        if args.training_recipe_strip_input_tool_result_payload:
-            recipe_projection["strip_input_tool_result_payload"] = True
-        if args.training_recipe_max_input_tool_content_chars is not None:
-            recipe_projection["max_input_tool_content_chars"] = (
-                args.training_recipe_max_input_tool_content_chars
-            )
-        config["training_projection"] = _parametric_memory_training_projection(
-            recipe_projection
-        )
-
-    job = store.create_job(
-        JobCreateRequest(
-            method=method,
-            job_type=method,
-            input_artifact_ids=input_artifact_ids,
-            config=config,
-            priority=args.priority,
-        )
-    )
-    payload: dict[str, Any] = {
-        "ingested_events": ingested_events,
-        "dataset": dataset_payload,
-        "job": {
-            "job_id": job.job_id,
-            "state": str(job.state),
-            "job_type": method,
-            "method": method,
-            "input_artifact_ids": input_artifact_ids,
-            "config": config,
-        },
-    }
-    if args.run_worker:
-        payload["completed_artifacts"] = _run_worker_once_local(
-            db_path=Path(args.db),
-            artifact_root=Path(args.artifact_root),
-        )
-    return payload
-
-
-def _create_terminal_bench_task_local_parametric_memory_job(
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    selections = select_task_local_candidates(
-        Path(args.trajectory_pool),
-        task_ids=args.task_id or None,
-    )
-    records: list[dict[str, Any]] = []
-    selected_task_ids: list[str] = []
-    selection_summary: list[dict[str, Any]] = []
-    for selection in selections:
-        task_records = build_task_local_sft_records(
-            selection,
-            command_contains=list(args.command_contains),
-            exclude_command_contains=list(args.exclude_command_contains),
-            target_command=args.target_command,
-            max_records=args.max_records_per_task,
-            target_repeat=args.target_repeat,
-            prompt_style=args.prompt_style,
-            target_mode=args.target_mode,
-            target_exec_timeout_seconds=args.target_exec_timeout_seconds,
-            include_run_tests_correction=args.include_run_tests_correction,
-            include_collect_result_correction=args.include_collect_result_correction,
-            include_tb_exec_failure_correction=(
-                args.include_tb_exec_failure_correction
-            ),
-            include_tool_schema_lock=args.include_tool_schema_lock,
-            tool_schema_lock_repeat=args.tool_schema_lock_repeat,
-        )
-        selection_summary.append(
-            {
-                "task_id": selection.task_id,
-                "failed_count": len(selection.failed),
-                "successful_count": len(selection.successful),
-                "null_reward_count": len(selection.null_reward),
-                "record_count": len(task_records),
-            }
-        )
-        if not task_records:
-            continue
-        selected_task_ids.append(selection.task_id)
-        records.extend(task_records)
-
-    if not records:
-        raise ValueError(
-            "terminal-bench-task-local-parametric-memory-job found no usable "
-            "task-local SFT records"
-        )
-
-    task_suffix = "-".join(selected_task_ids)
-    dataset_name = args.dataset_name or f"tb21-task-local-parametric-{task_suffix}"
-    output_root = Path(args.output_root)
-    target_filters = {
-        "command_contains": list(args.command_contains),
-        "exclude_command_contains": list(args.exclude_command_contains),
-        "prompt_style": args.prompt_style,
-        "target_mode": args.target_mode,
-    }
-    if args.target_command:
-        target_filters["target_command"] = args.target_command
-    if args.target_repeat != 1:
-        target_filters["target_repeat"] = args.target_repeat
-    if args.include_tool_schema_lock:
-        target_filters["include_tool_schema_lock"] = True
-    if args.tool_schema_lock_repeat != 1:
-        target_filters["tool_schema_lock_repeat"] = args.tool_schema_lock_repeat
-    payload = build_task_local_parametric_job_payload(
-        records=records,
-        output_root=output_root,
-        dataset_name=dataset_name,
-        base_model=args.base_model,
-        adapter_id=args.adapter_id,
-        trainer_command=args.trainer_command,
-        trainer_args=list(args.trainer_arg),
-        trainer_timeout_seconds=args.trainer_timeout_seconds,
-        task_ids=selected_task_ids,
-        target_filters=target_filters,
-    )
-    payload["trajectory_pool"] = str(Path(args.trajectory_pool))
-    payload["selected_tasks"] = selected_task_ids
-    payload["selection_summary"] = selection_summary
-    payload["command_contains"] = list(args.command_contains)
-    payload["exclude_command_contains"] = list(args.exclude_command_contains)
-    payload["target_command"] = args.target_command
-    payload["target_repeat"] = args.target_repeat
-    payload["prompt_style"] = args.prompt_style
-    payload["target_mode"] = args.target_mode
-    payload["target_exec_timeout_seconds"] = args.target_exec_timeout_seconds
-    payload["include_tool_schema_lock"] = args.include_tool_schema_lock
-    payload["tool_schema_lock_repeat"] = args.tool_schema_lock_repeat
-    payload["include_run_tests_correction"] = args.include_run_tests_correction
-    payload["include_collect_result_correction"] = (
-        args.include_collect_result_correction
-    )
-    payload["include_tb_exec_failure_correction"] = (
-        args.include_tb_exec_failure_correction
-    )
-
-    if args.run_worker:
-        artifact_root = Path(args.artifact_root) if args.artifact_root else output_root / "artifacts"
-        artifacts = run_method(
-            WorkerClaimedJob.model_validate(payload["job"]),
-            artifact_root=artifact_root,
-        )
-        completed_artifacts = [artifact.model_dump(mode="json") for artifact in artifacts]
-        payload["completed_artifacts"] = completed_artifacts
-        completed_path = output_root / "completed_artifacts.json"
-        completed_path.write_text(
-            json.dumps(completed_artifacts, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        payload["completed_artifacts_path"] = str(completed_path)
-
-    return payload
-
-
-def _local_success_replay_trials_from_args(
-    args: argparse.Namespace,
-) -> list[LocalSuccessReplayTrial]:
-    trial_dirs = [Path(path) for path in args.success_trial_dir]
-    task_ids = list(args.task_id)
-    if len(task_ids) == 1 and len(trial_dirs) > 1:
-        task_ids = task_ids * len(trial_dirs)
-    if len(task_ids) != len(trial_dirs):
-        raise ValueError(
-            "terminal-bench-local-success-replay-parametric-memory-job requires "
-            "one --task-id for all success trials or one --task-id per "
-            "--success-trial-dir"
-        )
-    return [
-        LocalSuccessReplayTrial(task_id=task_id, trial_dir=trial_dir)
-        for task_id, trial_dir in zip(task_ids, trial_dirs, strict=True)
-    ]
-
-
-def _create_terminal_bench_local_success_replay_parametric_memory_job(
-    args: argparse.Namespace,
-) -> dict[str, Any]:
-    trials = _local_success_replay_trials_from_args(args)
-    allowed_tools = list(args.allowed_tool) or None
-    records = build_local_success_replay_sft_records(
-        trials,
-        allowed_tools=allowed_tools,
-        require_tool_name=args.require_tool_name,
-        exclude_if_input_contains=list(args.exclude_if_input_contains),
-        exclude_if_output_contains=list(args.exclude_if_output_contains),
-        max_records=args.max_records,
-        max_records_per_trial=args.max_records_per_trial,
-    )
-    if not records:
-        raise ValueError(
-            "terminal-bench-local-success-replay-parametric-memory-job found no "
-            "usable local success replay records"
-        )
-    selected_task_ids = sorted({trial.task_id for trial in trials})
-    selection_filters = records[0]["metadata"]["selection_filters"]
-    source_models = sorted(
-        {
-            record["metadata"]["source_model"]
-            for record in records
-            if isinstance(record.get("metadata"), dict)
-            and isinstance(record["metadata"].get("source_model"), str)
-        }
-    )
-    task_suffix = "-".join(selected_task_ids)
-    dataset_name = args.dataset_name or f"tb21-local-success-replay-{task_suffix}"
-    output_root = Path(args.output_root)
-    payload = build_local_success_replay_parametric_job_payload(
-        records=records,
-        output_root=output_root,
-        dataset_name=dataset_name,
-        base_model=args.base_model,
-        adapter_id=args.adapter_id,
-        trainer_command=args.trainer_command,
-        trainer_args=list(args.trainer_arg),
-        trainer_timeout_seconds=args.trainer_timeout_seconds,
-        task_ids=selected_task_ids,
-        source_trial_dirs=[trial.trial_dir for trial in trials],
-        selection_filters=selection_filters,
-        source_models=source_models,
-    )
-    payload["source_trial_dirs"] = [str(trial.trial_dir) for trial in trials]
-    payload["selected_tasks"] = selected_task_ids
-    payload["selection_filters"] = selection_filters
-    payload["source_models"] = source_models
-
-    if args.run_worker:
-        if args.artifact_root:
-            artifact_root = Path(args.artifact_root)
-        else:
-            artifact_root = output_root / "artifacts"
-        artifacts = run_method(
-            WorkerClaimedJob.model_validate(payload["job"]),
-            artifact_root=artifact_root,
-        )
-        completed_artifacts = [
-            artifact.model_dump(mode="json") for artifact in artifacts
-        ]
-        payload["completed_artifacts"] = completed_artifacts
-        completed_path = output_root / "completed_artifacts.json"
-        completed_path.write_text(
-            json.dumps(completed_artifacts, indent=2, sort_keys=True) + "\n",
-            encoding="utf-8",
-        )
-        payload["completed_artifacts_path"] = str(completed_path)
-
-    return payload
-
-
 def _terminal_bench_job_method(method: str, input_artifact_ids: list[str]) -> str:
     if method != "auto":
         return method
@@ -2283,35 +1167,6 @@ def _parse_key_value_entries(entries: list[str]) -> dict[str, str]:
             raise ValueError(f"expected KEY=VALUE entry, got {entry!r}")
         parsed[key] = value
     return parsed
-
-
-def _local_parametric_verifier_env(
-    entries: list[str],
-    *,
-    python_install_mirror: str | None,
-) -> dict[str, str]:
-    env = _parse_key_value_entries(entries)
-    if python_install_mirror:
-        env.setdefault(
-            "UV_PYTHON_INSTALL_MIRROR",
-            _local_parametric_python_install_mirror(python_install_mirror),
-        )
-    return env
-
-
-def _local_parametric_server_url(value: str | None, port: int) -> str:
-    if value:
-        return value
-    return f"http://127.0.0.1:{int(port)}/v1"
-
-
-def _local_parametric_python_install_mirror(value: str) -> str:
-    mirror = value.rstrip("/")
-    if mirror.endswith("/releases/download"):
-        return mirror
-    if mirror.endswith("/python-build-standalone"):
-        return f"{mirror}/releases/download"
-    return mirror
 
 
 def _artifact_uri(store: EvolutionStore, artifact_id: str) -> str:
