@@ -34,6 +34,13 @@ maintenance operations. Lifecycle output may include actual sanitized SSH and
 Daemon stdout/stderr. Commands, environment values, credentials, tokens, Core
 endpoints, and absolute host paths remain forbidden.
 
+The real-science runner treats a sidecar relaunch as a new Local API instance.
+It must repeat strict release and authenticated-session negotiation, require all
+candidate composition fields to remain identical, require the instance-bound
+`build_id` to change, and pass only that current identity to the packaged
+renderer. Retaining the pre-relaunch `build_id` is a closed acceptance failure,
+not a reason to weaken renderer bootstrap equality.
+
 ## Focused Tests
 
 Run the smallest meaningful test set first, then broaden when a change touches a
