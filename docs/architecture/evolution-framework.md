@@ -306,6 +306,27 @@ callables through the legacy adapter without changing signatures, prompts,
 retries, or algorithm bodies. Method plugins run with worker-process permissions;
 validation is not a Python sandbox.
 
+The managed reference worker now supplies the first production implementation
+of that surface for `harness_id=codex`. It invokes the existing Codex CLI
+subscription backend directly; it does not add an LLM HTTP endpoint or accept a
+method-supplied endpoint, API key, environment, command, credential path, or
+working directory. Core copies the remote user's verified `~/.codex/auth.json`
+into a private one-turn `CODEX_HOME`, uses an empty private home/workspace, sends
+the prompt over stdin, and runs `codex exec` with user config/rules ignored,
+ephemeral state, a read-only sandbox, and shell, unified-exec, and standalone
+web-search features disabled. It accepts only a completed bounded JSON
+transcript, redacts credential values from errors and the final text, and
+scrubs the staged credential before removing the private run tree. No host path
+is returned as a transcript reference.
+
+This Codex implementation currently supports model selection and timeout. A
+method request that selects another harness or supplies `temperature` or
+`max_output_tokens` fails closed because Codex CLI does not provide those
+controls through this contract. This service is model-only algorithm inference;
+ordinary Science task execution continues to use the full
+`TaskRequest -> rollout -> Gateway -> CodexHarness` path and its managed runtime
+credential-isolation profile.
+
 Project value `agent_system.method=auto` is not a method, plugin, or generic
 schedule policy. Job materialization calls the single narrow
 `resolve_agent_system_method(requested_method, prior_dataset_artifact_ids)`:

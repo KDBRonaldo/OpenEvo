@@ -6,6 +6,8 @@ import sys
 import time
 
 from openevo.evolution.framework import load_verified_framework_registry
+from openevo.evolution.framework.execution import MethodExecutionServices
+from openevo.evolution.harness_service import CodexSubscriptionHarnessService
 from openevo.evolution.methods import METHOD_REGISTRY
 from openevo.evolution.server import create_app
 from openevo.evolution.worker import EvolutionWorkerClient, run_once
@@ -110,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
         args.base_url,
         headers=(internal_identity.request_headers() if internal_identity is not None else None),
     ) as client:
+        method_services = MethodExecutionServices(
+            harness=CodexSubscriptionHarnessService()
+        )
         if internal_identity is not None:
             client.register_internal_worker(
                 worker_id=args.worker_id,
@@ -125,6 +130,7 @@ def main(argv: list[str] | None = None) -> int:
                 artifact_root=artifact_root,
                 lease_seconds=args.lease_seconds,
                 executable_registry=registry,
+                method_services=method_services,
             )
             if args.once:
                 return 0
