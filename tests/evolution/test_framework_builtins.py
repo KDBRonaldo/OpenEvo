@@ -9,7 +9,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 
-from openevo.evolution import methods
+from openevo.evolution import memevolve, methods
 from openevo.evolution.framework import builtin_handlers, builtins
 from openevo.evolution.framework.builtins import (
     BUILTIN_METHOD_IDS,
@@ -60,6 +60,7 @@ METHOD_IDS = {
     "text_memory",
     "text_memory_reflector",
     "text_memory_expel_reflector",
+    "text_memory_memevolve",
     "skill_bundle",
     "skill_bundle_reflector",
     "agent_system",
@@ -78,6 +79,7 @@ PROTECTED_METHOD_IDS = {
 REFLECTOR_METHOD_IDS = {
     "text_memory_reflector",
     "text_memory_expel_reflector",
+    "text_memory_memevolve",
     "skill_bundle_reflector",
     "agent_system_reflector",
     "agent_system_history_reflector",
@@ -87,6 +89,7 @@ REFLECTOR_METHOD_IDS = {
 
 
 METHODS_MODULE = "openevo.evolution.methods"
+MEMEVOLVE_MODULE = "openevo.evolution.memevolve"
 BUILTINS_MODULE = "openevo.evolution.framework.builtins"
 BUILTIN_HANDLERS_MODULE = "openevo.evolution.framework.builtin_handlers"
 
@@ -156,6 +159,15 @@ def _entry_point_parts(entry_point: str) -> tuple[str, str]:
     return module_name, attribute_name
 
 
+def _method_entry_point(identity: ImplementationIdentity) -> Callable:
+    module_name, attribute_name = _entry_point_parts(identity.implementation.entry_point)
+    if module_name == METHODS_MODULE:
+        return getattr(methods, attribute_name)
+    if module_name == MEMEVOLVE_MODULE:
+        return getattr(memevolve, attribute_name)
+    raise AssertionError(f"unexpected method module: {module_name}")
+
+
 def _schema_nodes(schema: dict) -> list[dict]:
     nodes = [schema]
     for child in schema.get("properties", {}).values():
@@ -174,9 +186,12 @@ def test_builtin_catalog_is_complete_frozen_and_has_expected_defaults(
     assert frozenset(snapshot.targets) == frozenset(TARGET_IDS)
     assert frozenset(snapshot.target_handlers) == frozenset(HANDLER_IDS)
     assert frozenset(snapshot.methods) == frozenset(METHOD_IDS)
-    assert {descriptor.invocation_abi.value for descriptor in snapshot.methods.values()} == {
-        "legacy_worker_job_v1"
-    }
+    assert {
+        descriptor.invocation_abi.value for descriptor in snapshot.methods.values()
+    } == {"legacy_worker_job_v1", "method_context_v1"}
+    assert snapshot.methods["text_memory_memevolve"].invocation_abi.value == (
+        "method_context_v1"
+    )
 
     assert snapshot.targets["text_memory"].default_method_id == ("text_memory_expel_reflector")
     assert snapshot.targets["skill_bundle"].default_method_id == ("skill_bundle_reflector")
@@ -203,7 +218,10 @@ def test_builtin_descriptors_use_exact_method_target_and_handler_entry_points(
 ) -> None:
     for method_id, descriptor in snapshot.methods.items():
         assert descriptor.implementation_ref is not None
-        assert descriptor.implementation_ref.entry_point == (f"{METHODS_MODULE}:{method_id}")
+        expected_module = (
+            MEMEVOLVE_MODULE if method_id == "text_memory_memevolve" else METHODS_MODULE
+        )
+        assert descriptor.implementation_ref.entry_point == f"{expected_module}:{method_id}"
 
     target_anchor_names: set[str] = set()
     for descriptor in snapshot.targets.values():
@@ -466,7 +484,7 @@ def test_incomplete_lora_method_remains_unavailable_with_legacy_runtime_caps(
     assert support.runtime.missing_requirements == ("constrained_trainer_contract",)
 
 
-def test_load_builtin_method_handles_returns_exact_legacy_callables(
+def test_load_builtin_method_handles_returns_exact_verified_callables(
     snapshot: RegistrySnapshot,
 ) -> None:
     loaded_entry_points: list[str] = []
@@ -474,19 +492,20 @@ def test_load_builtin_method_handles_returns_exact_legacy_callables(
     def verified_loader(identity: ImplementationIdentity) -> Callable:
         entry_point = identity.implementation.entry_point
         loaded_entry_points.append(entry_point)
-        module_name, attribute_name = _entry_point_parts(entry_point)
-        assert module_name == METHODS_MODULE
-        return getattr(methods, attribute_name)
+        return _method_entry_point(identity)
 
     handles = load_builtin_method_handles(snapshot, verified_loader=verified_loader)
 
     assert isinstance(handles, Mapping)
     assert frozenset(handles) == frozenset(METHOD_IDS)
     assert set(loaded_entry_points) == {
-        f"{METHODS_MODULE}:{method_id}" for method_id in METHOD_IDS
+        descriptor.implementation_ref.entry_point
+        for descriptor in snapshot.methods.values()
+        if descriptor.implementation_ref is not None
     }
-    for method_id in METHOD_IDS:
+    for method_id in set(METHOD_IDS) - {"text_memory_memevolve"}:
         assert handles[method_id] is methods.METHOD_REGISTRY[method_id]
+    assert handles["text_memory_memevolve"] is memevolve.text_memory_memevolve
 
 
 @pytest.mark.parametrize("failure", ["missing", "extra"])
@@ -505,10 +524,7 @@ def test_load_builtin_method_handles_rejects_legacy_registry_key_drift(
     with pytest.raises((TypeError, ValueError), match="missing|extra|mismatch"):
         load_builtin_method_handles(
             snapshot,
-            verified_loader=lambda identity: getattr(
-                methods,
-                _entry_point_parts(identity.implementation.entry_point)[1],
-            ),
+            verified_loader=_method_entry_point,
         )
 
 
@@ -519,7 +535,7 @@ def test_load_builtin_method_handles_rejects_wrong_callable_identity(
         _, attribute_name = _entry_point_parts(identity.implementation.entry_point)
         if attribute_name == "text_memory":
             return methods.text_memory_reflector
-        return methods.METHOD_REGISTRY[attribute_name]
+        return _method_entry_point(identity)
 
     with pytest.raises((TypeError, ValueError), match="mismatch|identity"):
         load_builtin_method_handles(snapshot, verified_loader=verified_loader)
@@ -610,6 +626,9 @@ def test_verified_builtin_registry_loads_every_anchor_and_exact_method_handle(
     loaded = load_verified_builtin_registry(verified)
 
     assert frozenset(loaded.method_handles) == frozenset(METHOD_IDS)
+    assert loaded.method_handles["text_memory_memevolve"] is (
+        memevolve.text_memory_memevolve
+    )
     assert frozenset(loaded.handler_handles) == frozenset(HANDLER_IDS)
     assert loaded.distribution_attestations == {verified.expectation.distribution_digest: verified}
     assert frozenset(loaded.descriptor_anchors) == frozenset(

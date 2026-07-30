@@ -333,13 +333,19 @@ Typed feedback contract：
 
 Gateway 会把选中的 memory 写到 `OPENEVO_MEMORY_FILE`，并 prepend 到 agent instruction。
 该路径只依赖 rendered text，因此对 proxy/local inference 和 transcript-only subscription
-harness 都生效。内置 reference worker 提供三条 text-memory 方法：
+harness 都生效。内置 reference worker 提供四条 text-memory 方法：
 
 - `text_memory`：把 dataset records 渲染成简单 Markdown，主要用于 smoke test；
 - `text_memory_reflector`：调用 LLM 从成功/失败 trajectories 中生成 reusable memory；
 - `text_memory_expel_reflector`：使用 ExpeL/Reflexion-style synthesis，要求输出包含
   `## Do`、`## Avoid`、`## Validate`、`## When Applicable` 和
   `## Retired Or Superseded`，适合 Terminal Bench memory-only ablation。
+- `text_memory_memevolve`：通过 `method_context_v1` 和 Core-owned Codex harness 对每个
+  候选独立执行 trajectory analysis 与 declarative Markdown generation，再做 evidence
+  selection。它不进入 legacy method table，也不接受 endpoint/API key。artifact manifest
+  固定记录 `adaptation_scope=declarative_text_memory_v1` 和
+  `paper_equivalent=false`；该方法不执行上游 MemEvolve 生成的 Python provider，因此不包含
+  原版 provider 的 retrieval、online ingestion、management 或 task-executed tournament。
 
 ### `skill_bundle`
 
