@@ -317,6 +317,7 @@ function assertReleaseProviderV2(
     "listCoreOperations",
     "getCoreOperation",
     "cancelCoreOperation",
+    "loadTaskLogs",
     "loadServiceLogs",
     "cleanupCaches",
     "createDiagnostic",

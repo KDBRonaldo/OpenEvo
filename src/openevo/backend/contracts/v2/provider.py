@@ -9,13 +9,14 @@ typed 503 response.
 from __future__ import annotations
 
 import asyncio
+import base64
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timezone
 import hashlib
 import json
 import secrets
 import threading
-from typing import Literal
+from typing import Literal, Protocol
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
@@ -28,6 +29,12 @@ from openevo.backend.project_authority_v2 import (
     ProjectAuthorityV2Error,
 )
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
+from openevo.backend.service_supervisor import (
+    ServiceComponent,
+    ServiceStatus,
+    SupervisorLogEntry,
+    SupervisorServiceSummary,
+)
 from openevo.backend.science_run_store import (
     ScienceProjectAdmissionAuthorityV2,
     page_items,
@@ -142,6 +149,18 @@ _SERVICE_OPERATIONS = frozenset(
 )
 
 
+class CoreServiceAuthorityV2(Protocol):
+    def list(self) -> tuple[SupervisorServiceSummary, ...]: ...
+
+    def logs(
+        self,
+        service_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[SupervisorLogEntry, ...]: ...
+
+
 class CoreControlProviderV2:
     """Serve the frozen v2 contract from exact Core-owned durable state."""
 
@@ -152,6 +171,7 @@ class CoreControlProviderV2:
         task_owner: CoreScienceTaskOwnerV2,
         executable_registry: VerifiedExecutableRegistry,
         project_authority: ProjectAuthorityV2 | None = None,
+        service_authority: CoreServiceAuthorityV2 | None = None,
         bearer_token: str,
         release_version: str,
         source_commit: str,
@@ -173,6 +193,12 @@ class CoreControlProviderV2:
         if project_authority is not None and type(project_authority) is not ProjectAuthorityV2:
             raise TypeError("Core v2 project authority has the wrong type")
         self._project_authority = project_authority
+        if service_authority is not None and (
+            not callable(getattr(service_authority, "list", None))
+            or not callable(getattr(service_authority, "logs", None))
+        ):
+            raise TypeError("Core v2 service authority has the wrong type")
+        self._service_authority = service_authority
         self._authorization = b"Bearer " + token_bytes
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._lock = threading.RLock()
@@ -278,10 +304,12 @@ class CoreControlProviderV2:
             "getCoreTaskAttemptV2": self._get_task_attempt,
             "cancelCoreTaskAttemptV2": self._cancel_task_attempt,
             "getCoreTaskTimelineV2": self._task_timeline,
+            "getCoreTaskLogsV2": self._task_logs,
             "getCoreTaskContextV2": self._task_context,
             "closeCoreTaskV2": self._close_task,
             "listCoreServicesV2": self._list_services,
             "getCoreServiceV2": self._get_service,
+            "getCoreServiceLogsV2": self._service_logs,
             "getCoreOperationV2": self._get_operation,
             "streamCoreEventsV2": self._events,
         }
@@ -309,12 +337,10 @@ class CoreControlProviderV2:
                 *self._handlers,
                 "retryCoreSuccessorTransitionV2",
                 "abandonCoreSuccessorTransitionV2",
-                "getCoreTaskLogsV2",
                 "listCoreTaskArtifactsV2",
                 "getCoreArtifactV2",
                 "getCoreArtifactContentV2",
                 "restartCoreServiceV2",
-                "getCoreServiceLogsV2",
                 "cancelCoreOperationV2",
                 "createCoreDiagnosticV2",
                 "getCoreDiagnosticV2",
@@ -1280,6 +1306,19 @@ class CoreControlProviderV2:
             has_more=has_more,
         )
 
+    def _task_logs(self, arguments: Mapping[str, object]) -> m.LogPageV2:
+        _keys(arguments, "task_id", "limit", "after")
+        task_id = _string(arguments["task_id"])
+        logs = self._task_owner.invoke("getCoreTaskLogsV2", {"task_id": task_id})
+        if not isinstance(logs, list) or any(type(item) is not m.LogEntryV2 for item in logs):
+            raise RuntimeError("v2 Task owner returned the wrong log inventory")
+        return _log_page(
+            logs,
+            limit=_limit(arguments["limit"]),
+            after=_optional_string(arguments["after"]),
+            query=f"task-logs:{task_id}",
+        )
+
     def _task_context(self, arguments: Mapping[str, object]) -> m.TaskContextV2:
         _keys(arguments, "task_id")
         task_id = _string(arguments["task_id"])
@@ -1377,9 +1416,9 @@ class CoreControlProviderV2:
 
     def _list_services(self, arguments: Mapping[str, object]) -> m.ServicePageV2:
         _keys(arguments, "limit", "after")
-        service = self._daemon_service()
+        services = self._services()
         selected, next_cursor, has_more = _page_items(
-            [service],
+            services,
             limit=_limit(arguments["limit"]),
             after=_optional_string(arguments["after"]),
             query="services",
@@ -1392,7 +1431,12 @@ class CoreControlProviderV2:
 
     def _get_service(self, arguments: Mapping[str, object]) -> Response:
         _keys(arguments, "service_id")
-        if _string(arguments["service_id"]) != "daemon":
+        service_id = _string(arguments["service_id"])
+        service = next(
+            (candidate for candidate in self._services() if candidate.service_id == service_id),
+            None,
+        )
+        if service is None:
             raise _http_error(
                 404,
                 code="service_not_found",
@@ -1401,10 +1445,115 @@ class CoreControlProviderV2:
                 retryable=False,
                 repair_action="user_action_required",
             )
-        service = self._daemon_service()
         return JSONResponse(
             content=service.model_dump(mode="json"),
             headers={"ETag": service.etag},
+        )
+
+    def _services(self) -> list[m.ServiceV2]:
+        services = [self._daemon_service()]
+        authority = self._service_authority
+        if authority is None:
+            return services
+        try:
+            summaries = authority.list()
+        except Exception as exc:
+            raise _http_error(
+                503,
+                code="service_authority_unavailable",
+                message="Core could not read the managed service authority.",
+                category="service",
+                retryable=True,
+                repair_action="retry",
+            ) from exc
+        if not isinstance(summaries, tuple) or len(summaries) > 99:
+            raise RuntimeError("Core service authority returned an invalid inventory")
+        seen = {"daemon"}
+        children: list[m.ServiceV2] = []
+        for summary in summaries:
+            if type(summary) is not SupervisorServiceSummary or summary.id in seen:
+                raise RuntimeError("Core service authority returned duplicate service identity")
+            seen.add(summary.id)
+            children.append(_service_from_supervisor(summary))
+        children.sort(key=lambda item: item.service_id)
+        return [*services, *children]
+
+    def _service_logs(self, arguments: Mapping[str, object]) -> m.LogPageV2:
+        _keys(arguments, "service_id", "limit", "after")
+        service_id = _string(arguments["service_id"])
+        limit = _limit(arguments["limit"])
+        after = _optional_string(arguments["after"])
+        query = f"service-logs:{service_id}"
+        after_sequence = _log_after_sequence(after, query=query)
+        if service_id == "daemon":
+            return _log_page(
+                [
+                    m.LogEntryV2(
+                        sequence=1,
+                        occurred_at=self._started_at,
+                        stream="system",
+                        message="OpenEvo Daemon Core Control v2 is ready.",
+                    )
+                ],
+                limit=limit,
+                after=after,
+                query=query,
+            )
+        services = {item.service_id for item in self._services()}
+        authority = self._service_authority
+        if service_id not in services or authority is None:
+            raise _http_error(
+                404,
+                code="service_not_found",
+                message="The requested Core service was not found.",
+                category="service",
+                retryable=False,
+                repair_action="user_action_required",
+            )
+        try:
+            source = authority.logs(
+                service_id,
+                after_sequence=after_sequence,
+                limit=limit,
+            )
+            probe = (
+                authority.logs(
+                    service_id,
+                    after_sequence=source[-1].sequence,
+                    limit=1,
+                )
+                if len(source) == limit
+                else ()
+            )
+        except Exception as exc:
+            raise _http_error(
+                503,
+                code="service_logs_unavailable",
+                message="Core could not read the managed service logs.",
+                category="service",
+                retryable=True,
+                repair_action="retry",
+            ) from exc
+        entries = _project_supervisor_logs(
+            source,
+            service_id=service_id,
+            after_sequence=after_sequence,
+        )
+        projected_probe = _project_supervisor_logs(
+            probe,
+            service_id=service_id,
+            after_sequence=(entries[-1].sequence if entries else after_sequence),
+        )
+        has_more = bool(projected_probe)
+        next_cursor = (
+            _encode_log_cursor(query, entries[-1].sequence)
+            if has_more and entries
+            else None
+        )
+        return m.LogPageV2(
+            items=entries,
+            next_cursor=next_cursor,
+            has_more=has_more,
         )
 
     def _daemon_service(self) -> m.ServiceV2:
@@ -1564,6 +1713,137 @@ def _page_items(
             retryable=False,
             repair_action="reconfigure",
         ) from exc
+
+
+def _log_page(
+    items: Sequence[m.LogEntryV2],
+    *,
+    limit: int,
+    after: str | None,
+    query: str,
+) -> m.LogPageV2:
+    after_sequence = _log_after_sequence(after, query=query)
+    previous = 0
+    retained: list[m.LogEntryV2] = []
+    for item in items:
+        if type(item) is not m.LogEntryV2 or item.sequence <= previous:
+            raise RuntimeError("Core log authority returned a non-monotonic inventory")
+        previous = item.sequence
+        if item.sequence > after_sequence:
+            retained.append(item)
+    selected = retained[: limit + 1]
+    has_more = len(selected) > limit
+    selected = selected[:limit]
+    next_cursor = (
+        _encode_log_cursor(query, selected[-1].sequence)
+        if has_more and selected
+        else None
+    )
+    return m.LogPageV2(
+        items=selected,
+        next_cursor=next_cursor,
+        has_more=has_more,
+    )
+
+
+def _log_after_sequence(after: str | None, *, query: str) -> int:
+    if after is None:
+        return 0
+    try:
+        if not 1 <= len(after) <= 512:
+            raise ValueError("log cursor length is invalid")
+        padded = after + "=" * (-len(after) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")))
+        expected_query = hashlib.sha256(query.encode("utf-8")).hexdigest()
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != {"after_sequence", "query"}
+            or not isinstance(payload["after_sequence"], int)
+            or isinstance(payload["after_sequence"], bool)
+            or not 1 <= payload["after_sequence"] <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+            or payload["query"] != expected_query
+        ):
+            raise ValueError("log cursor authority is invalid")
+        return payload["after_sequence"]
+    except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _http_error(
+            400,
+            code="cursor_invalid",
+            message="The page cursor is invalid for this resource query.",
+            category="contract",
+            retryable=False,
+            repair_action="reconfigure",
+        ) from exc
+
+
+def _encode_log_cursor(query: str, after_sequence: int) -> str:
+    payload = json.dumps(
+        {
+            "after_sequence": after_sequence,
+            "query": hashlib.sha256(query.encode("utf-8")).hexdigest(),
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("ascii")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _service_from_supervisor(summary: SupervisorServiceSummary) -> m.ServiceV2:
+    kind = {
+        ServiceComponent.EVOLUTION_BACKEND: "worker",
+        ServiceComponent.ROLLOUT: "runtime",
+        ServiceComponent.GATEWAY: "gateway",
+        ServiceComponent.EVOLUTION_WORKER: "worker",
+        ServiceComponent.INFERENCE: "model",
+    }[summary.component]
+    status = {
+        ServiceStatus.STOPPED: "unavailable",
+        ServiceStatus.STARTING: "starting",
+        ServiceStatus.RUNNING: "ready",
+        ServiceStatus.DEGRADED: "degraded",
+        ServiceStatus.FAILED: "degraded",
+        ServiceStatus.UNAVAILABLE: "unavailable",
+    }[summary.status]
+    return m.ServiceV2(
+        service_id=summary.id,
+        kind=kind,
+        status=status,
+        updated_at=summary.updated_at,
+        etag=summary.etag,
+    )
+
+
+def _project_supervisor_logs(
+    source: tuple[SupervisorLogEntry, ...],
+    *,
+    service_id: str,
+    after_sequence: int,
+) -> list[m.LogEntryV2]:
+    if not isinstance(source, tuple) or len(source) > 100:
+        raise RuntimeError("Core service log authority exceeded its page bound")
+    entries: list[m.LogEntryV2] = []
+    previous = after_sequence
+    for item in source:
+        if (
+            type(item) is not SupervisorLogEntry
+            or item.service_id != service_id
+            or item.sequence <= previous
+            or hashlib.sha256(item.message.encode("utf-8")).hexdigest()
+            != item.content_sha256
+        ):
+            raise RuntimeError("Core service log authority returned invalid output")
+        entries.append(
+            m.LogEntryV2(
+                sequence=item.sequence,
+                occurred_at=item.occurred_at,
+                stream=("stderr" if item.level in {"warning", "error"} else "stdout"),
+                message=item.message,
+            )
+        )
+        previous = item.sequence
+    return entries
 
 
 def _canonical_action_request(value: Mapping[str, object]) -> bytes:

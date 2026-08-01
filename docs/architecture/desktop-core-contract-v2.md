@@ -239,6 +239,18 @@ an exact idempotent retry recovers that same terminal operation; changed request
 or ETag identity fails closed. Cancellation and terminal capture therefore keep
 the existing single-winner rule.
 
+Task and service logs are implemented Core-owned observations. Task log pages
+are projected under one consistent Task-store read from the immutable admission,
+Attempt execution records, successor event journal, and the bounded captured
+transcript; they never infer success from Desktop state. Service inventory and
+child-process log pages come from the active `CoreServiceSupervisor`, whose
+persisted stdout/stderr lines are already bounded and sanitized. The synthetic
+top-level `daemon` resource contributes only its fixed readiness line. Log
+cursors bind the exact task or service query and the last returned monotonic
+sequence, so a cursor cannot be replayed against another authority. The renderer
+loads live Task logs automatically, retains the timeline while logs are
+temporarily unavailable, and exposes explicit refresh for terminal transcripts.
+
 Profile connect/disconnect, host-key review, native workspace preparation,
 project create, and project activation return durable Desktop lifecycle
 operation authority with HTTP 202. Renderer mutation intent is persisted before

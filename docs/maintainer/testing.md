@@ -41,6 +41,14 @@ commit recovers under the same action key, exact replay returns the same
 Operation, and key/request reuse fails closed. The execution-owner suite keeps
 the running cancellation versus terminal-capture race coverage.
 
+Task/service log tests require query-bound sequence cursors, typed not-found
+behavior, a restart-stable transcript projection, and direct projection of
+sanitized supervisor stdout/stderr. Release composition tests pass the same
+supervisor that owns managed children into Core v2; a release may not substitute
+a Desktop-local service table. Renderer tests prove that a running Task loads
+the remote log page into the shared operation panel and labels system state and
+transcript output distinctly.
+
 The real-science runner treats a sidecar relaunch as a new Local API instance.
 It must repeat strict release and authenticated-session negotiation, require all
 candidate composition fields to remain identical, require the instance-bound

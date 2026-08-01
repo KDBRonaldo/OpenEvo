@@ -135,6 +135,20 @@ class _ReleaseServices:
     def authenticates_run_service(self, _headers: object) -> bool:
         return False
 
+    def list(self) -> tuple[object, ...]:
+        return ()
+
+    def logs(
+        self,
+        _service_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[object, ...]:
+        assert after_sequence >= 0
+        assert 1 <= limit <= 100
+        return ()
+
     def close(self) -> None:
         self.closed = True
 

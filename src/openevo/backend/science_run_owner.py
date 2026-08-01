@@ -269,6 +269,7 @@ class CoreScienceTaskOwnerV2:
             "cancelCoreTaskAttemptV2": self._cancel_attempt,
             "getCoreTaskAdmissionV2": self._get_admission,
             "getCoreTaskAttemptV2": self._get_attempt,
+            "getCoreTaskLogsV2": self._task_logs,
             "getCoreTaskV2": self._get_task,
             "listCoreTaskAttemptsV2": self._list_attempts,
             "listCoreTasksV2": self._list_tasks,
@@ -984,6 +985,12 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="getCoreTaskTimelineV2")
 
+    def list_task_logs(self, task_id: str) -> list[m2.LogEntryV2]:
+        try:
+            return self._ledger.list_task_logs(task_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreTaskLogsV2")
+
     async def verify(self, check: GenerationBoundRunAdmissionCheck) -> None:
         """Authorize only service calls derived from an active v2 Attempt."""
 
@@ -1116,6 +1123,12 @@ class CoreScienceTaskOwnerV2:
         return self._ledger.get_attempt(
             _v2_string_argument(arguments["task_id"], label="task ID"),
             _v2_string_argument(arguments["attempt_id"], label="attempt ID"),
+        )
+
+    def _task_logs(self, arguments: Mapping[str, object]) -> list[m2.LogEntryV2]:
+        _require_v2_argument_keys(arguments, {"task_id"})
+        return self.list_task_logs(
+            _v2_string_argument(arguments["task_id"], label="task ID")
         )
 
     def _cancel_attempt(self, arguments: Mapping[str, object]) -> m2.TaskV2:

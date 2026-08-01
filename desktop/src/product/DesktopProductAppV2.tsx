@@ -79,6 +79,7 @@ export function DesktopProductAppV2({
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [projectOpen, setProjectOpen] = useState(false);
+  const [taskLogs, setTaskLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
   const [serviceLogs, setServiceLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
   const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
     SAMPLE_SCIENTIFIC_PROJECT.id,
@@ -132,6 +133,26 @@ export function DesktopProductAppV2({
     setConnectionOpen(true);
     onConnectionSettingsOpened?.();
   }, [onConnectionSettingsOpened, openConnectionSettings, snapshot]);
+
+  useEffect(() => {
+    if (snapshot === null) return;
+    const activeTasks = snapshot.tasks.filter((task) => (
+      ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)
+    ));
+    if (activeTasks.length === 0) return;
+    let retained = true;
+    void Promise.all(activeTasks.map(async (task) => (
+      [task.task_id, (await provider.loadTaskLogs(task.task_id, { limit: 100 })).items] as const
+    ))).then((pages) => {
+      if (!retained) return;
+      setTaskLogs((current) => ({ ...current, ...Object.fromEntries(pages) }));
+    }).catch(() => {
+      // Timeline authority remains visible; explicit refresh reports a typed error.
+    });
+    return () => {
+      retained = false;
+    };
+  }, [provider, snapshot]);
 
   const act = useCallback(async <T,>(
     operation: () => Promise<T>,
@@ -278,6 +299,7 @@ export function DesktopProductAppV2({
               tasks={snapshot.tasks}
               transitions={snapshot.transitions}
               timelines={snapshot.timelines}
+              taskLogs={taskLogs}
               busy={busy}
               onRun={() => void runProject(activeProject)}
               onCancelTask={(task) => void act(
@@ -288,6 +310,18 @@ export function DesktopProductAppV2({
                 () => provider.retryTask(task.task_id, intentFor(snapshot, "retry-task")),
                 "A new infrastructure Attempt was requested under the same Task Admission.",
               )}
+              onLoadTaskLogs={async (taskId) => {
+                setBusy(true);
+                setActionError(null);
+                try {
+                  const page = await provider.loadTaskLogs(taskId, { limit: 100 });
+                  setTaskLogs((current) => ({ ...current, [taskId]: page.items }));
+                } catch (error) {
+                  setActionError(userMessageV2(error));
+                } finally {
+                  setBusy(false);
+                }
+              }}
               onRetryTransition={(transition) => void act(
                 () => provider.retryTransition(transition.transition.successor_transition_id, intentFor(snapshot, "retry-transition")),
                 "Successor transition retry requested.",
@@ -801,10 +835,12 @@ function ResearchWorkspaceV2({
   tasks,
   transitions,
   timelines,
+  taskLogs,
   busy,
   onRun,
   onCancelTask,
   onRetryTask,
+  onLoadTaskLogs,
   onRetryTransition,
   onAbandonTransition,
 }: {
@@ -812,10 +848,12 @@ function ResearchWorkspaceV2({
   readonly tasks: readonly TaskV2[];
   readonly transitions: Readonly<Record<string, SuccessorTransitionV2>>;
   readonly timelines: DesktopProductSnapshotV2["timelines"];
+  readonly taskLogs: Readonly<Record<string, readonly LogEntryV2[]>>;
   readonly busy: boolean;
   readonly onRun: () => void;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
+  readonly onLoadTaskLogs: (taskId: string) => void | Promise<void>;
   readonly onRetryTransition: (transition: SuccessorTransitionV2) => void;
   readonly onAbandonTransition: (transition: SuccessorTransitionV2) => void;
 }) {
@@ -834,7 +872,7 @@ function ResearchWorkspaceV2({
         <div className="panel-heading"><div><span className="panel-kicker">Immutable history</span><h2>Tasks and infrastructure Attempts</h2></div><span className="muted-pill">{projectTasks.length} Task{projectTasks.length === 1 ? "" : "s"}</span></div>
         {projectTasks.length === 0 ? <p className="v2-empty-copy">No admitted Task yet. Project edits remain drafts until validation and admission succeed.</p> : <div className="v2-task-list">{projectTasks.map((task) => {
           const transition = task.successor_transition ? transitions[task.successor_transition.successor_transition_id] : null;
-          return <TaskAuthorityCardV2 key={task.task_id} task={task} transition={transition ?? null} timeline={timelines[task.task_id] ?? []} busy={busy} onCancel={() => onCancelTask(task)} onRetry={() => onRetryTask(task)} onRetryTransition={() => transition && onRetryTransition(transition)} onAbandonTransition={() => transition && onAbandonTransition(transition)} />;
+          return <TaskAuthorityCardV2 key={task.task_id} task={task} transition={transition ?? null} timeline={timelines[task.task_id] ?? []} logs={taskLogs[task.task_id] ?? []} busy={busy} onCancel={() => onCancelTask(task)} onRetry={() => onRetryTask(task)} onLoadLogs={() => onLoadTaskLogs(task.task_id)} onRetryTransition={() => transition && onRetryTransition(transition)} onAbandonTransition={() => transition && onAbandonTransition(transition)} />;
         })}</div>}
       </section>
     </div>
@@ -858,18 +896,22 @@ function TaskAuthorityCardV2({
   task,
   transition,
   timeline,
+  logs,
   busy,
   onCancel,
   onRetry,
+  onLoadLogs,
   onRetryTransition,
   onAbandonTransition,
 }: {
   readonly task: TaskV2;
   readonly transition: SuccessorTransitionV2 | null;
   readonly timeline: DesktopProductSnapshotV2["timelines"][string];
+  readonly logs: readonly LogEntryV2[];
   readonly busy: boolean;
   readonly onCancel: () => void;
   readonly onRetry: () => void;
+  readonly onLoadLogs: () => void | Promise<void>;
   readonly onRetryTransition: () => void;
   readonly onAbandonTransition: () => void;
 }) {
@@ -879,17 +921,15 @@ function TaskAuthorityCardV2({
       <div className="v2-profile-card-head"><div><strong>Task {task.task_id}</strong><span>{task.state.replaceAll("_", " ")}</span></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <div className="v2-task-authority"><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
       <div className="v2-attempt-list">{task.attempts.map((attempt) => <div key={attempt.attempt_id}><strong>Attempt {attempt.ordinal}</strong><code>{attempt.attempt_id}</code>{attempt.attempt_id === task.authoritative_attempt_id ? <span className="muted-pill">authoritative</span> : null}</div>)}</div>
-      {!["completed", "closed"].includes(task.state) ? (
-        <LifecycleOperationPanelV2
-          model={taskPanelModelV2(task, timeline)}
-          onCancel={active ? onCancel : undefined}
-        />
-      ) : null}
+      <LifecycleOperationPanelV2
+        model={taskPanelModelV2(task, timeline, logs)}
+        onCancel={active ? onCancel : undefined}
+      />
       {transition !== null && transition.state !== "committed" ? (
         <LifecycleOperationPanelV2 model={transitionPanelModelV2(transition, timeline)} />
       ) : null}
       {transition ? <div className="v2-transition"><div><span>Successor Transition</span><strong>{transition.transition.successor_transition_id}</strong><small>Expected Project Head generation {transition.transition.expected_successor_generation}</small></div><span className={`state-pill ${transition.state}`}>{transition.state}</span>{transition.error ? <p>{transition.error.message}</p> : null}{transition.state === "failed" ? <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Abandon evolution result</button></div> : null}</div> : null}
-      <div className="v2-card-actions">{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
+      <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadLogs()}>Refresh task logs</button>{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
     </article>
   );
 }

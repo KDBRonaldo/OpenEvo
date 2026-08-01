@@ -184,6 +184,7 @@ def _build_release_daemon_v2_composition(
             task_owner=task_owner,
             executable_registry=executable_registry,
             project_authority=project_authority,
+            service_authority=service_supervisor,
             bearer_token=bearer_token,
             release_version=__version__,
             source_commit=source_commit,

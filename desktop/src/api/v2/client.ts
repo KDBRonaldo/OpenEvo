@@ -252,6 +252,7 @@ export interface DesktopApiClientV2 {
   cancelTask(taskId: string, input: TaskActionV2, options: ResourceMutationRequestOptionsV2): Promise<OperationV2>;
   retryTask(taskId: string, input: TaskActionV2, options: ResourceMutationRequestOptionsV2): Promise<LocalOperationV2>;
   taskTimeline(taskId: string, options?: ListRequestOptionsV2): Promise<TimelinePageV2>;
+  taskLogs(taskId: string, options?: ListRequestOptionsV2): Promise<LogPageV2>;
   taskContext(taskId: string): Promise<TaskContextV2>;
   taskArtifacts(taskId: string, options?: ListRequestOptionsV2): Promise<ArtifactPageV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
@@ -684,6 +685,12 @@ export function createDesktopApiClientV2(options: DesktopClientOptionsV2): Deskt
       `${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/retry`, input, taskActionV2Schema, localOperationV2Schema, mutation,
     ),
     taskTimeline: (taskId, listOptions) => request("GET", withListQuery(`${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/timeline`, listOptions), timelinePageV2Schema, 200),
+    taskLogs: (taskId, listOptions) => request(
+      "GET",
+      withListQuery(`${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/logs`, listOptions),
+      logPageV2Schema,
+      200,
+    ),
     taskContext: async (taskId) => assertIdentity(
       await request("GET", `${DESKTOP_API_V2_PREFIX}/tasks/${segment(taskId)}/context`, taskContextV2Schema, 200),
       "task_id",

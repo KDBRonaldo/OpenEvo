@@ -127,6 +127,7 @@ export interface DesktopProductProviderV2 {
   submitTask(projectId: string, intent: ProductMutationIntentV2): Promise<TaskV2>;
   cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  loadTaskLogs(taskId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;
   getRuntimeContext(runtimeContextSnapshotId: string): Promise<RuntimeContextSnapshotRefV2>;
@@ -194,6 +195,7 @@ export const unavailableDesktopProductProviderV2: DesktopProductProviderV2 = {
   submitTask: unavailable,
   cancelTask: unavailable,
   retryTask: unavailable,
+  loadTaskLogs: unavailable,
   getProjectHead: unavailable,
   getEvolutionRevision: unavailable,
   getRuntimeContext: unavailable,

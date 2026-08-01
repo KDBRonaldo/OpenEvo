@@ -43,6 +43,12 @@ from openevo.backend.contracts.v2.models import (
 )
 from openevo.backend.run_control import CoreTaskControlError
 from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
+from openevo.backend.service_supervisor import (
+    ServiceComponent,
+    ServiceStatus,
+    SupervisorLogEntry,
+    SupervisorServiceSummary,
+)
 from openevo.backend.science_successor import (
     ScienceSuccessorCleanupContextV2,
     ScienceSuccessorCleanupReceiptV2,
@@ -426,14 +432,176 @@ def test_authority_drift_and_unfinished_features_fail_closed(
     assert runtime.owner.ownership_counts() == (0, 0, 0)
 
     for path in (
-        "/v2/tasks/missing/logs",
         "/v2/tasks/missing/artifacts",
-        "/v2/services/daemon/logs",
     ):
         unavailable = runtime.client.get(path, headers=runtime.headers)
         assert unavailable.status_code == 503
         assert unavailable.json()["code"] == "feature_not_ready"
         assert "missing" not in unavailable.json()["message"]
+
+
+def test_task_and_daemon_logs_are_bounded_authoritative_pages(
+    runtime: _Runtime,
+) -> None:
+    missing = runtime.client.get("/v2/tasks/missing/logs", headers=runtime.headers)
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "task_not_found"
+
+    daemon = runtime.client.get(
+        "/v2/services/daemon/logs",
+        headers=runtime.headers,
+        params={"limit": 1},
+    )
+    assert daemon.status_code == 200
+    assert daemon.json() == {
+        "schema_version": "2",
+        "items": [
+            {
+                "sequence": 1,
+                "occurred_at": runtime.provider._started_at,
+                "stream": "system",
+                "message": "OpenEvo Daemon Core Control v2 is ready.",
+            }
+        ],
+        "next_cursor": None,
+        "has_more": False,
+    }
+
+    admitted = runtime.client.post(
+        "/v2/tasks",
+        headers={**runtime.headers, "Idempotency-Key": "task-logs-submit"},
+        json=_request(runtime.authority).model_dump(mode="json"),
+    ).json()
+    first = runtime.client.get(
+        f"/v2/tasks/{admitted['task_id']}/logs",
+        headers=runtime.headers,
+        params={"limit": 1},
+    )
+    assert first.status_code == 200
+    assert first.json()["items"][0]["message"] == "Task admitted by Core."
+    assert first.json()["has_more"] is True
+    cursor = first.json()["next_cursor"]
+    assert cursor is not None
+    second = runtime.client.get(
+        f"/v2/tasks/{admitted['task_id']}/logs",
+        headers=runtime.headers,
+        params={"limit": 100, "after": cursor},
+    )
+    assert second.status_code == 200
+    assert [item["sequence"] for item in second.json()["items"]] == list(
+        range(2, len(second.json()["items"]) + 2)
+    )
+    assert any("Attempt 1" in item["message"] for item in second.json()["items"])
+
+    wrong_cursor = runtime.client.get(
+        "/v2/services/daemon/logs",
+        headers=runtime.headers,
+        params={"after": cursor},
+    )
+    assert wrong_cursor.status_code == 400
+    assert wrong_cursor.json()["code"] == "cursor_invalid"
+
+
+class _ServiceLogAuthority:
+    def __init__(self) -> None:
+        self.summary = SupervisorServiceSummary(
+            id="gateway",
+            display_name="Gateway",
+            component=ServiceComponent.GATEWAY,
+            status=ServiceStatus.RUNNING,
+            restartable=True,
+            status_message=None,
+            error_code=None,
+            updated_at="2026-07-23T02:00:00Z",
+            observed_at="2026-07-23T02:00:01Z",
+            identity_digest="a" * 64,
+            pid=123,
+            port=43119,
+            etag=f'\"{"b" * 64}\"',
+        )
+        self.entries = (
+            SupervisorLogEntry(
+                id="gateway-log-1",
+                sequence=1,
+                occurred_at="2026-07-23T02:00:00Z",
+                level="info",
+                message="Gateway process started.",
+                service_id="gateway",
+                content_sha256=hashlib.sha256(b"Gateway process started.").hexdigest(),
+            ),
+            SupervisorLogEntry(
+                id="gateway-log-2",
+                sequence=2,
+                occurred_at="2026-07-23T02:00:01Z",
+                level="error",
+                message="Gateway health probe is retrying.",
+                service_id="gateway",
+                content_sha256=hashlib.sha256(
+                    b"Gateway health probe is retrying."
+                ).hexdigest(),
+            ),
+        )
+
+    def list(self) -> tuple[SupervisorServiceSummary, ...]:
+        return (self.summary,)
+
+    def logs(
+        self,
+        service_id: str,
+        *,
+        after_sequence: int = 0,
+        limit: int = 100,
+    ) -> tuple[SupervisorLogEntry, ...]:
+        assert service_id == "gateway"
+        return tuple(entry for entry in self.entries if entry.sequence > after_sequence)[:limit]
+
+
+def test_provider_projects_supervisor_services_and_actual_logs(tmp_path: Path) -> None:
+    owner = CoreScienceTaskOwnerV2(state_root=tmp_path / "owner", clock=_Clock())
+    store = CoreControlStoreV2(tmp_path / "catalog")
+    registry = verified_builtin_registry(tmp_path / "registry")
+    provider = CoreControlProviderV2(
+        store,
+        task_owner=owner,
+        executable_registry=registry,
+        service_authority=_ServiceLogAuthority(),
+        bearer_token=_TOKEN,
+        release_version="0.1.10",
+        source_commit="1" * 40,
+        build_channel="test",
+        runtime_contract_sha256=_RUNTIME_CONTRACT_SHA256,
+        clock=_Clock(),
+    )
+    client = TestClient(create_core_control_v2_contract_app(provider))
+    headers = {"Authorization": f"Bearer {_TOKEN}"}
+    try:
+        services = client.get("/v2/services", headers=headers)
+        assert services.status_code == 200
+        assert [(item["service_id"], item["kind"], item["status"]) for item in services.json()["items"]] == [
+            ("daemon", "daemon", "ready"),
+            ("gateway", "gateway", "ready"),
+        ]
+
+        first = client.get(
+            "/v2/services/gateway/logs",
+            headers=headers,
+            params={"limit": 1},
+        )
+        assert first.status_code == 200
+        assert first.json()["items"][0]["stream"] == "stdout"
+        assert first.json()["items"][0]["message"] == "Gateway process started."
+        assert first.json()["has_more"] is True
+        second = client.get(
+            "/v2/services/gateway/logs",
+            headers=headers,
+            params={"limit": 1, "after": first.json()["next_cursor"]},
+        )
+        assert second.status_code == 200
+        assert second.json()["items"][0]["stream"] == "stderr"
+        assert second.json()["items"][0]["sequence"] == 2
+    finally:
+        client.close()
+        provider.close()
 
 
 def test_event_reconnect_rejects_unknown_cursor_without_fallback(
@@ -832,7 +1000,6 @@ def test_provider_exposes_only_authoritative_services_and_fails_closed_elsewhere
     assert daemon.headers["etag"] == daemon.json()["etag"]
 
     unfinished = (
-        ("GET", "/v2/tasks/unavailable/logs", None),
         ("GET", "/v2/tasks/unavailable/artifacts", None),
         ("GET", "/v2/projects/project-1/artifacts/artifact-1", None),
         (

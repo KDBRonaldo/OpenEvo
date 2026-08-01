@@ -362,6 +362,8 @@ _MAX_V2_EVENT_ROWS = 100_000
 _MAX_V2_EVENTS_PER_TASK = 10_000
 _MAX_V2_RUN_ADMISSIONS = 100_000
 _MAX_V2_RUN_ADMISSIONS_PER_ATTEMPT = 4_096
+_MAX_V2_TASK_LOG_ENTRIES = 10_000
+_MAX_V2_TASK_LOG_TRANSCRIPT_BYTES = 1024 * 1024
 _MAX_V2_SUCCESSOR_ATTEMPTS_PER_TRANSITION = 100
 _MAX_V2_SUCCESSOR_COMMIT_AGGREGATE_BYTES = _MAX_V2_TASKS * _MAX_DOCUMENT_BYTES
 _V2_ACTION_RECEIPT_SCHEMA_TABLES = frozenset(
@@ -4611,6 +4613,124 @@ class ScienceTaskStoreV2:
             _load_v2_task_closure(connection, task_id)
             return _load_and_validate_v2_task_event_history(connection, task_id)
 
+    def list_task_logs(self, task_id: str) -> list[m2.LogEntryV2]:
+        """Project durable Task state and captured transcript into bounded logs."""
+
+        task_id = _v2_resource_id(task_id, label="task")
+        with self._lock, self._reader() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            events = _load_and_validate_v2_task_event_history(connection, task_id)
+            entries: list[tuple[str, str, str]] = [
+                (task.created_at, "system", "Task admitted by Core."),
+            ]
+            transcript_bytes = 0
+            for attempt in task.attempts:
+                entries.append(
+                    (
+                        attempt.created_at,
+                        "system",
+                        f"Attempt {attempt.ordinal} admitted.",
+                    )
+                )
+                record = _load_v2_attempt_execution_optional(
+                    connection,
+                    attempt.attempt_id,
+                )
+                if record is None:
+                    continue
+                entries.append(
+                    (
+                        record.created_at,
+                        "system",
+                        f"Attempt {attempt.ordinal} entered managed preparation.",
+                    )
+                )
+                entries.append(
+                    (
+                        record.updated_at,
+                        "system",
+                        _v2_attempt_log_message(attempt.ordinal, record),
+                    )
+                )
+                if record.state != "captured":
+                    continue
+                result = _load_v2_captured_session_result(
+                    connection,
+                    attempt.attempt_id,
+                )
+                completed_at = (
+                    record.receipt.completed_at
+                    if record.receipt is not None
+                    else record.updated_at
+                )
+                transcript_count = 0
+                for trace in result.trajectory.traces:
+                    for message in trace.response_messages:
+                        rendered = _v2_transcript_log_message(message)
+                        if rendered is None:
+                            continue
+                        encoded = rendered.encode("utf-8")
+                        if (
+                            len(entries) >= _MAX_V2_TASK_LOG_ENTRIES - 2
+                            or transcript_bytes + len(encoded)
+                            > _MAX_V2_TASK_LOG_TRANSCRIPT_BYTES
+                        ):
+                            entries.append(
+                                (
+                                    completed_at,
+                                    "system",
+                                    "Additional transcript output was omitted by the Core log bound.",
+                                )
+                            )
+                            break
+                        entries.append((completed_at, "transcript", rendered))
+                        transcript_bytes += len(encoded)
+                        transcript_count += 1
+                    else:
+                        continue
+                    break
+                if transcript_count == 0:
+                    entries.append(
+                        (
+                            completed_at,
+                            "system",
+                            "The captured transcript contains no displayable response text.",
+                        )
+                    )
+
+            for event in events:
+                message = _v2_task_event_log_message(event)
+                if message is not None:
+                    entries.append((event.occurred_at, "system", message))
+            if task.state != "admitted":
+                entries.append(
+                    (
+                        task.updated_at,
+                        "system",
+                        _v2_task_state_log_message(task.state),
+                    )
+                )
+            if len(entries) > _MAX_V2_TASK_LOG_ENTRIES:
+                entries = entries[: _MAX_V2_TASK_LOG_ENTRIES - 1] + [
+                    (
+                        task.updated_at,
+                        "system",
+                        "Additional Task lifecycle output was omitted by the Core log bound.",
+                    )
+                ]
+            return [
+                m2.LogEntryV2(
+                    sequence=sequence,
+                    occurred_at=occurred_at,
+                    stream=stream,
+                    message=message,
+                )
+                for sequence, (occurred_at, stream, message) in enumerate(
+                    entries,
+                    start=1,
+                )
+            ]
+
     def ownership_counts(self) -> tuple[int, int, int]:
         with self._lock, self._reader() as connection:
             return tuple(
@@ -7370,6 +7490,86 @@ def _load_and_validate_v2_task_event_history(
     elif commit_stage != 0:
         invalid()
     return events
+
+
+def _v2_attempt_log_message(
+    ordinal: int,
+    record: ScienceAttemptExecutionRecordV2,
+) -> str:
+    state = {
+        "preparing": "is preparing the managed runtime",
+        "running": "is running",
+        "cancelling": "is stopping after a cancellation request",
+        "captured": "completed execution and sealed its result",
+        "failed": f"failed ({record.error_code or 'unknown_error'})",
+        "cancelled": "was cancelled",
+    }[record.state]
+    return f"Attempt {ordinal} {state}."
+
+
+def _v2_task_state_log_message(state: m2.TaskStateV2) -> str:
+    return {
+        "admitted": "Task is admitted.",
+        "preparing": "Task is preparing its managed execution.",
+        "running": "Task is running.",
+        "cancelling": "Task cancellation is in progress.",
+        "completed": "Task completed and activated its successor Project Head.",
+        "failed": "Task failed; the predecessor Project Head remains active.",
+        "cancelled": "Task was cancelled; the predecessor Project Head remains active.",
+        "closed": "Task was closed without an accepted result.",
+        "waiting_for_successor": (
+            "Task execution completed; Core is preparing the successor Project Head."
+        ),
+    }[state]
+
+
+def _v2_task_event_log_message(event: m2.EventEnvelopeV2) -> str | None:
+    if isinstance(event, (m2.TaskAdmittedEventV2, m2.AttemptAppendedEventV2)):
+        return None
+    if isinstance(event, m2.DatasetSealedEventV2):
+        return "Captured transcript dataset sealed."
+    if isinstance(event, m2.TransitionChangedEventV2):
+        state = event.state.replace("_", " ")
+        return (
+            f"Successor transition {state} "
+            f"({event.progress_completed}/{event.progress_total})."
+        )
+    if isinstance(event, m2.EvolutionRevisionCommittedEventV2):
+        return "Evolution Revision committed."
+    if isinstance(event, m2.RuntimeContextCommittedEventV2):
+        return "Runtime Context Snapshot committed."
+    if isinstance(event, m2.ProjectHeadActivatedEventV2):
+        return "Successor Project Head activated."
+    raise ScienceTaskStoreV2Error("v2 Task log projection received an unknown event")
+
+
+def _v2_transcript_log_message(message: Mapping[str, object]) -> str | None:
+    if not isinstance(message, Mapping):
+        raise ScienceTaskStoreV2Error("captured transcript message is invalid")
+    role = message.get("role")
+    content = message.get("content")
+    if isinstance(content, str):
+        rendered = content
+    else:
+        try:
+            rendered = json.dumps(
+                content if content is not None else dict(message),
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError) as exc:
+            raise ScienceTaskStoreV2Error(
+                "captured transcript message cannot be rendered"
+            ) from exc
+    rendered = rendered.strip()
+    if not rendered:
+        return None
+    prefix = f"{role}: " if isinstance(role, str) and role else ""
+    encoded = (prefix + rendered).encode("utf-8")[:16_384]
+    value = encoded.decode("utf-8", errors="ignore")
+    return value or None
 
 
 def _v2_event_id(event: BaseModel) -> str:

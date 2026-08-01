@@ -615,12 +615,30 @@ describe("Desktop v2 product renderer", () => {
       tasks: [runningTask],
       transitions: {},
     };
+    const loadTaskLogs = vi.fn(async () => ({
+      schema_version: "2" as const,
+      items: [{
+        sequence: 1,
+        occurred_at: NOW,
+        stream: "system" as const,
+        message: "Daemon started the managed Task attempt.",
+      }],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const provider = {
+      ...providerFixture(runningSnapshot),
+      loadTaskLogs,
+    } satisfies DesktopProductProviderV2;
 
-    root = await render(providerFixture(runningSnapshot));
+    root = await render(provider);
 
     expect(document.body.textContent).toContain("Run science Task");
     expect(document.body.textContent).toContain("Task state: running");
     expect(document.body.textContent).toContain("Working — progress is not measurable for this phase");
+    expect(loadTaskLogs).toHaveBeenCalledWith("task-1", { limit: 100 });
+    expect(document.body.textContent).toContain("Daemon started the managed Task attempt.");
+    expect(document.body.textContent).toContain("Task state");
   });
 
   it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {

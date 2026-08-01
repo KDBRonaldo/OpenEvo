@@ -964,6 +964,14 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return this.observeOperation(dispatched.value);
   }
 
+  async loadTaskLogs(taskId: string, options?: ListRequestOptionsV2) {
+    const id = opaqueIdV2Schema.parse(taskId);
+    if (!this.requireSnapshot().tasks.some((task) => task.task_id === id)) {
+      throw new DesktopContractErrorV2("Task logs reference an unknown active Task");
+    }
+    return this.client.taskLogs(id, options);
+  }
+
   async loadServiceLogs(serviceId: string, options?: ListRequestOptionsV2) {
     const id = opaqueIdV2Schema.parse(serviceId);
     if (!this.requireSnapshot().services.some((service) => service.service_id === id)) {

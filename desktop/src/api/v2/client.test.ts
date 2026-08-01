@@ -288,6 +288,7 @@ describe("Desktop Local API v2 client", () => {
       .mockResolvedValueOnce(jsonResponse(operation))
       .mockResolvedValueOnce(jsonResponse(operation, 202))
       .mockResolvedValueOnce(jsonResponse(logs))
+      .mockResolvedValueOnce(jsonResponse(logs))
       .mockResolvedValueOnce(jsonResponse(operation, 202));
     const client = fixtureClient(fetch);
 
@@ -297,6 +298,7 @@ describe("Desktop Local API v2 client", () => {
       ifMatch: ETAG,
       idempotencyKey: "cancel-core-operation-0001",
     });
+    await client.taskLogs("task-1", { after: "task/cursor" });
     await client.serviceLogs("daemon-service-1", { after: "service/cursor" });
     await client.cleanupCaches({ schema_version: "2", scope: "safe_unreferenced" }, {
       resourceGeneration: 8,
@@ -306,6 +308,7 @@ describe("Desktop Local API v2 client", () => {
     expect(fetch.mock.calls.map(([url]) => String(url))).toEqual([
       "http://127.0.0.1:43117/desktop/v2/core-operations/core-operation-1",
       "http://127.0.0.1:43117/desktop/v2/core-operations/core-operation-1/cancel",
+      "http://127.0.0.1:43117/desktop/v2/tasks/task-1/logs?after=task%2Fcursor",
       "http://127.0.0.1:43117/desktop/v2/services/daemon-service-1/logs?after=service%2Fcursor",
       "http://127.0.0.1:43117/desktop/v2/maintenance/cache-cleanup",
     ]);

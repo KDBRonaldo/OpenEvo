@@ -409,6 +409,12 @@ def test_attempt_progress_and_verified_terminal_capture_are_durable(tmp_path) ->
         )
         assert replay == captured
         assert store.captured_attempt_ids() == [attempt.attempt_id]
+        logs = store.list_task_logs(task.task_id)
+        assert [item.sequence for item in logs] == list(range(1, len(logs) + 1))
+        assert any(
+            item.stream == "transcript" and item.message == "assistant: Done"
+            for item in logs
+        )
     finally:
         store.close()
 
@@ -426,6 +432,7 @@ def test_attempt_progress_and_verified_terminal_capture_are_durable(tmp_path) ->
             )
             == result
         )
+        assert restarted.list_task_logs(task.task_id) == logs
     finally:
         restarted.close()
 

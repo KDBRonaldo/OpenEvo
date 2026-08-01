@@ -17,6 +17,10 @@ const COLLAPSED_LOG_LINES = 6;
 
 export type OperationPanelLogSourceV2 = LifecycleLogEntryV2["source"]
   | "core_event"
+  | "task_system"
+  | "task_stdout"
+  | "task_stderr"
+  | "task_transcript"
   | "service_system"
   | "service_stdout"
   | "service_stderr"
@@ -127,6 +131,7 @@ export function coreOperationPanelModelV2(operation: OperationV2): OperationPane
 export function taskPanelModelV2(
   task: TaskV2,
   timeline: readonly CoreEventEnvelopeV2[],
+  logs: readonly LogEntryV2[] = [],
 ): OperationPanelModelV2 {
   const terminal = ["completed", "closed", "failed", "cancelled"].includes(task.state);
   const status: OperationPanelModelV2["status"] = task.state === "failed"
@@ -152,13 +157,21 @@ export function taskPanelModelV2(
       retryable: true,
       nextAction: "Append a new infrastructure Attempt under the same Task Admission.",
     } : null,
-    logs: coreTimelineLogsV2(timeline),
-    logTitle: "Core timeline",
+    logs: logs.length > 0
+      ? Object.freeze(logs.slice(-200).map((entry) => ({
+          sequence: entry.sequence,
+          occurred_at: entry.occurred_at,
+          source: `task_${entry.stream}` as OperationPanelLogSourceV2,
+          text: entry.message,
+          truncated: false,
+        })))
+      : coreTimelineLogsV2(timeline),
+    logTitle: logs.length > 0 ? "Task and transcript log" : "Core timeline",
     droppedBeforeSequence: 0,
     hasOlderLogs: false,
     hasNewerLogs: false,
     unresolvedMutation: false,
-    emptyLogMessage: "Waiting for an authoritative Core timeline event…",
+    emptyLogMessage: "Waiting for authoritative Task output…",
   });
 }
 
@@ -461,6 +474,10 @@ function sourceLabelV2(source: OperationPanelLogSourceV2): string {
     daemon_stdout: "Daemon output",
     daemon_stderr: "Daemon error",
     core_event: "Core event",
+    task_system: "Task state",
+    task_stdout: "Task output",
+    task_stderr: "Task error",
+    task_transcript: "Transcript",
     service_system: "Service",
     service_stdout: "Service output",
     service_stderr: "Service error",
