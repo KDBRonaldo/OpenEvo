@@ -2870,6 +2870,7 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     assert 'chmod 700 "$ssh_test_root"' in candidate_ssh_step
     assert 'trap \'rm -rf -- "$ssh_test_root"\' EXIT' in candidate_ssh_step
     assert '--basetemp="$ssh_test_root/pytest"' in candidate_ssh_step
+    assert '-m "not legacy_rsync"' in candidate_ssh_step
     assert "scripts/ci/run_desktop_system_ssh_integration.py" in candidate_ssh_step
     assert "--require-complete" in candidate_ssh_step
     assert '--evidence-out "$ssh_test_root/desktop-system-ssh-integration.json"' in (

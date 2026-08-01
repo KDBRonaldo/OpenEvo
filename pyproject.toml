@@ -99,6 +99,7 @@ markers = [
     "unit: fast CPU-only checks",
     "integration: checks that need local services or external programs",
     "gpu: checks that need GPU-backed model serving",
+    "legacy_rsync: legacy explicit-transport checks that require local /usr/bin/rsync",
 ]
 
 [tool.ruff]

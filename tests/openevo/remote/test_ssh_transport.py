@@ -3121,6 +3121,7 @@ def test_agent_proxy_is_closed_when_spawn_fails_or_is_cancelled(
             authority.release()
 
 
+@pytest.mark.legacy_rsync
 def test_rsync_nested_ssh_uses_verified_platform_target_and_inherits_fd(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3201,6 +3202,7 @@ def test_non_frozen_birth_launcher_uses_python_executable(
     assert ssh_module._owned_subprocess_launcher() == sys.executable
 
 
+@pytest.mark.legacy_rsync
 def test_darwin_rsync_nested_ssh_uses_revalidated_fixed_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

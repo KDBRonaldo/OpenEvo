@@ -920,7 +920,10 @@ system-OpenSSH authority intentionally has no rsync follower: Daemon bundle and
 managed-runtime bytes use the owned SSH command's stdin, while legacy
 generic-upload/Core-asset/runtime transfer methods reject before remote
 mutation. A conforming server therefore needs neither remote `rsync` nor Python
-for the v2 installation path. The primary
+for the v2 installation path. The macOS candidate's release-authority gate also
+excludes the separately marked legacy-rsync compatibility cases, so that gate
+does not require a local `/usr/bin/rsync`; those historical transport cases stay
+covered by the general compatibility workflows. The primary
 transport/stage commit is `7b5788a67`; sanitized public failure coverage is
 `1a21c2cb6`.
 

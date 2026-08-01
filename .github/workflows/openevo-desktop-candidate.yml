@@ -259,6 +259,7 @@ jobs:
           trap 'rm -rf -- "$ssh_test_root"' EXIT
           chmod 700 "$ssh_test_root"
           uv run python -m pytest --basetemp="$ssh_test_root/pytest" \
+            -m "not legacy_rsync" \
             tests/deployment/test_remote_home.py \
             tests/openevo/remote/test_system_executables.py \
             tests/openevo/remote/test_host_keys.py \

@@ -62,7 +62,10 @@ def _serve_agent_connections(
     [
         executables.SSH_EXECUTABLE,
         executables.SSH_KEYSCAN_EXECUTABLE,
-        executables.RSYNC_EXECUTABLE,
+        pytest.param(
+            executables.RSYNC_EXECUTABLE,
+            marks=pytest.mark.legacy_rsync,
+        ),
     ],
 )
 def test_fixed_system_executable_holds_verified_root_owned_identity(path: str) -> None:
