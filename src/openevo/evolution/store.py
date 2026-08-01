@@ -1589,6 +1589,154 @@ def _before_legacy_dataset_fchmod(
     del directory_descriptor, dataset_id, name, descriptor
 
 
+def _require_dataset_directory_mode_candidate(
+    entry: os.stat_result,
+    *,
+    label: str,
+) -> int:
+    permissions = stat.S_IMODE(entry.st_mode)
+    if (
+        not stat.S_ISDIR(entry.st_mode)
+        or entry.st_uid != os.geteuid()
+        or permissions & 0o7000
+        or permissions & 0o700 != 0o700
+    ):
+        raise DatasetIntegrityError(f"{label} is not an owned safe directory")
+    return permissions
+
+
+def _before_dataset_directory_fchmod(
+    dataset_root_descriptor: int,
+    dataset_id: str,
+    directory_descriptor: int,
+) -> None:
+    """Private no-op hook for deterministic dataset-directory race tests."""
+
+    del dataset_root_descriptor, dataset_id, directory_descriptor
+
+
+def _open_private_dataset_directory(
+    dataset_root_descriptor: int,
+    *,
+    dataset_id: str,
+    label: str,
+) -> int:
+    path_entry = _entry_stat(dataset_root_descriptor, dataset_id)
+    if path_entry is None:
+        raise DatasetIntegrityError(f"{label} is missing")
+    path_permissions = _require_dataset_directory_mode_candidate(
+        path_entry,
+        label=label,
+    )
+    try:
+        descriptor = os.open(
+            dataset_id,
+            os.O_RDONLY
+            | os.O_CLOEXEC
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | os.O_DIRECTORY,
+            dir_fd=dataset_root_descriptor,
+        )
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{label} could not be opened safely") from exc
+    try:
+        opened = os.fstat(descriptor)
+        opened_permissions = _require_dataset_directory_mode_candidate(
+            opened,
+            label=label,
+        )
+        if (
+            _dataset_file_identity(opened) != _dataset_file_identity(path_entry)
+            or opened_permissions != path_permissions
+        ):
+            raise DatasetIntegrityError(f"{label} changed before it was opened")
+        _require_dataset_file_path_identity(
+            dataset_root_descriptor,
+            dataset_id,
+            opened,
+            label=label,
+        )
+        if opened_permissions != 0o700:
+            _before_dataset_directory_fchmod(
+                dataset_root_descriptor,
+                dataset_id,
+                descriptor,
+            )
+            before_chmod = os.fstat(descriptor)
+            before_permissions = _require_dataset_directory_mode_candidate(
+                before_chmod,
+                label=label,
+            )
+            if (
+                _dataset_file_identity(before_chmod)
+                != _dataset_file_identity(opened)
+                or before_permissions != opened_permissions
+            ):
+                raise DatasetIntegrityError(f"{label} changed before chmod")
+            _require_dataset_file_path_identity(
+                dataset_root_descriptor,
+                dataset_id,
+                before_chmod,
+                label=label,
+            )
+            os.fchmod(descriptor, 0o700)
+            os.fsync(descriptor)
+            migrated = os.fstat(descriptor)
+            if (
+                stat.S_IMODE(migrated.st_mode) != 0o700
+                or _dataset_file_stable_identity(migrated)
+                != _dataset_file_stable_identity(opened)
+            ):
+                raise DatasetIntegrityError(f"{label} changed during migration")
+            _require_dataset_file_path_identity(
+                dataset_root_descriptor,
+                dataset_id,
+                migrated,
+                label=label,
+            )
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _create_private_dataset_directory(
+    dataset_root_descriptor: int,
+    *,
+    dataset_id: str,
+    allow_existing: bool,
+) -> None:
+    label = f"dataset directory {dataset_id!r}"
+    try:
+        os.mkdir(
+            dataset_id,
+            mode=0o700,
+            dir_fd=dataset_root_descriptor,
+        )
+    except FileExistsError as exc:
+        if not allow_existing:
+            raise DatasetIntegrityError(f"{label} already exists") from exc
+    except OSError as exc:
+        raise DatasetIntegrityError(f"{label} could not be created safely") from exc
+    descriptor = _open_private_dataset_directory(
+        dataset_root_descriptor,
+        dataset_id=dataset_id,
+        label=label,
+    )
+    try:
+        os.fsync(descriptor)
+        _require_dataset_file_path_identity(
+            dataset_root_descriptor,
+            dataset_id,
+            os.fstat(descriptor),
+            label=label,
+        )
+        os.fsync(dataset_root_descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def _migrate_legacy_dataset_file_mode(
     directory_descriptor: int,
     *,
@@ -3002,54 +3150,13 @@ class EvolutionStore:
                     f"sealed dataset path is inconsistent: {dataset_id}"
                 )
             directory_label = f"legacy dataset directory {dataset_id!r}"
-            path_entry = _entry_stat(
+            directory_descriptor = _open_private_dataset_directory(
                 dataset_root_descriptor,
-                dataset_id,
+                dataset_id=dataset_id,
+                label=directory_label,
             )
-            if path_entry is None:
-                raise DatasetIntegrityError(
-                    f"{directory_label} is missing"
-                )
-            permissions = stat.S_IMODE(path_entry.st_mode)
-            if (
-                not stat.S_ISDIR(path_entry.st_mode)
-                or path_entry.st_uid != os.geteuid()
-                or permissions & 0o7000
-                or permissions & 0o022
-                or permissions & 0o700 != 0o700
-            ):
-                raise DatasetIntegrityError(
-                    f"{directory_label} is not an owned safe directory"
-                )
-            try:
-                directory_descriptor = os.open(
-                    dataset_id,
-                    os.O_RDONLY
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW
-                    | os.O_NONBLOCK
-                    | os.O_DIRECTORY,
-                    dir_fd=dataset_root_descriptor,
-                )
-            except OSError as exc:
-                raise DatasetIntegrityError(
-                    f"{directory_label} could not be opened safely"
-                ) from exc
             try:
                 opened = os.fstat(directory_descriptor)
-                if (
-                    _dataset_file_identity(opened)
-                    != _dataset_file_identity(path_entry)
-                ):
-                    raise DatasetIntegrityError(
-                        f"{directory_label} changed before it was opened"
-                    )
-                _require_dataset_file_path_identity(
-                    dataset_root_descriptor,
-                    dataset_id,
-                    opened,
-                    label=directory_label,
-                )
                 _migrate_legacy_dataset_file_mode(
                     directory_descriptor,
                     dataset_id=dataset_id,
@@ -10971,15 +11078,23 @@ class EvolutionStore:
         return int(self._dataset_record_for_event_row(row)["trace_count"])
 
     def create_dataset(self, request: DatasetCreateRequest) -> DatasetCreateResponse:
-        with self._locked_dataset_materialization_root():
-            return self._create_dataset_locked(request)
+        with self._locked_dataset_materialization_root() as dataset_root_descriptor:
+            return self._create_dataset_locked(
+                request,
+                dataset_root_descriptor=dataset_root_descriptor,
+            )
 
     def _create_dataset_locked(
         self,
         request: DatasetCreateRequest,
+        *,
+        dataset_root_descriptor: int,
     ) -> DatasetCreateResponse:
         if request.idempotency_key is None:
-            return self._create_dataset_materialization(request)
+            return self._create_dataset_materialization(
+                request,
+                dataset_root_descriptor=dataset_root_descriptor,
+            )
         request_json = _dataset_create_request_json(request)
         request_sha256 = hashlib.sha256(
             request_json.encode("utf-8")
@@ -11048,6 +11163,7 @@ class EvolutionStore:
         response = self._create_dataset_materialization(
             request,
             reserved_dataset_id=dataset_id,
+            dataset_root_descriptor=dataset_root_descriptor,
         )
         response_json = _dataset_create_response_json(response)
         with self.connect() as conn:
@@ -11091,6 +11207,7 @@ class EvolutionStore:
         self,
         request: DatasetCreateRequest,
         *,
+        dataset_root_descriptor: int,
         reserved_dataset_id: str | None = None,
     ) -> DatasetCreateResponse:
         raw_payload = request.model_dump(mode="python")
@@ -11181,12 +11298,15 @@ class EvolutionStore:
                             dataset_id=dataset_id,
                             manifest=manifest,
                             dataset_records=dataset_records,
+                            dataset_root_descriptor=dataset_root_descriptor,
                         )
                     if existing is not None:
                         conn.rollback()
                         continue
-                    if reserved_dataset_id is None and (
-                        manifest_path.exists()
+                    if (
+                        _entry_stat(dataset_root_descriptor, dataset_id)
+                        is not None
+                        or manifest_path.exists()
                         or records_path.exists()
                         or manifest_path.with_name(
                             f".{manifest_path.name}.pending"
@@ -11232,6 +11352,9 @@ class EvolutionStore:
 
             try:
                 self._ensure_dataset_materialization_files(
+                    dataset_id=dataset_id,
+                    dataset_root_descriptor=dataset_root_descriptor,
+                    allow_existing_directory=False,
                     manifest_path=manifest_path,
                     manifest=manifest,
                     dataset_records=dataset_records,
@@ -11281,10 +11404,18 @@ class EvolutionStore:
     def _ensure_dataset_materialization_files(
         self,
         *,
+        dataset_id: str,
+        dataset_root_descriptor: int,
+        allow_existing_directory: bool,
         manifest_path: Path,
         manifest: dict[str, Any],
         dataset_records: list[dict[str, Any]],
     ) -> None:
+        _create_private_dataset_directory(
+            dataset_root_descriptor,
+            dataset_id=dataset_id,
+            allow_existing=allow_existing_directory,
+        )
         budget = _DatasetReadBudget(
             label="dataset materialization publication",
             max_files=2,
@@ -11314,6 +11445,7 @@ class EvolutionStore:
         dataset_id: str,
         manifest: dict[str, Any],
         dataset_records: list[dict[str, Any]],
+        dataset_root_descriptor: int,
     ) -> DatasetCreateResponse:
         with self.connect() as conn:
             row = conn.execute(
@@ -11330,6 +11462,9 @@ class EvolutionStore:
             manifest=manifest,
         )
         self._ensure_dataset_materialization_files(
+            dataset_id=dataset_id,
+            dataset_root_descriptor=dataset_root_descriptor,
+            allow_existing_directory=True,
             manifest_path=Path(str(row["manifest_path"])),
             manifest=manifest,
             dataset_records=dataset_records,

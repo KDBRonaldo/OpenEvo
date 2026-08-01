@@ -1434,6 +1434,76 @@ def test_startup_rejects_group_writable_dataset_without_chmod(tmp_path) -> None:
     assert manifest_path.stat().st_mode & 0o777 == 0o660
 
 
+def test_dataset_publication_makes_directory_private_under_collaborative_umask(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    previous_umask = os.umask(0o002)
+    try:
+        _request_value, dataset_id = _request_with_sealed_dataset(store)
+    finally:
+        os.umask(previous_umask)
+
+    dataset_directory = store.files.dataset_manifest_path(dataset_id).parent
+    assert dataset_directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_startup_tightens_product_created_group_writable_dataset_directory(
+    tmp_path,
+) -> None:
+    store = _store(tmp_path)
+    _request_value, dataset_id = _request_with_sealed_dataset(store)
+    dataset_directory = store.files.dataset_manifest_path(dataset_id).parent
+    dataset_directory.chmod(0o775)
+
+    restarted = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+        registry_snapshot=_snapshot(),
+    )
+    restarted.initialize()
+
+    assert dataset_directory.stat().st_mode & 0o777 == 0o700
+
+
+def test_dataset_directory_mode_migration_rechecks_path_before_chmod(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    store = _store(tmp_path)
+    _request_value, dataset_id = _request_with_sealed_dataset(store)
+    dataset_directory = store.files.dataset_manifest_path(dataset_id).parent
+    moved_directory = dataset_directory.with_name(f"{dataset_id}-before-mode-migration")
+    dataset_directory.chmod(0o775)
+
+    def replace_before_fchmod(
+        dataset_root_descriptor: int,
+        observed_dataset_id: str,
+        directory_descriptor: int,
+    ) -> None:
+        del dataset_root_descriptor, directory_descriptor
+        assert observed_dataset_id == dataset_id
+        dataset_directory.rename(moved_directory)
+        dataset_directory.mkdir(mode=0o775)
+        dataset_directory.chmod(0o775)
+
+    monkeypatch.setattr(
+        store_module,
+        "_before_dataset_directory_fchmod",
+        replace_before_fchmod,
+    )
+    restarted = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+        registry_snapshot=_snapshot(),
+    )
+    with pytest.raises(DatasetIntegrityError, match="changed before chmod"):
+        restarted.initialize()
+
+    assert moved_directory.stat().st_mode & 0o777 == 0o775
+    assert dataset_directory.stat().st_mode & 0o777 == 0o775
+
+
 def test_legacy_dataset_mode_migration_rechecks_path_before_chmod(
     tmp_path,
     monkeypatch,
