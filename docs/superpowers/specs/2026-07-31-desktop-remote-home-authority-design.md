@@ -1,6 +1,6 @@
 # OpenEvo Desktop Remote System-Home Authority Design
 
-Status: approved in design discussion; awaiting written-spec review
+Status: approved 2026-08-01
 
 Date: 2026-07-31
 

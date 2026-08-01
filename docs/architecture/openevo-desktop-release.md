@@ -867,6 +867,50 @@ successor mapping generation. It does not call project creation again. Thus an
 upgrade preserves the Core project identity while replacing historical
 observation evidence; all new writes remain current-release-only.
 
+### 0.1.10 verified remote-home source fix
+
+A source-bound Mac-to-Linux release E2E authenticated the selected literal alias
+successfully, then reproduced a pre-Daemon failure: the effective account's NSS
+home was a valid writable custom path, while the deployment transport derived
+`/home/<user>/.openevo/daemon-bundles` from the username. The resulting
+permission failure showed that successful system-OpenSSH authentication alone
+did not yet bind the workspace and Daemon roots to the account OpenSSH actually
+selected.
+
+The source fix keeps `/usr/bin/ssh <alias>` as final connection authority and
+adds a private, generation-bound NSS-home authority. Workspace and Daemon roots
+use fixed suffixes beneath that verified home; rich shell commands and Daemon
+staging independently revalidate the effective account/home, while the raw
+`ssh -W` Core tunnel remains non-shell. The v2 path cannot fall back to the
+legacy username convention. Failure is projected only as
+`ssh_remote_account_unavailable`; account, UID, NSS record, home, command, and
+absolute SSH/Daemon log paths stay out of public and persisted data.
+
+The principal transport/staging fix is commit `7b5788a67`; the closed public
+failure and privacy regression is commit `1a21c2cb6`. Source verification
+recorded on the Apple Silicon development Mac was:
+
+```text
+env -u SSH_AUTH_SOCK PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH" \
+  uv run pytest -q tests/openevo/remote/test_ssh_transport.py \
+  tests/deployment/test_daemon_bundle_transport.py \
+  tests/openevo/sidecar/test_system_ssh_session.py \
+  tests/openevo/sidecar/test_remote_lifecycle.py
+# 238 passed
+
+env -u SSH_AUTH_SOCK PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH" \
+  uv run pytest -q tests/openevo/sidecar/test_release_local_api_v2.py \
+  tests/openevo/sidecar/test_lifecycle_logs_v2.py
+# 28 passed, 1 third-party deprecation warning
+```
+
+This is source evidence only. Every prior `0.1.10` app, DMG, Daemon Bundle,
+manifest, signature, and remote result predates these commits and is not a
+candidate. A complete source-bound Daemon/Desktop rebuild, installed-DMG check,
+real custom-home remote E2E, evidence signing, tag, and GitHub publication are
+still mandatory. Repository visibility and publication/payment state are
+tracked separately and do not change technical candidate acceptance.
+
 ### 0.1.9 system OpenSSH composition
 
 The 0.1.9 release profile stores a literal configured alias and uses

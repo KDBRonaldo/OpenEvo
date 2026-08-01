@@ -320,19 +320,19 @@ git push origin HEAD:stable
 - Modify: `docs/architecture/openevo-desktop-release.md`
 - Modify: `docs/maintainer/macos-desktop-development-handoff.md`
 
-- [ ] **Step 1: Mark the design approved**
+- [x] **Step 1: Mark the design approved**
 
 Set its status to `approved 2026-08-01`; do not claim implementation/release completion there.
 
-- [ ] **Step 2: Document the implemented boundary**
+- [x] **Step 2: Document the implemented boundary**
 
 Cover literal alias/system OpenSSH final authority, private generation-bound NSS discovery, safe writable custom homes and fixed suffixes, no public/persisted/logged path, guarded rich commands, independent Daemon-stage validation, raw `ssh -W` tunnel distinction, no v2 username fallback, and the stable failure.
 
-- [ ] **Step 3: Update release/handoff evidence conservatively**
+- [x] **Step 3: Update release/handoff evidence conservatively**
 
 Record the reproduced real-E2E defect, fix commit, exact verification commands/results, and mandatory full source-bound rebuild. Keep GitHub publication/payment state separate; never describe an unproven candidate as released.
 
-- [ ] **Step 4: Check docs for drift**
+- [x] **Step 4: Check docs for drift**
 
 ```bash
 rg -n '/home/<user>|id -un|workspace_root|remote home|ssh_remote_account_unavailable' \
@@ -341,7 +341,7 @@ rg -n 'OPENEVOLVE_|/openevolve/|openevolve\.' \
   docs/architecture desktop/sidecar/README.md docs/maintainer/macos-desktop-development-handoff.md
 ```
 
-- [ ] **Step 5: Commit and push**
+- [x] **Step 5: Commit and push**
 
 ```bash
 git add -f docs/superpowers/specs/2026-07-31-desktop-remote-home-authority-design.md

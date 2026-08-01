@@ -1,9 +1,9 @@
 # macOS Desktop Development Handoff
 
-Status: completed `0.1.9` startup handoff; `0.1.10` lifecycle-recovery release
-validation in progress
+Status: completed `0.1.9` startup handoff; `0.1.10` source remediation and
+release validation in progress
 
-Last updated: 2026-07-27
+Last updated: 2026-08-01
 
 This document transfers Desktop development from the Linux/GPU development
 container to a real Apple Silicon Mac. It is an implementation handoff, not a
@@ -40,6 +40,13 @@ creating the remote project, and a retry used a new mutation identity. The
 implemented long-running workflow must expose durable authority, progress,
 logs, restart recovery, cancellation where safe, and exact idempotent retry.
 Section 11.3 records that release target and its acceptance boundary.
+
+The first source-bound `0.1.10` remote E2E then exposed a second independent
+defect after successful alias authentication: Daemon staging assumed
+`/home/<user>` although the selected account had a valid custom NSS home. The
+source now binds workspace and Daemon roots to a private generation-bound NSS
+home authority. That fix also requires a full replacement build and a repeated
+installed-app remote run; no artifact built before it is a release candidate.
 
 Do not change the implementation or behavior of any evolution algorithm while
 repairing Desktop packaging, startup, diagnostics, or remote control.
@@ -86,11 +93,11 @@ Use that command for developer-only diagnostics and for confirming that the Mac
 can reach the test host. It is not an instruction for ordinary users to operate
 the Daemon manually.
 
-The 0.1.8 Desktop transport deliberately invokes OpenSSH with `-F /dev/null`
-and explicit trust/authentication options, so it cannot load `Host evolab` from
-the user's configuration. That historical behavior is not an acceptance
-workaround. The 0.1.9 path must present the configured-host catalog and let the
-user select the `evolab` alias directly.
+The 0.1.8 Desktop transport deliberately invoked OpenSSH with `-F /dev/null`
+and explicit trust/authentication options, so it could not load `Host evolab`
+from the user's configuration. That historical behavior is not an acceptance
+workaround. The 0.1.9 configured-host path replaced it, and 0.1.10 must continue
+to present the catalog and let the user select the `evolab` alias directly.
 
 For developer-only diagnosis, inspect the alias without printing identity-file
 contents:
@@ -108,6 +115,15 @@ entry. Do not transcribe the resolved hostname, user, port, identity path,
 ProxyJump, or ProxyCommand into Desktop. The real `/usr/bin/ssh evolab`
 invocation remains authoritative for all of those values and for the user's
 agent/Keychain and known-host policy.
+
+After authentication, Desktop privately binds `id -un`, `id -u`, and the single
+matching `getent passwd <uid>` record. It accepts `/root`, `/home/<user>`, or a
+safe writable custom absolute home, then derives only the fixed
+`.openevo/workspaces` and `.openevo/daemon-bundles` suffixes. The home and
+derived paths are process-local authority: do not add them to a profile, Local
+API payload, evidence record, screenshot, or log. A mismatch must surface only
+as `ssh_remote_account_unavailable`; do not work around it by typing a username,
+setting `$HOME`, or creating the incorrectly inferred `/home/<user>` directory.
 
 Desktop mediates any first-host, encrypted-key passphrase, or password prompt
 through the sealed native askpass surface. It does not copy a key, password, or
@@ -129,10 +145,11 @@ As of this handoff, the remote container has the required first-release profile:
   permitted by the canonical `docker_user_container_v1` boundary; this does not
   permit bare-host root SSH or additional privilege elevation;
 - a working Docker CLI and mounted Docker Engine socket;
+- `getent` for exact NSS account lookup;
 - Codex installed and an existing subscription authentication file under the
   remote account;
 - a writable remote home with sufficient free space for the current smoke; and
-- retained `$HOME/.openevo` releases, state, and artifacts from earlier tests.
+- retained `<nss-home>/.openevo` releases, state, and artifacts from earlier tests.
 
 Treat those as facts to re-check, not permanent assumptions. Safe maintainer
 preflight from the Mac is:
@@ -140,13 +157,31 @@ preflight from the Mac is:
 ```bash
 ssh evolab '
   set -eu
+  set -f
+  account_user=$(id -un)
+  account_uid=$(id -u)
+  account_record=$(getent passwd "$account_uid")
+  test "$(printf "%s\n" "$account_record" | wc -l)" -eq 1
+  old_ifs=$IFS
+  IFS=:
+  set -- $account_record
+  IFS=$old_ifs
+  test "$#" -eq 7
+  test "$1" = "$account_user"
+  test "$3" = "$account_uid"
+  account_home=$6
+  test -d "$account_home"
+  test -w "$account_home"
+  physical_home=$(CDPATH=; cd -P "$account_home"; pwd -P)
+  test "$physical_home" = "$account_home"
+  test "$(stat -c %u -- "$account_home")" = "$account_uid"
   uname -srm
   command -v codex >/dev/null
-  test -f "$HOME/.codex/auth.json"
+  test -f "$account_home/.codex/auth.json"
   command -v docker >/dev/null
   test -S /var/run/docker.sock
   docker version --format "client={{.Client.Version}} server={{.Server.Version}}"
-  df -Pk "$HOME" | tail -1
+  df -Pk "$account_home" | tail -1
 '
 ```
 
@@ -158,8 +193,8 @@ record. Keep `high` reasoning effort.
 The existing checkout in the remote container is a development workspace, not
 a Daemon installation input. Desktop must transfer and activate its own exact
 release-matched Daemon Bundle. Do not point Desktop at the remote Git checkout,
-start the Daemon from that checkout, or pre-clean `$HOME/.openevo`; retained
-state is valuable upgrade and reconnect coverage.
+start the Daemon from that checkout, or pre-clean the NSS home's `.openevo`
+directory; retained state is valuable upgrade and reconnect coverage.
 
 For the end-to-end acceptance:
 
@@ -874,6 +909,39 @@ restarts, diagnostics, and maintenance operations retain Core authority and are
 rendered by the same long-operation panel without a Desktop shadow operation.
 Fast bounded CRUD and SSH-catalog parsing remain synchronous.
 
+The first source-bound remote run after the lifecycle work authenticated the
+literal `evolab` alias but failed before Daemon compatibility because the
+transport inferred `/home/<user>` instead of using the effective account's
+custom NSS home. The implemented source boundary now performs private
+generation-bound `id`/`getent` discovery, derives both fixed OpenEvo roots from
+that authority, guards rich commands, independently validates Daemon staging,
+leaves raw `ssh -W` non-shell, and has no v2 username fallback. The primary
+transport/stage commit is `7b5788a67`; sanitized public failure coverage is
+`1a21c2cb6`.
+
+The following source checks are complete on the target Mac:
+
+```text
+env -u SSH_AUTH_SOCK PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH" \
+  uv run pytest -q tests/openevo/remote/test_ssh_transport.py \
+  tests/deployment/test_daemon_bundle_transport.py \
+  tests/openevo/sidecar/test_system_ssh_session.py \
+  tests/openevo/sidecar/test_remote_lifecycle.py
+# 238 passed
+
+env -u SSH_AUTH_SOCK PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH" \
+  uv run pytest -q tests/openevo/sidecar/test_release_local_api_v2.py \
+  tests/openevo/sidecar/test_lifecycle_logs_v2.py
+# 28 passed, 1 third-party deprecation warning
+```
+
+These results do not validate an app artifact. Discard every earlier local
+`0.1.10` app/DMG/Daemon bundle as a candidate and rebuild all source-bound
+artifacts before repeating installed-app E2E against the custom-home account.
+Only after that run may maintainers fill candidate identities, sign evidence,
+tag, or publish. GitHub repository visibility and any publication/payment state
+remain separate from these technical gates.
+
 Release acceptance must prove all of the following against the exact downloaded
 candidate installed in `/Applications`:
 
@@ -881,6 +949,9 @@ candidate installed in `/Applications`:
   profiles or projects;
 - retained `0.1.9` Core bridge mappings recover read-only, then advance exactly
   once under live `0.1.10` authority without another Core project create;
+- the selected literal alias privately validates the exact effective NSS home,
+  including the custom-home case, while no home or derived path appears in Local
+  API data, persisted state, logs, screenshots, diagnostics, or evidence;
 - the project-create reservation is returned in less than 15 seconds while the
   terminal operation lasts more than 15 seconds;
 - at least two ordered real phases and actual sanitized SSH/Daemon stdout or
