@@ -824,12 +824,18 @@ class SystemOpenSshSession:
             if callable(configure):
                 configure(observer)
 
-    def start(self) -> SystemOpenSshSessionSnapshot:
+    def start(
+        self,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> SystemOpenSshSessionSnapshot:
+        _validate_session_cancellation_event(cancel_event)
         with self._guard:
             if self._started or self._closed:
                 raise _session_error("ssh_session_state_invalid", "SSH session cannot be started.")
             self._started = True
         try:
+            _raise_if_session_cancelled(cancel_event)
             runtime = _PrivateRuntimeDirectory.create(self._runtime_parent)
             self._runtime = runtime
             control_path = runtime.path / _CONTROL_SOCKET_NAME
@@ -864,16 +870,21 @@ class SystemOpenSshSession:
             )
             self._process = process
             deadline = time.monotonic() + self._startup_timeout
-            owner = self._await_owner_identity(process, deadline=deadline)
+            owner = self._await_owner_identity(
+                process,
+                deadline=deadline,
+                cancel_event=cancel_event,
+            )
             self._owner_identity = owner
             broker.bind_owner(capability, owner)
             control_identity = self._await_control_socket(
                 process,
                 control_path=control_path,
                 deadline=deadline,
+                cancel_event=cancel_event,
             )
             self._control_identity = control_identity
-            self._check_master(deadline=deadline)
+            self._check_master(deadline=deadline, cancel_event=cancel_event)
             snapshot = SystemOpenSshSessionSnapshot(
                 profile_id=self._profile.profile_id,
                 ssh_host_alias=self._profile.ssh_host_alias,
@@ -941,10 +952,13 @@ class SystemOpenSshSession:
         self,
         *,
         timeout_seconds: float = 30.0,
+        cancel_event: threading.Event | None = None,
     ) -> RemoteHomeAuthority:
         """Privately bind the effective remote NSS account to this master."""
 
+        _validate_session_cancellation_event(cancel_event)
         try:
+            _raise_if_session_cancelled(cancel_event)
             snapshot = self.snapshot()
             command = build_remote_home_probe_command()
             completed = self._run_session_subprocess(
@@ -953,7 +967,9 @@ class SystemOpenSshSession:
                 timeout_seconds,
                 observe_output=False,
                 max_capture_bytes=REMOTE_HOME_PROBE_OUTPUT_LIMIT,
+                cancel_event=cancel_event,
             )
+            _raise_if_session_cancelled(cancel_event)
             if self.snapshot() != snapshot:
                 raise ValueError("SSH session binding changed during account discovery")
             return parse_remote_home_probe(
@@ -963,6 +979,13 @@ class SystemOpenSshSession:
                 stdout=completed.stdout,
                 stderr=completed.stderr,
             )
+        except SystemOpenSshSessionError as exc:
+            if exc.code == "ssh_connection_cancelled":
+                raise
+            raise _session_error(
+                "ssh_remote_account_unavailable",
+                "The remote SSH account could not be verified.",
+            ) from None
         except Exception:
             raise _session_error(
                 "ssh_remote_account_unavailable",
@@ -1105,6 +1128,7 @@ class SystemOpenSshSession:
         process: OwnedSshMasterProcess,
         *,
         deadline: float,
+        cancel_event: threading.Event | None,
     ) -> ProcessIdentity:
         while time.monotonic() < deadline:
             if process.poll() is not None:
@@ -1120,6 +1144,14 @@ class SystemOpenSshSession:
                         "ssh_process_identity_changed",
                         "System OpenSSH master has an invalid process authority.",
                     )
+                if cancel_event is not None and cancel_event.is_set():
+                    # Bind the exact child before cancellation cleanup is
+                    # allowed to signal it.
+                    self._owner_identity = identity
+                    raise _session_error(
+                        "ssh_connection_cancelled",
+                        "SSH connection was cancelled.",
+                    )
                 return identity
             time.sleep(_STARTUP_POLL_SECONDS)
         raise _session_error(
@@ -1132,8 +1164,10 @@ class SystemOpenSshSession:
         *,
         control_path: Path,
         deadline: float,
+        cancel_event: threading.Event | None,
     ) -> _SocketIdentity:
         while time.monotonic() < deadline:
+            _raise_if_session_cancelled(cancel_event)
             if process.poll() is not None:
                 raise self._master_exit_error(process, during_startup=True)
             try:
@@ -1151,7 +1185,12 @@ class SystemOpenSshSession:
             "ssh_startup_timeout", "SSH control socket did not start before its deadline."
         )
 
-    def _check_master(self, *, deadline: float) -> None:
+    def _check_master(
+        self,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None,
+    ) -> None:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise _session_error(
@@ -1168,6 +1207,7 @@ class SystemOpenSshSession:
             ),
             self._base_environment(),
             remaining,
+            cancel_event=cancel_event,
         )
         if completed.returncode != 0:
             raise _session_error(
@@ -1188,17 +1228,31 @@ class SystemOpenSshSession:
         *,
         observe_output: bool = True,
         max_capture_bytes: int = _MAX_CAPTURE_BYTES,
+        cancel_event: threading.Event | None = None,
     ) -> subprocess.CompletedProcess[bytes]:
         _validate_capture_limit(max_capture_bytes)
+        _validate_session_cancellation_event(cancel_event)
+        _raise_if_session_cancelled(cancel_event)
         if self._uses_default_runner:
+            output_observer = self._output_observer if observe_output else None
+            if cancel_event is None:
+                return _run_bounded_subprocess(
+                    argv,
+                    environment,
+                    timeout_seconds,
+                    output_observer=output_observer,
+                    max_capture_bytes=max_capture_bytes,
+                )
             return _run_bounded_subprocess(
                 argv,
                 environment,
                 timeout_seconds,
-                output_observer=self._output_observer if observe_output else None,
+                output_observer=output_observer,
                 max_capture_bytes=max_capture_bytes,
+                cancel_event=cancel_event,
             )
         completed = self._runner(argv, environment, timeout_seconds)
+        _raise_if_session_cancelled(cancel_event)
         if type(completed.stdout) is bytes and type(completed.stderr) is bytes:
             if len(completed.stdout) + len(completed.stderr) > max_capture_bytes:
                 raise _session_error(
@@ -1366,7 +1420,9 @@ class SystemOpenSshSessionOwner:
         connection_generation: int,
         prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
         output_observer: LifecycleRawOutputObserverV2 | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> SystemOpenSshSessionSnapshot:
+        _validate_session_cancellation_event(cancel_event)
         with self._guard:
             if self._closed:
                 raise _session_error("ssh_session_owner_closed", "SSH session owner is closed.")
@@ -1380,7 +1436,7 @@ class SystemOpenSshSessionOwner:
                         session.set_prompt_observer(prompt_observer)
                     if output_observer is not None:
                         session.set_output_observer(output_observer)
-                    snapshot = session.start()
+                    snapshot = session.start(cancel_event=cancel_event)
                 except BaseException as exc:
                     try:
                         session.close()
@@ -1759,10 +1815,13 @@ def _run_bounded_subprocess(
     *,
     output_observer: LifecycleRawOutputObserverV2 | None = None,
     max_capture_bytes: int = _MAX_CAPTURE_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("SSH subprocess timeout is invalid")
     _validate_capture_limit(max_capture_bytes)
+    _validate_session_cancellation_event(cancel_event)
+    _raise_if_session_cancelled(cancel_event)
     process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
@@ -1778,6 +1837,7 @@ def _run_bounded_subprocess(
         timeout_seconds,
         output_observer=output_observer,
         max_capture_bytes=max_capture_bytes,
+        cancel_event=cancel_event,
     )
 
 
@@ -1825,10 +1885,12 @@ def _collect_bounded_process(
     *,
     output_observer: LifecycleRawOutputObserverV2 | None = None,
     max_capture_bytes: int = _MAX_CAPTURE_BYTES,
+    cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("SSH subprocess timeout is invalid")
     _validate_capture_limit(max_capture_bytes)
+    _validate_session_cancellation_event(cancel_event)
     assert process.stdout is not None and process.stderr is not None
     deadline = time.monotonic() + timeout_seconds
     selector = selectors.DefaultSelector()
@@ -1838,6 +1900,7 @@ def _collect_bounded_process(
     captured = 0
     try:
         while selector.get_map():
+            _raise_if_session_cancelled(cancel_event)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(argv, timeout_seconds)
@@ -1887,6 +1950,21 @@ def _collect_bounded_process(
 def _validate_capture_limit(value: int) -> None:
     if type(value) is not int or not 1 <= value <= _MAX_CAPTURE_BYTES:
         raise ValueError("SSH subprocess capture limit is invalid")
+
+
+def _validate_session_cancellation_event(
+    cancel_event: threading.Event | None,
+) -> None:
+    if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+        raise TypeError("SSH cancellation authority is invalid")
+
+
+def _raise_if_session_cancelled(cancel_event: threading.Event | None) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise _session_error(
+            "ssh_connection_cancelled",
+            "SSH connection was cancelled.",
+        )
 
 
 def _captured_master_stderr(process: OwnedSshMasterProcess) -> bytes:

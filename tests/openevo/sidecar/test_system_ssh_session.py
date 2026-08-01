@@ -14,6 +14,8 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -643,6 +645,57 @@ def test_child_exit_cancellation_and_close_have_bounded_cleanup(
     launcher.close_socket()
 
 
+def test_start_cancellation_stops_a_blackholed_owned_master(
+    short_tmp_path: Path,
+) -> None:
+    session, process, _inspector, launcher, _runner = _session(short_tmp_path)
+    original_spawn = launcher.spawn
+
+    def spawn_without_control_socket(*args: object, **kwargs: object) -> OwnedSshMasterProcess:
+        spawned = original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+        launcher.close_socket()
+        assert launcher.socket_path is not None
+        launcher.socket_path.unlink()
+        return spawned
+
+    launcher.spawn = spawn_without_control_socket  # type: ignore[method-assign]
+    cancel_event = threading.Event()
+    timer = threading.Timer(0.1, cancel_event.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemOpenSshSessionError) as captured:
+            session.start(cancel_event=cancel_event)
+    finally:
+        timer.cancel()
+        launcher.close_socket()
+
+    assert time.monotonic() - started < 1.0
+    assert captured.value.code == "ssh_connection_cancelled"
+    assert process.terminate_calls == 1
+    assert session.closed
+
+
+def test_remote_home_probe_cancellation_terminates_the_follower_promptly() -> None:
+    cancel_event = threading.Event()
+    timer = threading.Timer(0.1, cancel_event.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(SystemOpenSshSessionError) as captured:
+            session_module._run_bounded_subprocess(
+                [sys.executable, "-c", "import time; time.sleep(30)"],
+                {},
+                30.0,
+                cancel_event=cancel_event,
+            )
+    finally:
+        timer.cancel()
+
+    assert time.monotonic() - started < 2.0
+    assert captured.value.code == "ssh_connection_cancelled"
+
+
 def test_close_escalates_to_kill_when_graceful_exit_does_not_reap(
     short_tmp_path: Path,
 ) -> None:
@@ -1243,7 +1296,12 @@ def test_connection_owner_retries_once_after_first_host_acceptance() -> None:
             self.fail = fail
             self.close_calls = 0
 
-        def start(self) -> SystemOpenSshSessionSnapshot:
+        def start(
+            self,
+            *,
+            cancel_event: threading.Event | None = None,
+        ) -> SystemOpenSshSessionSnapshot:
+            assert cancel_event is None
             if self.fail:
                 raise SystemOpenSshSessionError(
                     "ssh_first_host_accepted_reconnect_required",

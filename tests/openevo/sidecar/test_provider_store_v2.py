@@ -1168,6 +1168,65 @@ def test_profile_transition_and_lifecycle_reservation_are_one_transaction(
     store.close()
 
 
+def test_profile_connect_cancellation_atomically_restores_disconnected_state(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    first = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="cancel-profile-create-0001",
+    )
+    queued = store.reserve_lifecycle_operation(
+        _connect_reservation(first),
+        idempotency_key="cancel-profile-connect-0001",
+    )
+
+    cancelled = store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=queued.etag,
+        idempotency_key="cancel-profile-connect-request-0001",
+    )
+
+    assert cancelled.status == "cancelled"
+    queued_profile = store.get_profile(first.profile_id)
+    assert queued_profile.connection_state == "disconnected"
+    assert queued_profile.failure is None
+
+    second = store.create_system_profile(
+        _profile("evolab-second"),
+        catalog_generation=1,
+        idempotency_key="cancel-profile-create-0002",
+    )
+    running = store.reserve_lifecycle_operation(
+        _connect_reservation(second),
+        idempotency_key="cancel-profile-connect-0002",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    assert work.operation.operation_id == running.operation_id
+    requested = store.request_lifecycle_cancellation(
+        running.operation_id,
+        if_match=work.operation.etag,
+        idempotency_key="cancel-profile-connect-request-0002",
+    )
+    terminal = store.finish_lifecycle_operation(
+        store_module.LifecycleOperationCompletionV2(
+            operation_id=requested.operation_id,
+            expected_etag=requested.etag,
+            status="cancelled",
+            result=None,
+            failure=None,
+        )
+    )
+
+    assert terminal.status == "cancelled"
+    running_profile = store.get_profile(second.profile_id)
+    assert running_profile.connection_state == "disconnected"
+    assert running_profile.failure is None
+    store.close()
+
+
 def test_lifecycle_progress_logs_terminal_retry_and_acknowledgement_are_durable(
     tmp_path: Path,
 ) -> None:

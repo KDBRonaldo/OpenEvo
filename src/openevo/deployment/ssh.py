@@ -1456,6 +1456,7 @@ class SshRemoteExecutorTransport:
             except subprocess.TimeoutExpired:
                 raise
             except Exception:
+                _raise_if_cancelled(cancel_event)
                 raise RuntimeError("system OpenSSH follower failed") from None
         assert self._trusted_host is not None
         trust_lease = self._trusted_host.open_for_spawn(self._profile)
@@ -1544,6 +1545,7 @@ class SshRemoteExecutorTransport:
             except subprocess.TimeoutExpired:
                 raise
             except Exception:
+                _raise_if_cancelled(cancel_event)
                 raise RuntimeError("system OpenSSH follower failed") from None
         assert self._trusted_host is not None
         trust_lease = self._trusted_host.open_for_spawn(self._profile)

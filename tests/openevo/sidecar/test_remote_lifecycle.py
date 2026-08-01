@@ -566,6 +566,7 @@ class _SystemSession:
         self.discovery_error = discovery_error
         self.commands: list[str] = []
         self.discoveries: list[float] = []
+        self.discovery_cancel_events: list[Event | None] = []
         self.authorities: list[RemoteHomeAuthority] = []
 
     def snapshot(self) -> object:
@@ -584,8 +585,10 @@ class _SystemSession:
         self,
         *,
         timeout_seconds: float = 30.0,
+        cancel_event: Event | None = None,
     ) -> RemoteHomeAuthority:
         self.discoveries.append(timeout_seconds)
+        self.discovery_cancel_events.append(cancel_event)
         if self.discovery_error is not None:
             raise self.discovery_error
         uid = 1001
@@ -612,6 +615,7 @@ class _SystemSessionOwner:
         self.discovery_failures: list[SystemOpenSshSessionError] = []
         self.remote_homes: dict[int, str] = {}
         self.connections: list[tuple[SystemOpenSshAliasProfile, int]] = []
+        self.cancel_events: list[Event | None] = []
         self.sessions: list[_SystemSession] = []
         self.disconnects = 0
         self.prompt_observer: Callable[[AskpassPromptObservation], None] | None = None
@@ -624,8 +628,10 @@ class _SystemSessionOwner:
         connection_generation: int,
         prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
         output_observer: LifecycleRawOutputObserverV2 | None = None,
+        cancel_event: Event | None = None,
     ) -> object:
         self.connections.append((profile, connection_generation))
+        self.cancel_events.append(cancel_event)
         self.prompt_observer = prompt_observer
         self.output_observer = output_observer
         if self.failures:
@@ -732,6 +738,21 @@ def test_v2_lifecycle_uses_literal_alias_and_verified_remote_home_authority() ->
     lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
     assert transport.closed
     assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_forwards_exact_connection_cancellation_authority() -> None:
+    owner = _SystemSessionOwner()
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: _SystemTransport(),
+    )
+    cancel_event = Event()
+
+    lifecycle.connect(_system_profile(), cancel_event=cancel_event)
+
+    assert owner.cancel_events == [cancel_event]
+    assert owner.sessions[0].discovery_cancel_events == [cancel_event]
 
 
 def test_v2_lifecycle_rediscovers_home_for_every_connection_generation() -> None:

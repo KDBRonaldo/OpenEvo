@@ -96,7 +96,12 @@ class _CatalogProviderV2(Protocol):
 
 
 class _RemoteLifecycleV2(Protocol):
-    def connect(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None: ...
+    def connect(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None: ...
 
     def disconnect(self, profile_id: str, connection_generation: int) -> None: ...
 
@@ -104,6 +109,8 @@ class _RemoteLifecycleV2(Protocol):
         self,
         profile: local_v2.RemoteWorkspaceProfileV2,
         request: local_v2.HostKeyReviewRequestV2,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> Literal["connected", "rejected"]: ...
 
     def close(self) -> None: ...
@@ -1175,8 +1182,13 @@ class DesktopReleaseProviderV2:
             started.active_project_id,
         )
         try:
-            self._lifecycle.connect(started)
+            self._lifecycle.connect(
+                started,
+                cancel_event=context.cancellation_event,
+            )
+            context.check_cancelled()
         except SystemOpenSshSessionError as exc:
+            self._propagate_profile_cancellation(context, started)
             review = exc.host_key_review
             if review is not None and exc.code == "ssh_host_key_changed":
                 pending = self._store.publish_profile_host_key_review(
@@ -1194,6 +1206,7 @@ class DesktopReleaseProviderV2:
                 ) from None
             raise self._fail_profile_connect(started, exc.code) from None
         except Exception:
+            self._propagate_profile_cancellation(context, started)
             raise self._fail_profile_connect(started, "ssh_connection_failed") from None
         return self._complete_profile_core_connection(context, started)
 
@@ -1273,16 +1286,22 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
-        context.checkpoint(
-            "waiting_for_user",
-            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=False,
-        )
         try:
-            outcome = self._lifecycle.review_host_key(started, request.request)
+            context.checkpoint(
+                "waiting_for_user",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=False,
+            )
+            outcome = self._lifecycle.review_host_key(
+                started,
+                request.request,
+                cancel_event=context.cancellation_event,
+            )
         except SystemOpenSshSessionError as exc:
+            self._propagate_profile_cancellation(context, started)
             raise self._fail_profile_connect(started, exc.code) from None
         except Exception:
+            self._propagate_profile_cancellation(context, started)
             raise self._fail_profile_connect(
                 started,
                 "ssh_host_key_review_failed",
@@ -1308,12 +1327,12 @@ class DesktopReleaseProviderV2:
         context: LifecycleExecutionContextV2,
         started: local_v2.RemoteWorkspaceProfileV2,
     ) -> local_v2.LifecycleProfileResultV2:
-        context.checkpoint(
-            "remote_preflight",
-            local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=True,
-        )
         try:
+            context.checkpoint(
+                "remote_preflight",
+                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                cancellable=True,
+            )
             remote = self._core_connector.connect_profile(
                 started.profile_id,
                 started.connection_generation,
@@ -1327,6 +1346,7 @@ class DesktopReleaseProviderV2:
             negotiated = self._exact_core_version(remote, started.profile_id)
             self._reactivate_saved_project(started)
         except DesktopReleaseProviderV2Error as exc:
+            self._propagate_profile_cancellation(context, started)
             self._abort_profile_transport(started)
             failed = self._store.fail_profile_connection(
                 started.profile_id,
@@ -1336,8 +1356,10 @@ class DesktopReleaseProviderV2:
             self._publish_profile(failed)
             raise
         except DesktopCoreBridgeErrorV2 as exc:
+            self._propagate_profile_cancellation(context, started)
             raise self._fail_profile_core_connect(started, exc) from None
         except Exception:
+            self._propagate_profile_cancellation(context, started)
             raise self._fail_profile_connect(
                 started,
                 "core_connection_failed",
@@ -2909,6 +2931,16 @@ class DesktopReleaseProviderV2:
             )
         except Exception:
             pass
+
+    def _propagate_profile_cancellation(
+        self,
+        context: LifecycleExecutionContextV2,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+    ) -> None:
+        if not context.cancellation_event.is_set():
+            return
+        self._abort_profile_transport(profile)
+        context.check_cancelled()
 
     def _deactivate_profile_project(
         self,

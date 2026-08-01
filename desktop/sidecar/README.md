@@ -322,14 +322,19 @@ uses the same coordinated snapshot and retains only exact reference/ownership
 matches while removing abandoned picker imports. Core upload consumption remains
 the next integration step.
 
-## Release Local Provider
+## Frozen Local API v1 implementation (0.1.8 historical)
+
+The remainder of this document describes the frozen v0.1.8 Local API v1 and its
+read-only migration inputs. It is not the packaged v0.1.10 composition. The
+active release path is the v2 provider, bridge, lifecycle, and system-OpenSSH
+authority documented above and in `docs/architecture/desktop-core-contract-v2.md`.
 
 The sidecar also owns the renderer-facing Desktop Local API and the process-owned
 connection to remote OpenEvo Core. The canonical public contract is defined once
 in `contracts/v1/app.py`; release implementations must use its provider injection
 point instead of registering another route table.
 
-### Current implementation
+### Historical implementation
 
 `release_app.create_release_desktop_local_api_app()` creates the real Local API v1
 application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`

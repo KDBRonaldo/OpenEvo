@@ -661,6 +661,60 @@ def test_system_openssh_stage_uses_custom_home_root_in_command_and_receipt(
     transport.close()
 
 
+def test_system_openssh_stream_cancellation_remains_a_typed_transport_error(
+    tmp_path: Path,
+) -> None:
+    cancel_event = threading.Event()
+
+    class CancelledSystemOpenSshAuthority(RecordingSystemOpenSshAuthority):
+        def run_argv(
+            self,
+            argv: list[str],
+            timeout_seconds: float,
+            *,
+            stdin_fd: int | None,
+            cancel_event: threading.Event | None,
+            stdout_source: str | None = "ssh_stdout",
+            stderr_source: str | None = "ssh_stderr",
+        ) -> subprocess.CompletedProcess[str]:
+            del argv, timeout_seconds, stdin_fd, stdout_source, stderr_source
+            assert cancel_event is not None
+            cancel_event.set()
+            raise RuntimeError("private follower cancellation")
+
+    authority = CancelledSystemOpenSshAuthority()
+    payload = b"\x7fELF\0cancelled-daemon-bundle"
+    bundle = tmp_path / "openevo-daemon"
+    bundle.write_bytes(payload)
+    manifest_payload = b"{}\n"
+    manifest = tmp_path / "openevo-daemon-bundle.json"
+    manifest.write_bytes(manifest_payload)
+    transport = SshRemoteExecutorTransport(
+        _profile(
+            host="gpu-lab",
+            port=22,
+            user="alice",
+            workspace_root=authority.remote_home_authority.workspace_root,
+        ),
+        system_openssh_authority=authority,
+    )
+
+    with pytest.raises(SshTransportError) as captured:
+        transport.stage_daemon_bundle(
+            bundle_path=str(bundle),
+            bundle_sha256=hashlib.sha256(payload).hexdigest(),
+            bundle_size=len(payload),
+            manifest_path=str(manifest),
+            manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+            manifest_size=len(manifest_payload),
+            cancel_event=cancel_event,
+        )
+
+    assert captured.value.code is SshTransportErrorCode.CANCELLED
+    assert captured.value.__cause__ is None
+    transport.close()
+
+
 def _trusted_binding(
     tmp_path: Path,
     profile: RemoteProfileConfig | None = None,

@@ -1463,6 +1463,11 @@ class DesktopProviderStoreV2:
             timestamp = self._timestamp()
             etag = self._etag("lifecycle_operation", operation_id, version)
             if current.status == "queued":
+                self._cancel_profile_lifecycle_transition(
+                    connection,
+                    row,
+                    timestamp=timestamp,
+                )
                 connection.execute(
                     """
                     UPDATE lifecycle_operations
@@ -1534,6 +1539,12 @@ class DesktopProviderStoreV2:
                 _canonical_json_bytes(validated.failure) if validated.failure is not None else None
             )
             etag = self._etag("lifecycle_operation", current.operation_id, version)
+            if validated.status == "cancelled":
+                self._cancel_profile_lifecycle_transition(
+                    connection,
+                    row,
+                    timestamp=timestamp,
+                )
             connection.execute(
                 """
                 UPDATE lifecycle_operations
@@ -3748,6 +3759,74 @@ class DesktopProviderStoreV2:
         )
         self._update_profile(connection, updated, version=version)
         return updated
+
+    def _cancel_profile_lifecycle_transition(
+        self,
+        connection: sqlite3.Connection,
+        operation_row: sqlite3.Row,
+        *,
+        timestamp: str,
+    ) -> None:
+        request = self._lifecycle_request_from_row(operation_row)
+        if not isinstance(
+            request,
+            (LifecycleProfileConnectRequestV2, LifecycleHostKeyReviewRequestV2),
+        ):
+            return
+        row = self._require_profile_row(connection, request.profile_id)
+        current = self._profile_from_row(row)
+        if not isinstance(current, m.RemoteWorkspaceProfileV2):
+            raise ProviderConflictV2("legacy profile cannot own lifecycle cancellation")
+        if (
+            operation_row["resource_kind"] != "profile"
+            or operation_row["resource_id"] != request.profile_id
+            or current.connection_generation != request.resource_generation + 1
+        ):
+            raise ProviderPreconditionFailedV2(
+                "profile cancellation generation changed"
+            )
+        if current.connection_state == "disconnected":
+            return
+        if current.connection_state not in {
+            "connecting",
+            "prompt_pending",
+            "bootstrapping",
+            "negotiating",
+        }:
+            raise ProviderConflictV2(
+                "profile cannot be cancelled from its current state"
+            )
+        current_version = cast(int, row["resource_version"])
+        if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+            raise ProviderCapacityV2Error("profile resource version is exhausted")
+        version = current_version + 1
+        updated = m.RemoteWorkspaceProfileV2(
+            profile_id=current.profile_id,
+            display_name=current.display_name,
+            ssh_host_alias=current.ssh_host_alias,
+            catalog_generation=current.catalog_generation,
+            connection_generation=current.connection_generation,
+            connection_state="disconnected",
+            prompt=None,
+            trust=m.SshTrustStateV2(
+                connection_generation=current.connection_generation,
+                state="unverified",
+                review_id=None,
+                review_sha256=None,
+                key_fingerprints=[],
+                repair_support="not_needed",
+            ),
+            failure=None,
+            active_project_id=current.active_project_id,
+            core_api_major=None,
+            core_openapi_sha256=None,
+            core_event_schema_sha256=None,
+            core_registry_sha256=None,
+            created_at=current.created_at,
+            updated_at=timestamp,
+            etag=self._etag("profile", current.profile_id, version),
+        )
+        self._update_profile(connection, updated, version=version)
 
     @staticmethod
     def _require_current_host_key_review(

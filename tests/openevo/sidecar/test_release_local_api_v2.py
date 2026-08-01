@@ -117,23 +117,41 @@ class _Lifecycle:
         self.connect_errors: list[Exception] = []
         self.disconnect_errors: list[Exception] = []
         self.review_outcome = "connected"
+        self.review_cancel_events: list[Event | None] = []
         self.prompt_observer = None
         self.prompt_started: Event | None = None
         self.prompt_release: Event | None = None
         self.connect_started: Event | None = None
         self.connect_release: Event | None = None
         self.second_connect_started: Event | None = None
+        self.connect_cancel_events: list[Event | None] = []
+        self.block_connect_until_cancel = False
 
     def set_prompt_observer(self, observer) -> None:
         self.prompt_observer = observer
 
-    def connect(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
+    def connect(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        *,
+        cancel_event: Event | None = None,
+    ) -> None:
         self.calls.append(("connect", profile.ssh_host_alias, profile.connection_generation))
+        self.connect_cancel_events.append(cancel_event)
         connect_count = sum(call[0] == "connect" for call in self.calls)
         if connect_count >= 2 and self.second_connect_started is not None:
             self.second_connect_started.set()
         if self.connect_started is not None and self.connect_release is not None:
             self.connect_started.set()
+            if self.block_connect_until_cancel:
+                if cancel_event is not None:
+                    assert cancel_event.wait(2)
+                    raise SystemOpenSshSessionError(
+                        "ssh_connection_cancelled",
+                        "SSH connection was cancelled.",
+                    )
+                assert self.connect_release.wait(2)
+                return
             assert self.connect_release.wait(2)
         if self.connect_errors:
             raise self.connect_errors.pop(0)
@@ -170,8 +188,11 @@ class _Lifecycle:
         self,
         profile: local_v2.RemoteWorkspaceProfileV2,
         request: local_v2.HostKeyReviewRequestV2,
+        *,
+        cancel_event: Event | None = None,
     ) -> str:
         del request
+        self.review_cancel_events.append(cancel_event)
         self.calls.append(("review", profile.ssh_host_alias, profile.connection_generation))
         if self.review_outcome == "connected":
             self.active = (profile.profile_id, profile.connection_generation)
@@ -570,10 +591,74 @@ def test_profile_connect_cancellation_reaches_remote_install_stream(
         assert connector.connect_cancelled.wait(2)
         terminal = _wait_lifecycle_operation(client, started.json())
         assert terminal["status"] == "cancelled"
+        cancelled_profile = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert cancelled_profile["connection_state"] == "disconnected"
+        assert cancelled_profile["failure"] is None
         assert len(connector.cancel_events) == 1
         assert isinstance(connector.cancel_events[0], Event)
     finally:
         connector.connect_release.set()
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_profile_connect_cancellation_interrupts_initial_system_ssh(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, connector = _provider(tmp_path)
+    lifecycle.connect_started = Event()
+    lifecycle.connect_release = Event()
+    lifecycle.block_connect_until_cancel = True
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "cancel-initial-ssh-connect-profile-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        operation_id = started.json()["operation_id"]
+        assert lifecycle.connect_started.wait(2)
+        current = client.get(
+            f"/desktop/v2/operations/{operation_id}",
+            headers=_headers(),
+        ).json()
+        cancelled = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": current["etag"],
+                    "Idempotency-Key": "cancel-initial-ssh-operation-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert cancelled.status_code == 202, cancelled.text
+        terminal = _wait_lifecycle_operation(client, started.json())
+        assert terminal["status"] == "cancelled"
+        assert len(lifecycle.connect_cancel_events) == 1
+        assert isinstance(lifecycle.connect_cancel_events[0], Event)
+        assert connector.calls == []
+        cancelled_profile = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert cancelled_profile["connection_state"] == "disconnected"
+        assert cancelled_profile["failure"] is None
+    finally:
+        lifecycle.connect_release.set()
         client.close()
         provider.close()
         store.close()
@@ -1471,6 +1556,8 @@ def test_changed_system_host_key_is_reviewed_then_reconnected_exactly(
             ("connect", "gpu-lab", 2),
             ("review", "gpu-lab", 3),
         ]
+        assert len(lifecycle.review_cancel_events) == 1
+        assert isinstance(lifecycle.review_cancel_events[0], Event)
         assert connector.calls == [(profile["profile_id"], 3)]
     finally:
         client.close()

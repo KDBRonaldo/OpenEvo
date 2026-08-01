@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock
 import time
 from typing import Literal, Protocol
 
@@ -478,6 +478,7 @@ class _SystemSessionOwnerV2(Protocol):
         connection_generation: int,
         prompt_observer: Callable[[AskpassPromptObservation], None] | None = None,
         output_observer: LifecycleRawOutputObserverV2 | None = None,
+        cancel_event: Event | None = None,
     ) -> object: ...
 
     def active_session(self) -> SystemOpenSshSession: ...
@@ -614,12 +615,18 @@ class SystemOpenSshRemoteLifecycleV2:
                 )
             self._output_observer = observer
 
-    def connect(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
+    def connect(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        *,
+        cancel_event: Event | None = None,
+    ) -> None:
         self._validate_connect_profile(profile)
+        self._validate_cancel_event(cancel_event)
         with self._transition:
             self._require_open()
             self._close_active()
-            self._connect_locked(profile)
+            self._connect_locked(profile, cancel_event=cancel_event)
 
     def active_transport(
         self,
@@ -658,8 +665,11 @@ class SystemOpenSshRemoteLifecycleV2:
         self,
         profile: local_v2.RemoteWorkspaceProfileV2,
         request: local_v2.HostKeyReviewRequestV2,
+        *,
+        cancel_event: Event | None = None,
     ) -> Literal["connected", "rejected"]:
         self._validate_connect_profile(profile)
+        self._validate_cancel_event(cancel_event)
         if type(request) is not local_v2.HostKeyReviewRequestV2:
             raise TypeError("host-key review request has the wrong type")
         with self._transition:
@@ -673,7 +683,7 @@ class SystemOpenSshRemoteLifecycleV2:
                 return "rejected"
             if pending is None and request.action == "replace_changed_key":
                 try:
-                    self._connect_locked(profile)
+                    self._connect_locked(profile, cancel_event=cancel_event)
                 except SystemOpenSshSessionError as exc:
                     current_review = exc.host_key_review
                     if exc.code != "ssh_host_key_changed" or current_review is None:
@@ -731,7 +741,7 @@ class SystemOpenSshRemoteLifecycleV2:
                     "The SSH host key could not be confirmed."
                 ) from None
             self._pending_reviews.pop(profile.profile_id, None)
-            self._connect_locked(profile)
+            self._connect_locked(profile, cancel_event=cancel_event)
             return "connected"
 
     def close(self) -> None:
@@ -758,7 +768,12 @@ class SystemOpenSshRemoteLifecycleV2:
             if failure is not None:
                 raise failure
 
-    def _connect_locked(self, profile: local_v2.RemoteWorkspaceProfileV2) -> None:
+    def _connect_locked(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        *,
+        cancel_event: Event | None,
+    ) -> None:
         alias = self._alias_profile(profile)
         transport: _RemoteTransport | None = None
         try:
@@ -778,16 +793,19 @@ class SystemOpenSshRemoteLifecycleV2:
                     connection_generation=profile.connection_generation,
                     prompt_observer=observe_prompt if observer is not None else None,
                     output_observer=self._output_observer,
+                    cancel_event=cancel_event,
                 )
             else:
                 self._session_owner.connect(
                     alias,
                     connection_generation=profile.connection_generation,
                     prompt_observer=observe_prompt if observer is not None else None,
+                    cancel_event=cancel_event,
                 )
             session = self._session_owner.active_session()
             authority = session.discover_remote_home_authority(
                 timeout_seconds=self._discovery_timeout_seconds,
+                cancel_event=cancel_event,
             )
             if type(authority) is not RemoteHomeAuthority or not authority.matches(
                 profile_id=profile.profile_id,
@@ -895,6 +913,11 @@ class SystemOpenSshRemoteLifecycleV2:
             "negotiating",
         }:
             raise TypeError("system OpenSSH lifecycle profile is invalid")
+
+    @staticmethod
+    def _validate_cancel_event(cancel_event: Event | None) -> None:
+        if cancel_event is not None and not isinstance(cancel_event, Event):
+            raise TypeError("system OpenSSH lifecycle cancellation authority is invalid")
 
     def _require_open(self) -> None:
         with self._state:

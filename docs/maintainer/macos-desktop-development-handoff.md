@@ -923,11 +923,15 @@ mutation. A conforming server therefore needs neither remote `rsync` nor Python
 for the v2 installation path. The macOS candidate's release-authority gate also
 excludes the separately marked legacy-rsync compatibility cases, so that gate
 does not require a local `/usr/bin/rsync`; those historical transport cases stay
-covered by the general compatibility workflows. Profile connection remains
-cancellable through remote preflight and both asset streams: one lifecycle event
-is forwarded through the release connector and deferred adapter to every safe
-SSH transfer, then the existing `starting_daemon` barrier permanently disables
-cancellation before service replacement or activation. The primary
+covered by the general compatibility workflows. An ordinary profile connection
+remains cancellable from owned SSH-master startup and remote-home discovery
+through remote preflight and both asset streams: one lifecycle event is forwarded
+through the release lifecycle, connector, and deferred adapter to every safe SSH
+operation. The existing `starting_daemon` barrier then permanently disables
+cancellation before service replacement or activation. A changed-host-key action
+instead crosses its durable non-cancellable barrier immediately before mutating
+the user's known-hosts authority; any following reconnect remains recoverable but
+cannot be reported as cancelled after that accepted trust mutation. The primary
 transport/stage commit is `7b5788a67`; sanitized public failure coverage is
 `1a21c2cb6`.
 

@@ -2881,6 +2881,9 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     testing_guide = Path("docs/maintainer/testing.md").read_text(encoding="utf-8")
     assert "streams fixture bytes through the owned SSH command's stdin" in testing_guide
     assert "rsync, control, and `-W` tunnel builders" not in testing_guide
+    sidecar_guide = Path("desktop/sidecar/README.md").read_text(encoding="utf-8")
+    assert "Frozen Local API v1 implementation (0.1.8 historical)" in sidecar_guide
+    assert "### Current implementation" not in sidecar_guide
 
     version_step = text.split(
         "      - name: Resolve exact product version and runner architecture\n",
