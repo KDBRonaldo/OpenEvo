@@ -141,8 +141,8 @@ logger = logging.getLogger(__name__)
 _SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _SUBSCRIPTION_AUTH_MODES = {"subscription", "chatgpt_subscription"}
 _FINALIZATION_BUDGET_SECONDS = 10.0
-_SUBSCRIPTION_STOP_ATTEMPTS = 3
-_SUBSCRIPTION_STOP_RETRY_DELAY_SECONDS = 0.1
+_TERMINAL_STOP_ATTEMPTS = 3
+_TERMINAL_STOP_RETRY_DELAY_SECONDS = 0.1
 _CLEANUP_RETRY_INTERVAL_SECONDS = 1.0
 _CLEANUP_JOURNAL_MAX_BYTES = 16 * 1024 * 1024
 _CLEANUP_JOURNAL_MAX_ROWS = 4096
@@ -548,8 +548,8 @@ class GatewayReadinessError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
-class SubscriptionFinalizationState:
-    """Private redacted authority needed to resume terminal publication."""
+class TerminalFinalizationState:
+    """Private redacted authority needed to resume post-runtime publication."""
 
     request: SessionDispatchRequest
     agent_result: AgentRunResult | None
@@ -642,8 +642,8 @@ class CleanupRetryOwnership:
     epoch_token: str | None = None
     eval_runtime: BaseRuntime | None = None
     managed: ManagedSession | None = None
-    finalize_subscription: bool = False
-    finalization_state: SubscriptionFinalizationState | None = None
+    finalize_terminal: bool = False
+    finalization_state: TerminalFinalizationState | None = None
     delivery_state: TerminalDeliveryState | None = None
 
 
@@ -1917,6 +1917,13 @@ def _is_codex_subscription_agent(agent) -> bool:
     return agent.harness == "codex" and _is_subscription_agent(agent)
 
 
+def _requires_postruntime_terminal_finalization(request: SessionDispatchRequest) -> bool:
+    return (
+        _is_codex_subscription_agent(request.agent)
+        or request.workspace_handoff is not None
+    )
+
+
 def _is_subscription_agent(agent) -> bool:
     auth_mode = agent.settings.get("auth_mode")
     return isinstance(auth_mode, str) and auth_mode in _SUBSCRIPTION_AUTH_MODES
@@ -2056,7 +2063,9 @@ class GatewayNodeManager:
             self._register_cleanup_retry(
                 managed,
                 eval_runtime=eval_runtime or managed.eval_runtime,
-                finalize_subscription=_is_codex_subscription_agent(managed.request.agent),
+                finalize_terminal=_requires_postruntime_terminal_finalization(
+                    managed.request
+                ),
             )
         await self._reconcile_cleanup_retries()
         if self.evolution_client is not None:
@@ -2347,10 +2356,10 @@ class GatewayNodeManager:
 
     async def cancel(self, session_id: str) -> bool:
         def persist_cancel_authority(managed: ManagedSession) -> None:
-            if not _is_codex_subscription_agent(managed.request.agent):
+            if not _requires_postruntime_terminal_finalization(managed.request):
                 return
             try:
-                self._persist_subscription_finalization_authority(
+                self._persist_terminal_finalization_authority(
                     managed,
                     cancel_requested=True,
                 )
@@ -3313,15 +3322,15 @@ class GatewayNodeManager:
         managed: ManagedSession,
         result: AgentRunResult,
     ) -> AgentRunResult:
-        if _is_codex_subscription_agent(managed.request.agent):
-            self._persist_subscription_finalization_authority(
+        if _requires_postruntime_terminal_finalization(managed.request):
+            self._persist_terminal_finalization_authority(
                 managed,
                 agent_result=result,
             )
         managed.agent_result = result
         return result
 
-    def _persist_subscription_finalization_authority(
+    def _persist_terminal_finalization_authority(
         self,
         managed: ManagedSession,
         *,
@@ -3339,14 +3348,14 @@ class GatewayNodeManager:
             ownership = self._cleanup_ownership_for(
                 managed,
                 eval_runtime=managed.eval_runtime,
-                finalize_subscription=True,
+                finalize_terminal=True,
             )
         updated = replace(
             ownership,
             managed=managed,
             phase=_RECOVERY_PHASE_TERMINAL_FINALIZATION,
-            finalize_subscription=True,
-            finalization_state=self._subscription_finalization_state(
+            finalize_terminal=True,
+            finalization_state=self._terminal_finalization_state(
                 managed,
                 agent_result=agent_result,
                 pending_status=pending_status,
@@ -3475,7 +3484,7 @@ class GatewayNodeManager:
         self,
         managed: ManagedSession,
         *,
-        subscription_retry: bool,
+        terminal_retry: bool,
     ) -> tuple[bool, list[BaseException]]:
         """Drain prewarm and attempt every runtime stop despite cancellation."""
 
@@ -3493,9 +3502,9 @@ class GatewayNodeManager:
             (managed.runtime, "runtime"),
         ]
         runtimes_removed = not managed.runtime_cleanup_blocked
-        if subscription_retry:
+        if terminal_retry:
             stopped, stop_errors = await self._await_cleanup_to_completion(
-                self._stop_subscription_runtimes_with_retry(
+                self._stop_terminal_runtimes_with_retry(
                     targets,
                     managed.session_id,
                 )
@@ -3558,8 +3567,11 @@ class GatewayNodeManager:
     # ------------------------------------------------------------------
 
     async def _handle_postrun(self, managed: ManagedSession) -> None:
-        if _is_codex_subscription_agent(managed.request.agent) and managed.runtime is not None:
-            await self._handle_subscription_postrun(managed)
+        if (
+            _requires_postruntime_terminal_finalization(managed.request)
+            and managed.runtime is not None
+        ):
+            await self._handle_terminal_finalization_postrun(managed)
             return
         await self._handle_standard_postrun(managed)
 
@@ -3620,7 +3632,7 @@ class GatewayNodeManager:
                 teardown_errors.append(exc)
             runtimes_removed, stop_errors = await self._drain_and_stop_postrun_runtimes(
                 managed,
-                subscription_retry=False,
+                terminal_retry=False,
             )
             teardown_errors.extend(stop_errors)
             managed.timer.mark("teardown", "finished")
@@ -3665,7 +3677,7 @@ class GatewayNodeManager:
                 request.session_id,
             )
 
-    async def _handle_subscription_postrun(self, managed: ManagedSession) -> None:
+    async def _handle_terminal_finalization_postrun(self, managed: ManagedSession) -> None:
         request = managed.request
         result = managed.final_result
         eval_runtime = managed.eval_runtime
@@ -3681,13 +3693,13 @@ class GatewayNodeManager:
                 except Exception as exc:
                     self._log_credential_safe_exception(
                         managed,
-                        "Subscription evaluation failed",
+                        "Terminal evaluation failed",
                         exc,
                     )
                     result = self._error_result(
                         request,
                         managed.timer,
-                        f"subscription evaluation failed: {exc}",
+                        f"terminal evaluation failed: {exc}",
                     )
                 managed.final_result = result
         finally:
@@ -3696,12 +3708,12 @@ class GatewayNodeManager:
                 self._register_cleanup_retry(
                     managed,
                     eval_runtime=managed.eval_runtime,
-                    finalize_subscription=True,
+                    finalize_terminal=True,
                 )
             finally:
                 runtimes_removed, teardown_errors = await self._drain_and_stop_postrun_runtimes(
                     managed,
-                    subscription_retry=True,
+                    terminal_retry=True,
                 )
                 managed.timer.mark("teardown", "finished")
                 if runtimes_removed:
@@ -3710,16 +3722,16 @@ class GatewayNodeManager:
                     self._register_cleanup_retry(
                         managed,
                         eval_runtime=eval_runtime or managed.eval_runtime,
-                        finalize_subscription=True,
+                        finalize_terminal=True,
                     )
                     logger.error(
-                        "Retaining subscription cleanup ownership because runtime absence "
+                        "Retaining terminal cleanup ownership because runtime absence "
                         "was not proven for session %s",
                         request.session_id,
                     )
                 if teardown_errors:
                     logger.error(
-                        "Subscription teardown retained cleanup retry after %d base error(s) "
+                        "Terminal teardown retained cleanup retry after %d base error(s) "
                         "for session %s",
                         len(teardown_errors),
                         request.session_id,
@@ -3727,15 +3739,15 @@ class GatewayNodeManager:
 
         if not runtimes_removed:
             return
-        await self._finalize_subscription_after_runtime_absence(managed, result=result)
+        await self._finalize_after_runtime_absence(managed, result=result)
 
-    async def _stop_subscription_runtimes_with_retry(
+    async def _stop_terminal_runtimes_with_retry(
         self,
         targets: list[tuple[BaseRuntime | None, str]],
         session_id: str,
     ) -> bool:
         pending = [(runtime, label) for runtime, label in targets if runtime is not None]
-        for attempt in range(_SUBSCRIPTION_STOP_ATTEMPTS):
+        for attempt in range(_TERMINAL_STOP_ATTEMPTS):
             if not pending:
                 return True
             outcomes = await asyncio.gather(
@@ -3750,11 +3762,11 @@ class GatewayNodeManager:
                 for target, outcome in zip(pending, outcomes, strict=True)
                 if outcome is not True
             ]
-            if pending and attempt + 1 < _SUBSCRIPTION_STOP_ATTEMPTS:
-                await asyncio.sleep(_SUBSCRIPTION_STOP_RETRY_DELAY_SECONDS)
+            if pending and attempt + 1 < _TERMINAL_STOP_ATTEMPTS:
+                await asyncio.sleep(_TERMINAL_STOP_RETRY_DELAY_SECONDS)
         return not pending
 
-    async def _finalize_subscription_after_runtime_absence(
+    async def _finalize_after_runtime_absence(
         self,
         managed: ManagedSession,
         *,
@@ -3792,13 +3804,13 @@ class GatewayNodeManager:
         except Exception as exc:
             self._log_credential_safe_exception(
                 managed,
-                "Subscription finalization failed",
+                "Terminal finalization failed",
                 exc,
             )
             result = self._error_result(
                 request,
                 managed.timer,
-                f"subscription finalization failed: {exc}",
+                f"terminal finalization failed: {exc}",
             )
         finally:
             managed.timer.mark("postrun", "finished")
@@ -3819,7 +3831,7 @@ class GatewayNodeManager:
                 managed.final_result = result
                 self._register_cleanup_retry(
                     managed,
-                    finalize_subscription=True,
+                    finalize_terminal=True,
                 )
                 return
 
@@ -4272,10 +4284,10 @@ class GatewayNodeManager:
         status: SessionStatus,
         error: str,
     ) -> None:
-        if _is_codex_subscription_agent(managed.request.agent) and (
+        if _requires_postruntime_terminal_finalization(managed.request) and (
             managed.runtime is not None or managed.credential_dir is not None
         ):
-            self._persist_subscription_finalization_authority(
+            self._persist_terminal_finalization_authority(
                 managed,
                 pending_status=status,
                 pending_error=error,
@@ -4581,7 +4593,7 @@ class GatewayNodeManager:
         managed: ManagedSession,
         *,
         eval_runtime: BaseRuntime | None = None,
-        finalize_subscription: bool = False,
+        finalize_terminal: bool = False,
     ) -> None:
         retries = getattr(self, "_cleanup_retries", None)
         if retries is None:
@@ -4590,7 +4602,7 @@ class GatewayNodeManager:
         ownership = self._cleanup_ownership_for(
             managed,
             eval_runtime=eval_runtime,
-            finalize_subscription=finalize_subscription,
+            finalize_terminal=finalize_terminal,
         )
         previous = retries.get(managed.session_id)
         if previous is not None:
@@ -4601,7 +4613,7 @@ class GatewayNodeManager:
                 ownership.phase = previous.phase
             if ownership.finalization_state is None:
                 ownership.finalization_state = previous.finalization_state
-                ownership.finalize_subscription = previous.finalize_subscription
+                ownership.finalize_terminal = previous.finalize_terminal
                 if previous.finalization_state is not None:
                     ownership.phase = previous.phase
         ownership = self._persist_cleanup_ownership(ownership)
@@ -4642,7 +4654,9 @@ class GatewayNodeManager:
             ownership = self._cleanup_ownership_for(
                 managed,
                 eval_runtime=managed.eval_runtime,
-                finalize_subscription=_is_codex_subscription_agent(managed.request.agent),
+                finalize_terminal=_requires_postruntime_terminal_finalization(
+                    managed.request
+                ),
             )
         finalization_state = ownership.finalization_state
         if finalization_state is not None:
@@ -4792,7 +4806,7 @@ class GatewayNodeManager:
         return value
 
     @classmethod
-    def _subscription_finalization_state(
+    def _terminal_finalization_state(
         cls,
         managed: ManagedSession,
         *,
@@ -4800,7 +4814,7 @@ class GatewayNodeManager:
         pending_status: SessionStatus | None | object = _UNSET,
         pending_error: str | None | object = _UNSET,
         cancel_requested: bool | object = _UNSET,
-    ) -> SubscriptionFinalizationState:
+    ) -> TerminalFinalizationState:
         redactor = managed.credential_redactor
 
         def redacted_model(model, model_type):
@@ -4822,7 +4836,7 @@ class GatewayNodeManager:
         )
         if effective_pending_error is not None and redactor is not None:
             effective_pending_error = redactor.redact(str(effective_pending_error))
-        return SubscriptionFinalizationState(
+        return TerminalFinalizationState(
             request=redacted_model(managed.request, SessionDispatchRequest),
             agent_result=redacted_model(
                 agent_result if agent_result is not None else managed.agent_result,
@@ -4844,11 +4858,11 @@ class GatewayNodeManager:
         managed: ManagedSession,
         *,
         eval_runtime: BaseRuntime | None = None,
-        finalize_subscription: bool = False,
+        finalize_terminal: bool = False,
     ) -> CleanupRetryOwnership:
         runtime = managed.runtime
         finalization_state = (
-            self._subscription_finalization_state(managed) if finalize_subscription else None
+            self._terminal_finalization_state(managed) if finalize_terminal else None
         )
         epoch = managed.cleanup_journal_epoch
         epoch_token = managed.cleanup_journal_epoch_token
@@ -4883,7 +4897,7 @@ class GatewayNodeManager:
             runtime=runtime,
             phase=(
                 _RECOVERY_PHASE_TERMINAL_FINALIZATION
-                if finalize_subscription
+                if finalize_terminal
                 else _RECOVERY_PHASE_RUNTIME_ACTIVE
             ),
             revision=managed.cleanup_journal_revision,
@@ -4892,7 +4906,7 @@ class GatewayNodeManager:
             epoch_token=epoch_token,
             eval_runtime=eval_runtime,
             managed=managed,
-            finalize_subscription=finalize_subscription,
+            finalize_terminal=finalize_terminal,
             finalization_state=finalization_state,
         )
 
@@ -5591,6 +5605,7 @@ class GatewayNodeManager:
                     "auth_identity": list(ownership.credential_auth_identity or ()),
                 }
             ),
+            # Historical journal key retained for version-9 recovery compatibility.
             "subscription_finalization": (
                 None
                 if state is None
@@ -6649,7 +6664,7 @@ class GatewayNodeManager:
                 )
                 or not isinstance(finalization_payload["timer_marks"], dict)
             ):
-                raise ValueError("subscription finalization payload is invalid")
+                raise ValueError("terminal finalization payload is invalid")
             timer_marks = finalization_payload["timer_marks"]
             if any(
                 not isinstance(key, str)
@@ -6658,7 +6673,7 @@ class GatewayNodeManager:
                 or not math.isfinite(float(value))
                 for key, value in timer_marks.items()
             ):
-                raise ValueError("subscription finalization timer is invalid")
+                raise ValueError("terminal finalization timer is invalid")
             pending_status_payload = finalization_payload["pending_status"]
             pending_status = (
                 None if pending_status_payload is None else SessionStatus(pending_status_payload)
@@ -6667,10 +6682,13 @@ class GatewayNodeManager:
                 SessionStatus.ERROR,
                 SessionStatus.TIMEOUT,
             }:
-                raise ValueError("subscription pending status is invalid")
+                raise ValueError("terminal pending status is invalid")
             request = SessionDispatchRequest.model_validate(finalization_payload["request"])
-            if request.session_id != session_id or not _is_codex_subscription_agent(request.agent):
-                raise ValueError("subscription finalization request is invalid")
+            if (
+                request.session_id != session_id
+                or not _requires_postruntime_terminal_finalization(request)
+            ):
+                raise ValueError("terminal finalization request is invalid")
             agent_payload = finalization_payload["agent_result"]
             result_payload = finalization_payload["final_result"]
             agent_result = (
@@ -6680,8 +6698,8 @@ class GatewayNodeManager:
                 None if result_payload is None else SessionResult.model_validate(result_payload)
             )
             if final_result is not None and final_result.session_id != session_id:
-                raise ValueError("subscription terminal result identity is invalid")
-            finalization_state = SubscriptionFinalizationState(
+                raise ValueError("terminal result identity is invalid")
+            finalization_state = TerminalFinalizationState(
                 request=request,
                 agent_result=agent_result,
                 final_result=final_result,
@@ -6833,7 +6851,7 @@ class GatewayNodeManager:
             epoch=epoch,
             epoch_token=epoch_token,
             eval_runtime=None,
-            finalize_subscription=finalization_state is not None,
+            finalize_terminal=finalization_state is not None,
             finalization_state=finalization_state,
             delivery_state=delivery_state,
         )
@@ -7049,24 +7067,34 @@ class GatewayNodeManager:
                         level=logging.WARNING,
                     )
 
-    def _restore_subscription_finalization(
+    def _restore_terminal_finalization(
         self,
         ownership: CleanupRetryOwnership,
     ) -> ManagedSession:
         state = ownership.finalization_state
         if state is None:
-            raise RuntimeError("subscription finalization authority is missing")
-        if (
-            ownership.credential_dir is None
-            or ownership.credential_root_identity is None
-            or ownership.credential_auth_identity is None
-        ):
-            raise RuntimeError("subscription credential authority is missing")
-        redactor = load_staged_codex_subscription_redactor(
-            ownership.credential_dir,
-            ownership.credential_root_identity,
-            ownership.credential_auth_identity,
-        )
+            raise RuntimeError("terminal finalization authority is missing")
+        subscription = _is_codex_subscription_agent(state.request.agent)
+        if subscription:
+            if (
+                ownership.credential_dir is None
+                or ownership.credential_root_identity is None
+                or ownership.credential_auth_identity is None
+            ):
+                raise RuntimeError("subscription credential authority is missing")
+            redactor = load_staged_codex_subscription_redactor(
+                ownership.credential_dir,
+                ownership.credential_root_identity,
+                ownership.credential_auth_identity,
+            )
+        else:
+            if (
+                ownership.credential_dir is not None
+                or ownership.credential_root_identity is not None
+                or ownership.credential_auth_identity is not None
+            ):
+                raise RuntimeError("non-subscription finalization retained credentials")
+            redactor = None
         timer = StageTimer()
         timer._marks = dict(state.timer_marks)
         managed = ManagedSession(
@@ -7081,13 +7109,13 @@ class GatewayNodeManager:
             credential_root_identity=ownership.credential_root_identity,
             credential_auth_identity=ownership.credential_auth_identity,
             credential_mount=(
-                None
-                if ownership.credential_auth_identity is None
-                else ManagedCredentialMount(
+                ManagedCredentialMount(
                     root=ownership.credential_dir,
                     root_identity=ownership.credential_root_identity,
                     auth_identity=ownership.credential_auth_identity,
                 )
+                if subscription
+                else None
             ),
             credential_redactor=redactor,
             agent_result=state.agent_result,
@@ -7152,9 +7180,9 @@ class GatewayNodeManager:
                 if not delivered:
                     return
             elif ownership.phase == _RECOVERY_PHASE_TERMINAL_FINALIZATION:
-                managed = self._restore_subscription_finalization(ownership)
+                managed = self._restore_terminal_finalization(ownership)
                 ownership.managed = managed
-                await self._finalize_subscription_after_runtime_absence(
+                await self._finalize_after_runtime_absence(
                     managed,
                     result=ownership.finalization_state.final_result,
                 )
@@ -7222,7 +7250,7 @@ class GatewayNodeManager:
             if not delivered:
                 return
         elif ownership.phase == _RECOVERY_PHASE_TERMINAL_FINALIZATION:
-            await self._finalize_subscription_after_runtime_absence(
+            await self._finalize_after_runtime_absence(
                 managed,
                 result=managed.final_result,
             )

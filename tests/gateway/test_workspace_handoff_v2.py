@@ -14,6 +14,7 @@ from openevo.backend.workspace_handoff_v2 import (
 from openevo.gateway.dispatcher import ManagedSession
 from openevo.gateway.node import GatewayNodeManager
 from openevo.gateway.session import SessionRegistry
+from openevo.gateway.session_files import capture_session_root_identity
 from openevo.gateway.storage import SessionStore
 from openevo.harness.models import AgentSpec
 from openevo.internal_auth import InternalServiceIdentity
@@ -91,7 +92,7 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
         remaining_timeout_seconds=30,
         agent=AgentSpec(
             harness="codex",
-            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+            settings={"auth_mode": "proxy", "capture_mode": "transcript"},
         ),
         workspace_handoff=binding,
     )
@@ -100,6 +101,7 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
         timer=StageTimer(),
         session_dir=session_dir,
         artifacts_dir=artifacts,
+        session_root_identity=capture_session_root_identity(session_dir),
     )
     result = SessionResult(
         session_id=session_id,
@@ -150,6 +152,18 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
             result,
         )
         assert replay.workspace_result == attached.workspace_result
+
+        manager._cleanup_journal_dir = tmp_path / "journal"
+        managed.final_result = result
+        manager._register_cleanup_retry(managed, finalize_terminal=True)
+        ownership = manager._cleanup_retries[session_id]
+        assert ownership.finalization_state is not None
+        assert ownership.finalization_state.request.workspace_handoff == binding
+        ownership.managed = None
+        restored = manager._restore_terminal_finalization(ownership)
+        assert restored.request.workspace_handoff == binding
+        assert restored.credential_dir is None
+        assert restored.credential_mount is None
     finally:
         await manager._client.aclose()
         store.close()

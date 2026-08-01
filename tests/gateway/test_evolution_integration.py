@@ -1259,6 +1259,30 @@ async def test_handle_postrun_does_not_cleanup_session_when_runtime_removal_fail
 
 
 @pytest.mark.asyncio
+async def test_proxy_workspace_handoff_uses_terminal_finalization_path(tmp_path) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    managed = _managed_postrun_session(tmp_path, _session_result())
+    managed.request = managed.request.model_copy(update={"workspace_handoff": object()})
+    managed.runtime = object()
+
+    async def terminal_finalization(captured: ManagedSession) -> None:
+        assert captured is managed
+        calls.append("terminal_finalization")
+
+    async def standard_postrun(captured: ManagedSession) -> None:
+        assert captured is managed
+        calls.append("standard_postrun")
+
+    manager._handle_terminal_finalization_postrun = terminal_finalization
+    manager._handle_standard_postrun = standard_postrun
+
+    await manager._handle_postrun(managed)
+
+    assert calls == ["terminal_finalization"]
+
+
+@pytest.mark.asyncio
 async def test_subscription_stops_runtime_and_redacts_background_output_before_result(
     tmp_path: Path,
 ) -> None:
@@ -1387,7 +1411,7 @@ async def test_subscription_evaluator_runs_before_runtime_is_stopped(
         calls.append("finalize")
 
     manager._build_session_result = build_result
-    manager._finalize_subscription_after_runtime_absence = finalize
+    manager._finalize_after_runtime_absence = finalize
 
     await manager._handle_postrun(managed)
 
@@ -1473,7 +1497,7 @@ async def test_subscription_postrun_base_exception_still_stops_all_runtimes(
     manager._stop_runtime_best_effort = stop_runtime
 
     with pytest.raises(failure_type):
-        await manager._handle_subscription_postrun(managed)
+        await manager._handle_terminal_finalization_postrun(managed)
 
     assert calls[-1] == "drain"
     assert stopped == [eval_runtime, main_runtime]
@@ -1656,10 +1680,10 @@ async def test_subscription_cancel_overrides_existing_evaluator_result(
         captured_results.append(result)
         return False
 
-    manager._stop_subscription_runtimes_with_retry = stop_all
+    manager._stop_terminal_runtimes_with_retry = stop_all
     manager._deliver_terminal_result = deliver
 
-    await manager._handle_subscription_postrun(managed)
+    await manager._handle_terminal_finalization_postrun(managed)
 
     assert len(captured_results) == 1
     result = captured_results[0]
@@ -1680,7 +1704,7 @@ def _attach_cancellable_subscription(
     manager._dispatcher._started = True
     manager._dispatcher._sessions[managed.session_id] = managed
     managed.stage = SessionStage.RUNNING
-    manager._register_cleanup_retry(managed, finalize_subscription=True)
+    manager._register_cleanup_retry(managed, finalize_terminal=True)
 
 
 @pytest.mark.asyncio
@@ -1815,9 +1839,9 @@ def test_durable_cancel_is_monotonic_over_completed_result_transition(
         settings={"auth_mode": "subscription", "capture_mode": "transcript"},
     )
     managed.session_root_identity = capture_session_root_identity(session_dir)
-    manager._register_cleanup_retry(managed, finalize_subscription=True)
+    manager._register_cleanup_retry(managed, finalize_terminal=True)
 
-    manager._persist_subscription_finalization_authority(
+    manager._persist_terminal_finalization_authority(
         managed,
         cancel_requested=True,
     )
@@ -3953,7 +3977,7 @@ def test_v5_credential_terminal_finalization_fails_closed_without_auth_authority
     )
     first = _postrun_manager(calls=[])
     first._cleanup_journal_dir = journal_dir
-    first._register_cleanup_retry(managed, finalize_subscription=True)
+    first._register_cleanup_retry(managed, finalize_terminal=True)
 
     journal_path = next(journal_dir.glob("*.json"))
     journal = json.loads(journal_path.read_text(encoding="utf-8"))
@@ -6006,7 +6030,7 @@ async def test_subscription_finalization_preserves_transcript_after_execution_bu
         managed.cancel_requested = True
     managed.execution_deadline = asyncio.get_running_loop().time() - 1
 
-    await manager._finalize_subscription_after_runtime_absence(
+    await manager._finalize_after_runtime_absence(
         managed,
         result=None,
     )
