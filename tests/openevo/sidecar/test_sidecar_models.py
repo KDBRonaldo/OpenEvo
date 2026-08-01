@@ -65,6 +65,16 @@ def test_profile_strings_are_trimmed_and_empty_strings_rejected() -> None:
         RemoteProfileConfig.model_validate(_minimal_payload() | {"name": "   "})
 
 
+def test_internal_workspace_root_never_enters_profile_representation() -> None:
+    workspace = "/srv/research/alice/.openevo/workspaces"
+    config = RemoteProfileConfig.model_validate(
+        _minimal_payload() | {"workspace_root": workspace}
+    )
+
+    assert config.workspace_root == workspace
+    assert workspace not in repr(config)
+
+
 def test_profile_validates_remote_path_and_numeric_bounds() -> None:
     with pytest.raises(ValidationError, match="workspace_root"):
         RemoteProfileConfig.model_validate(

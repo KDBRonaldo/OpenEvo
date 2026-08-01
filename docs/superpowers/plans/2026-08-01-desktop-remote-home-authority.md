@@ -156,18 +156,18 @@ git push origin HEAD:stable
 - Modify: `tests/openevo/sidecar/test_system_ssh_session.py`
 - Modify: `tests/openevo/sidecar/test_sidecar_models.py`
 
-- [ ] **Step 1: Write failing lifecycle/follower tests**
+- [x] **Step 1: Write failing lifecycle/follower tests**
 
 Replace the fake session's `id -un` result with `discover_remote_home_authority`. Prove one discovery per generation; exact literal alias remains `config.host`; sealed user and exact custom-home workspace are used; the factory receives `(config, session, authority)`; reconnect gets a fresh authority; mismatch in profile ID/generation/user/workspace rejects construction; representations and errors hide the home; malformed discovery disconnects before transport construction.
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 ```bash
 uv run pytest -q tests/openevo/sidecar/test_remote_lifecycle.py \
   tests/openevo/sidecar/test_system_ssh_session.py -k 'home or authority or discovered_remote'
 ```
 
-- [ ] **Step 3: Replace the free-form user path**
+- [x] **Step 3: Replace the free-form user path**
 
 Use:
 
@@ -181,7 +181,7 @@ In `_connect_locked`, call private discovery, construct the internal profile wit
 
 Make `SystemOpenSshFollowerTransportAuthority` accept the exact authority and require its profile/generation to match `session.snapshot()`. Carry it as a sealed, process-only `remote_home_authority`; `command_argv` wraps trusted commands with `build_remote_home_guarded_command`, while `core_tunnel_argv` remains raw `ssh -W`. Keep initial discovery unguarded/private. Set `RemoteProfileConfig.workspace_root = Field(default=None, repr=False)`.
 
-- [ ] **Step 4: Run complete lifecycle/session/profile regressions**
+- [x] **Step 4: Run complete lifecycle/session/profile regressions**
 
 ```bash
 uv run pytest -q tests/openevo/sidecar/test_remote_lifecycle.py \
@@ -189,7 +189,7 @@ uv run pytest -q tests/openevo/sidecar/test_remote_lifecycle.py \
 uv run pytest -q tests/openevo/sidecar/test_sidecar_models.py
 ```
 
-- [ ] **Step 5: Commit and push**
+- [x] **Step 5: Commit and push**
 
 ```bash
 git add desktop/sidecar/remote_lifecycle.py desktop/sidecar/system_ssh_session.py \

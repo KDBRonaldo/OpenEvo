@@ -37,6 +37,7 @@ from openevo.deployment.profile import SystemOpenSshAliasProfile
 from openevo.deployment.remote_home import (
     REMOTE_HOME_PROBE_OUTPUT_LIMIT,
     RemoteHomeAuthority,
+    build_remote_home_guarded_command,
     build_remote_home_probe_command,
     parse_remote_home_probe,
 )
@@ -1445,31 +1446,47 @@ class SystemOpenSshFollowerTransportAuthority:
 
     _MAX_ISSUED = 64
 
-    def __init__(self, session: SystemOpenSshSession, *, remote_user: str) -> None:
+    def __init__(
+        self,
+        session: SystemOpenSshSession,
+        *,
+        remote_home_authority: RemoteHomeAuthority,
+    ) -> None:
         if type(session) is not SystemOpenSshSession:
             raise TypeError("system OpenSSH follower requires an exact session")
-        if (
-            type(remote_user) is not str
-            or not remote_user
-            or len(remote_user) > 128
-            or any(
-                not (character.isascii() and (character.isalnum() or character in "._%+-"))
-                for character in remote_user
-            )
-        ):
-            raise ValueError("system OpenSSH remote user is invalid")
-        session.snapshot()
+        if type(remote_home_authority) is not RemoteHomeAuthority:
+            raise TypeError("system OpenSSH remote account authority is invalid")
+        snapshot = session.snapshot()
         self._session = session
-        self.remote_user = remote_user
+        self._remote_home_authority = remote_home_authority
         self.ssh_host_alias = session.ssh_host_alias
         self._guard = threading.Lock()
         self._issued: dict[tuple[str, ...], int] = {}
+        if not self._matches(snapshot):
+            raise ValueError("system OpenSSH remote account authority is inconsistent")
+
+    @property
+    def remote_user(self) -> str:
+        return self._remote_home_authority.remote_user
+
+    @property
+    def remote_home_authority(self) -> RemoteHomeAuthority:
+        return self._remote_home_authority
 
     def verify_authority(self) -> None:
-        self._session.snapshot()
+        if not self._matches(self._session.snapshot()):
+            raise _session_error(
+                "ssh_remote_account_unavailable",
+                "The remote SSH account could not be verified.",
+            )
 
     def command_argv(self, remote_command: str) -> list[str]:
-        return self._issue(self._session.command_argv(remote_command))
+        self.verify_authority()
+        guarded = build_remote_home_guarded_command(
+            self._remote_home_authority,
+            remote_command,
+        )
+        return self._issue(self._session.command_argv(guarded))
 
     def rsync_argv(
         self,
@@ -1560,6 +1577,19 @@ class SystemOpenSshFollowerTransportAuthority:
             stream_fd=stream_fd,
             environment=self._session.follower_environment(),
         )
+
+    def _matches(self, snapshot: SystemOpenSshSessionSnapshot) -> bool:
+        try:
+            return self._remote_home_authority.matches(
+                profile_id=snapshot.profile_id,
+                connection_generation=snapshot.connection_generation,
+                remote_user=self._remote_home_authority.remote_user,
+            )
+        except Exception:
+            return False
+
+    def __repr__(self) -> str:
+        return "SystemOpenSshFollowerTransportAuthority(<sealed>)"
 
     def _issue(self, argv: list[str]) -> list[str]:
         self.verify_authority()

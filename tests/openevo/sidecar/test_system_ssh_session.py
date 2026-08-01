@@ -23,6 +23,7 @@ from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     OwnedSshMasterProcess,
     SystemOpenSshHostTrust,
+    SystemOpenSshFollowerTransportAuthority,
     SystemOpenSshSession,
     SystemOpenSshSessionError,
     SystemOpenSshSessionOwner,
@@ -37,7 +38,9 @@ from openevo.deployment.host_keys import (
 )
 from openevo.deployment.remote_home import (
     REMOTE_HOME_PROBE_OUTPUT_LIMIT,
+    build_remote_home_guarded_command,
     build_remote_home_probe_command,
+    parse_remote_home_probe,
 )
 from openevo.deployment.ssh import (
     SystemOpenSshAskpassEnvironment,
@@ -444,6 +447,71 @@ def test_discovery_rechecks_owned_master_after_private_probe(
         runner.after_call = None
         runner.stdout = b""
         inspector.identity = original_identity
+        session.close()
+        launcher.close_socket()
+
+
+def test_follower_authority_guards_rich_commands_but_not_core_tunnel(
+    short_tmp_path: Path,
+) -> None:
+    session, _process, _inspector, launcher, runner = _session(short_tmp_path)
+    try:
+        session.start()
+        runner.stdout = _remote_home_record()
+        authority = session.discover_remote_home_authority(timeout_seconds=2.0)
+        runner.stdout = b""
+        follower = SystemOpenSshFollowerTransportAuthority(
+            session,
+            remote_home_authority=authority,
+        )
+
+        command = follower.command_argv("printf 'trusted command\\n'")
+        tunnel = follower.core_tunnel_argv(remote_port=8765)
+
+        assert command == session.command_argv(
+            build_remote_home_guarded_command(
+                authority,
+                "printf 'trusted command\\n'",
+            )
+        )
+        assert tunnel == session.core_tunnel_argv(remote_port=8765)
+        assert follower.remote_home_authority is authority
+        assert follower.remote_user == "researcher"
+        assert repr(follower) == "SystemOpenSshFollowerTransportAuthority(<sealed>)"
+        assert "/srv/research/alice" not in repr(follower)
+    finally:
+        session.close()
+        launcher.close_socket()
+
+
+@pytest.mark.parametrize(
+    ("profile_id", "generation"),
+    [("profile-other", 1), ("profile-1", 2)],
+)
+def test_follower_rejects_authority_from_another_profile_or_generation(
+    short_tmp_path: Path,
+    profile_id: str,
+    generation: int,
+) -> None:
+    session, _process, _inspector, launcher, _runner = _session(short_tmp_path)
+    mismatched = parse_remote_home_probe(
+        profile_id=profile_id,
+        connection_generation=generation,
+        return_code=0,
+        stdout=_remote_home_record(),
+        stderr=b"",
+    )
+    try:
+        session.start()
+
+        with pytest.raises((ValueError, SystemOpenSshSessionError)) as captured:
+            SystemOpenSshFollowerTransportAuthority(
+                session,
+                remote_home_authority=mismatched,
+            )
+
+        assert "/srv/research/alice" not in repr(captured.value)
+    finally:
         session.close()
         launcher.close_socket()
 

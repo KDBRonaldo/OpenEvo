@@ -129,7 +129,7 @@ class RemoteProfileConfig(_StrictFrozenModel):
     user: str = Field(min_length=1)
     auth: SSHAuthConfig = Field(default_factory=SSHAuthConfig)
     proxy: ProxySettings = Field(default_factory=ProxySettings)
-    workspace_root: str | None = None
+    workspace_root: str | None = Field(default=None, repr=False)
     min_home_available_kb: int = Field(default=20_000_000, ge=0)
     path: Path | None = None
 
