@@ -96,6 +96,27 @@ class RecordingRuntime(BaseRuntime):
         del remote_path, local_path
 
 
+class ExternallySandboxedRecordingRuntime(RecordingRuntime):
+    @property
+    def codex_bypass_sandbox_profile_id(self) -> str | None:
+        return "codex_managed_science_docker_v1"
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        env: dict[str, str] | None = None,
+        timeout_sec: float | None = None,
+    ) -> ExecResult:
+        del env, timeout_sec
+        self.commands.append(command)
+        if "-probe.sh" in command and "command_execution" in command:
+            assert cwd == CODEX_SUBSCRIPTION_CANARY_CWD
+            return ExecResult(stdout=f"{CODEX_SUBSCRIPTION_CANARY_OK}\n", return_code=0)
+        return ExecResult(return_code=0)
+
+
 def _codex_config_toml(commands: list[str]) -> str:
     marker = "config.toml << 'OPENEVO_CFG'\n"
     for command in commands:
@@ -377,6 +398,46 @@ def test_codex_run_steps_defaults_to_proxy_auth_mode():
     assert "model_providers.harness_proxy.base_url" in steps[1].command
     assert "--model gpt-5.5" in steps[1].command
     assert not steps[1].command.startswith("env -u")
+    assert "--dangerously-bypass-approvals-and-sandbox" not in steps[1].command
+
+
+@pytest.mark.asyncio
+async def test_codex_proxy_uses_bypass_only_after_external_sandbox_setup(tmp_path: Path) -> None:
+    harness = CodexHarness(AgentSpec(harness="codex", model_name="gpt-5.5"))
+    runtime = ExternallySandboxedRecordingRuntime(tmp_path)
+
+    assert (
+        "--dangerously-bypass-approvals-and-sandbox"
+        not in harness.run_steps("Before setup.")[1].command
+    )
+
+    await harness.setup(runtime)
+
+    command = harness.run_steps("After setup.")[1].command
+    assert "--dangerously-bypass-approvals-and-sandbox" in command
+
+
+@pytest.mark.asyncio
+async def test_codex_subscription_ignores_external_bypass_sandbox(tmp_path: Path) -> None:
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            model_name="gpt-5.5",
+            settings={
+                "auth_mode": "subscription",
+                "capture_mode": "transcript",
+                CODEX_SUBSCRIPTION_CONTRACT_KEY: codex_subscription_contract(),
+            },
+        )
+    )
+    runtime = ExternallySandboxedRecordingRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    assert (
+        "--dangerously-bypass-approvals-and-sandbox"
+        not in harness.run_steps("Do work.")[0].command
+    )
 
 
 @pytest.mark.parametrize(

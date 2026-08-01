@@ -28,6 +28,7 @@ from openevo.runtime.docker_host import (
 )
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
+    MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID,
     ManagedCredentialMount,
     managed_runtime_image_release,
     require_immutable_managed_runtime_image,
@@ -355,6 +356,8 @@ class DockerRuntime(BaseRuntime):
         self._create_succeeded = False
         self._absence_proven = False
         self._chmod_needed: bool | None = False if spec.container_user == "host" else None
+        self._codex_bypass_sandbox_candidate = self._is_codex_bypass_sandbox_candidate()
+        self._codex_bypass_sandbox_ready = False
 
     @property
     def runtime_id(self) -> str:
@@ -387,6 +390,29 @@ class DockerRuntime(BaseRuntime):
         if self._credential_mount is None:
             return None
         return MANAGED_SUBSCRIPTION_SANDBOX_PROFILE_ID
+
+    @property
+    def codex_bypass_sandbox_profile_id(self) -> str | None:
+        if (
+            not self._codex_bypass_sandbox_ready
+            or self._destroyed
+            or self._container_id is None
+            or self._ownership_state != "verified"
+        ):
+            return None
+        return MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID
+
+    def _is_codex_bypass_sandbox_candidate(self) -> bool:
+        if self._credential_mount is not None or self.spec.profile != "managed_science":
+            return False
+        try:
+            require_immutable_managed_runtime_image(
+                profile=self.spec.profile,
+                image=self.spec.image,
+            )
+        except ValueError:
+            return False
+        return True
 
     async def _run_local_command(
         self,
@@ -1030,11 +1056,16 @@ class DockerRuntime(BaseRuntime):
             "--cidfile",
             str(self._cidfile),
         ]
-        if self._credential_mount is not None:
+        if self._credential_mount is not None or self._codex_bypass_sandbox_candidate:
             create_args.extend(
                 [
                     "--cap-drop=ALL",
                     "--security-opt=no-new-privileges:true",
+                ]
+            )
+        if self._credential_mount is not None:
+            create_args.extend(
+                [
                     "--security-opt=seccomp=unconfined",
                     "--security-opt=apparmor=unconfined",
                     "--tmpfs",
@@ -1198,6 +1229,7 @@ class DockerRuntime(BaseRuntime):
                 self.runtime_session_dir,
                 timeout=self._STOP_TIMEOUT,
             )
+        self._codex_bypass_sandbox_ready = self._codex_bypass_sandbox_candidate
 
     async def _verified_create_image(self) -> str:
         release = managed_runtime_image_release(
@@ -1738,6 +1770,7 @@ class DockerRuntime(BaseRuntime):
         return "unknown"
 
     def _mark_no_ownership(self) -> None:
+        self._codex_bypass_sandbox_ready = False
         self._ownership_state = "none"
         self._create_succeeded = False
         self._absence_proven = True
@@ -1745,6 +1778,7 @@ class DockerRuntime(BaseRuntime):
         self._release_ownership_files()
 
     def _mark_owned_container_absent(self) -> None:
+        self._codex_bypass_sandbox_ready = False
         self._ownership_state = "absent"
         self._absence_proven = True
         self._destroyed = True

@@ -32,6 +32,7 @@ from openevo.runtime.managed import (
     MANAGED_CODEX_BINARY,
     MANAGED_CODEX_DEFAULT_MODEL,
     MANAGED_CODEX_HOME,
+    MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID,
 )
 from openevo.runtime.models import ExecInput
 
@@ -209,6 +210,7 @@ class CodexHarness(BaseHarness):
         self._configured_mcp_servers = tuple(agent_spec.mcp_servers)
         self._subscription_credential_isolation: dict[str, object] | None = None
         self._subscription_allow_internet = True
+        self._proxy_bypass_sandbox_profile_id: str | None = None
 
     def _codex_home_path(self) -> str:
         if self.settings.get("auth_mode") in {
@@ -219,6 +221,7 @@ class CodexHarness(BaseHarness):
         return _nonempty_env_path(self.env.get("CODEX_HOME")) or self._codex_home
 
     async def setup(self, runtime: BaseRuntime) -> None:
+        self._proxy_bypass_sandbox_profile_id = None
         auth_mode = self._auth_mode()
         codex_home = self._codex_home_path()
         if auth_mode == AUTH_MODE_SUBSCRIPTION:
@@ -274,6 +277,11 @@ class CodexHarness(BaseHarness):
 
         if auth_mode == AUTH_MODE_SUBSCRIPTION:
             self._subscription_credential_isolation = codex_subscription_readiness_receipt()
+        elif auth_mode == AUTH_MODE_PROXY:
+            profile_id = runtime.codex_bypass_sandbox_profile_id
+            if profile_id is not None and profile_id != MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID:
+                raise RuntimeError("Codex proxy external sandbox profile is unsupported")
+            self._proxy_bypass_sandbox_profile_id = profile_id
 
     def run_steps(self, instruction: str) -> list[ExecInput]:
         escaped = shlex.quote(instruction)
@@ -318,6 +326,16 @@ class CodexHarness(BaseHarness):
             value = self.settings.get(key)
             if value is not None:
                 flags.append(f"{cli}={shlex.quote(str(value))}")
+
+        if (
+            auth_mode == AUTH_MODE_PROXY
+            and self._proxy_bypass_sandbox_profile_id
+            == MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID
+        ):
+            # The verified managed task container is the outer security
+            # boundary. This is deliberately unavailable to subscription,
+            # unmanaged images, and calls that skipped setup.
+            flags.append("--dangerously-bypass-approvals-and-sandbox")
 
         if auth_mode == AUTH_MODE_SUBSCRIPTION:
             # These are deliberately final so no caller-controlled option can

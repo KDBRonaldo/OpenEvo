@@ -2018,6 +2018,12 @@ class BaseRuntime(ABC):
     def supports_storage_limits(self) -> bool:
         return False
 
+    @property
+    def codex_bypass_sandbox_profile_id(self) -> str | None:
+        """Return a sealed external sandbox profile for a proxy Codex run."""
+
+        return None
+
     @abstractmethod
     async def start(self) -> None:
         """Create and start the runtime instance."""

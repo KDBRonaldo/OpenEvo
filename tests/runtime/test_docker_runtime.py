@@ -18,6 +18,7 @@ from openevo.runtime import docker as docker_module
 from openevo.runtime.base import BaseRuntime, RuntimePathSecurityError
 from openevo.runtime.docker import (
     DockerRuntime,
+    MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID,
     MANAGED_SUBSCRIPTION_SANDBOX_PROFILE_ID,
     _CREDENTIAL_VIEW_NAME,
     verify_managed_runtime_image_admission,
@@ -1597,6 +1598,54 @@ async def test_managed_repo_digest_is_the_immutable_docker_create_target(
     create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
     assert release.immutable_reference in create
     assert release.image not in create
+    assert runtime.codex_bypass_sandbox_profile_id is None
+
+
+@pytest.mark.asyncio
+async def test_immutable_managed_science_runtime_seals_codex_proxy_sandbox(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    container_id = "6" * 64
+    release = MANAGED_RUNTIME_RELEASES["managed_science"]
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
+    runtime = DockerRuntime(
+        RuntimeSpec(
+            profile="managed_science",
+            image=release.loaded_image_id,
+            container_user="host",
+        ),
+        "managed-proxy-sandbox-session",
+        tmp_path / "session",
+        ownership_root=tmp_path / "ownership",
+    )
+
+    async def run_command_impl(*args, **kwargs):
+        del kwargs
+        if args[1:3] == ("image", "inspect"):
+            return (
+                0,
+                json.dumps([_managed_image_record(release.loaded_image_id)]),
+                None,
+            )
+        if args[1] == "create":
+            _write_mock_cidfile(args, container_id)
+            return 0, container_id, None
+        if args[1:3] == ("container", "inspect"):
+            return 0, container_id, None
+        return 0, None, None
+
+    run_command = AsyncMock(side_effect=run_command_impl)
+    monkeypatch.setattr(runtime, "_run_local_command", run_command)
+
+    assert runtime.codex_bypass_sandbox_profile_id is None
+
+    await runtime.start()
+
+    create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
+    assert "--cap-drop=ALL" in create
+    assert "--security-opt=no-new-privileges:true" in create
+    assert runtime.codex_bypass_sandbox_profile_id == MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID
 
 
 @pytest.mark.asyncio

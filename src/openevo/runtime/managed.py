@@ -557,6 +557,7 @@ MANAGED_CODEX_BINARY: Final[str] = f"{MANAGED_CODEX_PACKAGE_ROOT}/bin/codex"
 MANAGED_CODEX_VERSION: Final[str] = "0.144.1"
 MANAGED_CODEX_NPM_PACKAGE: Final[str] = f"@openai/codex@{MANAGED_CODEX_VERSION}"
 MANAGED_CODEX_DEFAULT_MODEL: Final[str] = "gpt-5.5"
+MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID: Final[str] = "codex_managed_science_docker_v1"
 MANAGED_PATH: Final[str] = (
     f"{MANAGED_CODEX_PACKAGE_ROOT}/bin:"
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
@@ -767,6 +768,7 @@ def require_managed_runtime_binding(
 
 __all__ = [
     "MANAGED_CODEX_HOME",
+    "MANAGED_CODEX_PROXY_SANDBOX_PROFILE_ID",
     "MANAGED_CODEX_READINESS_WORKSPACE",
     "MANAGED_CODEX_BINARY",
     "MANAGED_CODEX_PACKAGE_ROOT",
