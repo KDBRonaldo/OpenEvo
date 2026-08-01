@@ -217,6 +217,7 @@ def _provider(
     tmp_path: Path,
     *,
     max_lifecycle_log_entries: int | None = None,
+    event_broker: DesktopEventBrokerV2 | None = None,
 ) -> tuple[DesktopReleaseProviderV2, DesktopProviderStoreV2, _Lifecycle, _CoreConnector]:
     store_options = {}
     if max_lifecycle_log_entries is not None:
@@ -236,7 +237,7 @@ def _provider(
         bridge=_Bridge(),
         bridge_store=None,
         workspace_import_store=None,
-        event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
+        event_broker=event_broker or DesktopEventBrokerV2(clock=lambda: NOW),
         build_version="0.1.10",
         source_commit=SOURCE_COMMIT,
         build_channel="release",
@@ -774,6 +775,109 @@ def test_profile_connect_uses_literal_alias_and_exact_generation(
         assert stale.status_code == 412
         assert stale.json()["code"] == "profile_generation_changed"
         assert lifecycle.calls == [("connect", "gpu-lab", 2)]
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_remote_account_failure_is_stable_and_private_across_public_surfaces(
+    tmp_path: Path,
+) -> None:
+    event_broker = DesktopEventBrokerV2(clock=lambda: NOW)
+    provider, store, lifecycle, _connector = _provider(
+        tmp_path,
+        event_broker=event_broker,
+    )
+    private_user = "private-account-canary"
+    private_uid = "424242"
+    private_home = "/srv/research/private-account-canary"
+    private_nss = (
+        f"{private_user}:x:{private_uid}:1000:Private User:{private_home}:/bin/sh"
+    )
+    private_command = "getent passwd 424242 && /bin/sh -c private-command-canary"
+    lifecycle.connect_errors.append(
+        SystemOpenSshSessionError(
+            "ssh_remote_account_unavailable",
+            " ".join(
+                (
+                    f"user={private_user}",
+                    f"uid={private_uid}",
+                    f"nss={private_nss}",
+                    f"home={private_home}",
+                    f"command={private_command}",
+                )
+            ),
+        )
+    )
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        response = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-private-account-failure-01",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+
+        assert response.status_code == 202, response.text
+        operation = _wait_lifecycle_operation(client, response.json())
+        expected_failure = {
+            "schema_version": "2",
+            "code": "ssh_remote_account_unavailable",
+            "summary": "Desktop could not verify a supported writable remote account home.",
+            "retryable": True,
+            "action": "administrator_action",
+            "affected_resource_id": profile["profile_id"],
+        }
+        assert operation["status"] == "failed"
+        assert operation["failure"] == expected_failure
+
+        public_profile = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        state = client.get("/desktop/v2/state", headers=_headers()).json()
+        stored_operation = store.get_lifecycle_operation(str(operation["operation_id"]))
+        assert public_profile["failure"] == expected_failure
+        assert stored_operation.failure is not None
+        assert stored_operation.failure.model_dump(mode="json") == expected_failure
+
+        http_json = json.dumps(
+            [response.json(), operation, public_profile, state],
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        event_bytes = b"".join(frame.frame for frame in event_broker._events)
+        persisted_bytes = b"".join(
+            path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()
+        )
+        public_bytes = http_json.encode() + event_bytes + persisted_bytes
+        for canary in (
+            private_user,
+            private_uid,
+            private_home,
+            private_nss,
+            "private-command-canary",
+        ):
+            assert canary.encode() not in public_bytes
+
+        profile_fields = set(local_v2.RemoteWorkspaceProfileV2.model_fields)
+        assert profile_fields.isdisjoint(
+            {
+                "remote_user",
+                "remote_uid",
+                "remote_home",
+                "workspace_root",
+                "daemon_bundle_root",
+                "host_path",
+            }
+        )
     finally:
         client.close()
         provider.close()

@@ -182,6 +182,26 @@ def test_sanitizer_redacts_home_relative_host_paths() -> None:
     assert rendered.count("[REDACTED_HOST_PATH]") == 8
 
 
+def test_sanitizer_redacts_custom_remote_home_from_ssh_and_daemon_logs() -> None:
+    entries: list[tuple[str, str, bool]] = []
+    sanitizer = LifecycleOutputSanitizerV2(
+        lambda source, text, truncated: entries.append((source, text, truncated))
+    )
+    private_stage = "/srv/research/alice/.openevo/private-stage"
+
+    sanitizer.feed("ssh_stderr", f"ssh stage={private_stage}\n".encode())
+    sanitizer.feed("daemon_stdout", f"daemon stage={private_stage}\n".encode())
+    sanitizer.flush()
+
+    rendered = "".join(text for _source, text, _truncated in entries)
+    assert private_stage not in rendered
+    assert rendered.count("[REDACTED_HOST_PATH]") == 2
+    assert {source for source, _text, _truncated in entries} == {
+        "ssh_stderr",
+        "daemon_stdout",
+    }
+
+
 def test_bounded_subprocess_observer_receives_only_stream_and_bytes() -> None:
     observed: list[tuple[str, bytes]] = []
     command_canary = "argv-must-not-be-observed"

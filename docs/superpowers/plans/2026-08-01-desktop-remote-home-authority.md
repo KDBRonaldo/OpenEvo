@@ -257,22 +257,22 @@ git push origin HEAD:stable
 - Modify: `tests/openevo/sidecar/test_release_local_api_v2.py`
 - Modify: `tests/openevo/sidecar/test_lifecycle_logs_v2.py`
 
-- [ ] **Step 1: Write failing API and log privacy tests**
+- [x] **Step 1: Write failing API and log privacy tests**
 
 Inject the remote-account session error with a message containing user, UID, NSS line, home, and command. Await the persisted operation and assert exactly:
 
 ```python
 assert operation.failure.code == "ssh_remote_account_unavailable"
-assert operation.failure.message == (
+assert operation.failure.summary == (
     "Desktop could not verify a supported writable remote account home."
 )
 assert operation.failure.retryable is True
-assert operation.failure.recovery == "administrator_action"
+assert operation.failure.action == "administrator_action"
 ```
 
 Assert operation/events/provider persistence/HTTP JSON contain none of the injected data. Feed `/srv/research/alice/.openevo/private-stage` through SSH and Daemon log sources and require `[REDACTED_HOST_PATH]`. Inspect v2 model fields and prove no home/workspace/Daemon path field was added.
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 ```bash
 uv run pytest -q tests/openevo/sidecar/test_release_local_api_v2.py \
@@ -280,7 +280,7 @@ uv run pytest -q tests/openevo/sidecar/test_release_local_api_v2.py \
   -k 'remote_account or custom_home or public_model'
 ```
 
-- [ ] **Step 3: Add only the closed failure mapping**
+- [x] **Step 3: Add only the closed failure mapping**
 
 ```python
 "ssh_remote_account_unavailable": (
@@ -293,14 +293,14 @@ uv run pytest -q tests/openevo/sidecar/test_release_local_api_v2.py \
 
 Never project the original exception/message.
 
-- [ ] **Step 4: Run full provider/log suites GREEN**
+- [x] **Step 4: Run full provider/log suites GREEN**
 
 ```bash
 uv run pytest -q tests/openevo/sidecar/test_release_local_api_v2.py
 uv run pytest -q tests/openevo/sidecar/test_lifecycle_logs_v2.py
 ```
 
-- [ ] **Step 5: Commit and push**
+- [x] **Step 5: Commit and push**
 
 ```bash
 git add desktop/sidecar/release_provider_v2.py \
