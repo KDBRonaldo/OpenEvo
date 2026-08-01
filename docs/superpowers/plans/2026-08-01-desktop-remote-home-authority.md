@@ -19,7 +19,7 @@
 - Create: `src/openevo/deployment/remote_home.py`
 - Create: `tests/deployment/test_remote_home.py`
 
-- [ ] **Step 1: Write parser and authority construction tests that fail because the module does not exist**
+- [x] **Step 1: Write parser and authority construction tests that fail because the module does not exist**
 
 Add table-driven tests for `/root`, `/home/researcher`, and `/srv/research/alice` using the exact versioned private record:
 
@@ -49,9 +49,9 @@ def test_verified_probe_seals_exact_derived_roots(home: str) -> None:
 
 Cover every parser rejection named by the design: nonzero result; non-empty stderr; missing/extra line; no final newline; invalid UTF-8; NUL/control bytes; aggregate output over 8 KiB; unsafe username; non-canonical or out-of-range UID; `id`/NSS user or UID mismatch; relative/empty/over-4096-byte home; empty, `.`, `..`, unsafe, repeated, or trailing path components; physical-home mismatch; owner mismatch; and writable flag other than exact `1`.
 
-Assert the class cannot be constructed without its private seal, is immutable and generation-bound, and neither its `repr` nor any validation exception contains `/srv/research/alice`. Assert probe/guard command builders never read `$HOME`, require `getent passwd "$uid"`, validate one seven-field record plus physical path/owner/writability, quote every bound value, reject NUL/control/over-budget commands, and execute the trusted command only after all guards.
+Assert the class cannot be constructed without its private seal, is immutable and generation-bound, and neither its `repr` nor any validation exception contains `/srv/research/alice`. Assert probe/guard command builders never read `$HOME`, require `getent passwd "$uid"`, validate one seven-field record plus physical path/owner/writability, quote every bound value, reject empty/NUL/over-budget commands, preserve trusted multiline deployment scripts, and execute the trusted command only after all guards.
 
-- [ ] **Step 2: Run the new tests and record RED**
+- [x] **Step 2: Run the new tests and record RED**
 
 ```bash
 uv run pytest -q tests/deployment/test_remote_home.py
@@ -59,7 +59,7 @@ uv run pytest -q tests/deployment/test_remote_home.py
 
 Expected: collection fails with `ModuleNotFoundError: openevo.deployment.remote_home`.
 
-- [ ] **Step 3: Implement the sealed authority, strict parser, fixed probe, and guard builder**
+- [x] **Step 3: Implement the sealed authority, strict parser, fixed probe, and guard builder**
 
 Implement `RemoteHomeAuthorityError(ValueError)` and a
 `@dataclass(frozen=True, slots=True, repr=False)` named
@@ -82,14 +82,14 @@ Use a module-private seal sentinel. Validate encoded bytes before retaining stri
 
 The fixed `/bin/sh` probe uses `set -eu`, `set -f`, `LC_ALL=C`, `id -un`, `id -u`, one `getent passwd "$uid"` result, exactly seven colon fields, `test -d`, `test -w`, `stat -c %u`, and `CDPATH= cd -P "$home" && pwd -P`. The guard repeats these checks against shell-quoted sealed values and ends with `exec /bin/sh -c "$remote_command"` only after admission.
 
-- [ ] **Step 4: Run GREEN verification**
+- [x] **Step 4: Run GREEN verification**
 
 ```bash
 uv run pytest -q tests/deployment/test_remote_home.py
 uv run python -c 'from openevo.deployment.remote_home import RemoteHomeAuthority; print(RemoteHomeAuthority.__name__)'
 ```
 
-- [ ] **Step 5: Commit and push**
+- [x] **Step 5: Commit and push**
 
 ```bash
 git add src/openevo/deployment/remote_home.py tests/deployment/test_remote_home.py
