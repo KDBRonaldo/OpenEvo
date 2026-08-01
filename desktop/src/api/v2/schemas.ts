@@ -109,7 +109,7 @@ export const contractOnlyResponseV2Schema = z.object({
   message: safeSummaryV2Schema,
 }).strict();
 
-export const executionModeV2Schema = z.enum(["codex_subscription_transcript", "self_deployed"]);
+export const executionModeV2Schema = z.enum(["codex_subscription_transcript", "self-deployed"]);
 export const captureModeV2Schema = z.enum(["transcript", "proxy"]);
 export const transitionKindV2Schema = z.enum([
   "run_result",
@@ -278,11 +278,26 @@ export const codexSubscriptionExecutionSettingsV2Schema = z.object({
   task_network_allow_internet: z.boolean(),
 }).strict();
 
+export const selfDeployedExecutionSettingsV2Schema = z.object({
+  mode: z.literal("self-deployed"),
+  capture_mode: z.literal("transcript"),
+  token_level_metrics_available: z.literal(false),
+  harness_id: z.literal("codex"),
+  model_profile_id: z.literal("qwen3-0.6b-v1"),
+  token_limit: positiveSafeIntegerV2Schema.max(8_192),
+  task_network_allow_internet: z.boolean(),
+}).strict();
+
+export const scienceExecutionSettingsV2Schema = z.discriminatedUnion("mode", [
+  codexSubscriptionExecutionSettingsV2Schema,
+  selfDeployedExecutionSettingsV2Schema,
+]);
+
 export const scienceProjectConfigV2Schema = z.object({
   schema_version: schemaVersionV2Schema,
   task: scienceTaskConfigV2Schema,
   workspace: scienceWorkspaceSourceV2Schema,
-  execution: codexSubscriptionExecutionSettingsV2Schema,
+  execution: scienceExecutionSettingsV2Schema,
   evolution: scienceEvolutionConfigV2Schema,
 }).strict().superRefine((value, context) => {
   if (utf8ByteLength(canonicalJsonV2(value)) > MAX_PROJECT_CONFIG_BYTES_V2) {

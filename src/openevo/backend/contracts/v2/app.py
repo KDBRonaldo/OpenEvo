@@ -438,7 +438,7 @@ def create_core_control_v2_contract_app(
     )
     async def capabilities(
         execution_mode: Annotated[
-            Literal["codex_subscription_transcript", "self_deployed"], Query()
+            Literal["codex_subscription_transcript", "self-deployed"], Query()
         ],
     ) -> Response:
         return _not_implemented()

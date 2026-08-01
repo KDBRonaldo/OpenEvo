@@ -79,7 +79,7 @@ MimeType = Annotated[
 
 ExecutionModeV2: TypeAlias = Literal[
     "codex_subscription_transcript",
-    "self_deployed",
+    "self-deployed",
 ]
 CaptureModeV2: TypeAlias = Literal["transcript", "proxy"]
 TransitionKindV2: TypeAlias = Literal[
@@ -446,7 +446,7 @@ class ScienceWorkspaceSourceV2(ContractModel):
 
 
 class CodexSubscriptionExecutionSettingsV2(ContractModel):
-    """Closed desired settings for the v0.1.9 Subscription vertical."""
+    """Closed desired settings for the release Subscription vertical."""
 
     mode: Literal["codex_subscription_transcript"]
     capture_mode: Literal["transcript"]
@@ -472,6 +472,24 @@ class CodexSubscriptionExecutionSettingsV2(ContractModel):
         return model
 
 
+class SelfDeployedExecutionSettingsV2(ContractModel):
+    """Closed selection of one release-owned Self-Deployed model profile."""
+
+    mode: Literal["self-deployed"]
+    capture_mode: Literal["transcript"]
+    token_level_metrics_available: Literal[False]
+    harness_id: Literal["codex"]
+    model_profile_id: Literal["qwen3-0.6b-v1"]
+    token_limit: int = Field(ge=1, le=8_192)
+    task_network_allow_internet: bool
+
+
+ScienceExecutionSettingsV2: TypeAlias = Annotated[
+    CodexSubscriptionExecutionSettingsV2 | SelfDeployedExecutionSettingsV2,
+    Field(discriminator="mode"),
+]
+
+
 class ScienceEvolutionConfigV2(ContractModel):
     targets: ProjectEvolutionTargetMap
 
@@ -482,7 +500,7 @@ class ScienceProjectConfigV2(ContractModel):
     schema_version: Literal["2"] = "2"
     task: ScienceTaskConfigV2
     workspace: ScienceWorkspaceSourceV2
-    execution: CodexSubscriptionExecutionSettingsV2
+    execution: ScienceExecutionSettingsV2
     evolution: ScienceEvolutionConfigV2
 
     @model_validator(mode="after")
@@ -1116,8 +1134,10 @@ __all__ = [
     "RuntimeContextSnapshotRefV2",
     "ScienceEvolutionConfigV2",
     "ScienceProjectConfigV2",
+    "ScienceExecutionSettingsV2",
     "ScienceTaskConfigV2",
     "ScienceWorkspaceSourceV2",
+    "SelfDeployedExecutionSettingsV2",
     "ServicePageV2",
     "ServiceV2",
     "SseFrameV2",

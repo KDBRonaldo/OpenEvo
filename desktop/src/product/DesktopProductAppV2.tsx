@@ -728,6 +728,7 @@ function NewProjectDialogV2({
   const [objective, setObjective] = useState("");
   const [workspaceKind, setWorkspaceKind] = useState<"scratch" | "native_folder_snapshot">("scratch");
   const [workspaceDisplayName, setWorkspaceDisplayName] = useState("Research workspace");
+  const [executionMode, setExecutionMode] = useState<ScienceProjectConfigV2["execution"]["mode"]>("codex_subscription_transcript");
   const [selectedSourceDisplayName, setSelectedSourceDisplayName] = useState<string | null>(null);
   const [sourceActionId, setSourceActionId] = useState<string | null>(null);
   const closedRef = useRef(false);
@@ -746,6 +747,7 @@ function NewProjectDialogV2({
         objective,
         "native_folder_snapshot",
         workspaceDisplayName,
+        executionMode,
       );
       const source = await provider.selectNativeWorkspace({
         kind: "native_folder_snapshot",
@@ -782,7 +784,13 @@ function NewProjectDialogV2({
   const create = async (): Promise<void> => {
     if (!valid) return;
     const actionId = workspaceKind === "native_folder_snapshot" ? sourceActionId! : actionIdV2("create-project");
-    const config = scienceProjectConfig(title, objective, workspaceKind, workspaceDisplayName);
+    const config = scienceProjectConfig(
+      title,
+      objective,
+      workspaceKind,
+      workspaceDisplayName,
+      executionMode,
+    );
     onBusy(true);
     try {
       await provider.createProject({
@@ -822,7 +830,15 @@ function NewProjectDialogV2({
             <div className="v2-source-choice"><button type="button" className={workspaceKind === "scratch" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => { setWorkspaceKind("scratch"); setSourceActionId(null); setSelectedSourceDisplayName(null); setWorkspaceDisplayName("Research workspace"); }}>New scratch workspace</button><button type="button" className={workspaceKind === "native_folder_snapshot" ? "selected" : ""} disabled={!baseDraftValid || sourceActionId !== null} onClick={() => void chooseFolder()}><FolderOpen size={15} /> Choose folder snapshot</button></div>
             <p className="form-help">{workspaceKind === "native_folder_snapshot" ? selectedSourceDisplayName ?? "Preparing selected workspace…" : "Core will create an immutable empty Workspace Snapshot."}</p>
           </section>
-          <section className="form-section"><h3>Execution</h3><div className="agent-note"><ShieldCheck size={17} /><span>Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort</span></div></section>
+          <section className="form-section">
+            <h3>Execution</h3>
+            <div className="v2-source-choice">
+              <button type="button" className={executionMode === "codex_subscription_transcript" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => setExecutionMode("codex_subscription_transcript")}>Codex Subscription</button>
+              <button type="button" className={executionMode === "self-deployed" ? "selected" : ""} disabled={sourceActionId !== null} onClick={() => setExecutionMode("self-deployed")}>Self-Deployed</button>
+            </div>
+            <div className="agent-note"><ShieldCheck size={17} /><span>{executionMode === "self-deployed" ? "Codex → Core Gateway → managed vLLM · Qwen3 0.6B · exact release profile" : "Codex Subscription · transcript capture · gpt-5.3-codex-spark · high effort"}</span></div>
+            {executionMode === "self-deployed" ? <p className="form-help">Requires a supported NVIDIA GPU, NVIDIA Container Toolkit, Docker Engine, and at least 30 GiB free storage. OpenEvo prepares the pinned image and exact model snapshot on first run.</p> : null}
+          </section>
         </div>
         <div className="drawer-footer"><button type="button" className="secondary-button" onClick={() => void close()}>Cancel</button><button type="button" className="primary-button" onClick={() => void create()} disabled={busy || !valid}>{busy ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />} Create project</button></div>
       </section>
@@ -1086,12 +1102,19 @@ function scienceProjectConfig(
   objective: string,
   workspaceKind: "scratch" | "native_folder_snapshot",
   workspaceDisplayName: string,
+  executionMode: ScienceProjectConfigV2["execution"]["mode"],
 ): ScienceProjectConfigV2 {
-  return {
-    schema_version: "2",
-    task: { title: title.trim(), objective: objective.trim() },
-    workspace: { kind: workspaceKind, display_name: workspaceDisplayName.trim() },
-    execution: {
+  const execution: ScienceProjectConfigV2["execution"] = executionMode === "self-deployed"
+    ? {
+      mode: "self-deployed",
+      capture_mode: "transcript",
+      token_level_metrics_available: false,
+      harness_id: "codex",
+      model_profile_id: "qwen3-0.6b-v1",
+      token_limit: 8_192,
+      task_network_allow_internet: true,
+    }
+    : {
       mode: "codex_subscription_transcript",
       capture_mode: "transcript",
       token_level_metrics_available: false,
@@ -1100,7 +1123,12 @@ function scienceProjectConfig(
       reasoning_effort: "high",
       token_limit: 32_000,
       task_network_allow_internet: true,
-    },
+    };
+  return {
+    schema_version: "2",
+    task: { title: title.trim(), objective: objective.trim() },
+    workspace: { kind: workspaceKind, display_name: workspaceDisplayName.trim() },
+    execution,
     evolution: { targets: {} },
   };
 }

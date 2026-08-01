@@ -24,6 +24,7 @@ from openevo.backend.contracts.v2.models import (
     ProjectUpdateV2,
     RuntimeContextSnapshotRefV2,
     ScienceProjectConfigV2,
+    SelfDeployedExecutionSettingsV2,
     SseFrameV2,
     SuccessorTransitionRefV2,
     TaskAdmittedEventV2,
@@ -147,6 +148,20 @@ def _project_config() -> dict[str, Any]:
             }
         },
     }
+
+
+def _self_deployed_project_config() -> dict[str, Any]:
+    config = _project_config()
+    config["execution"] = {
+        "mode": "self-deployed",
+        "capture_mode": "transcript",
+        "token_level_metrics_available": False,
+        "harness_id": "codex",
+        "model_profile_id": "qwen3-0.6b-v1",
+        "token_limit": 8192,
+        "task_network_allow_internet": False,
+    }
+    return config
 
 
 def _workspace_archive() -> dict[str, Any]:
@@ -468,6 +483,26 @@ def test_subscription_project_execution_is_closed_to_transcript_codex() -> None:
             _json_model(CodexSubscriptionExecutionSettingsV2, execution | change)
 
 
+def test_self_deployed_project_execution_selects_only_release_model_profile() -> None:
+    execution = _self_deployed_project_config()["execution"]
+    parsed = _json_model(SelfDeployedExecutionSettingsV2, execution)
+    project = _json_model(ScienceProjectConfigV2, _self_deployed_project_config())
+
+    assert parsed.mode == "self-deployed"
+    assert parsed.model_profile_id == "qwen3-0.6b-v1"
+    assert project.execution == parsed
+    for change in (
+        {"capture_mode": "proxy"},
+        {"token_level_metrics_available": True},
+        {"harness_id": "claude"},
+        {"model_profile_id": "Qwen/Qwen3-0.6B"},
+        {"hf_model": "Qwen/Qwen3-0.6B"},
+        {"token_limit": 8193},
+    ):
+        with pytest.raises(ValidationError):
+            _json_model(SelfDeployedExecutionSettingsV2, execution | change)
+
+
 def test_workspace_upload_contract_is_resumable_bounded_and_snapshot_only() -> None:
     archive = _json_model(WorkspaceArchiveDeclarationV2, _workspace_archive())
     request = _json_model(
@@ -722,7 +757,7 @@ def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
     assert openapi_sha256() == (
-        "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+        "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86"
     )
 
 
@@ -731,7 +766,7 @@ def test_v2_event_schema_snapshot_is_exactly_rebuildable() -> None:
     assert EVENTS_SCHEMA_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == events_schema_sha256()
     assert events_schema_sha256() == (
-        "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+        "0e5465c110fd42964f53f076a4bbeed55e899b27f235b5e26c3d478356c5b7d2"
     )
 
 

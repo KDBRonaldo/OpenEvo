@@ -869,7 +869,7 @@ class ProjectActionV2(StrictModel):
 class ProjectCapabilityProjectionV2(StrictModel):
     schema_version: Literal["2"] = "2"
     project_id: OpaqueId
-    execution_mode: Literal["codex_subscription_transcript", "self_deployed"]
+    execution_mode: Literal["codex_subscription_transcript", "self-deployed"]
     registry_sha256: Digest
     capabilities_sha256: Digest
     capabilities: core.CapabilitiesResponseV2

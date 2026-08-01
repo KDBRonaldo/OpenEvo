@@ -18,16 +18,16 @@
   "schema_version": "1",
   "v0110": {
     "accepted_core_event_schema_digests": [
-      "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+      "0e5465c110fd42964f53f076a4bbeed55e899b27f235b5e26c3d478356c5b7d2"
     ],
     "accepted_core_openapi_digests": [
-      "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+      "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86"
     ],
     "accepted_desktop_event_schema_digests": [
       "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
     ],
     "accepted_desktop_openapi_digests": [
-      "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760"
+      "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af"
     ],
     "allow_direct_core_url": false,
     "allow_legacy_route_fallback": false,

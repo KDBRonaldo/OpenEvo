@@ -9,7 +9,7 @@ function nonEmpty<T>(values: readonly T[], label: string): readonly [T, ...T[]] 
 export const DESKTOP_PRODUCT_RELEASE_CONTRACT: DesktopReleaseContractV2 = Object.freeze({
   releaseVersion: "0.1.10",
   acceptedOpenApiDigests: nonEmpty([
-    "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760",
+    "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af",
   ], "a Desktop v2 OpenAPI digest"),
   acceptedEventSchemaDigests: nonEmpty([
     "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b",
@@ -33,10 +33,10 @@ export const CORE_PRODUCT_RELEASE_CONTRACT = Object.freeze({
   releaseVersion: "0.1.10",
   mutationMajor: 2,
   acceptedOpenApiDigests: nonEmpty([
-    "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b",
+    "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86",
   ], "a Core v2 OpenAPI digest"),
   acceptedEventSchemaDigests: nonEmpty([
-    "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df",
+    "0e5465c110fd42964f53f076a4bbeed55e899b27f235b5e26c3d478356c5b7d2",
   ], "a Core v2 event schema digest"),
   requiredFeatureFlags: Object.freeze([
     "atomic_successor_v2",

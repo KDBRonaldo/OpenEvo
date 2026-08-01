@@ -609,7 +609,9 @@ class CoreControlProviderV2:
     def _capabilities(self, arguments: Mapping[str, object]) -> object:
         _keys(arguments, "execution_mode")
         execution_mode = _string(arguments["execution_mode"])
-        if execution_mode != "codex_subscription_transcript":
+        try:
+            profile = execution_profile_for_release_mode(execution_mode)
+        except ValueError as exc:
             raise _http_error(
                 503,
                 code="execution_mode_unavailable",
@@ -617,10 +619,10 @@ class CoreControlProviderV2:
                 category="project",
                 retryable=False,
                 repair_action="unsupported",
-            )
+            ) from exc
         return build_evolution_capabilities(
             self._registry.snapshot,
-            profile=execution_profile_for_release_mode(execution_mode),
+            profile=profile,
             audience=CapabilityAudience.DESKTOP,
             core_version=self._release_version,
         )

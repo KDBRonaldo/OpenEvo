@@ -830,6 +830,75 @@ describe("Desktop v2 product renderer", () => {
     expect(cleanupCaches).toHaveBeenCalledWith(expect.objectContaining({ streamEpoch: 1 }));
   });
 
+  it("creates a project with the release-owned Self-Deployed execution profile", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const createProject = vi.fn(async () => ({
+      schema_version: "2" as const,
+      operation_id: "project-create-self-deployed-1",
+      kind: "project_create" as const,
+      resource: { resource_kind: "project" as const, resource_id: "project-pending-1" },
+      request_sha256: DIGEST,
+      status: "queued" as const,
+      phase: "queued" as const,
+      phase_index: 1,
+      phase_total: 17,
+      progress: { kind: "indeterminate" as const },
+      cancellable: true,
+      result: null,
+      failure: null,
+      log_sequence_high_watermark: 0,
+      created_at: NOW,
+      started_at: null,
+      updated_at: NOW,
+      finished_at: null,
+      etag: ETAG,
+    }));
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      createProject,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    await click("Self-Deployed");
+    expect(document.body.textContent).toContain("Qwen3 0.6B");
+    setTextarea("Task objective", "Run this task through the managed local model.");
+    await click("Create project");
+
+    expect(createProject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          execution: {
+            mode: "self-deployed",
+            capture_mode: "transcript",
+            token_level_metrics_available: false,
+            harness_id: "codex",
+            model_profile_id: "qwen3-0.6b-v1",
+            token_limit: 8_192,
+            task_network_allow_internet: true,
+          },
+        }),
+      }),
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
   it("closes project setup after HTTP 202 while progress and logs stay visible", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));

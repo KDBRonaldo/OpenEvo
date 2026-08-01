@@ -2979,7 +2979,7 @@ def _page_query(
 
 
 def _execution_mode(value: object) -> str:
-    if value not in {"codex_subscription_transcript", "self_deployed"}:
+    if value not in {"codex_subscription_transcript", "self-deployed"}:
         _raise_local(CoreClientLocalErrorCodeV2.INVALID_REQUEST, 400)
     return cast(str, value)
 

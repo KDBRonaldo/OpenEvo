@@ -388,4 +388,32 @@ describe("Desktop Local API v2 schemas", () => {
       task: { ...config.task, objective: "Analyze\u0000hidden" },
     })).toThrow();
   });
+
+  it("accepts only the release-owned Self-Deployed model profile", () => {
+    const config = {
+      schema_version: "2",
+      task: { title: "Local inference", objective: "Solve the task through Core Gateway." },
+      workspace: { kind: "scratch", display_name: "Self-Deployed workspace" },
+      execution: {
+        mode: "self-deployed",
+        capture_mode: "transcript",
+        token_level_metrics_available: false,
+        harness_id: "codex",
+        model_profile_id: "qwen3-0.6b-v1",
+        token_limit: 8_192,
+        task_network_allow_internet: false,
+      },
+      evolution: { targets: {} },
+    };
+
+    expect(scienceProjectConfigV2Schema.parse(config).execution.mode).toBe("self-deployed");
+    expect(() => scienceProjectConfigV2Schema.parse({
+      ...config,
+      execution: { ...config.execution, model_profile_id: "Qwen/Qwen3-0.6B" },
+    })).toThrow();
+    expect(() => scienceProjectConfigV2Schema.parse({
+      ...config,
+      execution: { ...config.execution, hf_model: "Qwen/Qwen3-0.6B" },
+    })).toThrow();
+  });
 });
