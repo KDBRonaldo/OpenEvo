@@ -1282,6 +1282,14 @@ class DesktopProviderStoreV2:
                 raise ProviderConflictV2("only a running lifecycle operation can advance")
             if not hmac.compare_digest(current.etag, validated.expected_etag):
                 raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
+            if current.kind == "profile_disconnect" and validated.cancellable:
+                raise ProviderPreconditionFailedV2(
+                    "profile disconnect cancellation barrier cannot reopen"
+                )
+            if not current.cancellable and validated.cancellable:
+                raise ProviderPreconditionFailedV2(
+                    "lifecycle cancellation barrier cannot reopen"
+                )
             next_phase_index = m.LIFECYCLE_PHASES.index(validated.phase)
             if next_phase_index < current.phase_index:
                 raise ProviderPreconditionFailedV2("lifecycle phase cannot regress")
@@ -1573,8 +1581,17 @@ class DesktopProviderStoreV2:
                 raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
             if current.status != "running":
                 raise ProviderConflictV2("only a running lifecycle operation can finish")
+            if current.kind == "profile_disconnect" and validated.status == "cancelled":
+                raise ProviderPreconditionFailedV2(
+                    "profile disconnect cannot finish as cancelled"
+                )
+            cancellation_requested = cast(int, row["cancellation_requested"]) == 1
+            if validated.status == "cancelled" and not cancellation_requested:
+                raise ProviderPreconditionFailedV2(
+                    "lifecycle cancellation was not requested"
+                )
             if (
-                cast(int, row["cancellation_requested"]) == 1
+                cancellation_requested
                 and validated.status != "cancelled"
             ):
                 raise ProviderPreconditionFailedV2(
@@ -4193,6 +4210,10 @@ class DesktopProviderStoreV2:
             raise ProviderDataV2Error("queued lifecycle operation requests cancellation")
         if row["status"] == "cancelled" and not row["cancellation_requested"]:
             raise ProviderDataV2Error("cancelled lifecycle operation lacks cancellation intent")
+        if row["cancellation_requested"] and row["cancellable"]:
+            raise ProviderDataV2Error(
+                "lifecycle cancellation intent remained cancellable"
+            )
 
         try:
             resource = _LIFECYCLE_RESOURCE_ADAPTER.validate_python(

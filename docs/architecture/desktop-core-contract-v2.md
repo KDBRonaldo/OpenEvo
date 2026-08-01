@@ -235,8 +235,12 @@ mutation barrier; after that barrier it returns a typed conflict instead of
 reporting an already-applied external mutation as cancelled. Profile disconnect
 crosses its generation and Core-authority invalidation barrier atomically with
 reservation, so queued and running disconnect authority is non-cancellable. One
-nonterminal lifecycle operation may own a given local resource at a time. Once
-cancellation is durably accepted it wins every later success/failure terminal race; an
+nonterminal lifecycle operation may own a given local resource at a time. A
+non-cancellable barrier is monotonic and cannot be reopened by a later phase
+update. Recovery requires exactly one canonical cancellation record iff the
+operation carries cancellation intent, and cancellation intent cannot coexist
+with `cancellable=true`. Once cancellation is durably accepted it wins every
+later success/failure terminal race; an
 ambiguous renderer response is replayed with the original action ID against the
 latest observed operation ETag without creating another lifecycle authority.
 If that replay loses a concurrent ETag race, renderer refreshes once and retries

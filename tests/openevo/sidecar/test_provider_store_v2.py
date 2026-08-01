@@ -1390,7 +1390,8 @@ def test_running_profile_cancellation_atomically_overrides_same_generation_failu
 def test_running_lifecycle_cancellation_replays_with_the_latest_etag(
     tmp_path: Path,
 ) -> None:
-    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
     queued = store.reserve_lifecycle_operation(
         _project_reservation("project-cancel-replay"),
         idempotency_key="cancel-replay-project-create-0001",
@@ -1411,7 +1412,22 @@ def test_running_lifecycle_cancellation_replays_with_the_latest_etag(
         )
         == requested
     )
+    with pytest.raises(
+        store_module.ProviderConflictV2,
+        match="not safely cancellable",
+    ):
+        store.request_lifecycle_cancellation(
+            queued.operation_id,
+            if_match=requested.etag,
+            idempotency_key="cancel-replay-distinct-action-0002",
+        )
     store.close()
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM lifecycle_idempotency_records "
+            "WHERE action = 'cancel' AND operation_id = ?",
+            (queued.operation_id,),
+        ).fetchone() == (1,)
 
 
 @pytest.mark.parametrize("digest_kind", ["forged", "legacy_if_match"])
@@ -1496,6 +1512,37 @@ def test_lifecycle_cancellation_record_requires_matching_operation_state(
         DesktopProviderStoreV2(root, clock=_Clock())
 
 
+def test_recovery_rejects_cancellation_intent_that_remains_cancellable(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation("project-invalid-cancellation-flags"),
+        idempotency_key="invalid-cancel-flags-project-create-0001",
+    )
+    running = store.claim_next_lifecycle_operation()
+    assert running is not None
+    store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=running.operation.etag,
+        idempotency_key="invalid-cancel-flags-request-0001",
+    )
+    store.close()
+
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        connection.execute(
+            "UPDATE lifecycle_operations SET cancellable = 1 WHERE operation_id = ?",
+            (queued.operation_id,),
+        )
+
+    with pytest.raises(
+        store_module.ProviderDataV2Error,
+        match="cancellation intent remained cancellable",
+    ):
+        DesktopProviderStoreV2(root, clock=_Clock())
+
+
 def test_profile_disconnect_reservation_is_an_atomic_non_cancellable_barrier(
     tmp_path: Path,
 ) -> None:
@@ -1546,6 +1593,19 @@ def test_profile_disconnect_reservation_is_an_atomic_non_cancellable_barrier(
     assert running.operation.operation_id == disconnect.operation_id
     assert running.operation.cancellable is False
     with pytest.raises(
+        store_module.ProviderPreconditionFailedV2,
+        match="disconnect cancellation barrier",
+    ):
+        store.advance_lifecycle_operation(
+            store_module.LifecycleOperationAdvanceV2(
+                operation_id=running.operation.operation_id,
+                expected_etag=running.operation.etag,
+                phase="connecting",
+                progress={"kind": "indeterminate"},
+                cancellable=True,
+            )
+        )
+    with pytest.raises(
         store_module.ProviderConflictV2,
         match="not safely cancellable",
     ):
@@ -1554,6 +1614,58 @@ def test_profile_disconnect_reservation_is_an_atomic_non_cancellable_barrier(
             if_match=running.operation.etag,
             idempotency_key="disconnect-barrier-running-cancel-0001",
         )
+    with pytest.raises(
+        store_module.ProviderPreconditionFailedV2,
+        match="disconnect cannot finish as cancelled",
+    ):
+        store.finish_lifecycle_operation(
+            store_module.LifecycleOperationCompletionV2(
+                operation_id=running.operation.operation_id,
+                expected_etag=running.operation.etag,
+                status="cancelled",
+                result=None,
+                failure=None,
+            )
+        )
+    assert store.get_lifecycle_operation(disconnect.operation_id) == running.operation
+    assert store.get_profile(connected.profile_id) == transitioned
+    store.close()
+
+
+def test_lifecycle_non_cancellable_barrier_cannot_reopen(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation("project-monotonic-cancellation-barrier"),
+        idempotency_key="monotonic-barrier-project-create-0001",
+    )
+    running = store.claim_next_lifecycle_operation()
+    assert running is not None
+    barrier = store.advance_lifecycle_operation(
+        store_module.LifecycleOperationAdvanceV2(
+            operation_id=queued.operation_id,
+            expected_etag=running.operation.etag,
+            phase="activating",
+            progress={"kind": "indeterminate"},
+            cancellable=False,
+        )
+    )
+
+    with pytest.raises(
+        store_module.ProviderPreconditionFailedV2,
+        match="cannot reopen",
+    ):
+        store.advance_lifecycle_operation(
+            store_module.LifecycleOperationAdvanceV2(
+                operation_id=queued.operation_id,
+                expected_etag=barrier.etag,
+                phase="finalizing",
+                progress={"kind": "indeterminate"},
+                cancellable=True,
+            )
+        )
+    assert store.get_lifecycle_operation(queued.operation_id) == barrier
     store.close()
 
 
