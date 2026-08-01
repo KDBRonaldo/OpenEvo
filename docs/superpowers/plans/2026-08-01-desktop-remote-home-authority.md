@@ -104,7 +104,7 @@ git push origin HEAD:stable
 - Modify: `desktop/sidecar/system_ssh_session.py`
 - Modify: `tests/openevo/sidecar/test_system_ssh_session.py`
 
-- [ ] **Step 1: Write failing tests for unobserved private discovery**
+- [x] **Step 1: Write failing tests for unobserved private discovery**
 
 Extend the injected test runner to return controlled byte stdout/stderr/status. Prove that `discover_remote_home_authority` sends exactly the fixed probe through the owned master, binds snapshot profile/generation, and never forwards private stdout or stderr to the lifecycle observer on either injected or production runner paths. Prove the production runner receives `output_observer=None` plus an exact 8 KiB aggregate cap, while ordinary `run()` and follower output stay observed.
 
@@ -119,25 +119,25 @@ SystemOpenSshSessionError(
 
 The exception representation and chain must contain no raw probe data.
 
-- [ ] **Step 2: Observe RED**
+- [x] **Step 2: Observe RED**
 
 ```bash
 uv run pytest -q tests/openevo/sidecar/test_system_ssh_session.py -k 'remote_home or private_discovery or output_observer'
 ```
 
-- [ ] **Step 3: Add per-call bounded capture and discovery**
+- [x] **Step 3: Add per-call bounded capture and discovery**
 
 Change `_run_bounded_subprocess`, `_run_verified_bounded_subprocess`, and `_collect_bounded_process` to accept `max_capture_bytes` with the existing 4 MiB default. Change `_run_session_subprocess` to accept keyword-only `observe_output: bool = True` and `max_capture_bytes`; skip notification on the private call and enforce the limit on injected-runner return bytes too.
 
 Add `SystemOpenSshSession.discover_remote_home_authority(timeout_seconds=30.0)`. It snapshots first, runs `build_remote_home_probe_command()` with observation disabled and the 8 KiB cap, then calls `parse_remote_home_probe` with snapshot profile/generation. Catch parser, timeout, bounded-output, and runner-shape errors and replace them with the exact sanitized session error using `from None`. Keep master startup diagnostics and normal commands on the observed path.
 
-- [ ] **Step 4: Run the full session test file**
+- [x] **Step 4: Run the full session test file**
 
 ```bash
 uv run pytest -q tests/openevo/sidecar/test_system_ssh_session.py
 ```
 
-- [ ] **Step 5: Commit and push**
+- [x] **Step 5: Commit and push**
 
 ```bash
 git add desktop/sidecar/system_ssh_session.py tests/openevo/sidecar/test_system_ssh_session.py

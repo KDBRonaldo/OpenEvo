@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections.abc import Callable
 from dataclasses import replace
 import hashlib
 import io
@@ -11,6 +12,7 @@ import socket
 import stat
 import struct
 import subprocess
+import sys
 import tempfile
 
 import pytest
@@ -32,6 +34,10 @@ from openevo.deployment.host_keys import (
     SystemHostKeyReviewAuthority,
     classify_system_openssh_host_key_failure,
     inspect_system_known_hosts_policy,
+)
+from openevo.deployment.remote_home import (
+    REMOTE_HOME_PROBE_OUTPUT_LIMIT,
+    build_remote_home_probe_command,
 )
 from openevo.deployment.ssh import (
     SystemOpenSshAskpassEnvironment,
@@ -145,6 +151,10 @@ class _Runner:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, str], float]] = []
         self.return_code = 0
+        self.stdout: bytes | object = b""
+        self.stderr: bytes | object = b""
+        self.error: BaseException | None = None
+        self.after_call: Callable[[], None] | None = None
 
     def __call__(
         self,
@@ -153,7 +163,17 @@ class _Runner:
         timeout_seconds: float,
     ) -> subprocess.CompletedProcess[bytes]:
         self.calls.append((list(argv), dict(environment), timeout_seconds))
-        return subprocess.CompletedProcess(argv, self.return_code, b"", b"")
+        if self.error is not None:
+            raise self.error
+        completed = subprocess.CompletedProcess(
+            argv,
+            self.return_code,
+            self.stdout,  # type: ignore[arg-type]
+            self.stderr,  # type: ignore[arg-type]
+        )
+        if self.after_call is not None:
+            self.after_call()
+        return completed
 
 
 def _helper(tmp_path: Path) -> AskpassHelperAuthority:
@@ -190,6 +210,7 @@ def _session(
     generation: int = 1,
     process_id: int = 901,
     profile: SystemOpenSshAliasProfile | None = None,
+    use_default_runner: bool = False,
 ) -> tuple[SystemOpenSshSession, _FakeProcess, _Inspector, _Launcher, _Runner]:
     identity = ProcessIdentity(
         process_id=process_id,
@@ -214,11 +235,24 @@ def _session(
         runtime_parent=tmp_path,
         inspector=inspector,
         launcher=launcher,
-        runner=runner,
+        runner=None if use_default_runner else runner,
         startup_timeout_seconds=1.0,
         cleanup_timeout_seconds=0.2,
     )
     return session, process, inspector, launcher, runner
+
+
+def _remote_home_record(
+    *,
+    user: str = "researcher",
+    uid: int = 1001,
+    home: str = "/srv/research/alice",
+) -> bytes:
+    return (
+        "openevo-remote-home-v1\n"
+        f"{user}\n{uid}\n{user}\n{uid}\n"
+        f"{home}\n{home}\n{uid}\n1\n"
+    ).encode("utf-8")
 
 
 def test_session_owns_private_runtime_master_and_exact_socket_identity(
@@ -301,6 +335,179 @@ def test_all_followers_reuse_only_the_exact_owned_socket(short_tmp_path: Path) -
     finally:
         session.close()
         launcher.close_socket()
+
+
+def test_injected_runner_keeps_account_discovery_private_but_observes_normal_run(
+    short_tmp_path: Path,
+) -> None:
+    observed: list[tuple[str, bytes]] = []
+    session, _process, _inspector, launcher, runner = _session(short_tmp_path)
+    session.set_output_observer(lambda source, chunk: observed.append((source, chunk)))
+    try:
+        session.start()
+        runner.stdout = _remote_home_record()
+
+        authority = session.discover_remote_home_authority(timeout_seconds=2.0)
+
+        assert authority.profile_id == "profile-1"
+        assert authority.connection_generation == 1
+        assert authority.remote_user == "researcher"
+        assert authority.workspace_root == "/srv/research/alice/.openevo/workspaces"
+        assert runner.calls[-1][0][-1] == build_remote_home_probe_command()
+        assert observed == []
+
+        runner.stdout = b"ordinary stdout\n"
+        runner.stderr = b"ordinary stderr\n"
+        result = session.run("printf ordinary", timeout_seconds=2.0)
+
+        assert result.stdout == "ordinary stdout\n"
+        assert result.stderr == "ordinary stderr\n"
+        assert observed == [
+            ("ssh_stdout", b"ordinary stdout\n"),
+            ("ssh_stderr", b"ordinary stderr\n"),
+        ]
+    finally:
+        runner.stdout = b""
+        runner.stderr = b""
+        session.close()
+        launcher.close_socket()
+
+
+@pytest.mark.parametrize(
+    ("return_code", "stdout", "stderr", "error"),
+    [
+        (1, _remote_home_record(), b"", None),
+        (0, _remote_home_record(), b"private remote stderr", None),
+        (0, b"x" * (REMOTE_HOME_PROBE_OUTPUT_LIMIT + 1), b"", None),
+        (0, "not bytes", b"", None),
+        (0, b"", b"", subprocess.TimeoutExpired("private probe", 1.0)),
+    ],
+    ids=("nonzero", "stderr", "over-budget", "wrong-type", "timeout"),
+)
+def test_injected_discovery_failure_is_sanitized_and_never_observed(
+    short_tmp_path: Path,
+    return_code: int,
+    stdout: object,
+    stderr: object,
+    error: BaseException | None,
+) -> None:
+    observed: list[tuple[str, bytes]] = []
+    session, _process, _inspector, launcher, runner = _session(short_tmp_path)
+    session.set_output_observer(lambda source, chunk: observed.append((source, chunk)))
+    try:
+        session.start()
+        runner.return_code = return_code
+        runner.stdout = stdout
+        runner.stderr = stderr
+        runner.error = error
+
+        with pytest.raises(SystemOpenSshSessionError) as captured:
+            session.discover_remote_home_authority(timeout_seconds=2.0)
+
+        assert captured.value.code == "ssh_remote_account_unavailable"
+        assert str(captured.value) == "The remote SSH account could not be verified."
+        assert captured.value.__cause__ is None
+        rendered = repr(captured.value)
+        assert "private remote stderr" not in rendered
+        assert "/srv/research/alice" not in rendered
+        assert "private probe" not in rendered
+        assert observed == []
+    finally:
+        runner.return_code = 0
+        runner.stdout = b""
+        runner.stderr = b""
+        runner.error = None
+        session.close()
+        launcher.close_socket()
+
+
+def test_discovery_rechecks_owned_master_after_private_probe(
+    short_tmp_path: Path,
+) -> None:
+    session, _process, inspector, launcher, runner = _session(short_tmp_path)
+    original_identity = inspector.identity
+    try:
+        session.start()
+        runner.stdout = _remote_home_record()
+        runner.after_call = lambda: setattr(
+            inspector,
+            "identity",
+            replace(original_identity, birth_identity="reused-after-probe"),
+        )
+
+        with pytest.raises(SystemOpenSshSessionError) as captured:
+            session.discover_remote_home_authority(timeout_seconds=2.0)
+
+        assert captured.value.code == "ssh_remote_account_unavailable"
+        assert str(captured.value) == "The remote SSH account could not be verified."
+    finally:
+        runner.after_call = None
+        runner.stdout = b""
+        inspector.identity = original_identity
+        session.close()
+        launcher.close_socket()
+
+
+def test_default_runner_discovery_uses_private_eight_kib_capture(
+    short_tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, bytes]] = []
+    calls: list[tuple[list[str], object, int]] = []
+
+    def bounded_run(
+        argv: list[str],
+        environment: dict[str, str],
+        timeout_seconds: float,
+        *,
+        output_observer=None,
+        max_capture_bytes: int = session_module._MAX_CAPTURE_BYTES,
+    ) -> subprocess.CompletedProcess[bytes]:
+        del environment, timeout_seconds
+        calls.append((list(argv), output_observer, max_capture_bytes))
+        stdout = (
+            _remote_home_record()
+            if argv[-1] == build_remote_home_probe_command()
+            else b""
+        )
+        return subprocess.CompletedProcess(argv, 0, stdout, b"")
+
+    monkeypatch.setattr(session_module, "_run_bounded_subprocess", bounded_run)
+    session, _process, _inspector, launcher, _runner = _session(
+        short_tmp_path,
+        use_default_runner=True,
+    )
+    session.set_output_observer(lambda source, chunk: observed.append((source, chunk)))
+    try:
+        session.start()
+        authority = session.discover_remote_home_authority(timeout_seconds=2.0)
+
+        assert authority.daemon_bundle_root == (
+            "/srv/research/alice/.openevo/daemon-bundles"
+        )
+        assert calls[-1][0][-1] == build_remote_home_probe_command()
+        assert calls[-1][1] is None
+        assert calls[-1][2] == REMOTE_HOME_PROBE_OUTPUT_LIMIT
+        assert observed == []
+    finally:
+        session.close()
+        launcher.close_socket()
+
+
+def test_bounded_runner_enforces_a_private_per_call_capture_limit() -> None:
+    with pytest.raises(SystemOpenSshSessionError) as captured:
+        session_module._run_bounded_subprocess(
+            [
+                sys.executable,
+                "-c",
+                "import os; os.write(1, b'12345')",
+            ],
+            {},
+            2.0,
+            max_capture_bytes=4,
+        )
+
+    assert captured.value.code == "ssh_output_limit_exceeded"
 
 
 def test_pid_reuse_or_control_socket_replacement_poison_the_session(
