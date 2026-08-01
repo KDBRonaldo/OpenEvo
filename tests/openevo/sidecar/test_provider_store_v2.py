@@ -375,6 +375,148 @@ def test_disconnect_and_process_restart_preserve_the_reconnect_project_binding(
         reopened.close()
 
 
+def test_restart_quarantines_a_profile_with_unproven_ssh_cleanup(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=7,
+        idempotency_key="cleanup-quarantine-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=created.connection_generation
+        ),
+        action="connect",
+        resource_generation=created.connection_generation,
+        if_match=created.etag,
+        idempotency_key="cleanup-quarantine-profile-connect-001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    queued = store.reserve_lifecycle_operation(
+        _disconnect_reservation(connected),
+        idempotency_key="cleanup-quarantine-disconnect-0001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    assert work.operation.operation_id == queued.operation_id
+    cleanup_failure = contract_models.DesktopErrorV2(
+        code="ssh_cleanup_failed",
+        summary="The system OpenSSH connection could not be closed safely.",
+        retryable=True,
+        action="retry",
+        affected_resource_id=created.profile_id,
+    )
+    failed_profile = store.fail_profile_disconnect(
+        created.profile_id,
+        connection_generation=connected.connection_generation + 1,
+        failure=cleanup_failure,
+    )
+    assert failed_profile.connection_state == "failed"
+    terminal = store.finish_lifecycle_operation(
+        store_module.LifecycleOperationCompletionV2(
+            operation_id=work.operation.operation_id,
+            expected_etag=work.operation.etag,
+            status="failed",
+            result=None,
+            failure=cleanup_failure,
+        )
+    )
+    assert terminal.status == "failed"
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        recovered = reopened.reconcile_process_restart()
+        assert [item.profile_id for item in recovered] == [created.profile_id]
+        quarantined = reopened.get_profile(created.profile_id)
+        assert quarantined.connection_state == "failed"
+        assert quarantined.connection_generation == failed_profile.connection_generation + 1
+        assert quarantined.failure == contract_models.DesktopErrorV2(
+            code="ssh_cleanup_authority_lost",
+            summary=(
+                "Desktop cannot prove that the previous system OpenSSH master stopped."
+            ),
+            retryable=False,
+            action="administrator_action",
+            affected_resource_id=created.profile_id,
+        )
+        with pytest.raises(store_module.ProviderConflictV2, match="cleanup authority"):
+            reopened.reserve_lifecycle_operation(
+                _disconnect_reservation(quarantined),
+                idempotency_key="cleanup-quarantine-disconnect-0002",
+            )
+        with pytest.raises(store_module.ProviderConflictV2, match="cleanup authority"):
+            reopened.begin_profile_action(
+                quarantined.profile_id,
+                ProfileConnectionActionV2(
+                    expected_connection_generation=quarantined.connection_generation
+                ),
+                action="connect",
+                resource_generation=quarantined.connection_generation,
+                if_match=quarantined.etag,
+                idempotency_key="cleanup-quarantine-connect-direct-0001",
+            )
+        assert reopened.reconcile_process_restart() == ()
+        assert reopened.get_profile(created.profile_id) == quarantined
+    finally:
+        reopened.close()
+
+
+def test_restart_quarantines_an_interrupted_running_profile_disconnect(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=7,
+        idempotency_key="running-cleanup-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(expected_connection_generation=1),
+        action="connect",
+        resource_generation=1,
+        if_match=created.etag,
+        idempotency_key="running-cleanup-profile-connect-0001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    queued = store.reserve_lifecycle_operation(
+        _disconnect_reservation(connected),
+        idempotency_key="running-cleanup-disconnect-0001",
+    )
+    running = store.claim_next_lifecycle_operation()
+    assert running is not None
+    assert running.operation.operation_id == queued.operation_id
+    assert running.operation.status == "running"
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        recovered = reopened.reconcile_process_restart()
+        assert [item.profile_id for item in recovered] == [created.profile_id]
+        quarantined = reopened.get_profile(created.profile_id)
+        assert quarantined.connection_state == "failed"
+        assert quarantined.failure is not None
+        assert quarantined.failure.code == "ssh_cleanup_authority_lost"
+        assert quarantined.failure.action == "administrator_action"
+        assert quarantined.connection_generation == connected.connection_generation + 2
+    finally:
+        reopened.close()
+
+
 def test_native_prompt_observation_is_generation_bound_and_never_persists_text(
     tmp_path: Path,
 ) -> None:

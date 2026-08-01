@@ -127,6 +127,13 @@ changed keys, master reuse, ambient-agent/master isolation, cancellation, and
 complete process/socket cleanup. The emitted evidence is a closed boolean
 summary and never contains fixture paths or response values.
 
+Focused sidecar fault tests additionally force the owned master and askpass
+worker to outlive their first cleanup deadline. They require the session owner
+and rich transport to retain the same authority for a later action, require a
+fresh disconnect action to finish without repeating completed cleanup phases,
+and require restart recovery of failed or running disconnect work to persist
+`ssh_cleanup_authority_lost` instead of `disconnected`.
+
 The hermetic local-`sshd` fixture supplies its generated SSH config with a
 test-only `-F` adapter after separately asserting that the production plans are
 the unchanged alias-only builders. Product code never uses that adapter: the

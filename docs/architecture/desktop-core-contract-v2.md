@@ -106,6 +106,13 @@ process group, socket identity, alias, and generation and never adopts an
 ambient master. Cancellation, replacement, disconnect, or app shutdown closes
 and reaps the generation within a hard deadline.
 
+The cleanup deadline is not a success boundary. If the master has not been
+reaped, the session remains cleanup-only and unavailable to followers, while
+the session owner and rich transport retain it for a later disconnect action.
+Completed transport/session cleanup phases are monotonic, so retry does not
+discard or repeat an already completed phase. Only proof of full cleanup may
+retire that authority.
+
 After that master authenticates, the sidecar privately discovers the effective
 `id` username and UID plus the single matching `getent passwd <uid>` home. It
 requires the NSS name/UID to match `id`, the home to be a normalized safe
@@ -263,6 +270,14 @@ pending profile lifecycle operation is resumed instead of duplicated, and an
 explicitly disconnected profile is never inferred to be restart-owned. A parent
 with durable cancellation intent is never eligible to create a reconnect
 prerequisite.
+
+A restart cannot adopt an un-reaped master whose private in-memory cleanup
+authority was lost. A `disconnecting` profile, or a profile carrying
+`ssh_cleanup_failed`, is atomically advanced to a persistent failed generation
+with `ssh_cleanup_authority_lost`, `retryable=false`, and
+`administrator_action`. This quarantine survives subsequent restarts, blocks
+connect/disconnect mutation, and prevents a resumed lifecycle operation from
+turning absence of an in-process handle into false disconnect success.
 
 ## Core Control API v2 Identity Model
 

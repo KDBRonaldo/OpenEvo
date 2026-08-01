@@ -78,6 +78,38 @@ def test_process_identity_accepts_posix_session_one_and_rejects_zero() -> None:
         )
 
 
+def test_broker_close_retries_until_its_worker_is_proven_stopped(
+    runtime_dir: Path,
+) -> None:
+    broker = AskpassAuthorizationBroker(
+        runtime_dir / "a",
+        helper_path="/Applications/OpenEvo Desktop.app/Contents/MacOS/openevo-ssh-askpass",
+        inspector=_Inspector({}),
+    )
+
+    class RetryableThread:
+        def __init__(self) -> None:
+            self.join_calls = 0
+
+        def join(self, _timeout: float) -> None:
+            self.join_calls += 1
+
+        def is_alive(self) -> bool:
+            return self.join_calls == 1
+
+    worker = RetryableThread()
+    broker._thread = worker  # type: ignore[assignment]
+
+    with pytest.raises(AskpassBrokerError, match="did not stop"):
+        broker.close()
+
+    with pytest.raises(AskpassBrokerError, match="closed"):
+        broker.start()
+    broker.close()
+    broker.close()
+    assert worker.join_calls == 2
+
+
 def _request(
     *,
     capability: str,

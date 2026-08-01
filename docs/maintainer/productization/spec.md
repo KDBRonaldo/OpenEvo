@@ -403,6 +403,14 @@ multiplexing socket, forwarding, TTY, and deadlines. It MUST NOT use
 `-F /dev/null`, select an authentication method, override identity or route
 configuration, or replace user known-host policy with an OpenEvo store.
 
+Desktop MUST report disconnect success only after the exact owned OpenSSH
+master has exited and its private session resources are closed. A bounded
+cleanup failure retains the same process/session authority for a new idempotent
+disconnect action in the same sidecar process. If a process restart destroys
+that retry authority before cleanup is proven, the profile remains failed with
+a typed non-retryable administrator action; restart reconciliation MUST NOT
+project it as disconnected or create a replacement connection.
+
 A changed host key MUST block connection until the user explicitly reviews and
 accepts the new identity. Desktop MUST NOT silently replace a user trust record.
 Automated repair is permitted only when Desktop proves one ordinary writable

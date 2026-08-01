@@ -168,6 +168,8 @@ class FakeTransport:
         self.advance = advance
         self.commands: list[tuple[str, float]] = []
         self.closed = False
+        self.close_calls = 0
+        self.close_errors: list[BaseException] = []
 
     def run(
         self,
@@ -188,6 +190,9 @@ class FakeTransport:
         return RemoteCommandResult(command=command, return_code=self.return_code)
 
     def close(self) -> None:
+        self.close_calls += 1
+        if self.close_errors:
+            raise self.close_errors.pop(0)
         self.closed = True
 
 
@@ -618,6 +623,7 @@ class _SystemSessionOwner:
         self.cancel_events: list[Event | None] = []
         self.sessions: list[_SystemSession] = []
         self.disconnects = 0
+        self.disconnect_errors: list[BaseException] = []
         self.prompt_observer: Callable[[AskpassPromptObservation], None] | None = None
         self.output_observer: LifecycleRawOutputObserverV2 | None = None
 
@@ -657,6 +663,8 @@ class _SystemSessionOwner:
 
     def disconnect(self) -> None:
         self.disconnects += 1
+        if self.disconnect_errors:
+            raise self.disconnect_errors.pop(0)
         self.active = None
 
     close = disconnect
@@ -738,6 +746,38 @@ def test_v2_lifecycle_uses_literal_alias_and_verified_remote_home_authority() ->
     lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
     assert transport.closed
     assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_retries_the_same_cleanup_authority_after_failure() -> None:
+    owner = _SystemSessionOwner()
+    transport = _SystemTransport()
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: transport,
+    )
+    profile = _system_profile()
+    lifecycle.connect(profile)
+    owner.disconnect_errors.append(
+        SystemOpenSshSessionError(
+            "ssh_cleanup_failed",
+            "SSH master did not stop before its deadline.",
+        )
+    )
+
+    with pytest.raises(SystemOpenSshSessionError, match="did not stop"):
+        lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
+
+    assert transport.close_calls == 1
+    assert owner.active is not None
+    with pytest.raises(RemoteConnectionFailedError, match="not connected"):
+        lifecycle.active_transport(profile.profile_id, profile.connection_generation)
+
+    lifecycle.disconnect(profile.profile_id, profile.connection_generation + 2)
+
+    assert transport.close_calls == 1
+    assert owner.disconnects == 2
+    assert owner.active is None
 
 
 def test_v2_lifecycle_forwards_exact_connection_cancellation_authority() -> None:

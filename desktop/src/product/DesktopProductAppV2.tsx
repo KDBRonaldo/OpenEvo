@@ -634,6 +634,10 @@ function ProfileSetupCardV2({
     );
   }
   const trust = profile.trust;
+  const cleanupRetryable = profile.connection_state === "failed"
+    && profile.failure?.code === "ssh_cleanup_failed";
+  const cleanupAuthorityLost = profile.connection_state === "failed"
+    && profile.failure?.code === "ssh_cleanup_authority_lost";
   return (
     <article className="v2-profile-card">
       <div className="v2-profile-card-head"><div><strong>{profile.display_name}</strong><span><code>{profile.ssh_host_alias}</code> · {connectionLabel(profile.connection_state)}</span></div><span className={`state-pill ${profile.connection_state}`}>{profile.connection_state.replaceAll("_", " ")}</span></div>
@@ -651,7 +655,15 @@ function ProfileSetupCardV2({
         </div>
       ) : (
         <div className="v2-card-actions">
-          {profile.connection_state === "connected" ? <button type="button" className="secondary-button" disabled={busy} onClick={() => void mutate(() => provider.disconnectProfile(profile.profile_id, intentFor(snapshot, "disconnect-profile")))}>Disconnect</button> : <button type="button" className="secondary-button" disabled={busy || ["connecting", "bootstrapping", "negotiating", "prompt_pending"].includes(profile.connection_state)} onClick={() => void mutate(() => provider.connectProfile(profile.profile_id, intentFor(snapshot, "connect-profile")))}>Connect</button>}
+          {profile.connection_state === "connected" ? (
+            <button type="button" className="secondary-button" disabled={busy} onClick={() => void mutate(() => provider.disconnectProfile(profile.profile_id, intentFor(snapshot, "disconnect-profile")))}>Disconnect</button>
+          ) : cleanupRetryable ? (
+            <button type="button" className="secondary-button" disabled={busy} onClick={() => void mutate(() => provider.disconnectProfile(profile.profile_id, intentFor(snapshot, "retry-disconnect-profile")))}>Retry disconnect</button>
+          ) : cleanupAuthorityLost ? (
+            <span>Administrator action is required before this workspace can reconnect.</span>
+          ) : (
+            <button type="button" className="secondary-button" disabled={busy || ["connecting", "bootstrapping", "negotiating", "prompt_pending"].includes(profile.connection_state)} onClick={() => void mutate(() => provider.connectProfile(profile.profile_id, intentFor(snapshot, "connect-profile")))}>Connect</button>
+          )}
         </div>
       )}
     </article>

@@ -188,6 +188,7 @@ class AskpassAuthorizationBroker:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._closed = False
+        self._closing = False
         self._authorized_prompt_count = 0
 
     @property
@@ -228,7 +229,7 @@ class AskpassAuthorizationBroker:
 
     def start(self) -> None:
         with self._guard:
-            if self._closed:
+            if self._closed or self._closing:
                 raise AskpassBrokerError("askpass broker is closed")
             if self._listener is not None:
                 raise AskpassBrokerError("askpass broker is already started")
@@ -250,7 +251,7 @@ class AskpassAuthorizationBroker:
             listener.listen(4)
             listener.settimeout(_BROKER_ACCEPT_INTERVAL_SECONDS)
             with self._guard:
-                if self._closed or self._listener is not None:
+                if self._closed or self._closing or self._listener is not None:
                     raise AskpassBrokerError("askpass broker start was superseded")
                 self._listener = listener
                 self._socket_identity = identity
@@ -278,7 +279,7 @@ class AskpassAuthorizationBroker:
     def issue_capability(self, *, connection_generation: int) -> AskpassCapability:
         _require_generation(connection_generation)
         with self._guard:
-            if self._closed or self._listener is None:
+            if self._closed or self._closing or self._listener is None:
                 raise AskpassBrokerError("askpass broker is unavailable")
             if self._record is not None:
                 raise AskpassBrokerError("askpass prompt capacity is exhausted")
@@ -307,6 +308,7 @@ class AskpassAuthorizationBroker:
             record = self._record
             if (
                 self._closed
+                or self._closing
                 or record is None
                 or record.cancelled
                 or record.consumed
@@ -349,13 +351,19 @@ class AskpassAuthorizationBroker:
             record = self._record
             if record is not None and record.owner is None and not record.cancelled:
                 deadline = time.monotonic() + _BROKER_BIND_WAIT_SECONDS
-                while record.owner is None and not record.cancelled and not self._closed:
+                while (
+                    record.owner is None
+                    and not record.cancelled
+                    and not self._closed
+                    and not self._closing
+                ):
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         break
                     self._bound.wait(remaining)
             if (
                 self._closed
+                or self._closing
                 or record is None
                 or record.owner is None
                 or record.cancelled
@@ -399,6 +407,7 @@ class AskpassAuthorizationBroker:
             record = self._record
             if (
                 self._closed
+                or self._closing
                 or record is None
                 or record.owner is None
                 or record.cancelled
@@ -447,6 +456,8 @@ class AskpassAuthorizationBroker:
 
     def verify_socket_binding(self) -> None:
         with self._guard:
+            if self._closed or self._closing:
+                raise AskpassBrokerError("askpass broker socket is unavailable")
             expected = self._socket_identity
         if expected is None:
             raise AskpassBrokerError("askpass broker socket is unavailable")
@@ -462,7 +473,7 @@ class AskpassAuthorizationBroker:
         with self._bound:
             if self._closed:
                 return
-            self._closed = True
+            self._closing = True
             self._stop.set()
             record = self._record
             if record is not None:
@@ -502,6 +513,9 @@ class AskpassAuthorizationBroker:
         _zero(self._hmac_key)
         if cleanup_failure is not None:
             raise cleanup_failure
+        with self._bound:
+            self._closed = True
+            self._closing = False
 
     def _derive_capability(self, generation: int, nonce: bytearray) -> str:
         message = _CAPABILITY_DOMAIN + str(generation).encode("ascii") + b"\0" + bytes(nonce)

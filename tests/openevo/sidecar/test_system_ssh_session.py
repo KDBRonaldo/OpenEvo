@@ -20,7 +20,11 @@ import time
 import pytest
 
 from desktop.sidecar import system_ssh_session as session_module
-from desktop.sidecar.askpass_broker import AskpassPromptObservation, ProcessIdentity
+from desktop.sidecar.askpass_broker import (
+    AskpassBrokerError,
+    AskpassPromptObservation,
+    ProcessIdentity,
+)
 from desktop.sidecar.system_ssh_session import (
     AskpassHelperAuthority,
     OwnedSshMasterProcess,
@@ -717,6 +721,76 @@ def test_close_escalates_to_kill_when_graceful_exit_does_not_reap(
     launcher.close_socket()
 
 
+def test_close_retains_cleanup_authority_until_owned_master_is_reaped(
+    short_tmp_path: Path,
+) -> None:
+    session, process, _inspector, launcher, runner = _session(short_tmp_path)
+    snapshot = session.start()
+
+    def ignore_terminate() -> None:
+        process.terminate_calls += 1
+
+    def ignore_kill() -> None:
+        process.kill_calls += 1
+
+    process.terminate = ignore_terminate  # type: ignore[method-assign]
+    process.kill = ignore_kill  # type: ignore[method-assign]
+    runner.return_code = 255
+
+    with pytest.raises(SystemOpenSshSessionError) as captured:
+        session.close()
+
+    assert captured.value.code == "ssh_cleanup_failed"
+    assert not session.closed
+    assert snapshot.runtime_directory.exists()
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    with pytest.raises(SystemOpenSshSessionError) as unavailable:
+        session.snapshot()
+    assert unavailable.value.code == "ssh_session_unavailable"
+
+    process.returncode = -9
+    session.close()
+
+    assert session.closed
+    assert not snapshot.runtime_directory.exists()
+    launcher.close_socket()
+
+
+def test_close_retains_runtime_until_askpass_worker_cleanup_is_proven(
+    short_tmp_path: Path,
+) -> None:
+    session, _process, _inspector, launcher, _runner = _session(short_tmp_path)
+    snapshot = session.start()
+    broker = session._broker
+    assert broker is not None
+    original_close = broker.close
+    close_calls = 0
+
+    def fail_once() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise AskpassBrokerError("askpass broker worker did not stop")
+        original_close()
+
+    broker.close = fail_once  # type: ignore[method-assign]
+
+    with pytest.raises(SystemOpenSshSessionError) as captured:
+        session.close()
+
+    assert captured.value.code == "ssh_askpass_broker_failed"
+    assert not session.closed
+    assert snapshot.runtime_directory.exists()
+
+    session.close()
+
+    assert session.closed
+    assert close_calls == 2
+    assert not snapshot.runtime_directory.exists()
+    launcher.close_socket()
+
+
 def test_reconnect_never_adopts_an_ambient_master(short_tmp_path: Path) -> None:
     tmp_path = short_tmp_path
     created: list[tuple[SystemOpenSshSession, _Launcher]] = []
@@ -1327,3 +1401,59 @@ def test_connection_owner_retries_once_after_first_host_acceptance() -> None:
         assert attempts[0].close_calls == 1  # type: ignore[attr-defined]
     finally:
         owner.close()
+
+
+def test_connection_owner_retains_session_when_disconnect_cleanup_fails() -> None:
+    snapshot = SystemOpenSshSessionSnapshot(
+        profile_id="profile-1",
+        ssh_host_alias="evolab",
+        connection_generation=8,
+        runtime_directory=Path("/tmp/owned-runtime"),
+        control_path=Path("/tmp/owned-runtime/m"),
+        owner_process_id=901,
+        owner_birth_identity="birth-901",
+        process_group_id=900,
+        session_id=800,
+        control_socket_device=1,
+        control_socket_inode=2,
+    )
+
+    class RetryableSession:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        def start(
+            self,
+            *,
+            cancel_event: threading.Event | None = None,
+        ) -> SystemOpenSshSessionSnapshot:
+            assert cancel_event is None
+            return snapshot
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise SystemOpenSshSessionError(
+                    "ssh_cleanup_failed",
+                    "SSH master did not stop before its deadline.",
+                )
+
+        def snapshot(self) -> SystemOpenSshSessionSnapshot:
+            return snapshot
+
+    session = RetryableSession()
+    owner = SystemOpenSshSessionOwner(
+        lambda _profile_value, _generation: session  # type: ignore[arg-type]
+    )
+    owner.connect(_profile(), connection_generation=8)
+
+    with pytest.raises(SystemOpenSshSessionError, match="did not stop"):
+        owner.disconnect()
+
+    assert owner.active_session() is session
+    owner.disconnect()
+    assert session.close_calls == 2
+    with pytest.raises(SystemOpenSshSessionError) as unavailable:
+        owner.active_session()
+    assert unavailable.value.code == "ssh_session_unavailable"
+    owner.close()

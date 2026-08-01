@@ -1984,6 +1984,14 @@ class DesktopProviderStoreV2:
                 if not isinstance(validated, m.HostKeyReviewRequestV2):
                     raise ProviderContractV2Error("host-key review request is invalid")
                 self._require_current_host_key_review(current, validated)
+            if (
+                current.connection_state == "failed"
+                and current.failure is not None
+                and current.failure.code == "ssh_cleanup_authority_lost"
+            ):
+                raise ProviderConflictV2(
+                    "profile cleanup authority was lost; administrator action is required"
+                )
             current_version = cast(int, row["resource_version"])
             if (
                 current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER
@@ -2335,6 +2343,63 @@ class DesktopProviderStoreV2:
             self._update_profile(connection, updated, version=version)
             return updated
 
+    def fail_profile_disconnect(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        failure: m.DesktopErrorV2,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Retain a failed disconnect generation until owned cleanup is proven."""
+
+        self._validate_profile_id(profile_id)
+        if (
+            type(failure) is not m.DesktopErrorV2
+            or failure.code != "ssh_cleanup_failed"
+            or not failure.retryable
+            or failure.action != "retry"
+            or failure.affected_resource_id != profile_id
+        ):
+            raise ProviderContractV2Error("profile cleanup failure has the wrong type")
+        with self._transaction(write=True, operation="failProfileDisconnectV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own a cleanup failure")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.connection_state == "failed":
+                if current.failure != failure:
+                    raise ProviderConflictV2("profile cleanup failure authority changed")
+                return current
+            if current.connection_state != "disconnecting":
+                raise ProviderConflictV2("profile cannot fail cleanup from its current state")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="failed",
+                prompt=None,
+                trust=current.trust,
+                failure=failure,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
     def complete_profile_rejection(
         self,
         profile_id: str,
@@ -2472,10 +2537,31 @@ class DesktopProviderStoreV2:
             for raw_row in rows:
                 row = cast(sqlite3.Row, raw_row)
                 current = self._profile_from_row(row)
+                cleanup_authority_uncertain = (
+                    isinstance(current, m.RemoteWorkspaceProfileV2)
+                    and (
+                        current.connection_state == "disconnecting"
+                        or (
+                            current.connection_state == "failed"
+                            and current.failure is not None
+                            and current.failure.code == "ssh_cleanup_failed"
+                        )
+                    )
+                )
+                cleanup_authority_lost = (
+                    isinstance(current, m.RemoteWorkspaceProfileV2)
+                    and current.connection_state == "failed"
+                    and current.failure is not None
+                    and current.failure.code == "ssh_cleanup_authority_lost"
+                )
                 if (
                     not isinstance(current, m.RemoteWorkspaceProfileV2)
                     or current.connection_state == "disconnected"
-                    or current.profile_id in lifecycle_owned_profiles
+                    or cleanup_authority_lost
+                    or (
+                        current.profile_id in lifecycle_owned_profiles
+                        and not cleanup_authority_uncertain
+                    )
                 ):
                     continue
                 current_version = cast(int, row["resource_version"])
@@ -2486,6 +2572,46 @@ class DesktopProviderStoreV2:
                     raise ProviderCapacityV2Error("profile restart generation is exhausted")
                 version = current_version + 1
                 generation = current.connection_generation + 1
+                if cleanup_authority_uncertain:
+                    cleanup_failure = m.DesktopErrorV2(
+                        code="ssh_cleanup_authority_lost",
+                        summary=(
+                            "Desktop cannot prove that the previous system OpenSSH master "
+                            "stopped."
+                        ),
+                        retryable=False,
+                        action="administrator_action",
+                        affected_resource_id=current.profile_id,
+                    )
+                    recovered_profile = m.RemoteWorkspaceProfileV2(
+                        profile_id=current.profile_id,
+                        display_name=current.display_name,
+                        ssh_host_alias=current.ssh_host_alias,
+                        catalog_generation=current.catalog_generation,
+                        connection_generation=generation,
+                        connection_state="failed",
+                        prompt=None,
+                        trust=m.SshTrustStateV2(
+                            connection_generation=generation,
+                            state="unverified",
+                            review_id=None,
+                            review_sha256=None,
+                            key_fingerprints=[],
+                            repair_support="not_needed",
+                        ),
+                        failure=cleanup_failure,
+                        active_project_id=current.active_project_id,
+                        core_api_major=None,
+                        core_openapi_sha256=None,
+                        core_event_schema_sha256=None,
+                        core_registry_sha256=None,
+                        created_at=current.created_at,
+                        updated_at=self._timestamp(),
+                        etag=self._etag("profile", current.profile_id, version),
+                    )
+                    self._update_profile(connection, recovered_profile, version=version)
+                    recovered.append(recovered_profile)
+                    continue
                 recovered_profile = m.RemoteWorkspaceProfileV2(
                     profile_id=current.profile_id,
                     display_name=current.display_name,
@@ -3858,6 +3984,14 @@ class DesktopProviderStoreV2:
             raise ProviderPreconditionFailedV2("profile ETag changed")
         if isinstance(request, LifecycleHostKeyReviewRequestV2):
             self._require_current_host_key_review(current, request.request)
+        if (
+            current.connection_state == "failed"
+            and current.failure is not None
+            and current.failure.code == "ssh_cleanup_authority_lost"
+        ):
+            raise ProviderConflictV2(
+                "profile cleanup authority was lost; administrator action is required"
+            )
         current_version = row["resource_version"]
         if (
             type(current_version) is not int

@@ -755,6 +755,7 @@ class SystemOpenSshSession:
         self._startup_timeout = startup_timeout_seconds
         self._cleanup_timeout = cleanup_timeout_seconds
         self._guard = threading.RLock()
+        self._shutdown_guard = threading.Lock()
         self._runtime: _PrivateRuntimeDirectory | None = None
         self._broker: AskpassAuthorizationBroker | None = None
         self._process: OwnedSshMasterProcess | None = None
@@ -764,6 +765,7 @@ class SystemOpenSshSession:
         self._prompt_observer: Callable[[AskpassPromptObservation], None] | None = None
         self._started = False
         self._closed = False
+        self._closing = False
         self._cancelled = False
         self._poisoned = False
 
@@ -803,7 +805,12 @@ class SystemOpenSshSession:
         if not callable(observer):
             raise TypeError("SSH prompt observer must be callable")
         with self._guard:
-            if self._started or self._closed or self._prompt_observer is not None:
+            if (
+                self._started
+                or self._closed
+                or self._closing
+                or self._prompt_observer is not None
+            ):
                 raise _session_error(
                     "ssh_session_state_invalid",
                     "SSH prompt observer cannot be changed.",
@@ -814,7 +821,12 @@ class SystemOpenSshSession:
         if not callable(observer):
             raise TypeError("SSH output observer must be callable")
         with self._guard:
-            if self._started or self._closed or self._output_observer is not None:
+            if (
+                self._started
+                or self._closed
+                or self._closing
+                or self._output_observer is not None
+            ):
                 raise _session_error(
                     "ssh_session_state_invalid",
                     "SSH output observer cannot be changed.",
@@ -831,7 +843,7 @@ class SystemOpenSshSession:
     ) -> SystemOpenSshSessionSnapshot:
         _validate_session_cancellation_event(cancel_event)
         with self._guard:
-            if self._started or self._closed:
+            if self._started or self._closed or self._closing:
                 raise _session_error("ssh_session_state_invalid", "SSH session cannot be started.")
             self._started = True
         try:
@@ -1013,16 +1025,30 @@ class SystemOpenSshSession:
         self._shutdown()
 
     def _shutdown(self) -> None:
+        with self._shutdown_guard:
+            self._shutdown_serialized()
+
+    def _shutdown_serialized(self) -> None:
         with self._guard:
             if self._closed:
                 return
-            self._closed = True
+            self._closing = True
             broker = self._broker
             process = self._process
             owner = self._owner_identity
             runtime = self._runtime
             control_identity = self._control_identity
             snapshot = self._snapshot
+
+        def raise_cleanup_failure(error: BaseException) -> None:
+            if isinstance(error, SystemOpenSshSessionError):
+                raise error
+            if isinstance(error, AskpassBrokerError):
+                raise _session_error(
+                    "ssh_askpass_broker_failed", "SSH prompt broker cleanup failed."
+                ) from error
+            raise _session_error("ssh_cleanup_failed", "SSH session cleanup failed.") from error
+
         failure: BaseException | None = None
         if broker is not None:
             try:
@@ -1058,16 +1084,20 @@ class SystemOpenSshSession:
                     except BaseException as exc:
                         if failure is None:
                             failure = exc
-                    if not _wait_process(process, self._cleanup_timeout / 3) and failure is None:
-                        failure = _session_error(
-                            "ssh_cleanup_failed", "SSH master did not stop before its deadline."
+                    if not _wait_process(process, self._cleanup_timeout / 3):
+                        raise_cleanup_failure(
+                            _session_error(
+                                "ssh_cleanup_failed",
+                                "SSH master did not stop before its deadline.",
+                            )
                         )
         elif process is not None and process.poll() is None and not process_owned:
-            if failure is None:
-                failure = _session_error(
+            raise_cleanup_failure(
+                _session_error(
                     "ssh_process_identity_changed",
                     "SSH master process identity changed before cleanup.",
                 )
+            )
         if broker is not None:
             try:
                 broker.close()
@@ -1115,13 +1145,9 @@ class SystemOpenSshSession:
                 if failure is None:
                     failure = exc
         if failure is not None:
-            if isinstance(failure, SystemOpenSshSessionError):
-                raise failure
-            if isinstance(failure, AskpassBrokerError):
-                raise _session_error(
-                    "ssh_askpass_broker_failed", "SSH prompt broker cleanup failed."
-                ) from failure
-            raise _session_error("ssh_cleanup_failed", "SSH session cleanup failed.") from failure
+            raise_cleanup_failure(failure)
+        with self._guard:
+            self._closed = True
 
     def _await_owner_identity(
         self,
@@ -1278,7 +1304,7 @@ class SystemOpenSshSession:
             return self._output_observer
 
     def _require_healthy_locked(self) -> SystemOpenSshSessionSnapshot:
-        if self._closed or self._cancelled or self._snapshot is None:
+        if self._closed or self._closing or self._cancelled or self._snapshot is None:
             raise _session_error("ssh_session_unavailable", "SSH session is not connected.")
         if self._poisoned:
             raise _session_error(
@@ -1426,9 +1452,10 @@ class SystemOpenSshSessionOwner:
         with self._guard:
             if self._closed:
                 raise _session_error("ssh_session_owner_closed", "SSH session owner is closed.")
-            previous, self._active = self._active, None
+            previous = self._active
             if previous is not None:
                 previous.close()
+                self._active = None
             for attempt in range(2):
                 session = self._factory(profile, connection_generation)
                 try:
@@ -1440,8 +1467,9 @@ class SystemOpenSshSessionOwner:
                 except BaseException as exc:
                     try:
                         session.close()
-                    except BaseException:
-                        pass
+                    except BaseException as cleanup_exc:
+                        self._active = session
+                        raise cleanup_exc from exc
                     if (
                         attempt == 0
                         and isinstance(exc, SystemOpenSshSessionError)
@@ -1455,9 +1483,10 @@ class SystemOpenSshSessionOwner:
 
     def disconnect(self) -> None:
         with self._guard:
-            active, self._active = self._active, None
+            active = self._active
             if active is not None:
                 active.close()
+                self._active = None
 
     def active_session(self) -> SystemOpenSshSession:
         with self._guard:
@@ -1470,10 +1499,11 @@ class SystemOpenSshSessionOwner:
         with self._guard:
             if self._closed:
                 return
-            self._closed = True
-            active, self._active = self._active, None
+            active = self._active
             if active is not None:
                 active.close()
+                self._active = None
+            self._closed = True
 
 
 class SystemOpenSshFollowerTransportAuthority:

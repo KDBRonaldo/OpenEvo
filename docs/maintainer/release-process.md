@@ -136,6 +136,12 @@ projects created by ambiguous `0.1.9` retries are preserved and may be manually
 ignored; migration never deletes them. This paragraph is release intent until
 the guarded publisher completes and immutable identities are recorded.
 
+Disconnect is also action-idempotent without weakening process ownership. A
+cleanup failure is visible on both the terminal operation and profile, retains
+the exact master for a new in-process action, and never becomes successful just
+because the handle is absent. If Desktop relaunches before cleanup is proven,
+the profile is persistently quarantined for administrator action.
+
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner
 architecture, mounts the exact candidate DMG, launches its real Tauri app,

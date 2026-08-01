@@ -1240,14 +1240,20 @@ class DesktopReleaseProviderV2:
                 started.connection_generation,
             )
         except Exception:
-            raise _provider_error(
-                "ssh_cleanup_failed",
-                "The system OpenSSH connection could not be closed safely.",
-                status=503,
+            error = local_v2.DesktopErrorV2(
+                code="ssh_cleanup_failed",
+                summary="The system OpenSSH connection could not be closed safely.",
                 retryable=True,
                 action="retry",
                 affected_resource_id=started.profile_id,
-            ) from None
+            )
+            failed = self._store.fail_profile_disconnect(
+                started.profile_id,
+                connection_generation=started.connection_generation,
+                failure=error,
+            )
+            self._publish_profile(failed)
+            raise DesktopReleaseProviderV2Error(503, error) from None
         context.checkpoint(
             "activating",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),

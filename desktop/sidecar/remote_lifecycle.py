@@ -524,7 +524,10 @@ SystemPromptObserverV2 = Callable[[str, AskpassPromptObservation], None]
 class _ActiveSystemRemoteV2:
     profile_id: str
     connection_generation: int
-    transport: _RemoteTransport
+    transport: _RemoteTransport | None
+    cleanup_started: bool = False
+    transport_closed: bool = False
+    session_closed: bool = False
 
 
 def _system_transport_factory_v2(
@@ -640,6 +643,8 @@ class SystemOpenSshRemoteLifecycleV2:
                 or active is None
                 or active.profile_id != profile_id
                 or active.connection_generation != profile_connection_generation
+                or active.cleanup_started
+                or active.transport is None
             ):
                 raise RemoteConnectionFailedError("The requested remote profile is not connected.")
             return active.transport
@@ -652,8 +657,9 @@ class SystemOpenSshRemoteLifecycleV2:
                 if active is None:
                     self._pending_reviews.pop(profile_id, None)
                     return
-                if active.profile_id != profile_id or (
-                    active.connection_generation + 1 != connection_generation
+                if (
+                    active.profile_id != profile_id
+                    or connection_generation <= active.connection_generation
                 ):
                     raise RemoteConnectionFailedError(
                         "The requested remote profile is not connected."
@@ -749,16 +755,11 @@ class SystemOpenSshRemoteLifecycleV2:
             with self._state:
                 if self._closed:
                     return
-                self._closed = True
-            failure: BaseException | None = None
-            try:
-                self._close_active()
-            except BaseException as exc:
-                failure = exc
-            self._pending_reviews.clear()
+            self._close_active()
             cleanups = [self._session_owner.close, self._host_trust.close]
             if self._owned_askpass_helper is not None:
                 cleanups.append(self._owned_askpass_helper.close)
+            failure: BaseException | None = None
             for close in cleanups:
                 try:
                     close()
@@ -767,6 +768,9 @@ class SystemOpenSshRemoteLifecycleV2:
                         failure = exc
             if failure is not None:
                 raise failure
+            with self._state:
+                self._pending_reviews.clear()
+                self._closed = True
 
     def _connect_locked(
         self,
@@ -851,42 +855,69 @@ class SystemOpenSshRemoteLifecycleV2:
                         "The pending SSH host key is no longer current."
                     ) from None
                 self._pending_reviews[profile.profile_id] = review
-            self._cleanup_failed_connect(transport)
+            self._cleanup_failed_connect(profile, transport)
             raise
         except RemoteLifecycleError:
-            self._cleanup_failed_connect(transport)
+            self._cleanup_failed_connect(profile, transport)
             raise
         except Exception:
-            self._cleanup_failed_connect(transport)
+            self._cleanup_failed_connect(profile, transport)
             raise RemoteConnectionFailedError(
                 "The SSH connection could not be established."
             ) from None
 
-    def _cleanup_failed_connect(self, transport: _RemoteTransport | None) -> None:
-        if transport is not None:
-            self._close_transport(transport)
-        try:
-            self._session_owner.disconnect()
-        except Exception:
-            pass
+    def _cleanup_failed_connect(
+        self,
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        transport: _RemoteTransport | None,
+    ) -> None:
         with self._state:
-            self._active = None
+            if self._active is not None:
+                raise RemoteConnectionFailedError(
+                    "The prior system OpenSSH cleanup is incomplete."
+                )
+            self._active = _ActiveSystemRemoteV2(
+                profile_id=profile.profile_id,
+                connection_generation=profile.connection_generation,
+                transport=transport,
+                cleanup_started=True,
+                transport_closed=transport is None,
+            )
+        self._close_active()
 
     def _close_active(self) -> None:
         with self._state:
-            active, self._active = self._active, None
+            active = self._active
+            if active is not None:
+                active.cleanup_started = True
         failure: BaseException | None = None
-        if active is not None:
+        if (
+            active is not None
+            and active.transport is not None
+            and not active.transport_closed
+        ):
             try:
                 self._close_transport(active.transport)
             except BaseException as exc:
                 failure = exc
-        if active is not None:
+            else:
+                active.transport_closed = True
+        if active is not None and not active.session_closed:
             try:
                 self._session_owner.disconnect()
             except BaseException as exc:
                 if failure is None:
                     failure = exc
+            else:
+                active.session_closed = True
+        if (
+            active is not None
+            and active.transport_closed
+            and active.session_closed
+        ):
+            with self._state:
+                if self._active is active:
+                    self._active = None
         if failure is not None:
             raise failure
 

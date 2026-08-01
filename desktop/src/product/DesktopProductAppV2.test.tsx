@@ -311,6 +311,15 @@ function providerFixture(initial: DesktopProductSnapshotV2) {
       created_at: NOW,
       updated_at: NOW,
     } as never)),
+    disconnectProfile: vi.fn(async () => ({
+      schema_version: "2",
+      operation_id: "operation-disconnect-1",
+      kind: "profile_disconnect",
+      status: "queued",
+      failure: null,
+      created_at: NOW,
+      updated_at: NOW,
+    } as never)),
     rebindProfile: vi.fn(async () => systemProfile() as never),
     reviewHostKey: vi.fn(async () => ({
       schema_version: "2",
@@ -452,6 +461,67 @@ describe("Desktop v2 product renderer", () => {
       "replace_changed_key",
       expect.objectContaining({ streamEpoch: 1 }),
     );
+  });
+
+  it("retries failed SSH cleanup as disconnect and keeps lost authority blocked", async () => {
+    const retryable = systemProfile({
+      connection_state: "failed",
+      failure: {
+        schema_version: "2",
+        code: "ssh_cleanup_failed",
+        summary: "The system OpenSSH connection could not be closed safely.",
+        retryable: true,
+        action: "retry",
+        affected_resource_id: "profile-gpu",
+      },
+    });
+    const retrySnapshot = baseSnapshot({
+      profiles: [retryable] as never,
+      state: { ...baseSnapshot().state, profiles: [retryable] as never },
+    });
+    const retryProvider = providerFixture(retrySnapshot);
+    root = await render(retryProvider);
+    await click("Add remote workspace");
+
+    await click("Retry disconnect");
+    expect(retryProvider.disconnectProfile).toHaveBeenCalledWith(
+      "profile-gpu",
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+
+    await act(async () => root?.unmount());
+    root = null;
+    document.body.innerHTML = "<div id=\"root\"></div>";
+    const quarantined = systemProfile({
+      connection_generation: 5,
+      connection_state: "failed",
+      trust: {
+        ...retryable.trust,
+        connection_generation: 5,
+        state: "unverified",
+      },
+      failure: {
+        schema_version: "2",
+        code: "ssh_cleanup_authority_lost",
+        summary: "Desktop cannot prove that the previous system OpenSSH master stopped.",
+        retryable: false,
+        action: "administrator_action",
+        affected_resource_id: "profile-gpu",
+      },
+    });
+    root = await render(providerFixture(baseSnapshot({
+      profiles: [quarantined] as never,
+      state: { ...baseSnapshot().state, profiles: [quarantined] as never },
+    })));
+    await click("Add remote workspace");
+
+    expect(dialog()?.textContent).toContain(
+      "Administrator action is required before this workspace can reconnect.",
+    );
+    const actionLabels = [...(dialog()?.querySelectorAll("button") ?? [])]
+      .map((candidate) => candidate.textContent?.trim());
+    expect(actionLabels).not.toContain("Connect");
+    expect(actionLabels).not.toContain("Retry disconnect");
   });
 
   it("distinguishes task, admission, attempt, project head, evolution, runtime, and execution identities", async () => {

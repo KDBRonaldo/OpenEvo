@@ -53,6 +53,15 @@ stdin, and legacy rsync-based transfer methods are unavailable to that
 authority. References to rsync below remain frozen v0.1.8 foundation history,
 not a Desktop release dependency.
 
+Disconnect cleanup is monotonic in v0.1.10. The session, owner, and rich
+transport retain the exact master and independently completed cleanup phases
+until the process is proven reaped; a later action may retry those same handles
+without re-closing completed phases. A sidecar restart cannot reconstruct that
+private authority. A profile whose cleanup was failed or interrupted is
+therefore durably quarantined as `ssh_cleanup_authority_lost` with
+`administrator_action`, rather than being projected as disconnected or
+silently replaced.
+
 ## Frozen 0.1.8 Foundation
 
 The remaining sections document the explicit transport retained only for v1

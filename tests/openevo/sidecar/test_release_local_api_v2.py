@@ -181,7 +181,11 @@ class _Lifecycle:
         self.calls.append(("disconnect", profile_id, connection_generation))
         if self.disconnect_errors:
             raise self.disconnect_errors.pop(0)
-        if self.active == (profile_id, connection_generation - 1):
+        if (
+            self.active is not None
+            and self.active[0] == profile_id
+            and self.active[1] < connection_generation
+        ):
             self.active = None
 
     def review_host_key(
@@ -1089,7 +1093,8 @@ def test_profile_disconnect_cleanup_failure_never_reports_success(
         unresolved = client.get(
             f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
         ).json()
-        assert unresolved["connection_state"] == "disconnecting"
+        assert unresolved["connection_state"] == "failed"
+        assert unresolved["failure"] == terminal["failure"]
         assert lifecycle.active == (profile["profile_id"], connected["connection_generation"])
 
         replay = client.post(
@@ -1100,6 +1105,35 @@ def test_profile_disconnect_cleanup_failure_never_reports_success(
         assert replay.status_code == 202, replay.text
         assert replay.json()["operation_id"] == terminal["operation_id"]
         assert [call[0] for call in lifecycle.calls].count("disconnect") == 1
+
+        retry = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        unresolved["connection_generation"]
+                    ),
+                    "If-Match": str(unresolved["etag"]),
+                    "Idempotency-Key": "disconnect-cleanup-failure-retry-01",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": unresolved[
+                    "connection_generation"
+                ],
+            },
+        )
+        assert retry.status_code == 202, retry.text
+        retried_terminal = _wait_lifecycle_operation(client, retry.json())
+        assert retried_terminal["status"] == "succeeded"
+        disconnected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert disconnected["connection_state"] == "disconnected"
+        assert disconnected["failure"] is None
+        assert lifecycle.active is None
+        assert [call[0] for call in lifecycle.calls].count("disconnect") == 2
     finally:
         client.close()
         provider.close()
