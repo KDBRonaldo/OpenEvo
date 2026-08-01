@@ -3466,6 +3466,42 @@ def test_real_subprocess_tracked_capacity_reclaims_only_reaped_groups(_attempt: 
             backend.wait(first, 1)
 
 
+def test_real_subprocess_capacity_releases_reaped_group_before_callback_finishes() -> None:
+    backend = RealSubprocessBackend(max_tracked_processes=1)
+    callback_started = threading.Event()
+    release_callback = threading.Event()
+
+    def block_exit_callback(_identity: ProcessIdentity, _returncode: int) -> None:
+        callback_started.set()
+        release_callback.wait(1)
+
+    exited = backend.spawn(
+        _sleep_process_spec("callback-pending", "9" * 64, 0),
+        lambda *_args: None,
+        block_exit_callback,
+    )
+    replacement: ProcessIdentity | None = None
+    try:
+        assert backend.wait(exited, 1) == 0
+        assert callback_started.wait(1)
+        replacement = backend.spawn(
+            _sleep_process_spec("capacity-replacement", "a" * 64, 60),
+            lambda *_args: None,
+            lambda *_args: None,
+        )
+        with pytest.raises(SupervisorStateError, match="capacity"):
+            backend.spawn(
+                _sleep_process_spec("capacity-overflow", "b" * 64, 60),
+                lambda *_args: None,
+                lambda *_args: None,
+            )
+    finally:
+        release_callback.set()
+        if replacement is not None and backend.is_alive(replacement):
+            backend.kill(replacement)
+            backend.wait(replacement, 1)
+
+
 def test_restart_operation_capacity_preserves_replay_and_rejects_conflicts(
     tmp_path: Path,
     framework_lock: Path,

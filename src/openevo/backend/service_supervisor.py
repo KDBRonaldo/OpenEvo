@@ -2210,6 +2210,7 @@ class RealSubprocessBackend:
         self._tracked: dict[str, _TrackedProcess] = {}
         self._completed: OrderedDict[str, tuple[ProcessIdentity, int]] = OrderedDict()
         self._max_tracked_processes = max_tracked_processes
+        self._max_tracked_records = max_tracked_processes + 1
         self._spawn_reservations = 0
 
     def spawn(
@@ -2357,9 +2358,13 @@ class RealSubprocessBackend:
                 returncode = tracked.process.poll()
             members = _owned_process_group_members(identity)
             if members == ():
-                result = returncode if returncode is not None else 0
+                if returncode is None:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        return None
+                    time.sleep(0.001)
+                    continue
                 self._retire_if_complete(identity)
-                return result
+                return returncode
             if members is None:
                 completed_returncode = self._completed_returncode(identity)
                 if completed_returncode is not None:
@@ -2413,7 +2418,11 @@ class RealSubprocessBackend:
     def _reserve_spawn_slot(self) -> None:
         with self._lock:
             self._reclaim_completed_locked()
-            if len(self._tracked) + self._spawn_reservations >= self._max_tracked_processes:
+            if (
+                len(self._tracked) + self._spawn_reservations >= self._max_tracked_records
+                or self._active_process_slots_locked() + self._spawn_reservations
+                >= self._max_tracked_processes
+            ):
                 raise SupervisorStateError("tracked process capacity is exhausted")
             self._spawn_reservations += 1
 
@@ -2431,6 +2440,19 @@ class RealSubprocessBackend:
             ):
                 self._tracked.pop(birth_token, None)
                 self._remember_completed_locked(tracked)
+
+    def _active_process_slots_locked(self) -> int:
+        active = 0
+        for tracked in self._tracked.values():
+            if tracked.process.poll() is None:
+                active += 1
+                continue
+            # A reaped group no longer consumes process capacity even while its
+            # bounded exit callback record is retained. Unknown ownership still
+            # consumes capacity so process identity failures remain fail closed.
+            if _owned_process_group_members(tracked.identity) != ():
+                active += 1
+        return active
 
     def _retire_if_complete(self, identity: ProcessIdentity) -> None:
         with self._lock:
