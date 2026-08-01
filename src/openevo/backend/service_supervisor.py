@@ -2201,6 +2201,54 @@ class _BoundedLogStreamRedactor:
         return (safe.encode("utf-8") + b"\n") if safe else b""
 
 
+class _StartupLogCapture:
+    """Capture sanitized child output without taking the lifecycle mutex."""
+
+    def __init__(self, credential: str, *, max_bytes: int) -> None:
+        if max_bytes < 1:
+            raise ValueError("startup log byte limit must be positive")
+        self._mutex = threading.Lock()
+        self._redactor = _BoundedLogStreamRedactor(credential)
+        self._max_bytes = max_bytes
+        self._payload = bytearray()
+        self._accepting = True
+
+    def capture(self, payload: bytes) -> bool:
+        with self._mutex:
+            if not self._accepting:
+                return False
+            self._append(self._redactor.feed(payload))
+            return True
+
+    def promote(self) -> tuple[bytes, _BoundedLogStreamRedactor]:
+        """Stop capture while preserving redactor carry for steady-state output."""
+
+        with self._mutex:
+            if not self._accepting:
+                raise SupervisorStateError("startup log capture was already completed")
+            self._accepting = False
+            payload = bytes(self._payload)
+            self._payload.clear()
+            return payload, self._redactor
+
+    def finish(self) -> bytes:
+        """Stop terminal capture and flush any bounded partial log line."""
+
+        with self._mutex:
+            if not self._accepting:
+                return b""
+            self._accepting = False
+            self._append(self._redactor.flush())
+            payload = bytes(self._payload)
+            self._payload.clear()
+            return payload
+
+    def _append(self, payload: bytes) -> None:
+        remaining = self._max_bytes - len(self._payload)
+        if remaining > 0:
+            self._payload.extend(payload[:remaining])
+
+
 class RealSubprocessBackend:
     """Controlled process-group launcher with Linux PID birth identity."""
 
@@ -2974,14 +3022,25 @@ class CoreServiceSupervisor:
         runtime_image: str | None = None,
         total_timeout: float | None = None,
     ) -> ServiceGroupSnapshot:
-        return self._ensure_locked(
+        preparation_token = self._begin_public_self_deployed_preparation(
             execution_mode,
             model_ref=model_ref,
-            codex_model=codex_model,
             runtime_image=runtime_image,
-            total_timeout=total_timeout,
-            force_restart=False,
         )
+        with self._mutex:
+            try:
+                return self._ensure_locked(
+                    execution_mode,
+                    model_ref=model_ref,
+                    codex_model=codex_model,
+                    runtime_image=runtime_image,
+                    total_timeout=total_timeout,
+                    force_restart=False,
+                    preparation_token=preparation_token,
+                )
+            finally:
+                if preparation_token is not None:
+                    self._finish_self_deployed_preparation(preparation_token)
 
     def ensure_run_binding(
         self,
@@ -2994,30 +3053,42 @@ class CoreServiceSupervisor:
     ) -> tuple[ServiceGroupSnapshot, ServiceRunLease | None]:
         """Ensure readiness and issue its exact binding under one lifecycle lock."""
 
+        preparation_token = self._begin_public_self_deployed_preparation(
+            execution_mode,
+            model_ref=model_ref,
+            runtime_image=runtime_image,
+        )
         with self._mutex:
-            snapshot = self._ensure_locked(
-                execution_mode,
-                model_ref=model_ref,
-                codex_model=codex_model,
-                runtime_image=runtime_image,
-                total_timeout=total_timeout,
-                force_restart=False,
-            )
-            if not snapshot.run_ready:
-                return snapshot, None
-            if self._active_run_lease is not None:
-                raise SupervisorStateError("managed service generation already has a run lease")
-            binding = self._run_binding_locked()
-            if not _binding_matches_snapshot(snapshot, binding):
-                raise SupervisorStateError(
-                    "managed service generation changed while issuing a run binding"
+            try:
+                snapshot = self._ensure_locked(
+                    execution_mode,
+                    model_ref=model_ref,
+                    codex_model=codex_model,
+                    runtime_image=runtime_image,
+                    total_timeout=total_timeout,
+                    force_restart=False,
+                    preparation_token=preparation_token,
                 )
-            token = object()
-            self._active_run_lease = token
-            return snapshot, ServiceRunLease(
-                binding=binding,
-                _release=lambda: self._release_run_lease(token),
-            )
+                if not snapshot.run_ready:
+                    return snapshot, None
+                if self._active_run_lease is not None:
+                    raise SupervisorStateError(
+                        "managed service generation already has a run lease"
+                    )
+                binding = self._run_binding_locked()
+                if not _binding_matches_snapshot(snapshot, binding):
+                    raise SupervisorStateError(
+                        "managed service generation changed while issuing a run binding"
+                    )
+                token = object()
+                self._active_run_lease = token
+                return snapshot, ServiceRunLease(
+                    binding=binding,
+                    _release=lambda: self._release_run_lease(token),
+                )
+            finally:
+                if preparation_token is not None:
+                    self._finish_self_deployed_preparation(preparation_token)
 
     def _ensure_locked(
         self,
@@ -3028,6 +3099,7 @@ class CoreServiceSupervisor:
         runtime_image: str | None = None,
         total_timeout: float | None = None,
         force_restart: bool,
+        preparation_token: object | None = None,
     ) -> ServiceGroupSnapshot:
         with self._mutex:
             self._require_open()
@@ -3042,6 +3114,7 @@ class CoreServiceSupervisor:
             self._framework_lock_source.verified_payload()
             self_deployed = execution_mode is ServiceExecutionMode.SELF_DEPLOYED
             preparation_messages: list[str] = []
+            active_preparation_token = preparation_token
             pre_stopped = False
             if runtime_image is None:
                 raise ValueError("service ensure requires a managed runtime_image")
@@ -3091,21 +3164,29 @@ class CoreServiceSupervisor:
                         self._persist()
                         return self._group_snapshot()
                     self._release_active_credential_authority()
-                preparation_token = self._begin_self_deployed_preparation(self_deployed_request)
+                if active_preparation_token is None:
+                    active_preparation_token = self._begin_self_deployed_preparation(
+                        self_deployed_request
+                    )
                 try:
                     self_deployed_runtime = self._self_deployed_runtime_probe.verify(
                         self_deployed_request,
                         deadline,
                         cancellation,
                         progress=lambda message: self._append_preparation_log(
-                            preparation_token,
+                            active_preparation_token,
                             message,
                         ),
                     )
                 finally:
-                    preparation_messages = self._finish_self_deployed_preparation(
-                        preparation_token
-                    )
+                    if preparation_token is None:
+                        preparation_messages = self._finish_self_deployed_preparation(
+                            active_preparation_token
+                        )
+                    else:
+                        preparation_messages = self._self_deployed_preparation_messages(
+                            active_preparation_token
+                        )
                 runtime = self_deployed_runtime
                 candidate_authority = None
             else:
@@ -3360,6 +3441,22 @@ class CoreServiceSupervisor:
             self._root.ensure_directory("rollout")
             self._root.atomic_write("topology.json", _canonical_bytes(topology))
             started: list[str] = []
+            startup_captures: dict[str, _StartupLogCapture] = {}
+
+            def finish_startup_capture(service_id: str) -> None:
+                capture = startup_captures.pop(service_id, None)
+                if capture is not None:
+                    self._append_output_payload(service_id, capture.finish())
+
+            def promote_startup_capture(
+                service_id: str,
+                identity: ProcessIdentity,
+            ) -> None:
+                capture = startup_captures.pop(service_id)
+                payload, redactor = capture.promote()
+                self._output_redactors[(service_id, generation_digest, identity)] = redactor
+                self._append_output_payload(service_id, payload)
+
             try:
                 for spec in specs:
                     self._raise_if_cancelled(cancellation)
@@ -3372,15 +3469,28 @@ class CoreServiceSupervisor:
                         self._rollback(started, deadline)
                         return self._group_snapshot()
                     self._set_starting(spec.service_id)
+                    startup_message = f"Starting {spec.display_name}."
+                    if active_preparation_token is not None:
+                        self._append_preparation_log(
+                            active_preparation_token,
+                            startup_message,
+                        )
+                        self._append_log("inference", "info", startup_message)
                     if spec.component is ServiceComponent.INFERENCE:
                         listener = listeners.pop(spec.service_id, None)
                         if listener is not None:
                             listener.close()
+                    startup_capture = _StartupLogCapture(
+                        credential,
+                        max_bytes=self._max_log_bytes,
+                    )
+                    startup_captures[spec.service_id] = startup_capture
                     try:
                         identity = self._process_backend.spawn(
                             spec,
-                            lambda process_identity, payload, service_id=spec.service_id: (
-                                self._record_output(
+                            lambda process_identity, payload, service_id=spec.service_id, capture=startup_capture: (
+                                self._capture_startup_output(
+                                    capture,
                                     service_id,
                                     generation_digest,
                                     process_identity,
@@ -3397,6 +3507,7 @@ class CoreServiceSupervisor:
                             ),
                         )
                     except Exception as exc:
+                        finish_startup_capture(spec.service_id)
                         self._fail_record(
                             spec.service_id,
                             "service_spawn_failed",
@@ -3425,9 +3536,25 @@ class CoreServiceSupervisor:
                             else "service_health_failed"
                         )
                         self._fail_record(spec.service_id, code, _sanitize(health.message))
+                        if active_preparation_token is not None:
+                            self._append_preparation_log(
+                                active_preparation_token,
+                                f"{spec.display_name} failed its readiness check.",
+                            )
                         self._rollback(started, deadline)
+                        finish_startup_capture(spec.service_id)
+                        self._persist()
                         return self._group_snapshot()
+                    promote_startup_capture(spec.service_id, identity)
                     self._set_running(spec.service_id, health.message)
+                    ready_message = f"{spec.display_name} is ready."
+                    if active_preparation_token is not None:
+                        self._append_preparation_log(
+                            active_preparation_token,
+                            ready_message,
+                        )
+                        self._append_log("inference", "info", ready_message)
+                        self._persist()
                 if isinstance(self._health_checker, DefaultHealthChecker):
                     rollout_spec = self._specs["rollout"]
                     graph_ready, graph_message = _probe_rollout_registration(
@@ -3448,6 +3575,15 @@ class CoreServiceSupervisor:
                     )
                 raise
             finally:
+                captured_output = False
+                for service_id in tuple(startup_captures):
+                    capture = startup_captures.pop(service_id)
+                    payload = capture.finish()
+                    if payload:
+                        self._append_output_payload(service_id, payload)
+                        captured_output = True
+                if captured_output:
+                    self._persist()
                 for listener in listeners.values():
                     listener.close()
 
@@ -3845,6 +3981,30 @@ class CoreServiceSupervisor:
             self._framework_lock_source.close()
             self._root.close()
 
+    def _begin_public_self_deployed_preparation(
+        self,
+        execution_mode: ServiceExecutionMode,
+        *,
+        model_ref: str | None,
+        runtime_image: str | None,
+    ) -> object | None:
+        if (
+            execution_mode is not ServiceExecutionMode.SELF_DEPLOYED
+            or model_ref is None
+            or runtime_image is None
+        ):
+            return None
+        request = SelfDeployedRuntimeRequest(
+            profile_id=model_ref,
+            runtime_image=runtime_image,
+        )
+        try:
+            return self._begin_self_deployed_preparation(request)
+        except SupervisorBusyError:
+            # A concurrent ensure already owns the serialized lifecycle operation.
+            # This caller will wait on the lifecycle mutex and replay its exact request.
+            return None
+
     def _begin_self_deployed_preparation(
         self,
         request: SelfDeployedRuntimeRequest,
@@ -3852,6 +4012,7 @@ class CoreServiceSupervisor:
         profile = require_release_self_deployed_model_profile(request.profile_id)
         token = object()
         now = _timestamp()
+        initial_message = "Preparing the verified Self-Deployed runtime."
         state = _SelfDeployedPreparationState(
             token=token,
             model_ref=profile.model_id,
@@ -3866,6 +4027,18 @@ class CoreServiceSupervisor:
             ),
             started_at=now,
             updated_at=now,
+            log_sequence=1,
+            logs=[
+                SupervisorLogEntry(
+                    id="inference-log-1",
+                    sequence=1,
+                    occurred_at=now,
+                    level="info",
+                    message=initial_message,
+                    service_id="inference",
+                    content_sha256=hashlib.sha256(initial_message.encode("utf-8")).hexdigest(),
+                )
+            ],
         )
         with self._preparation_mutex:
             if self._self_deployed_preparation is not None:
@@ -3911,6 +4084,13 @@ class CoreServiceSupervisor:
             messages = [item.message for item in state.logs]
             self._self_deployed_preparation = None
             return messages
+
+    def _self_deployed_preparation_messages(self, token: object) -> list[str]:
+        with self._preparation_mutex:
+            state = self._self_deployed_preparation
+            if state is None or state.token is not token:
+                return []
+            return [item.message for item in state.logs]
 
     def _preparation_summary(self) -> SupervisorServiceSummary | None:
         with self._preparation_mutex:
@@ -4604,6 +4784,18 @@ class CoreServiceSupervisor:
             record.error_code = None
             record.status_message = "Managed service is stopped."
         self._persist()
+
+    def _capture_startup_output(
+        self,
+        capture: _StartupLogCapture,
+        service_id: str,
+        generation_digest: str,
+        identity: ProcessIdentity,
+        payload: bytes,
+    ) -> None:
+        if capture.capture(payload):
+            return
+        self._record_output(service_id, generation_digest, identity, payload)
 
     def _record_output(
         self,

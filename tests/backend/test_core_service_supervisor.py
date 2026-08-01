@@ -1934,6 +1934,7 @@ def test_self_deployed_preparation_is_observable_without_waiting_for_probe(
         assert services[0].model_preparation is not None
         assert services[0].model_preparation.status == "downloading"
         assert [entry.message for entry in logs] == [
+            "Preparing the verified Self-Deployed runtime.",
             "Checking immutable Self-Deployed prerequisites.",
             "Model download progress: 25% (32/128 bytes).",
         ]
@@ -1945,6 +1946,212 @@ def test_self_deployed_preparation_is_observable_without_waiting_for_probe(
     assert not thread.is_alive()
     assert not failure
     assert len(result) == 1
+
+
+def test_self_deployed_preparation_is_observable_before_release_reverification(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+    verification_entered = threading.Event()
+    allow_verification = threading.Event()
+    observation_complete = threading.Event()
+    observed: list[tuple[tuple[object, ...], tuple[object, ...], float]] = []
+    failures: list[BaseException] = []
+    original_verification = supervisor._verify_release_installation
+
+    def blocking_verification() -> None:
+        verification_entered.set()
+        assert allow_verification.wait(2)
+        original_verification()
+
+    monkeypatch.setattr(supervisor, "_verify_release_installation", blocking_verification)
+
+    def ensure() -> None:
+        try:
+            supervisor.ensure(
+                ServiceExecutionMode.SELF_DEPLOYED,
+                model_ref="qwen3-0.6b-v1",
+                runtime_image="openevo/science-runtime:0.1.1",
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def observe() -> None:
+        started = time.monotonic()
+        try:
+            observed.append(
+                (
+                    supervisor.list(),
+                    supervisor.logs("inference"),
+                    time.monotonic() - started,
+                )
+            )
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            observation_complete.set()
+
+    ensure_thread = threading.Thread(target=ensure)
+    observer_thread = threading.Thread(target=observe)
+    ensure_thread.start()
+    try:
+        assert verification_entered.wait(1)
+        observer_thread.start()
+        assert observation_complete.wait(0.25)
+    finally:
+        allow_verification.set()
+        ensure_thread.join(timeout=2)
+        observer_thread.join(timeout=2)
+        if not ensure_thread.is_alive() and not observer_thread.is_alive():
+            supervisor.close()
+
+    assert not ensure_thread.is_alive()
+    assert not observer_thread.is_alive()
+    assert not failures
+    assert len(observed) == 1
+    services, logs, elapsed = observed[0]
+    assert elapsed < 0.25
+    assert len(services) == 1
+    assert services[0].id == "inference"
+    assert services[0].status is ServiceStatus.STARTING
+    assert [entry.message for entry in logs] == ["Preparing the verified Self-Deployed runtime."]
+
+
+def test_self_deployed_preparation_remains_observable_during_service_health(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    class BlockingInferenceHealth(FakeHealthChecker):
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def wait_ready(
+            self,
+            spec,
+            identity,
+            process_backend,
+            deadline,
+            cancellation=None,
+        ) -> HealthCheckResult:
+            if spec.service_id == "inference":
+                self.entered.set()
+                assert self.release.wait(2)
+            return super().wait_ready(
+                spec,
+                identity,
+                process_backend,
+                deadline,
+                cancellation,
+            )
+
+    health = BlockingInferenceHealth()
+    supervisor, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        health=health,
+        startup_timeout=3,
+    )
+    observation_complete = threading.Event()
+    observed: list[tuple[tuple[object, ...], tuple[object, ...]]] = []
+    failures: list[BaseException] = []
+
+    def ensure() -> None:
+        try:
+            supervisor.ensure(
+                ServiceExecutionMode.SELF_DEPLOYED,
+                model_ref="qwen3-0.6b-v1",
+                runtime_image="openevo/science-runtime:0.1.1",
+            )
+        except BaseException as exc:
+            failures.append(exc)
+
+    def observe() -> None:
+        try:
+            observed.append((supervisor.list(), supervisor.logs("inference")))
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            observation_complete.set()
+
+    ensure_thread = threading.Thread(target=ensure)
+    observer_thread = threading.Thread(target=observe)
+    ensure_thread.start()
+    try:
+        assert health.entered.wait(1)
+        observer_thread.start()
+        assert observation_complete.wait(0.25)
+    finally:
+        health.release.set()
+        ensure_thread.join(timeout=2)
+        observer_thread.join(timeout=2)
+        if not ensure_thread.is_alive() and not observer_thread.is_alive():
+            supervisor.close()
+
+    assert not ensure_thread.is_alive()
+    assert not observer_thread.is_alive()
+    assert not failures
+    assert len(observed) == 1
+    services, logs = observed[0]
+    assert len(services) == 1
+    assert services[0].status is ServiceStatus.STARTING
+    assert [entry.message for entry in logs][-1] == "Starting Managed inference."
+
+
+def test_fast_startup_output_is_preserved_when_service_exits_before_health(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    class FastFailingProcessBackend(FakeProcessBackend):
+        def spawn(self, spec, on_output, on_exit) -> ProcessIdentity:
+            identity = super().spawn(spec, on_output, on_exit)
+            if spec.service_id == "evolution-backend":
+                assert spec.internal_identity is not None
+                on_output(
+                    identity,
+                    (
+                        "fast startup failure before health; credential="
+                        f"{spec.internal_identity.credential}\n"
+                    ).encode(),
+                )
+                with self._condition:
+                    self.alive[spec.service_id] = False
+                    self.returncodes[spec.service_id] = 37
+                    self._condition.notify_all()
+                on_exit(identity, 37)
+            return identity
+
+    backend = FastFailingProcessBackend()
+    supervisor, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        backend=backend,
+    )
+    try:
+        snapshot = supervisor.ensure(
+            ServiceExecutionMode.SELF_DEPLOYED,
+            model_ref="qwen3-0.6b-v1",
+            runtime_image="openevo/science-runtime:0.1.1",
+        )
+
+        assert snapshot.run_ready is False
+        assert snapshot.service("evolution-backend").status is ServiceStatus.FAILED
+        rendered = "\n".join(
+            entry.message for entry in supervisor.logs("evolution-backend", limit=100)
+        )
+        assert "fast startup failure before health" in rendered
+        assert "<redacted>" in rendered
+        credential = backend.spawned[0].internal_identity
+        assert credential is not None
+        assert credential.credential not in rendered
+        assert credential.credential not in (tmp_path / "core-services" / "ledger.json").read_text(
+            encoding="utf-8"
+        )
+    finally:
+        supervisor.close()
 
 
 def test_restart_once_preserves_the_active_self_deployed_release_profile(
