@@ -302,7 +302,9 @@ def test_verify_app_resource_rejects_askpass_symlink_wrong_mode_and_replacement(
     dmg = tmp_path / "OpenEvo-Desktop.dmg"
     dmg.write_bytes(b"candidate")
     dmg.chmod(0o600)
-    monkeypatch.setattr(module, "_validate_packaged_runtime_loader", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        module, "_validate_packaged_runtime_loader", lambda *_args, **_kwargs: None
+    )
     monkeypatch.setattr(module, "_verify_macos_adhoc_signature", lambda _path: "adhoc")
 
     arguments = {
@@ -334,6 +336,18 @@ def test_verify_app_resource_rejects_askpass_symlink_wrong_mode_and_replacement(
         return "adhoc"
 
     monkeypatch.setattr(module, "_verify_macos_adhoc_signature", replace_during_signature)
+    with pytest.raises(module.ResourceCompositionError, match="changed during verification"):
+        module.verify_app_resource(**arguments)
+
+    def swap_and_restore_during_signature(path: Path) -> str:
+        held = path.with_name("held-askpass-helper")
+        path.rename(held)
+        _write_thin_mach_o(path)
+        path.unlink()
+        held.rename(path)
+        return "adhoc"
+
+    monkeypatch.setattr(module, "_verify_macos_adhoc_signature", swap_and_restore_during_signature)
     with pytest.raises(module.ResourceCompositionError, match="changed during verification"):
         module.verify_app_resource(**arguments)
 

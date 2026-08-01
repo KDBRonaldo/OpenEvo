@@ -131,8 +131,14 @@ def _controlled_file_snapshot(
                 changed_error or f"Controlled release input changed while reading: {path}"
             ) from exc
         if (
-            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-            != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+            != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+            )
             or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
             or len(payload) != before.st_size
         ):
@@ -154,6 +160,7 @@ def _controlled_file_snapshot(
             after.st_nlink,
             after.st_size,
             after.st_mtime_ns,
+            after.st_ctime_ns,
         ) != (
             before.st_dev,
             before.st_ino,
@@ -161,6 +168,7 @@ def _controlled_file_snapshot(
             before.st_nlink,
             before.st_size,
             before.st_mtime_ns,
+            before.st_ctime_ns,
         ) or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
             raise ResourceCompositionError(
                 changed_error or f"Controlled release input changed while held open: {path}"
