@@ -620,8 +620,19 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
                 codex_model="gpt-5.1-codex-mini",
             )
         ]
-        assert all("codex" not in part.lower() for spec in backend.spawned for part in spec.argv)
+        assert all(
+            Path(spec.argv[0]).name != "codex" and not spec.argv[0].endswith("/codex")
+            for spec in backend.spawned
+        )
         assert all(spec.argv[1] == "-I" for spec in backend.spawned)
+        gateway = next(spec for spec in backend.spawned if spec.service_id == "gateway")
+        assert _argv_option(gateway.argv, "--managed-execution-mode") == (
+            "codex_subscription_transcript"
+        )
+        assert isinstance(
+            gateway.codex_credential_authority,
+            PreparedCodexCredentialSnapshot,
+        )
         framework_specs = [spec for spec in backend.spawned if "--framework-lock" in spec.argv]
         assert len(framework_specs) == 2
         assert all(
@@ -1870,6 +1881,9 @@ def test_self_deployed_starts_verified_inference_and_core_service_group(
         assert inference.model_preparation is not None
         assert inference.model_preparation.status == "ready"
         assert inference.model_preparation.model_ref == "Qwen/Qwen3-0.6B"
+        gateway = next(spec for spec in backend.spawned if spec.service_id == "gateway")
+        assert _argv_option(gateway.argv, "--managed-execution-mode") == "self-deployed"
+        assert gateway.codex_credential_authority is None
         binding = supervisor.run_binding()
         assert binding.execution_mode is ServiceExecutionMode.SELF_DEPLOYED
         assert binding.codex_model == "Qwen/Qwen3-0.6B"

@@ -4287,6 +4287,12 @@ class CoreServiceSupervisor:
                     "core-gateway",
                     "--log-level",
                     "info",
+                    "--managed-execution-mode",
+                    (
+                        ServiceExecutionMode.SELF_DEPLOYED.value
+                        if self_deployed
+                        else ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT.value
+                    ),
                 ),
                 ports["gateway"],
                 ServiceHealthProbe.http(

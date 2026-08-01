@@ -100,10 +100,20 @@ _run_admission_verifier: GenerationBoundRunAdmissionVerifier | None = None
 _credential_authority: (
     HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
 ) = None
+_managed_execution_mode: str | None = None
+
+_CODEX_SUBSCRIPTION_EXECUTION_MODE = "codex_subscription_transcript"
+_SELF_DEPLOYED_EXECUTION_MODE = "self-deployed"
+_MANAGED_EXECUTION_MODES = frozenset(
+    {_CODEX_SUBSCRIPTION_EXECUTION_MODE, _SELF_DEPLOYED_EXECUTION_MODE}
+)
 
 
 def _require_credential_authority() -> None:
-    if _internal_identity is None:
+    if (
+        _internal_identity is None
+        or _managed_execution_mode == _SELF_DEPLOYED_EXECUTION_MODE
+    ):
         return
     authority = _credential_authority
     try:
@@ -128,14 +138,22 @@ def configure_server(
     credential_authority: (
         HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
     ) = None,
+    managed_execution_mode: str | None = None,
 ) -> None:
     global _configured_topology_path, _configured_node_id
-    global _internal_identity, _run_admission_verifier, _credential_authority, _state
+    global _internal_identity, _run_admission_verifier, _credential_authority
+    global _managed_execution_mode, _state
+    if (
+        managed_execution_mode is not None
+        and managed_execution_mode not in _MANAGED_EXECUTION_MODES
+    ):
+        raise ValueError("managed Gateway execution mode is invalid")
     _configured_topology_path = topology_path
     _configured_node_id = node_id
     _internal_identity = internal_identity
     _run_admission_verifier = run_admission_verifier
     _credential_authority = credential_authority
+    _managed_execution_mode = managed_execution_mode
     _state = None
 
 
@@ -995,6 +1013,7 @@ def serve(
     *,
     node_id: str | None = None,
     log_level: str = "info",
+    managed_execution_mode: str | None = None,
 ) -> None:
     import uvicorn
 
@@ -1002,15 +1021,28 @@ def serve(
         required=False,
         expected_service_id="gateway",
     )
+    if internal_identity is not None and managed_execution_mode not in _MANAGED_EXECUTION_MODES:
+        raise RuntimeError("release-owned Gateway is missing its managed execution mode")
     credential_authority = PreparedCodexCredentialSnapshot.from_inherited_environment(
-        required=internal_identity is not None,
+        required=(
+            internal_identity is not None
+            and managed_execution_mode == _CODEX_SUBSCRIPTION_EXECUTION_MODE
+        ),
     )
+    if (
+        internal_identity is not None
+        and managed_execution_mode == _SELF_DEPLOYED_EXECUTION_MODE
+        and credential_authority is not None
+    ):
+        credential_authority.close()
+        raise RuntimeError("Self-Deployed Gateway received subscription credentials")
     configure_server(
         topology_path,
         node_id=node_id,
         internal_identity=internal_identity,
         run_admission_verifier=configured_run_admission_verifier(internal_identity),
         credential_authority=credential_authority,
+        managed_execution_mode=managed_execution_mode,
     )
     state = get_state()
     listen_fd = inherited_listen_fd()
@@ -1033,8 +1065,17 @@ def main() -> None:
     parser.add_argument("--config", default=os.environ.get("OPENEVO_TOPOLOGY", "topology.yaml"))
     parser.add_argument("--node-id", default=os.environ.get("OPENEVO_GATEWAY_NODE_ID"))
     parser.add_argument("--log-level", default="info")
+    parser.add_argument(
+        "--managed-execution-mode",
+        choices=sorted(_MANAGED_EXECUTION_MODES),
+    )
     args = parser.parse_args()
-    serve(args.config, node_id=args.node_id, log_level=args.log_level)
+    serve(
+        args.config,
+        node_id=args.node_id,
+        log_level=args.log_level,
+        managed_execution_mode=args.managed_execution_mode,
+    )
 
 
 if __name__ == "__main__":

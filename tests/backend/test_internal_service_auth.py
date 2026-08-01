@@ -674,6 +674,62 @@ def test_release_gateway_session_create_and_dispatch_require_run_admission(
         gateway_server._credential_authority = None
 
 
+def test_release_self_deployed_gateway_admits_proxy_session_without_codex_credentials(
+    monkeypatch,
+) -> None:
+    class DispatchProbe:
+        called = False
+
+        async def dispatch(self, _request) -> None:
+            self.called = True
+
+    class AdmissionVerifier:
+        async def verify(self, _check: GenerationBoundRunAdmissionCheck) -> None:
+            return None
+
+    dispatch = DispatchProbe()
+    monkeypatch.setattr(
+        gateway_server,
+        "get_state",
+        lambda: SimpleNamespace(
+            node=SimpleNamespace(id="core-gateway"),
+            node_manager=dispatch,
+        ),
+    )
+    identity = _identity("gateway")
+    gateway_server._internal_identity = identity
+    gateway_server._run_admission_verifier = AdmissionVerifier()
+    gateway_server._credential_authority = None
+    gateway_server._managed_execution_mode = "self-deployed"
+    try:
+        response = TestClient(gateway_server.app).post(
+            "/sessions",
+            headers=identity.request_headers(),
+            json={
+                "session_id": "self-deployed-session",
+                "task_id": "self-deployed-task",
+                "instruction": "run through the managed proxy",
+                "remaining_timeout_seconds": 30,
+                "agent": {
+                    "harness": "codex",
+                    "settings": {
+                        "auth_mode": "proxy",
+                        "capture_mode": "transcript",
+                    },
+                },
+                "runtime": {"image": "managed-runtime"},
+            },
+        )
+
+        assert response.status_code == 200
+        assert dispatch.called is True
+    finally:
+        gateway_server._internal_identity = None
+        gateway_server._run_admission_verifier = None
+        gateway_server._credential_authority = None
+        gateway_server._managed_execution_mode = None
+
+
 def test_release_gateway_verifier_receives_only_generation_bound_digest(
     monkeypatch,
     tmp_path: Path,
