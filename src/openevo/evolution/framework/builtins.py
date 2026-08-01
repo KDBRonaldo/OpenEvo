@@ -63,11 +63,12 @@ BUILTIN_METHOD_IDS = (
     "agent_system_pareto_reflector",
     "agent_system_gepa_reflector",
     "parametric_memory_register",
-    "parametric_memory_lora_sft",
+    "parametric_memory_sd_lora",
 )
 
 _METHODS_MODULE = "openevo.evolution.methods"
 _MEMEVOLVE_MODULE = "openevo.evolution.memevolve"
+_SD_LORA_MODULE = "openevo.evolution.parametric.sd_lora"
 _BUILTINS_MODULE = "openevo.evolution.framework.builtins"
 _BUILTIN_HANDLERS_MODULE = "openevo.evolution.framework.builtin_handlers"
 _BOTH_EXECUTION_MODES = (
@@ -281,6 +282,20 @@ def _positive_integer(*, maximum: int = 10_000) -> dict[str, Any]:
     return {"type": "integer", "minimum": 1, "maximum": maximum}
 
 
+def _bounded_number(
+    *,
+    minimum: float | None = None,
+    exclusive_minimum: float | None = None,
+    maximum: float,
+) -> dict[str, Any]:
+    schema: dict[str, Any] = {"type": "number", "maximum": maximum}
+    if minimum is not None:
+        schema["minimum"] = minimum
+    if exclusive_minimum is not None:
+        schema["exclusiveMinimum"] = exclusive_minimum
+    return schema
+
+
 def _string_array(*, maximum: int) -> dict[str, Any]:
     return {
         "type": "array",
@@ -367,6 +382,66 @@ def _agent_system_fields() -> dict[str, dict[str, Any]]:
     }
 
 
+def _sd_lora_schema() -> dict[str, Any]:
+    return _closed_object(
+        {
+            "base_model": _string(maximum=193),
+            "model_revision": {
+                "type": "string",
+                "minLength": 40,
+                "maxLength": 64,
+            },
+            "rank": _positive_integer(maximum=128),
+            "target_modules": _string_array(maximum=128),
+            "learning_rate": _bounded_number(exclusive_minimum=0.0, maximum=1.0),
+            "coefficient_learning_rate": _bounded_number(
+                exclusive_minimum=0.0,
+                maximum=1.0,
+            ),
+            "weight_decay": _bounded_number(minimum=0.0, maximum=1.0),
+            "epochs": _positive_integer(maximum=100),
+            "max_steps": _positive_integer(maximum=1_000_000),
+            "max_length": {
+                "type": "integer",
+                "minimum": 32,
+                "maximum": 131_072,
+            },
+            "max_records": _positive_integer(maximum=100_000),
+            "replay_capacity": _positive_integer(maximum=100_000),
+            "per_device_train_batch_size": _positive_integer(maximum=128),
+            "gradient_accumulation_steps": _positive_integer(maximum=4096),
+            "max_grad_norm": _bounded_number(
+                exclusive_minimum=0.0,
+                maximum=1_000.0,
+            ),
+            "dtype": {
+                "type": "string",
+                "enum": ["bfloat16", "float16", "float32"],
+            },
+            "load_in_4bit": {"type": "boolean"},
+            "gradient_checkpointing": {"type": "boolean"},
+            "coefficient_init": _bounded_number(
+                exclusive_minimum=0.0,
+                maximum=100.0,
+            ),
+            "minimum_reward": _bounded_number(
+                minimum=-1_000_000.0,
+                maximum=1_000_000.0,
+            ),
+            "seed": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9_007_199_254_740_991,
+            },
+            "timeout_seconds": _bounded_number(
+                exclusive_minimum=0.0,
+                maximum=86_400.0,
+            ),
+        },
+        required=("base_model", "model_revision"),
+    )
+
+
 def _current_dataset() -> MethodInputBinding:
     return MethodInputBinding(
         binding_id="current_dataset",
@@ -403,6 +478,15 @@ def _prior_target(artifact_type: str) -> MethodInputBinding:
         source="current_target_artifacts",
         artifact_type=artifact_type,
         max_count=128,
+    )
+
+
+def _single_prior_target(artifact_type: str) -> MethodInputBinding:
+    return MethodInputBinding(
+        binding_id="prior_target_artifacts",
+        source="current_target_artifacts",
+        artifact_type=artifact_type,
+        max_count=1,
     )
 
 
@@ -449,7 +533,7 @@ def _target_descriptors(
             "Model adapter state for self-deployed inference backends.",
             "parametric_memory_handler",
             RendererKind.ADAPTER,
-            "parametric_memory_register",
+            "parametric_memory_sd_lora",
             40,
             Exposure.INTERNAL,
             "parametric_memory_target_anchor",
@@ -865,23 +949,50 @@ def _method_descriptors(
         ),
         _method(
             identity,
-            method_id="parametric_memory_lora_sft",
-            display_name="Parametric memory LoRA SFT",
-            description="Legacy internal LoRA trainer pending a constrained trainer contract.",
+            method_id="parametric_memory_sd_lora",
+            display_name="SD-LoRA continual parametric memory",
+            description=(
+                "Train one new SD-LoRA component with bounded trajectory replay and export "
+                "one cumulative PEFT adapter."
+            ),
             target_id="parametric_memory",
             execution_modes=_SELF_DEPLOYED,
             input_bindings=(
-                _ordered_dataset_inputs(),
-                _prior_target("parametric_memory"),
+                _current_dataset(),
+                _single_prior_target("parametric_memory"),
             ),
             output_artifact_types=("parametric_memory",),
-            config_schema=_closed_object(),
+            config_schema=_sd_lora_schema(),
+            default_config={
+                "rank": 8,
+                "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+                "learning_rate": 0.0002,
+                "coefficient_learning_rate": 0.01,
+                "weight_decay": 0.0,
+                "epochs": 1,
+                "max_length": 2048,
+                "max_records": 256,
+                "replay_capacity": 64,
+                "per_device_train_batch_size": 1,
+                "gradient_accumulation_steps": 1,
+                "max_grad_norm": 1.0,
+                "dtype": "bfloat16",
+                "load_in_4bit": False,
+                "gradient_checkpointing": True,
+                "coefficient_init": 0.8,
+                "minimum_reward": 0.5,
+                "seed": 1993,
+                "timeout_seconds": 3600.0,
+            },
             exposure=Exposure.INTERNAL,
             runtime_requirements=(
                 "adapter_serving",
-                "constrained_trainer_contract",
-                "trainer",
+                "gpu",
+                "sd_lora_continual_trainer",
             ),
+            project_config_injections=_AGENT_MODEL_PROJECT_CONFIG_INJECTIONS,
+            invocation_abi=MethodInvocationABI.METHOD_CONTEXT_V1,
+            implementation_module=_SD_LORA_MODULE,
         ),
     )
 
@@ -945,9 +1056,7 @@ def load_builtin_method_handles(
         if method_id in legacy_method_ids:
             expected_callable = METHOD_REGISTRY[method_id]
             if loaded is not expected_callable:
-                raise ValueError(
-                    f"built-in method callable identity mismatch for {method_id!r}"
-                )
+                raise ValueError(f"built-in method callable identity mismatch for {method_id!r}")
             handles[method_id] = expected_callable
         else:
             handles[method_id] = loaded

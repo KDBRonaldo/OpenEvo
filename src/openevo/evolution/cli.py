@@ -8,6 +8,9 @@ import time
 from openevo.evolution.framework import load_verified_framework_registry
 from openevo.evolution.framework.execution import MethodExecutionServices
 from openevo.evolution.harness_service import CodexSubscriptionHarnessService
+from openevo.evolution.parametric.trainer_service import (
+    SubprocessSdLoraTrainerService,
+)
 from openevo.evolution.methods import METHOD_REGISTRY
 from openevo.evolution.server import create_app
 from openevo.evolution.worker import EvolutionWorkerClient, run_once
@@ -83,12 +86,18 @@ def main(argv: list[str] | None = None) -> int:
             uvicorn.run(app, fd=listen_fd)
         return 0
 
-    capabilities = _parse_capabilities(args.capability)
     artifact_root = Path(args.artifact_root)
+    artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     registry = (
         load_verified_framework_registry(args.framework_lock)
         if args.framework_lock is not None
         else None
+    )
+    capabilities = _parse_capabilities(
+        args.capability,
+        defaults=(
+            tuple(registry.snapshot.methods) if registry is not None else tuple(METHOD_REGISTRY)
+        ),
     )
     internal_identity = read_internal_service_identity(
         required=False,
@@ -111,9 +120,10 @@ def main(argv: list[str] | None = None) -> int:
     with EvolutionWorkerClient(
         args.base_url,
         headers=(internal_identity.request_headers() if internal_identity is not None else None),
-    ) as client:
+    ) as client, SubprocessSdLoraTrainerService(artifact_root) as parametric_trainer:
         method_services = MethodExecutionServices(
-            harness=CodexSubscriptionHarnessService()
+            harness=CodexSubscriptionHarnessService(),
+            parametric_trainer=parametric_trainer,
         )
         if internal_identity is not None:
             client.register_internal_worker(
@@ -138,11 +148,15 @@ def main(argv: list[str] | None = None) -> int:
                 time.sleep(args.sleep_seconds)
 
 
-def _parse_capabilities(values: list[str]) -> list[str]:
+def _parse_capabilities(
+    values: list[str],
+    *,
+    defaults: tuple[str, ...] | None = None,
+) -> list[str]:
     capabilities: list[str] = []
     for value in values:
         capabilities.extend(part.strip() for part in value.split(",") if part.strip())
-    return capabilities or list(METHOD_REGISTRY)
+    return capabilities or list(defaults or METHOD_REGISTRY)
 
 
 if __name__ == "__main__":

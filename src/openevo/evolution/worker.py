@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from threading import Event, Thread
 from types import TracebackType
@@ -28,6 +29,25 @@ from openevo.evolution.planned_jobs import validate_plan_against_snapshot
 
 
 _DEFAULT_LEASE_SECONDS = 600
+_MAX_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+
+class _WorkerCancellationSignal:
+    def __init__(self, event: Event, upstream: object | None) -> None:
+        self._event = event
+        self._upstream = upstream
+
+    def is_set(self) -> bool:
+        upstream_is_set = getattr(self._upstream, "is_set", None)
+        return self._event.is_set() or bool(
+            upstream_is_set is not None and upstream_is_set()
+        )
+
+    def wait(self, timeout: float | None = None) -> bool:
+        if self.is_set():
+            return True
+        self._event.wait(timeout)
+        return self.is_set()
 
 
 class WorkerClient(Protocol):
@@ -145,7 +165,7 @@ def run_once(
 
 
 def _heartbeat_interval_seconds(lease_seconds: int) -> float:
-    return lease_seconds / 3
+    return min(lease_seconds / 3, _MAX_HEARTBEAT_INTERVAL_SECONDS)
 
 
 def _run_method_with_heartbeats(
@@ -158,6 +178,7 @@ def _run_method_with_heartbeats(
     method_services: MethodExecutionServices | None,
 ) -> list[ArtifactRegisterRequest]:
     stop = Event()
+    cancellation = Event()
     heartbeat_errors: list[Exception] = []
 
     def heartbeat_until_stopped() -> None:
@@ -166,6 +187,7 @@ def _run_method_with_heartbeats(
                 client.heartbeat(job.job_id, job.lease_id, message="running")
             except Exception as exc:
                 heartbeat_errors.append(exc)
+                cancellation.set()
                 stop.set()
                 return
 
@@ -176,12 +198,23 @@ def _run_method_with_heartbeats(
     heartbeat_thread.start()
     method_error: Exception | None = None
     artifacts: list[ArtifactRegisterRequest] = []
+    effective_services = (
+        replace(
+            method_services,
+            cancellation=_WorkerCancellationSignal(
+                cancellation,
+                method_services.cancellation,
+            ),
+        )
+        if method_services is not None
+        else None
+    )
     try:
         artifacts = _run_claimed_method(
             job,
             artifact_root=artifact_root,
             executable_registry=executable_registry,
-            method_services=method_services,
+            method_services=effective_services,
         )
     except Exception as exc:
         method_error = exc

@@ -128,9 +128,9 @@ base-class mutation bypass cannot alter later normalization or stored identity.
 ## A2.2 Built-In Catalog
 
 `openevo.evolution.framework.builtins` registers four targets, four handler
-descriptors, twelve legacy method callables, and the context-only
-`text_memory_memevolve` method. Target descriptors retain non-executable identity
-anchors. Handler descriptors point to the four
+descriptors, eleven legacy method callables, and two context-native methods:
+`text_memory_memevolve` and `parametric_memory_sd_lora`. Target descriptors retain
+non-executable identity anchors. Handler descriptors point to the four
 pure callables in `builtin_handlers`; release loading verifies their exact wheel
 inventory, entry point, signature, identity, and distribution attestation before
 sealing them in `VerifiedExecutableRegistry.handler_handles`. The internal projection
@@ -142,13 +142,13 @@ have not yet cut over.
 | `agent_system` | `agent_system_gepa_reflector` | Desktop | `markdown` |
 | `text_memory` | `text_memory_expel_reflector` | Desktop | `markdown` |
 | `skill_bundle` | `skill_bundle_reflector` | Desktop | `file_bundle` |
-| `parametric_memory` | `parametric_memory_register` | internal | `adapter` |
+| `parametric_memory` | `parametric_memory_sd_lora` | internal | `adapter` |
 
-All current `METHOD_REGISTRY` keys have exactly one legacy-ABI descriptor whose
+All current legacy `METHOD_REGISTRY` keys have exactly one method descriptor whose
 entry point is `openevo.evolution.methods:<method_id>`. The A2.2
 `load_builtin_method_handles` check remains an anti-drift test for exactly that
-legacy subset. `text_memory_memevolve` is loaded from the independently verified
-`openevo.evolution.memevolve:text_memory_memevolve` entry point and is absent from
+legacy subset. `text_memory_memevolve` and `parametric_memory_sd_lora` are loaded
+from their independently verified context-method entry points and are absent from
 both legacy method tables. Production plan-bound jobs dispatch from
 `VerifiedExecutableRegistry.method_handles`; they never fall back to
 `METHOD_REGISTRY`. The legacy table remains only for unplanned benchmark jobs
@@ -182,12 +182,15 @@ only the current-round dataset, while agent-system history, Pareto, and GEPA
 receive current then prior datasets. New methods request history explicitly with
 `history_datasets`; they do not inherit a legacy method-ID convention.
 
-The incomplete `parametric_memory_lora_sft` descriptor remains internal and
-requires the unavailable `constrained_trainer_contract` runtime capability. It
-cannot be reported as runnable merely because a machine has `trainer` and
-`adapter_serving`. Skill bundles permit common text, code, data, and image MIME
-types, with `application/octet-stream` as the inventory fallback for other
-auxiliary files.
+`parametric_memory_sd_lora` is an internal `method_context_v1` method and is not
+present in the legacy `METHOD_REGISTRY`. It is self-deployed only and requires
+`adapter_serving`, `gpu`, and `sd_lora_continual_trainer`. The launcher publishes
+the latter two capabilities only when the Daemon has the complete optional
+training profile and CUDA is available. Its closed schema contains bounded
+hyperparameters and an exact model revision; it has no trainer command,
+endpoint, credential, task router, or benchmark-specific projection field.
+Skill bundles permit common text, code, data, and image MIME types, with
+`application/octet-stream` as the inventory fallback for other auxiliary files.
 
 The execution envelope reconstructs the existing flat `job.config` immediately
 before invoking a legacy ABI method. This preserves current algorithm inputs

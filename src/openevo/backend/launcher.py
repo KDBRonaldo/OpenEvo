@@ -39,6 +39,7 @@ from openevo.evolution.framework import (
     load_verified_framework_registry,
 )
 from openevo.evolution.framework.builtins import VerifiedExecutableRegistry
+from openevo.evolution.parametric.trainer_service import sd_lora_trainer_available
 from openevo.harness.capture import transcript_capture_enabled
 from openevo.runtime.managed import require_managed_runtime_binding
 
@@ -459,11 +460,16 @@ def _execution_profile_for_config(config) -> EvolutionExecutionProfile:
         if subscription or transcript_capture_enabled(configured_capture)
         else "token_level"
     )
+    runtime_capabilities: tuple[str, ...] = ()
+    if not subscription:
+        runtime_capabilities = ("adapter_serving",)
+        if sd_lora_trainer_available():
+            runtime_capabilities += ("gpu", "sd_lora_continual_trainer")
     return EvolutionExecutionProfile(
         execution_mode="subscription" if subscription else "self_deployed",
         capture_mode=capture_mode,
         harness_id=config.agent.preset,
-        runtime_capabilities=("adapter_serving",) if not subscription else (),
+        runtime_capabilities=runtime_capabilities,
     )
 
 

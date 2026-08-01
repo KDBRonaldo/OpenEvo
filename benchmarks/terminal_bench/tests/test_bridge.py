@@ -13,11 +13,44 @@ from openevo_terminal_bench.cli import (
     main,
 )
 from openevo.evolution.models import DatasetCreateRequest, EventIngestRequest, WorkerClaimRequest
+from openevo.evolution.parametric.training_data import normalize_chat_messages
 from openevo.evolution.store import EvolutionStore
 from openevo_terminal_bench.bridge import (
+    CodexGatewayTrainingContract,
     TerminalBenchBridgeError,
     build_terminal_bench_events,
 )
+
+
+def _codex_gateway_contract(task_instruction: str) -> CodexGatewayTrainingContract:
+    return CodexGatewayTrainingContract.from_gateway_request(
+        {
+            "messages": [
+                {"role": "system", "content": "Use the Codex harness tools."},
+                {"role": "user", "content": task_instruction},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "description": "Run a command in a PTY.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "cmd": {"type": "string"},
+                                "max_output_tokens": {"type": "integer"},
+                                "yield_time_ms": {"type": "integer"},
+                            },
+                            "required": ["cmd"],
+                            "additionalProperties": False,
+                        },
+                        "strict": False,
+                    },
+                }
+            ],
+        }
+    )
 
 
 def test_build_terminal_bench_event_preserves_transcript_metadata_without_secrets(tmp_path):
@@ -213,6 +246,193 @@ def test_build_terminal_bench_event_allows_llm_calls_without_transcript_when_opt
     assert trace["metadata"]["llm_calls"][0]["metadata"]["step_index"] == 12
 
 
+def test_build_terminal_bench_event_projects_atif_agent_turns_as_training_traces(
+    tmp_path,
+):
+    trial_dir = _write_trial(
+        tmp_path,
+        stdout="Solved through Codex.\n",
+        stderr="",
+        atif_trajectory={
+            "schema_version": "ATIF-v1.5",
+            "session_id": "codex-session",
+            "agent": {
+                "name": "codex",
+                "version": "0.144.1",
+                "model_name": "gpt-5.5",
+            },
+            "steps": [
+                {
+                    "step_id": 1,
+                    "source": "user",
+                    "message": "Repair the certificate task.",
+                },
+                {
+                    "step_id": 2,
+                    "source": "agent",
+                    "message": "I will inspect the workspace.",
+                },
+                {
+                    "step_id": 3,
+                    "source": "agent",
+                    "message": "Executed exec_command call-1",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call-1",
+                            "function_name": "exec_command",
+                            "arguments": {
+                                "cmd": "pwd && ls -la",
+                                "yield_time_ms": 10000,
+                                "max_output_tokens": 2000,
+                            },
+                        }
+                    ],
+                    "observation": {
+                        "results": [
+                            {
+                                "source_call_id": "call-1",
+                                "content": "/app\n",
+                            }
+                        ]
+                    },
+                },
+                {
+                    "step_id": 4,
+                    "source": "agent",
+                    "message": "The requested files are now verified.",
+                },
+            ],
+        },
+    )
+
+    contract = _codex_gateway_contract("Repair the certificate task.")
+    [event] = build_terminal_bench_events(
+        trial_dir,
+        include_atif_traces=True,
+        codex_gateway_contract=contract,
+    )
+
+    trajectory = event.payload["session_result"]["trajectory"]
+    assert trajectory["metadata"]["builder"] == "terminal_bench_atif_bridge"
+    assert trajectory["metadata"]["trace_count"] == 2
+    first, second = trajectory["traces"]
+    assert first["prompt_messages"] == [
+        {"role": "system", "content": "Use the Codex harness tools."},
+        {"role": "user", "content": "Repair the certificate task."},
+    ]
+    assert first["response_messages"] == [
+        {
+            "role": "assistant",
+            "content": "I will inspect the workspace.",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": (
+                            '{"cmd":"pwd && ls -la","max_output_tokens":2000,'
+                            '"yield_time_ms":10000}'
+                        ),
+                    },
+                }
+            ],
+        }
+    ]
+    assert first["tools"] == contract.tools
+    assert first["metadata"]["harness_contract_digest"] == contract.digest
+    assert first["metadata"]["atif_step_ids"] == [2, 3]
+    assert second["prompt_messages"][-2:] == [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": first["response_messages"][0]["tool_calls"],
+        },
+        {"role": "tool", "content": "/app\n", "tool_call_id": "call-1"},
+    ]
+    assert second["prompt_messages"] == normalize_chat_messages(
+        [
+            *contract.messages,
+            {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "I will inspect the workspace.",
+                "tool_calls": first["response_messages"][0]["tool_calls"],
+            },
+            {"role": "tool", "content": "/app\n", "tool_call_id": "call-1"},
+        ]
+    )
+    assert second["response_messages"] == [
+        {
+            "role": "assistant",
+            "content": "The requested files are now verified.",
+        }
+    ]
+    assert all(trace["reward"] == 0.5 for trace in trajectory["traces"])
+
+
+def test_build_terminal_bench_event_prefers_structured_task_identity(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path,
+        stdout="done\n",
+        stderr="",
+    )
+    result_path = trial_dir / "result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result["task_name"] = "terminal-bench/fix-git"
+    result_path.write_text(json.dumps(result), encoding="utf-8")
+
+    [event] = build_terminal_bench_events(trial_dir)
+
+    assert event.task_id == "fix-git"
+    task_metadata = event.payload["session_result"]["trajectory"]["metadata"]["task_metadata"]
+    assert task_metadata["task_name"] == "terminal-bench/fix-git"
+
+
+def test_build_terminal_bench_event_requires_atif_when_training_projection_is_enabled(
+    tmp_path,
+):
+    trial_dir = _write_trial(tmp_path, stdout="Only a summary.\n", stderr="")
+
+    with pytest.raises(TerminalBenchBridgeError, match="ATIF trajectory"):
+        build_terminal_bench_events(trial_dir, include_atif_traces=True)
+
+
+def test_codex_gateway_projection_rejects_unavailable_custom_tools(tmp_path):
+    trial_dir = _write_trial(
+        tmp_path,
+        stdout="Codex attempted a custom edit.\n",
+        stderr="",
+        atif_trajectory={
+            "schema_version": "ATIF-v1.5",
+            "session_id": "codex-session",
+            "agent": {"name": "codex", "version": "0.144.1"},
+            "steps": [
+                {"step_id": 1, "source": "user", "message": "Create a file."},
+                {
+                    "step_id": 2,
+                    "source": "agent",
+                    "message": "I will patch it.",
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call-patch",
+                            "function_name": "apply_patch",
+                            "arguments": {"input": "*** Begin Patch"},
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+
+    with pytest.raises(TerminalBenchBridgeError, match="unavailable Codex tool"):
+        build_terminal_bench_events(
+            trial_dir,
+            include_atif_traces=True,
+            codex_gateway_contract=_codex_gateway_contract("Create a file."),
+        )
+
+
 def test_build_terminal_bench_event_uses_report_when_stdout_is_empty(tmp_path):
     trial_dir = _write_trial(
         tmp_path,
@@ -230,9 +450,7 @@ def test_build_terminal_bench_event_uses_report_when_stdout_is_empty(tmp_path):
             "content": "# Terminal Bench Report\n\nRecovered commit c499730.\n",
         }
     ]
-    assert trace["metadata"]["transcript_sources"] == [
-        "agent/evolab_lab/terminal_bench_report.md"
-    ]
+    assert trace["metadata"]["transcript_sources"] == ["agent/evolab_lab/terminal_bench_report.md"]
 
 
 def test_build_terminal_bench_event_uses_codex_log_when_stdout_is_empty(tmp_path):
@@ -287,9 +505,10 @@ def test_terminal_bench_events_cli_writes_jsonl(tmp_path):
     event_payload = json.loads(lines[0])
     assert event_payload["source"] == "terminal_bench.harbor"
     assert event_payload["event_type"] == "openevo.session_completed"
-    assert event_payload["payload"]["session_result"]["trajectory"]["metadata"][
-        "capture_mode"
-    ] == "transcript"
+    assert (
+        event_payload["payload"]["session_result"]["trajectory"]["metadata"]["capture_mode"]
+        == "transcript"
+    )
 
 
 def test_terminal_bench_dataset_cli_ingests_events_and_creates_dataset(tmp_path):
@@ -504,9 +723,7 @@ def test_terminal_bench_agent_system_job_cli_uses_history_method_for_multiple_da
         "terminal-bench",
         "terminal-bench:fix-git",
     ]
-    forbidden_literals = payload["job"]["config"]["agent_system_audit"][
-        "forbidden_literals"
-    ]
+    forbidden_literals = payload["job"]["config"]["agent_system_audit"]["forbidden_literals"]
     assert forbidden_literals == {}
 
 
@@ -768,6 +985,7 @@ def _write_trial(
     ctrf: dict | None = None,
     verifier_stdout: str = "",
     llm_calls: list[dict] | None = None,
+    atif_trajectory: dict | None = None,
 ) -> Path:
     trial_dir = root / "fix-git__abc123"
     (trial_dir / "agent").mkdir(parents=True)
@@ -786,10 +1004,17 @@ def _write_trial(
             encoding="utf-8",
         )
     if llm_calls is not None:
-        trajectory_dir = trial_dir / "agent" / "evolab_lab" / ".evolab" / "registries" / "trajectory"
+        trajectory_dir = (
+            trial_dir / "agent" / "evolab_lab" / ".evolab" / "registries" / "trajectory"
+        )
         trajectory_dir.mkdir(parents=True)
         (trajectory_dir / "llm_calls.jsonl").write_text(
             "".join(json.dumps(call) + "\n" for call in llm_calls),
+            encoding="utf-8",
+        )
+    if atif_trajectory is not None:
+        (trial_dir / "agent" / "trajectory.json").write_text(
+            json.dumps(atif_trajectory),
             encoding="utf-8",
         )
     (trial_dir / "verifier" / "reward.txt").write_text("0.5", encoding="utf-8")

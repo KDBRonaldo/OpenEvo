@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Event
 import time
 
 import pytest
@@ -501,6 +502,69 @@ def test_plan_bound_worker_renews_real_store_lease_while_method_runs(
             (created.job_id,),
         ).fetchone()
     assert row["state"] == "succeeded"
+
+
+def test_plan_bound_worker_cancels_context_method_when_heartbeat_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    method_started = Event()
+    method_cancelled = Event()
+
+    def cancellable_skill_handle(context):
+        cancellation = context.services.cancellation
+        assert cancellation is not None
+        method_started.set()
+        if not cancellation.wait(1.0):
+            raise AssertionError("worker cancellation did not reach the context method")
+        method_cancelled.set()
+        return []
+
+    class _FailingHeartbeatClient(_StoreWorkerClient):
+        def heartbeat(
+            self,
+            job_id: str,
+            lease_id: str,
+            *,
+            progress: float | None = None,
+            message: str | None = None,
+        ):
+            if message == "running":
+                self.heartbeat_messages.append(message)
+                raise RuntimeError("worker lease heartbeat was rejected")
+            return super().heartbeat(
+                job_id,
+                lease_id,
+                progress=progress,
+                message=message,
+            )
+
+    registry = _context_registry(cancellable_skill_handle)
+    store = _store(tmp_path)
+    request, created = _create_skill_job(store, registry=registry)
+    client = _FailingHeartbeatClient(store)
+    monkeypatch.setattr(worker_module, "_heartbeat_interval_seconds", lambda _: 0.01)
+
+    assert run_once(
+        client,
+        worker_id="context-worker",
+        capabilities=[request.job_type],
+        artifact_root=tmp_path / "artifacts",
+        lease_seconds=1,
+        executable_registry=registry,
+        method_services=MethodExecutionServices(harness=object()),
+    )
+
+    assert method_started.is_set()
+    assert method_cancelled.is_set()
+    assert client.heartbeat_messages.count("running") == 1
+    with store.connect() as connection:
+        row = connection.execute(
+            "SELECT state, error FROM jobs WHERE job_id = ?",
+            (created.job_id,),
+        ).fetchone()
+    assert row["state"] == "failed"
+    assert row["error"] == "worker lease heartbeat was rejected"
 
 
 def test_plan_bound_worker_dispatches_context_abi_with_core_services(

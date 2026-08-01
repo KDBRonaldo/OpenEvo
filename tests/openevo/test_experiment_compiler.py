@@ -461,6 +461,77 @@ def test_evolution_methods_include_parametric_memory_when_enabled() -> None:
     assert "reflector_llm" not in specs[1].config
 
 
+@pytest.mark.parametrize(
+    ("enable_memevolve", "enable_sd_lora", "expected_methods"),
+    [
+        (True, False, ("text_memory_memevolve",)),
+        (False, True, ("parametric_memory_sd_lora",)),
+        (
+            True,
+            True,
+            ("text_memory_memevolve", "parametric_memory_sd_lora"),
+        ),
+    ],
+)
+def test_context_memory_methods_compile_independently(
+    enable_memevolve: bool,
+    enable_sd_lora: bool,
+    expected_methods: tuple[str, ...],
+) -> None:
+    targets: dict[str, dict[str, object]] = {
+        "text_memory": {"enabled": False},
+        "parametric_memory": {"enabled": False},
+        "skill_bundle": {"enabled": False},
+        "agent_system": {"enabled": False},
+    }
+    if enable_memevolve:
+        targets["text_memory"] = {
+            "enabled": True,
+            "method": "text_memory_memevolve",
+            "config": {"candidate_count": 2},
+        }
+    if enable_sd_lora:
+        targets["parametric_memory"] = {
+            "enabled": True,
+            "method": "parametric_memory_sd_lora",
+            "config": {"model_revision": "a" * 40},
+        }
+
+    compiled = _compile_experiment(
+        _config(evolution={"targets": targets}),
+        registry_snapshot=_REGISTRY_SNAPSHOT,
+        execution_profile=EvolutionExecutionProfile(
+            execution_mode="self_deployed",
+            capture_mode="transcript",
+            harness_id="codex",
+            runtime_capabilities=(
+                "adapter_serving",
+                "gpu",
+                "sd_lora_continual_trainer",
+            ),
+        ),
+    )
+
+    specs = compiled.evolution_methods_for_round(
+        0,
+        prior_dataset_artifact_ids=[],
+    )
+    assert tuple(spec.method for spec in specs) == expected_methods
+    by_method = {spec.method: spec for spec in specs}
+    if enable_memevolve:
+        assert by_method["text_memory_memevolve"].config["reflector_llm"] == {
+            "provider": "codex_cli",
+            "model": "gpt-5.1-codex-mini",
+        }
+    if enable_sd_lora:
+        assert by_method["parametric_memory_sd_lora"].config["base_model"] == (
+            "gpt-5.1-codex-mini"
+        )
+        assert by_method["parametric_memory_sd_lora"].config["model_revision"] == (
+            "a" * 40
+        )
+
+
 def test_parametric_memory_config_rejects_undeclared_reflector_llm() -> None:
     with pytest.raises(ValueError, match="config.reflector_llm: unknown property"):
         compile_experiment(

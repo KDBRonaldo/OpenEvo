@@ -4148,7 +4148,14 @@ def release_identity_from_verified_registry(registry: object) -> ServiceReleaseI
 
 
 def _controlled_environment() -> dict[str, str]:
-    allowed = ("HOME", "LANG", "LC_ALL", "PATH", "TMPDIR")
+    allowed = (
+        "CUDA_VISIBLE_DEVICES",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "PATH",
+        "TMPDIR",
+    )
     result = {key: os.environ[key] for key in allowed if key in os.environ}
     result.setdefault("PATH", os.defpath)
     result["PYTHONNOUSERSITE"] = "1"

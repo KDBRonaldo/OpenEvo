@@ -170,6 +170,11 @@ def test_memevolve_descriptor_is_context_only_and_not_legacy_registered() -> Non
     assert descriptor.invocation_abi.value == "method_context_v1"
     assert descriptor.target_id == "text_memory"
     assert descriptor.output_artifact_types == ("text_memory",)
+    assert {mode.value for mode in descriptor.execution_modes} == {
+        "subscription",
+        "self_deployed",
+    }
+    assert descriptor.supported_harness_ids == ("codex",)
     assert descriptor.implementation_ref is not None
     assert descriptor.implementation_ref.entry_point == (
         "openevo.evolution.memevolve:text_memory_memevolve"

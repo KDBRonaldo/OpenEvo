@@ -13,6 +13,9 @@ from openevo.evolution.harness_service import (
     CodexSubscriptionHarnessService,
     HarnessInferenceError,
 )
+from openevo.evolution.parametric.trainer_service import (
+    SubprocessSdLoraTrainerService,
+)
 
 
 def _completed_events(text: str) -> bytes:
@@ -323,3 +326,7 @@ def test_worker_injects_core_codex_harness_service(
     _client, kwargs = observed["run_once"]
     services = kwargs["method_services"]
     assert isinstance(services.harness, CodexSubscriptionHarnessService)
+    assert isinstance(services.parametric_trainer, SubprocessSdLoraTrainerService)
+    artifact_root = tmp_path / "artifacts"
+    assert artifact_root.is_dir()
+    assert artifact_root.stat().st_mode & 0o777 == 0o700

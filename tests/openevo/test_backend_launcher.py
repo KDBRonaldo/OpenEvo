@@ -84,6 +84,32 @@ def test_backend_launcher_builds_transcript_profile_for_science_execution_modes(
         assert config.runtime.container_user == "host"
 
 
+def test_backend_launcher_publishes_sd_lora_training_capabilities_only_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = ExperimentConfig.model_validate(
+        {
+            "experiment": {"name": "science"},
+            "agent": {
+                "preset": "codex",
+                "model": "science-model",
+                "auth": "proxy",
+                "settings": {"capture_mode": "transcript"},
+            },
+            "tasks": [{"id": "task", "instruction": "Run the task."}],
+        }
+    )
+    monkeypatch.setattr(launcher, "sd_lora_trainer_available", lambda: True)
+
+    profile = launcher._execution_profile_for_config(config)
+
+    assert profile.runtime_capabilities == (
+        "adapter_serving",
+        "gpu",
+        "sd_lora_continual_trainer",
+    )
+
+
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
