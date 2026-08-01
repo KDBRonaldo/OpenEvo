@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from dataclasses import FrozenInstanceError, replace
 import os
 from pathlib import Path
 import pickle
 import shlex
 import subprocess
-import sys
 
 import pytest
 
@@ -16,11 +14,9 @@ from openevo.deployment.remote_home import (
     RemoteHomeAuthority,
     RemoteHomeAuthorityError,
     build_remote_home_guarded_command,
-    build_remote_home_guarded_rsync_path,
     build_remote_home_probe_command,
     parse_remote_home_probe,
 )
-from openevo.deployment.system_executables import RSYNC_EXECUTABLE
 
 
 def _record(
@@ -424,176 +420,15 @@ def test_guard_refuses_nss_home_drift_before_running_command(tmp_path: Path) -> 
     assert not marker.exists()
 
 
-def test_rsync_guard_forwards_server_arguments_after_account_revalidation(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "account-home"
-    home.mkdir()
-    uid = os.getuid()
-    tools = _fake_account_tools(
-        tmp_path,
-        user="researcher",
-        uid=uid,
-        home=home,
-    )
-    authority = _authority(user="researcher", uid=uid, home=os.fspath(home))
-    marker = tmp_path / "rsync-started"
-    remote_rsync = tmp_path / "remote-rsync"
-    _write_executable(
-        remote_rsync,
-        f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {shlex.quote(os.fspath(marker))}\n",
-    )
-    guarded = build_remote_home_guarded_rsync_path(
-        authority,
-        shlex.quote(os.fspath(remote_rsync)),
-    )
-
-    completed = subprocess.run(
-        " ".join(
-            (
-                *shlex.split(guarded),
-                "--server",
-                "--sender",
-                ".",
-                "/remote/target",
-            )
-        ),
-        shell=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={"PATH": os.fspath(tools)},
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert marker.read_text(encoding="utf-8") == ("--server\n--sender\n.\n/remote/target\n")
-
-
-def test_rsync_guard_refuses_nss_home_drift_before_starting_rsync(
-    tmp_path: Path,
-) -> None:
-    home = tmp_path / "account-home"
-    home.mkdir()
-    changed_home = tmp_path / "changed-home"
-    changed_home.mkdir()
-    uid = os.getuid()
-    tools = _fake_account_tools(
-        tmp_path,
-        user="researcher",
-        uid=uid,
-        home=home,
-        nss_home=changed_home,
-    )
-    authority = _authority(user="researcher", uid=uid, home=os.fspath(home))
-    marker = tmp_path / "rsync-must-not-start"
-    remote_rsync = tmp_path / "remote-rsync"
-    _write_executable(
-        remote_rsync,
-        f"#!/bin/sh\n: > {shlex.quote(os.fspath(marker))}\n",
-    )
-
-    guarded = build_remote_home_guarded_rsync_path(
-        authority,
-        shlex.quote(os.fspath(remote_rsync)),
-    )
-    completed = subprocess.run(
-        " ".join(
-            (
-                *shlex.split(guarded),
-                "--server",
-                ".",
-                "/remote/target",
-            )
-        ),
-        shell=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={"PATH": os.fspath(tools)},
-        check=False,
-    )
-
-    assert completed.returncode != 0
-    assert not marker.exists()
-
-
-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS openrsync transport contract")
 @pytest.mark.parametrize(
-    "remote_rsync_command",
+    "command",
     [
-        RSYNC_EXECUTABLE,
-        f"/usr/bin/env 'OPENEVO_RSYNC_GUARD=value with spaces' {RSYNC_EXECUTABLE}",
+        "",
+        "contains\x00nul",
+        "contains-unpaired-surrogate-\ud800",
+        "x" * 1_048_577,
     ],
 )
-def test_macos_openrsync_preserves_the_guard_through_openssh_argv_join(
-    tmp_path: Path,
-    remote_rsync_command: str,
-) -> None:
-    home = tmp_path / "account-home"
-    home.mkdir()
-    uid = os.getuid()
-    tools = _fake_account_tools(
-        tmp_path,
-        user="researcher",
-        uid=uid,
-        home=home,
-    )
-    authority = _authority(user="researcher", uid=uid, home=os.fspath(home))
-    fake_ssh = tmp_path / "fake-ssh"
-    _write_executable(
-        fake_ssh,
-        "#!/usr/bin/python3\n"
-        "import os\n"
-        "import sys\n"
-        "os.execv('/bin/sh', ['/bin/sh', '-c', ' '.join(sys.argv[2:])])\n",
-    )
-    source = tmp_path / "source"
-    source.mkdir()
-    (source / "payload.txt").write_text("guarded transfer\n", encoding="utf-8")
-    target = tmp_path / "target"
-
-    completed = subprocess.run(
-        [
-            RSYNC_EXECUTABLE,
-            "--archive",
-            "--rsync-path",
-            build_remote_home_guarded_rsync_path(authority, remote_rsync_command),
-            "-e",
-            os.fspath(fake_ssh),
-            f"{source}/",
-            f"fixture:{target}/",
-        ],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={"PATH": os.fspath(tools)},
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert (target / "payload.txt").read_text(encoding="utf-8") == "guarded transfer\n"
-
-
-@pytest.mark.parametrize(
-    ("builder", "command"),
-    [
-        (builder, command)
-        for builder in (
-            build_remote_home_guarded_command,
-            build_remote_home_guarded_rsync_path,
-        )
-        for command in (
-            "",
-            "contains\x00nul",
-            "contains-unpaired-surrogate-\ud800",
-            "x" * 1_048_577,
-        )
-    ],
-)
-def test_guard_rejects_invalid_trusted_command(
-    builder: Callable[[RemoteHomeAuthority, str], str],
-    command: str,
-) -> None:
+def test_guard_rejects_invalid_trusted_command(command: str) -> None:
     with pytest.raises(RemoteHomeAuthorityError, match="Remote account command is invalid"):
-        builder(_authority(), command)
+        build_remote_home_guarded_command(_authority(), command)

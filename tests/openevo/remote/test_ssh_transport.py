@@ -259,17 +259,6 @@ class RecordingSystemOpenSshAuthority:
         self.commands.append(remote_command)
         return ["/usr/bin/ssh", "-S", "/private/tmp/owned-master", "--", "gpu-lab", remote_command]
 
-    def rsync_argv(
-        self,
-        *,
-        local_path: Path,
-        remote_path: str,
-        arguments: tuple[str, ...],
-        remote_rsync_path: str | None,
-    ) -> list[str]:
-        del local_path, remote_path, arguments, remote_rsync_path
-        return ["/usr/bin/rsync", "--version"]
-
     def core_tunnel_argv(self, *, remote_port: int) -> list[str]:
         return [
             "/usr/bin/ssh",
@@ -374,6 +363,138 @@ def test_system_openssh_authority_drives_commands_and_owned_core_tunnel() -> Non
     assert authority.tunnels[0][0] == authority.core_tunnel_argv(remote_port=8765)
     assert "-F" not in authority.tunnels[0][0]
     assert "-W" in authority.tunnels[0][0]
+    transport.close()
+
+
+def test_system_openssh_transport_does_not_require_an_rsync_follower() -> None:
+    authority = RecordingSystemOpenSshAuthority()
+    profile = _profile(
+        host="gpu-lab",
+        port=22,
+        user="alice",
+        workspace_root=authority.remote_home_authority.workspace_root,
+    )
+
+    transport = SshRemoteExecutorTransport(
+        profile,
+        system_openssh_authority=authority,
+    )
+
+    assert transport.run("true").ok
+    transport.close()
+
+
+def test_system_openssh_legacy_upload_fails_before_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    authority = RecordingSystemOpenSshAuthority()
+    profile = _profile(
+        host="gpu-lab",
+        port=22,
+        user="alice",
+        workspace_root=authority.remote_home_authority.workspace_root,
+    )
+    local = tmp_path / "workspace"
+    local.mkdir()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        system_openssh_authority=authority,
+    )
+
+    with pytest.raises(SshTransportError) as captured:
+        transport.upload_dir(str(local), "/home/alice/.openevo/workspaces/project")
+
+    assert captured.value.code is SshTransportErrorCode.INVALID_REQUEST
+    assert authority.commands == []
+    assert authority.runs == []
+    transport.close()
+
+
+def test_system_openssh_legacy_core_asset_transfer_fails_before_remote_mutation(
+    tmp_path: Path,
+) -> None:
+    authority = RecordingSystemOpenSshAuthority()
+    wheel = tmp_path / "openevo.whl"
+    wheel.write_bytes(b"wheel")
+    wheel_sha256 = hashlib.sha256(wheel.read_bytes()).hexdigest()
+    framework_lock = tmp_path / "framework-lock.json"
+    framework_lock.write_text(
+        json.dumps(
+            {
+                "schema_version": "1",
+                "distribution": "openevo",
+                "distribution_version": "0.1.10",
+                "distribution_digest": wheel_sha256,
+                "wheel_filename": wheel.name,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    transport = SshRemoteExecutorTransport(
+        _profile(
+            host="gpu-lab",
+            port=22,
+            user="alice",
+            workspace_root=authority.remote_home_authority.workspace_root,
+        ),
+        system_openssh_authority=authority,
+    )
+
+    with pytest.raises(SshTransportError) as captured:
+        transport.stage_core_bootstrap_assets(
+            runtime=_core_runtime_authority(),
+            wheel_path=str(wheel),
+            wheel_sha256=wheel_sha256,
+            wheel_size=wheel.stat().st_size,
+            framework_lock_path=str(framework_lock),
+            framework_lock_sha256=hashlib.sha256(framework_lock.read_bytes()).hexdigest(),
+            framework_lock_size=framework_lock.stat().st_size,
+            bundle_id="c" * 64,
+            timeout_seconds=30,
+        )
+
+    assert captured.value.code is SshTransportErrorCode.INVALID_REQUEST
+    assert authority.commands == []
+    assert authority.runs == []
+    transport.close()
+
+
+def test_system_openssh_legacy_runtime_transfer_fails_before_remote_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    authority = RecordingSystemOpenSshAuthority()
+    archive = tmp_path / "runtime.tar.gz"
+    release = write_test_managed_runtime_archive(archive)
+    monkeypatch.setattr(managed_runtime_assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    transport = SshRemoteExecutorTransport(
+        _profile(
+            host="gpu-lab",
+            port=22,
+            user="alice",
+            workspace_root=authority.remote_home_authority.workspace_root,
+        ),
+        system_openssh_authority=authority,
+    )
+
+    with pytest.raises(SshTransportError) as captured:
+        transport.ensure_managed_runtime(
+            runtime=_core_runtime_authority(),
+            archive_path=str(archive),
+            archive_sha256=release.sha256,
+            archive_size=release.byte_size,
+            platform=release.platform,
+            config_id=release.config_id,
+            oci_index_id=release.oci_index_id,
+            aliases=release.aliases,
+            timeout_seconds=30,
+        )
+
+    assert captured.value.code is SshTransportErrorCode.INVALID_REQUEST
+    assert authority.commands == []
+    assert authority.runs == []
     transport.close()
 
 

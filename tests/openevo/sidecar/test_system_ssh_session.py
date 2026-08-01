@@ -39,7 +39,6 @@ from openevo.deployment.host_keys import (
 from openevo.deployment.remote_home import (
     REMOTE_HOME_PROBE_OUTPUT_LIMIT,
     build_remote_home_guarded_command,
-    build_remote_home_guarded_rsync_path,
     build_remote_home_probe_command,
     parse_remote_home_probe,
 )
@@ -48,7 +47,6 @@ from openevo.deployment.ssh import (
     build_system_openssh_environment,
 )
 from openevo.deployment.system_executables import (
-    RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
     SSH_KEYGEN_EXECUTABLE,
     SYSTEM_OPENSSH_OWNER_ARGUMENT,
@@ -319,24 +317,20 @@ def test_master_environment_is_closed_and_bound_to_one_broker_capability(
         launcher.close_socket()
 
 
-def test_all_followers_reuse_only_the_exact_owned_socket(short_tmp_path: Path) -> None:
+def test_all_ssh_followers_reuse_only_the_exact_owned_socket(short_tmp_path: Path) -> None:
     tmp_path = short_tmp_path
-    local = tmp_path / "workspace"
-    local.mkdir()
     session, _process, _inspector, launcher, _runner = _session(tmp_path)
     try:
         snapshot = session.start()
 
         command = session.command_argv("true")
-        upload = session.upload_argv(local_path=local, remote_path="/srv/workspace")
         tunnel = session.core_tunnel_argv(remote_port=8765)
 
         assert command[0:3] == [SSH_EXECUTABLE, "-S", str(snapshot.control_path)]
-        remote_shell = upload[upload.index("-e") + 1]
-        assert f"-S {snapshot.control_path}" in remote_shell
         assert tunnel[0:3] == [SSH_EXECUTABLE, "-S", str(snapshot.control_path)]
         assert "ControlMaster=no" in command
         assert "ControlMaster=no" in tunnel
+        assert not hasattr(session, "upload_argv")
     finally:
         session.close()
         launcher.close_socket()
@@ -486,17 +480,10 @@ def test_follower_authority_guards_rich_commands_but_not_core_tunnel(
         launcher.close_socket()
 
 
-@pytest.mark.parametrize(
-    "remote_rsync_path",
-    [None, "/usr/bin/python3 -I -c 'trusted lease' /usr/bin/rsync"],
-)
-def test_follower_authority_guards_every_rsync_server_command(
+def test_follower_authority_does_not_expose_rsync_as_a_release_capability(
     short_tmp_path: Path,
-    remote_rsync_path: str | None,
 ) -> None:
     session, _process, _inspector, launcher, runner = _session(short_tmp_path)
-    local = short_tmp_path / "upload"
-    local.mkdir()
     try:
         session.start()
         runner.stdout = _remote_home_record()
@@ -506,18 +493,7 @@ def test_follower_authority_guards_every_rsync_server_command(
             remote_home_authority=authority,
         )
 
-        argv = follower.rsync_argv(
-            local_path=local,
-            remote_path="/srv/research/alice/.openevo/workspaces/project",
-            arguments=("--archive",),
-            remote_rsync_path=remote_rsync_path,
-        )
-
-        rsync_path_index = argv.index("--rsync-path")
-        assert argv[rsync_path_index + 1] == build_remote_home_guarded_rsync_path(
-            authority,
-            remote_rsync_path or RSYNC_EXECUTABLE,
-        )
+        assert not hasattr(follower, "rsync_argv")
     finally:
         session.close()
         launcher.close_socket()

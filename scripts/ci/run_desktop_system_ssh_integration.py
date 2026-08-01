@@ -40,6 +40,7 @@ from desktop.sidecar.system_ssh_session import (  # noqa: E402
     SystemOpenSshSessionError,
     _SystemSshMasterLauncher,
     _run_verified_bounded_subprocess,
+    _run_verified_follower_subprocess,
 )
 from openevo.deployment.host_keys import (  # noqa: E402
     SystemHostKeyFailureCode,
@@ -53,11 +54,9 @@ from openevo.deployment.ssh import (  # noqa: E402
     build_system_openssh_core_tunnel_argv,
     build_system_openssh_environment,
     build_system_openssh_master_argv,
-    build_system_openssh_upload_argv,
 )
 from openevo.deployment.system_executables import (  # noqa: E402
     MACOS_SYSTEM_COMMAND_PATH,
-    RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
     SSH_KEYGEN_EXECUTABLE,
     VerifiedSystemExecutable,
@@ -69,6 +68,7 @@ SSH_AGENT_EXECUTABLE = "/usr/bin/ssh-agent"
 SSH_ADD_EXECUTABLE = "/usr/bin/ssh-add"
 CLANG_EXECUTABLE = "/usr/bin/clang"
 REMOTE_COMMAND = "printf 'openevo-system-ssh-command-v1\\n'"
+STREAMING_TRANSFER_PAYLOAD = b"openevo-system-ssh-stream-v1\n"
 _ROOT_PREFIX = ".oe-ssh-integration-"
 _MAX_OUTPUT_BYTES = 256 * 1024
 _START_TIMEOUT_SECONDS = 10.0
@@ -112,8 +112,8 @@ class FixturePaths:
     askpass_helper: Path
     askpass_responses: Path
     askpass_events: Path
-    upload_source: Path
-    upload_target: Path
+    stream_source: Path
+    stream_target: Path
 
     @classmethod
     def for_root(cls, root: Path | str) -> FixturePaths:
@@ -147,8 +147,8 @@ class FixturePaths:
             askpass_helper=root_path / "askpass-fixture",
             askpass_responses=root_path / "askpass-responses",
             askpass_events=root_path / "askpass-events",
-            upload_source=root_path / "upload-source",
-            upload_target=root_path / "upload-target",
+            stream_source=root_path / "stream-source",
+            stream_target=root_path / "stream-target",
         )
 
 
@@ -164,7 +164,7 @@ class FixtureTopology:
 class ProductionSshPlan:
     master: list[str]
     command: list[str]
-    upload: list[str]
+    stream: list[str]
     tunnel: list[str]
     exit_master: list[str]
 
@@ -173,8 +173,7 @@ def build_production_plan(
     profile: SystemOpenSshAliasProfile,
     *,
     control_path: Path,
-    upload_root: Path,
-    remote_upload_root: str,
+    remote_stream_path: str,
     core_port: int,
 ) -> ProductionSshPlan:
     """Build every operation through the shipped alias-only builders."""
@@ -186,11 +185,10 @@ def build_production_plan(
             control_path=control_path,
             remote_command=REMOTE_COMMAND,
         ),
-        upload=build_system_openssh_upload_argv(
+        stream=build_system_openssh_command_argv(
             profile,
             control_path=control_path,
-            local_path=upload_root,
-            remote_path=remote_upload_root,
+            remote_command=build_stream_receive_command(remote_stream_path),
         ),
         tunnel=build_system_openssh_core_tunnel_argv(
             profile,
@@ -203,6 +201,12 @@ def build_production_plan(
             operation="exit",
         ),
     )
+
+
+def build_stream_receive_command(remote_path: str) -> str:
+    if not isinstance(remote_path, str) or not remote_path.startswith("/"):
+        raise IntegrationError("stream_target_invalid")
+    return f"umask 077; /bin/cat > {shlex.quote(remote_path)}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,7 +233,7 @@ class IntegrationEvidence:
             "changed_host_key",
             "repeated_changed_host_key",
             "command",
-            "upload",
+            "streaming_transfer",
             "core_tunnel",
             "master_reuse",
             "ambient_control_master_isolation",
@@ -288,7 +292,6 @@ def verify_substrate(*, platform_name: str | None = None) -> dict[str, Path]:
         SSHD_EXECUTABLE,
         SSH_EXECUTABLE,
         SSH_KEYGEN_EXECUTABLE,
-        RSYNC_EXECUTABLE,
         SSH_AGENT_EXECUTABLE,
         SSH_ADD_EXECUTABLE,
         CLANG_EXECUTABLE,
@@ -742,8 +745,7 @@ class _FixtureSession:
         return build_production_plan(
             self.profile,
             control_path=self.control_path,
-            upload_root=self.paths.upload_source,
-            remote_upload_root=str(self.paths.upload_target),
+            remote_stream_path=str(self.paths.stream_target),
             core_port=core_port,
         )
 
@@ -764,6 +766,49 @@ class _FixtureSession:
     def run_command(self, core_port: int) -> subprocess.CompletedProcess[bytes]:
         plan = _bind_fixture_config(self.production_plan(core_port), self.paths.client_config)
         return self.run_argv(plan.command)
+
+    def run_streaming_argv(
+        self,
+        argv: list[str],
+        source: Path,
+        *,
+        timeout_seconds: float = _PROCESS_TIMEOUT_SECONDS,
+    ) -> subprocess.CompletedProcess[str]:
+        if self.environment is None:
+            raise IntegrationError("ssh_session_unavailable")
+        descriptor = os.open(source, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_uid != os.geteuid()
+                or before.st_nlink != 1
+                or stat.S_IMODE(before.st_mode) != 0o600
+            ):
+                raise IntegrationError("stream_source_invalid")
+            completed = _run_verified_follower_subprocess(
+                argv,
+                self.environment,
+                timeout_seconds,
+                stdin_fd=descriptor,
+                cancel_event=None,
+            )
+            after = os.fstat(descriptor)
+            if (
+                after.st_dev,
+                after.st_ino,
+                after.st_size,
+                after.st_mtime_ns,
+            ) != (
+                before.st_dev,
+                before.st_ino,
+                before.st_size,
+                before.st_mtime_ns,
+            ):
+                raise IntegrationError("stream_source_changed")
+            return completed
+        finally:
+            os.close(descriptor)
 
     def close(self, *, suppress: bool = False) -> None:
         if self._closed:
@@ -1278,9 +1323,7 @@ def _write_askpass_responses(
 
 def _prepare_fixture(paths: FixturePaths, topology: FixtureTopology) -> _FixtureSecrets:
     paths.ssh_directory.mkdir(mode=0o700)
-    paths.upload_source.mkdir(mode=0o700)
-    paths.upload_target.mkdir(mode=0o700)
-    _write_private(paths.upload_source / "payload.txt", b"openevo-system-ssh-upload-v1\n")
+    _write_private(paths.stream_source, STREAMING_TRANSFER_PAYLOAD)
     passphrase = secrets.token_hex(16)
     password = secrets.token_hex(16)
     fixture_secrets = _FixtureSecrets(passphrase=passphrase, password=password)
@@ -1350,17 +1393,10 @@ def _inject_fixture_config(argv: list[str], config: Path) -> list[str]:
 
 
 def _bind_fixture_config(plan: ProductionSshPlan, config: Path) -> ProductionSshPlan:
-    upload = list(plan.upload)
-    try:
-        index = upload.index("-e") + 1
-    except ValueError as exc:
-        raise IntegrationError("fixture_rsync_argv_invalid") from exc
-    remote_shell = shlex.split(upload[index])
-    upload[index] = shlex.join(_inject_fixture_config(remote_shell, config))
     return ProductionSshPlan(
         master=_inject_fixture_config(plan.master, config),
         command=_inject_fixture_config(plan.command, config),
-        upload=upload,
+        stream=_inject_fixture_config(plan.stream, config),
         tunnel=_inject_fixture_config(plan.tunnel, config),
         exit_master=_inject_fixture_config(plan.exit_master, config),
     )
@@ -1505,16 +1541,16 @@ def _assert_command(session: _FixtureSession, core_port: int) -> None:
         raise IntegrationError("ssh_command_failed")
 
 
-def _assert_upload(session: _FixtureSession, core_port: int) -> None:
+def _assert_streaming_transfer(session: _FixtureSession, core_port: int) -> None:
     plan = _bind_fixture_config(session.production_plan(core_port), session.paths.client_config)
-    completed = session.run_argv(plan.upload)
-    target = session.paths.upload_target / "payload.txt"
+    completed = session.run_streaming_argv(plan.stream, session.paths.stream_source)
+    target = session.paths.stream_target
     if (
         completed.returncode != 0
         or not target.is_file()
-        or target.read_bytes() != b"openevo-system-ssh-upload-v1\n"
+        or target.read_bytes() != STREAMING_TRANSFER_PAYLOAD
     ):
-        raise IntegrationError("ssh_upload_failed")
+        raise IntegrationError("ssh_streaming_transfer_failed")
 
 
 def _assert_tunnel(session: _FixtureSession, core_port: int) -> None:
@@ -1814,8 +1850,8 @@ def _run_fixture(paths: FixturePaths, topology: FixtureTopology) -> _FixtureResu
         owner_pid = direct.process.pid if direct.process is not None else -1
         _assert_command(direct, topology.core_port)
         checks["command"] = True
-        _assert_upload(direct, topology.core_port)
-        checks["upload"] = True
+        _assert_streaming_transfer(direct, topology.core_port)
+        checks["streaming_transfer"] = True
         _assert_tunnel(direct, topology.core_port)
         checks["core_tunnel"] = True
         _assert_command(direct, topology.core_port)

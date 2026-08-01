@@ -88,7 +88,6 @@ from openevo.deployment.ssh import (
     build_system_openssh_environment,
     build_system_openssh_master_argv,
     build_system_openssh_probe_argv,
-    build_system_openssh_upload_argv,
 )
 from openevo.deployment.workspace import (
     WorkspacePreparationAction,
@@ -156,7 +155,6 @@ __all__ = [
     "build_system_openssh_environment",
     "build_system_openssh_master_argv",
     "build_system_openssh_probe_argv",
-    "build_system_openssh_upload_argv",
     "execute_sidecar_plan",
     "execute_remote_services_plan",
     "execute_workspace_plan",

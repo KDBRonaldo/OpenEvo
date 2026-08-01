@@ -130,15 +130,6 @@ class SystemOpenSshFollowerAuthority(Protocol):
 
     def command_argv(self, remote_command: str) -> list[str]: ...
 
-    def rsync_argv(
-        self,
-        *,
-        local_path: Path,
-        remote_path: str,
-        arguments: tuple[str, ...],
-        remote_rsync_path: str | None,
-    ) -> list[str]: ...
-
     def core_tunnel_argv(self, *, remote_port: int) -> list[str]: ...
 
     def run_argv(
@@ -405,51 +396,6 @@ def build_system_openssh_command_argv(
         profile.ssh_host_alias,
         remote_command,
     ]
-
-
-def build_system_openssh_upload_argv(
-    profile: SystemOpenSshAliasProfile,
-    *,
-    control_path: Path | str,
-    local_path: Path | str,
-    remote_path: str,
-    delete: bool = False,
-) -> list[str]:
-    """Build a bounded rsync upload through the exact owned SSH socket."""
-
-    if type(delete) is not bool:
-        raise ValueError("rsync delete flag must be boolean")
-    local = Path(local_path)
-    if not local.is_absolute() or not local.is_dir():
-        raise ValueError("rsync local path must be an existing absolute directory")
-    _validate_remote_absolute_path(remote_path, "remote_path")
-    remote_shell = [
-        *_system_openssh_follower_argv(control_path),
-        "-o",
-        "ClearAllForwardings=yes",
-        "-o",
-        "PermitLocalCommand=no",
-        "-o",
-        "ForwardAgent=no",
-        "-o",
-        "RequestTTY=no",
-        "-o",
-        "RemoteCommand=none",
-        "-T",
-        "--",
-    ]
-    argv = [RSYNC_EXECUTABLE, "--archive"]
-    if delete:
-        argv.append("--delete")
-    argv.extend(
-        [
-            "-e",
-            shlex.join(remote_shell),
-            _with_trailing_slash(str(local)),
-            f"{profile.ssh_host_alias}:{_with_trailing_slash(remote_path)}",
-        ]
-    )
-    return argv
 
 
 def build_system_openssh_control_argv(
@@ -1351,7 +1297,6 @@ class SshRemoteExecutorTransport:
             try:
                 required = (
                     "command_argv",
-                    "rsync_argv",
                     "core_tunnel_argv",
                     "run_argv",
                     "start_tunnel",
@@ -1727,6 +1672,8 @@ class SshRemoteExecutorTransport:
             invalid_request = True
             local = Path(".")
         if invalid_request:
+            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
+        if self._system_openssh_authority is not None:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
 
         mkdir_result = self.run(f"mkdir -p {shlex.quote(remote_path)}")
@@ -2397,6 +2344,7 @@ class SshRemoteExecutorTransport:
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not 0 < timeout_seconds <= 300
+            or self._system_openssh_authority is not None
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         try:
@@ -2531,6 +2479,7 @@ class SshRemoteExecutorTransport:
             or not isinstance(timeout_seconds, (int, float))
             or not 0 < timeout_seconds <= 900
             or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
+            or self._system_openssh_authority is not None
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         try:
@@ -3419,14 +3368,6 @@ class SshRemoteExecutorTransport:
         remote_path: str,
         known_hosts_file: Path,
     ) -> list[str]:
-        system_authority = self._system_openssh_authority
-        if system_authority is not None:
-            return system_authority.rsync_argv(
-                local_path=local,
-                remote_path=remote_path,
-                arguments=("--archive", "--delete"),
-                remote_rsync_path=None,
-            )
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             RSYNC_EXECUTABLE,
@@ -3447,25 +3388,6 @@ class SshRemoteExecutorTransport:
         authority: _CoreAssetTransferAuthority,
     ) -> list[str]:
         _validate_remote_absolute_path(remote_root, "remote_root")
-        system_authority = self._system_openssh_authority
-        if system_authority is not None:
-            return system_authority.rsync_argv(
-                local_path=local_root,
-                remote_path=remote_root,
-                arguments=(
-                    "--recursive",
-                    "--delete",
-                    f"--filter=protect /{CORE_ASSET_TRANSFER_LEASE}",
-                    "--chmod=F600,D700",
-                    "--no-owner",
-                    "--no-group",
-                ),
-                remote_rsync_path=build_core_asset_rsync_path(
-                    service_root=authority.service_root,
-                    bundle_id=authority.bundle_id,
-                    transfer_id=authority.transfer_id,
-                ),
-            )
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             RSYNC_EXECUTABLE,
@@ -3495,26 +3417,6 @@ class SshRemoteExecutorTransport:
         *,
         archive_size: int,
     ) -> list[str]:
-        system_authority = self._system_openssh_authority
-        if system_authority is not None:
-            return system_authority.rsync_argv(
-                local_path=local_root,
-                remote_path=transfer.incoming_root,
-                arguments=(
-                    "--recursive",
-                    "--inplace",
-                    "--delete",
-                    f"--max-size={archive_size}",
-                    f"--filter=protect /{MANAGED_RUNTIME_TRANSFER_LEASE}",
-                    "--chmod=F600,D700",
-                    "--no-owner",
-                    "--no-group",
-                ),
-                remote_rsync_path=build_managed_runtime_rsync_path(
-                    transfer,
-                    archive_size=archive_size,
-                ),
-            )
         ssh_command = " ".join(shlex.quote(part) for part in self._ssh_base_argv(known_hosts_file))
         return [
             RSYNC_EXECUTABLE,

@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
-import shlex
 import sys
 from types import ModuleType
 
@@ -15,7 +14,6 @@ from openevo.deployment.ssh import (
     build_system_openssh_control_argv,
     build_system_openssh_core_tunnel_argv,
     build_system_openssh_master_argv,
-    build_system_openssh_upload_argv,
 )
 
 
@@ -52,6 +50,20 @@ def test_substrate_is_darwin_only_and_requires_exact_system_tools(
     )
     with pytest.raises(integration.IntegrationError, match="substrate_unavailable"):
         integration.verify_substrate(platform_name="darwin")
+
+
+def test_substrate_does_not_require_local_or_remote_rsync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        integration,
+        "_verified_tool",
+        lambda path: None if path == "/usr/bin/rsync" else Path(path),
+    )
+
+    observed = integration.verify_substrate(platform_name="darwin")
+
+    assert "/usr/bin/rsync" not in observed
 
 
 def test_fixture_configs_bind_loopback_current_user_and_literal_aliases(
@@ -92,8 +104,6 @@ def test_fixture_configs_bind_loopback_current_user_and_literal_aliases(
 
 
 def test_integration_plan_delegates_to_production_alias_builders(tmp_path: Path) -> None:
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
     profile = SystemOpenSshAliasProfile(
         profile_id="fixture-profile",
         ssh_host_alias="proxy-jump",
@@ -105,8 +115,7 @@ def test_integration_plan_delegates_to_production_alias_builders(tmp_path: Path)
     plan = integration.build_production_plan(
         profile,
         control_path=control_path,
-        upload_root=workspace,
-        remote_upload_root="/tmp/openevo-system-ssh-upload",
+        remote_stream_path="/tmp/openevo-system-ssh-stream",
         core_port=42103,
     )
 
@@ -119,11 +128,12 @@ def test_integration_plan_delegates_to_production_alias_builders(tmp_path: Path)
         control_path=control_path,
         remote_command=integration.REMOTE_COMMAND,
     )
-    assert plan.upload == build_system_openssh_upload_argv(
+    assert plan.stream == build_system_openssh_command_argv(
         profile,
         control_path=control_path,
-        local_path=workspace,
-        remote_path="/tmp/openevo-system-ssh-upload",
+        remote_command=integration.build_stream_receive_command(
+            "/tmp/openevo-system-ssh-stream"
+        ),
     )
     assert plan.tunnel == build_system_openssh_core_tunnel_argv(
         profile,
@@ -139,7 +149,7 @@ def test_integration_plan_delegates_to_production_alias_builders(tmp_path: Path)
     original = integration.ProductionSshPlan(
         master=list(plan.master),
         command=list(plan.command),
-        upload=list(plan.upload),
+        stream=list(plan.stream),
         tunnel=list(plan.tunnel),
         exit_master=list(plan.exit_master),
     )
@@ -149,18 +159,11 @@ def test_integration_plan_delegates_to_production_alias_builders(tmp_path: Path)
     for before, after in (
         (plan.master, bound.master),
         (plan.command, bound.command),
+        (plan.stream, bound.stream),
         (plan.tunnel, bound.tunnel),
         (plan.exit_master, bound.exit_master),
     ):
         assert after == [before[0], "-F", str(fixture_config), *before[1:]]
-    remote_shell = shlex.split(bound.upload[bound.upload.index("-e") + 1])
-    original_shell = shlex.split(plan.upload[plan.upload.index("-e") + 1])
-    assert remote_shell == [
-        original_shell[0],
-        "-F",
-        str(fixture_config),
-        *original_shell[1:],
-    ]
     assert plan == original
 
 
@@ -184,6 +187,8 @@ def test_evidence_is_closed_and_contains_no_fixture_path_or_secret() -> None:
     assert "/Users/" not in encoded
     assert "/tmp/" not in encoded
     assert "passphrase" not in encoded.casefold()
+    assert "upload" not in payload["checks"]
+    assert "streaming_transfer" in payload["checks"]
 
 
 def test_fixture_cleanup_never_removes_a_replacement_directory(tmp_path: Path) -> None:

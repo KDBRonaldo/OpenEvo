@@ -47,6 +47,12 @@ effective values. First-host and changed-key behavior uses the user's OpenSSH
 trust policy, with explicit changed-key review and only provably unambiguous
 `ssh-keygen` repair.
 
+The v0.1.10 release authority further removes the system-OpenSSH rsync follower
+entirely. Release installation assets stream through the owned SSH command's
+stdin, and legacy rsync-based transfer methods are unavailable to that
+authority. References to rsync below remain frozen v0.1.8 foundation history,
+not a Desktop release dependency.
+
 ## Frozen 0.1.8 Foundation
 
 The remaining sections document the explicit transport retained only for v1

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-import shlex
 import subprocess
 import sys
 
@@ -17,11 +16,9 @@ from openevo.deployment.ssh import (
     build_system_openssh_environment,
     build_system_openssh_master_argv,
     build_system_openssh_probe_argv,
-    build_system_openssh_upload_argv,
 )
 from openevo.deployment.system_executables import (
     MACOS_SYSTEM_COMMAND_PATH,
-    RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
 )
 
@@ -39,7 +36,7 @@ def _control_path(tmp_path: Path) -> Path:
 
 
 def _assert_user_authority_not_flattened(argv: list[str]) -> None:
-    assert argv[0] in {SSH_EXECUTABLE, RSYNC_EXECUTABLE}
+    assert argv[0] == SSH_EXECUTABLE
     forbidden_tokens = {"-F", "-p", "-l", "-i"}
     forbidden_options = (
         "IdentityFile=",
@@ -55,11 +52,10 @@ def _assert_user_authority_not_flattened(argv: list[str]) -> None:
         "ProxyJump=",
         "Hostname=",
     )
-    flattened = argv if argv[0] == SSH_EXECUTABLE else shlex.split(argv[argv.index("-e") + 1])
-    assert forbidden_tokens.isdisjoint(flattened)
+    assert forbidden_tokens.isdisjoint(argv)
     assert not any(
         token.startswith(forbidden_options)
-        for token in flattened
+        for token in argv
     )
 
 
@@ -176,31 +172,6 @@ def test_command_builder_reuses_exact_socket_without_auth_or_route_options(
         "RemoteCommand=none",
     ):
         assert option in argv
-    _assert_user_authority_not_flattened(argv)
-
-
-def test_upload_builder_uses_alias_and_owned_socket_without_flattening(
-    tmp_path: Path,
-) -> None:
-    control = _control_path(tmp_path)
-    local = tmp_path / "workspace with spaces"
-    local.mkdir()
-    argv = build_system_openssh_upload_argv(
-        _profile(),
-        control_path=control,
-        local_path=local,
-        remote_path="/srv/openevo/workspace",
-        delete=True,
-    )
-
-    assert argv[0] == RSYNC_EXECUTABLE
-    assert "--delete" in argv
-    assert argv[-2] == f"{local}/"
-    assert argv[-1] == "evolab:/srv/openevo/workspace/"
-    remote_shell = shlex.split(argv[argv.index("-e") + 1])
-    assert remote_shell[0:3] == [SSH_EXECUTABLE, "-S", str(control)]
-    assert remote_shell[-1] == "--"
-    assert "ClearAllForwardings=yes" in remote_shell
     _assert_user_authority_not_flattened(argv)
 
 

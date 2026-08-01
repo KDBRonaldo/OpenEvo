@@ -8,9 +8,7 @@ import hashlib
 import locale
 import os
 from pathlib import Path
-import re
 import selectors
-import shlex
 import signal
 import stat
 import subprocess
@@ -38,7 +36,6 @@ from openevo.deployment.remote_home import (
     REMOTE_HOME_PROBE_OUTPUT_LIMIT,
     RemoteHomeAuthority,
     build_remote_home_guarded_command,
-    build_remote_home_guarded_rsync_path,
     build_remote_home_probe_command,
     parse_remote_home_probe,
 )
@@ -59,11 +56,9 @@ from openevo.deployment.ssh import (
     build_system_openssh_environment,
     build_system_openssh_probe_argv,
     build_system_openssh_master_argv,
-    build_system_openssh_upload_argv,
     build_system_ssh_keygen_remove_argv,
 )
 from openevo.deployment.system_executables import (
-    RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
     SYSTEM_OPENSSH_OWNER_ARGUMENT,
     VerifiedSystemExecutable,
@@ -922,23 +917,6 @@ class SystemOpenSshSession:
                 remote_command=remote_command,
             )
 
-    def upload_argv(
-        self,
-        *,
-        local_path: Path | str,
-        remote_path: str,
-        delete: bool = False,
-    ) -> list[str]:
-        with self._guard:
-            snapshot = self._require_healthy_locked()
-            return build_system_openssh_upload_argv(
-                self._profile,
-                control_path=snapshot.control_path,
-                local_path=local_path,
-                remote_path=remote_path,
-                delete=delete,
-            )
-
     def core_tunnel_argv(self, *, remote_port: int) -> list[str]:
         with self._guard:
             snapshot = self._require_healthy_locked()
@@ -1495,66 +1473,6 @@ class SystemOpenSshFollowerTransportAuthority:
         )
         return self._issue(self._session.command_argv(guarded))
 
-    def rsync_argv(
-        self,
-        *,
-        local_path: Path,
-        remote_path: str,
-        arguments: tuple[str, ...],
-        remote_rsync_path: str | None,
-    ) -> list[str]:
-        allowed = {
-            "--archive",
-            "--delete",
-            "--recursive",
-            "--inplace",
-            "--chmod=F600,D700",
-            "--no-owner",
-            "--no-group",
-        }
-        if (
-            type(arguments) is not tuple
-            or not arguments
-            or any(
-                argument not in allowed
-                and re.fullmatch(r"--max-size=[1-9][0-9]{0,19}", argument) is None
-                and re.fullmatch(r"--filter=protect /[A-Za-z0-9._-]{1,128}", argument) is None
-                for argument in arguments
-            )
-            or (
-                remote_rsync_path is not None
-                and (
-                    type(remote_rsync_path) is not str
-                    or not remote_rsync_path
-                    or len(remote_rsync_path.encode("utf-8")) > 65_536
-                    or "\x00" in remote_rsync_path
-                    or any(
-                        ord(character) < 0x20 or ord(character) == 0x7F
-                        for character in remote_rsync_path
-                    )
-                )
-            )
-        ):
-            raise ValueError("system OpenSSH rsync request is invalid")
-        base = self._session.upload_argv(
-            local_path=local_path,
-            remote_path=remote_path,
-            delete=False,
-        )
-        shell_index = base.index("-e")
-        argv = [base[0], *arguments]
-        argv.extend(
-            (
-                "--rsync-path",
-                build_remote_home_guarded_rsync_path(
-                    self._remote_home_authority,
-                    remote_rsync_path or RSYNC_EXECUTABLE,
-                ),
-            )
-        )
-        argv.extend(("-e", base[shell_index + 1], base[-2], base[-1]))
-        return self._issue(argv)
-
     def core_tunnel_argv(self, *, remote_port: int) -> list[str]:
         return self._issue(self._session.core_tunnel_argv(remote_port=remote_port))
 
@@ -1691,7 +1609,7 @@ def _run_verified_follower_subprocess(
 ) -> subprocess.CompletedProcess[str]:
     if (
         not argv
-        or argv[0] not in {SSH_EXECUTABLE, RSYNC_EXECUTABLE}
+        or argv[0] != SSH_EXECUTABLE
         or not 0 < timeout_seconds <= 3600
         or (stdin_fd is not None and (type(stdin_fd) is not int or stdin_fd < 0))
         or (cancel_event is not None and not isinstance(cancel_event, threading.Event))
@@ -1705,25 +1623,9 @@ def _run_verified_follower_subprocess(
             "System SSH follower was cancelled.",
         )
     executable = VerifiedSystemExecutable.open(argv[0])
-    nested: VerifiedSystemExecutable | None = None
     spawn_argv = list(argv)
     try:
-        if argv[0] == RSYNC_EXECUTABLE:
-            try:
-                shell_index = spawn_argv.index("-e") + 1
-                shell = shlex.split(spawn_argv[shell_index])
-            except (ValueError, IndexError) as exc:
-                raise ValueError("system OpenSSH rsync shell is invalid") from exc
-            if not shell or shell[0] != SSH_EXECUTABLE:
-                raise ValueError("system OpenSSH rsync shell is invalid")
-            nested = VerifiedSystemExecutable.open(SSH_EXECUTABLE)
-            nested.verify_path_binding()
-            shell[0] = nested.execution_path
-            spawn_argv[shell_index] = shlex.join(shell)
         executable.verify_path_binding()
-        pass_fds = [executable.descriptor]
-        if nested is not None:
-            pass_fds.append(nested.descriptor)
         process = subprocess.Popen(
             spawn_argv,
             executable=executable.execution_path,
@@ -1732,12 +1634,10 @@ def _run_verified_follower_subprocess(
             stderr=subprocess.PIPE,
             env=environment,
             close_fds=True,
-            pass_fds=tuple(pass_fds),
+            pass_fds=(executable.descriptor,),
             start_new_session=True,
         )
         executable.verify_path_binding()
-        if nested is not None:
-            nested.verify_path_binding()
         completed = _collect_follower_process(
             process,
             argv,
@@ -1755,8 +1655,6 @@ def _run_verified_follower_subprocess(
             stderr=(completed.stderr or b"").decode(encoding),
         )
     finally:
-        if nested is not None:
-            nested.close()
         executable.close()
 
 
