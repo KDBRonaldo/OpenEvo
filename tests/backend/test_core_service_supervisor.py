@@ -1856,12 +1856,15 @@ def test_self_deployed_starts_verified_inference_and_core_service_group(
         assert _argv_option(inference_argv, "--security-opt") == ("no-new-privileges=true")
         assert _argv_option(inference_argv, "--pids-limit") == "4096"
         assert _argv_option(inference_argv, "--shm-size") == "4294967296"
+        assert _argv_option(inference_argv, "--user") == f"{os.geteuid()}:{os.getegid()}"
         assert "--init" in inference_argv
         assert "--pid" not in inference_argv
         assert "--ipc" not in inference_argv
         assert "HF_HOME=/tmp/huggingface" in inference_argv
         assert "XDG_CACHE_HOME=/tmp/cache" in inference_argv
         assert "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor" in inference_argv
+        assert "USER=openevo" in inference_argv
+        assert "LOGNAME=openevo" in inference_argv
         inference = snapshot.service("inference")
         assert inference.status is ServiceStatus.RUNNING
         assert inference.model_preparation is not None

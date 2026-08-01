@@ -4205,6 +4205,13 @@ class CoreServiceSupervisor:
                 "VLLM_NO_USAGE_STATS=1",
                 "--env",
                 "HOME=/tmp",
+                # The serving image cannot enumerate arbitrary host UIDs. These
+                # non-secret names keep getpass/cache initialization independent
+                # of /etc/passwd while retaining owner-only model file access.
+                "--env",
+                "USER=openevo",
+                "--env",
+                "LOGNAME=openevo",
                 "--env",
                 "HF_HOME=/tmp/huggingface",
                 "--env",
