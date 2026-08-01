@@ -140,6 +140,9 @@ class _SuccessfulProcess:
             "component_count": 1,
             "effective_rank": 8,
             "request_id": request["request_id"],
+            "replay_buffer_record_count": 1,
+            "replay_data_path": "adapter/openevo_sd_lora_replay.jsonl",
+            "replay_training_record_count": 0,
             "schema_version": SD_LORA_RESULT_SCHEMA,
             "state_manifest_path": "adapter/openevo_sd_lora_state.json",
             "state_weights_path": "adapter/openevo_sd_lora_state.safetensors",
@@ -149,6 +152,7 @@ class _SuccessfulProcess:
             "target_module_names": ["model.layers.0.self_attn.q_proj"],
             "task_index": 0,
             "training_loss": 0.5,
+            "optimizer_training_record_count": 1,
             "training_record_count": 1,
         }
         response_path = Path(kwargs["cwd"]) / response_name

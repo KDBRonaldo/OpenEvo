@@ -12,12 +12,16 @@ from openevo.evolution.parametric.contracts import SdLoraMethodConfig
 from openevo.evolution.store import EvolutionStore
 import openevo_terminal_bench.continual_memory as continual_memory_module
 from openevo_terminal_bench.cli import build_parser, main
+from openevo_terminal_bench.bridge import CodexGatewayTrainingContract
 from openevo_terminal_bench.continual_memory import (
     AdapterServingSpec,
     ContinualTask,
     build_core_codex_harbor_command,
     build_vllm_command,
     continual_learning_metrics,
+    _agent_execution_failure,
+    _capture_gateway_training_contract,
+    _evaluation_process_environments,
     parse_continual_tasks,
     run_continual_memory_eval_dry_run,
     _prepare_training_dataset,
@@ -33,6 +37,31 @@ from openevo_terminal_bench.core_codex_payload import (
 
 
 _MODEL_REVISION = "cdbee75f17c01a7cc42f958dc650907174af0554"
+
+
+def _codex_gateway_contract(task_instruction: str) -> CodexGatewayTrainingContract:
+    return CodexGatewayTrainingContract.from_gateway_request(
+        {
+            "messages": [
+                {"role": "system", "content": "Use the available tools."},
+                {"role": "user", "content": task_instruction},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "exec_command",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"cmd": {"type": "string"}},
+                            "required": ["cmd"],
+                            "additionalProperties": False,
+                        },
+                    },
+                }
+            ],
+        }
+    )
 
 
 def test_core_codex_run_uses_gateway_and_isolates_docker_bypass() -> None:
@@ -125,9 +154,7 @@ def test_vllm_command_serves_one_user_adapter() -> None:
     )
     assert command[command.index("--revision") + 1] == _MODEL_REVISION
     assert command[command.index("--max-lora-rank") + 1] == "16"
-    assert command[command.index("--lora-modules") + 1] == (
-        "sd-lora-g1=/srv/adapters/sd-lora-g1"
-    )
+    assert command[command.index("--lora-modules") + 1] == ("sd-lora-g1=/srv/adapters/sd-lora-g1")
 
 
 def test_gateway_topology_is_accepted_by_core_config(tmp_path: Path) -> None:
@@ -159,6 +186,22 @@ def test_subprocess_pythonpath_uses_absolute_core_roots() -> None:
     assert all(Path(entry).is_absolute() for entry in entries)
     assert any((Path(entry) / "openevo").is_dir() for entry in entries)
     assert any((Path(entry) / "openevo_terminal_bench").is_dir() for entry in entries)
+
+
+def test_evaluation_process_environments_isolate_vllm_from_core_source() -> None:
+    vllm_env, gateway_env = _evaluation_process_environments(
+        gpu="3",
+        inherited={"PATH": "/usr/bin", "PYTHONPATH": "/opt/vllm-extensions"},
+    )
+
+    assert vllm_env == {
+        "PATH": "/usr/bin",
+        "CUDA_VISIBLE_DEVICES": "3",
+    }
+    assert gateway_env["CUDA_VISIBLE_DEVICES"] == "3"
+    gateway_entries = gateway_env["PYTHONPATH"].split(":")
+    assert "/opt/vllm-extensions" in gateway_entries
+    assert any((Path(entry) / "openevo").is_dir() for entry in gateway_entries)
 
 
 def test_continual_metrics_report_transfer_and_forgetting() -> None:
@@ -207,9 +250,7 @@ def test_training_dataset_normalizes_only_bound_legacy_task_identity(
                 "trajectory": {
                     "traces": [
                         {
-                            "prompt_messages": [
-                                {"role": "user", "content": "Repair task A."}
-                            ],
+                            "prompt_messages": [{"role": "user", "content": "Repair task A."}],
                             "response_messages": [
                                 {"role": "assistant", "content": "Completed task A."}
                             ],
@@ -223,7 +264,7 @@ def test_training_dataset_normalizes_only_bound_legacy_task_identity(
     monkeypatch.setattr(
         continual_memory_module,
         "build_terminal_bench_events",
-        lambda _: [event],
+        lambda _, **kwargs: [event],
     )
     store = EvolutionStore(
         db_path=tmp_path / "evolution.db",
@@ -234,6 +275,8 @@ def test_training_dataset_normalizes_only_bound_legacy_task_identity(
     claimed = _prepare_training_dataset(
         store,
         ContinualTask("task-a", tmp_path / "task-a__trial"),
+        maximum_traces=8,
+        codex_gateway_contract=_codex_gateway_contract("Repair task A."),
     )
     examples = _training_examples((claimed,), maximum=8, minimum_reward=1.0)
 
@@ -249,7 +292,252 @@ def test_training_dataset_normalizes_only_bound_legacy_task_identity(
         _prepare_training_dataset(
             other_store,
             ContinualTask("task-b", tmp_path / "task-a__trial"),
+            maximum_traces=8,
+            codex_gateway_contract=_codex_gateway_contract("Repair task B."),
         )
+
+
+def test_training_dataset_preserves_all_bounded_atif_turns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    traces = [
+        {
+            "prompt_messages": [{"role": "user", "content": "Repair task A."}],
+            "response_messages": [{"role": "assistant", "content": f"Action {index}."}],
+            "reward": 1.0,
+        }
+        for index in range(4)
+    ]
+    event = EventIngestRequest(
+        source="terminal_bench.harbor",
+        event_type="openevo.session_completed",
+        source_event_id="terminal-bench:task-a__trial",
+        task_id="task-a",
+        session_id="task-a__trial",
+        status="COMPLETED",
+        reward=1.0,
+        payload={"session_result": {"trajectory": {"status": "COMPLETED", "traces": traces}}},
+    )
+    observed_kwargs: dict[str, object] = {}
+
+    def build_events(path: Path, **kwargs: object) -> list[EventIngestRequest]:
+        del path
+        observed_kwargs.update(kwargs)
+        return [event]
+
+    monkeypatch.setattr(
+        continual_memory_module,
+        "build_terminal_bench_events",
+        build_events,
+    )
+    store = EvolutionStore(
+        db_path=tmp_path / "evolution.db",
+        artifact_root=tmp_path / "artifacts",
+    )
+    store.initialize()
+
+    contract = _codex_gateway_contract("Repair task A.")
+    claimed = _prepare_training_dataset(
+        store,
+        ContinualTask("task-a", tmp_path / "task-a__trial"),
+        maximum_traces=4,
+        codex_gateway_contract=contract,
+    )
+    examples = _training_examples((claimed,), maximum=4, minimum_reward=1.0)
+
+    assert observed_kwargs == {
+        "include_atif_traces": True,
+        "max_atif_agent_turns": 4,
+        "codex_gateway_contract": contract,
+    }
+    assert [example["messages"][-1]["content"] for example in examples] == [
+        "Action 0.",
+        "Action 1.",
+        "Action 2.",
+        "Action 3.",
+    ]
+    assert [example["target_message_start"] for example in examples] == [1, 1, 1, 1]
+
+
+def test_gateway_capture_uses_first_request_and_validates_later_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _codex_gateway_contract("Repair task A.")
+    first_request = {
+        "messages": contract.messages,
+        "tools": contract.tools,
+        "model": "Qwen/Qwen3-4B-Instruct-2507",
+    }
+    second_request = {
+        **first_request,
+        "messages": [
+            *contract.messages,
+            {"role": "assistant", "content": "I will inspect it."},
+        ],
+    }
+
+    def gateway_json(base_url: str, path: str) -> dict[str, object]:
+        assert base_url == "http://127.0.0.1:8100"
+        if path == "/sessions?limit=1000":
+            return {
+                "sessions": [
+                    {"session_id": "known-session"},
+                    {"session_id": "request-a"},
+                    {"session_id": "request-b"},
+                ]
+            }
+        requests = {
+            "/sessions/request-a/completions": {
+                "session_id": "request-a",
+                "completions": [
+                    {
+                        "timestamp": "2026-07-31T12:00:00+00:00",
+                        "request": first_request,
+                    }
+                ],
+            },
+            "/sessions/request-b/completions": {
+                "session_id": "request-b",
+                "completions": [
+                    {
+                        "timestamp": "2026-07-31T12:00:01+00:00",
+                        "request": second_request,
+                    }
+                ],
+            },
+        }
+        return requests[path]
+
+    monkeypatch.setattr(continual_memory_module, "_gateway_json", gateway_json)
+
+    captured, receipt = _capture_gateway_training_contract(
+        gateway_management_url="http://127.0.0.1:8100",
+        known_session_ids={"known-session"},
+    )
+
+    assert captured.digest == contract.digest
+    assert receipt["request_count"] == 2
+    assert receipt["session_ids"] == ["request-a", "request-b"]
+    assert receipt["empty_session_ids"] == []
+
+
+def test_gateway_capture_audits_cancelled_empty_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _codex_gateway_contract("Repair task A.")
+
+    def gateway_json(_base_url: str, path: str) -> dict[str, object]:
+        if path == "/sessions?limit=1000":
+            return {"sessions": [{"session_id": "completed"}, {"session_id": "cancelled"}]}
+        session_id = path.split("/")[2]
+        return {
+            "session_id": session_id,
+            "completions": (
+                [{"timestamp": "2026-07-31T12:00:00Z", "request": contract.to_payload()}]
+                if session_id == "completed"
+                else []
+            ),
+        }
+
+    monkeypatch.setattr(continual_memory_module, "_gateway_json", gateway_json)
+
+    captured, receipt = _capture_gateway_training_contract(
+        gateway_management_url="http://127.0.0.1:8100",
+        known_session_ids=set(),
+    )
+
+    assert captured.digest == contract.digest
+    assert receipt["request_count"] == 1
+    assert receipt["session_ids"] == ["cancelled", "completed"]
+    assert receipt["empty_session_ids"] == ["cancelled"]
+
+
+def test_gateway_capture_rejects_tool_contract_drift(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contract = _codex_gateway_contract("Repair task A.")
+    drifted_request = {
+        "messages": [
+            *contract.messages,
+            {"role": "assistant", "content": "I will inspect it."},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "write_stdin",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+        ],
+    }
+
+    def gateway_json(_base_url: str, path: str) -> dict[str, object]:
+        if path == "/sessions?limit=1000":
+            return {"sessions": [{"session_id": "request-a"}, {"session_id": "request-b"}]}
+        request = (
+            {"messages": contract.messages, "tools": contract.tools}
+            if path == "/sessions/request-a/completions"
+            else drifted_request
+        )
+        return {
+            "session_id": path.split("/")[2],
+            "completions": [{"timestamp": path, "request": request}],
+        }
+
+    monkeypatch.setattr(continual_memory_module, "_gateway_json", gateway_json)
+
+    with pytest.raises(ValueError, match="do not share one Codex harness contract"):
+        _capture_gateway_training_contract(
+            gateway_management_url="http://127.0.0.1:8100",
+            known_session_ids=set(),
+        )
+
+
+def test_agent_execution_failure_is_a_bounded_zero_reward_outcome(tmp_path: Path) -> None:
+    trial_dir = tmp_path / "task-a__trial"
+    trial_dir.mkdir()
+    (trial_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "agent_execution": {
+                    "started_at": "2026-07-31T12:00:00Z",
+                    "finished_at": "2026-07-31T12:05:00Z",
+                },
+                "exception_info": {
+                    "exception_type": "RuntimeError",
+                    "exception_message": "Command timed out after 300 seconds" + ("x" * 800),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    failure = _agent_execution_failure(trial_dir)
+
+    assert failure is not None
+    assert failure["type"] == "RuntimeError"
+    assert failure["message"].startswith("Command timed out after 300 seconds")
+    assert len(failure["message"]) == 512
+
+
+def test_non_agent_trial_failure_remains_unscored(tmp_path: Path) -> None:
+    trial_dir = tmp_path / "task-a__trial"
+    trial_dir.mkdir()
+    (trial_dir / "result.json").write_text(
+        json.dumps(
+            {
+                "exception_info": {
+                    "exception_type": "RuntimeError",
+                    "exception_message": "Environment setup failed",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert _agent_execution_failure(trial_dir) is None
 
 
 def test_dry_run_records_controlled_three_condition_schedule(tmp_path: Path) -> None:
@@ -295,6 +583,26 @@ def test_dry_run_records_controlled_three_condition_schedule(tmp_path: Path) -> 
     }
 
 
+def test_dry_run_can_skip_optional_ordinary_control(tmp_path: Path) -> None:
+    payload = run_continual_memory_eval_dry_run(
+        tasks=[ContinualTask("task-a", tmp_path / "train-a")],
+        task_root=tmp_path / "tasks",
+        run_root=tmp_path / "run",
+        model="Qwen/Qwen3-4B-Instruct-2507",
+        model_revision=_MODEL_REVISION,
+        gpu="3",
+        codex_version="0.118.0",
+        config=SdLoraMethodConfig(
+            base_model="Qwen/Qwen3-4B-Instruct-2507",
+            model_revision=_MODEL_REVISION,
+            max_steps=2,
+        ),
+        include_ordinary_control=False,
+    )
+
+    assert payload["conditions"] == ["base", "sd_lora"]
+
+
 def test_continual_cli_dry_run_writes_closed_plan(tmp_path: Path) -> None:
     output = tmp_path / "plan.json"
     assert (
@@ -313,6 +621,7 @@ def test_continual_cli_dry_run_writes_closed_plan(tmp_path: Path) -> None:
                 _MODEL_REVISION,
                 "--codex-version",
                 "0.118.0",
+                "--skip-ordinary-control",
                 "--dry-run",
                 "--output",
                 str(output),
@@ -324,12 +633,15 @@ def test_continual_cli_dry_run_writes_closed_plan(tmp_path: Path) -> None:
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["task_order"] == ["task-a"]
     assert payload["inference_path"].startswith("OpenEvo Core CodexHarness")
+    assert payload["conditions"] == ["base", "sd_lora"]
 
 
 def test_legacy_parametric_commands_are_not_parseable() -> None:
     parser = build_parser()
     subparsers = next(
-        action for action in parser._actions if action.dest == "command"  # noqa: SLF001
+        action
+        for action in parser._actions
+        if action.dest == "command"  # noqa: SLF001
     )
 
     assert "terminal-bench-continual-memory-eval" in subparsers.choices

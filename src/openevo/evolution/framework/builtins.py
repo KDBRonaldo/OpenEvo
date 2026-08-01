@@ -394,6 +394,10 @@ def _sd_lora_schema() -> dict[str, Any]:
             "rank": _positive_integer(maximum=128),
             "target_modules": _string_array(maximum=128),
             "learning_rate": _bounded_number(exclusive_minimum=0.0, maximum=1.0),
+            "coefficient_learning_rate": _bounded_number(
+                exclusive_minimum=0.0,
+                maximum=1.0,
+            ),
             "weight_decay": _bounded_number(minimum=0.0, maximum=1.0),
             "epochs": _positive_integer(maximum=100),
             "max_steps": _positive_integer(maximum=1_000_000),
@@ -403,6 +407,7 @@ def _sd_lora_schema() -> dict[str, Any]:
                 "maximum": 131_072,
             },
             "max_records": _positive_integer(maximum=100_000),
+            "replay_capacity": _positive_integer(maximum=100_000),
             "per_device_train_batch_size": _positive_integer(maximum=128),
             "gradient_accumulation_steps": _positive_integer(maximum=4096),
             "max_grad_norm": _bounded_number(
@@ -947,7 +952,8 @@ def _method_descriptors(
             method_id="parametric_memory_sd_lora",
             display_name="SD-LoRA continual parametric memory",
             description=(
-                "Train one new SD-LoRA component and export one cumulative PEFT adapter."
+                "Train one new SD-LoRA component with bounded trajectory replay and export "
+                "one cumulative PEFT adapter."
             ),
             target_id="parametric_memory",
             execution_modes=_SELF_DEPLOYED,
@@ -961,10 +967,12 @@ def _method_descriptors(
                 "rank": 8,
                 "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
                 "learning_rate": 0.0002,
+                "coefficient_learning_rate": 0.01,
                 "weight_decay": 0.0,
                 "epochs": 1,
                 "max_length": 2048,
                 "max_records": 256,
+                "replay_capacity": 64,
                 "per_device_train_batch_size": 1,
                 "gradient_accumulation_steps": 1,
                 "max_grad_norm": 1.0,
@@ -1048,9 +1056,7 @@ def load_builtin_method_handles(
         if method_id in legacy_method_ids:
             expected_callable = METHOD_REGISTRY[method_id]
             if loaded is not expected_callable:
-                raise ValueError(
-                    f"built-in method callable identity mismatch for {method_id!r}"
-                )
+                raise ValueError(f"built-in method callable identity mismatch for {method_id!r}")
             handles[method_id] = expected_callable
         else:
             handles[method_id] = loaded

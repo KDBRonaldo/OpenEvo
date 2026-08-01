@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
@@ -45,12 +45,17 @@ from openevo.evolution.parametric.trainer_service import (
     SubprocessSdLoraTrainerService,
 )
 from openevo.evolution.store import EvolutionStore
-from openevo_terminal_bench.bridge import build_terminal_bench_events
+from openevo_terminal_bench.bridge import (
+    CodexGatewayTrainingContract,
+    TerminalBenchBridgeError,
+    build_terminal_bench_events,
+)
 from openevo_terminal_bench.ordinary_lora import train_ordinary_sequential_lora
 from openevo_terminal_bench.per_task import (
     DEFAULT_TERMINAL_BENCH_PACKAGE_ROOT,
     _attempt_reward,
     _locate_evolved_attempt_trials,
+    _read_trial_result,
     _terminal_bench_extra_docker_compose,
 )
 
@@ -63,6 +68,9 @@ DEFAULT_MAX_MODEL_LENGTH = 16384
 DEFAULT_AGENT_TIMEOUT_SECONDS = 3600
 _PROCESS_STOP_SECONDS = 30.0
 _STARTUP_POLL_SECONDS = 0.5
+_GATEWAY_CAPTURE_TIMEOUT_SECONDS = 30.0
+_MAX_GATEWAY_COMPLETIONS_PER_TASK = 256
+_MAX_TRIAL_FAILURE_TEXT = 512
 
 
 @dataclass(frozen=True)
@@ -84,6 +92,12 @@ class ManagedProcess:
     pid: int
     stdout_path: Path
     stderr_path: Path
+
+
+@dataclass(frozen=True)
+class _ConditionEvaluation:
+    report: dict[str, Any]
+    contracts: dict[str, CodexGatewayTrainingContract]
 
 
 CommandRunner = Callable[..., Any]
@@ -114,8 +128,7 @@ def parse_continual_tasks(
             f"missing={missing}, unexpected={unexpected}"
         )
     return [
-        ContinualTask(task_id=task_id, training_trial_dir=by_task[task_id])
-        for task_id in ordered
+        ContinualTask(task_id=task_id, training_trial_dir=by_task[task_id]) for task_id in ordered
     ]
 
 
@@ -135,7 +148,11 @@ def continual_learning_metrics(
         raise ValueError("continual rewards must be finite")
 
     final_average = sum(rows[-1]) / task_count
-    seen_values = [rows[generation][task] for generation in range(task_count) for task in range(generation + 1)]
+    seen_values = [
+        rows[generation][task]
+        for generation in range(task_count)
+        for task in range(generation + 1)
+    ]
     anytime_average = sum(seen_values) / len(seen_values)
     forward_transfer = (
         sum(rows[task - 1][task] - baseline[task] for task in range(1, task_count))
@@ -144,15 +161,13 @@ def continual_learning_metrics(
         else 0.0
     )
     backward_transfer = (
-        sum(rows[-1][task] - rows[task][task] for task in range(task_count - 1))
-        / (task_count - 1)
+        sum(rows[-1][task] - rows[task][task] for task in range(task_count - 1)) / (task_count - 1)
         if task_count > 1
         else 0.0
     )
     forgetting = (
         sum(
-            max(rows[generation][task] for generation in range(task, task_count))
-            - rows[-1][task]
+            max(rows[generation][task] for generation in range(task, task_count)) - rows[-1][task]
             for task in range(task_count - 1)
         )
         / (task_count - 1)
@@ -217,9 +232,7 @@ def build_core_codex_harbor_command(
         "--memory",
         "ignore",
     ]
-    for compose_file in _terminal_bench_extra_docker_compose(
-        terminal_bench_package_root
-    ):
+    for compose_file in _terminal_bench_extra_docker_compose(terminal_bench_package_root):
         command.extend(["--extra-docker-compose", str(compose_file)])
     for key, value in sorted((verifier_env or {}).items()):
         command.extend(["--verifier-env", f"{key}={value}"])
@@ -296,6 +309,7 @@ def run_continual_memory_eval_dry_run(
     gateway_advertise_host: str | None = None,
     maximum_model_length: int = DEFAULT_MAX_MODEL_LENGTH,
     agent_timeout_seconds: int = DEFAULT_AGENT_TIMEOUT_SECONDS,
+    include_ordinary_control: bool = True,
 ) -> dict[str, Any]:
     if config.base_model != model or config.model_revision != model_revision:
         raise ValueError("training config must pin the planned base model and revision")
@@ -305,9 +319,7 @@ def run_continual_memory_eval_dry_run(
         "task_root": str(task_root),
         "run_root": str(run_root),
         "task_order": [task.task_id for task in tasks],
-        "training_trials": {
-            task.task_id: str(task.training_trial_dir) for task in tasks
-        },
+        "training_trials": {task.task_id: str(task.training_trial_dir) for task in tasks},
         "base_model": model,
         "model_revision": model_revision,
         "gpu": gpu,
@@ -321,7 +333,11 @@ def run_continual_memory_eval_dry_run(
         "maximum_model_length": maximum_model_length,
         "agent_timeout_seconds": agent_timeout_seconds,
         "inference_path": "OpenEvo Core CodexHarness -> OpenEvo Gateway -> local vLLM",
-        "conditions": ["base", "ordinary_sequential_lora", "sd_lora"],
+        "conditions": [
+            "base",
+            *(["ordinary_sequential_lora"] if include_ordinary_control else []),
+            "sd_lora",
+        ],
         "enabled_evolution_targets": ["parametric_memory"],
         "disabled_evolution_targets": [
             "text_memory",
@@ -356,6 +372,7 @@ def run_continual_memory_eval(
     agent_timeout_seconds: int = DEFAULT_AGENT_TIMEOUT_SECONDS,
     verifier_env: dict[str, str] | None = None,
     command_runner: CommandRunner = subprocess.run,
+    include_ordinary_control: bool = True,
 ) -> dict[str, Any]:
     if not tasks:
         raise ValueError("continual-memory evaluation requires at least one task")
@@ -365,9 +382,7 @@ def run_continual_memory_eval(
         raise ValueError("task stream exceeds the SD-LoRA effective-rank limit")
     run_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(run_root, 0o700, follow_symlinks=False)
-    effective_gateway_host = resolve_gateway_advertise_host(
-        gateway_advertise_host
-    )
+    effective_gateway_host = resolve_gateway_advertise_host(gateway_advertise_host)
     previous_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu
     try:
@@ -376,8 +391,7 @@ def run_continual_memory_eval(
             artifact_root=run_root / "artifacts",
         )
         store.initialize()
-        datasets = [_prepare_training_dataset(store, task) for task in tasks]
-        baseline = _evaluate_condition(
+        baseline_evaluation = _evaluate_condition(
             condition="base",
             generation=-1,
             tasks=tasks,
@@ -398,68 +412,94 @@ def run_continual_memory_eval(
             verifier_env=verifier_env or {},
             command_runner=command_runner,
         )
+        baseline = baseline_evaluation.report
+        datasets = [
+            _prepare_training_dataset(
+                store,
+                task,
+                maximum_traces=config.max_records,
+                codex_gateway_contract=baseline_evaluation.contracts[task.task_id],
+            )
+            for task in tasks
+        ]
         baseline_rewards = [float(task["reward"]) for task in baseline["tasks"]]
 
-        ordinary_generations: list[dict[str, Any]] = []
-        ordinary_matrix: list[list[float]] = []
-        prior_ordinary: Path | None = None
-        for generation, (task, dataset) in enumerate(zip(tasks, datasets, strict=True)):
-            examples = _training_examples(
-                (dataset,),
-                maximum=config.max_records,
-                minimum_reward=config.minimum_reward,
-            )
-            output_dir = run_root / "ordinary_adapters" / f"generation-{generation}"
-            training = train_ordinary_sequential_lora(
-                config=config,
-                examples=examples,
-                output_dir=output_dir,
-                prior_adapter=prior_ordinary,
-            )
-            adapter = AdapterServingSpec(
-                adapter_id=f"ordinary-lora-g{generation}",
-                adapter_path=training.adapter_path,
-                maximum_rank=config.rank,
-            )
-            evaluation = _evaluate_condition(
-                condition="ordinary-sequential-lora",
-                generation=generation,
-                tasks=tasks,
-                task_root=task_root,
-                run_root=run_root,
-                model=model,
-                model_revision=model_revision,
-                adapter=adapter,
-                gpu=gpu,
-                codex_version=codex_version,
-                terminal_bench_package_root=terminal_bench_package_root,
-                vllm_executable=vllm_executable,
-                vllm_port=vllm_port,
-                gateway_port=gateway_port,
-                gateway_advertise_host=effective_gateway_host,
-                maximum_model_length=maximum_model_length,
-                agent_timeout_seconds=agent_timeout_seconds,
-                verifier_env=verifier_env or {},
-                command_runner=command_runner,
-            )
-            row = [float(value["reward"]) for value in evaluation["tasks"]]
-            ordinary_matrix.append(row)
-            ordinary_generations.append(
-                {
-                    "generation": generation,
-                    "training_task_id": task.task_id,
-                    "adapter_id": adapter.adapter_id,
-                    "adapter_path": str(adapter.adapter_path),
-                    "adapter_bytes": _directory_size(adapter.adapter_path),
-                    "training_record_count": training.training_record_count,
-                    "steps_completed": training.steps_completed,
-                    "training_loss": training.training_loss,
-                    "training_time_seconds": training.training_time_seconds,
-                    "gpu_peak_memory_bytes": training.gpu_peak_memory_bytes,
-                    "evaluation": evaluation,
-                }
-            )
-            prior_ordinary = training.adapter_path
+        ordinary_result: dict[str, Any] = {
+            "skipped": True,
+            "reason": "disabled_by_benchmark_invocation",
+        }
+        if include_ordinary_control:
+            ordinary_generations: list[dict[str, Any]] = []
+            ordinary_matrix: list[list[float]] = []
+            prior_ordinary: Path | None = None
+            for generation, (task, dataset) in enumerate(zip(tasks, datasets, strict=True)):
+                examples = _training_examples(
+                    (dataset,),
+                    maximum=config.max_records,
+                    minimum_reward=config.minimum_reward,
+                )
+                output_dir = run_root / "ordinary_adapters" / f"generation-{generation}"
+                training = train_ordinary_sequential_lora(
+                    config=config,
+                    examples=examples,
+                    output_dir=output_dir,
+                    prior_adapter=prior_ordinary,
+                )
+                adapter = AdapterServingSpec(
+                    adapter_id=f"ordinary-lora-g{generation}",
+                    adapter_path=training.adapter_path,
+                    maximum_rank=config.rank,
+                )
+                condition_evaluation = _evaluate_condition(
+                    condition="ordinary-sequential-lora",
+                    generation=generation,
+                    tasks=tasks,
+                    task_root=task_root,
+                    run_root=run_root,
+                    model=model,
+                    model_revision=model_revision,
+                    adapter=adapter,
+                    gpu=gpu,
+                    codex_version=codex_version,
+                    terminal_bench_package_root=terminal_bench_package_root,
+                    vllm_executable=vllm_executable,
+                    vllm_port=vllm_port,
+                    gateway_port=gateway_port,
+                    gateway_advertise_host=effective_gateway_host,
+                    maximum_model_length=maximum_model_length,
+                    agent_timeout_seconds=agent_timeout_seconds,
+                    verifier_env=verifier_env or {},
+                    command_runner=command_runner,
+                    expected_contracts=baseline_evaluation.contracts,
+                )
+                evaluation = condition_evaluation.report
+                row = [float(value["reward"]) for value in evaluation["tasks"]]
+                ordinary_matrix.append(row)
+                ordinary_generations.append(
+                    {
+                        "generation": generation,
+                        "training_task_id": task.task_id,
+                        "adapter_id": adapter.adapter_id,
+                        "adapter_path": str(adapter.adapter_path),
+                        "adapter_bytes": _directory_size(adapter.adapter_path),
+                        "training_record_count": training.training_record_count,
+                        "steps_completed": training.steps_completed,
+                        "training_loss": training.training_loss,
+                        "training_time_seconds": training.training_time_seconds,
+                        "gpu_peak_memory_bytes": training.gpu_peak_memory_bytes,
+                        "evaluation": evaluation,
+                    }
+                )
+                prior_ordinary = training.adapter_path
+            ordinary_result = {
+                "skipped": False,
+                "reward_matrix": ordinary_matrix,
+                "metrics": continual_learning_metrics(
+                    ordinary_matrix,
+                    baseline_rewards,
+                ),
+                "generations": ordinary_generations,
+            }
 
         sd_generations: list[dict[str, Any]] = []
         sd_matrix: list[list[float]] = []
@@ -481,7 +521,7 @@ def run_continual_memory_eval(
                     adapter_path=adapter_path,
                     maximum_rank=int(artifact.manifest["effective_rank"]),
                 )
-                evaluation = _evaluate_condition(
+                condition_evaluation = _evaluate_condition(
                     condition="sd-lora",
                     generation=generation,
                     tasks=tasks,
@@ -501,7 +541,9 @@ def run_continual_memory_eval(
                     agent_timeout_seconds=agent_timeout_seconds,
                     verifier_env=verifier_env or {},
                     command_runner=command_runner,
+                    expected_contracts=baseline_evaluation.contracts,
                 )
+                evaluation = condition_evaluation.report
                 row = [float(value["reward"]) for value in evaluation["tasks"]]
                 sd_matrix.append(row)
                 sd_generations.append(
@@ -514,17 +556,20 @@ def run_continual_memory_eval(
                         "adapter_bytes": _directory_size(adapter.adapter_path),
                         "component_count": artifact.manifest["component_count"],
                         "effective_rank": artifact.manifest["effective_rank"],
-                        "training_record_count": artifact.manifest[
-                            "training_record_count"
+                        "training_record_count": artifact.manifest["training_record_count"],
+                        "replay_training_record_count": artifact.manifest[
+                            "replay_training_record_count"
+                        ],
+                        "optimizer_training_record_count": artifact.manifest[
+                            "optimizer_training_record_count"
+                        ],
+                        "replay_buffer_record_count": artifact.manifest[
+                            "replay_buffer_record_count"
                         ],
                         "steps_completed": artifact.manifest["steps_completed"],
                         "training_loss": artifact.manifest["training_loss"],
-                        "training_time_seconds": artifact.manifest[
-                            "training_time_seconds"
-                        ],
-                        "gpu_peak_memory_bytes": artifact.manifest[
-                            "gpu_peak_memory_bytes"
-                        ],
+                        "training_time_seconds": artifact.manifest["training_time_seconds"],
+                        "gpu_peak_memory_bytes": artifact.manifest["gpu_peak_memory_bytes"],
                         "evaluation": evaluation,
                     }
                 )
@@ -534,9 +579,7 @@ def run_continual_memory_eval(
             "dry_run": False,
             "benchmark": "terminal-bench-2.1",
             "task_order": [task.task_id for task in tasks],
-            "training_trials": {
-                task.task_id: str(task.training_trial_dir) for task in tasks
-            },
+            "training_trials": {task.task_id: str(task.training_trial_dir) for task in tasks},
             "base_model": model,
             "model_revision": model_revision,
             "gpu": gpu,
@@ -549,9 +592,7 @@ def run_continual_memory_eval(
             "gateway_advertise_host": effective_gateway_host,
             "maximum_model_length": maximum_model_length,
             "agent_timeout_seconds": agent_timeout_seconds,
-            "inference_path": (
-                "OpenEvo Core CodexHarness -> OpenEvo Gateway -> local vLLM"
-            ),
+            "inference_path": ("OpenEvo Core CodexHarness -> OpenEvo Gateway -> local vLLM"),
             "attempts_per_task": 1,
             "enabled_evolution_targets": ["parametric_memory"],
             "disabled_evolution_targets": [
@@ -560,14 +601,7 @@ def run_continual_memory_eval(
                 "agent_system",
             ],
             "base": baseline,
-            "ordinary_sequential_lora": {
-                "reward_matrix": ordinary_matrix,
-                "metrics": continual_learning_metrics(
-                    ordinary_matrix,
-                    baseline_rewards,
-                ),
-                "generations": ordinary_generations,
-            },
+            "ordinary_sequential_lora": ordinary_result,
             "sd_lora": {
                 "reward_matrix": sd_matrix,
                 "metrics": continual_learning_metrics(sd_matrix, baseline_rewards),
@@ -590,21 +624,25 @@ def run_continual_memory_eval(
 def _prepare_training_dataset(
     store: EvolutionStore,
     task: ContinualTask,
+    *,
+    maximum_traces: int,
+    codex_gateway_contract: CodexGatewayTrainingContract,
 ) -> WorkerClaimInputArtifact:
-    events = build_terminal_bench_events(task.training_trial_dir)
+    if maximum_traces < 1:
+        raise ValueError("maximum training traces must be positive")
+    events = build_terminal_bench_events(
+        task.training_trial_dir,
+        include_atif_traces=True,
+        max_atif_agent_turns=maximum_traces,
+        codex_gateway_contract=codex_gateway_contract,
+    )
     if len(events) != 1:
-        raise ValueError(
-            f"training trial for {task.task_id!r} must contain exactly one trial"
-        )
+        raise ValueError(f"training trial for {task.task_id!r} must contain exactly one trial")
     event = events[0]
     if event.task_id != task.task_id:
-        legacy_trial_name = task.training_trial_dir.name.startswith(
-            f"{task.task_id}__"
-        )
+        legacy_trial_name = task.training_trial_dir.name.startswith(f"{task.task_id}__")
         if event.task_id != "terminal-bench-task" or not legacy_trial_name:
-            raise ValueError(
-                f"training trial identity does not match task {task.task_id!r}"
-            )
+            raise ValueError(f"training trial identity does not match task {task.task_id!r}")
         event = event.model_copy(update={"task_id": task.task_id})
     if event.reward is None or event.reward < 1.0:
         raise ValueError(f"training trial for {task.task_id!r} must have reward 1")
@@ -620,7 +658,7 @@ def _prepare_training_dataset(
                 "source_event_id": event.source_event_id,
                 "reward_min": 1.0,
             },
-            limits={"max_events": 1, "max_traces": 1},
+            limits={"max_events": 1, "max_traces": maximum_traces},
         )
     )
     artifact = store.get_artifact(dataset.artifact_id)
@@ -670,9 +708,7 @@ def _train_sd_lora_generation(
             binding_id="prior_target_artifacts",
             artifact_ids=((prior_input.artifact_id,) if prior_input is not None else ()),
             artifact_digests=(
-                (worker_input_artifact_digest(prior_input),)
-                if prior_input is not None
-                else ()
+                (worker_input_artifact_digest(prior_input),) if prior_input is not None else ()
             ),
         ),
     )
@@ -754,7 +790,8 @@ def _evaluate_condition(
     agent_timeout_seconds: int,
     verifier_env: dict[str, str],
     command_runner: CommandRunner,
-) -> dict[str, Any]:
+    expected_contracts: Mapping[str, CodexGatewayTrainingContract] | None = None,
+) -> _ConditionEvaluation:
     generation_name = "initial" if generation < 0 else f"generation-{generation}"
     evaluation_root = run_root / "evaluations" / condition / generation_name
     jobs_dir = evaluation_root / "harbor_jobs"
@@ -770,16 +807,12 @@ def _evaluate_condition(
     )
     vllm_url = f"http://127.0.0.1:{vllm_port}"
     gateway_url = f"http://{gateway_advertise_host}:{gateway_port}/v1"
-    process_env = dict(os.environ)
-    process_env["CUDA_VISIBLE_DEVICES"] = gpu
-    process_env["PYTHONPATH"] = _source_pythonpath(
-        process_env.get("PYTHONPATH")
-    )
+    vllm_env, gateway_env = _evaluation_process_environments(gpu=gpu)
     with _managed_process(
         name="vllm",
         command=vllm_command,
         cwd=evaluation_root,
-        env=process_env,
+        env=vllm_env,
         readiness=lambda process: _wait_for_model(
             base_url=vllm_url,
             expected_model=serving_model,
@@ -808,21 +841,25 @@ def _evaluate_condition(
                 "warning",
             ),
             cwd=evaluation_root,
-            env=process_env,
+            env=gateway_env,
             readiness=lambda process: _wait_for_health(
                 url=f"http://127.0.0.1:{gateway_port}/health",
                 process=process,
                 timeout_seconds=120.0,
             ),
         ) as gateway_process:
-            task_results = [
-                _run_harbor_task(
+            gateway_management_url = f"http://127.0.0.1:{gateway_port}"
+            observed_session_ids = _gateway_session_ids(gateway_management_url)
+            task_results: list[dict[str, Any]] = []
+            contracts: dict[str, CodexGatewayTrainingContract] = {}
+            for task in tasks:
+                task_result = _run_harbor_task(
                     condition=condition,
                     generation_name=generation_name,
                     task=task,
                     task_root=task_root,
                     jobs_dir=jobs_dir,
-                    model=serving_model,
+                    model=model,
                     gateway_url=gateway_url,
                     codex_version=codex_version,
                     terminal_bench_package_root=terminal_bench_package_root,
@@ -830,20 +867,167 @@ def _evaluate_condition(
                     verifier_env=verifier_env,
                     command_runner=command_runner,
                 )
-                for task in tasks
-            ]
-    return {
+                contract, capture = _capture_gateway_training_contract(
+                    gateway_management_url=gateway_management_url,
+                    known_session_ids=observed_session_ids,
+                )
+                observed_session_ids.update(capture["session_ids"])
+                expected = (
+                    expected_contracts.get(task.task_id)
+                    if expected_contracts is not None
+                    else None
+                )
+                if expected is not None and contract.digest != expected.digest:
+                    raise ValueError(
+                        "Codex Gateway harness contract drifted between base and "
+                        f"{condition} evaluation for task {task.task_id!r}"
+                    )
+                receipt_path = _write_gateway_contract_receipt(
+                    evaluation_root=evaluation_root,
+                    task=task,
+                    condition=condition,
+                    codex_version=codex_version,
+                    contract=contract,
+                    capture=capture,
+                )
+                contracts[task.task_id] = contract
+                task_results.append(
+                    {
+                        **task_result,
+                        "harness_contract": {
+                            "digest": contract.digest,
+                            "message_count": len(contract.messages),
+                            "path": str(receipt_path),
+                            "request_count": capture["request_count"],
+                            "session_count": len(capture["session_ids"]),
+                            "tool_names": list(contract.tool_names),
+                        },
+                    }
+                )
+    report = {
         "condition": condition,
         "generation": generation,
-        "model": serving_model,
+        "model": model,
+        "served_model": serving_model,
         "adapter_id": adapter.adapter_id if adapter is not None else None,
         "adapter_path": str(adapter.adapter_path) if adapter is not None else None,
         "tasks": task_results,
-        "mean_reward": sum(float(task["reward"]) for task in task_results)
-        / len(task_results),
+        "mean_reward": sum(float(task["reward"]) for task in task_results) / len(task_results),
         "vllm": _process_metadata(vllm_process),
         "gateway": _process_metadata(gateway_process),
     }
+    return _ConditionEvaluation(report=report, contracts=contracts)
+
+
+def _gateway_json(base_url: str, path: str) -> dict[str, Any]:
+    try:
+        with httpx.Client(
+            timeout=_GATEWAY_CAPTURE_TIMEOUT_SECONDS,
+            trust_env=False,
+        ) as client:
+            response = client.get(f"{base_url.rstrip('/')}{path}")
+            response.raise_for_status()
+            payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise RuntimeError("failed to read the live Gateway evaluation contract") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Gateway contract endpoint returned a non-object payload")
+    return payload
+
+
+def _gateway_session_ids(base_url: str) -> set[str]:
+    payload = _gateway_json(base_url, "/sessions?limit=1000")
+    rows = payload.get("sessions")
+    if not isinstance(rows, list) or len(rows) > 1000:
+        raise ValueError("Gateway session inventory has an invalid shape")
+    session_ids: set[str] = set()
+    for row in rows:
+        session_id = row.get("session_id") if isinstance(row, dict) else None
+        if not isinstance(session_id, str) or not session_id or session_id in session_ids:
+            raise ValueError("Gateway session inventory has an invalid identity")
+        session_ids.add(session_id)
+    return session_ids
+
+
+def _capture_gateway_training_contract(
+    *,
+    gateway_management_url: str,
+    known_session_ids: set[str],
+) -> tuple[CodexGatewayTrainingContract, dict[str, Any]]:
+    current_session_ids = _gateway_session_ids(gateway_management_url)
+    new_session_ids = sorted(current_session_ids.difference(known_session_ids))
+    if not new_session_ids or len(new_session_ids) > _MAX_GATEWAY_COMPLETIONS_PER_TASK:
+        raise ValueError("Gateway did not expose a bounded task completion set")
+
+    captured: list[tuple[str, str, int, dict[str, Any]]] = []
+    empty_session_ids: list[str] = []
+    for session_id in new_session_ids:
+        payload = _gateway_json(
+            gateway_management_url,
+            f"/sessions/{session_id}/completions",
+        )
+        if payload.get("session_id") != session_id:
+            raise ValueError("Gateway completion payload changed session identity")
+        completions = payload.get("completions")
+        if not isinstance(completions, list):
+            raise ValueError("Gateway task session has an invalid completion inventory")
+        if not completions:
+            empty_session_ids.append(session_id)
+            continue
+        for index, completion in enumerate(completions):
+            if not isinstance(completion, dict):
+                raise ValueError("Gateway completion record has an invalid shape")
+            timestamp = completion.get("timestamp")
+            request = completion.get("request")
+            if not isinstance(timestamp, str) or not timestamp or not isinstance(request, dict):
+                raise ValueError("Gateway completion record lacks request provenance")
+            captured.append((timestamp, session_id, index, request))
+            if len(captured) > _MAX_GATEWAY_COMPLETIONS_PER_TASK:
+                raise ValueError("Gateway task completion set exceeds its request budget")
+
+    if not captured:
+        raise ValueError("Gateway task sessions contain no captured completion")
+    captured.sort(key=lambda item: item[:3])
+    try:
+        contract = CodexGatewayTrainingContract.from_gateway_request(captured[0][3])
+        for _, _, _, request in captured:
+            contract.validate_request_extension(request)
+    except TerminalBenchBridgeError as exc:
+        raise ValueError("Gateway task requests do not share one Codex harness contract") from exc
+    return contract, {
+        "first_completion_timestamp": captured[0][0],
+        "first_session_id": captured[0][1],
+        "request_count": len(captured),
+        "session_ids": new_session_ids,
+        "empty_session_ids": empty_session_ids,
+    }
+
+
+def _write_gateway_contract_receipt(
+    *,
+    evaluation_root: Path,
+    task: ContinualTask,
+    condition: str,
+    codex_version: str,
+    contract: CodexGatewayTrainingContract,
+    capture: Mapping[str, Any],
+) -> Path:
+    contract_root = evaluation_root / "harness_contracts"
+    contract_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(contract_root, 0o700, follow_symlinks=False)
+    path = contract_root / f"{_safe_name(task.task_id)}.json"
+    payload = {
+        "schema_version": "openevo.terminal_bench.gateway_contract_receipt.v1",
+        "condition": condition,
+        "task_id": task.task_id,
+        "codex_version": codex_version,
+        "contract_digest": contract.digest,
+        "capture": dict(capture),
+        "contract": contract.to_payload(),
+    }
+    path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+    os.chmod(path, 0o600, follow_symlinks=False)
+    return path
 
 
 def _run_harbor_task(
@@ -891,15 +1075,42 @@ def _run_harbor_task(
     if len(trials) != 1:
         raise ValueError("continual-memory evaluation requires exactly one Harbor attempt")
     reward = _attempt_reward(trials[0])
+    agent_failure: dict[str, str] | None = None
     if reward is None or not math.isfinite(float(reward)):
-        raise ValueError(f"Terminal-Bench task {task.task_id!r} has no finite reward")
-    return {
+        agent_failure = _agent_execution_failure(trials[0])
+        if agent_failure is None:
+            raise ValueError(f"Terminal-Bench task {task.task_id!r} has no finite reward")
+        reward = 0.0
+    result = {
         "task_id": task.task_id,
         "job_name": job_name,
         "trial_dir": str(trials[0]),
         "reward": float(reward),
         "passed": float(reward) >= 1.0,
         "latency_seconds": latency,
+    }
+    if agent_failure is not None:
+        result["agent_failure"] = agent_failure
+    return result
+
+
+def _agent_execution_failure(trial_dir: Path) -> dict[str, str] | None:
+    result = _read_trial_result(trial_dir / "result.json")
+    execution = result.get("agent_execution")
+    exception = result.get("exception_info")
+    if not isinstance(execution, dict) or not execution.get("started_at"):
+        return None
+    if not isinstance(exception, dict):
+        return None
+    exception_type = exception.get("exception_type")
+    exception_message = exception.get("exception_message")
+    if not isinstance(exception_type, str) or not exception_type.strip():
+        return None
+    if not isinstance(exception_message, str) or not exception_message.strip():
+        return None
+    return {
+        "type": exception_type.strip()[:_MAX_TRIAL_FAILURE_TEXT],
+        "message": exception_message.strip()[:_MAX_TRIAL_FAILURE_TEXT],
     }
 
 
@@ -1041,9 +1252,7 @@ def _write_gateway_topology(
                     "id": "tb21-local",
                     "host": "0.0.0.0",
                     "port": gateway_port,
-                    "public_url": (
-                        f"http://{gateway_advertise_host}:{gateway_port}"
-                    ),
+                    "public_url": (f"http://{gateway_advertise_host}:{gateway_port}"),
                     "max_init_workers": 1,
                     "max_run_workers": 1,
                     "max_postrun_workers": 1,
@@ -1058,9 +1267,7 @@ def _write_gateway_topology(
 
 
 def resolve_gateway_advertise_host(explicit_host: str | None = None) -> str:
-    configured = explicit_host or os.environ.get(
-        "OPENEVO_TB_GATEWAY_ADVERTISE_HOST"
-    )
+    configured = explicit_host or os.environ.get("OPENEVO_TB_GATEWAY_ADVERTISE_HOST")
     if configured:
         address = ipaddress.ip_address(configured)
         if not isinstance(address, ipaddress.IPv4Address) or address.is_unspecified:
@@ -1108,8 +1315,7 @@ def _supported_vllm_lora_rank(required: int) -> int:
 
 def _safe_name(value: str) -> str:
     normalized = "".join(
-        character if character.isalnum() or character in {"-", "_"} else "-"
-        for character in value
+        character if character.isalnum() or character in {"-", "_"} else "-" for character in value
     ).strip("-")
     if not normalized:
         normalized = hashlib.sha256(value.encode("utf-8")).hexdigest()[:16]
@@ -1123,13 +1329,25 @@ def _source_pythonpath(existing: str | None) -> str:
     ]
     if existing:
         entries.extend(
-            str((Path.cwd() / entry).resolve())
-            if not Path(entry).is_absolute()
-            else entry
+            str((Path.cwd() / entry).resolve()) if not Path(entry).is_absolute() else entry
             for entry in existing.split(os.pathsep)
             if entry
         )
     return os.pathsep.join(dict.fromkeys(entries))
+
+
+def _evaluation_process_environments(
+    *,
+    gpu: str,
+    inherited: dict[str, str] | None = None,
+) -> tuple[dict[str, str], dict[str, str]]:
+    base_env = dict(os.environ if inherited is None else inherited)
+    base_env["CUDA_VISIBLE_DEVICES"] = gpu
+    gateway_env = dict(base_env)
+    gateway_env["PYTHONPATH"] = _source_pythonpath(gateway_env.get("PYTHONPATH"))
+    vllm_env = dict(base_env)
+    vllm_env.pop("PYTHONPATH", None)
+    return vllm_env, gateway_env
 
 
 def _process_metadata(process: ManagedProcess) -> dict[str, Any]:

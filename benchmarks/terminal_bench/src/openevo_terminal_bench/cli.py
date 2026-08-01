@@ -254,7 +254,9 @@ def build_parser() -> argparse.ArgumentParser:
     tb_group.add_argument("--task-root", required=True)
     tb_group.add_argument("--group-id", required=True)
     tb_group.add_argument("--task-id", action="append", default=[], required=True)
-    tb_group.add_argument("--objective", choices=["macro_mean_reward"], default="macro_mean_reward")
+    tb_group.add_argument(
+        "--objective", choices=["macro_mean_reward"], default="macro_mean_reward"
+    )
     tb_group.add_argument("--run-root", required=True)
     tb_group.add_argument("--baseline-root")
     tb_group.add_argument(
@@ -342,10 +344,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
     )
     tb_continual.add_argument("--learning-rate", type=float, default=2.0e-4)
+    tb_continual.add_argument(
+        "--coefficient-learning-rate",
+        type=float,
+        default=1.0e-2,
+    )
     tb_continual.add_argument("--epochs", type=int, default=1)
     tb_continual.add_argument("--max-steps", type=int)
     tb_continual.add_argument("--max-length", type=int, default=2048)
     tb_continual.add_argument("--max-records", type=int, default=256)
+    tb_continual.add_argument("--replay-capacity", type=int, default=64)
     tb_continual.add_argument("--gradient-accumulation-steps", type=int, default=1)
     tb_continual.add_argument("--load-in-4bit", action="store_true")
     tb_continual.add_argument(
@@ -355,6 +363,11 @@ def build_parser() -> argparse.ArgumentParser:
     tb_continual.add_argument("--seed", type=int, default=1993)
     tb_continual.add_argument("--trainer-timeout-seconds", type=float, default=3600.0)
     tb_continual.add_argument("--verifier-env", action="append", default=[])
+    tb_continual.add_argument(
+        "--skip-ordinary-control",
+        action="store_true",
+        help="Skip the optional ordinary sequential-LoRA algorithm control.",
+    )
     tb_continual.add_argument("--dry-run", action="store_true")
     tb_continual.add_argument("--output", required=True)
     return parser
@@ -444,14 +457,14 @@ def main(argv: list[str] | None = None) -> int:
             base_model=args.model,
             model_revision=args.model_revision,
             rank=args.rank,
-            target_modules=tuple(
-                args.target_module or ("q_proj", "k_proj", "v_proj", "o_proj")
-            ),
+            target_modules=tuple(args.target_module or ("q_proj", "k_proj", "v_proj", "o_proj")),
             learning_rate=args.learning_rate,
+            coefficient_learning_rate=args.coefficient_learning_rate,
             epochs=args.epochs,
             max_steps=args.max_steps,
             max_length=args.max_length,
             max_records=args.max_records,
+            replay_capacity=args.replay_capacity,
             gradient_accumulation_steps=args.gradient_accumulation_steps,
             load_in_4bit=args.load_in_4bit,
             gradient_checkpointing=not args.no_gradient_checkpointing,
@@ -475,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
                 gateway_advertise_host=args.gateway_advertise_host,
                 maximum_model_length=args.max_model_length,
                 agent_timeout_seconds=args.agent_timeout_seconds,
+                include_ordinary_control=not args.skip_ordinary_control,
             )
             _write_json_output(payload, args.output)
             return 0
@@ -495,6 +509,7 @@ def main(argv: list[str] | None = None) -> int:
             maximum_model_length=args.max_model_length,
             agent_timeout_seconds=args.agent_timeout_seconds,
             verifier_env=_parse_key_value_entries(args.verifier_env),
+            include_ordinary_control=not args.skip_ordinary_control,
         )
         _write_json_output(payload, args.output)
         return 0
@@ -1117,9 +1132,7 @@ def _unique_forbidden_literal_map(
 ) -> dict[str, list[str]]:
     return {
         key: unique
-        for key, unique in (
-            (key, _unique_nonempty_text(items)) for key, items in values.items()
-        )
+        for key, unique in ((key, _unique_nonempty_text(items)) for key, items in values.items())
         if unique
     }
 

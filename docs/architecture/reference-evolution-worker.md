@@ -530,7 +530,7 @@ self-deployed inference，且只在下一 task/session 生效。
 - at most one prior `parametric_memory_sd_lora` artifact；
 - exact `base_model` 和 immutable `model_revision`；
 - closed method config 中的 rank、target modules、optimizer、steps/epochs、sequence length、
-  record cap、dtype、quantization 和 timeout。
+  current record cap、replay capacity、dtype、quantization 和 timeout。
 
 执行边界：
 
@@ -542,15 +542,22 @@ self-deployed inference，且只在下一 task/session 生效。
 - trainer 使用独立 process group、Linux parent-death signal、closed environment 和
   core/file/open-file/CPU resource limits。active receipt 绑定 boot ID、PID、process group、
   session 和进程 start time，service 重启时只终止 identity 仍完全匹配的遗留进程；
-- 旧 A/B components 冻结，新 A/B component 和共享 coefficients 参与训练；
+- 旧的全局单位 Frobenius directions 冻结，上一代 magnitudes 从 state 恢复，新 A/B component
+  和全部共享 magnitudes 在 current trajectories 与 bounded historical replay 上参与训练；
+  magnitude 使用独立学习率；新 component 在 generation boundary 规范化并把 norm 吸收到
+  magnitude，因而 cumulative export 和下一代加载保持同一个 effective update；
 - 输出前把所有 components 折叠成一个标准 PEFT adapter，同时保存可继续训练的
-  `openevo_sd_lora_state.json` 和 `openevo_sd_lora_state.safetensors`；
+  `openevo_sd_lora_state.json`、`openevo_sd_lora_state.safetensors` 和 digest-bound
+  `openevo_sd_lora_replay.jsonl`；
 - task inference 继续使用 OpenEvo 已有 harness。该 trainer 不调用额外模型 API。
 
 输出是一个 `parametric_memory` artifact。Manifest 将其声明为
 `routing_mode=single_cumulative_adapter`，并绑定 exact model revision、component/rank
-inventory、source datasets、prior artifact、实际 trainer wall time 和 peak allocated GPU
-memory。它不声称 training loss 或这些 resource metrics 是 held-out performance。
+inventory、source datasets、prior artifact、replay retention/counts、实际 trainer wall time
+和 peak allocated GPU memory。该语言-agent adaptation 显式声明
+`paper_equivalent=false`、`rehearsal_free=false`；bounded replay 用于约束一个累计 memory，
+不产生 task-specific adapter bank。它不声称 training loss 或这些 resource metrics 是
+held-out performance。
 
 该方法要求 Daemon 安装 `openevo[parametric-memory]`、CUDA 可用，并由 launcher 发布
 `adapter_serving`、`gpu`、`sd_lora_continual_trainer`。它是 internal/experimental research

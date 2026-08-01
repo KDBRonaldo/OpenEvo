@@ -150,3 +150,61 @@ attempts or specify another uncertainty protocol. It must retain all task-level
 rewards and distinguish infrastructure failures from verifier failures and
 model failures. Serving latency, if evaluated, needs an isolated request-level
 measurement rather than Harbor wall time.
+
+## Corrected Continual-Learning Gain Smoke
+
+On 2026-08-01, a second controlled run addressed the two main defects exposed
+by the first smoke:
+
+- training examples now project successful Harbor ATIF turns into the exact
+  messages and tools contract captured from the live base-model
+  `CodexHarness -> Gateway` requests, and loss is restricted to the projected
+  assistant targets;
+- each historical component is stored as a frozen global unit-Frobenius
+  direction, while its learned magnitude is restored and jointly optimized
+  with the new direction and magnitude. A bounded successful-trajectory replay
+  buffer supplies retention data without adding task routing.
+
+The fixed base was `Qwen/Qwen3-4B-Instruct-2507` at immutable revision
+`cdbee75f17c01a7cc42f958dc650907174af0554`, served through vLLM on GPU 3.
+Codex `0.146.0` performed all task inference through the existing OpenEvo
+Gateway. Only `parametric_memory` evolution was enabled; ordinary sequential
+LoRA was deliberately skipped in this run. The ordered tasks were
+`prove-plus-comm` and `regex-log`, with one successful GPT-5.5 teacher trial
+projected for each task. Rank 16 components targeted `q_proj`, `k_proj`,
+`v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`; direction and
+magnitude learning rates were `1e-4` and `1e-2`, respectively.
+
+| Condition / generation | `prove-plus-comm` | `regex-log` | Mean |
+|---|---:|---:|---:|
+| Fixed base | 0 | 0 | 0.000 |
+| SD-LoRA generation 0 | 1 | 0 | 0.500 |
+| SD-LoRA generation 1 | 1 | 1 | 1.000 |
+
+The resulting reward matrix was `[[1, 0], [1, 1]]`. Final average and anytime
+average were both 1.000, backward transfer was 0.000, and forgetting was
+0.000. All six Harbor attempts returned finite rewards without infrastructure
+exceptions. The first task's reward remained 1 after learning the second task.
+
+| Generation | Components | Effective rank | Current / replay records | Steps | Loss | Train time | Peak allocated GPU memory |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 0 | 1 | 16 | 5 / 0 | 100 | 0.355367 | 238.333 s | 23,794,438,656 bytes |
+| 1 | 2 | 32 | 12 / 12 | 200 | 0.171579 | 603.307 s | 30,517,412,352 bytes |
+
+Generation 1 restored the first component magnitude and updated it from
+`4.083327` to `3.995929`; the new component magnitude was `5.577014`. Both
+serving commands used `--max-loras 1`. Generation 1 loaded one rank-32
+cumulative adapter, not two task adapters, and every condition reproduced the
+same per-task Gateway contract digest.
+
+The canonical report is
+`/tmp/tb21-sd-lora-normalized-two-task-20260801-v3/report.json`, with SHA-256
+`0e69820410ba56a707d2269ede5a22cdd7cbe3f36d373db216f9f4aad0627ff8`.
+
+This is positive end-to-end evidence that the corrected SD-LoRA path can learn
+two selected base failures without forgetting the first one. It remains a
+conditional two-task, one-attempt smoke: the tasks and successful teacher
+trajectories are not an unbiased sample, ordinary LoRA was not rerun under this
+larger budget, and no confidence interval is available. It therefore does not
+replace the larger frozen, repeated Terminal Bench performance gate described
+above.

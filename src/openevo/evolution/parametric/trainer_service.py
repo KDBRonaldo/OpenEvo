@@ -32,9 +32,7 @@ _MAX_RESULT_BYTES = 1024 * 1024
 _READ_CHUNK_BYTES = 16 * 1024
 _ACTIVE_RECEIPT_SCHEMA = "openevo.sd_lora_active_process.v1"
 _ACTIVE_RECEIPT_RE = re.compile(r"\.sd-lora-[0-9a-f]{24}\.active\.json")
-_BOOT_ID_RE = re.compile(
-    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
-)
+_BOOT_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _TRAINER_LOCK_NAME = ".sd-lora-trainer.lock"
 _PARENT_PID_ENV = "OPENEVO_SD_LORA_PARENT_PID"
 _PROCESS_POLL_SECONDS = 0.1
@@ -399,10 +397,7 @@ class SubprocessSdLoraTrainerService:
                     continue
                 if re.fullmatch(r"sd-lora-[0-9a-f]{32}", entry.name) is None:
                     continue
-                if (
-                    observed.st_uid != os.geteuid()
-                    or stat.S_IMODE(observed.st_mode) != 0o700
-                ):
+                if observed.st_uid != os.geteuid() or stat.S_IMODE(observed.st_mode) != 0o700:
                     raise ValueError("abandoned trainer work directory is not private")
                 work_dir = Path(entry.path)
                 receipts = [
@@ -420,9 +415,7 @@ class SubprocessSdLoraTrainerService:
                     receipt_path,
                     maximum_bytes=16 * 1024,
                 )
-                receipt = _validate_process_receipt(
-                    json.loads(receipt_bytes.decode("utf-8"))
-                )
+                receipt = _validate_process_receipt(json.loads(receipt_bytes.decode("utf-8")))
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise ValueError("trainer active-process receipt is invalid") from exc
             if receipt_bytes != (canonical_json(receipt) + "\n").encode("utf-8"):

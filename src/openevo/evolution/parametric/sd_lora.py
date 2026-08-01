@@ -20,6 +20,7 @@ from openevo.evolution.models import (
 )
 
 from .contracts import (
+    SD_LORA_REPLAY_DATA,
     SD_LORA_STATE_MANIFEST,
     SD_LORA_STATE_WEIGHTS,
     SdLoraMethodConfig,
@@ -49,6 +50,7 @@ _REQUIRED_ADAPTER_FILES = frozenset(
     {
         "adapter_config.json",
         "adapter_model.safetensors",
+        SD_LORA_REPLAY_DATA,
         SD_LORA_STATE_MANIFEST,
         SD_LORA_STATE_WEIGHTS,
     }
@@ -127,6 +129,7 @@ def _training_examples(
                     continue
                 example: dict[str, Any] = {
                     "messages": [*prompt_messages, *response_messages],
+                    "target_message_start": len(prompt_messages),
                     "metadata": {
                         "dataset_artifact_id": dataset.artifact_id,
                         "dataset_name": manifest.get("name") or dataset.name,
@@ -314,6 +317,12 @@ def _validated_output_state(
             or weights_entry.sha256 != state.state_weights_sha256
         ):
             raise ValueError("SD-LoRA state weights do not match their manifest")
+        replay_entry = entries[SD_LORA_REPLAY_DATA]
+        if (
+            replay_entry.size_bytes != state.replay_data_size_bytes
+            or replay_entry.sha256 != state.replay_data_sha256
+        ):
+            raise ValueError("SD-LoRA replay data does not match its manifest")
         payloads.verify_payload_content(snapshot.payload_handle)
 
     expected_values = {
@@ -325,6 +334,9 @@ def _validated_output_state(
         "effective_rank": result.effective_rank,
         "target_module_suffixes": request.config.target_modules,
         "training_record_count": result.training_record_count,
+        "replay_training_record_count": result.replay_training_record_count,
+        "optimizer_training_record_count": result.optimizer_training_record_count,
+        "replay_buffer_record_count": result.replay_buffer_record_count,
         "steps_completed": result.steps_completed,
         "training_time_seconds": result.training_time_seconds,
         "gpu_peak_memory_bytes": result.gpu_peak_memory_bytes,
@@ -360,6 +372,7 @@ def _train_and_validate_output(
     if result.adapter_path != request.output_adapter_path or (
         result.state_manifest_path != f"{request.output_adapter_path}/{SD_LORA_STATE_MANIFEST}"
         or result.state_weights_path != f"{request.output_adapter_path}/{SD_LORA_STATE_WEIGHTS}"
+        or result.replay_data_path != f"{request.output_adapter_path}/{SD_LORA_REPLAY_DATA}"
     ):
         raise ValueError("SD-LoRA trainer returned unexpected output paths")
     adapter_dir = Path(request.work_dir) / result.adapter_path
@@ -492,8 +505,9 @@ def parametric_memory_sd_lora(
     manifest = {
         "method": "parametric_memory_sd_lora",
         "algorithm_family": "SD-LoRA",
-        "adaptation_scope": "causal_lm_continual_sft_v1",
+        "adaptation_scope": "causal_lm_continual_sft_v4",
         "paper_equivalent": False,
+        "direction_parameterization": "frozen_global_unit_frobenius_direction",
         "upstream_repository": "https://github.com/WuYichen-97/SD-Lora-CL",
         "upstream_revision": "8bacded6eb44786db071f66fb90a87dd660d94ea",
         "adapter_id": adapter_id,
@@ -502,6 +516,8 @@ def parametric_memory_sd_lora(
         "base_model": config.base_model,
         "model_revision": config.model_revision,
         "routing_mode": "single_cumulative_adapter",
+        "retention_strategy": "bounded_trajectory_replay",
+        "rehearsal_free": False,
         "continual_task_index": result.task_index,
         "component_count": result.component_count,
         "component_rank": config.rank,
@@ -509,6 +525,9 @@ def parametric_memory_sd_lora(
         "coefficients": list(result.coefficients),
         "target_module_names": list(result.target_module_names),
         "training_record_count": len(examples),
+        "replay_training_record_count": result.replay_training_record_count,
+        "optimizer_training_record_count": result.optimizer_training_record_count,
+        "replay_buffer_record_count": result.replay_buffer_record_count,
         "steps_completed": result.steps_completed,
         "training_loss": result.training_loss,
         "training_time_seconds": result.training_time_seconds,
@@ -520,6 +539,7 @@ def parametric_memory_sd_lora(
         ),
         "state_manifest_path": SD_LORA_STATE_MANIFEST,
         "state_weights_path": SD_LORA_STATE_WEIGHTS,
+        "replay_data_path": SD_LORA_REPLAY_DATA,
         "training_config": config.model_dump(mode="json"),
     }
     core_config = context.envelope.core_config()

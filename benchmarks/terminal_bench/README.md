@@ -90,7 +90,19 @@ fixed payloads into each isolated Harbor task container, and verifies their
 hashes and version before execution. Task inference then follows
 `CodexHarness -> Gateway -> local vLLM`; adapter training does not call a model
 API. The supplied training trials are read only as successful trajectory data
-and must not expose verifier answers or other benchmark-private data.
+and must not expose verifier answers or other benchmark-private data. Before
+training, the command captures the live base-model Gateway request contract for
+each task and projects teacher turns into that exact messages/tools shape. Every
+adapter evaluation must reproduce the same contract digest or fail closed.
+
+OpenEvo's language-agent SD-LoRA variant retains a bounded trajectory replay
+buffer in the cumulative artifact. Each new generation freezes historical A/B
+global unit-Frobenius directions, restores their learned magnitudes, and jointly
+optimizes the new direction plus shared magnitudes on current and deterministic
+prior replay examples. New directions are normalized at the generation boundary
+with their norm absorbed into the magnitude, preserving the exact effective
+model. Serving still loads exactly one cumulative adapter; replay does not
+introduce task routing or a bank of independently selected LoRAs.
 
 For an ordered stream of `N` tasks, the command runs the base model once on all
 tasks, then evaluates every ordinary sequential-LoRA generation and every

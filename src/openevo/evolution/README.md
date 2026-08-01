@@ -226,9 +226,14 @@ scanner 不支持远程 `hf`/`https`/`s3` inventory，不解压 archives，也�
 HTTP backend 不在 request handler 内训练 LoRA，也不负责 serving inference。Plan-bound
 `parametric_memory_sd_lora` job 由 Daemon worker 的固定 trainer service 在 inference 进程外
 执行本地 CUDA training，并注册一个 cumulative PEFT adapter；它不接受外部 trainer command
-或模型 API endpoint。Parametric memory artifacts 在 context resolve 时以 adapter merge specs
-返回给 serving infrastructure。该方法目前是 internal/experimental capability，不属于
-External Beta release acceptance。
+或模型 API endpoint。每代只增加一个 component，冻结旧的全局单位 Frobenius directions，
+并在 current trajectories 与 bounded historical replay 上训练新 component 和共享 magnitudes；
+magnitude 使用独立学习率，新 component 的 norm 在 generation boundary 被吸收到 magnitude，
+因此训练结束、导出和下一代加载保持同一个 effective update。Replay
+属于同一个 cumulative state，不是 router 或独立 adapter bank；该语言-agent adaptation 也
+因此显式声明不是 upstream paper 的 rehearsal-free equivalent。Parametric memory artifacts 在
+context resolve 时以 adapter merge specs 返回给 serving infrastructure。该方法目前是
+internal/experimental capability，不属于 External Beta release acceptance。
 
 ## OPSD privileged distillation helpers
 

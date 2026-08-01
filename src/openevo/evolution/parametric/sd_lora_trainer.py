@@ -23,6 +23,7 @@ from openevo.evolution.framework.contracts import canonical_json, validate_relat
 from .contracts import (
     MAX_SD_LORA_COMPONENTS,
     MAX_SD_LORA_EFFECTIVE_RANK,
+    SD_LORA_REPLAY_DATA,
     SD_LORA_STATE_MANIFEST,
     SD_LORA_STATE_WEIGHTS,
     SdLoraDType,
@@ -84,9 +85,7 @@ def _apply_resource_limits(timeout_seconds: float) -> None:
     cpu_hard = resource.getrlimit(resource.RLIMIT_CPU)[1]
     requested_cpu = max(1, math.ceil(timeout_seconds) + 60)
     cpu_limit = (
-        requested_cpu
-        if cpu_hard == resource.RLIM_INFINITY
-        else min(requested_cpu, cpu_hard)
+        requested_cpu if cpu_hard == resource.RLIM_INFINITY else min(requested_cpu, cpu_hard)
     )
     resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
 
@@ -253,6 +252,114 @@ def _read_examples(path: Path, *, expected_count: int) -> list[dict[str, Any]]:
     return examples
 
 
+def _write_private_jsonl(path: Path, records: Sequence[dict[str, Any]]) -> None:
+    if not records:
+        raise ValueError("SD-LoRA replay data must not be empty")
+    fd = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        total_bytes = 0
+        for record in records:
+            line = (canonical_json(record) + "\n").encode("utf-8")
+            if len(line) > MAX_TRAINING_LINE_BYTES:
+                raise ValueError("SD-LoRA replay example exceeds the line budget")
+            total_bytes += len(line)
+            if total_bytes > MAX_TRAINING_FILE_BYTES:
+                raise ValueError("SD-LoRA replay data exceeds the file budget")
+            pending = memoryview(line)
+            while pending:
+                written = os.write(fd, pending)
+                if written <= 0:
+                    raise OSError("SD-LoRA replay write made no progress")
+                pending = pending[written:]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _example_identity(example: dict[str, Any]) -> str:
+    value = {
+        key: example[key]
+        for key in ("messages", "target_message_start", "tools")
+        if key in example
+    }
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _example_group(example: dict[str, Any]) -> str:
+    metadata = example.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("task_id", "dataset_artifact_id", "dataset_name"):
+            value = metadata.get(key)
+            if isinstance(value, str) and value:
+                return f"{key}:{value}"
+    return "unknown"
+
+
+def _bounded_replay_buffer(
+    prior: Sequence[dict[str, Any]],
+    current: Sequence[dict[str, Any]],
+    *,
+    capacity: int,
+) -> list[dict[str, Any]]:
+    unique: dict[str, dict[str, Any]] = {}
+    for example in (*prior, *current):
+        unique[_example_identity(example)] = example
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for example in unique.values():
+        groups.setdefault(_example_group(example), []).append(example)
+    selected: list[dict[str, Any]] = []
+    offsets = {key: 0 for key in groups}
+    while len(selected) < min(capacity, len(unique)):
+        made_progress = False
+        for key in sorted(groups):
+            offset = offsets[key]
+            if offset >= len(groups[key]):
+                continue
+            selected.append(groups[key][offset])
+            offsets[key] = offset + 1
+            made_progress = True
+            if len(selected) >= capacity:
+                break
+        if not made_progress:
+            break
+    return selected
+
+
+def _select_replay_examples(
+    replay_buffer: Sequence[dict[str, Any]],
+    *,
+    count: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if not replay_buffer or count <= 0:
+        return []
+    randomizer = random.Random(seed)
+    selected: list[dict[str, Any]] = []
+    indices = list(range(len(replay_buffer)))
+    while len(selected) < count:
+        randomizer.shuffle(indices)
+        selected.extend(
+            replay_buffer[index] for index in indices[: min(len(indices), count - len(selected))]
+        )
+    return selected
+
+
+def _initial_coefficient_values(
+    prior_manifest: SdLoraStateManifest | None,
+    current_value: float,
+) -> tuple[float, ...]:
+    prior_values = (
+        tuple(component.coefficient for component in prior_manifest.components)
+        if prior_manifest is not None
+        else ()
+    )
+    return (*prior_values, current_value)
+
+
 def _target_module_names(model: Any, suffixes: Sequence[str]) -> tuple[str, ...]:
     names: list[str] = []
     for name, module in model.named_modules():
@@ -284,7 +391,11 @@ def _load_prior_state(
     *,
     torch: Any,
     load_file: Any,
-) -> tuple[SdLoraStateManifest, list[dict[str, tuple[Any, Any]]]]:
+) -> tuple[
+    SdLoraStateManifest,
+    list[dict[str, tuple[Any, Any]]],
+    list[dict[str, Any]],
+]:
     manifest_path = prior_dir / SD_LORA_STATE_MANIFEST
     weights_path = prior_dir / SD_LORA_STATE_WEIGHTS
     manifest_bytes = _read_owned_file(manifest_path, maximum_bytes=_MAX_REQUEST_BYTES)
@@ -310,6 +421,17 @@ def _load_prior_state(
         or observed_digest != manifest.state_weights_sha256
     ):
         raise ValueError("prior SD-LoRA state weights do not match their manifest")
+    replay_path = prior_dir / SD_LORA_REPLAY_DATA
+    replay_size, replay_digest = _sha256_file(replay_path)
+    if (
+        replay_size != manifest.replay_data_size_bytes
+        or replay_digest != manifest.replay_data_sha256
+    ):
+        raise ValueError("prior SD-LoRA replay data does not match its manifest")
+    replay_examples = _read_examples(
+        replay_path,
+        expected_count=manifest.replay_buffer_record_count,
+    )
     tensors = load_file(str(weights_path), device="cpu")
     expected_keys = {
         _state_key(component.task_index, module.name, matrix)
@@ -335,7 +457,15 @@ def _load_prior_state(
                 raise ValueError("prior SD-LoRA state contains non-finite tensors")
             values[module.name] = (matrix_a.float(), matrix_b.float())
         components.append(values)
-    return manifest, components
+    for component in components:
+        direction_norm = _component_direction_frobenius_norm(
+            torch,
+            component,
+            tuple(module.name for module in manifest.modules),
+        )
+        if not math.isclose(direction_norm, 1.0, rel_tol=1.0e-4, abs_tol=1.0e-5):
+            raise ValueError("prior SD-LoRA component is not a unit direction")
+    return manifest, components, replay_examples
 
 
 def _sd_lora_layer_class(torch: Any) -> type[Any]:
@@ -384,16 +514,11 @@ def _sd_lora_layer_class(torch: Any) -> type[Any]:
             for index, (matrix_a, matrix_b) in enumerate(
                 zip(self.prior_a, self.prior_b, strict=True)
             ):
-                denominator = (matrix_a.float().norm() * matrix_b.float().norm()).clamp_min(
-                    torch.finfo(torch.float32).eps
-                )
                 projected = torch.nn.functional.linear(
                     torch.nn.functional.linear(inputs, matrix_a),
                     matrix_b,
                 )
-                delta = delta + projected * (
-                    coefficients[index].to(projected.dtype) / denominator.to(projected.dtype)
-                )
+                delta = delta + projected * coefficients[index].to(projected.dtype)
             current = torch.nn.functional.linear(
                 torch.nn.functional.linear(inputs, self.current_a),
                 self.current_b,
@@ -418,6 +543,8 @@ def _encode_fallback(
     tokenizer: Any,
     messages: Sequence[dict[str, Any]],
     maximum: int,
+    *,
+    target_message_start: int = 0,
 ) -> dict[str, list[int]]:
     input_ids: list[int] = []
     labels: list[int] = []
@@ -425,7 +552,7 @@ def _encode_fallback(
     if isinstance(bos_token_id, int):
         input_ids.append(bos_token_id)
         labels.append(-100)
-    for message in messages:
+    for message_index, message in enumerate(messages):
         role = message["role"]
         if message.get("name"):
             role += f":{message['name']}"
@@ -438,11 +565,16 @@ def _encode_fallback(
         rendered = f"<|{role}|>\n{content}\n"
         segment = tokenizer.encode(rendered, add_special_tokens=False)
         input_ids.extend(segment)
-        labels.extend(segment if message["role"] == "assistant" else [-100] * len(segment))
+        is_target = message_index >= target_message_start and message["role"] == "assistant"
+        labels.extend(segment if is_target else [-100] * len(segment))
     eos_token_id = getattr(tokenizer, "eos_token_id", None)
     if isinstance(eos_token_id, int) and len(input_ids) < maximum:
         input_ids.append(eos_token_id)
-        labels.append(eos_token_id if messages[-1]["role"] == "assistant" else -100)
+        labels.append(
+            eos_token_id
+            if len(messages) - 1 >= target_message_start and messages[-1]["role"] == "assistant"
+            else -100
+        )
     input_ids = input_ids[-maximum:]
     labels = labels[-maximum:]
     if not any(label != -100 for label in labels):
@@ -466,6 +598,7 @@ def _encode_chat_template_with_offsets(
     maximum: int,
 ) -> dict[str, list[int]]:
     messages = example["messages"]
+    target_message_start = example.get("target_message_start", 0)
     template_kwargs: dict[str, Any] = {}
     if "tools" in example:
         template_kwargs["tools"] = example["tools"]
@@ -480,7 +613,7 @@ def _encode_chat_template_with_offsets(
 
     assistant_spans: list[tuple[int, int]] = []
     for index, message in enumerate(messages):
-        if message["role"] != "assistant":
+        if index < target_message_start or message["role"] != "assistant":
             continue
         target_prefix = tokenizer.apply_chat_template(
             messages[:index],
@@ -504,7 +637,7 @@ def _encode_chat_template_with_offsets(
             raise ValueError("chat template assistant boundaries are not prefix-stable")
         assistant_spans.append((len(target_prefix), len(completed_prefix)))
     if not assistant_spans:
-        raise ValueError("chat template example has no assistant span")
+        raise ValueError("chat template example has no target assistant span")
 
     encoded = tokenizer(
         rendered,
@@ -530,8 +663,13 @@ def _encode_chat_template_with_offsets(
 
 def _encode_example(tokenizer: Any, example: dict[str, Any], maximum: int) -> dict[str, list[int]]:
     messages = example["messages"]
+    target_message_start = example.get("target_message_start", 0)
     chat_template = getattr(tokenizer, "chat_template", None)
-    if chat_template and _chat_template_has_generation_block(chat_template):
+    if (
+        target_message_start == 0
+        and chat_template
+        and _chat_template_has_generation_block(chat_template)
+    ):
         kwargs: dict[str, Any] = {
             "tokenize": True,
             "add_generation_prompt": False,
@@ -567,7 +705,12 @@ def _encode_example(tokenizer: Any, example: dict[str, Any], maximum: int) -> di
             raise ValueError(
                 "SD-LoRA could not derive an exact assistant mask from the model chat template"
             ) from exc
-    return _encode_fallback(tokenizer, messages, maximum)
+    return _encode_fallback(
+        tokenizer,
+        messages,
+        maximum,
+        target_message_start=target_message_start,
+    )
 
 
 def _collate(
@@ -614,7 +757,6 @@ def _compose_cumulative_weights(
 
     if not components or len(components) != len(coefficients):
         raise ValueError("SD-LoRA composition requires one coefficient per component")
-    newest = len(components) - 1
     merged: dict[str, tuple[Any, Any]] = {}
     for module_name in module_names:
         matrices_a: list[Any] = []
@@ -622,11 +764,6 @@ def _compose_cumulative_weights(
         for index, component in enumerate(components):
             matrix_a, matrix_b = component[module_name]
             scale = float(coefficients[index])
-            if index < newest:
-                denominator = float(matrix_a.float().norm() * matrix_b.float().norm())
-                if not math.isfinite(denominator) or denominator <= 0.0:
-                    raise ValueError("prior SD-LoRA component has a zero or invalid norm")
-                scale /= denominator
             matrices_a.append(matrix_a.float().contiguous())
             matrices_b.append((matrix_b.float() * scale).contiguous())
         merged[module_name] = (
@@ -634,6 +771,56 @@ def _compose_cumulative_weights(
             torch.cat(matrices_b, dim=1).contiguous(),
         )
     return merged
+
+
+def _component_direction_frobenius_norm(
+    torch: Any,
+    component: dict[str, tuple[Any, Any]],
+    module_names: Sequence[str],
+) -> float:
+    """Return the global Frobenius norm without materializing full B @ A updates."""
+
+    if set(component) != set(module_names):
+        raise ValueError("SD-LoRA component module inventory is not exact")
+    squared_norm = torch.zeros((), dtype=torch.float64)
+    for module_name in module_names:
+        matrix_a, matrix_b = component[module_name]
+        matrix_a = matrix_a.detach().float().cpu()
+        matrix_b = matrix_b.detach().float().cpu()
+        gram_a = matrix_a @ matrix_a.transpose(0, 1)
+        gram_b = matrix_b.transpose(0, 1) @ matrix_b
+        squared_norm += (gram_a.double() * gram_b.double()).sum()
+    squared_value = float(squared_norm)
+    if not math.isfinite(squared_value) or squared_value <= 0.0:
+        raise ValueError("SD-LoRA component direction norm must be finite and positive")
+    return math.sqrt(squared_value)
+
+
+def _normalize_component_direction(
+    torch: Any,
+    component: dict[str, tuple[Any, Any]],
+    module_names: Sequence[str],
+) -> tuple[dict[str, tuple[Any, Any]], float]:
+    direction_norm = _component_direction_frobenius_norm(
+        torch,
+        component,
+        module_names,
+    )
+    normalized = {
+        module_name: (
+            component[module_name][0].detach().float().cpu().contiguous(),
+            (component[module_name][1].detach().float().cpu() / direction_norm).contiguous(),
+        )
+        for module_name in module_names
+    }
+    normalized_norm = _component_direction_frobenius_norm(
+        torch,
+        normalized,
+        module_names,
+    )
+    if not math.isclose(normalized_norm, 1.0, rel_tol=1.0e-4, abs_tol=1.0e-5):
+        raise RuntimeError("SD-LoRA component direction normalization was unstable")
+    return normalized, direction_norm
 
 
 def _initialize_cuda_runtime(
@@ -649,7 +836,37 @@ def _initialize_cuda_runtime(
     torch.cuda.reset_peak_memory_stats()
 
 
+def _planned_optimizer_steps(
+    *,
+    record_count: int,
+    batch_size: int,
+    epochs: int,
+    gradient_accumulation_steps: int,
+    max_steps: int | None,
+) -> int:
+    micro_batches = math.ceil(record_count / batch_size) * epochs
+    optimizer_steps = math.ceil(micro_batches / gradient_accumulation_steps)
+    if max_steps is not None:
+        optimizer_steps = min(optimizer_steps, max_steps)
+    return optimizer_steps
+
+
 def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
+    if (
+        request.prior_adapter_path is None
+        and _planned_optimizer_steps(
+            record_count=request.training_record_count,
+            batch_size=request.config.per_device_train_batch_size,
+            epochs=request.config.epochs,
+            gradient_accumulation_steps=request.config.gradient_accumulation_steps,
+            max_steps=request.config.max_steps,
+        )
+        < 2
+    ):
+        raise ValueError(
+            "SD-LoRA training requires at least two optimizer steps because its "
+            "zero-initialized B matrices do not propagate gradients to A on the first step"
+        )
     training_started = time.monotonic()
     (
         torch,
@@ -700,18 +917,10 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         tokenizer.pad_token = tokenizer.eos_token
 
     work_dir = Path(request.work_dir)
-    examples = _read_examples(
+    current_examples = _read_examples(
         work_dir / request.training_data_path,
         expected_count=request.training_record_count,
     )
-    original_truncation_side = tokenizer.truncation_side
-    tokenizer.truncation_side = "left"
-    try:
-        encoded_examples = [
-            _encode_example(tokenizer, example, request.config.max_length) for example in examples
-        ]
-    finally:
-        tokenizer.truncation_side = original_truncation_side
     target_names = _target_module_names(model, request.config.target_modules)
     module_specs = tuple(
         SdLoraStateModule(
@@ -724,8 +933,9 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
 
     prior_manifest: SdLoraStateManifest | None = None
     prior_components: list[dict[str, tuple[Any, Any]]] = []
+    prior_replay_buffer: list[dict[str, Any]] = []
     if request.prior_adapter_path is not None:
-        prior_manifest, prior_components = _load_prior_state(
+        prior_manifest, prior_components, prior_replay_buffer = _load_prior_state(
             request,
             work_dir / request.prior_adapter_path,
             torch=torch,
@@ -733,6 +943,38 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         )
         if tuple(prior_manifest.modules) != module_specs:
             raise ValueError("prior SD-LoRA state does not match the loaded model modules")
+    replay_examples = _select_replay_examples(
+        prior_replay_buffer,
+        count=len(current_examples),
+        seed=request.config.seed + len(prior_components),
+    )
+    optimizer_examples = [*current_examples, *replay_examples]
+    replay_buffer = _bounded_replay_buffer(
+        prior_replay_buffer,
+        current_examples,
+        capacity=request.config.replay_capacity,
+    )
+    planned_optimizer_steps = _planned_optimizer_steps(
+        record_count=len(optimizer_examples),
+        batch_size=request.config.per_device_train_batch_size,
+        epochs=request.config.epochs,
+        gradient_accumulation_steps=request.config.gradient_accumulation_steps,
+        max_steps=request.config.max_steps,
+    )
+    if planned_optimizer_steps < 2:
+        raise ValueError(
+            "SD-LoRA training requires at least two optimizer steps because its "
+            "zero-initialized B matrices do not propagate gradients to A on the first step"
+        )
+    original_truncation_side = tokenizer.truncation_side
+    tokenizer.truncation_side = "left"
+    try:
+        encoded_examples = [
+            _encode_example(tokenizer, example, request.config.max_length)
+            for example in optimizer_examples
+        ]
+    finally:
+        tokenizer.truncation_side = original_truncation_side
     component_count = len(prior_components) + 1
     effective_rank = component_count * request.config.rank
     if effective_rank > MAX_SD_LORA_EFFECTIVE_RANK:
@@ -740,13 +982,12 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
 
     for parameter in model.parameters():
         parameter.requires_grad = False
+    initial_coefficients = _initial_coefficient_values(
+        prior_manifest,
+        request.config.coefficient_init,
+    )
     coefficients = torch.nn.Parameter(
-        torch.full(
-            (component_count,),
-            request.config.coefficient_init,
-            dtype=torch.float32,
-            device=device,
-        )
+        torch.tensor(initial_coefficients, dtype=torch.float32, device=device)
     )
     layer_class = _sd_lora_layer_class(torch)
     wrappers: dict[str, Any] = {}
@@ -775,13 +1016,23 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
             model.enable_input_require_grads()
     if hasattr(model.config, "use_cache"):
         model.config.use_cache = False
-    trainable = [coefficients]
+    direction_parameters: list[Any] = []
     for wrapper in wrappers.values():
-        trainable.extend((wrapper.current_a, wrapper.current_b))
+        direction_parameters.extend((wrapper.current_a, wrapper.current_b))
+    trainable = [coefficients, *direction_parameters]
     optimizer = torch.optim.AdamW(
-        trainable,
-        lr=request.config.learning_rate,
-        weight_decay=request.config.weight_decay,
+        (
+            {
+                "params": [coefficients],
+                "lr": request.config.coefficient_learning_rate,
+                "weight_decay": 0.0,
+            },
+            {
+                "params": direction_parameters,
+                "lr": request.config.learning_rate,
+                "weight_decay": request.config.weight_decay,
+            },
+        )
     )
     scaler = torch.amp.GradScaler(
         "cuda",
@@ -839,7 +1090,7 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
     if steps_completed < 1 or not losses:
         raise ValueError("SD-LoRA training completed no optimizer steps")
     training_loss = sum(losses) / len(losses)
-    coefficient_values = tuple(
+    trained_coefficient_values = tuple(
         float(value) for value in coefficients.detach().float().cpu().tolist()
     )
 
@@ -850,7 +1101,18 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         )
         for module_name, wrapper in wrappers.items()
     }
-    all_components = [*prior_components, current_component]
+    normalized_current_component, current_direction_norm = _normalize_component_direction(
+        torch,
+        current_component,
+        target_names,
+    )
+    coefficient_values = (
+        *trained_coefficient_values[:-1],
+        trained_coefficient_values[-1] * current_direction_norm,
+    )
+    if any(not math.isfinite(value) for value in coefficient_values):
+        raise ValueError("SD-LoRA canonical magnitudes must be finite")
+    all_components = [*prior_components, normalized_current_component]
     merged = _compose_cumulative_weights(
         torch,
         all_components,
@@ -888,6 +1150,9 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
     if output_dir.exists() or output_dir.is_symlink():
         raise ValueError("SD-LoRA output adapter path already exists")
     peft_model.save_pretrained(output_dir, safe_serialization=True)
+    replay_data_path = output_dir / SD_LORA_REPLAY_DATA
+    _write_private_jsonl(replay_data_path, replay_buffer)
+    replay_data_size, replay_data_digest = _sha256_file(replay_data_path)
     state_tensors = {
         _state_key(task_index, module_name, matrix): tensor
         for task_index, component in enumerate(all_components)
@@ -924,7 +1189,12 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         ),
         state_weights_size_bytes=state_weights_size,
         state_weights_sha256=state_weights_digest,
+        replay_data_size_bytes=replay_data_size,
+        replay_data_sha256=replay_data_digest,
         training_record_count=request.training_record_count,
+        replay_training_record_count=len(replay_examples),
+        optimizer_training_record_count=len(optimizer_examples),
+        replay_buffer_record_count=len(replay_buffer),
         steps_completed=steps_completed,
         training_loss=training_loss,
         training_time_seconds=training_time_seconds,
@@ -946,7 +1216,11 @@ def _train(request: SdLoraTrainingRequest) -> SdLoraTrainingResult:
         adapter_path=request.output_adapter_path,
         state_manifest_path=f"{request.output_adapter_path}/{SD_LORA_STATE_MANIFEST}",
         state_weights_path=f"{request.output_adapter_path}/{SD_LORA_STATE_WEIGHTS}",
+        replay_data_path=f"{request.output_adapter_path}/{SD_LORA_REPLAY_DATA}",
         training_record_count=request.training_record_count,
+        replay_training_record_count=len(replay_examples),
+        optimizer_training_record_count=len(optimizer_examples),
+        replay_buffer_record_count=len(replay_buffer),
         steps_completed=steps_completed,
         training_loss=training_loss,
         training_time_seconds=training_time_seconds,
@@ -997,7 +1271,12 @@ if __name__ == "__main__":
 
 __all__ = [
     "_apply_resource_limits",
+    "_bounded_replay_buffer",
+    "_component_direction_frobenius_norm",
     "_compose_cumulative_weights",
+    "_initial_coefficient_values",
+    "_normalize_component_direction",
     "_install_parent_death_signal",
+    "_select_replay_examples",
     "main",
 ]

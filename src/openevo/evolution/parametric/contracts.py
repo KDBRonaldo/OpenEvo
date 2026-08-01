@@ -21,9 +21,10 @@ from openevo.evolution.framework.contracts import (
 
 SD_LORA_STATE_MANIFEST = "openevo_sd_lora_state.json"
 SD_LORA_STATE_WEIGHTS = "openevo_sd_lora_state.safetensors"
-SD_LORA_REQUEST_SCHEMA = "openevo.sd_lora_train_request.v1"
-SD_LORA_RESULT_SCHEMA = "openevo.sd_lora_train_result.v1"
-SD_LORA_STATE_SCHEMA = "openevo.sd_lora_state.v1"
+SD_LORA_REPLAY_DATA = "openevo_sd_lora_replay.jsonl"
+SD_LORA_REQUEST_SCHEMA = "openevo.sd_lora_train_request.v3"
+SD_LORA_RESULT_SCHEMA = "openevo.sd_lora_train_result.v3"
+SD_LORA_STATE_SCHEMA = "openevo.sd_lora_state.v4"
 MAX_SD_LORA_COMPONENTS = 64
 MAX_SD_LORA_EFFECTIVE_RANK = 4096
 MAX_SD_LORA_TARGET_MODULES = 128
@@ -105,11 +106,13 @@ class SdLoraMethodConfig(_Contract):
         "o_proj",
     )
     learning_rate: float = Field(default=2.0e-4, gt=0.0, le=1.0)
+    coefficient_learning_rate: float = Field(default=1.0e-2, gt=0.0, le=1.0)
     weight_decay: float = Field(default=0.0, ge=0.0, le=1.0)
     epochs: int = Field(default=1, ge=1, le=100)
     max_steps: int | None = Field(default=None, ge=1, le=1_000_000)
     max_length: int = Field(default=2048, ge=32, le=131_072)
     max_records: int = Field(default=256, ge=1, le=100_000)
+    replay_capacity: int = Field(default=64, ge=1, le=100_000)
     per_device_train_batch_size: int = Field(default=1, ge=1, le=128)
     gradient_accumulation_steps: int = Field(default=1, ge=1, le=4096)
     max_grad_norm: float = Field(default=1.0, gt=0.0, le=1_000.0)
@@ -129,6 +132,7 @@ class SdLoraMethodConfig(_Contract):
     def _finite_values(self) -> SdLoraMethodConfig:
         for label, value in (
             ("learning_rate", self.learning_rate),
+            ("coefficient_learning_rate", self.coefficient_learning_rate),
             ("weight_decay", self.weight_decay),
             ("max_grad_norm", self.max_grad_norm),
             ("coefficient_init", self.coefficient_init),
@@ -199,7 +203,11 @@ class SdLoraTrainingResult(_Contract):
     adapter_path: str
     state_manifest_path: str
     state_weights_path: str
+    replay_data_path: str
     training_record_count: int = Field(ge=1, le=100_000)
+    replay_training_record_count: int = Field(ge=0, le=100_000)
+    optimizer_training_record_count: int = Field(ge=1, le=200_000)
+    replay_buffer_record_count: int = Field(ge=1, le=100_000)
     steps_completed: int = Field(ge=1, le=1_000_000)
     training_loss: float
     training_time_seconds: float = Field(gt=0.0, le=86_400.0)
@@ -213,6 +221,7 @@ class SdLoraTrainingResult(_Contract):
     _request_id = field_validator("request_id")(_stable_id)
     _paths = field_validator(
         "adapter_path",
+        "replay_data_path",
         "state_manifest_path",
         "state_weights_path",
     )(validate_relative_path)
@@ -226,9 +235,12 @@ class SdLoraTrainingResult(_Contract):
             raise ValueError("SD-LoRA task index must identify the newest component")
         if len(self.coefficients) != self.component_count:
             raise ValueError("SD-LoRA result requires one coefficient per component")
-        if not math.isfinite(self.training_loss) or not math.isfinite(
-            self.training_time_seconds
+        if (
+            self.training_record_count + self.replay_training_record_count
+            != self.optimizer_training_record_count
         ):
+            raise ValueError("SD-LoRA optimizer record count does not match its inputs")
+        if not math.isfinite(self.training_loss) or not math.isfinite(self.training_time_seconds):
             raise ValueError("training loss and time must be finite")
         if any(not math.isfinite(value) for value in self.coefficients):
             raise ValueError("SD-LoRA coefficients must be finite")
@@ -259,8 +271,9 @@ class SdLoraStateComponent(_Contract):
 class SdLoraStateManifest(_Contract):
     schema_version: str = SD_LORA_STATE_SCHEMA
     algorithm_family: str = "SD-LoRA"
-    adaptation_scope: str = "causal_lm_continual_sft_v1"
+    adaptation_scope: str = "causal_lm_continual_sft_v4"
     paper_equivalent: bool = False
+    direction_parameterization: str = "frozen_global_unit_frobenius_direction"
     adapter_id: str
     base_model: str
     model_revision: str
@@ -272,7 +285,12 @@ class SdLoraStateManifest(_Contract):
     components: tuple[SdLoraStateComponent, ...]
     state_weights_size_bytes: int = Field(ge=1, le=16 * 1024 * 1024 * 1024)
     state_weights_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    replay_data_size_bytes: int = Field(ge=1, le=256 * 1024 * 1024)
+    replay_data_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     training_record_count: int = Field(ge=1, le=100_000)
+    replay_training_record_count: int = Field(ge=0, le=100_000)
+    optimizer_training_record_count: int = Field(ge=1, le=200_000)
+    replay_buffer_record_count: int = Field(ge=1, le=100_000)
     steps_completed: int = Field(ge=1, le=1_000_000)
     training_loss: float
     training_time_seconds: float = Field(gt=0.0, le=86_400.0)
@@ -282,6 +300,7 @@ class SdLoraStateManifest(_Contract):
     upstream_repository: str = "https://github.com/WuYichen-97/SD-Lora-CL"
     upstream_revision: str = "8bacded6eb44786db071f66fb90a87dd660d94ea"
     routing_mode: str = "single_cumulative_adapter"
+    retention_strategy: str = "bounded_trajectory_replay"
 
     _adapter = field_validator("adapter_id")(_stable_id)
     _model = field_validator("base_model")(_model_id)
@@ -305,9 +324,11 @@ class SdLoraStateManifest(_Contract):
         if (
             self.schema_version != SD_LORA_STATE_SCHEMA
             or self.algorithm_family != "SD-LoRA"
-            or self.adaptation_scope != "causal_lm_continual_sft_v1"
+            or self.adaptation_scope != "causal_lm_continual_sft_v4"
             or self.paper_equivalent is not False
+            or self.direction_parameterization != "frozen_global_unit_frobenius_direction"
             or self.routing_mode != "single_cumulative_adapter"
+            or self.retention_strategy != "bounded_trajectory_replay"
         ):
             raise ValueError("unsupported SD-LoRA state identity")
         if self.task_index + 1 != self.component_count:
@@ -325,9 +346,12 @@ class SdLoraStateManifest(_Contract):
             raise ValueError("SD-LoRA state modules must be non-empty and unique")
         if not self.source_dataset_artifact_ids:
             raise ValueError("SD-LoRA state requires source dataset lineage")
-        if not math.isfinite(self.training_loss) or not math.isfinite(
-            self.training_time_seconds
+        if (
+            self.training_record_count + self.replay_training_record_count
+            != self.optimizer_training_record_count
         ):
+            raise ValueError("SD-LoRA state optimizer record count does not match its inputs")
+        if not math.isfinite(self.training_loss) or not math.isfinite(self.training_time_seconds):
             raise ValueError("SD-LoRA state training loss and time must be finite")
         return self
 
@@ -357,6 +381,7 @@ __all__ = [
     "MAX_SD_LORA_EFFECTIVE_RANK",
     "SD_LORA_REQUEST_SCHEMA",
     "SD_LORA_RESULT_SCHEMA",
+    "SD_LORA_REPLAY_DATA",
     "SD_LORA_STATE_SCHEMA",
     "SD_LORA_STATE_MANIFEST",
     "SD_LORA_STATE_WEIGHTS",

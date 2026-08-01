@@ -15,6 +15,7 @@ or release claim.
 | Terminal Bench 2.1, GEPA per-task loop | `agent_system_gepa_reflector` | 10-task smoke | 9/9 already-passing tasks stayed passing; `filter-js-from-html` improved from 0 to 1 in generation 1 | `/tmp/tb21-gepa-loop-5task-20260624-060926/summary.json`, `/tmp/tb21-gepa-loop-remaining5-20260624-071032/summary.json` |
 | Terminal Bench 2.1, frozen baseline-failure conditional subset | OpenEvo declarative `text_memory_memevolve`, `gpt-5.5` subscription | 21 tasks, one attempt per condition | Baseline 2/21; MemEvolve 9/21; delta +7 tasks / +33.33 percentage points; no pass-to-fail transitions | `/tmp/tb21-memevolve-frozen21-gpt55-20260729-v1/corrected_paired_summary.json` |
 | Terminal Bench 2.1, continual-memory lifecycle smoke | base vs ordinary sequential LoRA vs `parametric_memory_sd_lora`, Qwen3-4B | 2-task stream, one attempt and one training step | All base and adapter rewards were 0; lifecycle completed, but no performance gain was observed | `/tmp/tb21-continual-memory-qwen3-4b-20260730-v1/report.json`; [experiment note](terminal-bench-continual-memory-eval.md) |
+| Terminal Bench 2.1, conditional continual-memory gain smoke | base vs corrected `parametric_memory_sd_lora`, Qwen3-4B | 2 selected tasks, one attempt per task/generation, 100/200 optimizer steps | Base `[0, 0]`; generation matrix `[[1, 0], [1, 1]]`; final average 1.000, BWT 0.000, forgetting 0.000 | `/tmp/tb21-sd-lora-normalized-two-task-20260801-v3/report.json`; [experiment note](terminal-bench-continual-memory-eval.md) |
 
 Key interpretation:
 
@@ -32,7 +33,9 @@ Key interpretation:
 - The MemEvolve result is conditional on a previously selected baseline-failure
   subset and is not an unbiased full-suite score. It is evidence for the
   OpenEvo declarative adaptation, not the upstream executable-provider method.
-- The SD-LoRA run proves two-generation training, artifact continuity, serving,
-  and task execution through Core. Its all-zero two-task reward matrix is
-  negative performance evidence; a larger repeated frozen stream is still
-  required.
+- The first SD-LoRA run proved two-generation lifecycle continuity but was
+  negative performance evidence. The corrected run then improved two selected
+  base failures while retaining the first learned task after generation 2. It
+  is positive functional evidence for the continual-learning path, but its
+  selected two-task, one-attempt protocol is not a statistically meaningful or
+  release-level Terminal Bench result.

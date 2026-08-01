@@ -542,7 +542,18 @@ agent settings 或 metadata 标记 subscription auth 时跳过 `parametric_memor
 内置 `parametric_memory_sd_lora` 是 self-deployed 模式下的实验性 continual-learning
 method。它从当前 task 的成功 trajectories 训练一个新 SD-LoRA component，并把至多一个
 上一代 SD-LoRA artifact 的 frozen components 一并折叠成单个 cumulative PEFT adapter。
-下一 session 因而只选择一个 adapter；Core 不维护 task router，也不按 task 猜测 adapter。
+下一 session 因而只选择一个 adapter；Core 不维护 task router、specialist bank，也不按 task
+猜测 adapter。
+
+语言 agent task 的目标分布比原论文的 vision class-incremental setting 更异质，因此该实现
+显式声明 `paper_equivalent=false` 和 `rehearsal_free=false`。Artifact 保留有界、按 task
+均衡的成功 trajectory replay buffer；下一代按确定性 1:1 current/replay 比例构造 optimizer
+数据。旧的全局单位 Frobenius directions 保持冻结，旧 magnitude 从上一代 state 恢复，新
+direction 与全部共享 magnitudes 联合更新；magnitude 使用独立的较高学习率，避免用标准 LoRA
+direction 学习率时基本不更新。每代结束时，新 `A/B` update 会在全部 target modules 组成的
+参数空间中规范化，并把原 norm 吸收到 magnitude。训练结束、导出和下一代加载因此严格保持
+同一个 effective model，同时实现论文 Eq. (4) 的 magnitude/direction 解耦。Replay 是单一累计 memory state 的 retention mechanism，不是 task router，
+也不会产生或选择多个独立 serving adapters。
 
 训练由 Daemon-owned fixed subprocess service 执行。Method config 只包含 closed、bounded
 hyperparameters，以及 exact `base_model`/`model_revision`；不接受 shell command、API
@@ -564,10 +575,12 @@ closed child environment 只透传该 GPU selection，不透传 provider/API cre
 Artifact 同时包含标准 PEFT adapter 和 SD-LoRA decomposition state。后一部分记录 exact
 base model revision、target modules、每代 rank、A/B tensors、learned coefficients 和完整
 tensor inventory；下一代训练会重新验证并冻结旧 components，只训练新 component 与共享
-coefficients。Artifact 还记录实际 training wall time 和 peak allocated GPU memory；这些指标与
-training loss 都不是 held-out reward。当前实现是 research/internal capability，尚不属于 External Beta release
-acceptance；完整 successor readiness、serving preparation 和 run-owner activation 仍遵循
-项目级 cross-session contract，不能由 method 自行绕过。
+coefficients。Artifact 还包含 digest-bound `openevo_sd_lora_replay.jsonl`，并记录 current、
+replay、optimizer 和 retained-buffer record counts、实际 training wall time 和 peak allocated
+GPU memory；这些指标与 training loss 都不是 held-out reward。当前实现是 research/internal
+capability，尚不属于 External Beta release acceptance；完整 successor readiness、serving
+preparation 和 run-owner activation 仍遵循项目级 cross-session contract，不能由 method
+自行绕过。
 
 
 Benchmark-specific task-local builders, local evaluation adapters, serving-time adapter

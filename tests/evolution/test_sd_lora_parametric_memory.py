@@ -35,6 +35,7 @@ from openevo.evolution.models import (
     WorkerHeartbeatRequest,
 )
 from openevo.evolution.parametric.contracts import (
+    SD_LORA_REPLAY_DATA,
     SD_LORA_STATE_MANIFEST,
     SD_LORA_STATE_WEIGHTS,
     SdLoraStateComponent,
@@ -315,14 +316,26 @@ class _FakeTrainer:
             [json.loads(line) for line in training_text.splitlines() if line]
         )
         prior_count = 0
+        prior_replay: list[dict[str, object]] = []
+        prior_coefficients: list[float] = []
         if request.prior_adapter_path is not None:
             prior_dir = work_dir / request.prior_adapter_path
             assert prior_dir.is_dir()
             assert (prior_dir / SD_LORA_STATE_WEIGHTS).read_bytes() == b"state-weights"
+            prior_replay = [
+                json.loads(line)
+                for line in (prior_dir / SD_LORA_REPLAY_DATA)
+                .read_text(encoding="utf-8")
+                .splitlines()
+                if line
+            ]
             prior_state = json.loads(
                 (prior_dir / SD_LORA_STATE_MANIFEST).read_text(encoding="utf-8")
             )
             prior_count = int(prior_state["component_count"])
+            prior_coefficients = [
+                float(component["coefficient"]) for component in prior_state["components"]
+            ]
 
         component_count = prior_count + 1
         output = work_dir / request.output_adapter_path
@@ -331,6 +344,13 @@ class _FakeTrainer:
         _private_write(output / "adapter_model.safetensors", b"adapter-weights")
         state_weights = b"state-weights"
         _private_write(output / SD_LORA_STATE_WEIGHTS, state_weights)
+        replay_records = [*prior_replay, *self.training_records[-1]]
+        replay_bytes = b"".join(
+            (canonical_json(record) + "\n").encode("utf-8") for record in replay_records
+        )
+        _private_write(output / SD_LORA_REPLAY_DATA, replay_bytes)
+        replay_training_record_count = request.training_record_count if prior_replay else 0
+        coefficients = (*prior_coefficients, 0.8)
         state = SdLoraStateManifest(
             adapter_id=request.adapter_id,
             base_model=request.config.base_model,
@@ -350,13 +370,20 @@ class _FakeTrainer:
                 SdLoraStateComponent(
                     task_index=index,
                     rank=request.config.rank,
-                    coefficient=0.8,
+                    coefficient=coefficients[index],
                 )
                 for index in range(component_count)
             ),
             state_weights_size_bytes=len(state_weights),
             state_weights_sha256=hashlib.sha256(state_weights).hexdigest(),
+            replay_data_size_bytes=len(replay_bytes),
+            replay_data_sha256=hashlib.sha256(replay_bytes).hexdigest(),
             training_record_count=request.training_record_count,
+            replay_training_record_count=replay_training_record_count,
+            optimizer_training_record_count=(
+                request.training_record_count + replay_training_record_count
+            ),
+            replay_buffer_record_count=len(replay_records),
             steps_completed=2,
             training_loss=0.25,
             training_time_seconds=1.5,
@@ -373,7 +400,13 @@ class _FakeTrainer:
             adapter_path=request.output_adapter_path,
             state_manifest_path=(f"{request.output_adapter_path}/{SD_LORA_STATE_MANIFEST}"),
             state_weights_path=(f"{request.output_adapter_path}/{SD_LORA_STATE_WEIGHTS}"),
+            replay_data_path=(f"{request.output_adapter_path}/{SD_LORA_REPLAY_DATA}"),
             training_record_count=request.training_record_count,
+            replay_training_record_count=replay_training_record_count,
+            optimizer_training_record_count=(
+                request.training_record_count + replay_training_record_count
+            ),
+            replay_buffer_record_count=len(replay_records),
             steps_completed=2,
             training_loss=0.25,
             training_time_seconds=1.5,
@@ -382,7 +415,7 @@ class _FakeTrainer:
             component_count=component_count,
             effective_rank=component_count * request.config.rank,
             target_module_names=("model.layers.0.self_attn.q_proj",),
-            coefficients=tuple(0.8 for _ in range(component_count)),
+            coefficients=coefficients,
         )
 
 
@@ -397,6 +430,20 @@ class _TamperedStateTrainer(_FakeTrainer):
         state_weights = Path(request.work_dir) / result.state_weights_path
         state_weights.write_bytes(state_weights.read_bytes() + b"tampered")
         state_weights.chmod(0o600)
+        return result
+
+
+class _TamperedReplayTrainer(_FakeTrainer):
+    def train_sd_lora(
+        self,
+        request: SdLoraTrainingRequest,
+        *,
+        cancellation=None,
+    ) -> SdLoraTrainingResult:
+        result = super().train_sd_lora(request, cancellation=cancellation)
+        replay_data = Path(request.work_dir) / result.replay_data_path
+        replay_data.write_bytes(replay_data.read_bytes() + b"{}\n")
+        replay_data.chmod(0o600)
         return result
 
 
@@ -474,6 +521,10 @@ def test_sd_lora_publishes_one_cumulative_adapter_across_generations(
     )[0]
 
     assert first.manifest["routing_mode"] == "single_cumulative_adapter"
+    assert first.manifest["retention_strategy"] == "bounded_trajectory_replay"
+    assert first.manifest["rehearsal_free"] is False
+    assert first.manifest["adaptation_scope"] == "causal_lm_continual_sft_v4"
+    assert first.manifest["direction_parameterization"] == "frozen_global_unit_frobenius_direction"
     assert first.manifest["component_count"] == 1
     assert first.manifest["paper_equivalent"] is False
     assert first.manifest["base_model"] == "Qwen/Qwen3-0.6B"
@@ -483,6 +534,9 @@ def test_sd_lora_publishes_one_cumulative_adapter_across_generations(
     assert first.scores["heldout_reward_delta"] == 0.1
     assert first.scores["quality"] == pytest.approx(0.8)
     assert trainer.requests[0].prior_adapter_path is None
+    assert first.manifest["replay_training_record_count"] == 0
+    assert first.manifest["optimizer_training_record_count"] == 1
+    assert first.manifest["replay_buffer_record_count"] == 1
 
     prior = WorkerClaimInputArtifact(
         artifact_id="parametric-memory-one",
@@ -511,6 +565,9 @@ def test_sd_lora_publishes_one_cumulative_adapter_across_generations(
     assert second.manifest["continual_task_index"] == 1
     assert second.manifest["effective_rank"] == 8
     assert second.manifest["routing_mode"] == "single_cumulative_adapter"
+    assert second.manifest["replay_training_record_count"] == 1
+    assert second.manifest["optimizer_training_record_count"] == 2
+    assert second.manifest["replay_buffer_record_count"] == 2
     assert second.lineage["prior_parametric_memory_artifact_id"] == prior.artifact_id
     assert Path(second.uri.removeprefix("file://")).is_dir()
     for training_request in trainer.requests:
@@ -558,6 +615,7 @@ def test_sd_lora_preserves_generic_tool_calls_from_codex_style_trajectories(
     request = trainer.requests[0]
     [record] = trainer.training_records[0]
     assert not (Path(request.work_dir) / request.training_data_path).exists()
+    assert record["target_message_start"] == 3
     assert record["messages"][1]["tool_calls"][0]["function"] == {
         "arguments": {"task_id": "task-tool"},
         "name": "read_task",
@@ -593,6 +651,7 @@ def test_sd_lora_accepts_plain_gateway_response_with_empty_tool_calls(
     )
 
     [record] = trainer.training_records[0]
+    assert record["target_message_start"] == 1
     assert record["messages"][-1] == {
         "content": "Run focused tests and inspect their output.",
         "role": "assistant",
@@ -610,6 +669,23 @@ def test_sd_lora_rejects_trainer_state_weight_tampering(tmp_path: Path) -> None:
                 artifact_root,
                 trainer,
                 _dataset(artifact_root, "tampered"),
+            )
+        )
+    request = trainer.requests[0]
+    assert not Path(request.work_dir).exists()
+
+
+def test_sd_lora_rejects_trainer_replay_tampering(tmp_path: Path) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
+
+    trainer = _TamperedReplayTrainer()
+    with pytest.raises(ValueError, match="replay data does not match"):
+        parametric_memory_sd_lora(
+            _context(
+                artifact_root,
+                trainer,
+                _dataset(artifact_root, "tampered-replay"),
             )
         )
     request = trainer.requests[0]
@@ -759,4 +835,5 @@ def test_sd_lora_crosses_plan_store_worker_and_artifact_publication(
     assert execution["method_id"] == "parametric_memory_sd_lora"
     output_dir = Path(artifact_row["uri"].removeprefix("file://"))
     assert (output_dir / "adapter_model.safetensors").is_file()
+    assert (output_dir / SD_LORA_REPLAY_DATA).is_file()
     assert (output_dir / SD_LORA_STATE_MANIFEST).is_file()

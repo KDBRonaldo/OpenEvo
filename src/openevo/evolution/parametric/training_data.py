@@ -25,6 +25,15 @@ _MAX_TEXT_BYTES = 4 * 1024 * 1024
 _MAX_TOOL_JSON_BYTES = 4 * 1024 * 1024
 _TOOL_NAME_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.:-]{0,255}")
 _MESSAGE_KEYS = frozenset({"content", "name", "role", "tool_call_id", "tool_calls"})
+_TRAINING_METADATA_TEXT_FIELDS = (
+    "dataset_artifact_id",
+    "dataset_name",
+    "event_id",
+    "session_id",
+    "status",
+    "task_id",
+)
+_TRAINING_METADATA_KEYS = frozenset({*_TRAINING_METADATA_TEXT_FIELDS, "reward", "trace_index"})
 
 
 def _text(value: Any, *, label: str, maximum_bytes: int, allow_empty: bool = False) -> str:
@@ -186,7 +195,8 @@ def normalize_chat_messages(value: Any, *, strict: bool = False) -> list[dict[st
                     raw_tool_calls,
                     strict=strict,
                 )
-        if not content and "tool_calls" not in item:
+        empty_tool_observation = role == "tool" and "tool_call_id" in item
+        if not content and "tool_calls" not in item and not empty_tool_observation:
             raise ValueError("chat message requires content or assistant tool_calls")
         if strict and item != message:
             raise ValueError("chat message is not in canonical training shape")
@@ -249,21 +259,65 @@ def normalize_tool_definitions(value: Any, *, strict: bool = False) -> list[dict
 def normalize_training_example(value: Any) -> dict[str, Any]:
     """Validate the exact JSONL shape consumed by the trusted trainer."""
 
-    if not isinstance(value, dict) or set(value).difference({"messages", "metadata", "tools"}):
+    if not isinstance(value, dict) or set(value).difference(
+        {"messages", "metadata", "target_message_start", "tools"}
+    ):
         raise ValueError("SD-LoRA training example has an open or invalid shape")
     messages = normalize_chat_messages(value.get("messages"), strict=True)
+    target_message_start = value.get("target_message_start", 0)
+    if (
+        not isinstance(target_message_start, int)
+        or isinstance(target_message_start, bool)
+        or target_message_start < 0
+        or target_message_start >= len(messages)
+    ):
+        raise ValueError("SD-LoRA target_message_start is outside the message sequence")
     if not any(
         message["role"] == "assistant"
         and (bool(message["content"]) or bool(message.get("tool_calls")))
-        for message in messages
+        for message in messages[target_message_start:]
     ):
         raise ValueError("SD-LoRA training example has no assistant target")
-    normalized: dict[str, Any] = {"messages": messages}
+    normalized: dict[str, Any] = {
+        "messages": messages,
+        "target_message_start": target_message_start,
+    }
     if value.get("tools") is not None:
         normalized["tools"] = normalize_tool_definitions(value["tools"], strict=True)
     metadata = value.get("metadata")
-    if metadata is not None and not isinstance(metadata, dict):
-        raise ValueError("SD-LoRA training metadata must be an object")
+    if metadata is not None:
+        if not isinstance(metadata, dict) or set(metadata).difference(_TRAINING_METADATA_KEYS):
+            raise ValueError("SD-LoRA training metadata has an open or invalid shape")
+        normalized_metadata: dict[str, Any] = {}
+        for key in _TRAINING_METADATA_TEXT_FIELDS:
+            item = metadata.get(key)
+            if item is not None:
+                normalized_metadata[key] = _identity(
+                    item,
+                    label=f"training metadata {key}",
+                    maximum_bytes=4096,
+                )
+        reward = metadata.get("reward")
+        if reward is not None:
+            if (
+                not isinstance(reward, (int, float))
+                or isinstance(reward, bool)
+                or not math.isfinite(float(reward))
+            ):
+                raise ValueError("SD-LoRA training metadata reward must be finite")
+            normalized_metadata["reward"] = reward
+        trace_index = metadata.get("trace_index")
+        if trace_index is not None:
+            if (
+                not isinstance(trace_index, int)
+                or isinstance(trace_index, bool)
+                or trace_index < 0
+                or trace_index > MAX_JAVASCRIPT_SAFE_INTEGER
+            ):
+                raise ValueError("SD-LoRA training metadata trace_index is invalid")
+            normalized_metadata["trace_index"] = trace_index
+        if normalized_metadata:
+            normalized["metadata"] = normalized_metadata
     return normalized
 
 
