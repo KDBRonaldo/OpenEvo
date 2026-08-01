@@ -5929,7 +5929,9 @@ def _owned_process_group_members(identity: ProcessIdentity) -> tuple[int, ...] |
             if candidate.stat().st_uid != os.getuid():
                 return None
             environment = (candidate / "environ").read_bytes().split(b"\0")
-        except OSError:
+        except OSError as exc:
+            if _process_group_candidate_no_longer_matches(candidate, identity, exc):
+                continue
             return None
         expected = f"{INTERNAL_OWNERSHIP_ENV}={identity.ownership_digest}".encode("ascii")
         if expected not in environment:
@@ -5938,6 +5940,33 @@ def _owned_process_group_members(identity: ProcessIdentity) -> tuple[int, ...] |
             return None
         members.append(pid)
     return tuple(sorted(members))
+
+
+def _process_group_candidate_no_longer_matches(
+    candidate: Path,
+    identity: ProcessIdentity,
+    error: OSError,
+) -> bool:
+    """Confirm that a /proc member vanished or left the owned group after enumeration."""
+
+    if error.errno not in {errno.ENOENT, errno.ESRCH}:
+        return False
+    try:
+        stat_text = (candidate / "stat").read_text(encoding="ascii")
+    except OSError as exc:
+        return exc.errno in {errno.ENOENT, errno.ESRCH}
+    try:
+        end = stat_text.rfind(")")
+        fields = stat_text[end + 2 :].split()
+        state = fields[0]
+        process_group_id = int(fields[2])
+        session_id = int(fields[3])
+    except (UnicodeDecodeError, ValueError, IndexError):
+        return False
+    return state == "Z" or (
+        process_group_id != identity.process_group_id
+        or session_id != identity.session_id
+    )
 
 
 def _require_private_directory(info: os.stat_result, uid: int, label: str) -> None:

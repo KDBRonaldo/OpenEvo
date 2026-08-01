@@ -4,6 +4,7 @@ import copy
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -3730,6 +3731,61 @@ def test_real_subprocess_backend_smoke_uses_pid_identity_and_bounded_stop() -> N
         backend.terminate(identity)
         assert backend.wait(identity, 1) is not None
         assert not backend.is_alive(identity)
+    finally:
+        if backend.is_alive(identity):
+            backend.kill(identity)
+            backend.wait(identity, 1)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="requires Linux /proc")
+def test_process_group_scan_ignores_member_that_exits_during_identity_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = RealSubprocessBackend()
+    output: list[bytes] = []
+    code = (
+        "import signal,subprocess,sys,time;"
+        "signal.signal(signal.SIGCHLD,signal.SIG_IGN);"
+        "child=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)']);"
+        "print(child.pid,flush=True);time.sleep(60)"
+    )
+    spec = ServiceProcessSpec(
+        service_id="member-exit-race",
+        display_name="Member exit race",
+        component=ServiceComponent.EVOLUTION_WORKER,
+        argv=(sys.executable, "-c", code),
+        env={"PATH": os.environ.get("PATH", "")},
+        argv_digest="1" * 64,
+        env_digest="2" * 64,
+        identity_digest="3" * 64,
+        port=None,
+        health_probe=ServiceHealthProbe.process(),
+    )
+    identity = backend.spawn(
+        spec,
+        lambda _identity, payload: output.append(payload),
+        lambda _identity, _returncode: None,
+    )
+    child_pid = _wait_for_probe_pid(output)
+    child_environ = Path("/proc") / str(child_pid) / "environ"
+    original_read_bytes = Path.read_bytes
+    injected = False
+
+    def remove_member_before_environment_read(path: Path) -> bytes:
+        nonlocal injected
+        if path == child_environ and not injected:
+            injected = True
+            os.kill(child_pid, signal.SIGKILL)
+            deadline = time.monotonic() + 1
+            while child_environ.parent.exists() and time.monotonic() < deadline:
+                time.sleep(0.001)
+            assert not child_environ.parent.exists()
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", remove_member_before_environment_read)
+    try:
+        assert backend.is_alive(identity) is True
+        assert injected is True
     finally:
         if backend.is_alive(identity):
             backend.kill(identity)
