@@ -21,8 +21,11 @@ from openevo.backend.service_supervisor import (
     CoreServiceSupervisor,
     HealthCheckResult,
     LocalManagedScienceRuntimeProbe,
+    LocalSelfDeployedRuntimeProbe,
     ManagedScienceRuntimeReadiness,
     ManagedScienceRuntimeRequest,
+    SelfDeployedRuntimeReadiness,
+    SelfDeployedRuntimeRequest,
     ProcessIdentity,
     ProbeCommandResult,
     RealSubprocessBackend,
@@ -45,6 +48,7 @@ from openevo.gateway.session_files import (
     SessionFileSecurityError,
 )
 from openevo.runtime.managed import MANAGED_CODEX_VERSION, MANAGED_RUNTIME_RELEASES
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 from openevo.runtime.docker_host import (
     DOCKER_EXECUTABLE_PATH,
     DockerHostPathSpec,
@@ -57,6 +61,11 @@ from tests.framework_testkit import verified_builtin_registry
 
 INSTALL_DIGEST = "a" * 64
 REGISTRY_DIGEST = "b" * 64
+
+
+def _argv_option(argv: tuple[str, ...], option: str) -> str:
+    index = argv.index(option)
+    return argv[index + 1]
 
 
 class FakeProcessBackend:
@@ -243,6 +252,64 @@ class FakeManagedScienceRuntimeProbe:
         )
 
 
+class FakeSelfDeployedRuntimeProbe:
+    def __init__(self, docker_host_path: DockerHostPathSpec) -> None:
+        self.docker_host_path = docker_host_path
+        self.requests: list[SelfDeployedRuntimeRequest] = []
+        self.removed_generations: list[str] = []
+
+    def verify(self, request, deadline, cancellation=None, progress=None):
+        assert time.monotonic() < deadline
+        assert cancellation is None or not cancellation.is_set()
+        self.requests.append(request)
+        if progress is not None:
+            progress("Verified release-owned model snapshot.")
+        profile = require_release_self_deployed_model_profile(request.profile_id)
+        container_path = (
+            Path(self.docker_host_path.runtime_container_root) / "models" / (profile.profile_id)
+        )
+        container_path.parent.mkdir(mode=0o700, exist_ok=True)
+        container_path.mkdir(mode=0o700, exist_ok=True)
+        return SelfDeployedRuntimeReadiness(
+            ready=True,
+            code=ServiceRunReadinessCode.READY,
+            identity_digest="9" * 64,
+            runtime_image_immutable_reference=(
+                MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
+            ),
+            profile=profile,
+            model_cache_container_path=container_path,
+            model_cache_daemon_path=self.docker_host_path.translate(container_path),
+            daemon_container_id="a" * 64,
+            gpu_device_id="GPU-12345678-1234-1234-1234-123456789abc",
+            message="Self-Deployed runtime bootstrap is verified.",
+            docker_host_path=self.docker_host_path,
+        )
+
+    def remove_managed_container(self, generation_digest, deadline):
+        assert time.monotonic() < deadline
+        self.removed_generations.append(generation_digest)
+        return True
+
+
+class BlockingSelfDeployedRuntimeProbe(FakeSelfDeployedRuntimeProbe):
+    def __init__(self, docker_host_path: DockerHostPathSpec) -> None:
+        super().__init__(docker_host_path)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def verify(self, request, deadline, cancellation=None, progress=None):
+        if progress is not None:
+            progress("Checking immutable Self-Deployed prerequisites.")
+            progress("Model download progress: 25% (32/128 bytes).")
+        self.entered.set()
+        while not self.release.wait(0.005):
+            assert time.monotonic() < deadline
+            if cancellation is not None and cancellation.is_set():
+                raise AssertionError("test preparation was unexpectedly cancelled")
+        return super().verify(request, deadline, cancellation, progress)
+
+
 class BlockingManagedScienceRuntimeProbe(FakeManagedScienceRuntimeProbe):
     def __init__(self) -> None:
         super().__init__()
@@ -277,7 +344,7 @@ class FakeProbeCommandRunner:
         self.environments: list[dict[str, str]] = []
 
     def hold_executable(self, name: str):
-        assert name == "codex"
+        assert name in {"codex", "nvidia-smi"}
         runner = self
 
         class FakeExecutable:
@@ -285,7 +352,7 @@ class FakeProbeCommandRunner:
 
             def run(self, argv, deadline, cancellation=None, *, env=None):
                 return runner.run(
-                    ("codex", *argv),
+                    (name, *argv),
                     deadline,
                     cancellation,
                     env=env,
@@ -320,6 +387,15 @@ class FakeProbeCommandRunner:
             )
         if argv == ("codex", "login", "status"):
             return ProbeCommandResult(0, b"", b"Logged in using ChatGPT\n")
+        if argv[0] == "nvidia-smi":
+            return ProbeCommandResult(
+                0,
+                (
+                    "0, GPU-12345678-1234-1234-1234-123456789abc, "
+                    "NVIDIA A800, 16384, 40960, 570.00\n"
+                ).encode("ascii"),
+                b"",
+            )
         if argv == (DOCKER_EXECUTABLE_PATH, "--version"):
             return ProbeCommandResult(0, b"Docker version 27.0.1\n", b"")
         payload = [
@@ -377,6 +453,7 @@ def _supervisor(
     max_log_entries: int = 100,
     max_log_bytes: int = 32_768,
     runtime_probe: FakeManagedScienceRuntimeProbe | None = None,
+    self_deployed_runtime_probe: FakeSelfDeployedRuntimeProbe | None = None,
     max_restart_operations: int = 256,
     run_admission_url: str | None = ("http://127.0.0.1:19000/internal/v1/run-admissions/verify"),
 ) -> tuple[
@@ -389,6 +466,21 @@ def _supervisor(
     health = health or FakeHealthChecker()
     runtime_probe = runtime_probe or FakeManagedScienceRuntimeProbe()
     runtime_probe.configure_auth_path(tmp_path / "codex-home" / ".codex" / "auth.json")
+    if self_deployed_runtime_probe is None:
+        mount = tmp_path / "docker-data"
+        mount.mkdir(mode=0o700, exist_ok=True)
+        container_id = "a" * 64
+        docker_host_path = discover_docker_host_path(
+            _docker_host_evidence(
+                mount,
+                hostname=container_id[:12],
+                container_id=container_id,
+            ),
+            namespace="test-self-deployed",
+            hostname=container_id[:12],
+            minimum_available_bytes=0,
+        )
+        self_deployed_runtime_probe = FakeSelfDeployedRuntimeProbe(docker_host_path)
     supervisor = CoreServiceSupervisor(
         launch_mode=ServiceLaunchMode.DEVELOPMENT_TEST,
         service_root=tmp_path / "core-services",
@@ -401,6 +493,7 @@ def _supervisor(
         health_checker=health,
         port_probe=ports or FakePortProbe(),
         managed_runtime_probe=runtime_probe,
+        self_deployed_runtime_probe=self_deployed_runtime_probe,
         run_admission_url=run_admission_url,
         startup_timeout=startup_timeout,
         stop_timeout=stop_timeout,
@@ -1364,8 +1457,9 @@ def test_release_mode_requires_verified_registry_and_reverifies_each_ensure(
     )
     try:
         snapshot = supervisor.ensure(
-            ServiceExecutionMode.SELF_DEPLOYED,
-            model_ref="Qwen/release-probe",
+            ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+            codex_model="gpt-5.5",
+            runtime_image="openevo/science-runtime:0.1.1",
         )
         assert snapshot.services_available is False
         assert calls == 2
@@ -1378,8 +1472,9 @@ def test_release_mode_requires_verified_registry_and_reverifies_each_ensure(
         monkeypatch.setattr(loading, "_reverify_distribution_inventory", reject_inventory)
         with pytest.raises(SupervisorStateError, match="could not be revalidated"):
             supervisor.ensure(
-                ServiceExecutionMode.SELF_DEPLOYED,
-                model_ref="Qwen/release-probe",
+                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                codex_model="gpt-5.5",
+                runtime_image="openevo/science-runtime:0.1.1",
             )
     finally:
         supervisor.close()
@@ -1734,7 +1829,7 @@ def test_log_budget_is_global_across_all_services(
         supervisor.close()
 
 
-def test_self_deployed_is_typed_unavailable_and_never_claims_model_ready(
+def test_self_deployed_starts_verified_inference_and_core_service_group(
     tmp_path: Path,
     framework_lock: Path,
 ) -> None:
@@ -1742,20 +1837,203 @@ def test_self_deployed_is_typed_unavailable_and_never_claims_model_ready(
     try:
         snapshot = supervisor.ensure(
             ServiceExecutionMode.SELF_DEPLOYED,
-            model_ref="Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            model_ref="qwen3-0.6b-v1",
+            runtime_image="openevo/science-runtime:0.1.1",
         )
-        assert snapshot.services_available is False
-        assert snapshot.run_ready is False
-        assert backend.spawned == []
+        assert snapshot.services_available is True
+        assert snapshot.run_ready is True
+        assert [spec.service_id for spec in backend.spawned] == [
+            "inference",
+            "evolution-backend",
+            "rollout",
+            "gateway",
+            "evolution-worker",
+        ]
+        inference_argv = backend.spawned[0].argv
+        assert _argv_option(inference_argv, "--platform") == "linux/amd64"
+        assert "--read-only" in inference_argv
+        assert _argv_option(inference_argv, "--cap-drop") == "ALL"
+        assert _argv_option(inference_argv, "--security-opt") == ("no-new-privileges=true")
+        assert _argv_option(inference_argv, "--pids-limit") == "4096"
+        assert _argv_option(inference_argv, "--shm-size") == "4294967296"
+        assert "--init" in inference_argv
+        assert "--pid" not in inference_argv
+        assert "--ipc" not in inference_argv
+        assert "HF_HOME=/tmp/huggingface" in inference_argv
+        assert "XDG_CACHE_HOME=/tmp/cache" in inference_argv
+        assert "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor" in inference_argv
         inference = snapshot.service("inference")
-        assert inference.status is ServiceStatus.UNAVAILABLE
+        assert inference.status is ServiceStatus.RUNNING
         assert inference.model_preparation is not None
-        assert inference.model_preparation.status == "unresolved"
-        assert inference.model_preparation.next_interface == "model_preparer_v1"
+        assert inference.model_preparation.status == "ready"
+        assert inference.model_preparation.model_ref == "Qwen/Qwen3-0.6B"
+        binding = supervisor.run_binding()
+        assert binding.execution_mode is ServiceExecutionMode.SELF_DEPLOYED
+        assert binding.codex_model == "Qwen/Qwen3-0.6B"
         contract = inference.to_contract()
         assert isinstance(contract, ServiceSummaryV1)
-        assert contract.status.value == "unavailable"
-        assert contract.model_preparation.status.value == "unresolved"
+        assert contract.status.value == "running"
+        assert contract.model_preparation.status.value == "ready"
+    finally:
+        supervisor.close()
+
+
+def test_self_deployed_preparation_is_observable_without_waiting_for_probe(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    mount = tmp_path / "docker-preparation-data"
+    mount.mkdir(mode=0o700)
+    container_id = "a" * 64
+    docker_host_path = discover_docker_host_path(
+        _docker_host_evidence(
+            mount,
+            hostname=container_id[:12],
+            container_id=container_id,
+        ),
+        namespace="test-self-deployed-preparation",
+        hostname=container_id[:12],
+        minimum_available_bytes=0,
+    )
+    probe = BlockingSelfDeployedRuntimeProbe(docker_host_path)
+    supervisor, _, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        self_deployed_runtime_probe=probe,
+    )
+    result: list[object] = []
+    failure: list[BaseException] = []
+
+    def ensure() -> None:
+        try:
+            result.append(
+                supervisor.ensure(
+                    ServiceExecutionMode.SELF_DEPLOYED,
+                    model_ref="qwen3-0.6b-v1",
+                    runtime_image="openevo/science-runtime:0.1.1",
+                )
+            )
+        except BaseException as exc:
+            failure.append(exc)
+
+    thread = threading.Thread(target=ensure)
+    thread.start()
+    try:
+        assert probe.entered.wait(1)
+        started = time.monotonic()
+        services = supervisor.list()
+        logs = supervisor.logs("inference")
+        assert time.monotonic() - started < 0.25
+        assert len(services) == 1
+        assert services[0].id == "inference"
+        assert services[0].status is ServiceStatus.STARTING
+        assert services[0].restartable is False
+        assert services[0].model_preparation is not None
+        assert services[0].model_preparation.status == "downloading"
+        assert [entry.message for entry in logs] == [
+            "Checking immutable Self-Deployed prerequisites.",
+            "Model download progress: 25% (32/128 bytes).",
+        ]
+    finally:
+        probe.release.set()
+        thread.join(timeout=2)
+        if not thread.is_alive():
+            supervisor.close()
+    assert not thread.is_alive()
+    assert not failure
+    assert len(result) == 1
+
+
+def test_restart_once_preserves_the_active_self_deployed_release_profile(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    mount = tmp_path / "docker-restart-data"
+    mount.mkdir(mode=0o700)
+    container_id = "a" * 64
+    docker_host_path = discover_docker_host_path(
+        _docker_host_evidence(
+            mount,
+            hostname=container_id[:12],
+            container_id=container_id,
+        ),
+        namespace="test-self-deployed-restart",
+        hostname=container_id[:12],
+        minimum_available_bytes=0,
+    )
+    probe = FakeSelfDeployedRuntimeProbe(docker_host_path)
+    supervisor, backend, _, subscription_probe = _supervisor(
+        tmp_path,
+        framework_lock,
+        self_deployed_runtime_probe=probe,
+    )
+    try:
+        supervisor.ensure(
+            ServiceExecutionMode.SELF_DEPLOYED,
+            model_ref="qwen3-0.6b-v1",
+            runtime_image="openevo/science-runtime:0.1.1",
+        )
+        expected = supervisor.get("gateway")
+        restarted = supervisor.restart_once(
+            "gateway",
+            operation_id="restart-self-deployed",
+            expected_service_etag=expected.etag,
+        )
+        assert restarted.status is ServiceStatus.RUNNING
+        assert len(probe.requests) == 2
+        assert subscription_probe.requests == []
+        assert [spec.service_id for spec in backend.spawned[-5:]] == [
+            "inference",
+            "evolution-backend",
+            "rollout",
+            "gateway",
+            "evolution-worker",
+        ]
+        assert supervisor.run_binding().execution_mode is ServiceExecutionMode.SELF_DEPLOYED
+    finally:
+        supervisor.close()
+
+
+def test_self_deployed_run_binding_reuses_the_live_reserved_gpu_generation(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    mount = tmp_path / "docker-live-generation-data"
+    mount.mkdir(mode=0o700)
+    container_id = "a" * 64
+    docker_host_path = discover_docker_host_path(
+        _docker_host_evidence(
+            mount,
+            hostname=container_id[:12],
+            container_id=container_id,
+        ),
+        namespace="test-self-deployed-live-generation",
+        hostname=container_id[:12],
+        minimum_available_bytes=0,
+    )
+    probe = FakeSelfDeployedRuntimeProbe(docker_host_path)
+    supervisor, backend, _, _ = _supervisor(
+        tmp_path,
+        framework_lock,
+        self_deployed_runtime_probe=probe,
+    )
+    try:
+        first = supervisor.ensure(
+            ServiceExecutionMode.SELF_DEPLOYED,
+            model_ref="qwen3-0.6b-v1",
+            runtime_image="openevo/science-runtime:0.1.1",
+        )
+        snapshot, lease = supervisor.ensure_run_binding(
+            ServiceExecutionMode.SELF_DEPLOYED,
+            model_ref="qwen3-0.6b-v1",
+            runtime_image="openevo/science-runtime:0.1.1",
+        )
+        assert lease is not None
+        assert snapshot.generation_digest == first.generation_digest
+        assert len(probe.requests) == 1
+        assert len(backend.spawned) == 5
+        assert probe.removed_generations == []
+        lease.close()
     finally:
         supervisor.close()
 
@@ -2266,6 +2544,184 @@ def test_release_probe_fails_closed_without_docker_user_container_mapping(
     assert readiness.docker_host_path is None
     assert readiness.credential_authority is None
     assert runner.calls[-1] == self_inspect
+
+
+def test_self_deployed_probe_proves_container_toolkit_before_vllm_or_model_prepare(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "self-deployed-data"
+    data_root.mkdir(mode=0o700)
+    hostname = "7" * 12
+    container_id = hostname + ("8" * 52)
+    self_inspect = docker_self_inspect_argv(hostname)
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    gpu_uuid = "GPU-12345678-1234-1234-1234-123456789abc"
+    toolkit_argv = (
+        DOCKER_EXECUTABLE_PATH,
+        "run",
+        "--rm",
+        "--platform",
+        "linux/amd64",
+        "--network",
+        "none",
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges=true",
+        "--pids-limit",
+        "64",
+        "--gpus",
+        f"device={gpu_uuid}",
+        "--user",
+        f"{os.geteuid()}:{os.getegid()}",
+        "--entrypoint",
+        "nvidia-smi",
+        MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+        "--query-gpu=uuid",
+        "--format=csv,noheader",
+    )
+    vllm_inspect_argv = (
+        DOCKER_EXECUTABLE_PATH,
+        "image",
+        "inspect",
+        profile.vllm_image,
+    )
+
+    class SelfDeployedRunner(FakeProbeCommandRunner):
+        def run(self, argv, deadline, cancellation=None, *, env=None, pass_fds=()):
+            if argv == toolkit_argv:
+                self.calls.append(argv)
+                self.environments.append(dict(env or {}))
+                return ProbeCommandResult(0, f"{gpu_uuid}\n".encode("ascii"), b"")
+            if argv == vllm_inspect_argv:
+                self.calls.append(argv)
+                self.environments.append(dict(env or {}))
+                return ProbeCommandResult(
+                    0,
+                    json.dumps(
+                        [
+                            {
+                                "Id": profile.vllm_image_config_digest,
+                                "RepoDigests": [profile.vllm_image],
+                                "Architecture": "amd64",
+                                "Os": "linux",
+                            }
+                        ]
+                    ).encode("utf-8"),
+                    b"",
+                )
+            return super().run(
+                argv,
+                deadline,
+                cancellation,
+                env=env,
+                pass_fds=pass_fds,
+            )
+
+    class DockerAuthority:
+        identity_digest = "d" * 64
+
+        def argv(self, *arguments: str) -> tuple[str, ...]:
+            return (DOCKER_EXECUTABLE_PATH, *arguments)
+
+        def environment(self) -> dict[str, str]:
+            return docker_cli_environment()
+
+        def verify(self) -> None:
+            return None
+
+    runner = SelfDeployedRunner(
+        results={
+            self_inspect: ProbeCommandResult(
+                0,
+                _docker_host_evidence(
+                    data_root,
+                    hostname=hostname,
+                    container_id=container_id,
+                ),
+                b"",
+            )
+        }
+    )
+    prepared: list[Path] = []
+
+    def prepare(*, cache_root, **_kwargs):
+        path = cache_root / "verified-model"
+        path.mkdir(mode=0o700)
+        prepared.append(path)
+        return path
+
+    monkeypatch.setattr(
+        supervisor_module.DockerEngineAuthority,
+        "open",
+        staticmethod(lambda: DockerAuthority()),
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.os.statvfs",
+        lambda _path: type(
+            "StatVfs",
+            (),
+            {"f_bavail": 64 * 1024**3, "f_frsize": 1},
+        )(),
+    )
+    monkeypatch.setattr(supervisor_module, "_linux_system_memory_bytes", lambda: 64 * 1024**3)
+    monkeypatch.setattr(supervisor_module, "prepare_release_model_snapshot", prepare)
+
+    readiness = LocalSelfDeployedRuntimeProbe(
+        command_runner=runner,
+        runtime_namespace="core-release",
+        require_docker_user_container=True,
+    ).verify(
+        SelfDeployedRuntimeRequest(
+            profile_id=profile.profile_id,
+            runtime_image="openevo/science-runtime:0.1.1",
+        ),
+        time.monotonic() + 5,
+    )
+
+    assert readiness.ready is True, runner.calls
+    assert readiness.gpu_device_id == gpu_uuid
+    assert prepared
+    host_gpu_argv = next(call for call in runner.calls if call[0] == "nvidia-smi")
+    assert (
+        runner.calls.index(host_gpu_argv)
+        < runner.calls.index(toolkit_argv)
+        < runner.calls.index(vllm_inspect_argv)
+    )
+
+
+@pytest.mark.parametrize(
+    ("architecture", "operating_system"),
+    (("arm64", "linux"), ("amd64", "windows")),
+)
+def test_vllm_image_inspect_rejects_wrong_release_platform(
+    architecture: str,
+    operating_system: str,
+) -> None:
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    result = ProbeCommandResult(
+        0,
+        json.dumps(
+            [
+                {
+                    "Id": profile.vllm_image_config_digest,
+                    "RepoDigests": [profile.vllm_image],
+                    "Architecture": architecture,
+                    "Os": operating_system,
+                }
+            ]
+        ).encode("utf-8"),
+        b"",
+    )
+
+    with pytest.raises(ValueError, match="platform"):
+        supervisor_module._verified_vllm_image_inspect(result, profile)
 
 
 def test_release_probe_returns_typed_failure_for_invalid_local_engine_socket(
@@ -2852,19 +3308,13 @@ def test_local_managed_runtime_probe_rejects_missing_auth_evidence(tmp_path: Pat
 
 def test_probe_executable_size_bound_accepts_current_codex_binary_scale() -> None:
     def executable_stat(size: int) -> os.stat_result:
-        return os.stat_result(
-            (0o100755, 2, 1, 1, os.geteuid(), os.getegid(), size, 0, 0, 0)
-        )
+        return os.stat_result((0o100755, 2, 1, 1, os.geteuid(), os.getegid(), size, 0, 0, 0))
 
-    identity = supervisor_module._probe_executable_identity(
-        executable_stat(300 * 1024 * 1024)
-    )
+    identity = supervisor_module._probe_executable_identity(executable_stat(300 * 1024 * 1024))
 
     assert identity[5] == 300 * 1024 * 1024
     with pytest.raises(OSError, match="identity is invalid"):
-        supervisor_module._probe_executable_identity(
-            executable_stat((512 * 1024 * 1024) + 1)
-        )
+        supervisor_module._probe_executable_identity(executable_stat((512 * 1024 * 1024) + 1))
 
 
 def test_real_probe_command_is_cancelled_and_reaped_within_bound() -> None:
@@ -3074,11 +3524,14 @@ def test_restart_once_completed_receipt_replays_across_restart_until_acknowledge
     try:
         assert expected is not None
         assert completed is not None
-        assert replay.restart_once(
-            "gateway",
-            operation_id="durable-completed",
-            expected_service_etag=expected.etag,
-        ) == completed
+        assert (
+            replay.restart_once(
+                "gateway",
+                operation_id="durable-completed",
+                expected_service_etag=expected.etag,
+            )
+            == completed
+        )
         assert replay_backend.spawned == []
         with pytest.raises(SupervisorStateError, match="different request"):
             replay.restart_once(
@@ -3226,8 +3679,7 @@ def test_restart_once_ack_publication_failure_resyncs_deleted_receipt(
             ledger = json.loads(payload)
             attempts = ledger.get("restart_attempts", [])
             if not injected and not any(
-                item.get("operation_id") == "durable-published-ack"
-                for item in attempts
+                item.get("operation_id") == "durable-published-ack" for item in attempts
             ):
                 injected = True
                 raise OSError("post-publication fsync observation failure")

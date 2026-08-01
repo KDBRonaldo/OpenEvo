@@ -75,7 +75,16 @@ from openevo.runtime.managed import (
     require_immutable_managed_runtime_image,
     verified_managed_runtime_image_reference,
 )
+from openevo.runtime.self_deployed import (
+    SelfDeployedModelProfile,
+    require_release_self_deployed_model_profile,
+)
+from openevo.runtime.self_deployed_cache import (
+    SelfDeployedModelCacheError,
+    prepare_release_model_snapshot,
+)
 from openevo.runtime.docker_host import (
+    DOCKER_EXECUTABLE_PATH,
     DockerEngineAuthority,
     DockerExecutableAuthority,
     DockerHostPathError,
@@ -261,6 +270,7 @@ class ServiceHealthProbe:
     expected_service_id: str | None = None
     required_worker_id: str | None = None
     expected_gateway_url: str | None = None
+    expected_model_id: str | None = None
 
     @classmethod
     def process(cls) -> ServiceHealthProbe:
@@ -274,6 +284,7 @@ class ServiceHealthProbe:
         expected_service_id: str,
         required_worker_id: str | None = None,
         expected_gateway_url: str | None = None,
+        expected_model_id: str | None = None,
     ) -> ServiceHealthProbe:
         if not url.startswith("http://127.0.0.1:"):
             raise ValueError("service health URLs must use loopback HTTP")
@@ -283,6 +294,7 @@ class ServiceHealthProbe:
             expected_service_id=expected_service_id,
             required_worker_id=required_worker_id,
             expected_gateway_url=expected_gateway_url,
+            expected_model_id=expected_model_id,
         )
 
 
@@ -388,6 +400,79 @@ class ManagedScienceRuntimeReadiness:
 
 
 @dataclass(frozen=True, slots=True)
+class SelfDeployedRuntimeRequest:
+    """Closed release profile selected for one managed local inference group."""
+
+    profile_id: str
+    runtime_image: str
+
+    def __post_init__(self) -> None:
+        require_release_self_deployed_model_profile(self.profile_id)
+        if self.runtime_image not in set(MANAGED_RUNTIME_IMAGES.values()):
+            raise ValueError("Self-Deployed runtime_image is not a managed Science image")
+
+
+@dataclass(frozen=True, slots=True)
+class SelfDeployedRuntimeReadiness:
+    """Verified, non-secret host/model/serving inputs for Self-Deployed startup."""
+
+    ready: bool
+    code: ServiceRunReadinessCode
+    identity_digest: str | None
+    runtime_image_immutable_reference: str | None
+    profile: SelfDeployedModelProfile | None
+    model_cache_container_path: Path | None
+    model_cache_daemon_path: Path | None
+    daemon_container_id: str | None
+    gpu_device_id: str | None
+    message: str
+    docker_host_path: DockerHostPathSpec | None = None
+
+    def __post_init__(self) -> None:
+        if self.ready != (self.code is ServiceRunReadinessCode.READY):
+            raise ValueError("Self-Deployed readiness code does not match ready state")
+        evidence = (
+            self.identity_digest,
+            self.runtime_image_immutable_reference,
+            self.profile,
+            self.model_cache_container_path,
+            self.model_cache_daemon_path,
+            self.daemon_container_id,
+            self.gpu_device_id,
+            self.docker_host_path,
+        )
+        if self.ready != all(value is not None for value in evidence):
+            raise ValueError("ready Self-Deployed evidence is incomplete")
+        if self.identity_digest is not None:
+            _require_digest(self.identity_digest, "Self-Deployed runtime identity_digest")
+        if self.runtime_image_immutable_reference is not None:
+            require_immutable_managed_runtime_image(
+                profile="managed_science",
+                image=self.runtime_image_immutable_reference,
+            )
+        if self.profile is not None:
+            self.profile.__post_init__()
+        if self.docker_host_path is not None:
+            if self.model_cache_container_path is None or self.model_cache_daemon_path is None:
+                raise ValueError("Self-Deployed model cache mapping is incomplete")
+            translated = self.docker_host_path.translate(self.model_cache_container_path)
+            if translated != self.model_cache_daemon_path:
+                raise ValueError("Self-Deployed model cache mapping is inconsistent")
+        if (
+            self.daemon_container_id is not None
+            and re.fullmatch(r"[0-9a-f]{64}", self.daemon_container_id) is None
+        ):
+            raise ValueError("Self-Deployed Daemon container identity is invalid")
+        if (
+            self.gpu_device_id is not None
+            and re.fullmatch(r"GPU-[0-9A-Fa-f-]{16,64}", self.gpu_device_id) is None
+        ):
+            raise ValueError("Self-Deployed GPU identity is invalid")
+        if not self.message.strip() or len(self.message) > 256:
+            raise ValueError("Self-Deployed runtime readiness message is invalid")
+
+
+@dataclass(frozen=True, slots=True)
 class ProbeCommandResult:
     returncode: int
     stdout: bytes
@@ -431,6 +516,18 @@ class ManagedScienceRuntimeProbe(Protocol):
         deadline: float,
         cancellation: threading.Event | None = None,
     ) -> ManagedScienceRuntimeReadiness: ...
+
+
+class SelfDeployedRuntimeProbe(Protocol):
+    def verify(
+        self,
+        request: SelfDeployedRuntimeRequest,
+        deadline: float,
+        cancellation: threading.Event | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> SelfDeployedRuntimeReadiness: ...
+
+    def remove_managed_container(self, generation_digest: str, deadline: float) -> bool: ...
 
 
 class ProcessBackend(Protocol):
@@ -1059,6 +1156,532 @@ class LocalManagedScienceRuntimeProbe:
                 authority.close()
 
 
+class LocalSelfDeployedRuntimeProbe:
+    """Prepare and verify the one release-owned Self-Deployed profile."""
+
+    def __init__(
+        self,
+        *,
+        command_runner: ProbeCommandRunner | None = None,
+        runtime_namespace: str | None = None,
+        require_docker_user_container: bool = False,
+    ) -> None:
+        self._command_runner = command_runner or BoundedProbeCommandRunner()
+        self._runtime_namespace = runtime_namespace
+        self._require_docker_user_container = require_docker_user_container
+
+    def verify(
+        self,
+        request: SelfDeployedRuntimeRequest,
+        deadline: float,
+        cancellation: threading.Event | None = None,
+        progress: Callable[[str], None] | None = None,
+    ) -> SelfDeployedRuntimeReadiness:
+        profile = require_release_self_deployed_model_profile(request.profile_id)
+        _progress(progress, "Checking Docker Engine and managed Science runtime image.")
+        try:
+            docker_engine = DockerEngineAuthority.open()
+            runtime = self._run_docker(
+                docker_engine,
+                ("--version",),
+                deadline,
+                cancellation,
+            )
+        except Exception:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+                "The Docker Engine required for Self-Deployed execution is unavailable.",
+            )
+        if runtime.returncode != 0:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.RUNTIME_EXECUTABLE_UNAVAILABLE,
+                "The Docker Engine required for Self-Deployed execution is unavailable.",
+            )
+        try:
+            managed_image = self._run_docker(
+                docker_engine,
+                ("image", "inspect", request.runtime_image),
+                deadline,
+                cancellation,
+            )
+            immutable_runtime_image, managed_image_id = _verified_managed_image_inspect(
+                managed_image,
+                request.runtime_image,
+            )
+        except Exception:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+                "The managed Science runtime image is not prepared.",
+            )
+
+        if self._runtime_namespace is None:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                "The Docker user-container data-root mapping is unavailable.",
+            )
+        try:
+            self_inspect = docker_self_inspect_argv()
+            host_result = self._run_docker(
+                docker_engine,
+                self_inspect[1:],
+                deadline,
+                cancellation,
+            )
+            if host_result.returncode != 0:
+                raise DockerHostPathError("Docker could not inspect the Daemon container")
+            docker_host_path = discover_docker_host_path(
+                host_result.stdout,
+                namespace=self._runtime_namespace,
+                minimum_available_bytes=profile.minimum_free_disk_bytes,
+            )
+        except Exception:
+            if self._require_docker_user_container:
+                return _self_deployed_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                    "No verified Docker bind root has enough free space for this model profile.",
+                )
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                "The Docker data-root mapping is unavailable.",
+            )
+
+        _progress(progress, "Checking NVIDIA GPU capacity for managed inference.")
+        gpu_authority: ProbeExecutableAuthority | None = None
+        try:
+            gpu_authority = self._command_runner.hold_executable("nvidia-smi")
+            gpu_result = gpu_authority.run(
+                (
+                    "--query-gpu=index,uuid,name,memory.free,memory.total,driver_version",
+                    "--format=csv,noheader,nounits",
+                ),
+                deadline,
+                cancellation,
+            )
+            gpu_device_id, gpu_inventory_digest = _select_self_deployed_gpu(
+                gpu_result,
+                minimum_free_vram_bytes=profile.minimum_free_vram_bytes,
+            )
+        except Exception:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
+                "No NVIDIA GPU currently satisfies the release model profile.",
+            )
+        finally:
+            if gpu_authority is not None:
+                gpu_authority.close()
+        try:
+            system_memory_bytes = _linux_system_memory_bytes()
+            if system_memory_bytes < profile.minimum_system_memory_bytes:
+                raise ValueError("system memory is below the profile floor")
+        except Exception:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
+                "System memory is below the release model profile requirement.",
+            )
+
+        _progress(progress, "Checking NVIDIA Container Toolkit GPU injection.")
+        try:
+            toolkit = self._run_docker(
+                docker_engine,
+                (
+                    "run",
+                    "--rm",
+                    "--platform",
+                    "linux/amd64",
+                    "--network",
+                    "none",
+                    "--read-only",
+                    "--cap-drop",
+                    "ALL",
+                    "--security-opt",
+                    "no-new-privileges=true",
+                    "--pids-limit",
+                    "64",
+                    "--gpus",
+                    f"device={gpu_device_id}",
+                    "--user",
+                    f"{os.geteuid()}:{os.getegid()}",
+                    "--entrypoint",
+                    "nvidia-smi",
+                    immutable_runtime_image,
+                    "--query-gpu=uuid",
+                    "--format=csv,noheader",
+                ),
+                deadline,
+                cancellation,
+            )
+            _verify_nvidia_toolkit_probe(toolkit, gpu_device_id)
+        except Exception:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
+                "NVIDIA Container Toolkit could not inject the selected GPU.",
+            )
+
+        _progress(progress, "Checking the immutable vLLM serving image.")
+        try:
+            vllm_inspect = self._run_docker(
+                docker_engine,
+                ("image", "inspect", profile.vllm_image),
+                deadline,
+                cancellation,
+            )
+            if vllm_inspect.returncode != 0:
+                _progress(
+                    progress,
+                    f"Pulling immutable vLLM {profile.vllm_version} image; this can take several minutes.",
+                )
+                pulled = self._run_docker(
+                    docker_engine,
+                    ("pull", "--platform", "linux/amd64", profile.vllm_image),
+                    deadline,
+                    cancellation,
+                )
+                if pulled.returncode != 0:
+                    raise ValueError("immutable vLLM image pull failed")
+                vllm_inspect = self._run_docker(
+                    docker_engine,
+                    ("image", "inspect", profile.vllm_image),
+                    deadline,
+                    cancellation,
+                )
+            vllm_image_id = _verified_vllm_image_inspect(vllm_inspect, profile)
+        except Exception:
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
+                "The immutable vLLM serving image could not be prepared or verified.",
+            )
+
+        cache_root = Path(docker_host_path.runtime_container_root) / "models"
+        try:
+            cache_root.mkdir(mode=0o700, exist_ok=True)
+            if stat.S_IMODE(os.lstat(cache_root).st_mode) != 0o700:
+                raise ValueError("model cache root is not private")
+            _progress(
+                progress,
+                "Preparing the exact Hugging Face model snapshot; progress will be reported by bytes.",
+            )
+            model_path = prepare_release_model_snapshot(
+                cache_root=cache_root,
+                profile=profile,
+                deadline=deadline,
+                cancellation=cancellation,
+                progress=progress,
+            )
+            daemon_model_path = docker_host_path.translate(model_path)
+        except (OSError, ValueError, SelfDeployedModelCacheError):
+            return _self_deployed_not_ready(
+                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
+                "The release model snapshot could not be downloaded and verified.",
+            )
+
+        identity_digest = _digest_json(
+            {
+                "docker_engine_identity_digest": docker_engine.identity_digest,
+                "docker_host_path_identity": docker_host_path.identity_digest,
+                "gpu_device_id": gpu_device_id,
+                "gpu_inventory_digest": gpu_inventory_digest,
+                "managed_runtime_image_id": managed_image_id,
+                "managed_runtime_image_immutable_reference": immutable_runtime_image,
+                "model_profile_sha256": profile.profile_sha256,
+                "model_snapshot_manifest_sha256": (profile.model_snapshot_manifest_sha256),
+                "runtime_version_evidence": _command_evidence(runtime),
+                "system_memory_bytes": system_memory_bytes,
+                "toolkit_probe_evidence": _command_evidence(toolkit),
+                "vllm_image": profile.vllm_image,
+                "vllm_image_id": vllm_image_id,
+            }
+        )
+        _progress(progress, "Self-Deployed model and serving prerequisites are verified.")
+        return SelfDeployedRuntimeReadiness(
+            ready=True,
+            code=ServiceRunReadinessCode.READY,
+            identity_digest=identity_digest,
+            runtime_image_immutable_reference=immutable_runtime_image,
+            profile=profile,
+            model_cache_container_path=model_path,
+            model_cache_daemon_path=daemon_model_path,
+            daemon_container_id=docker_host_path.container_id,
+            gpu_device_id=gpu_device_id,
+            message="Self-Deployed runtime bootstrap is verified.",
+            docker_host_path=docker_host_path,
+        )
+
+    def _run_docker(
+        self,
+        authority: DockerEngineAuthority,
+        arguments: tuple[str, ...],
+        deadline: float,
+        cancellation: threading.Event | None,
+    ) -> ProbeCommandResult:
+        try:
+            return self._command_runner.run(
+                authority.argv(*arguments),
+                deadline,
+                cancellation,
+                env=authority.environment(),
+            )
+        finally:
+            authority.verify()
+
+    def remove_managed_container(self, generation_digest: str, deadline: float) -> bool:
+        """Idempotently reap only the exactly labelled inference container."""
+
+        try:
+            _require_digest(generation_digest, "Self-Deployed generation digest")
+            authority = DockerEngineAuthority.open()
+            name = _self_deployed_container_name(generation_digest)
+            selected = self._run_docker(
+                authority,
+                (
+                    "container",
+                    "ls",
+                    "--all",
+                    "--quiet",
+                    "--no-trunc",
+                    "--filter",
+                    f"name=^/{name}$",
+                ),
+                deadline,
+                None,
+            )
+            if selected.returncode != 0:
+                return False
+            identities = tuple(
+                line.strip()
+                for line in selected.stdout.decode("ascii").splitlines()
+                if line.strip()
+            )
+            if not identities:
+                return True
+            if len(identities) != 1 or re.fullmatch(r"[0-9a-f]{64}", identities[0]) is None:
+                return False
+            identity = identities[0]
+            inspected = self._run_docker(
+                authority,
+                ("container", "inspect", identity),
+                deadline,
+                None,
+            )
+            if not _managed_inference_container_matches(
+                inspected,
+                container_id=identity,
+                container_name=name,
+                generation_digest=generation_digest,
+            ):
+                return False
+            removed = self._run_docker(
+                authority,
+                ("container", "rm", "--force", identity),
+                deadline,
+                None,
+            )
+            if removed.returncode != 0:
+                return False
+            confirmed = self._run_docker(
+                authority,
+                (
+                    "container",
+                    "ls",
+                    "--all",
+                    "--quiet",
+                    "--no-trunc",
+                    "--filter",
+                    f"name=^/{name}$",
+                ),
+                deadline,
+                None,
+            )
+            return confirmed.returncode == 0 and not confirmed.stdout.strip()
+        except Exception:
+            return False
+
+
+def _self_deployed_not_ready(
+    code: ServiceRunReadinessCode,
+    message: str,
+) -> SelfDeployedRuntimeReadiness:
+    return SelfDeployedRuntimeReadiness(
+        ready=False,
+        code=code,
+        identity_digest=None,
+        runtime_image_immutable_reference=None,
+        profile=None,
+        model_cache_container_path=None,
+        model_cache_daemon_path=None,
+        daemon_container_id=None,
+        gpu_device_id=None,
+        message=message,
+        docker_host_path=None,
+    )
+
+
+def _verified_managed_image_inspect(
+    result: ProbeCommandResult,
+    runtime_image: str,
+) -> tuple[str, str]:
+    if result.returncode != 0:
+        raise ValueError("managed runtime image is unavailable")
+    payload = json.loads(result.stdout.decode("utf-8"))
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise ValueError("managed runtime inspect payload is invalid")
+    image = payload[0]
+    config = image.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    immutable = verified_managed_runtime_image_reference(
+        profile="managed_science",
+        image=runtime_image,
+        image_id=image.get("Id"),
+        repo_digests=image.get("RepoDigests"),
+        labels=labels,
+    )
+    image_id = image.get("Id")
+    if not isinstance(image_id, str):
+        raise ValueError("managed runtime image ID is unavailable")
+    return immutable, image_id
+
+
+def _verified_vllm_image_inspect(
+    result: ProbeCommandResult,
+    profile: SelfDeployedModelProfile,
+) -> str:
+    if result.returncode != 0:
+        raise ValueError("vLLM image is unavailable")
+    payload = json.loads(result.stdout.decode("utf-8"))
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        raise ValueError("vLLM image inspect payload is invalid")
+    image = payload[0]
+    image_id = image.get("Id")
+    repo_digests = image.get("RepoDigests")
+    expected_digest = profile.vllm_image.split("@", 1)[1]
+    if (
+        image_id != profile.vllm_image_config_digest
+        or not isinstance(repo_digests, list)
+        or not any(
+            isinstance(item, str) and item.endswith(f"vllm/vllm-openai@{expected_digest}")
+            for item in repo_digests
+        )
+    ):
+        raise ValueError("vLLM image identity differs from the release profile")
+    if image.get("Architecture") != "amd64" or image.get("Os") != "linux":
+        raise ValueError("vLLM image platform differs from the release profile")
+    return image_id
+
+
+def _self_deployed_container_name(generation_digest: str) -> str:
+    _require_digest(generation_digest, "Self-Deployed generation digest")
+    return f"openevo-vllm-{generation_digest[:24]}"
+
+
+def _managed_inference_container_matches(
+    result: ProbeCommandResult,
+    *,
+    container_id: str,
+    container_name: str,
+    generation_digest: str,
+) -> bool:
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(payload, list) or len(payload) != 1 or not isinstance(payload[0], dict):
+        return False
+    item = payload[0]
+    config = item.get("Config")
+    labels = config.get("Labels") if isinstance(config, dict) else None
+    return (
+        item.get("Id") == container_id
+        and item.get("Name") == f"/{container_name}"
+        and isinstance(labels, dict)
+        and labels.get("io.openevo.generation") == generation_digest
+        and labels.get("io.openevo.managed-service") == "true"
+    )
+
+
+def _select_self_deployed_gpu(
+    result: ProbeCommandResult,
+    *,
+    minimum_free_vram_bytes: int,
+) -> tuple[str, str]:
+    if result.returncode != 0:
+        raise ValueError("NVIDIA GPU inventory is unavailable")
+    try:
+        text = result.stdout.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("NVIDIA GPU inventory is not UTF-8") from exc
+    inventory: list[dict[str, object]] = []
+    for line in text.splitlines():
+        fields = tuple(value.strip() for value in line.split(","))
+        if len(fields) != 6:
+            raise ValueError("NVIDIA GPU inventory shape is invalid")
+        index_text, uuid, name, free_text, total_text, driver = fields
+        if (
+            not index_text.isdecimal()
+            or re.fullmatch(r"GPU-[0-9A-Fa-f-]{16,64}", uuid) is None
+            or not name
+            or not free_text.isdecimal()
+            or not total_text.isdecimal()
+            or re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", driver) is None
+        ):
+            raise ValueError("NVIDIA GPU inventory value is invalid")
+        inventory.append(
+            {
+                "index": int(index_text),
+                "uuid": uuid,
+                "name": name,
+                "free_bytes": int(free_text) * 1024 * 1024,
+                "total_bytes": int(total_text) * 1024 * 1024,
+                "driver_version": driver,
+            }
+        )
+    candidates = [item for item in inventory if int(item["free_bytes"]) >= minimum_free_vram_bytes]
+    if not candidates:
+        raise ValueError("no NVIDIA GPU satisfies the free VRAM floor")
+    selected = max(candidates, key=lambda item: (int(item["free_bytes"]), str(item["uuid"])))
+    stable_inventory = [
+        {
+            "index": item["index"],
+            "uuid": item["uuid"],
+            "name": item["name"],
+            "total_bytes": item["total_bytes"],
+            "driver_version": item["driver_version"],
+        }
+        for item in sorted(inventory, key=lambda item: int(item["index"]))
+    ]
+    return str(selected["uuid"]), _digest_json(stable_inventory)
+
+
+def _verify_nvidia_toolkit_probe(
+    result: ProbeCommandResult,
+    expected_gpu_uuid: str,
+) -> None:
+    if result.returncode != 0:
+        raise ValueError("NVIDIA Container Toolkit probe failed")
+    try:
+        lines = tuple(line.strip() for line in result.stdout.decode("ascii").splitlines())
+    except UnicodeDecodeError as exc:
+        raise ValueError("NVIDIA Container Toolkit probe is not ASCII") from exc
+    if lines != (expected_gpu_uuid,):
+        raise ValueError("NVIDIA Container Toolkit exposed a different GPU")
+
+
+def _linux_system_memory_bytes() -> int:
+    payload = Path("/proc/meminfo").read_text(encoding="ascii")
+    matches = [line for line in payload.splitlines() if line.startswith("MemTotal:")]
+    if len(matches) != 1:
+        raise ValueError("Linux system memory evidence is unavailable")
+    fields = matches[0].split()
+    if len(fields) != 3 or not fields[1].isdecimal() or fields[2] != "kB":
+        raise ValueError("Linux system memory evidence is invalid")
+    return int(fields[1]) * 1024
+
+
+def _progress(callback: Callable[[str], None] | None, message: str) -> None:
+    if callback is not None:
+        callback(message)
+
+
 def _runtime_not_ready(
     code: ServiceRunReadinessCode,
     message: str,
@@ -1101,6 +1724,17 @@ class SupervisorModelPreparation:
     status: str
     updated_at: str
     next_interface: str
+
+
+@dataclass(slots=True)
+class _SelfDeployedPreparationState:
+    token: object
+    model_ref: str
+    identity_digest: str
+    started_at: str
+    updated_at: str
+    log_sequence: int = 0
+    logs: list[SupervisorLogEntry] = field(default_factory=list)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1212,6 +1846,12 @@ class ServiceRunBinding:
     evolution_backend_url: str
     gateway_url: str
     _identity: InternalServiceIdentity = field(repr=False, compare=False)
+    self_deployed_profile_id: str | None = None
+    self_deployed_profile_sha256: str | None = None
+    self_deployed_model_revision: str | None = None
+    self_deployed_model_snapshot_sha256: str | None = None
+    self_deployed_vllm_image: str | None = None
+    self_deployed_vllm_image_config_digest: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.execution_mode, ServiceExecutionMode):
@@ -1230,6 +1870,32 @@ class ServiceRunBinding:
         )
         if release.image != self.runtime_image:
             raise ValueError("service run binding immutable image does not match its alias")
+        self_deployed_values = (
+            self.self_deployed_profile_id,
+            self.self_deployed_profile_sha256,
+            self.self_deployed_model_revision,
+            self.self_deployed_model_snapshot_sha256,
+            self.self_deployed_vllm_image,
+            self.self_deployed_vllm_image_config_digest,
+        )
+        if self.execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
+            if not all(value is not None for value in self_deployed_values):
+                raise ValueError("Self-Deployed service binding evidence is incomplete")
+            profile = require_release_self_deployed_model_profile(
+                self.self_deployed_profile_id or ""
+            )
+            if (
+                self.codex_model != profile.model_id
+                or self.self_deployed_profile_sha256 != profile.profile_sha256
+                or self.self_deployed_model_revision != profile.model_revision
+                or self.self_deployed_model_snapshot_sha256
+                != profile.model_snapshot_manifest_sha256
+                or self.self_deployed_vllm_image != profile.vllm_image
+                or self.self_deployed_vllm_image_config_digest != profile.vllm_image_config_digest
+            ):
+                raise ValueError("Self-Deployed service binding differs from its release profile")
+        elif any(value is not None for value in self_deployed_values):
+            raise ValueError("Subscription service binding contains Self-Deployed evidence")
         for value, label in (
             (self.runtime_identity_digest, "runtime_identity_digest"),
             (self.generation_digest, "generation_digest"),
@@ -2158,6 +2824,7 @@ class CoreServiceSupervisor:
         health_checker: HealthChecker | None = None,
         port_probe: PortProbe | None = None,
         managed_runtime_probe: ManagedScienceRuntimeProbe | None = None,
+        self_deployed_runtime_probe: SelfDeployedRuntimeProbe | None = None,
         startup_timeout: float = 30.0,
         stop_timeout: float = 5.0,
         max_log_entries: int = 512,
@@ -2179,6 +2846,7 @@ class CoreServiceSupervisor:
                 health_checker,
                 port_probe,
                 managed_runtime_probe,
+                self_deployed_runtime_probe,
             )
         )
         if launch_mode is ServiceLaunchMode.RELEASE:
@@ -2194,6 +2862,8 @@ class CoreServiceSupervisor:
                 )
             resolved_release_identity = release_identity
         self._mutex = threading.RLock()
+        self._preparation_mutex = threading.RLock()
+        self._self_deployed_preparation: _SelfDeployedPreparationState | None = None
         self._root = _SecureServiceRoot(service_root)
         self._closed = False
         try:
@@ -2224,6 +2894,18 @@ class CoreServiceSupervisor:
                 ),
                 require_docker_user_container=(launch_mode is ServiceLaunchMode.RELEASE),
             )
+            self._self_deployed_runtime_probe = (
+                self_deployed_runtime_probe
+                or LocalSelfDeployedRuntimeProbe(
+                    runtime_namespace=(
+                        "core-"
+                        + hashlib.sha256(
+                            os.fsencode(os.fspath(self._root.path.absolute()))
+                        ).hexdigest()[:24]
+                    ),
+                    require_docker_user_container=(launch_mode is ServiceLaunchMode.RELEASE),
+                )
+            )
             self._startup_timeout = startup_timeout
             self._stop_timeout = stop_timeout
             self._max_log_entries = max_log_entries
@@ -2242,6 +2924,8 @@ class CoreServiceSupervisor:
             self._active_plan_key: str | None = None
             self._active_credential: str | None = None
             self._active_runtime_request: ManagedScienceRuntimeRequest | None = None
+            self._active_self_deployed_request: SelfDeployedRuntimeRequest | None = None
+            self._active_self_deployed_runtime: SelfDeployedRuntimeReadiness | None = None
             self._active_runtime_image_immutable_reference: str | None = None
             self._active_credential_authority: (
                 HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
@@ -2333,26 +3017,87 @@ class CoreServiceSupervisor:
                 self._startup_timeout if total_timeout is None else total_timeout
             )
             self._framework_lock_source.verified_payload()
-            if execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
-                if self._active_run_lease is not None:
-                    raise SupervisorStateError(
-                        "managed service generation is leased to an active run"
-                    )
-                return self._ensure_self_deployed_unavailable(model_ref, deadline)
-            if codex_model is None or runtime_image is None:
-                raise ValueError(
-                    "subscription ensure requires codex_model and managed runtime_image"
+            self_deployed = execution_mode is ServiceExecutionMode.SELF_DEPLOYED
+            preparation_messages: list[str] = []
+            pre_stopped = False
+            if runtime_image is None:
+                raise ValueError("service ensure requires a managed runtime_image")
+            self_deployed_request: SelfDeployedRuntimeRequest | None = None
+            self_deployed_runtime: SelfDeployedRuntimeReadiness | None = None
+            if self_deployed:
+                if model_ref is None:
+                    raise ValueError("Self-Deployed ensure requires a release model profile ID")
+                self_deployed_request = SelfDeployedRuntimeRequest(
+                    profile_id=model_ref,
+                    runtime_image=runtime_image,
                 )
-            runtime_request = ManagedScienceRuntimeRequest(
-                runtime_image=runtime_image,
-                codex_model=codex_model,
-            )
-            runtime = self._managed_runtime_probe.verify(
-                runtime_request,
-                deadline,
-                cancellation,
-            )
-            candidate_authority = runtime.credential_authority
+                requested_profile = require_release_self_deployed_model_profile(model_ref)
+                runtime_request = ManagedScienceRuntimeRequest(
+                    runtime_image=runtime_image,
+                    codex_model=requested_profile.model_id,
+                )
+                if (
+                    not force_restart
+                    and self._active_self_deployed_request == self_deployed_request
+                    and self._active_runtime_request == runtime_request
+                    and self._active_self_deployed_runtime is not None
+                    and self._active_self_deployed_runtime.ready
+                    and self._active_plan_key is not None
+                    and self._active_credential is not None
+                    and self._specs
+                    and self._ledger.generation_digest is not None
+                    and self._is_current_group_healthy(
+                        execution_mode,
+                        self._ledger.generation_digest,
+                        tuple(self._specs.values()),
+                        deadline,
+                        cancellation,
+                    )
+                ):
+                    return self._group_snapshot()
+                if self._ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED and (
+                    self._specs or self._handles
+                ):
+                    if self._active_run_lease is not None:
+                        raise SupervisorStateError(
+                            "managed service generation is leased to an active run"
+                        )
+                    pre_stopped = self._stop_all(deadline)
+                    if not pre_stopped:
+                        self._ledger.group_status_message = "Existing managed children could not be stopped; service start aborted."
+                        self._persist()
+                        return self._group_snapshot()
+                    self._release_active_credential_authority()
+                preparation_token = self._begin_self_deployed_preparation(self_deployed_request)
+                try:
+                    self_deployed_runtime = self._self_deployed_runtime_probe.verify(
+                        self_deployed_request,
+                        deadline,
+                        cancellation,
+                        progress=lambda message: self._append_preparation_log(
+                            preparation_token,
+                            message,
+                        ),
+                    )
+                finally:
+                    preparation_messages = self._finish_self_deployed_preparation(
+                        preparation_token
+                    )
+                runtime = self_deployed_runtime
+                candidate_authority = None
+            else:
+                if codex_model is None:
+                    raise ValueError("subscription ensure requires codex_model")
+                runtime_request = ManagedScienceRuntimeRequest(
+                    runtime_image=runtime_image,
+                    codex_model=codex_model,
+                )
+                runtime = self._managed_runtime_probe.verify(
+                    runtime_request,
+                    deadline,
+                    cancellation,
+                )
+                candidate_authority = runtime.credential_authority
             if cancellation.is_set():
                 if candidate_authority is not None:
                     candidate_authority.close()
@@ -2380,44 +3125,36 @@ class CoreServiceSupervisor:
                         if runtime.docker_host_path is None
                         else runtime.docker_host_path.identity_digest
                     ),
+                    "self_deployed_profile_sha256": (
+                        None
+                        if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                        else self_deployed_runtime.profile.profile_sha256
+                    ),
                 }
             )
-            if self._active_run_lease is not None:
-                if (
-                    force_restart
-                    or not runtime.ready
-                    or self._active_plan_key != plan_key
-                    or self._active_credential is None
-                    or candidate_authority is None
-                    or not self._active_credential_authority_matches(candidate_authority)
-                    or not self._specs
-                    or self._ledger.generation_digest is None
-                    or not self._is_current_group_healthy_with_candidate(
+
+            def credential_authority_matches() -> bool:
+                if self_deployed:
+                    return self._active_credential_authority is None
+                return (
+                    candidate_authority is not None
+                    and self._active_credential_authority_matches(candidate_authority)
+                )
+
+            def current_group_is_healthy() -> bool:
+                if self._ledger.generation_digest is None:
+                    return False
+                if self_deployed:
+                    return self._is_current_group_healthy(
                         execution_mode,
                         self._ledger.generation_digest,
                         tuple(self._specs.values()),
                         deadline,
                         cancellation,
-                        candidate_authority,
                     )
-                ):
-                    if candidate_authority is not None:
-                        candidate_authority.close()
-                    raise SupervisorStateError(
-                        "managed service generation is leased to an active run"
-                    )
-                candidate_authority.close()
-                return self._group_snapshot()
-            if (
-                not force_restart
-                and runtime.ready
-                and self._active_plan_key == plan_key
-                and self._active_credential is not None
-                and candidate_authority is not None
-                and self._active_credential_authority_matches(candidate_authority)
-                and self._specs
-                and self._ledger.generation_digest is not None
-                and self._is_current_group_healthy_with_candidate(
+                if candidate_authority is None:
+                    return False
+                return self._is_current_group_healthy_with_candidate(
                     execution_mode,
                     self._ledger.generation_digest,
                     tuple(self._specs.values()),
@@ -2425,14 +3162,45 @@ class CoreServiceSupervisor:
                     cancellation,
                     candidate_authority,
                 )
+
+            if self._active_run_lease is not None:
+                if (
+                    force_restart
+                    or not runtime.ready
+                    or self._active_plan_key != plan_key
+                    or self._active_credential is None
+                    or not credential_authority_matches()
+                    or not self._specs
+                    or self._ledger.generation_digest is None
+                    or not current_group_is_healthy()
+                ):
+                    if candidate_authority is not None:
+                        candidate_authority.close()
+                    raise SupervisorStateError(
+                        "managed service generation is leased to an active run"
+                    )
+                if candidate_authority is not None:
+                    candidate_authority.close()
+                return self._group_snapshot()
+            if (
+                not force_restart
+                and runtime.ready
+                and self._active_plan_key == plan_key
+                and self._active_credential is not None
+                and credential_authority_matches()
+                and self._specs
+                and self._ledger.generation_digest is not None
+                and current_group_is_healthy()
             ):
                 if cancellation.is_set():
-                    candidate_authority.close()
+                    if candidate_authority is not None:
+                        candidate_authority.close()
                     self._raise_if_cancelled(cancellation)
-                candidate_authority.close()
+                if candidate_authority is not None:
+                    candidate_authority.close()
                 return self._group_snapshot()
             try:
-                stopped = self._stop_all(deadline)
+                stopped = pre_stopped or self._stop_all(deadline)
             except BaseException:
                 if candidate_authority is not None:
                     candidate_authority.close()
@@ -2446,9 +3214,35 @@ class CoreServiceSupervisor:
                 self._persist()
                 return self._group_snapshot()
             self._release_active_credential_authority()
+            if self_deployed and not runtime.ready:
+                assert self_deployed_request is not None
+                generation_digest = _digest_json(
+                    {
+                        "plan_key": plan_key,
+                        "readiness_code": runtime.code.value,
+                    }
+                )
+                self._active_plan_key = plan_key
+                self._active_credential = None
+                self._active_runtime_request = runtime_request
+                self._active_self_deployed_request = self_deployed_request
+                self._active_self_deployed_runtime = self_deployed_runtime
+                self._active_runtime_image_immutable_reference = None
+                snapshot = self._install_self_deployed_unavailable(
+                    request=self_deployed_request,
+                    runtime=runtime,
+                    generation_digest=generation_digest,
+                )
+                for message in preparation_messages:
+                    self._append_log("inference", "info", message)
+                self._persist()
+                return snapshot
             listeners: dict[str, socket.socket] = {}
             try:
-                for service_id in ("evolution-backend", "rollout", "gateway"):
+                service_ids = ["evolution-backend", "rollout", "gateway"]
+                if self_deployed:
+                    service_ids.insert(0, "inference")
+                for service_id in service_ids:
                     self._raise_if_cancelled(cancellation)
                     listeners[service_id] = self._port_probe.reserve("127.0.0.1")
             except SupervisorStateError:
@@ -2471,7 +3265,7 @@ class CoreServiceSupervisor:
                 }
             )
             try:
-                specs, topology = self._subscription_plan(
+                specs, topology = self._service_plan(
                     runtime_request,
                     plan_runtime_identity,
                     generation_digest,
@@ -2479,6 +3273,7 @@ class CoreServiceSupervisor:
                     listeners,
                     candidate_authority,
                     runtime.docker_host_path,
+                    self_deployed_runtime=self_deployed_runtime,
                 )
             except Exception:
                 for listener in listeners.values():
@@ -2490,6 +3285,8 @@ class CoreServiceSupervisor:
             self._active_plan_key = plan_key
             self._active_credential = credential
             self._active_runtime_request = runtime_request
+            self._active_self_deployed_request = self_deployed_request
+            self._active_self_deployed_runtime = self_deployed_runtime
             self._active_runtime_image_immutable_reference = (
                 runtime.runtime_image_immutable_reference
             )
@@ -2522,6 +3319,20 @@ class CoreServiceSupervisor:
                 runtime_readiness_code=runtime.code,
                 group_status_message=None,
             )
+            if self_deployed_runtime is not None:
+                profile = self_deployed_runtime.profile
+                if profile is None:
+                    raise SupervisorStateError(
+                        "Self-Deployed runtime profile disappeared after planning"
+                    )
+                inference_record = self._record("inference")
+                inference_record.model_ref = profile.model_id
+                inference_record.model_status = "ready"
+                inference_record.model_updated_at = _timestamp()
+                inference_record.model_next_interface = "run_task"
+                for message in preparation_messages:
+                    self._append_log("inference", "info", message)
+                self._persist()
             self._root.ensure_directory("evolution")
             self._root.ensure_directory("rollout")
             self._root.atomic_write("topology.json", _canonical_bytes(topology))
@@ -2538,6 +3349,10 @@ class CoreServiceSupervisor:
                         self._rollback(started, deadline)
                         return self._group_snapshot()
                     self._set_starting(spec.service_id)
+                    if spec.component is ServiceComponent.INFERENCE:
+                        listener = listeners.pop(spec.service_id, None)
+                        if listener is not None:
+                            listener.close()
                     try:
                         identity = self._process_backend.spawn(
                             spec,
@@ -2567,7 +3382,7 @@ class CoreServiceSupervisor:
                         self._rollback(started, deadline)
                         return self._group_snapshot()
                     if spec.service_id in listeners:
-                        listeners[spec.service_id].close()
+                        listeners.pop(spec.service_id).close()
                     self._handles[spec.service_id] = identity
                     self._write_process_identity(self._record(spec.service_id), identity)
                     self._persist()
@@ -2614,6 +3429,9 @@ class CoreServiceSupervisor:
                     listener.close()
 
     def list(self) -> tuple[SupervisorServiceSummary, ...]:
+        preparation = self._preparation_summary()
+        if preparation is not None:
+            return (preparation,)
         with self._mutex:
             self._require_open()
             self._refresh_process_state()
@@ -2633,13 +3451,15 @@ class CoreServiceSupervisor:
     def _run_binding_locked(self) -> ServiceRunBinding:
         self._require_open()
         self._verify_release_installation()
-        self._require_active_credential_authority()
+        if self._ledger.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
+            self._require_active_credential_authority()
         self._refresh_process_state()
         snapshot = self._group_snapshot()
         credential = self._active_credential
         runtime_request = self._active_runtime_request
         immutable_runtime_image = self._active_runtime_image_immutable_reference
         runtime_identity = snapshot.runtime_identity_digest
+        self_deployed_runtime = self._active_self_deployed_runtime
         if (
             not snapshot.run_ready
             or credential is None
@@ -2674,6 +3494,36 @@ class CoreServiceSupervisor:
             rollout_url=f"http://127.0.0.1:{ports['rollout']}",
             evolution_backend_url=f"http://127.0.0.1:{ports['evolution-backend']}",
             gateway_url=f"http://127.0.0.1:{ports['gateway']}",
+            self_deployed_profile_id=(
+                None
+                if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                else self_deployed_runtime.profile.profile_id
+            ),
+            self_deployed_profile_sha256=(
+                None
+                if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                else self_deployed_runtime.profile.profile_sha256
+            ),
+            self_deployed_model_revision=(
+                None
+                if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                else self_deployed_runtime.profile.model_revision
+            ),
+            self_deployed_model_snapshot_sha256=(
+                None
+                if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                else self_deployed_runtime.profile.model_snapshot_manifest_sha256
+            ),
+            self_deployed_vllm_image=(
+                None
+                if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                else self_deployed_runtime.profile.vllm_image
+            ),
+            self_deployed_vllm_image_config_digest=(
+                None
+                if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                else self_deployed_runtime.profile.vllm_image_config_digest
+            ),
             _identity=identity,
         )
 
@@ -2686,10 +3536,11 @@ class CoreServiceSupervisor:
         with self._mutex:
             if self._closed:
                 return False
-            try:
-                self._require_active_credential_authority()
-            except SupervisorStateError:
-                return False
+            if self._ledger.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
+                try:
+                    self._require_active_credential_authority()
+                except SupervisorStateError:
+                    return False
             credential = self._active_credential
             generation = self._ledger.generation_digest
             if credential is None or generation is None:
@@ -2705,6 +3556,9 @@ class CoreServiceSupervisor:
             return identity.authenticates(normalized)
 
     def get(self, service_id: str) -> SupervisorServiceSummary:
+        preparation = self._preparation_summary()
+        if preparation is not None and service_id == preparation.id:
+            return preparation
         with self._mutex:
             self._require_open()
             self._refresh_process_state()
@@ -2739,13 +3593,10 @@ class CoreServiceSupervisor:
                 raise SupervisorBusyError("restart operation replay capacity is exhausted")
             runtime_request = self._active_runtime_request
             if runtime_request is None:
-                raise SupervisorStateError("subscription runtime request is unavailable")
-            snapshot = self._ensure_locked(
-                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-                codex_model=runtime_request.codex_model,
-                runtime_image=runtime_request.runtime_image,
+                raise SupervisorStateError("managed runtime request is unavailable")
+            snapshot = self._restart_active_group_locked(
+                runtime_request,
                 total_timeout=total_timeout,
-                force_restart=True,
             )
             result = snapshot.service(service_id)
             self._restart_results[operation_id] = (service_id, result)
@@ -2777,7 +3628,9 @@ class CoreServiceSupervisor:
                         "restart attempt was already started and cannot be executed again"
                     )
                 if prior.service is None:
-                    raise SupervisorStateError("completed restart attempt lacks its service result")
+                    raise SupervisorStateError(
+                        "completed restart attempt lacks its service result"
+                    )
                 return self._restart_service_summary(prior.service)
 
             record = self._record(service_id)
@@ -2790,7 +3643,7 @@ class CoreServiceSupervisor:
                 raise SupervisorBusyError("restart attempt receipt capacity is exhausted")
             runtime_request = self._active_runtime_request
             if runtime_request is None:
-                raise SupervisorStateError("subscription runtime request is unavailable")
+                raise SupervisorStateError("managed runtime request is unavailable")
 
             attempt = _LedgerRestartAttempt(
                 operation_id=operation_id,
@@ -2801,12 +3654,9 @@ class CoreServiceSupervisor:
             self._ledger.restart_attempts.append(attempt)
             self._persist()
 
-            snapshot = self._ensure_locked(
-                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-                codex_model=runtime_request.codex_model,
-                runtime_image=runtime_request.runtime_image,
+            snapshot = self._restart_active_group_locked(
+                runtime_request,
                 total_timeout=total_timeout,
-                force_restart=True,
             )
             result = snapshot.service(service_id)
             frozen = self._ledger_restart_service(result)
@@ -2827,6 +3677,34 @@ class CoreServiceSupervisor:
                     return self._restart_service_summary(persisted.service)
                 raise original_error.with_traceback(original_error.__traceback__)
             return result
+
+    def _restart_active_group_locked(
+        self,
+        runtime_request: ManagedScienceRuntimeRequest,
+        *,
+        total_timeout: float | None,
+    ) -> ServiceGroupSnapshot:
+        execution_mode = self._ledger.execution_mode
+        if execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
+            request = self._active_self_deployed_request
+            if request is None or request.runtime_image != runtime_request.runtime_image:
+                raise SupervisorStateError("Self-Deployed runtime request is unavailable")
+            return self._ensure_locked(
+                execution_mode,
+                model_ref=request.profile_id,
+                runtime_image=runtime_request.runtime_image,
+                total_timeout=total_timeout,
+                force_restart=True,
+            )
+        if execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
+            return self._ensure_locked(
+                execution_mode,
+                codex_model=runtime_request.codex_model,
+                runtime_image=runtime_request.runtime_image,
+                total_timeout=total_timeout,
+                force_restart=True,
+            )
+        raise SupervisorStateError("managed service execution mode is unavailable")
 
     def list_restart_attempts(self) -> tuple[ServiceRestartAttempt, ...]:
         with self._mutex:
@@ -2877,6 +3755,13 @@ class CoreServiceSupervisor:
     ) -> tuple[SupervisorLogEntry, ...]:
         if after_sequence < 0 or not 1 <= limit <= 100:
             raise ValueError("log snapshot bounds are invalid")
+        preparation = self._preparation_logs(
+            service_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+        if preparation is not None:
+            return preparation
         with self._mutex:
             self._require_open()
             record = self._record(service_id)
@@ -2937,7 +3822,129 @@ class CoreServiceSupervisor:
             self._framework_lock_source.close()
             self._root.close()
 
-    def _subscription_plan(
+    def _begin_self_deployed_preparation(
+        self,
+        request: SelfDeployedRuntimeRequest,
+    ) -> object:
+        profile = require_release_self_deployed_model_profile(request.profile_id)
+        token = object()
+        now = _timestamp()
+        state = _SelfDeployedPreparationState(
+            token=token,
+            model_ref=profile.model_id,
+            identity_digest=_digest_json(
+                {
+                    "install_digest": self._release_identity.install_digest,
+                    "profile_sha256": profile.profile_sha256,
+                    "registry_digest": self._release_identity.registry_digest,
+                    "runtime_image": request.runtime_image,
+                    "state": "preparing",
+                }
+            ),
+            started_at=now,
+            updated_at=now,
+        )
+        with self._preparation_mutex:
+            if self._self_deployed_preparation is not None:
+                raise SupervisorBusyError(
+                    "another Self-Deployed runtime preparation is already active"
+                )
+            self._self_deployed_preparation = state
+        return token
+
+    def _append_preparation_log(self, token: object, message: str) -> None:
+        safe = _sanitize(message)
+        with self._preparation_mutex:
+            state = self._self_deployed_preparation
+            if state is None or state.token is not token:
+                return
+            state.log_sequence += 1
+            now = _timestamp()
+            entry = SupervisorLogEntry(
+                id=f"inference-log-{state.log_sequence}",
+                sequence=state.log_sequence,
+                occurred_at=now,
+                level="info",
+                message=safe,
+                service_id="inference",
+                content_sha256=hashlib.sha256(safe.encode("utf-8")).hexdigest(),
+            )
+            state.logs.append(entry)
+            state.updated_at = now
+            while len(state.logs) > self._max_log_entries:
+                state.logs.pop(0)
+            while (
+                state.logs
+                and sum(len(item.message.encode("utf-8")) for item in state.logs)
+                > self._max_log_bytes
+            ):
+                state.logs.pop(0)
+
+    def _finish_self_deployed_preparation(self, token: object) -> list[str]:
+        with self._preparation_mutex:
+            state = self._self_deployed_preparation
+            if state is None or state.token is not token:
+                return []
+            messages = [item.message for item in state.logs]
+            self._self_deployed_preparation = None
+            return messages
+
+    def _preparation_summary(self) -> SupervisorServiceSummary | None:
+        with self._preparation_mutex:
+            state = self._self_deployed_preparation
+            if state is None:
+                return None
+            status_message = (
+                state.logs[-1].message
+                if state.logs
+                else "Preparing the verified Self-Deployed runtime."
+            )
+            return SupervisorServiceSummary(
+                id="inference",
+                display_name="Managed inference",
+                component=ServiceComponent.INFERENCE,
+                status=ServiceStatus.STARTING,
+                restartable=False,
+                status_message=status_message,
+                error_code=None,
+                updated_at=state.updated_at,
+                observed_at=_timestamp(),
+                identity_digest=state.identity_digest,
+                pid=None,
+                port=None,
+                etag=_service_summary_etag(
+                    component=ServiceComponent.INFERENCE,
+                    error_code=None,
+                    identity_digest=state.identity_digest,
+                    model_status="downloading",
+                    pid=None,
+                    service_id="inference",
+                    status=ServiceStatus.STARTING,
+                    status_message=status_message,
+                    updated_at=state.updated_at,
+                ),
+                model_preparation=SupervisorModelPreparation(
+                    model_ref=state.model_ref,
+                    status="downloading",
+                    updated_at=state.updated_at,
+                    next_interface="retry_service_ensure",
+                ),
+            )
+
+    def _preparation_logs(
+        self,
+        service_id: str,
+        *,
+        after_sequence: int,
+        limit: int,
+    ) -> tuple[SupervisorLogEntry, ...] | None:
+        with self._preparation_mutex:
+            state = self._self_deployed_preparation
+            if state is None or service_id != "inference":
+                return None
+            return tuple(item for item in state.logs if item.sequence > after_sequence)[:limit]
+
+    def _service_plan(
         self,
         runtime_request: ManagedScienceRuntimeRequest,
         runtime_identity_digest: str,
@@ -2948,6 +3955,8 @@ class CoreServiceSupervisor:
             HeldCodexCredentialAuthority | PreparedCodexCredentialSnapshot | None
         ),
         docker_host_path: DockerHostPathSpec | None,
+        *,
+        self_deployed_runtime: SelfDeployedRuntimeReadiness | None,
     ) -> tuple[tuple[ServiceProcessSpec, ...], dict[str, object]]:
         root = self._root.path
         topology_path = root / "topology.json"
@@ -2959,6 +3968,12 @@ class CoreServiceSupervisor:
         evolution_url = f"http://127.0.0.1:{ports['evolution-backend']}"
         rollout_url = f"http://127.0.0.1:{ports['rollout']}"
         gateway_url = f"http://127.0.0.1:{ports['gateway']}"
+        self_deployed = self_deployed_runtime is not None
+        if self_deployed and not self_deployed_runtime.ready:
+            raise ValueError("Self-Deployed service planning requires ready runtime evidence")
+        inference_url = (
+            f"http://127.0.0.1:{ports['inference']}" if self_deployed else "http://127.0.0.1:1"
+        )
         topology: dict[str, object] = {
             "gateway": {
                 "heartbeat_interval_seconds": 2,
@@ -2967,7 +3982,7 @@ class CoreServiceSupervisor:
                         "host": "127.0.0.1",
                         "id": "core-gateway",
                         "inference": {
-                            "base_url": "http://127.0.0.1:1",
+                            "base_url": inference_url,
                             "engine": "vllm",
                         },
                         "model_served": runtime_request.codex_model,
@@ -3006,7 +4021,7 @@ class CoreServiceSupervisor:
         base_env = _controlled_environment()
         if self._run_admission_url is not None:
             base_env[CORE_RUN_ADMISSION_URL_ENV] = self._run_admission_url
-        plans = (
+        common_plans = (
             (
                 "evolution-backend",
                 "Evolution backend",
@@ -3104,6 +4119,111 @@ class CoreServiceSupervisor:
                 ),
             ),
         )
+        inference_plans: tuple[
+            tuple[
+                str,
+                str,
+                ServiceComponent,
+                tuple[str, ...],
+                int | None,
+                ServiceHealthProbe,
+            ],
+            ...,
+        ] = ()
+        if self_deployed:
+            assert self_deployed_runtime is not None
+            profile = self_deployed_runtime.profile
+            model_path = self_deployed_runtime.model_cache_daemon_path
+            daemon_container_id = self_deployed_runtime.daemon_container_id
+            gpu_device_id = self_deployed_runtime.gpu_device_id
+            if (
+                profile is None
+                or model_path is None
+                or daemon_container_id is None
+                or gpu_device_id is None
+            ):
+                raise ValueError("Self-Deployed runtime evidence is incomplete")
+            container_name = _self_deployed_container_name(generation_digest)
+            inference_argv = (
+                DOCKER_EXECUTABLE_PATH,
+                "run",
+                "--platform",
+                "linux/amd64",
+                "--rm",
+                "--init",
+                "--read-only",
+                "--cap-drop",
+                "ALL",
+                "--security-opt",
+                "no-new-privileges=true",
+                "--pids-limit",
+                "4096",
+                "--shm-size",
+                "4294967296",
+                "--stop-timeout",
+                "10",
+                "--name",
+                container_name,
+                "--label",
+                "io.openevo.managed-service=true",
+                "--label",
+                f"io.openevo.generation={generation_digest}",
+                "--network",
+                f"container:{daemon_container_id}",
+                "--gpus",
+                f"device={gpu_device_id}",
+                "--user",
+                f"{os.geteuid()}:{os.getegid()}",
+                "--env",
+                "HF_HUB_OFFLINE=1",
+                "--env",
+                "TRANSFORMERS_OFFLINE=1",
+                "--env",
+                "VLLM_NO_USAGE_STATS=1",
+                "--env",
+                "HOME=/tmp",
+                "--env",
+                "HF_HOME=/tmp/huggingface",
+                "--env",
+                "XDG_CACHE_HOME=/tmp/cache",
+                "--env",
+                "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor",
+                "--env",
+                "VLLM_CACHE_ROOT=/tmp/vllm-cache",
+                "--tmpfs",
+                "/tmp:rw,exec,nosuid,size=4294967296",
+                "--mount",
+                f"type=bind,src={model_path},dst=/openevo/model,readonly",
+                "--entrypoint",
+                "python3",
+                profile.vllm_image,
+                "-m",
+                "vllm.entrypoints.openai.api_server",
+                "--model",
+                "/openevo/model",
+                "--served-model-name",
+                profile.model_id,
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(ports["inference"]),
+                *profile.serving_arguments,
+            )
+            inference_plans = (
+                (
+                    "inference",
+                    "Managed inference",
+                    ServiceComponent.INFERENCE,
+                    inference_argv,
+                    ports["inference"],
+                    ServiceHealthProbe.http(
+                        f"{inference_url}/v1/models",
+                        expected_service_id="inference",
+                        expected_model_id=profile.model_id,
+                    ),
+                ),
+            )
+        plans = (*inference_plans, *common_plans)
         topology_digest = _digest_json(topology)
         specs = []
         for service_id, display_name, component, argv, port, health_probe in plans:
@@ -3115,11 +4235,13 @@ class CoreServiceSupervisor:
                 credential=credential,
             )
             argv_digest = _digest_json(list(argv))
-            service_env = dict(base_env)
+            service_env = (
+                docker_cli_environment()
+                if component is ServiceComponent.INFERENCE
+                else dict(base_env)
+            )
             if service_id == "gateway":
-                service_env[WORKSPACE_HANDOFF_ROOT_ENV] = os.fspath(
-                    self._workspace_handoff_root
-                )
+                service_env[WORKSPACE_HANDOFF_ROOT_ENV] = os.fspath(self._workspace_handoff_root)
             service_env = dict(sorted(service_env.items()))
             env_digest = _digest_json(service_env)
             identity_digest = _digest_json(
@@ -3134,6 +4256,11 @@ class CoreServiceSupervisor:
                     "registry_digest": self._release_identity.registry_digest,
                     "runtime_identity_digest": runtime_identity_digest,
                     "runtime_image": runtime_request.runtime_image,
+                    "self_deployed_profile_sha256": (
+                        None
+                        if self_deployed_runtime is None or self_deployed_runtime.profile is None
+                        else self_deployed_runtime.profile.profile_sha256
+                    ),
                     "service_id": service_id,
                     "topology_digest": topology_digest,
                     "generation_digest": generation_digest,
@@ -3155,7 +4282,9 @@ class CoreServiceSupervisor:
                     cwd=os.fspath(self._child_cwd),
                     internal_identity=internal_identity,
                     listen_fd=(
-                        listeners[service_id].fileno() if service_id in listeners else None
+                        listeners[service_id].fileno()
+                        if service_id in listeners and component is not ServiceComponent.INFERENCE
+                        else None
                     ),
                     codex_credential_authority=(
                         credential_authority if service_id == "gateway" else None
@@ -3164,37 +4293,22 @@ class CoreServiceSupervisor:
             )
         return tuple(specs), topology
 
-    def _ensure_self_deployed_unavailable(
+    def _install_self_deployed_unavailable(
         self,
-        model_ref: str | None,
-        deadline: float,
+        *,
+        request: SelfDeployedRuntimeRequest,
+        runtime: SelfDeployedRuntimeReadiness,
+        generation_digest: str,
     ) -> ServiceGroupSnapshot:
-        if model_ref is None or not model_ref.strip() or len(model_ref.strip()) > 256:
-            raise ValueError("self-deployed execution requires a bounded model_ref")
-        if not self._stop_all(deadline):
-            self._ledger.group_status_message = (
-                "Existing managed children could not be stopped; mode change aborted."
-            )
-            self._persist()
-            return self._group_snapshot()
-        self._release_active_credential_authority()
+        if runtime.ready or runtime.code is ServiceRunReadinessCode.READY:
+            raise ValueError("ready Self-Deployed runtime cannot be installed as unavailable")
+        profile = require_release_self_deployed_model_profile(request.profile_id)
         now = _timestamp()
-        identity = _digest_json(
-            {
-                "framework_lock_digest": self._framework_lock_digest,
-                "install_digest": self._release_identity.install_digest,
-                "model_ref": model_ref.strip(),
-                "registry_digest": self._release_identity.registry_digest,
-                "required_interface": "model_preparer_v1",
-            }
-        )
         self._ledger.execution_mode = ServiceExecutionMode.SELF_DEPLOYED
-        self._ledger.generation_digest = identity
+        self._ledger.generation_digest = generation_digest
         self._ledger.runtime_identity_digest = None
-        self._ledger.runtime_readiness_code = ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE
-        self._ledger.group_status_message = (
-            "Self-deployed model preparation is unavailable in this release slice."
-        )
+        self._ledger.runtime_readiness_code = runtime.code
+        self._ledger.group_status_message = _sanitize(runtime.message)
         self._ledger.services = [
             _LedgerService(
                 service_id="inference",
@@ -3202,19 +4316,15 @@ class CoreServiceSupervisor:
                 component=ServiceComponent.INFERENCE,
                 status=ServiceStatus.UNAVAILABLE,
                 restartable=False,
-                status_message=(
-                    "Self-deployed model preparation requires model_preparer_v1; "
-                    "dependency installation, Hugging Face download, proxy delivery, "
-                    "vLLM launch, and served-model verification are not wired."
-                ),
+                status_message=_sanitize(runtime.message),
                 updated_at=now,
-                identity_digest=identity,
+                identity_digest=generation_digest,
                 argv_digest=_digest_json([]),
                 env_digest=_digest_json({}),
-                model_ref=model_ref.strip(),
-                model_status="unresolved",
+                model_ref=profile.model_id,
+                model_status="failed",
                 model_updated_at=now,
-                model_next_interface="model_preparer_v1",
+                model_next_interface="retry_service_ensure",
             )
         ]
         self._specs = {}
@@ -3322,7 +4432,10 @@ class CoreServiceSupervisor:
         stopped = True
         for record in reversed(self._ledger.services):
             self._stop_service(record.service_id, deadline)
-            if self._record(record.service_id).error_code == "service_stop_timeout":
+            if self._record(record.service_id).error_code in {
+                "service_stop_timeout",
+                "managed_container_cleanup_failed",
+            }:
                 stopped = False
         return stopped
 
@@ -3378,6 +4491,8 @@ class CoreServiceSupervisor:
         authority = self._active_credential_authority
         self._active_credential_authority = None
         self._active_runtime_image_immutable_reference = None
+        self._active_self_deployed_request = None
+        self._active_self_deployed_runtime = None
         if authority is not None:
             authority.close()
 
@@ -3407,14 +4522,47 @@ class CoreServiceSupervisor:
                 except Exception as exc:
                     self._append_log(service_id, "error", _safe_message("Kill failed", exc))
                 self._process_backend.wait(identity, max(0.0, deadline - time.monotonic()))
+        container_cleanup_failed = False
+        if (
+            record.component is ServiceComponent.INFERENCE
+            and self._ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED
+            and self._ledger.runtime_identity_digest is not None
+            and self._ledger.generation_digest is not None
+        ):
+            removed = self._self_deployed_runtime_probe.remove_managed_container(
+                self._ledger.generation_digest,
+                deadline,
+            )
+            if not removed:
+                container_cleanup_failed = True
+                self._append_log(
+                    service_id,
+                    "error",
+                    "The managed inference container could not be verified and removed.",
+                )
+            elif identity is not None and self._process_backend.is_alive(identity):
+                self._process_backend.wait(
+                    identity,
+                    max(0.0, deadline - time.monotonic()),
+                )
         still_alive = identity is not None and self._process_backend.is_alive(identity)
         record.updated_at = _timestamp()
-        if still_alive:
-            self._handles[service_id] = identity
-            self._write_process_identity(record, identity)
+        if still_alive or container_cleanup_failed:
+            if identity is not None and still_alive:
+                self._handles[service_id] = identity
+                self._write_process_identity(record, identity)
+            else:
+                self._handles.pop(service_id, None)
+                self._clear_process_identity(record)
             record.status = ServiceStatus.FAILED
-            record.error_code = "service_stop_timeout"
-            record.status_message = "Managed child did not exit before the stop deadline."
+            record.error_code = (
+                "service_stop_timeout" if still_alive else "managed_container_cleanup_failed"
+            )
+            record.status_message = (
+                "Managed child did not exit before the stop deadline."
+                if still_alive
+                else "Managed inference container cleanup could not be verified."
+            )
             record.restartable = False
         elif preserve_failure:
             self._clear_process_identity(record)
@@ -3641,15 +4789,10 @@ class CoreServiceSupervisor:
             services=services,
             runtime_image=(
                 self._active_runtime_request.runtime_image
-                if execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-                and self._active_runtime_request is not None
+                if self._active_runtime_request is not None
                 else None
             ),
-            runtime_image_immutable_reference=(
-                self._active_runtime_image_immutable_reference
-                if execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
-                else None
-            ),
+            runtime_image_immutable_reference=(self._active_runtime_image_immutable_reference),
             runtime_identity_digest=self._ledger.runtime_identity_digest,
             status_message=message,
         )
@@ -3753,11 +4896,31 @@ class CoreServiceSupervisor:
 
     def _validate_loaded_ledger(self, ledger: _LedgerBase) -> None:
         if ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED:
-            if ledger.runtime_identity_digest is not None or ledger.runtime_readiness_code not in {
-                None,
-                ServiceRunReadinessCode.SELF_DEPLOYED_UNAVAILABLE,
-            }:
-                raise SupervisorStateError("self-deployed unavailable state has runtime evidence")
+            has_running_state = any(
+                record.status
+                in {
+                    ServiceStatus.STARTING,
+                    ServiceStatus.RUNNING,
+                    ServiceStatus.DEGRADED,
+                }
+                for record in ledger.services
+            )
+            if has_running_state and ledger.runtime_identity_digest is None:
+                raise SupervisorStateError("Self-Deployed service state lacks runtime evidence")
+            if (
+                ledger.runtime_identity_digest is not None
+                and ledger.runtime_readiness_code
+                not in {
+                    None,
+                    ServiceRunReadinessCode.READY,
+                }
+            ) or (
+                ledger.runtime_identity_digest is None
+                and ledger.runtime_readiness_code is ServiceRunReadinessCode.READY
+            ):
+                raise SupervisorStateError(
+                    "Self-Deployed runtime readiness evidence is inconsistent"
+                )
         elif ledger.execution_mode is ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT:
             has_running_state = any(
                 record.status
@@ -3833,15 +4996,15 @@ class CoreServiceSupervisor:
             > self._max_log_bytes
         ):
             raise SupervisorStateError("service ledger aggregate log budget is exceeded")
-        restart_attempts = (
-            ledger.restart_attempts if isinstance(ledger, _Ledger) else ()
-        )
+        restart_attempts = ledger.restart_attempts if isinstance(ledger, _Ledger) else ()
         if len(restart_attempts) > self._max_restart_operations:
             raise SupervisorStateError("restart attempt receipt capacity is exceeded")
         operation_ids: set[str] = set()
         for attempt in restart_attempts:
             if attempt.operation_id in operation_ids:
-                raise SupervisorStateError("restart attempt ledger contains duplicate operation IDs")
+                raise SupervisorStateError(
+                    "restart attempt ledger contains duplicate operation IDs"
+                )
             operation_ids.add(attempt.operation_id)
             if attempt.state is ServiceRestartAttemptState.STARTED:
                 if attempt.service is not None:
@@ -3872,9 +5035,7 @@ class CoreServiceSupervisor:
                     raise SupervisorStateError(
                         "restart attempt service result etag is inconsistent"
                     )
-                if (service.status is ServiceStatus.FAILED) != (
-                    service.error_code is not None
-                ):
+                if (service.status is ServiceStatus.FAILED) != (service.error_code is not None):
                     raise SupervisorStateError(
                         "restart attempt service result failure state is inconsistent"
                     )
@@ -3899,6 +5060,7 @@ class CoreServiceSupervisor:
                 ServiceStatus.RUNNING,
                 ServiceStatus.DEGRADED,
             }:
+                recovered = True
                 if record.pid is not None:
                     identity = ProcessIdentity(
                         pid=record.pid,
@@ -3911,10 +5073,10 @@ class CoreServiceSupervisor:
                         identity,
                         time.monotonic() + self._stop_timeout,
                     )
-                    if not recovered:
-                        raise SupervisorStateError(
-                            "persisted process group could not be verified and recovered"
-                        )
+                if not recovered:
+                    raise SupervisorStateError(
+                        "persisted process group could not be verified and recovered"
+                    )
                 record.status = ServiceStatus.FAILED
                 record.error_code = "service_prior_owner_lost"
                 record.status_message = (
@@ -3923,6 +5085,18 @@ class CoreServiceSupervisor:
                 self._clear_process_identity(record)
                 record.updated_at = _timestamp()
                 changed = True
+        if (
+            self._ledger.execution_mode is ServiceExecutionMode.SELF_DEPLOYED
+            and self._ledger.runtime_identity_digest is not None
+            and self._ledger.generation_digest is not None
+            and not self._self_deployed_runtime_probe.remove_managed_container(
+                self._ledger.generation_digest,
+                time.monotonic() + self._stop_timeout,
+            )
+        ):
+            raise SupervisorStateError(
+                "persisted managed inference container could not be verified and recovered"
+            )
         if changed:
             self._persist()
 
@@ -3965,7 +5139,9 @@ class CoreServiceSupervisor:
         service: SupervisorServiceSummary,
     ) -> _LedgerRestartService:
         return _LedgerRestartService.model_validate(
-            service.__dict__ if hasattr(service, "__dict__") else {
+            service.__dict__
+            if hasattr(service, "__dict__")
+            else {
                 "id": service.id,
                 "display_name": service.display_name,
                 "component": service.component.value,
@@ -4058,7 +5234,9 @@ class CoreServiceSupervisor:
             attempt.service_id != service_id
             or attempt.expected_service_etag != expected_service_etag
         ):
-            raise SupervisorStateError("restart operation identity was reused for a different request")
+            raise SupervisorStateError(
+                "restart operation identity was reused for a different request"
+            )
 
     def _record(self, service_id: str) -> _LedgerService:
         record = self._record_or_none(service_id)
@@ -4297,6 +5475,18 @@ def _probe_http(spec: ServiceProcessSpec, remaining: float) -> tuple[bool, str]:
                 payload = json.loads(raw.decode("utf-8"))
                 if not isinstance(payload, dict):
                     return False, "HTTP health response is not an object"
+                if probe.expected_service_id == "inference":
+                    data = payload.get("data")
+                    expected_model = probe.expected_model_id
+                    if (
+                        expected_model is None
+                        or not isinstance(data, list)
+                        or len(data) != 1
+                        or not isinstance(data[0], dict)
+                        or data[0].get("id") != expected_model
+                    ):
+                        return False, "managed inference served-model identity mismatch"
+                    return True, "managed inference served-model identity is healthy"
                 actual = payload.get("internal_identity")
                 expected = identity.health_identity()
                 expected["service_id"] = probe.expected_service_id

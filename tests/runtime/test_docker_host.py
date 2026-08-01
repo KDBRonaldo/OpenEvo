@@ -99,6 +99,25 @@ def test_discovery_pins_private_runtime_root_and_translates_only_descendants(
         authority.translate(destination / "unmanaged")
 
 
+def test_discovery_accepts_preprovisioned_private_root_below_read_only_mount(
+    tmp_path: Path,
+) -> None:
+    destination = tmp_path / "shared-data"
+    destination.mkdir()
+    private_parent = destination / f".openevo-runtime-{os.geteuid()}"
+    private_parent.mkdir(mode=0o700)
+    destination.chmod(0o555)
+
+    try:
+        authority, payload = _discover(destination)
+
+        assert authority.runtime_container_root == os.fspath(private_parent / "core-release")
+        assert Path(authority.runtime_container_root).stat().st_mode & 0o777 == 0o700
+        verify_docker_host_path(authority, payload, hostname=_HOSTNAME)
+    finally:
+        destination.chmod(0o700)
+
+
 def test_discovery_rejects_two_eligible_bind_roots(tmp_path: Path) -> None:
     first = tmp_path / "first"
     second = tmp_path / "second"

@@ -31,6 +31,7 @@ from openevo.runtime.managed import (
     MANAGED_RUNTIME_RELEASES,
     require_immutable_managed_runtime_image,
 )
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 
 
 def _binding(
@@ -43,9 +44,11 @@ def _binding(
         profile="managed_science",
         image=MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest,
     )
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    self_deployed = execution_mode is ServiceExecutionMode.SELF_DEPLOYED
     return ServiceRunBinding(
         execution_mode=execution_mode,
-        codex_model=codex_model,
+        codex_model=profile.model_id if self_deployed else codex_model,
         runtime_image=image,
         runtime_image_immutable_reference=release.immutable_reference,
         runtime_identity_digest="1" * 64,
@@ -55,6 +58,16 @@ def _binding(
         rollout_url="http://127.0.0.1:41001",
         evolution_backend_url="http://127.0.0.1:41002",
         gateway_url="http://127.0.0.1:41003",
+        self_deployed_profile_id=profile.profile_id if self_deployed else None,
+        self_deployed_profile_sha256=profile.profile_sha256 if self_deployed else None,
+        self_deployed_model_revision=profile.model_revision if self_deployed else None,
+        self_deployed_model_snapshot_sha256=(
+            profile.model_snapshot_manifest_sha256 if self_deployed else None
+        ),
+        self_deployed_vllm_image=profile.vllm_image if self_deployed else None,
+        self_deployed_vllm_image_config_digest=(
+            profile.vllm_image_config_digest if self_deployed else None
+        ),
         _identity=InternalServiceIdentity(
             service_id="core-control",
             generation_digest="2" * 64,
@@ -103,18 +116,14 @@ def test_subscription_genesis_issues_complete_verified_snapshot() -> None:
         profile="managed_science",
         image=binding.runtime_image_immutable_reference,
     )
-    assert snapshot.runtime.image_digest == runtime_release.trusted_digest.removeprefix(
-        "sha256:"
-    )
+    assert snapshot.runtime.image_digest == runtime_release.trusted_digest.removeprefix("sha256:")
     assert snapshot.runtime.policy_id == CODEX_SUBSCRIPTION_POLICY_ID
     assert snapshot.runtime.policy_digest == CODEX_SUBSCRIPTION_POLICY_SHA256
     assert snapshot.task_network.allow_internet is True
     assert snapshot.task_network.policy_id == "openevo.task-network.v1"
     assert snapshot.serving.kind == "subscription"
     assert snapshot.serving.endpoint is None
-    assert execution_snapshot_id_for_snapshot(snapshot) == (
-        f"exec-{canonical_digest(snapshot)}"
-    )
+    assert execution_snapshot_id_for_snapshot(snapshot) == (f"exec-{canonical_digest(snapshot)}")
 
     encoded = json.dumps(snapshot.model_dump(mode="json"), sort_keys=True)
     for forbidden in (
@@ -170,7 +179,6 @@ def test_task_network_policy_is_part_of_the_snapshot_identity() -> None:
     [
         ({"capture_mode": "proxy"}, "subscription_capture_invalid"),
         ({"harness_id": "claude-code"}, "subscription_harness_invalid"),
-        ({"execution_mode": "self_deployed"}, "self_deployed_execution_unavailable"),
     ],
 )
 def test_unsupported_execution_profiles_fail_with_typed_unavailable(
@@ -208,6 +216,57 @@ def test_unavailable_or_mismatched_managed_runtime_fails_closed() -> None:
             service_binding=_binding(codex_model="gpt-5.5"),
         )
     assert wrong_model.value.code == "managed_runtime_model_mismatch"
+
+
+def test_self_deployed_genesis_issues_exact_hugging_face_and_vllm_snapshot() -> None:
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    binding = _binding(execution_mode=ServiceExecutionMode.SELF_DEPLOYED)
+    verified = resolve_genesis_execution_snapshot(
+        settings=_settings(
+            execution_mode="self-deployed",
+            model_ref=profile.model_id,
+            token_limit=8192,
+        ),
+        service_binding=binding,
+    )
+
+    assert verified.producer_id == "self-deployed-snapshot-issuer-v1"
+    snapshot = verified.snapshot
+    assert snapshot.execution_mode == "self_deployed"
+    assert snapshot.capture_mode == "transcript"
+    assert snapshot.token_level_metrics_available is False
+    assert snapshot.model.source == "hugging_face"
+    assert snapshot.model.model_id == profile.model_id
+    assert snapshot.model.model_revision == profile.model_revision
+    assert snapshot.model.token_limit == 8192
+    assert snapshot.runtime.kind == "managed_runtime"
+    assert snapshot.runtime.snapshot.content_digest == binding.runtime_identity_digest
+    assert snapshot.serving.kind == "managed_deployment"
+    assert snapshot.serving.deployment_id == "vllm-qwen3-0.6b-v1"
+    assert snapshot.serving.endpoint is None
+
+
+def test_self_deployed_snapshot_rejects_wrong_binding_or_model() -> None:
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    settings = _settings(
+        execution_mode="self-deployed",
+        model_ref=profile.model_id,
+        token_limit=8192,
+    )
+    with pytest.raises(EffectiveExecutionSnapshotUnavailable) as wrong_binding:
+        resolve_genesis_execution_snapshot(settings=settings, service_binding=_binding())
+    assert wrong_binding.value.code == "self_deployed_runtime_identity_unavailable"
+
+    with pytest.raises(EffectiveExecutionSnapshotUnavailable) as wrong_model:
+        resolve_genesis_execution_snapshot(
+            settings=_settings(
+                execution_mode="self-deployed",
+                model_ref="Qwen/Qwen3-1.7B",
+                token_limit=8192,
+            ),
+            service_binding=_binding(execution_mode=ServiceExecutionMode.SELF_DEPLOYED),
+        )
+    assert wrong_model.value.code == "self_deployed_model_mismatch"
 
 
 @pytest.mark.parametrize(

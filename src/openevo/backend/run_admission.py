@@ -12,7 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from openevo.backend.runtime_identity import (
     RuntimeIdentityError,
+    require_managed_self_deployed_runtime_identity,
     require_managed_subscription_runtime_identity,
+)
+from openevo.backend.self_deployed_snapshot_issuer import (
+    SelfDeployedSnapshotIssueError,
+    _issue_self_deployed_snapshot,
 )
 from openevo.backend.subscription_snapshot_issuer import (
     SubscriptionSnapshotIssueError,
@@ -59,7 +64,7 @@ class EffectiveExecutionSettings(BaseModel):
 
     execution_mode: Literal[
         "codex_subscription_transcript",
-        "self_deployed",
+        "self-deployed",
     ]
     capture_mode: Literal["transcript", "proxy", "token_level"]
     harness_id: str
@@ -92,21 +97,27 @@ class EffectiveExecutionSnapshotUnavailable(RuntimeError):
             "managed_runtime_model_mismatch": (
                 "The verified managed runtime does not match the desired Subscription model."
             ),
-            "self_deployed_execution_unavailable": (
-                "Self-Deployed execution is unavailable until its verified issuer is ready."
+            "self_deployed_runtime_identity_unavailable": (
+                "The verified managed Self-Deployed runtime identity is unavailable."
+            ),
+            "self_deployed_capture_invalid": (
+                "Self-Deployed execution requires transcript capture."
+            ),
+            "self_deployed_harness_invalid": (
+                "The effective Self-Deployed harness must be Codex."
+            ),
+            "self_deployed_model_mismatch": (
+                "The verified Self-Deployed serving profile does not match the project."
+            ),
+            "self_deployed_snapshot_invalid": (
+                "The effective Self-Deployed snapshot could not be sealed."
             ),
             "subscription_capture_invalid": (
                 "Codex Subscription execution requires transcript capture."
             ),
-            "subscription_harness_invalid": (
-                "The effective Subscription harness must be Codex."
-            ),
-            "subscription_model_invalid": (
-                "The desired Subscription model identity is invalid."
-            ),
-            "task_network_policy_invalid": (
-                "The effective task-network policy is invalid."
-            ),
+            "subscription_harness_invalid": ("The effective Subscription harness must be Codex."),
+            "subscription_model_invalid": ("The desired Subscription model identity is invalid."),
+            "task_network_policy_invalid": ("The effective task-network policy is invalid."),
             "subscription_snapshot_invalid": (
                 "The effective Subscription snapshot could not be sealed."
             ),
@@ -152,11 +163,42 @@ def _resolve_effective_execution_snapshot(
     if type(settings) is not EffectiveExecutionSettings:
         raise TypeError("effective execution settings must be a closed settings object")
     settings = EffectiveExecutionSettings.model_validate(settings.model_dump(mode="python"))
-    if settings.execution_mode == "self_deployed":
-        raise EffectiveExecutionSnapshotUnavailable(
-            "self_deployed_execution_unavailable",
-            retryable=False,
-        )
+    if settings.execution_mode == "self-deployed":
+        if settings.capture_mode != "transcript":
+            raise EffectiveExecutionSnapshotUnavailable(
+                "self_deployed_capture_invalid",
+                retryable=False,
+            )
+        if settings.harness_id != "codex":
+            raise EffectiveExecutionSnapshotUnavailable(
+                "self_deployed_harness_invalid",
+                retryable=False,
+            )
+        try:
+            runtime = require_managed_self_deployed_runtime_identity(service_binding)
+        except RuntimeIdentityError as exc:
+            raise EffectiveExecutionSnapshotUnavailable(
+                "self_deployed_runtime_identity_unavailable",
+                retryable=True,
+            ) from exc
+        try:
+            return _issue_self_deployed_snapshot(
+                runtime=runtime,
+                capture_mode=settings.capture_mode,
+                harness_id=settings.harness_id,
+                model_ref=settings.model_ref,
+                token_limit=settings.token_limit,
+                task_network_allow_internet=settings.task_network_allow_internet,
+            )
+        except SelfDeployedSnapshotIssueError as exc:
+            raise EffectiveExecutionSnapshotUnavailable(
+                exc.code,
+                retryable=exc.code
+                in {
+                    "self_deployed_runtime_identity_unavailable",
+                    "self_deployed_snapshot_invalid",
+                },
+            ) from exc
     if settings.capture_mode != "transcript":
         raise EffectiveExecutionSnapshotUnavailable(
             "subscription_capture_invalid",

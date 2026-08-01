@@ -109,15 +109,11 @@ def _successor_dataset_idempotency_key(
             "schema_version": "1",
             "project_id": context.task.project_id,
             "task_id": context.task.task_id,
-            "task_admission_id": (
-                context.task.admission.task_admission_id
-            ),
+            "task_admission_id": (context.task.admission.task_admission_id),
             "accepted_attempt_id": context.accepted_attempt.attempt_id,
             "rollout_task_id": record.receipt.rollout_task_id,
             "session_id": record.receipt.session_id,
-            "session_result_sha256": (
-                record.evidence.session_result_sha256
-            ),
+            "session_result_sha256": (record.evidence.session_result_sha256),
         }
     )
     return f"science-successor-dataset-{identity}"
@@ -281,9 +277,7 @@ class ProductionScienceSuccessorPreparerV2:
                         "event_types": ["openevo.session_completed"],
                         "status": ["COMPLETED"],
                         "policy_version": record.evidence.policy_version,
-                        "source_event_id": (
-                            f"session:{record.receipt.session_id}"
-                        ),
+                        "source_event_id": (f"session:{record.receipt.session_id}"),
                         "task_id": record.receipt.rollout_task_id,
                         "session_id": record.receipt.session_id,
                     },
@@ -375,11 +369,7 @@ class ProductionScienceSuccessorPreparerV2:
             "task_id": receipt.rollout_task_id,
             "session_id": receipt.session_id,
         }
-        expected_query = {
-            key: value
-            for key, value in expected_query.items()
-            if value is not None
-        }
+        expected_query = {key: value for key, value in expected_query.items() if value is not None}
         if (
             dataset.event_count != 1
             or dataset.trace_count != expected_record_count
@@ -389,12 +379,10 @@ class ProductionScienceSuccessorPreparerV2:
             or artifact.state is not ArtifactState.ACTIVE
             or artifact.promoted is not True
             or artifact.name != expected_name
-            or artifact.compatibility
-            != {"purpose": "openevo_science_successor_v2"}
+            or artifact.compatibility != {"purpose": "openevo_science_successor_v2"}
             or manifest.get("dataset_id") != dataset.dataset_id
             or manifest.get("name") != expected_name
-            or manifest.get("purpose")
-            != "openevo_science_successor_v2"
+            or manifest.get("purpose") != "openevo_science_successor_v2"
             or manifest.get("query") != expected_query
             or manifest.get("limits")
             != {
@@ -418,8 +406,7 @@ class ProductionScienceSuccessorPreparerV2:
                 manifest["records_sha256"],
             )
             is None
-            or manifest.get("create_identity")
-            != expected_idempotency_key
+            or manifest.get("create_identity") != expected_idempotency_key
             or source_event_evidence
             != {
                 "event_id": event_ids[0],
@@ -485,12 +472,8 @@ class ProductionScienceSuccessorPreparerV2:
                     client,
                     spec=spec,
                     legacy_payload=legacy_payload,
-                    transition_attempt_id=(
-                        context.transition_attempt.transition_attempt_id
-                    ),
-                    transition_attempt_ordinal=(
-                        context.transition_attempt.ordinal
-                    ),
+                    transition_attempt_id=(context.transition_attempt.transition_attempt_id),
+                    transition_attempt_ordinal=(context.transition_attempt.ordinal),
                     successor_transition_id=(
                         context.transition.transition.successor_transition_id
                     ),
@@ -533,26 +516,18 @@ class ProductionScienceSuccessorPreparerV2:
                 inherited,
                 _prior_owner_by_target,
             ) = self._prior_context_artifacts(context, client)
-        composition_by_target = {
-            item.target_id: item
-            for item in inherited
-        }
-        transition_id = (
-            context.transition.transition.successor_transition_id
-        )
+        composition_by_target = {item.target_id: item for item in inherited}
+        transition_id = context.transition.transition.successor_transition_id
         for output in outputs:
-            composition_by_target[output.target_id] = (
-                SuccessorArtifactContributionV2(
-                    target_id=output.target_id,
-                    artifact_id=output.artifact_id,
-                    artifact_type=output.artifact_type,
-                    owner_successor_transition_id=transition_id,
-                    origin="produced",
-                )
+            composition_by_target[output.target_id] = SuccessorArtifactContributionV2(
+                target_id=output.target_id,
+                artifact_id=output.artifact_id,
+                artifact_type=output.artifact_type,
+                owner_successor_transition_id=transition_id,
+                origin="produced",
             )
         composition = tuple(
-            composition_by_target[target_id]
-            for target_id in sorted(composition_by_target)
+            composition_by_target[target_id] for target_id in sorted(composition_by_target)
         )
         if not context.plan.enabled_methods:
             predecessor_revision = (
@@ -570,15 +545,10 @@ class ProductionScienceSuccessorPreparerV2:
                 evolution_revision=predecessor_revision,
             )
         manifest = {
-            "artifacts": [
-                item.model_dump(mode="json")
-                for item in composition
-            ],
+            "artifacts": [item.model_dump(mode="json") for item in composition],
             "dataset": dataset.model_dump(mode="json"),
             "evolution_revision_contract_version": "2",
-            "method_outputs": [
-                item.model_dump(mode="json") for item in outputs
-            ],
+            "method_outputs": [item.model_dump(mode="json") for item in outputs],
             "predecessor_evolution_revision": (
                 context.task.admission.predecessor_project_head.evolution_revision.model_dump(
                     mode="json"
@@ -622,12 +592,9 @@ class ProductionScienceSuccessorPreparerV2:
             )
         record, _result, project = self._authority(context)
         assert record.evidence is not None
-        output_ids = tuple(
-            item.artifact_id for item in validated.composition
-        )
+        output_ids = tuple(item.artifact_id for item in validated.composition)
         owner_transition_ids = tuple(
-            item.owner_successor_transition_id
-            for item in validated.composition
+            item.owner_successor_transition_id for item in validated.composition
         )
         with self._evolution(context, record, project) as (_binding, client):
             request = ContextProjectionResolveRequest(
@@ -639,7 +606,13 @@ class ProductionScienceSuccessorPreparerV2:
                 ),
                 agent={
                     "harness": "codex",
-                    "settings": {"auth_mode": "subscription"},
+                    "settings": {
+                        "auth_mode": (
+                            "subscription"
+                            if project.config.execution.mode == "codex_subscription_transcript"
+                            else "proxy"
+                        )
+                    },
                 },
                 base_model=project.config.execution.codex_model,
                 policy_version=record.evidence.policy_version,
@@ -652,9 +625,7 @@ class ProductionScienceSuccessorPreparerV2:
                     ],
                     "evolution": {
                         "context_artifact_ids": output_ids,
-                        "context_artifact_owner_transition_ids": (
-                            owner_transition_ids
-                        ),
+                        "context_artifact_owner_transition_ids": (owner_transition_ids),
                     },
                 },
                 execution_profile=execution_profile_for_release_mode(
@@ -729,29 +700,18 @@ class ProductionScienceSuccessorPreparerV2:
         context: ScienceSuccessorPreparationContextV2,
         validated: ValidatedScienceOutputsV2,
     ) -> SuccessorMaterializationV2:
-        predecessor = (
-            context.task.admission.predecessor_project_head
-        )
-        artifact_ids = tuple(
-            item.artifact_id for item in validated.composition
-        )
+        predecessor = context.task.admission.predecessor_project_head
+        artifact_ids = tuple(item.artifact_id for item in validated.composition)
         if (
             validated.outputs
-            or any(
-                item.origin != "inherited"
-                for item in validated.composition
-            )
-            or validated.evolution_revision
-            != predecessor.evolution_revision
-            or len(artifact_ids)
-            != predecessor.evolution_revision.artifact_count
+            or any(item.origin != "inherited" for item in validated.composition)
+            or validated.evolution_revision != predecessor.evolution_revision
+            or len(artifact_ids) != predecessor.evolution_revision.artifact_count
         ):
             raise ScienceSuccessorPreparationV2Error(
                 "no-evolution successor changed predecessor evolution authority"
             )
-        commit = self._ledger.successor_commit_for_project_head(
-            predecessor.project_head_id
-        )
+        commit = self._ledger.successor_commit_for_project_head(predecessor.project_head_id)
         runtime_source: str
         source_transition_id: str | None
         source_predecessor_id: str | None
@@ -773,105 +733,65 @@ class ProductionScienceSuccessorPreparerV2:
             materialized_manifest_sha256 = None
         else:
             manifest = commit.manifest
-            if (
-                manifest.method_artifact_ids != artifact_ids
-                or (
-                    manifest.artifacts
-                    and tuple(
-                        (
-                            item.target_id,
-                            item.artifact_id,
-                            item.artifact_type,
-                            item.owner_successor_transition_id,
-                        )
-                        for item in manifest.artifacts
+            if manifest.method_artifact_ids != artifact_ids or (
+                manifest.artifacts
+                and tuple(
+                    (
+                        item.target_id,
+                        item.artifact_id,
+                        item.artifact_type,
+                        item.owner_successor_transition_id,
                     )
-                    != tuple(
-                        (
-                            item.target_id,
-                            item.artifact_id,
-                            item.artifact_type,
-                            item.owner_successor_transition_id,
-                        )
-                        for item in validated.composition
+                    for item in manifest.artifacts
+                )
+                != tuple(
+                    (
+                        item.target_id,
+                        item.artifact_id,
+                        item.artifact_type,
+                        item.owner_successor_transition_id,
                     )
+                    for item in validated.composition
                 )
             ):
                 raise ScienceSuccessorPreparationV2Error(
                     "no-evolution successor artifact receipt changed"
                 )
             if type(manifest) is AtomicSuccessorManifestV2:
-                if (
-                    manifest.runtime_context_source
-                    == "materialized_new"
-                ):
+                if manifest.runtime_context_source == "materialized_new":
                     runtime_source = "materialized_inherited"
-                    source_transition_id = (
-                        manifest.successor_transition_id
-                    )
-                    source_predecessor_id = (
-                        manifest.predecessor_project_head_id
-                    )
-                    materialized_context_id = (
-                        manifest.materialized_context_id
-                    )
-                    materialized_manifest_sha256 = (
-                        manifest.materialized_context_manifest_sha256
-                    )
+                    source_transition_id = manifest.successor_transition_id
+                    source_predecessor_id = manifest.predecessor_project_head_id
+                    materialized_context_id = manifest.materialized_context_id
+                    materialized_manifest_sha256 = manifest.materialized_context_manifest_sha256
                 else:
                     runtime_source = manifest.runtime_context_source
-                    source_transition_id = (
-                        manifest.materialized_source_successor_transition_id
-                    )
+                    source_transition_id = manifest.materialized_source_successor_transition_id
                     source_predecessor_id = (
                         manifest.materialized_source_predecessor_project_head_id
                     )
-                    materialized_context_id = (
-                        manifest.materialized_context_id
-                    )
-                    materialized_manifest_sha256 = (
-                        manifest.materialized_context_manifest_sha256
-                    )
+                    materialized_context_id = manifest.materialized_context_id
+                    materialized_manifest_sha256 = manifest.materialized_context_manifest_sha256
             elif type(manifest) is AtomicEvolutionAbandonManifestV2:
                 runtime_source = manifest.runtime_context_source
-                source_transition_id = (
-                    manifest.materialized_source_successor_transition_id
-                )
-                source_predecessor_id = (
-                    manifest.materialized_source_predecessor_project_head_id
-                )
-                materialized_context_id = (
-                    manifest.materialized_context_id
-                )
-                materialized_manifest_sha256 = (
-                    manifest.materialized_context_manifest_sha256
-                )
+                source_transition_id = manifest.materialized_source_successor_transition_id
+                source_predecessor_id = manifest.materialized_source_predecessor_project_head_id
+                materialized_context_id = manifest.materialized_context_id
+                materialized_manifest_sha256 = manifest.materialized_context_manifest_sha256
             else:  # pragma: no cover - closed receipt union
                 raise ScienceSuccessorPreparationV2Error(
                     "no-evolution successor receipt type is unsupported"
                 )
         return SuccessorMaterializationV2(
             project_id=context.task.project_id,
-            successor_transition_id=(
-                context.transition.transition.successor_transition_id
-            ),
-            predecessor_project_head_id=(
-                predecessor.project_head_id
-            ),
+            successor_transition_id=(context.transition.transition.successor_transition_id),
+            predecessor_project_head_id=(predecessor.project_head_id),
             runtime_context_source=runtime_source,
-            materialized_source_successor_transition_id=(
-                source_transition_id
-            ),
-            materialized_source_predecessor_project_head_id=(
-                source_predecessor_id
-            ),
+            materialized_source_successor_transition_id=(source_transition_id),
+            materialized_source_predecessor_project_head_id=(source_predecessor_id),
             materialized_context_id=materialized_context_id,
-            materialized_context_manifest_sha256=(
-                materialized_manifest_sha256
-            ),
-            runtime_context_snapshot=(
-                predecessor.runtime_context_snapshot
-            ),
+            materialized_context_manifest_sha256=(materialized_manifest_sha256),
+            runtime_context_snapshot=(predecessor.runtime_context_snapshot),
         )
 
     def capture_workspace_result(
@@ -981,30 +901,19 @@ class ProductionScienceSuccessorPreparerV2:
         """Discard non-active outputs after the Core has committed abandon."""
 
         self._require_running()
-        record, _result, project = self._cleanup_authority(
-            context
-        )
-        transition_id = (
-            context.transition.transition.successor_transition_id
-        )
+        record, _result, project = self._cleanup_authority(context)
+        transition_id = context.transition.transition.successor_transition_id
         with self._evolution(context, record, project) as (_binding, client):
-            raw = client.discard_successor_transition_outputs(
-                transition_id
-            )
+            raw = client.discard_successor_transition_outputs(transition_id)
         self._require_running()
-        discarded = (
-            raw.get("discarded_artifact_ids")
-            if type(raw) is dict
-            else None
-        )
+        discarded = raw.get("discarded_artifact_ids") if type(raw) is dict else None
         discarded_contexts = (
-            raw.get("discarded_materialized_context_ids")
-            if type(raw) is dict
-            else None
+            raw.get("discarded_materialized_context_ids") if type(raw) is dict else None
         )
         if (
             type(raw) is not dict
-            or set(raw) != {
+            or set(raw)
+            != {
                 "successor_transition_id",
                 "discarded_artifact_ids",
                 "discarded_materialized_context_ids",
@@ -1013,16 +922,14 @@ class ProductionScienceSuccessorPreparerV2:
             or not isinstance(discarded, list)
             or not isinstance(discarded_contexts, list)
             or any(
-                not isinstance(artifact_id, str) or not artifact_id
-                for artifact_id in discarded
+                not isinstance(artifact_id, str) or not artifact_id for artifact_id in discarded
             )
             or any(
                 not isinstance(context_id, str) or not context_id
                 for context_id in discarded_contexts
             )
             or len(discarded) != len(set(discarded))
-            or len(discarded_contexts)
-            != len(set(discarded_contexts))
+            or len(discarded_contexts) != len(set(discarded_contexts))
         ):
             raise ScienceSuccessorPreparationV2Error(
                 "discard receipt differs from the requested transition"
@@ -1031,9 +938,7 @@ class ProductionScienceSuccessorPreparerV2:
             return ScienceSuccessorCleanupReceiptV2(
                 successor_transition_id=transition_id,
                 discarded_artifact_ids=tuple(discarded),
-                discarded_materialized_context_ids=tuple(
-                    discarded_contexts
-                ),
+                discarded_materialized_context_ids=tuple(discarded_contexts),
             )
         except ValueError as exc:
             raise ScienceSuccessorPreparationV2Error(
@@ -1053,15 +958,12 @@ class ProductionScienceSuccessorPreparerV2:
         context: ScienceSuccessorCleanupContextV2,
     ) -> tuple[ScienceAttemptExecutionRecordV2, Any, ProjectRecordV2]:
         if type(context) is not ScienceSuccessorCleanupContextV2:
-            raise TypeError(
-                "v2 successor cleanup requires its exact context"
-            )
+            raise TypeError("v2 successor cleanup requires its exact context")
         return self._validated_authority(context)
 
     def _validated_authority(
         self,
-        context: ScienceSuccessorPreparationContextV2
-        | ScienceSuccessorCleanupContextV2,
+        context: ScienceSuccessorPreparationContextV2 | ScienceSuccessorCleanupContextV2,
     ) -> tuple[ScienceAttemptExecutionRecordV2, Any, ProjectRecordV2]:
         record = self._ledger.get_attempt_execution(
             context.task.task_id,
@@ -1089,18 +991,25 @@ class ProductionScienceSuccessorPreparerV2:
     @contextmanager
     def _evolution(
         self,
-        context: ScienceSuccessorPreparationContextV2
-        | ScienceSuccessorCleanupContextV2,
+        context: ScienceSuccessorPreparationContextV2 | ScienceSuccessorCleanupContextV2,
         record: ScienceAttemptExecutionRecordV2,
         project: ProjectRecordV2,
     ) -> Iterator[tuple[ServiceRunBinding, EvolutionClientProtocol]]:
         self._require_running()
         assert record.receipt is not None
-        snapshot, lease = self._services.ensure_run_binding(
-            ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-            codex_model=project.config.execution.codex_model,
-            runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
-        )
+        if project.config.execution.mode == "self-deployed":
+            snapshot, lease = self._services.ensure_run_binding(
+                ServiceExecutionMode.SELF_DEPLOYED,
+                model_ref=project.config.execution.model_profile_id,
+                runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+                total_timeout=7200.0,
+            )
+        else:
+            snapshot, lease = self._services.ensure_run_binding(
+                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                codex_model=project.config.execution.codex_model,
+                runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+            )
         binding = getattr(lease, "binding", None)
         if (
             lease is None
@@ -1208,32 +1117,24 @@ class ProductionScienceSuccessorPreparerV2:
                 "predecessor context has an unsupported commit receipt"
             )
         stored_contributions = manifest.artifacts
-        if stored_contributions and tuple(
-            item.artifact_id for item in stored_contributions
-        ) != manifest.method_artifact_ids:
+        if (
+            stored_contributions
+            and tuple(item.artifact_id for item in stored_contributions)
+            != manifest.method_artifact_ids
+        ):
             raise ScienceSuccessorPreparationV2Error(
                 "predecessor artifact composition differs from its receipt"
             )
         if type(manifest) is AtomicSuccessorManifestV2:
             legacy_owner = manifest.successor_transition_id
         else:
-            legacy_owner = (
-                manifest.materialized_source_successor_transition_id
-            )
+            legacy_owner = manifest.materialized_source_successor_transition_id
         contributions: list[SuccessorArtifactContributionV2] = []
         owner_by_target: dict[str, str] = {}
-        for index, artifact_id in enumerate(
-            manifest.method_artifact_ids
-        ):
-            stored = (
-                None
-                if not stored_contributions
-                else stored_contributions[index]
-            )
+        for index, artifact_id in enumerate(manifest.method_artifact_ids):
+            stored = None if not stored_contributions else stored_contributions[index]
             owner_transition_id = (
-                legacy_owner
-                if stored is None
-                else stored.owner_successor_transition_id
+                legacy_owner if stored is None else stored.owner_successor_transition_id
             )
             if owner_transition_id is None:
                 raise ScienceSuccessorPreparationV2Error(
@@ -1259,9 +1160,7 @@ class ProductionScienceSuccessorPreparerV2:
                 target_id = candidate_targets[0]
             else:
                 target_id = stored.target_id
-                target = self._registry.snapshot.targets.get(
-                    target_id
-                )
+                target = self._registry.snapshot.targets.get(target_id)
                 if (
                     stored.artifact_id != artifact_id
                     or stored.artifact_type != artifact_type
@@ -1293,9 +1192,7 @@ class ProductionScienceSuccessorPreparerV2:
                     target_id=target_id,
                     artifact_id=artifact_id,
                     artifact_type=artifact_type,
-                    owner_successor_transition_id=(
-                        owner_transition_id
-                    ),
+                    owner_successor_transition_id=(owner_transition_id),
                     origin="inherited",
                 )
             )
@@ -1332,9 +1229,7 @@ class ProductionScienceSuccessorPreparerV2:
             spec,
             legacy_payload,
             successor_transition_id=successor_transition_id,
-            predecessor_successor_transition_id=(
-                predecessor_successor_transition_id
-            ),
+            predecessor_successor_transition_id=(predecessor_successor_transition_id),
         )
         created = JobCreateResponse.model_validate(
             client.create_plan_bound_job(request.model_dump(mode="json"))
@@ -1419,8 +1314,7 @@ class ProductionScienceSuccessorPreparerV2:
         if (
             terminal.get("job_id") != created.job_id
             or terminal.get("error") is not None
-            or terminal.get("successor_transition_id")
-            != successor_transition_id
+            or terminal.get("successor_transition_id") != successor_transition_id
         ):
             raise ScienceSuccessorPreparationV2Error(
                 "managed evolution terminal identity is invalid"
@@ -1502,9 +1396,7 @@ def _plan_bound_request(
         job_type=spec.method,
         input_bindings=tuple(bindings),
         successor_transition_id=successor_transition_id,
-        predecessor_successor_transition_id=(
-            predecessor_successor_transition_id
-        ),
+        predecessor_successor_transition_id=(predecessor_successor_transition_id),
         core_config=core_config,
         priority=100,
     )

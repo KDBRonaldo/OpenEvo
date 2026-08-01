@@ -524,10 +524,16 @@ def discover_docker_host_path(
             if (
                 not stat.S_ISDIR(metadata.st_mode)
                 or destination_path.resolve(strict=True) != destination_path
-                or not os.access(destination_path, os.W_OK | os.X_OK)
             ):
                 continue
-            filesystem = os.statvfs(destination_path)
+            private_parent = destination_path / f".openevo-runtime-{os.geteuid()}"
+            mount_is_writable = os.access(destination_path, os.W_OK | os.X_OK)
+            if not mount_is_writable and not _is_usable_preprovisioned_private_directory(
+                private_parent,
+                os.geteuid(),
+            ):
+                continue
+            filesystem = os.statvfs(destination_path if mount_is_writable else private_parent)
             available = filesystem.f_bavail * filesystem.f_frsize
             if available < minimum_available_bytes:
                 continue
@@ -677,6 +683,22 @@ def _ensure_private_directory(path: Path, uid: int) -> None:
     )
     if path.resolve(strict=True) != path or metadata.st_nlink < 2:
         raise DockerHostPathError("runtime Docker data root is not private")
+
+
+def _is_usable_preprovisioned_private_directory(path: Path, uid: int) -> bool:
+    try:
+        metadata = _private_directory_metadata(
+            path,
+            expected_uid=uid,
+            require_private=True,
+        )
+        return (
+            path.resolve(strict=True) == path
+            and metadata.st_nlink >= 2
+            and os.access(path, os.W_OK | os.X_OK)
+        )
+    except (DockerHostPathError, OSError):
+        return False
 
 
 def _private_directory_metadata(

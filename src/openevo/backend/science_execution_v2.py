@@ -84,6 +84,7 @@ _ERROR_CODE_PATTERN = r"^[a-z][a-z0-9_]{0,127}$"
 MAX_CAPTURED_SESSION_RESULT_BYTES = 64 * 1024 * 1024
 _MAX_CAPTURED_RESULT_NODES = 1_000_000
 _MAX_CAPTURED_RESULT_DEPTH = 64
+_MANAGED_PROXY_CODEX_HOME = f"{MANAGED_HOME}/.codex"
 
 
 class ScienceAttemptExecutionV2Error(RuntimeError):
@@ -242,6 +243,12 @@ def compile_science_attempt_v2(
     )
     registry = require_verified_executable_registry(executable_registry)
     config = project.config
+    subscription = config.execution.mode == "codex_subscription_transcript"
+    expected_service_mode = (
+        ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        if subscription
+        else ServiceExecutionMode.SELF_DEPLOYED
+    )
     admission = task.admission
     predecessor = admission.predecessor_project_head
     if (
@@ -259,7 +266,7 @@ def compile_science_attempt_v2(
         or workspace_handoff.admission_sha256 != admission.admission_sha256
         or workspace_handoff.project_id != task.project_id
         or workspace_handoff.input_workspace_snapshot != admission.workspace_snapshot
-        or binding.execution_mode is not ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT
+        or binding.execution_mode is not expected_service_mode
         or binding.codex_model != config.execution.codex_model
         or binding.registry_digest != admission.registry_sha256
         or workspace_handoff.service_generation_sha256 != binding.generation_digest
@@ -335,7 +342,18 @@ def compile_science_attempt_v2(
                     command=MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
                 )
             ],
-            env={"HOME": MANAGED_HOME, "PATH": MANAGED_PATH},
+            env={
+                "HOME": MANAGED_HOME,
+                "PATH": MANAGED_PATH,
+                **(
+                    {}
+                    if subscription
+                    else {
+                        "CODEX_HOME": _MANAGED_PROXY_CODEX_HOME,
+                        "OPENEVO_MANAGED_HF_MODEL": config.execution.codex_model,
+                    }
+                ),
+            },
             network="host",
             workdir=MANAGED_WORKSPACE,
             allow_internet=config.execution.task_network_allow_internet,
@@ -344,14 +362,18 @@ def compile_science_attempt_v2(
             harness="codex",
             model_name=config.execution.codex_model,
             settings={
-                "auth_mode": "subscription",
+                "auth_mode": "subscription" if subscription else "proxy",
                 "capture_mode": "transcript",
                 **(
                     {"reasoning_effort": config.execution.reasoning_effort}
-                    if config.execution.reasoning_effort is not None
+                    if subscription and config.execution.reasoning_effort is not None
                     else {}
                 ),
-                CODEX_SUBSCRIPTION_CONTRACT_KEY: codex_subscription_contract(),
+                **(
+                    {CODEX_SUBSCRIPTION_CONTRACT_KEY: (codex_subscription_contract())}
+                    if subscription
+                    else {}
+                ),
             },
         ),
         builder=StrategySpec(strategy="agent_transcript"),
@@ -405,6 +427,7 @@ def compile_science_evolution_experiment_v2(
 ) -> CompiledExperiment:
     del prior_dataset_artifact_ids
     config = project.config
+    subscription = config.execution.mode == "codex_subscription_transcript"
     experiment = ExperimentConfig.model_validate(
         {
             "version": 1,
@@ -412,18 +435,18 @@ def compile_science_evolution_experiment_v2(
             "agent": {
                 "preset": "codex",
                 "model": config.execution.codex_model,
-                "auth": "subscription",
+                "auth": "subscription" if subscription else "proxy",
                 "provider": "codex_cli",
                 "settings": {
-                    "auth_mode": "subscription",
+                    "auth_mode": "subscription" if subscription else "proxy",
                     "capture_mode": "transcript",
                     **(
                         {"reasoning_effort": config.execution.reasoning_effort}
-                        if config.execution.reasoning_effort is not None
+                        if subscription and config.execution.reasoning_effort is not None
                         else {}
                     ),
                 },
-                "env": {},
+                "env": ({} if subscription else {"CODEX_HOME": _MANAGED_PROXY_CODEX_HOME}),
             },
             "tasks": [
                 {
@@ -438,7 +461,18 @@ def compile_science_evolution_experiment_v2(
                 "container_user": "host",
                 "workdir": MANAGED_WORKSPACE,
                 "image": binding.runtime_image_immutable_reference,
-                "env": {"HOME": MANAGED_HOME, "PATH": MANAGED_PATH},
+                "env": {
+                    "HOME": MANAGED_HOME,
+                    "PATH": MANAGED_PATH,
+                    **(
+                        {}
+                        if subscription
+                        else {
+                            "CODEX_HOME": _MANAGED_PROXY_CODEX_HOME,
+                            "OPENEVO_MANAGED_HF_MODEL": config.execution.codex_model,
+                        }
+                    ),
+                },
                 "prepare": [
                     {
                         "type": "exec",
@@ -563,11 +597,19 @@ class ScienceAttemptExecutorV2:
         submitted = False
         terminal_received = False
         try:
-            snapshot, service_lease = self._services.ensure_run_binding(
-                ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-                codex_model=config.execution.codex_model,
-                runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
-            )
+            if config.execution.mode == "self-deployed":
+                snapshot, service_lease = self._services.ensure_run_binding(
+                    ServiceExecutionMode.SELF_DEPLOYED,
+                    model_ref=config.execution.model_profile_id,
+                    runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+                    total_timeout=7200.0,
+                )
+            else:
+                snapshot, service_lease = self._services.ensure_run_binding(
+                    ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                    codex_model=config.execution.codex_model,
+                    runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+                )
             binding = getattr(service_lease, "binding", None)
             if (
                 service_lease is None
@@ -912,8 +954,7 @@ def _validate_runtime_context_terminal_metadata(
     head = binding.project_head
     expected_evolution = {
         "context_id": binding.materialized_context_id,
-        "context_injected": binding.source
-        in {"materialized_successor", "materialized_inherited"},
+        "context_injected": binding.source in {"materialized_successor", "materialized_inherited"},
         "context_source": binding.source,
         "runtime_context_snapshot_id": (head.runtime_context_snapshot.runtime_context_snapshot_id),
     }

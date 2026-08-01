@@ -254,9 +254,7 @@ class TaskAdmissionRefV2(ContractModel):
         if self.workspace_snapshot.project_id != self.project_id:
             raise ValueError("workspace snapshot belongs to another project")
         if self.workspace_snapshot != self.predecessor_project_head.workspace_snapshot:
-            raise ValueError(
-                "workspace snapshot differs from the predecessor project head"
-            )
+            raise ValueError("workspace snapshot differs from the predecessor project head")
         if self.registry_sha256 != self.predecessor_project_head.registry_sha256:
             raise ValueError("admission registry digest differs from the predecessor head")
         if self.admission_sha256 != task_admission_sha256_for(self):
@@ -298,9 +296,7 @@ class SuccessorTransitionRefV2(ContractModel):
     project_id: OpaqueId
     kind: TransitionKindV2
     predecessor_project_head: ProjectHeadRefV2
-    expected_successor_generation: int = Field(
-        ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER
-    )
+    expected_successor_generation: int = Field(ge=1, le=MAX_JAVASCRIPT_SAFE_INTEGER)
     plan_sha256: Sha256Digest
     task_admission: TaskAdmissionRefV2 | None
     accepted_attempt: AttemptRefV2 | None
@@ -363,9 +359,7 @@ class ContractOfferV2(ContractModel):
             self.access != "read_only_migration" or self.mutation_compatible
         ):
             raise ValueError("Core Control API v1 is read-only migration input")
-        if self.api_major == 2 and (
-            (self.access == "mutation") != self.mutation_compatible
-        ):
+        if self.api_major == 2 and ((self.access == "mutation") != self.mutation_compatible):
             raise ValueError("v2 access and mutation compatibility differ")
         return self
 
@@ -482,6 +476,20 @@ class SelfDeployedExecutionSettingsV2(ContractModel):
     model_profile_id: Literal["qwen3-0.6b-v1"]
     token_limit: int = Field(ge=1, le=8_192)
     task_network_allow_internet: bool
+
+    @property
+    def codex_model(self) -> str:
+        """Core-owned concrete model derived from the closed release profile."""
+
+        from openevo.runtime.self_deployed import (
+            require_release_self_deployed_model_profile,
+        )
+
+        return require_release_self_deployed_model_profile(self.model_profile_id).model_id
+
+    @property
+    def reasoning_effort(self) -> None:
+        return None
 
 
 ScienceExecutionSettingsV2: TypeAlias = Annotated[
@@ -799,10 +807,7 @@ class TaskV2(ContractModel):
 
     @model_validator(mode="after")
     def _bind_task_ownership(self) -> TaskV2:
-        if (
-            self.admission.task_id != self.task_id
-            or self.admission.project_id != self.project_id
-        ):
+        if self.admission.task_id != self.task_id or self.admission.project_id != self.project_id:
             raise ValueError("admission does not belong to this task")
         expected_ordinal = 1
         attempt_ids: set[str] = set()

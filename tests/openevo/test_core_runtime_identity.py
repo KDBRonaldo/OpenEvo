@@ -23,7 +23,7 @@ from openevo.backend.runtime_identity import (
 
 def test_release_runtime_contract_identity_is_frozen() -> None:
     assert release_runtime_contract_sha256() == (
-        "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+        "375c62fa7ccc1f5b257eeede9fe9eb95b3d47ee8a6f928f0aca4f0eed7364153"
     )
 
 

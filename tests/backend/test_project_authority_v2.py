@@ -41,6 +41,7 @@ from openevo.evolution.framework import canonical_digest
 from openevo.internal_auth import InternalServiceIdentity
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 from tests.framework_testkit import verified_builtin_registry
 
 
@@ -94,6 +95,20 @@ def _skill_bundle_config() -> ScienceProjectConfigV2:
     return ScienceProjectConfigV2.model_validate(payload)
 
 
+def _self_deployed_config() -> ScienceProjectConfigV2:
+    payload = _config().model_dump(mode="json")
+    payload["execution"] = {
+        "mode": "self-deployed",
+        "capture_mode": "transcript",
+        "token_level_metrics_available": False,
+        "harness_id": "codex",
+        "model_profile_id": "qwen3-0.6b-v1",
+        "token_limit": 8192,
+        "task_network_allow_internet": False,
+    }
+    return ScienceProjectConfigV2.model_validate(payload)
+
+
 def _binding(
     registry_sha256: str,
     *,
@@ -127,21 +142,52 @@ def _binding(
     )
 
 
+def _self_deployed_binding(registry_sha256: str) -> ServiceRunBinding:
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    subscription = _binding(registry_sha256)
+    return ServiceRunBinding(
+        execution_mode=ServiceExecutionMode.SELF_DEPLOYED,
+        codex_model=profile.model_id,
+        runtime_image=subscription.runtime_image,
+        runtime_image_immutable_reference=(subscription.runtime_image_immutable_reference),
+        runtime_identity_digest=subscription.runtime_identity_digest,
+        generation_digest=subscription.generation_digest,
+        registry_digest=subscription.registry_digest,
+        framework_lock_digest=subscription.framework_lock_digest,
+        rollout_url=subscription.rollout_url,
+        evolution_backend_url=subscription.evolution_backend_url,
+        gateway_url=subscription.gateway_url,
+        self_deployed_profile_id=profile.profile_id,
+        self_deployed_profile_sha256=profile.profile_sha256,
+        self_deployed_model_revision=profile.model_revision,
+        self_deployed_model_snapshot_sha256=(profile.model_snapshot_manifest_sha256),
+        self_deployed_vllm_image=profile.vllm_image,
+        self_deployed_vllm_image_config_digest=profile.vllm_image_config_digest,
+        _identity=subscription._identity,
+    )
+
+
 class _Services:
     def __init__(self, binding: ServiceRunBinding | None) -> None:
         self.binding = binding
         self.require_ensure = False
         self.ensured = False
-        self.ensure_calls: list[tuple[object, str | None, str | None]] = []
+        self.ensure_calls: list[
+            tuple[object, str | None, str | None, str | None, float | None]
+        ] = []
 
     def ensure(
         self,
         execution_mode: object,
         *,
+        model_ref: str | None = None,
         codex_model: str | None = None,
         runtime_image: str | None = None,
+        total_timeout: float | None = None,
     ) -> object:
-        self.ensure_calls.append((execution_mode, codex_model, runtime_image))
+        self.ensure_calls.append(
+            (execution_mode, model_ref, codex_model, runtime_image, total_timeout)
+        )
         self.ensured = True
         return object()
 
@@ -159,9 +205,7 @@ class _Runtime:
         self.catalog = CoreControlStoreV2(root / "catalog")
         self.workspaces = WorkspaceStoreV2(root / "workspaces")
         self.owner = CoreScienceTaskOwnerV2(state_root=root, clock=self.clock)
-        self.services = _Services(
-            _binding(self.registry.snapshot.registry_digest)
-        )
+        self.services = _Services(_binding(self.registry.snapshot.registry_digest))
         self.authority = ProjectAuthorityV2(
             catalog_store=self.catalog,
             workspace_store=self.workspaces,
@@ -214,15 +258,9 @@ def test_genesis_is_content_addressed_verified_and_restart_stable(
     assert head.runtime_context_snapshot.registry_sha256 == (
         runtime.registry.snapshot.registry_digest
     )
-    assert head.runtime_context_snapshot.runtime_contract_sha256 == (
-        _RUNTIME_CONTRACT_SHA256
-    )
-    assert head.effective_execution_snapshot.producer_id == (
-        "subscription-snapshot-issuer-v1"
-    )
-    assert head.effective_execution_snapshot.execution_mode == (
-        "codex_subscription_transcript"
-    )
+    assert head.runtime_context_snapshot.runtime_contract_sha256 == (_RUNTIME_CONTRACT_SHA256)
+    assert head.effective_execution_snapshot.producer_id == ("subscription-snapshot-issuer-v1")
+    assert head.effective_execution_snapshot.execution_mode == ("codex_subscription_transcript")
     assert head.effective_execution_snapshot.capture_mode == "transcript"
     assert head.effective_execution_snapshot.token_level_metrics_available is False
     assert head.effective_execution_snapshot.effective_execution_snapshot_id == (
@@ -230,9 +268,7 @@ def test_genesis_is_content_addressed_verified_and_restart_stable(
     )
     assert head.project_head_id == f"project-head-{head.manifest_sha256}"
     assert runtime.owner.project_admission_authority(record.project_id) == authority
-    snapshot = runtime.workspaces.get_snapshot(
-        authority.workspace_snapshot.workspace_snapshot_id
-    )
+    snapshot = runtime.workspaces.get_snapshot(authority.workspace_snapshot.workspace_snapshot_id)
     assert snapshot == authority.workspace_snapshot
 
     runtime.owner.close()
@@ -273,8 +309,37 @@ def test_genesis_ensures_the_managed_subscription_service_group_before_binding(
         assert runtime.services.ensure_calls == [
             (
                 ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                None,
                 "gpt-5.5",
                 MANAGED_RUNTIME_IMAGES["managed_science"],
+                None,
+            )
+        ]
+    finally:
+        runtime.close()
+
+
+def test_genesis_ensures_and_seals_release_self_deployed_profile(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    runtime.services.binding = _self_deployed_binding(runtime.registry.snapshot.registry_digest)
+    runtime.services.require_ensure = True
+    record = runtime.create(_self_deployed_config())
+    try:
+        authority = runtime.authority.ensure_project(record)
+
+        assert authority is not None
+        execution = authority.active_project_head.effective_execution_snapshot
+        assert execution.execution_mode == "self-deployed"
+        assert execution.producer_id == "self-deployed-snapshot-issuer-v1"
+        assert runtime.services.ensure_calls == [
+            (
+                ServiceExecutionMode.SELF_DEPLOYED,
+                "qwen3-0.6b-v1",
+                None,
+                MANAGED_RUNTIME_IMAGES["managed_science"],
+                7200.0,
             )
         ]
     finally:
@@ -290,9 +355,7 @@ def test_unavailable_or_drifted_runtime_is_not_ready_without_partial_head(
     assert runtime.authority.ensure_project(record) is None
     readiness = runtime.authority.readiness(record)
     assert readiness.ready is False
-    assert [check.check_id for check in readiness.checks] == [
-        "managed-subscription-runtime"
-    ]
+    assert [check.check_id for check in readiness.checks] == ["managed-subscription-runtime"]
     assert readiness.checks[0].status == "unavailable"
     with pytest.raises(Exception, match="not found"):
         runtime.owner.project_admission_authority(record.project_id)
@@ -309,9 +372,7 @@ def test_unavailable_or_drifted_runtime_is_not_ready_without_partial_head(
     assert readiness.ready is False
     assert readiness.checks[-1].check_id == "effective-execution-snapshot"
     assert readiness.checks[-1].status == "failed"
-    assert runtime.owner.active_project_head(record.project_id) == (
-        authority.active_project_head
-    )
+    assert runtime.owner.active_project_head(record.project_id) == (authority.active_project_head)
     runtime.close()
 
 
@@ -394,9 +455,7 @@ def test_validation_uses_exact_head_config_registry_and_compiler(tmp_path: Path)
         record,
         ProjectValidationRequestV2(
             expected_project_head_id=authority.active_project_head.project_head_id,
-            expected_project_head_manifest_sha256=(
-                authority.active_project_head.manifest_sha256
-            ),
+            expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
             expected_project_config_sha256=record.project_config_sha256,
             expected_registry_sha256=runtime.registry.snapshot.registry_digest,
         ),
@@ -456,12 +515,8 @@ def test_provider_creates_ready_genesis_and_admits_only_server_derived_pins(
     assert project["active_project_head"]["generation"] == 0
     validation_request = {
         "schema_version": "2",
-        "expected_project_head_id": project["active_project_head"][
-            "project_head_id"
-        ],
-        "expected_project_head_manifest_sha256": project["active_project_head"][
-            "manifest_sha256"
-        ],
+        "expected_project_head_id": project["active_project_head"]["project_head_id"],
+        "expected_project_head_manifest_sha256": project["active_project_head"]["manifest_sha256"],
         "expected_project_config_sha256": project["project_config_sha256"],
         "expected_registry_sha256": runtime.registry.snapshot.registry_digest,
     }
@@ -500,23 +555,17 @@ def test_provider_creates_ready_genesis_and_admits_only_server_derived_pins(
             "schema_version": "2",
             "project_id": project["project_id"],
             "expected_project_admission_etag": project["admission_etag"],
-            "expected_project_head_id": project["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": project["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": project["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": project[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": project["project_config_sha256"],
         },
     )
     assert submit.status_code == 202
     admission = submit.json()["admission"]
-    assert admission["workspace_snapshot"] == project["active_project_head"][
-        "workspace_snapshot"
-    ]
-    assert admission["project_config_sha256"] == project[
-        "project_config_sha256"
-    ]
+    assert admission["workspace_snapshot"] == project["active_project_head"]["workspace_snapshot"]
+    assert admission["project_config_sha256"] == project["project_config_sha256"]
     assert admission["registry_sha256"] == runtime.registry.snapshot.registry_digest
     client.close()
     provider.close()
@@ -577,8 +626,7 @@ def test_provider_native_workspace_upload_publishes_genesis_without_host_paths(
     assert upload.status_code == 201
     session = upload.json()
     chunk = client.put(
-        f"/v2/projects/{project['project_id']}/workspace-uploads/"
-        f"{session['upload_id']}/chunks/0",
+        f"/v2/projects/{project['project_id']}/workspace-uploads/{session['upload_id']}/chunks/0",
         headers={
             "Authorization": auth,
             "If-Match": session["etag"],
@@ -592,8 +640,7 @@ def test_provider_native_workspace_upload_publishes_genesis_without_host_paths(
     assert chunk.status_code == 200
     session = chunk.json()
     finalized = client.post(
-        f"/v2/projects/{project['project_id']}/workspace-uploads/"
-        f"{session['upload_id']}/finalize",
+        f"/v2/projects/{project['project_id']}/workspace-uploads/{session['upload_id']}/finalize",
         headers={
             "Authorization": auth,
             "If-Match": session["etag"],
@@ -614,12 +661,12 @@ def test_provider_native_workspace_upload_publishes_genesis_without_host_paths(
     )
     assert fetched.status_code == 200
     assert fetched.json()["state"] == "ready"
-    assert fetched.json()["active_project_head"]["workspace_snapshot"] == (
-        finalized.json()["workspace_snapshot"]
+    assert (
+        fetched.json()["active_project_head"]["workspace_snapshot"]
+        == (finalized.json()["workspace_snapshot"])
     )
     replayed_finalize = client.post(
-        f"/v2/projects/{project['project_id']}/workspace-uploads/"
-        f"{session['upload_id']}/finalize",
+        f"/v2/projects/{project['project_id']}/workspace-uploads/{session['upload_id']}/finalize",
         headers={
             "Authorization": auth,
             "If-Match": session["etag"],
@@ -654,12 +701,8 @@ def test_provider_project_update_is_etag_bound_idempotent_and_head_safe(
     ).json()
     update_request = {
         "schema_version": "2",
-        "expected_project_head_id": created["active_project_head"][
-            "project_head_id"
-        ],
-        "expected_project_head_manifest_sha256": created["active_project_head"][
-            "manifest_sha256"
-        ],
+        "expected_project_head_id": created["active_project_head"]["project_head_id"],
+        "expected_project_head_manifest_sha256": created["active_project_head"]["manifest_sha256"],
         "expected_project_config_sha256": created["project_config_sha256"],
         "display_name": "After update",
         "config": created["config"],
@@ -719,9 +762,7 @@ def test_provider_project_update_is_etag_bound_idempotent_and_head_safe(
         update={
             "project_head_id": "project-head-replay-successor",
             "generation": 1,
-            "predecessor_project_head_id": (
-                authority.active_project_head.project_head_id
-            ),
+            "predecessor_project_head_id": (authority.active_project_head.project_head_id),
             "manifest_sha256": "b" * 64,
         }
     )
@@ -730,15 +771,9 @@ def test_provider_project_update_is_etag_bound_idempotent_and_head_safe(
         active_project_head=successor,
         project_config_sha256=authority.project_config_sha256,
         workspace_snapshot=successor.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            authority.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
     )
-    database = (
-        tmp_path
-        / "science-tasks-v2"
-        / "science-tasks-v2.sqlite3"
-    )
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         task_store_module._store_v2_project_head(connection, successor)
@@ -786,9 +821,7 @@ def test_display_update_rejects_a_concurrent_successor_head(
         update={
             "project_head_id": "project-head-display-race-successor",
             "generation": 1,
-            "predecessor_project_head_id": (
-                genesis.active_project_head.project_head_id
-            ),
+            "predecessor_project_head_id": (genesis.active_project_head.project_head_id),
             "manifest_sha256": "e" * 64,
         }
     )
@@ -797,9 +830,7 @@ def test_display_update_rejects_a_concurrent_successor_head(
         active_project_head=successor,
         project_config_sha256=genesis.project_config_sha256,
         workspace_snapshot=successor.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            genesis.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(genesis.normalized_evolution_intent_sha256),
     )
     raced = False
 
@@ -808,11 +839,7 @@ def test_display_update_rejects_a_concurrent_successor_head(
         if raced:
             return
         raced = True
-        database = (
-            tmp_path
-            / "science-tasks-v2"
-            / "science-tasks-v2.sqlite3"
-        )
+        database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
         with sqlite3.connect(database) as connection:
             connection.row_factory = sqlite3.Row
             task_store_module._store_v2_project_head(connection, successor)
@@ -840,12 +867,10 @@ def test_display_update_rejects_a_concurrent_successor_head(
         },
         json={
             "schema_version": "2",
-            "expected_project_head_id": created["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": created["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": created["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": created[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": created["project_config_sha256"],
             "display_name": "Must not cross successor",
             "config": created["config"],
@@ -880,12 +905,8 @@ def test_provider_project_update_rebinds_next_task_evolution_intent_without_new_
     changed_config = _skill_bundle_config().model_dump(mode="json")
     update_request = {
         "schema_version": "2",
-        "expected_project_head_id": created["active_project_head"][
-            "project_head_id"
-        ],
-        "expected_project_head_manifest_sha256": created["active_project_head"][
-            "manifest_sha256"
-        ],
+        "expected_project_head_id": created["active_project_head"]["project_head_id"],
+        "expected_project_head_manifest_sha256": created["active_project_head"]["manifest_sha256"],
         "expected_project_config_sha256": created["project_config_sha256"],
         "display_name": "Evolution enabled",
         "config": changed_config,
@@ -937,12 +958,10 @@ def test_provider_project_update_rebinds_next_task_evolution_intent_without_new_
             "schema_version": "2",
             "project_id": updated["project_id"],
             "expected_project_admission_etag": updated["admission_etag"],
-            "expected_project_head_id": updated["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": updated["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": updated["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": updated[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": updated["project_config_sha256"],
         },
     )
@@ -982,19 +1001,15 @@ def test_provider_project_update_rejects_an_open_task_without_partial_config(
             "schema_version": "2",
             "project_id": created["project_id"],
             "expected_project_admission_etag": created["admission_etag"],
-            "expected_project_head_id": created["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": created["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": created["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": created[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": created["project_config_sha256"],
         },
     )
     assert submitted.status_code == 202
-    original_authority = runtime.owner.project_admission_authority(
-        created["project_id"]
-    )
+    original_authority = runtime.owner.project_admission_authority(created["project_id"])
     rejected = client.patch(
         f"/v2/projects/{created['project_id']}",
         headers={
@@ -1004,12 +1019,10 @@ def test_provider_project_update_rejects_an_open_task_without_partial_config(
         },
         json={
             "schema_version": "2",
-            "expected_project_head_id": created["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": created["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": created["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": created[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": created["project_config_sha256"],
             "display_name": "Must not persist",
             "config": _skill_bundle_config().model_dump(mode="json"),
@@ -1020,10 +1033,7 @@ def test_provider_project_update_rejects_an_open_task_without_partial_config(
     persisted = runtime.catalog.get_project(created["project_id"])
     assert persisted.display_name == "Immutable task project"
     assert persisted.config == _config()
-    assert (
-        runtime.owner.project_admission_authority(created["project_id"])
-        == original_authority
-    )
+    assert runtime.owner.project_admission_authority(created["project_id"]) == original_authority
     client.close()
     provider.close()
 
@@ -1043,9 +1053,7 @@ def test_project_intent_update_rejects_a_concurrent_catalog_resource_version(
     )
     display_update = ProjectUpdateV2(
         expected_project_head_id=authority.active_project_head.project_head_id,
-        expected_project_head_manifest_sha256=(
-            authority.active_project_head.manifest_sha256
-        ),
+        expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
         expected_project_config_sha256=record.project_config_sha256,
         display_name="Concurrent display update",
         config=record.config,
@@ -1091,9 +1099,7 @@ def test_project_intent_update_replays_before_validating_a_stale_snapshot(
     assert authority is not None
     request = ProjectUpdateV2(
         expected_project_head_id=authority.active_project_head.project_head_id,
-        expected_project_head_manifest_sha256=(
-            authority.active_project_head.manifest_sha256
-        ),
+        expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
         expected_project_config_sha256=record.project_config_sha256,
         display_name="Exact retry",
         config=_skill_bundle_config(),
@@ -1159,16 +1165,12 @@ def test_project_intent_update_reports_an_existing_transition_as_in_flight(
         active_project_head=authority.active_project_head,
         project_config_sha256=authority.project_config_sha256,
         workspace_snapshot=authority.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            authority.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(authority.normalized_evolution_intent_sha256),
         blockers=(ScienceProjectReadinessBlockerV2.SETTINGS_TRANSITION,),
     )
     runtime.owner.publish_project_admission_authority(
         blocked,
-        expected_project_head_id=(
-            authority.active_project_head.project_head_id
-        ),
+        expected_project_head_id=(authority.active_project_head.project_head_id),
     )
     response = client.patch(
         f"/v2/projects/{created['project_id']}",
@@ -1179,12 +1181,10 @@ def test_project_intent_update_reports_an_existing_transition_as_in_flight(
         },
         json={
             "schema_version": "2",
-            "expected_project_head_id": created["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": created["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": created["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": created[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": created["project_config_sha256"],
             "display_name": "Must remain blocked",
             "config": _skill_bundle_config().model_dump(mode="json"),
@@ -1216,9 +1216,7 @@ def test_project_intent_fence_blocks_a_separate_owner_task_admission(
         project_id=record.project_id,
         expected_project_admission_etag=authority.project_etag,
         expected_project_head_id=authority.active_project_head.project_head_id,
-        expected_project_head_manifest_sha256=(
-            authority.active_project_head.manifest_sha256
-        ),
+        expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
         expected_project_config_sha256=record.project_config_sha256,
     )
 
@@ -1243,9 +1241,7 @@ def test_project_intent_fence_blocks_a_separate_owner_task_admission(
     )
     update = ProjectUpdateV2(
         expected_project_head_id=authority.active_project_head.project_head_id,
-        expected_project_head_manifest_sha256=(
-            authority.active_project_head.manifest_sha256
-        ),
+        expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
         expected_project_config_sha256=record.project_config_sha256,
         display_name="Safely rebound",
         config=_skill_bundle_config(),
@@ -1288,9 +1284,7 @@ def test_project_intent_update_repairs_an_ordinary_cross_store_failure(
     assert authority is not None
     request = ProjectUpdateV2(
         expected_project_head_id=authority.active_project_head.project_head_id,
-        expected_project_head_manifest_sha256=(
-            authority.active_project_head.manifest_sha256
-        ),
+        expected_project_head_manifest_sha256=(authority.active_project_head.manifest_sha256),
         expected_project_config_sha256=record.project_config_sha256,
         display_name="Recovered ordinary failure",
         config=_skill_bundle_config(),
@@ -1334,15 +1328,11 @@ def test_project_intent_update_repairs_an_ordinary_cross_store_failure(
             "request": TaskSubmitRequestV2(
                 project_id=record.project_id,
                 expected_project_admission_etag=published.project_etag,
-                expected_project_head_id=(
-                    published.active_project_head.project_head_id
-                ),
+                expected_project_head_id=(published.active_project_head.project_head_id),
                 expected_project_head_manifest_sha256=(
                     published.active_project_head.manifest_sha256
                 ),
-                expected_project_config_sha256=(
-                    published.project_config_sha256
-                ),
+                expected_project_config_sha256=(published.project_config_sha256),
             ),
             "idempotency_key": "submit-after-ordinary-recovery",
         },
@@ -1362,9 +1352,7 @@ def test_project_intent_update_preserves_a_successor_project_head(
         update={
             "project_head_id": "project-head-successor-test",
             "generation": 1,
-            "predecessor_project_head_id": (
-                genesis.active_project_head.project_head_id
-            ),
+            "predecessor_project_head_id": (genesis.active_project_head.project_head_id),
             "manifest_sha256": "f" * 64,
         }
     )
@@ -1373,15 +1361,9 @@ def test_project_intent_update_preserves_a_successor_project_head(
         active_project_head=successor,
         project_config_sha256=genesis.project_config_sha256,
         workspace_snapshot=successor.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            genesis.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(genesis.normalized_evolution_intent_sha256),
     )
-    database = (
-        tmp_path
-        / "science-tasks-v2"
-        / "science-tasks-v2.sqlite3"
-    )
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         task_store_module._store_v2_project_head(connection, successor)
@@ -1445,9 +1427,7 @@ def test_successor_project_intent_rebind_recovers_without_losing_the_active_head
         update={
             "project_head_id": "project-head-recovery-successor",
             "generation": 1,
-            "predecessor_project_head_id": (
-                genesis.active_project_head.project_head_id
-            ),
+            "predecessor_project_head_id": (genesis.active_project_head.project_head_id),
             "manifest_sha256": "c" * 64,
         }
     )
@@ -1456,15 +1436,9 @@ def test_successor_project_intent_rebind_recovers_without_losing_the_active_head
         active_project_head=successor,
         project_config_sha256=genesis.project_config_sha256,
         workspace_snapshot=successor.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            genesis.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(genesis.normalized_evolution_intent_sha256),
     )
-    database = (
-        tmp_path
-        / "science-tasks-v2"
-        / "science-tasks-v2.sqlite3"
-    )
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
     with sqlite3.connect(database) as connection:
         connection.row_factory = sqlite3.Row
         task_store_module._store_v2_project_head(connection, successor)
@@ -1521,9 +1495,7 @@ def test_successor_project_intent_rebind_recovers_without_losing_the_active_head
         actual = runtime.owner.project_admission_authority(record.project_id)
         assert actual.active_project_head == successor
         assert actual.blockers == ()
-        if hook_name == (
-            "_after_project_config_catalog_publish_before_rebind_release"
-        ):
+        if hook_name == ("_after_project_config_catalog_publish_before_rebind_release"):
             assert actual.project_config_sha256 == (
                 project_config_sha256_for(_skill_bundle_config())
             )
@@ -1575,14 +1547,10 @@ def test_project_intent_update_recovers_each_cross_store_crash_boundary(
         },
     ).json()
     client.close()
-    original_authority = runtime.owner.project_admission_authority(
-        created["project_id"]
-    )
+    original_authority = runtime.owner.project_admission_authority(created["project_id"])
     request = ProjectUpdateV2(
         expected_project_head_id=created["active_project_head"]["project_head_id"],
-        expected_project_head_manifest_sha256=created["active_project_head"][
-            "manifest_sha256"
-        ],
+        expected_project_head_manifest_sha256=created["active_project_head"]["manifest_sha256"],
         expected_project_config_sha256=created["project_config_sha256"],
         display_name="Recovered evolution intent",
         config=_skill_bundle_config(),
@@ -1602,22 +1570,12 @@ def test_project_intent_update_recovers_each_cross_store_crash_boundary(
             now=runtime.clock(),
         )
     prepared_project = runtime.catalog.get_project(created["project_id"])
-    expected_config = (
-        _skill_bundle_config()
-        if catalog_updated_before_restart
-        else _config()
-    )
+    expected_config = _skill_bundle_config() if catalog_updated_before_restart else _config()
     assert prepared_project.config == expected_config
-    before_restart = runtime.owner.project_admission_authority(
-        created["project_id"]
-    )
+    before_restart = runtime.owner.project_admission_authority(created["project_id"])
     if ledger_updated_before_restart:
-        assert before_restart.project_config_sha256 == (
-            prepared_project.project_config_sha256
-        )
-        assert before_restart.blockers == (
-            ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
-        )
+        assert before_restart.project_config_sha256 == (prepared_project.project_config_sha256)
+        assert before_restart.blockers == (ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,)
     else:
         assert before_restart == original_authority.__class__(
             project_id=original_authority.project_id,
@@ -1627,9 +1585,7 @@ def test_project_intent_update_recovers_each_cross_store_crash_boundary(
             normalized_evolution_intent_sha256=(
                 original_authority.normalized_evolution_intent_sha256
             ),
-            blockers=(
-                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
-            ),
+            blockers=(ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,),
         )
     provider.close()
     monkeypatch.setattr(authority_module, hook_name, lambda *_args: None)
@@ -1651,19 +1607,14 @@ def test_project_intent_update_recovers_each_cross_store_crash_boundary(
         recovered_authority = recovered.ensure_project(recovered_project)
         assert recovered_authority is not None
         assert recovered_project.config == expected_config
-        assert (
-            recovered_authority.active_project_head
-            == original_authority.active_project_head
-        )
+        assert recovered_authority.active_project_head == original_authority.active_project_head
         assert recovered_authority.project_config_sha256 == (
             recovered_project.project_config_sha256
         )
         assert recovered_authority.normalized_evolution_intent_sha256 == (
             normalized_evolution_intent_sha256_for(expected_config)
         )
-        assert owner.project_admission_authority(created["project_id"]) == (
-            recovered_authority
-        )
+        assert owner.project_admission_authority(created["project_id"]) == (recovered_authority)
     finally:
         owner.close()
         recovered.close()
@@ -1702,12 +1653,10 @@ def test_provider_runtime_drift_blocks_task_before_admission(tmp_path: Path) -> 
             "schema_version": "2",
             "project_id": created["project_id"],
             "expected_project_admission_etag": created["admission_etag"],
-            "expected_project_head_id": created["active_project_head"][
-                "project_head_id"
+            "expected_project_head_id": created["active_project_head"]["project_head_id"],
+            "expected_project_head_manifest_sha256": created["active_project_head"][
+                "manifest_sha256"
             ],
-            "expected_project_head_manifest_sha256": created[
-                "active_project_head"
-            ]["manifest_sha256"],
             "expected_project_config_sha256": created["project_config_sha256"],
         },
     )

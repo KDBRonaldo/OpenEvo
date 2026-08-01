@@ -70,6 +70,7 @@ from openevo.internal_auth import (
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
 from openevo.rollout.models import SessionResult, TaskRequest, TaskStatus
 from openevo.runtime.managed import MANAGED_RUNTIME_RELEASES
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 from openevo.trajectory.models import Trace, Trajectory
 from tests.framework_testkit import verified_builtin_registry
 from openevo.backend.workspace_store_v2 import WorkspaceStoreV2
@@ -412,8 +413,7 @@ def test_attempt_progress_and_verified_terminal_capture_are_durable(tmp_path) ->
         logs = store.list_task_logs(task.task_id)
         assert [item.sequence for item in logs] == list(range(1, len(logs) + 1))
         assert any(
-            item.stream == "transcript" and item.message == "assistant: Done"
-            for item in logs
+            item.stream == "transcript" and item.message == "assistant: Done" for item in logs
         )
     finally:
         store.close()
@@ -841,6 +841,20 @@ def _project_config() -> ScienceProjectConfigV2:
     )
 
 
+def _self_deployed_project_config() -> ScienceProjectConfigV2:
+    payload = _project_config().model_dump(mode="json")
+    payload["execution"] = {
+        "mode": "self-deployed",
+        "capture_mode": "transcript",
+        "token_level_metrics_available": False,
+        "harness_id": "codex",
+        "model_profile_id": "qwen3-0.6b-v1",
+        "token_limit": 8192,
+        "task_network_allow_internet": False,
+    }
+    return ScienceProjectConfigV2.model_validate(payload)
+
+
 def _service_binding(registry_sha256: str) -> ServiceRunBinding:
     identity = InternalServiceIdentity(
         service_id="core-control",
@@ -865,6 +879,31 @@ def _service_binding(registry_sha256: str) -> ServiceRunBinding:
         evolution_backend_url="http://127.0.0.1:41002",
         gateway_url="http://127.0.0.1:41003",
         _identity=identity,
+    )
+
+
+def _self_deployed_service_binding(registry_sha256: str) -> ServiceRunBinding:
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    subscription = _service_binding(registry_sha256)
+    return ServiceRunBinding(
+        execution_mode=ServiceExecutionMode.SELF_DEPLOYED,
+        codex_model=profile.model_id,
+        runtime_image=subscription.runtime_image,
+        runtime_image_immutable_reference=(subscription.runtime_image_immutable_reference),
+        runtime_identity_digest=subscription.runtime_identity_digest,
+        generation_digest=subscription.generation_digest,
+        registry_digest=subscription.registry_digest,
+        framework_lock_digest=subscription.framework_lock_digest,
+        rollout_url=subscription.rollout_url,
+        evolution_backend_url=subscription.evolution_backend_url,
+        gateway_url=subscription.gateway_url,
+        self_deployed_profile_id=profile.profile_id,
+        self_deployed_profile_sha256=profile.profile_sha256,
+        self_deployed_model_revision=profile.model_revision,
+        self_deployed_model_snapshot_sha256=(profile.model_snapshot_manifest_sha256),
+        self_deployed_vllm_image=profile.vllm_image,
+        self_deployed_vllm_image_config_digest=profile.vllm_image_config_digest,
+        _identity=subscription._identity,
     )
 
 
@@ -956,6 +995,67 @@ def test_compiler_uses_saved_v2_authority_without_legacy_context_routes(tmp_path
     store.close()
 
 
+def test_compiler_routes_self_deployed_codex_through_managed_gateway(tmp_path) -> None:
+    clock = _Clock()
+    registry = verified_builtin_registry(tmp_path / "self-registry")
+    config = _self_deployed_project_config()
+    workspace = _workspace()
+    effective = EffectiveExecutionSnapshotRefV2(
+        effective_execution_snapshot_id="exec-self-deployed",
+        project_id=workspace.project_id,
+        execution_mode="self-deployed",
+        capture_mode="transcript",
+        token_level_metrics_available=False,
+        producer_id="self-deployed-snapshot-issuer-v1",
+        snapshot_sha256="4" * 64,
+    )
+    head = _head(
+        registry_sha256=registry.snapshot.registry_digest,
+        workspace=workspace,
+        effective_execution=effective,
+    )
+    authority = ScienceProjectAdmissionAuthorityV2(
+        project_id=head.project_id,
+        active_project_head=head,
+        project_config_sha256=project_config_sha256_for(config),
+        workspace_snapshot=workspace,
+        normalized_evolution_intent_sha256=canonical_digest(config.evolution),
+    )
+    store = ScienceTaskStoreV2(tmp_path / "self-state")
+    task = _admit(store, clock, authority)
+    binding = _self_deployed_service_binding(registry.snapshot.registry_digest)
+    project = ProjectRecordV2(
+        project_id=task.project_id,
+        display_name="Self-Deployed compiler project",
+        config=config,
+        project_config_sha256=project_config_sha256_for(config),
+        created_at="2026-07-23T02:00:00.000000Z",
+        updated_at="2026-07-23T02:00:00.000000Z",
+        resource_version=1,
+    )
+
+    compiled = compile_science_attempt_v2(
+        task=task,
+        attempt=task.attempts[0],
+        project=project,
+        binding=binding,
+        workspace_handoff=_workspace_handoff(task, binding),
+        executable_registry=registry,
+    )
+
+    request = compiled.rollout.request
+    assert request.agent.model_name == "Qwen/Qwen3-0.6B"
+    assert request.agent.settings == {
+        "auth_mode": "proxy",
+        "capture_mode": "transcript",
+    }
+    assert request.runtime is not None
+    assert request.runtime.env["CODEX_HOME"] == "/openevo/session/home/.codex"
+    assert request.runtime.env["OPENEVO_MANAGED_HF_MODEL"] == "Qwen/Qwen3-0.6B"
+    assert compiled.evolution_plan.execution_profile.execution_mode == "self_deployed"
+    store.close()
+
+
 class _Catalog:
     def __init__(self, project: ProjectRecordV2) -> None:
         self.project = project
@@ -969,8 +1069,10 @@ class _Services:
     def __init__(self, binding: ServiceRunBinding) -> None:
         self.binding = binding
         self.released = False
+        self.ensure_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
-    def ensure_run_binding(self, *_args, **_kwargs):
+    def ensure_run_binding(self, *args, **kwargs):
+        self.ensure_calls.append((args, kwargs))
         snapshot = ServiceGroupSnapshot(
             execution_mode=self.binding.execution_mode,
             services_available=True,
@@ -1162,13 +1264,19 @@ def _wait_task_state(
     raise AssertionError(f"v2 Task did not reach {expected}")
 
 
+@pytest.mark.parametrize("self_deployed", [False, True])
 def test_executor_captures_one_real_workspace_result_and_releases_generation(
     tmp_path,
+    self_deployed: bool,
 ) -> None:
     clock = _Clock()
     registry = verified_builtin_registry(tmp_path / "registry")
-    config = _project_config()
-    binding = _service_binding(registry.snapshot.registry_digest)
+    config = _self_deployed_project_config() if self_deployed else _project_config()
+    binding = (
+        _self_deployed_service_binding(registry.snapshot.registry_digest)
+        if self_deployed
+        else _service_binding(registry.snapshot.registry_digest)
+    )
     project_id = "project-execution"
     workspaces = WorkspaceStoreV2(tmp_path / "workspaces")
     workspace = workspaces.ensure_empty_snapshot(project_id)
@@ -1258,6 +1366,27 @@ def test_executor_captures_one_real_workspace_result_and_releases_generation(
     )
     assert ledger.get_task(task.task_id).authoritative_attempt_id == attempt.attempt_id
     assert services.released is True
+    if self_deployed:
+        assert services.ensure_calls == [
+            (
+                (ServiceExecutionMode.SELF_DEPLOYED,),
+                {
+                    "model_ref": "qwen3-0.6b-v1",
+                    "runtime_image": MANAGED_RUNTIME_IMAGES["managed_science"],
+                    "total_timeout": 7200.0,
+                },
+            )
+        ]
+    else:
+        assert services.ensure_calls == [
+            (
+                (ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,),
+                {
+                    "codex_model": config.execution.codex_model,
+                    "runtime_image": MANAGED_RUNTIME_IMAGES["managed_science"],
+                },
+            )
+        ]
     assert rollout.closed is True
     handoffs.close()
     ledger.close()

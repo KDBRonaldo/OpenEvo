@@ -26,6 +26,7 @@ from openevo.runtime.managed import (
     MANAGED_CODEX_VERSION,
     require_immutable_managed_runtime_image,
 )
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 
 
 _BEARER_PATTERN = re.compile(r"[A-Za-z0-9_-]{64}\Z")
@@ -93,6 +94,67 @@ class ManagedSubscriptionRuntimeIdentity:
             raise ValueError("managed subscription runtime policy digest is invalid")
 
 
+SELF_DEPLOYED_RUNTIME_POLICY_ID = "openevo.self-deployed-runtime.v1"
+
+
+@dataclass(frozen=True, slots=True)
+class ManagedSelfDeployedRuntimeIdentity:
+    """Closed projection of verified managed Codex + vLLM serving evidence."""
+
+    harness_id: str
+    harness_version: str
+    model_profile_id: str
+    model_id: str
+    model_revision: str
+    model_snapshot_manifest_sha256: str
+    profile_sha256: str
+    runtime_image_digest: str
+    runtime_identity_digest: str
+    runtime_policy_id: str
+    runtime_policy_digest: str
+    vllm_image: str
+    vllm_image_config_digest: str
+
+    def __post_init__(self) -> None:
+        profile = require_release_self_deployed_model_profile(self.model_profile_id)
+        expected = {
+            "harness_id": "codex",
+            "harness_version": MANAGED_CODEX_VERSION,
+            "model_id": profile.model_id,
+            "model_revision": profile.model_revision,
+            "model_snapshot_manifest_sha256": profile.model_snapshot_manifest_sha256,
+            "profile_sha256": profile.profile_sha256,
+            "runtime_policy_id": SELF_DEPLOYED_RUNTIME_POLICY_ID,
+            "runtime_policy_digest": self_deployed_runtime_policy_digest(profile.profile_id),
+            "vllm_image": profile.vllm_image,
+            "vllm_image_config_digest": profile.vllm_image_config_digest,
+        }
+        if any(getattr(self, field) != value for field, value in expected.items()):
+            raise ValueError("managed Self-Deployed runtime profile identity is invalid")
+        for value, label in (
+            (self.runtime_image_digest, "managed Self-Deployed image digest"),
+            (self.runtime_identity_digest, "managed Self-Deployed runtime digest"),
+        ):
+            if _DIGEST_PATTERN.fullmatch(value) is None:
+                raise ValueError(f"{label} is invalid")
+
+
+def self_deployed_runtime_policy_digest(profile_id: str) -> str:
+    profile = require_release_self_deployed_model_profile(profile_id)
+    return hashlib.sha256(
+        b"openevo-self-deployed-runtime-policy-v1\0"
+        + canonical_json_bytes(
+            {
+                "policy_id": SELF_DEPLOYED_RUNTIME_POLICY_ID,
+                "profile_id": profile.profile_id,
+                "profile_sha256": profile.profile_sha256,
+                "vllm_image": profile.vllm_image,
+                "vllm_image_config_digest": profile.vllm_image_config_digest,
+            }
+        )
+    ).hexdigest()
+
+
 def require_managed_subscription_runtime_identity(
     service_binding: object,
 ) -> ManagedSubscriptionRuntimeIdentity:
@@ -137,8 +199,52 @@ def require_managed_subscription_runtime_identity(
         identity.__post_init__()
         return identity
     except (TypeError, ValueError) as exc:
+        raise RuntimeIdentityError("Managed Subscription runtime identity is unavailable") from exc
+
+
+def require_managed_self_deployed_runtime_identity(
+    service_binding: object,
+) -> ManagedSelfDeployedRuntimeIdentity:
+    """Project exact release profile evidence from a trusted run binding."""
+
+    from openevo.backend.service_supervisor import (
+        ServiceExecutionMode,
+        ServiceRunBinding,
+    )
+
+    if type(service_binding) is not ServiceRunBinding:
+        raise RuntimeIdentityError("Managed Self-Deployed runtime identity is unavailable")
+    try:
+        service_binding.__post_init__()
+        if service_binding.execution_mode is not ServiceExecutionMode.SELF_DEPLOYED:
+            raise ValueError("run binding is not the Self-Deployed profile")
+        profile = require_release_self_deployed_model_profile(
+            service_binding.self_deployed_profile_id or ""
+        )
+        release = require_immutable_managed_runtime_image(
+            profile="managed_science",
+            image=service_binding.runtime_image_immutable_reference,
+        )
+        identity = ManagedSelfDeployedRuntimeIdentity(
+            harness_id="codex",
+            harness_version=MANAGED_CODEX_VERSION,
+            model_profile_id=profile.profile_id,
+            model_id=profile.model_id,
+            model_revision=profile.model_revision,
+            model_snapshot_manifest_sha256=(profile.model_snapshot_manifest_sha256),
+            profile_sha256=profile.profile_sha256,
+            runtime_image_digest=release.trusted_digest.removeprefix("sha256:"),
+            runtime_identity_digest=service_binding.runtime_identity_digest,
+            runtime_policy_id=SELF_DEPLOYED_RUNTIME_POLICY_ID,
+            runtime_policy_digest=self_deployed_runtime_policy_digest(profile.profile_id),
+            vllm_image=profile.vllm_image,
+            vllm_image_config_digest=profile.vllm_image_config_digest,
+        )
+        identity.__post_init__()
+        return identity
+    except (TypeError, ValueError) as exc:
         raise RuntimeIdentityError(
-            "Managed Subscription runtime identity is unavailable"
+            "Managed Self-Deployed runtime identity is unavailable"
         ) from exc
 
 
@@ -381,17 +487,18 @@ def compute_release_identity(
 
 
 def release_runtime_contract_sha256() -> str:
-    """Identify the complete v0.1.9 managed runtime/context ABI.
+    """Identify the complete v0.1.10 managed runtime/context ABI.
 
     The registry digest separately binds executable evolution handlers.  This
-    digest binds the stable runtime destinations and managed Subscription
-    execution contract that consume their materialized output.
+    digest binds the stable runtime destinations and both release-owned
+    execution contracts that consume their materialized output.
     """
 
     evolution_root = f"{RUNTIME_SESSION_DIR}/evolution"
+    self_deployed = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
     material = canonical_json_bytes(
         {
-            "schema_version": 1,
+            "schema_version": 2,
             "contract_id": "openevo.runtime-context.v2",
             "runtime_session_dir": RUNTIME_SESSION_DIR,
             "managed_home": MANAGED_HOME,
@@ -410,9 +517,19 @@ def release_runtime_contract_sha256() -> str:
                 MANAGED_RUNTIME_RELEASES["managed_science"].immutable_reference
             ),
             "codex_subscription": codex_subscription_contract(),
+            "self_deployed": {
+                "profile": self_deployed.canonical_profile_payload(),
+                "required_model_files": [
+                    item.canonical_payload() for item in self_deployed.required_files
+                ],
+                "runtime_policy_id": SELF_DEPLOYED_RUNTIME_POLICY_ID,
+                "runtime_policy_sha256": self_deployed_runtime_policy_digest(
+                    self_deployed.profile_id
+                ),
+            },
         }
     )
-    return hashlib.sha256(b"openevo-runtime-contract-v1\0" + material).hexdigest()
+    return hashlib.sha256(b"openevo-runtime-contract-v2\0" + material).hexdigest()
 
 
 def canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
@@ -653,14 +770,18 @@ def _unlink_at_if_regular(directory_fd: int, name: str) -> None:
 __all__ = [
     "CoreReleaseIdentity",
     "HostServiceRoot",
+    "ManagedSelfDeployedRuntimeIdentity",
     "ManagedSubscriptionRuntimeIdentity",
     "RuntimeIdentityError",
+    "SELF_DEPLOYED_RUNTIME_POLICY_ID",
     "canonical_json_bytes",
     "compute_release_identity",
     "default_core_service_root",
     "load_bounded_json",
     "load_or_create_core_bearer_token",
+    "require_managed_self_deployed_runtime_identity",
     "require_managed_subscription_runtime_identity",
+    "self_deployed_runtime_policy_digest",
     "require_host_global_service_root",
     "release_runtime_contract_sha256",
     "rotate_core_bearer_token",

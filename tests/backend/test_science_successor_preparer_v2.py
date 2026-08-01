@@ -42,6 +42,8 @@ from tests.backend.test_science_execution_v2 import (
     _Services,
     _head,
     _project_config,
+    _self_deployed_project_config,
+    _self_deployed_service_binding,
     _service_binding,
     _wait_task_state,
 )
@@ -160,9 +162,7 @@ class _Evolution:
         ordinal = self.target_run_counts.get(request.target_id, 0) + 1
         self.target_run_counts[request.target_id] = ordinal
         suffix = "" if ordinal == 1 else f"-{ordinal}"
-        artifact_id = (
-            f"artifact-{request.target_id}-successor{suffix}"
-        )
+        artifact_id = f"artifact-{request.target_id}-successor{suffix}"
         manifest = {
             "content_path": "memory.md",
             "target_id": request.target_id,
@@ -181,9 +181,7 @@ class _Evolution:
             promoted=True,
         ).model_dump(mode="json")
         self.artifacts[artifact_id] = artifact
-        self.artifact_owners[artifact_id] = (
-            request.successor_transition_id
-        )
+        self.artifact_owners[artifact_id] = request.successor_transition_id
         job_id = f"job-{request.target_id}-successor{suffix}"
         output = {
             "artifact_id": artifact_id,
@@ -235,9 +233,7 @@ class _Evolution:
         successor_transition_id: str,
         artifact_id: str,
     ) -> dict:
-        assert self.artifact_owners[artifact_id] == (
-            successor_transition_id
-        )
+        assert self.artifact_owners[artifact_id] == (successor_transition_id)
         return self.artifacts[artifact_id]
 
     def discard_successor_transition_outputs(
@@ -252,21 +248,15 @@ class _Evolution:
         request = ContextProjectionResolveRequest.model_validate(payload)
         assert request.metadata.evolution is not None
         artifact_ids = request.metadata.evolution.context_artifact_ids
-        owner_transition_ids = (
-            request.metadata.evolution.context_artifact_owner_transition_ids
-        )
+        owner_transition_ids = request.metadata.evolution.context_artifact_owner_transition_ids
         assert artifact_ids is not None
         assert owner_transition_ids is not None
-        assert tuple(
-            self.artifact_owners[artifact_id]
-            for artifact_id in artifact_ids
-        ) == owner_transition_ids
-        self.materialized_count += 1
-        context_suffix = (
-            ""
-            if self.materialized_count == 1
-            else f"-{self.materialized_count}"
+        assert (
+            tuple(self.artifact_owners[artifact_id] for artifact_id in artifact_ids)
+            == owner_transition_ids
         )
+        self.materialized_count += 1
+        context_suffix = "" if self.materialized_count == 1 else f"-{self.materialized_count}"
         self.materialized = MaterializedContext(
             context_id=f"ctx-successor-v2{context_suffix}",
             request_digest=canonical_digest(request),
@@ -309,9 +299,7 @@ def test_production_preparer_discards_only_the_exact_transition_outputs(
     )
     context = SimpleNamespace(
         transition=SimpleNamespace(
-            transition=SimpleNamespace(
-                successor_transition_id="successor-transition-exact"
-            )
+            transition=SimpleNamespace(successor_transition_id="successor-transition-exact")
         )
     )
     record = object()
@@ -334,23 +322,13 @@ def test_production_preparer_discards_only_the_exact_transition_outputs(
     evolution.discard_response = {
         "successor_transition_id": "successor-transition-exact",
         "discarded_artifact_ids": ["artifact-sealed-1"],
-        "discarded_materialized_context_ids": [
-            "context-materialized-1"
-        ],
+        "discarded_materialized_context_ids": ["context-materialized-1"],
     }
     receipt = preparer.discard_transition_outputs(context)
-    assert receipt.successor_transition_id == (
-        "successor-transition-exact"
-    )
-    assert receipt.discarded_artifact_ids == (
-        "artifact-sealed-1",
-    )
-    assert receipt.discarded_materialized_context_ids == (
-        "context-materialized-1",
-    )
-    assert evolution.discarded_transition_ids == [
-        "successor-transition-exact"
-    ]
+    assert receipt.successor_transition_id == ("successor-transition-exact")
+    assert receipt.discarded_artifact_ids == ("artifact-sealed-1",)
+    assert receipt.discarded_materialized_context_ids == ("context-materialized-1",)
+    assert evolution.discarded_transition_ids == ["successor-transition-exact"]
 
     evolution.discard_response = {
         "successor_transition_id": "successor-transition-other",
@@ -386,12 +364,14 @@ def test_production_preparer_fails_closed_after_shutdown_is_requested(
         preparer.seal_dataset(object())
 
 
+@pytest.mark.parametrize("self_deployed", [False, True])
 def test_production_preparer_commits_complete_workspace_and_context_successor(
     tmp_path,
+    self_deployed: bool,
 ) -> None:
     clock = _Clock()
     registry = verified_builtin_registry(tmp_path / "registry")
-    base_config = _project_config()
+    base_config = _self_deployed_project_config() if self_deployed else _project_config()
     config_json = base_config.model_dump(mode="json")
     config_json["evolution"]["targets"] = {
         "agent_system": {
@@ -411,7 +391,11 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         },
     }
     config = type(base_config).model_validate(config_json)
-    binding = _service_binding(registry.snapshot.registry_digest)
+    binding = (
+        _self_deployed_service_binding(registry.snapshot.registry_digest)
+        if self_deployed
+        else _service_binding(registry.snapshot.registry_digest)
+    )
     project_id = "project-execution"
     workspaces = WorkspaceStoreV2(tmp_path / "workspaces")
     input_workspace = workspaces.ensure_empty_snapshot(project_id)
@@ -539,9 +523,7 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         transition = owner.get_successor_transition_for_task(task.task_id)
         commit = owner.successor_commit(transition.transition.successor_transition_id)
         assert commit is not None
-        assert commit.manifest.dataset_artifact_id == (
-            "artifact-dataset-successor-1"
-        )
+        assert commit.manifest.dataset_artifact_id == ("artifact-dataset-successor-1")
         assert commit.manifest.method_artifact_ids == (
             "artifact-agent_system-successor",
             "artifact-skill_bundle-successor",
@@ -568,16 +550,12 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
                 "config": {},
             },
         }
-        partial_config = type(config).model_validate(
-            partial_config_json
-        )
+        partial_config = type(config).model_validate(partial_config_json)
         partial_project = ProjectRecordV2(
             project_id=project_id,
             display_name=project.display_name,
             config=partial_config,
-            project_config_sha256=project_config_sha256_for(
-                partial_config
-            ),
+            project_config_sha256=project_config_sha256_for(partial_config),
             created_at=project.created_at,
             updated_at="2026-07-23T02:00:01.000000Z",
             resource_version=2,
@@ -586,13 +564,9 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         desired_next_authority = ScienceProjectAdmissionAuthorityV2(
             project_id=project_id,
             active_project_head=successor,
-            project_config_sha256=(
-                partial_project.project_config_sha256
-            ),
+            project_config_sha256=(partial_project.project_config_sha256),
             workspace_snapshot=next_authority.workspace_snapshot,
-            normalized_evolution_intent_sha256=canonical_digest(
-                partial_config.evolution
-            ),
+            normalized_evolution_intent_sha256=canonical_digest(partial_config.evolution),
         )
         owner.begin_project_admission_authority_rebind(next_authority)
         owner.finish_project_admission_authority_rebind(
@@ -609,9 +583,7 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
                     expected_project_admission_etag=next_authority.project_etag,
                     expected_project_head_id=successor.project_head_id,
                     expected_project_head_manifest_sha256=successor.manifest_sha256,
-                    expected_project_config_sha256=(
-                        partial_project.project_config_sha256
-                    ),
+                    expected_project_config_sha256=(partial_project.project_config_sha256),
                 ),
                 "idempotency_key": "production-successor-session-2",
             },
@@ -628,9 +600,7 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         second_successor = owner.active_project_head(project_id)
         assert second_successor.generation == 2
         assert second_successor.evolution_revision.artifact_count == 3
-        second_transition = owner.get_successor_transition_for_task(
-            second.task_id
-        )
+        second_transition = owner.get_successor_transition_for_task(second.task_id)
         second_commit = owner.successor_commit(
             second_transition.transition.successor_transition_id
         )
@@ -649,16 +619,12 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         no_evolution_json = partial_config.model_dump(mode="json")
         for target in no_evolution_json["evolution"]["targets"].values():
             target["enabled"] = False
-        no_evolution_config = type(config).model_validate(
-            no_evolution_json
-        )
+        no_evolution_config = type(config).model_validate(no_evolution_json)
         no_evolution_project = ProjectRecordV2(
             project_id=project_id,
             display_name=project.display_name,
             config=no_evolution_config,
-            project_config_sha256=project_config_sha256_for(
-                no_evolution_config
-            ),
+            project_config_sha256=project_config_sha256_for(no_evolution_config),
             created_at=project.created_at,
             updated_at="2026-07-23T02:00:02.000000Z",
             resource_version=3,
@@ -668,13 +634,9 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         desired_third_authority = ScienceProjectAdmissionAuthorityV2(
             project_id=project_id,
             active_project_head=second_successor,
-            project_config_sha256=(
-                no_evolution_project.project_config_sha256
-            ),
+            project_config_sha256=(no_evolution_project.project_config_sha256),
             workspace_snapshot=current_authority.workspace_snapshot,
-            normalized_evolution_intent_sha256=canonical_digest(
-                no_evolution_config.evolution
-            ),
+            normalized_evolution_intent_sha256=canonical_digest(no_evolution_config.evolution),
         )
         owner.begin_project_admission_authority_rebind(current_authority)
         owner.finish_project_admission_authority_rebind(
@@ -689,39 +651,23 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
             {
                 "request": TaskSubmitRequestV2(
                     project_id=project_id,
-                    expected_project_admission_etag=(
-                        third_authority.project_etag
-                    ),
-                    expected_project_head_id=(
-                        second_successor.project_head_id
-                    ),
-                    expected_project_head_manifest_sha256=(
-                        second_successor.manifest_sha256
-                    ),
-                    expected_project_config_sha256=(
-                        no_evolution_project.project_config_sha256
-                    ),
+                    expected_project_admission_etag=(third_authority.project_etag),
+                    expected_project_head_id=(second_successor.project_head_id),
+                    expected_project_head_manifest_sha256=(second_successor.manifest_sha256),
+                    expected_project_config_sha256=(no_evolution_project.project_config_sha256),
                 ),
-                "idempotency_key": (
-                    "production-successor-session-3-no-evolution"
-                ),
+                "idempotency_key": ("production-successor-session-3-no-evolution"),
             },
         )
         _wait_task_state(owner, third.task_id, "completed")
         third_successor = owner.active_project_head(project_id)
         assert third_successor.generation == 3
-        assert third_successor.evolution_revision == (
-            second_successor.evolution_revision
-        )
+        assert third_successor.evolution_revision == (second_successor.evolution_revision)
         assert third_successor.runtime_context_snapshot == (
             second_successor.runtime_context_snapshot
         )
-        third_transition = owner.get_successor_transition_for_task(
-            third.task_id
-        )
-        third_commit = owner.successor_commit(
-            third_transition.transition.successor_transition_id
-        )
+        third_transition = owner.get_successor_transition_for_task(third.task_id)
+        third_commit = owner.successor_commit(third_transition.transition.successor_transition_id)
         assert third_commit is not None
         assert third_commit.manifest.method_artifact_ids == (
             second_commit.manifest.method_artifact_ids
@@ -730,12 +676,22 @@ def test_production_preparer_commits_complete_workspace_and_context_successor(
         assert len(evolution.jobs) == 4
         assert len(rollout.requests) == 3
         assert len(evolution.dataset_requests) == 3
-        assert len(
-            {
-                request.idempotency_key
-                for request in evolution.dataset_requests
-            }
-        ) == 3
+        assert len({request.idempotency_key for request in evolution.dataset_requests}) == 3
+        assert len(services.ensure_calls) >= 6
+        expected_mode = binding.execution_mode
+        assert all(
+            call_args == (expected_mode,) for call_args, _call_kwargs in services.ensure_calls
+        )
+        if self_deployed:
+            assert all(
+                call_kwargs
+                == {
+                    "model_ref": "qwen3-0.6b-v1",
+                    "runtime_image": binding.runtime_image,
+                    "total_timeout": 7200.0,
+                }
+                for _call_args, call_kwargs in services.ensure_calls
+            )
     finally:
         owner.close()
         handoffs.close()

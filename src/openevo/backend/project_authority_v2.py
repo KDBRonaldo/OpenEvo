@@ -49,6 +49,7 @@ from openevo.evolution.revisions import (
     require_verified_execution_snapshot,
 )
 from openevo.runtime.managed import MANAGED_RUNTIME_IMAGES
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 from openevo.experiments import (
     ProjectEvolutionValidationError,
     validate_project_evolution_selections,
@@ -166,14 +167,9 @@ class _ProjectAuthorityRecordV1(m.ContractModel):
         if self.publication_state == "draft":
             if any(value is not None for value in prepared_values):
                 raise ValueError("a draft project authority contains sealed state")
-        elif self.workspace_snapshot is None or any(
-            value is None for value in prepared_values
-        ):
+        elif self.workspace_snapshot is None or any(value is None for value in prepared_values):
             raise ValueError("a prepared project authority is incomplete")
-        if (
-            self.pending_project_head is not None
-            and self.publication_state != "prepared"
-        ):
+        if self.pending_project_head is not None and self.publication_state != "prepared":
             raise ValueError("only a prepared authority may bind a pending head")
         if (
             self.workspace_snapshot is not None
@@ -289,9 +285,7 @@ class ProjectAuthorityV2:
                     "model": config.execution.codex_model,
                 },
                 registry_snapshot=self._registry.snapshot,
-                execution_profile=execution_profile_for_release_mode(
-                    config.execution.mode
-                ),
+                execution_profile=execution_profile_for_release_mode(config.execution.mode),
             )
         except ProjectEvolutionValidationError as exc:
             raise ProjectAuthorityInvalidV2(
@@ -306,8 +300,11 @@ class ProjectAuthorityV2:
     ) -> ScienceProjectAdmissionAuthorityV2 | None:
         project = _exact_project_record(project)
         self.validate_config(project.config)
-        with self._lock, self._catalog.action_execution_fence(
-            coordination_scope=_project_authority_scope(project.project_id),
+        with (
+            self._lock,
+            self._catalog.action_execution_fence(
+                coordination_scope=_project_authority_scope(project.project_id),
+            ),
         ):
             return self._ensure_project_locked(project)
 
@@ -403,14 +400,10 @@ class ProjectAuthorityV2:
                 authority = _science_authority(authority_record)
                 if (
                     verified.snapshot != authority_record.execution_snapshot
-                    or verified.producer_id
-                    != authority_record.execution_snapshot_producer_id
-                    or binding.framework_lock_digest
-                    != authority_record.framework_lock_sha256
-                    or authority.active_project_head.registry_sha256
-                    != self._registry_sha256
-                    or authority.active_project_head.runtime_context_snapshot
-                    .runtime_contract_sha256
+                    or verified.producer_id != authority_record.execution_snapshot_producer_id
+                    or binding.framework_lock_digest != authority_record.framework_lock_sha256
+                    or authority.active_project_head.registry_sha256 != self._registry_sha256
+                    or authority.active_project_head.runtime_context_snapshot.runtime_contract_sha256
                     != self._runtime_contract_sha256
                 ):
                     return None
@@ -440,12 +433,13 @@ class ProjectAuthorityV2:
         project = _exact_project_record(project)
         if type(request) is not m.ProjectUpdateV2:
             raise TypeError("project update request has the wrong type")
-        request = m.ProjectUpdateV2.model_validate(
-            request.model_dump(mode="python")
-        )
+        request = m.ProjectUpdateV2.model_validate(request.model_dump(mode="python"))
         self.validate_config(request.config)
-        with self._lock, self._catalog.action_execution_fence(
-            coordination_scope=_project_authority_scope(project.project_id),
+        with (
+            self._lock,
+            self._catalog.action_execution_fence(
+                coordination_scope=_project_authority_scope(project.project_id),
+            ),
         ):
             replay = self._catalog.project_update_replay(
                 project.project_id,
@@ -458,9 +452,7 @@ class ProjectAuthorityV2:
                 return replay, True
             current_project = self._catalog.get_project(project.project_id)
             if current_project.resource_version != project.resource_version:
-                raise ProjectPreconditionFailedV2(
-                    "v2 project resource ETag changed"
-                )
+                raise ProjectPreconditionFailedV2("v2 project resource ETag changed")
             project = current_project
             if request.config.execution != project.config.execution:
                 raise ProjectAuthoritySettingsTransitionRequiredV2(
@@ -470,13 +462,9 @@ class ProjectAuthorityV2:
                 raise ProjectAuthoritySettingsTransitionRequiredV2(
                     "workspace settings require an atomic workspace successor"
                 )
-            document = self._catalog.get_project_authority_document(
-                project.project_id
-            )
+            document = self._catalog.get_project_authority_document(project.project_id)
             if document is None:
-                raise ProjectAuthorityV2Error(
-                    "project authority document is unavailable"
-                )
+                raise ProjectAuthorityV2Error("project authority document is unavailable")
             authority_record = _load_authority_record(
                 document,
                 expected_project=project,
@@ -486,14 +474,10 @@ class ProjectAuthorityV2:
                     request.expected_project_head_id is not None
                     or request.expected_project_head_manifest_sha256 is not None
                 ):
-                    raise ProjectAuthorityConflictV2(
-                        "project update head authority changed"
-                    )
+                    raise ProjectAuthorityConflictV2("project update head authority changed")
                 desired_draft = authority_record.model_copy(
                     update={
-                        "project_config_sha256": m.project_config_sha256_for(
-                            request.config
-                        ),
+                        "project_config_sha256": m.project_config_sha256_for(request.config),
                         "normalized_evolution_intent_sha256": (
                             normalized_evolution_intent_sha256_for(request.config)
                         ),
@@ -507,9 +491,7 @@ class ProjectAuthorityV2:
                         current_etag=current_etag,
                         expected_resource_version=project.resource_version,
                         idempotency_key=idempotency_key,
-                        authority_record_json=(
-                            _authority_record_bytes(desired_draft)
-                        ),
+                        authority_record_json=(_authority_record_bytes(desired_draft)),
                         expected_authority_record_sha256=document.record_sha256,
                         now=now,
                     )
@@ -517,13 +499,9 @@ class ProjectAuthorityV2:
                 return updated, replayed
             if authority_record.publication_state != "published":
                 self._publish_prepared_authority(project, document, authority_record)
-                document = self._catalog.get_project_authority_document(
-                    project.project_id
-                )
+                document = self._catalog.get_project_authority_document(project.project_id)
                 if document is None:
-                    raise ProjectAuthorityV2Error(
-                        "project authority document is unavailable"
-                    )
+                    raise ProjectAuthorityV2Error("project authority document is unavailable")
                 authority_record = _load_authority_record(
                     document,
                     expected_project=project,
@@ -538,17 +516,12 @@ class ProjectAuthorityV2:
             head = current_authority.active_project_head
             if (
                 request.expected_project_head_id != head.project_head_id
-                or request.expected_project_head_manifest_sha256
-                != head.manifest_sha256
+                or request.expected_project_head_manifest_sha256 != head.manifest_sha256
             ):
-                raise ProjectAuthorityConflictV2(
-                    "project update head authority changed"
-                )
+                raise ProjectAuthorityConflictV2("project update head authority changed")
             desired_record = authority_record.model_copy(
                 update={
-                    "project_config_sha256": m.project_config_sha256_for(
-                        request.config
-                    ),
+                    "project_config_sha256": m.project_config_sha256_for(request.config),
                     "normalized_evolution_intent_sha256": (
                         normalized_evolution_intent_sha256_for(request.config)
                     ),
@@ -560,9 +533,7 @@ class ProjectAuthorityV2:
             blocked = self._tasks.begin_project_admission_authority_rebind(
                 current_authority,
             )
-            if blocked.blockers != (
-                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
-            ):
+            if blocked.blockers != (ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,):
                 raise ProjectAuthorityConflictV2(
                     "science owner did not fence project configuration"
                 )
@@ -579,9 +550,7 @@ class ProjectAuthorityV2:
                         current_etag=current_etag,
                         expected_resource_version=project.resource_version,
                         idempotency_key=idempotency_key,
-                        authority_record_json=(
-                            _authority_record_bytes(desired_record)
-                        ),
+                        authority_record_json=(_authority_record_bytes(desired_record)),
                         expected_authority_record_sha256=document.record_sha256,
                         now=now,
                     )
@@ -589,24 +558,18 @@ class ProjectAuthorityV2:
                 if replayed:
                     recovered = self._ensure_project_locked(updated)
                     if recovered is None:
-                        raise ProjectAuthorityV2Error(
-                            "replayed project update is not ready"
-                        )
+                        raise ProjectAuthorityV2Error("replayed project update is not ready")
                     return updated, True
                 _after_project_config_prepare_before_science_publish(
                     project.project_id,
                     head.project_head_id,
                 )
-                staged = (
-                    self._tasks.finish_project_admission_authority_rebind(
-                        desired_authority,
-                    )
+                staged = self._tasks.finish_project_admission_authority_rebind(
+                    desired_authority,
                 )
                 expected_staged = replace(
                     desired_authority,
-                    blockers=(
-                        ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
-                    ),
+                    blockers=(ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,),
                 )
                 if staged != desired_authority and staged != expected_staged:
                     raise ProjectAuthorityConflictV2(
@@ -629,10 +592,8 @@ class ProjectAuthorityV2:
                     project.project_id,
                     head.project_head_id,
                 )
-                released = (
-                    self._tasks.release_project_admission_authority_rebind(
-                        desired_authority,
-                    )
+                released = self._tasks.release_project_admission_authority_rebind(
+                    desired_authority,
                 )
                 if released != desired_authority:
                     raise ProjectAuthorityConflictV2(
@@ -655,9 +616,7 @@ class ProjectAuthorityV2:
             expected_project=project,
         )
         if authority_record.publication_state != "prepared":
-            raise ProjectAuthorityV2Error(
-                "project authority is not prepared for publication"
-            )
+            raise ProjectAuthorityV2Error("project authority is not prepared for publication")
         desired = _prepared_science_authority(authority_record)
         published = self._published_authority_or_none(project.project_id)
         if published is None:
@@ -665,13 +624,9 @@ class ProjectAuthorityV2:
                 raise ProjectAuthorityConflictV2(
                     "prepared config rebind has no prior science authority"
                 )
-            published = self._tasks.publish_project_admission_authority(
-                desired
-            )
+            published = self._tasks.publish_project_admission_authority(desired)
             if published != desired:
-                raise ProjectAuthorityConflictV2(
-                    "science authority differs from prepared genesis"
-                )
+                raise ProjectAuthorityConflictV2("science authority differs from prepared genesis")
             _after_science_authority_publish_before_catalog_commit(
                 project.project_id,
                 desired.active_project_head.project_head_id,
@@ -683,9 +638,7 @@ class ProjectAuthorityV2:
             )
         if authority_record.pending_project_head is None:
             if published != desired:
-                raise ProjectAuthorityConflictV2(
-                    "science authority differs from prepared genesis"
-                )
+                raise ProjectAuthorityConflictV2("science authority differs from prepared genesis")
             return self._mark_published(
                 document,
                 authority_record,
@@ -701,21 +654,15 @@ class ProjectAuthorityV2:
         )
         changed = False
         if published != desired and published != expected_staged:
-            if published.blockers != (
-                ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,
-            ):
-                published = (
-                    self._tasks.begin_project_admission_authority_rebind(
-                        published,
-                    )
+            if published.blockers != (ScienceProjectReadinessBlockerV2.PROJECT_CONFIG_REBIND,):
+                published = self._tasks.begin_project_admission_authority_rebind(
+                    published,
                 )
             changed = True
         if published != desired:
             already_staged = published == expected_staged
-            published = (
-                self._tasks.finish_project_admission_authority_rebind(
-                    desired,
-                )
+            published = self._tasks.finish_project_admission_authority_rebind(
+                desired,
             )
             changed = changed or not already_staged
         if published != desired and published != expected_staged:
@@ -770,9 +717,7 @@ class ProjectAuthorityV2:
         project = self._catalog.get_project(project_id)
         document = self._catalog.get_project_authority_document(project_id)
         if document is None:
-            raise ProjectAuthorityV2Error(
-                "project authority document disappeared during recovery"
-            )
+            raise ProjectAuthorityV2Error("project authority document disappeared during recovery")
         authority_record = _load_authority_record(
             document,
             expected_project=project,
@@ -800,9 +745,7 @@ class ProjectAuthorityV2:
         expected_project_config_sha256: str,
     ) -> ScienceProjectAdmissionAuthorityV2 | None:
         project = _exact_project_record(project)
-        snapshot = m.WorkspaceSnapshotRefV2.model_validate(
-            snapshot.model_dump(mode="python")
-        )
+        snapshot = m.WorkspaceSnapshotRefV2.model_validate(snapshot.model_dump(mode="python"))
         if (
             snapshot.project_id != project.project_id
             or expected_project_config_sha256 != project.project_config_sha256
@@ -814,9 +757,7 @@ class ProjectAuthorityV2:
             document = self._catalog.get_project_authority_document(project.project_id)
             if document is None:
                 self.ensure_project(project)
-                document = self._catalog.get_project_authority_document(
-                    project.project_id
-                )
+                document = self._catalog.get_project_authority_document(project.project_id)
             if document is None:
                 raise ProjectAuthorityV2Error("project authority draft is missing")
             authority_record = _load_authority_record(
@@ -829,17 +770,10 @@ class ProjectAuthorityV2:
                     raise ProjectAuthorityV2Error(
                         "sealed project authority has no active project head"
                     )
-                if (
-                    expected_project_head_id
-                    != active_head.predecessor_project_head_id
-                ):
-                    raise ProjectAuthorityConflictV2(
-                        "workspace publication predecessor changed"
-                    )
+                if expected_project_head_id != active_head.predecessor_project_head_id:
+                    raise ProjectAuthorityConflictV2("workspace publication predecessor changed")
                 if authority_record.workspace_snapshot != snapshot:
-                    raise ProjectAuthorityConflictV2(
-                        "published genesis workspace is immutable"
-                    )
+                    raise ProjectAuthorityConflictV2("published genesis workspace is immutable")
                 return _science_authority(authority_record)
             if expected_project_head_id is not None:
                 raise ProjectAuthorityConflictV2(
@@ -851,9 +785,7 @@ class ProjectAuthorityV2:
                     "another workspace snapshot already owns the genesis draft"
                 )
             if authority_record.workspace_snapshot is None:
-                updated = authority_record.model_copy(
-                    update={"workspace_snapshot": snapshot}
-                )
+                updated = authority_record.model_copy(update={"workspace_snapshot": snapshot})
                 self._catalog.put_project_authority_document(
                     project_id=project.project_id,
                     record_json=_authority_record_bytes(updated),
@@ -872,9 +804,7 @@ class ProjectAuthorityV2:
         project = _exact_project_record(project)
         if type(request) is not m.WorkspaceUploadCreateV2:
             raise TypeError("workspace upload request has the wrong type")
-        request = m.WorkspaceUploadCreateV2.model_validate(
-            request.model_dump(mode="python")
-        )
+        request = m.WorkspaceUploadCreateV2.model_validate(request.model_dump(mode="python"))
         with self._lock:
             self.ensure_project(project)
             document = self._catalog.get_project_authority_document(project.project_id)
@@ -883,16 +813,13 @@ class ProjectAuthorityV2:
             record = _load_authority_record(document, expected_project=project)
             head = record.active_project_head
             if (
-                request.expected_project_config_sha256
-                != project.project_config_sha256
+                request.expected_project_config_sha256 != project.project_config_sha256
                 or request.expected_project_head_id
                 != (None if head is None else head.project_head_id)
                 or request.expected_project_head_manifest_sha256
                 != (None if head is None else head.manifest_sha256)
             ):
-                raise ProjectAuthorityConflictV2(
-                    "workspace upload authority changed"
-                )
+                raise ProjectAuthorityConflictV2("workspace upload authority changed")
             if record.publication_state != "draft":
                 raise ProjectAuthorityConflictV2(
                     "workspace changes require a successor transition"
@@ -959,16 +886,12 @@ class ProjectAuthorityV2:
         )
         snapshot = session.workspace_snapshot
         if snapshot is None:
-            raise ProjectAuthorityV2Error(
-                "finalized workspace upload has no immutable snapshot"
-            )
+            raise ProjectAuthorityV2Error("finalized workspace upload has no immutable snapshot")
         self.adopt_workspace_snapshot(
             project,
             snapshot,
             expected_project_head_id=session.expected_project_head_id,
-            expected_project_config_sha256=(
-                session.expected_project_config_sha256
-            ),
+            expected_project_config_sha256=(session.expected_project_config_sha256),
         )
         return session, replayed
 
@@ -1008,9 +931,7 @@ class ProjectAuthorityV2:
         project = _exact_project_record(project)
         if type(request) is not m.ProjectValidationRequestV2:
             raise TypeError("project validation request has the wrong type")
-        request = m.ProjectValidationRequestV2.model_validate(
-            request.model_dump(mode="python")
-        )
+        request = m.ProjectValidationRequestV2.model_validate(request.model_dump(mode="python"))
         document = self._catalog.get_project_authority_document(project.project_id)
         authority_record = (
             None
@@ -1029,9 +950,7 @@ class ProjectAuthorityV2:
             or request.expected_project_config_sha256 != project.project_config_sha256
             or request.expected_registry_sha256 != self._registry_sha256
         ):
-            raise ProjectAuthorityConflictV2(
-                "project validation authority changed"
-            )
+            raise ProjectAuthorityConflictV2("project validation authority changed")
         checks, ready = self._evaluate(project, include_passed=True)
         return m.ProjectValidationResponseV2(
             project_id=project.project_id,
@@ -1096,8 +1015,7 @@ class ProjectAuthorityV2:
             )
         published = (
             None
-            if authority_record is None
-            or authority_record.publication_state != "published"
+            if authority_record is None or authority_record.publication_state != "published"
             else self._published_authority_or_none(project.project_id)
         )
         expected_execution = _effective_execution_ref(
@@ -1108,14 +1026,10 @@ class ProjectAuthorityV2:
         effective_matches = bool(
             published is not None
             and authority_record is not None
-            and authority_record.framework_lock_sha256
-            == binding.framework_lock_digest
-            and published.active_project_head.effective_execution_snapshot
-            == expected_execution
-            and published.active_project_head.registry_sha256
-            == self._registry_sha256
-            and published.active_project_head.runtime_context_snapshot
-            .runtime_contract_sha256
+            and authority_record.framework_lock_sha256 == binding.framework_lock_digest
+            and published.active_project_head.effective_execution_snapshot == expected_execution
+            and published.active_project_head.registry_sha256 == self._registry_sha256
+            and published.active_project_head.runtime_context_snapshot.runtime_contract_sha256
             == self._runtime_contract_sha256
         )
         if include_passed or not effective_matches:
@@ -1174,11 +1088,19 @@ class ProjectAuthorityV2:
     ) -> tuple[VerifiedExecutionSnapshot, ServiceRunBinding] | None:
         try:
             if ensure_services:
-                self._services.ensure(
-                    ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
-                    codex_model=config.execution.codex_model,
-                    runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
-                )
+                if config.execution.mode == "self-deployed":
+                    self._services.ensure(
+                        ServiceExecutionMode.SELF_DEPLOYED,
+                        model_ref=config.execution.model_profile_id,
+                        runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+                        total_timeout=7200.0,
+                    )
+                else:
+                    self._services.ensure(
+                        ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
+                        codex_model=config.execution.codex_model,
+                        runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
+                    )
             binding = self._services.run_binding()
         except Exception:
             return None
@@ -1194,11 +1116,15 @@ class ProjectAuthorityV2:
             execution_mode=config.execution.mode,
             capture_mode=config.execution.capture_mode,
             harness_id=config.execution.harness_id,
-            model_ref=config.execution.codex_model,
-            token_limit=config.execution.token_limit,
-            task_network_allow_internet=(
-                config.execution.task_network_allow_internet
+            model_ref=(
+                require_release_self_deployed_model_profile(
+                    config.execution.model_profile_id
+                ).model_id
+                if config.execution.mode == "self-deployed"
+                else config.execution.codex_model
             ),
+            token_limit=config.execution.token_limit,
+            task_network_allow_internet=(config.execution.task_network_allow_internet),
         )
         try:
             verified = resolve_genesis_execution_snapshot(
@@ -1218,9 +1144,7 @@ class ProjectAuthorityV2:
         except CoreTaskControlError as exc:
             if exc.code == "task_not_found":
                 return None
-            raise ProjectAuthorityV2Error(
-                "science project authority is unavailable"
-            ) from exc
+            raise ProjectAuthorityV2Error("science project authority is unavailable") from exc
 
     def _require_published_authority(
         self,
@@ -1297,9 +1221,7 @@ def _build_genesis_authority(
         active_project_head=head,
         project_config_sha256=project.project_config_sha256,
         workspace_snapshot=workspace,
-        normalized_evolution_intent_sha256=(
-            normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(normalized_evolution_intent_sha256),
     )
 
 
@@ -1384,9 +1306,15 @@ def _effective_execution_ref(
     return m.EffectiveExecutionSnapshotRefV2(
         effective_execution_snapshot_id=f"exec-{execution_sha256}",
         project_id=project_id,
-        execution_mode="codex_subscription_transcript",
-        capture_mode="transcript",
-        token_level_metrics_available=False,
+        execution_mode=(
+            "codex_subscription_transcript"
+            if execution_snapshot.execution_mode.value == "subscription"
+            else "self-deployed"
+        ),
+        capture_mode=(
+            "transcript" if execution_snapshot.capture_mode.value == "transcript" else "proxy"
+        ),
+        token_level_metrics_available=(execution_snapshot.token_level_metrics_available),
         producer_id=execution_snapshot_producer_id,
         snapshot_sha256=execution_sha256,
     )
@@ -1402,9 +1330,7 @@ def _science_authority(
         active_project_head=record.active_project_head,
         project_config_sha256=record.project_config_sha256,
         workspace_snapshot=record.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            record.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(record.normalized_evolution_intent_sha256),
     )
 
 
@@ -1421,9 +1347,7 @@ def _prepared_science_authority(
         active_project_head=head,
         project_config_sha256=record.project_config_sha256,
         workspace_snapshot=head.workspace_snapshot,
-        normalized_evolution_intent_sha256=(
-            record.normalized_evolution_intent_sha256
-        ),
+        normalized_evolution_intent_sha256=(record.normalized_evolution_intent_sha256),
     )
 
 
@@ -1436,9 +1360,7 @@ def _load_authority_record(
         decoded = _decode_bounded_json(document.record_json)
         record = _ProjectAuthorityRecordV1.model_validate(decoded)
     except (TypeError, ValueError, ValidationError) as exc:
-        raise ProjectAuthorityV2Error(
-            "persisted project authority record is invalid"
-        ) from exc
+        raise ProjectAuthorityV2Error("persisted project authority record is invalid") from exc
     if (
         record.project_id != document.project_id
         or record.project_id != expected_project.project_id
@@ -1460,19 +1382,14 @@ def _load_authority_record(
             project_id=record.project_id,
             workspace=record.workspace_snapshot,
             execution_snapshot=record.execution_snapshot,
-            execution_snapshot_producer_id=(
-                record.execution_snapshot_producer_id
-            ),
+            execution_snapshot_producer_id=(record.execution_snapshot_producer_id),
             registry_sha256=record.active_project_head.registry_sha256,
             runtime_contract_sha256=(
-                record.active_project_head.runtime_context_snapshot
-                .runtime_contract_sha256
+                record.active_project_head.runtime_context_snapshot.runtime_contract_sha256
             ),
         )
         if record.active_project_head != expected_head:
-            raise ProjectAuthorityV2Error(
-                "persisted project genesis is not content addressed"
-            )
+            raise ProjectAuthorityV2Error("persisted project genesis is not content addressed")
     return record
 
 
@@ -1552,9 +1469,13 @@ def _project_authority_scope(project_id: str) -> str:
 def _timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise TypeError("project authority timestamp requires timezone information")
-    return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
-        "+00:00",
-        "Z",
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace(
+            "+00:00",
+            "Z",
+        )
     )
 
 
