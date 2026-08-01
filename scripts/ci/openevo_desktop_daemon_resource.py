@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 import hashlib
 import importlib.util
@@ -18,7 +19,7 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import ModuleType
-from typing import Sequence
+from typing import Iterator, Sequence
 
 from openevo.runtime.managed import (
     MANAGED_RUNTIME_ARCHIVE_RELEASE,
@@ -93,7 +94,17 @@ def _reject_symlink_components(path: Path) -> None:
             )
 
 
-def _read_controlled_file(path: Path, *, executable: bool = False) -> bytes:
+def _read_descriptor(descriptor: int) -> bytes:
+    chunks: list[bytes] = []
+    while chunk := os.read(descriptor, 1024 * 1024):
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+@contextmanager
+def _controlled_file_snapshot(
+    path: Path, *, executable: bool = False, changed_error: str | None = None
+) -> Iterator[tuple[bytes, int, os.stat_result]]:
     _reject_symlink_components(path)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -111,12 +122,14 @@ def _read_controlled_file(path: Path, *, executable: bool = False) -> bytes:
             or (executable and not before.st_mode & stat.S_IXUSR)
         ):
             raise ResourceCompositionError(f"Controlled release input is not trusted: {path}")
-        chunks: list[bytes] = []
-        while chunk := os.read(descriptor, 1024 * 1024):
-            chunks.append(chunk)
-        payload = b"".join(chunks)
-        after = os.fstat(descriptor)
-        current = os.stat(path, follow_symlinks=False)
+        payload = _read_descriptor(descriptor)
+        try:
+            after = os.fstat(descriptor)
+            current = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise ResourceCompositionError(
+                changed_error or f"Controlled release input changed while reading: {path}"
+            ) from exc
         if (
             (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
             != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
@@ -124,11 +137,41 @@ def _read_controlled_file(path: Path, *, executable: bool = False) -> bytes:
             or len(payload) != before.st_size
         ):
             raise ResourceCompositionError(
-                f"Controlled release input changed while reading: {path}"
+                changed_error or f"Controlled release input changed while reading: {path}"
             )
-        return payload
+        yield payload, descriptor, before
+        try:
+            after = os.fstat(descriptor)
+            current = os.stat(path, follow_symlinks=False)
+        except OSError as exc:
+            raise ResourceCompositionError(
+                changed_error or f"Controlled release input changed while held open: {path}"
+            ) from exc
+        if (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+        ) != (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+        ) or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
+            raise ResourceCompositionError(
+                changed_error or f"Controlled release input changed while held open: {path}"
+            )
     finally:
         os.close(descriptor)
+
+
+def _read_controlled_file(path: Path, *, executable: bool = False) -> bytes:
+    with _controlled_file_snapshot(path, executable=executable) as (payload, _, _):
+        return payload
 
 
 def _write_new_at(directory_fd: int, name: str, payload: bytes, *, mode: int) -> None:
@@ -590,38 +633,31 @@ def _inspect_packaged_askpass_helper(app: Path) -> dict[str, object]:
     try:
         with os.scandir(macos_root) as entries:
             helper_names = sorted(
-                entry.name
-                for entry in entries
-                if entry.name.startswith("openevo-ssh-askpass")
+                entry.name for entry in entries if entry.name.startswith("openevo-ssh-askpass")
             )
     except OSError as exc:
-        raise ResourceCompositionError("Packaged SSH askpass helper inventory is unavailable") from exc
+        raise ResourceCompositionError(
+            "Packaged SSH askpass helper inventory is unavailable"
+        ) from exc
     if helper_names != [helper.name]:
         raise ResourceCompositionError("App bundle does not contain the exact SSH askpass helper")
 
-    try:
-        before = os.stat(helper, follow_symlinks=False)
-    except OSError as exc:
-        raise ResourceCompositionError("Packaged SSH askpass helper is unavailable") from exc
-    payload = _read_controlled_file(helper, executable=True)
-    if stat.S_IMODE(before.st_mode) != 0o755:
-        raise ResourceCompositionError("Packaged SSH askpass helper mode must be exactly 0755")
-    if not 0 < len(payload) <= MAX_ASKPASS_HELPER_BYTES:
-        raise ResourceCompositionError("Packaged SSH askpass helper exceeds its byte limit")
-    architecture = _thin_mach_o_architecture(payload)
-    signature = _verify_macos_adhoc_signature(helper)
-    try:
-        after = os.stat(helper, follow_symlinks=False)
-    except OSError as exc:
-        raise ResourceCompositionError(
-            "Packaged SSH askpass helper changed during verification"
-        ) from exc
-    if (
-        (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)
-        != (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
-        or stat.S_IMODE(after.st_mode) != 0o755
-    ):
-        raise ResourceCompositionError("Packaged SSH askpass helper changed during verification")
+    with _controlled_file_snapshot(
+        helper,
+        executable=True,
+        changed_error="Packaged SSH askpass helper changed during verification",
+    ) as (payload, descriptor, before):
+        if stat.S_IMODE(before.st_mode) != 0o755:
+            raise ResourceCompositionError("Packaged SSH askpass helper mode must be exactly 0755")
+        if not 0 < len(payload) <= MAX_ASKPASS_HELPER_BYTES:
+            raise ResourceCompositionError("Packaged SSH askpass helper exceeds its byte limit")
+        architecture = _thin_mach_o_architecture(payload)
+        signature = _verify_macos_adhoc_signature(helper)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        if _read_descriptor(descriptor) != payload:
+            raise ResourceCompositionError(
+                "Packaged SSH askpass helper changed during verification"
+            )
     return {
         "architecture": architecture,
         "byte_size": len(payload),
