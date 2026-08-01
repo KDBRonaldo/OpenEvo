@@ -33,6 +33,10 @@ from openevo.deployment.host_keys import (
     ProviderKnownHostStore,
     TrustedKnownHostsBinding,
 )
+from openevo.deployment.remote_home import (
+    RemoteHomeAuthority,
+    parse_remote_home_probe,
+)
 from openevo.deployment.ssh import (
     SshRemoteExecutorTransport,
     SshTransportError,
@@ -187,15 +191,69 @@ class FakeTunnelProcess:
         self.return_code = return_code
 
 
+def _remote_home_authority(
+    *,
+    home: str = "/home/alice",
+    profile_id: str = "lab-gpu",
+    connection_generation: int = 1,
+    remote_user: str = "alice",
+    uid: int = 1000,
+) -> RemoteHomeAuthority:
+    record = "\n".join(
+        (
+            "openevo-remote-home-v1",
+            remote_user,
+            str(uid),
+            remote_user,
+            str(uid),
+            home,
+            home,
+            str(uid),
+            "1",
+        )
+    )
+    return parse_remote_home_probe(
+        profile_id=profile_id,
+        connection_generation=connection_generation,
+        return_code=0,
+        stdout=f"{record}\n".encode(),
+        stderr=b"",
+    )
+
+
 class RecordingSystemOpenSshAuthority:
     ssh_host_alias = "gpu-lab"
-    remote_user = "alice"
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        home: str = "/home/alice",
+        profile_id: str = "lab-gpu",
+        connection_generation: int = 1,
+        follower_generation: int | None = None,
+        remote_user: str = "alice",
+        uid: int = 1000,
+        verify_error: bool = False,
+    ) -> None:
+        self.remote_home_authority = _remote_home_authority(
+            home=home,
+            profile_id=profile_id,
+            connection_generation=connection_generation,
+            remote_user=remote_user,
+            uid=uid,
+        )
+        self.connection_generation = (
+            connection_generation if follower_generation is None else follower_generation
+        )
+        self.verify_error = verify_error
         self.commands: list[str] = []
         self.runs: list[tuple[list[str], int | None]] = []
         self.tunnels: list[tuple[list[str], int]] = []
         self.streams: list[socket.socket] = []
+
+    @property
+    def remote_user(self) -> str:
+        return self.remote_home_authority.remote_user
 
     def command_argv(self, remote_command: str) -> list[str]:
         self.commands.append(remote_command)
@@ -230,12 +288,38 @@ class RecordingSystemOpenSshAuthority:
         *,
         stdin_fd: int | None,
         cancel_event: threading.Event | None,
+        stdout_source: str | None = "ssh_stdout",
+        stderr_source: str | None = "ssh_stderr",
     ) -> subprocess.CompletedProcess[str]:
-        del timeout_seconds, cancel_event
+        del timeout_seconds, cancel_event, stdout_source, stderr_source
         self.runs.append((argv, stdin_fd))
         marker = re.search(r"(__OPENEVO_REMOTE_COMPLETION_[0-9a-f]+__=)", argv[-1])
-        stderr = "" if marker is None else f"{marker.group(1)}0\n"
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr=stderr)
+        if marker is None:
+            marker = re.search(
+                r"(__OPENEVO_DAEMON_BUNDLE_COMPLETION_[0-9a-f]+__=)",
+                argv[-1],
+            )
+        stderr = "" if marker is None else f"\n{marker.group(1)}0\n"
+        stdout = "ok"
+        if stdin_fd is not None and "openevo-daemon-stage-v1" in argv[-1]:
+            payload = bytearray()
+            while chunk := os.read(stdin_fd, 8192):
+                payload.extend(chunk)
+            digest = hashlib.sha256(payload).hexdigest()
+            service_root = self.remote_home_authority.daemon_bundle_root
+            stdout = json.dumps(
+                {
+                    "executable_path": f"{service_root}/bundle-{digest}",
+                    "host_profile": "docker_user_container_v1",
+                    "reused": False,
+                    "schema_version": 1,
+                    "sha256": digest,
+                    "size": len(payload),
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n"
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=stderr)
 
     def start_tunnel(self, argv: list[str], stream_fd: int) -> FakeTunnelProcess:
         self.tunnels.append((argv, stream_fd))
@@ -243,7 +327,8 @@ class RecordingSystemOpenSshAuthority:
         return FakeTunnelProcess()
 
     def verify_authority(self) -> None:
-        return None
+        if self.verify_error:
+            raise RuntimeError("follower binding changed")
 
 
 def _profile(**extra) -> RemoteProfileConfig:
@@ -260,7 +345,12 @@ def _profile(**extra) -> RemoteProfileConfig:
 
 def test_system_openssh_authority_drives_commands_and_owned_core_tunnel() -> None:
     authority = RecordingSystemOpenSshAuthority()
-    profile = _profile(host="gpu-lab", port=22, user="alice")
+    profile = _profile(
+        host="gpu-lab",
+        port=22,
+        user="alice",
+        workspace_root=authority.remote_home_authority.workspace_root,
+    )
     transport = SshRemoteExecutorTransport(
         profile,
         system_openssh_authority=authority,
@@ -305,7 +395,12 @@ def test_system_openssh_core_tunnel_renews_follower_authority_per_socket() -> No
 
     authority = OneShotFollowerAuthority()
     transport = SshRemoteExecutorTransport(
-        _profile(host="gpu-lab", port=22, user="alice"),
+        _profile(
+            host="gpu-lab",
+            port=22,
+            user="alice",
+            workspace_root=authority.remote_home_authority.workspace_root,
+        ),
         system_openssh_authority=authority,
     )
     tunnel = transport.open_core_tunnel(remote_port=8765)
@@ -320,6 +415,128 @@ def test_system_openssh_core_tunnel_renews_follower_authority_per_socket() -> No
     tunnel.close()
     for child_stream in authority.streams:
         child_stream.close()
+    transport.close()
+
+
+@pytest.mark.parametrize(
+    ("remote_user", "uid", "home"),
+    [
+        ("root", 0, "/root"),
+        ("alice", 1000, "/home/alice"),
+        ("alice", 1000, "/srv/research/alice"),
+    ],
+)
+def test_system_openssh_transport_derives_service_root_only_from_remote_home_authority(
+    monkeypatch: pytest.MonkeyPatch,
+    remote_user: str,
+    uid: int,
+    home: str,
+) -> None:
+    authority = RecordingSystemOpenSshAuthority(
+        home=home,
+        remote_user=remote_user,
+        uid=uid,
+    )
+    profile = _profile(
+        host="gpu-lab",
+        port=22,
+        user=remote_user,
+        workspace_root=authority.remote_home_authority.workspace_root,
+    )
+
+    def forbidden_fallback(_remote_user: str) -> str:
+        raise AssertionError("system OpenSSH must not use the username fallback")
+
+    monkeypatch.setattr(
+        ssh_module,
+        "daemon_bundle_service_root_for_user",
+        forbidden_fallback,
+    )
+
+    transport = SshRemoteExecutorTransport(
+        profile,
+        system_openssh_authority=authority,
+    )
+
+    assert transport._daemon_bundle_service_root == f"{home}/.openevo/daemon-bundles"
+    transport.close()
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    [
+        "profile_id",
+        "connection_generation",
+        "remote_user",
+        "workspace_root",
+        "missing_workspace_root",
+        "follower_binding",
+    ],
+)
+def test_system_openssh_transport_rejects_remote_home_authority_mismatch(
+    mismatch: str,
+) -> None:
+    authority = RecordingSystemOpenSshAuthority(
+        profile_id="other-profile" if mismatch == "profile_id" else "lab-gpu",
+        follower_generation=2 if mismatch == "connection_generation" else None,
+        verify_error=mismatch == "follower_binding",
+    )
+    workspace_root: str | None = authority.remote_home_authority.workspace_root
+    if mismatch == "workspace_root":
+        workspace_root = "/srv/other/.openevo/workspaces"
+    elif mismatch == "missing_workspace_root":
+        workspace_root = None
+    profile = _profile(
+        host="gpu-lab",
+        port=22,
+        user="bob" if mismatch == "remote_user" else "alice",
+        workspace_root=workspace_root,
+    )
+
+    with pytest.raises(SshTransportError) as captured:
+        SshRemoteExecutorTransport(
+            profile,
+            system_openssh_authority=authority,
+        )
+
+    assert captured.value.code is SshTransportErrorCode.INVALID_REQUEST
+    assert captured.value.__cause__ is None
+
+
+def test_system_openssh_stage_uses_custom_home_root_in_command_and_receipt(
+    tmp_path: Path,
+) -> None:
+    authority = RecordingSystemOpenSshAuthority(home="/srv/research/alice")
+    profile = _profile(
+        host="gpu-lab",
+        port=22,
+        user="alice",
+        workspace_root=authority.remote_home_authority.workspace_root,
+    )
+    payload = b"\x7fELF\0custom-home-bundle"
+    bundle = tmp_path / "openevo-daemon"
+    bundle.write_bytes(payload)
+    manifest_payload = b"{}\n"
+    manifest = tmp_path / "openevo-daemon-bundle.json"
+    manifest.write_bytes(manifest_payload)
+    transport = SshRemoteExecutorTransport(
+        profile,
+        system_openssh_authority=authority,
+    )
+
+    staged = transport.stage_daemon_bundle(
+        bundle_path=str(bundle),
+        bundle_sha256=hashlib.sha256(payload).hexdigest(),
+        bundle_size=len(payload),
+        manifest_path=str(manifest),
+        manifest_sha256=hashlib.sha256(manifest_payload).hexdigest(),
+        manifest_size=len(manifest_payload),
+    )
+
+    expected_root = "/srv/research/alice/.openevo/daemon-bundles"
+    assert staged._service_root == expected_root
+    assert len(authority.commands) == 2
+    assert all(expected_root in command for command in authority.commands)
     transport.close()
 
 
@@ -356,6 +573,33 @@ def _trusted_binding(
         algorithm=candidate.algorithm,
         fingerprint=candidate.fingerprint,
     )
+
+
+def test_legacy_explicit_transport_alone_uses_conventional_username_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+    original = ssh_module.daemon_bundle_service_root_for_user
+
+    def recording_fallback(remote_user: str) -> str:
+        calls.append(remote_user)
+        return original(remote_user)
+
+    monkeypatch.setattr(
+        ssh_module,
+        "daemon_bundle_service_root_for_user",
+        recording_fallback,
+    )
+    profile = _profile()
+    transport = SshRemoteExecutorTransport(
+        profile,
+        trusted_host=_trusted_binding(tmp_path, profile),
+    )
+
+    assert calls == ["alice"]
+    assert transport._daemon_bundle_service_root == "/home/alice/.openevo/daemon-bundles"
+    transport.close()
 
 
 def _transport(

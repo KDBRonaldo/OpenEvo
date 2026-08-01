@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from threading import Lock
-import re
 import time
 from typing import Literal, Protocol
 
@@ -34,6 +33,7 @@ from openevo.deployment.profile import (
     SSHAuthConfig,
     SystemOpenSshAliasProfile,
 )
+from openevo.deployment.remote_home import RemoteHomeAuthority
 from openevo.deployment.ssh import SshRemoteExecutorTransport
 
 
@@ -512,9 +512,11 @@ class _SystemHostTrustV2(Protocol):
     def close(self) -> None: ...
 
 
-SystemTransportFactoryV2 = Callable[[RemoteProfileConfig, object, str], _RemoteTransport]
+SystemTransportFactoryV2 = Callable[
+    [RemoteProfileConfig, object, RemoteHomeAuthority],
+    _RemoteTransport,
+]
 SystemPromptObserverV2 = Callable[[str, AskpassPromptObservation], None]
-_SYSTEM_REMOTE_USER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]{0,127}\Z", re.ASCII)
 
 
 @dataclass(slots=True)
@@ -527,13 +529,13 @@ class _ActiveSystemRemoteV2:
 def _system_transport_factory_v2(
     config: RemoteProfileConfig,
     session: object,
-    remote_user: str,
+    remote_home_authority: RemoteHomeAuthority,
 ) -> _RemoteTransport:
     if type(session) is not SystemOpenSshSession:
         raise TypeError("system OpenSSH lifecycle requires an exact owned session")
     authority = SystemOpenSshFollowerTransportAuthority(
         session,
-        remote_user=remote_user,
+        remote_home_authority=remote_home_authority,
     )
     return SshRemoteExecutorTransport(
         config,
@@ -578,7 +580,7 @@ class SystemOpenSshRemoteLifecycleV2:
             or not isinstance(discovery_timeout_seconds, (int, float))
             or not 0 < discovery_timeout_seconds <= 30.0
         ):
-            raise ValueError("system OpenSSH user discovery timeout is invalid")
+            raise ValueError("system OpenSSH account discovery timeout is invalid")
         self._session_owner: _SystemSessionOwnerV2 = session_owner
         self._host_trust: _SystemHostTrustV2 = host_trust
         self._owned_askpass_helper = owned_askpass_helper
@@ -784,20 +786,28 @@ class SystemOpenSshRemoteLifecycleV2:
                     prompt_observer=observe_prompt if observer is not None else None,
                 )
             session = self._session_owner.active_session()
-            result = session.run(
-                "id -un",
+            authority = session.discover_remote_home_authority(
                 timeout_seconds=self._discovery_timeout_seconds,
             )
-            remote_user = self._remote_user(result)
+            if type(authority) is not RemoteHomeAuthority or not authority.matches(
+                profile_id=profile.profile_id,
+                connection_generation=profile.connection_generation,
+                remote_user=authority.remote_user,
+            ):
+                raise SystemOpenSshSessionError(
+                    "ssh_remote_account_unavailable",
+                    "The remote SSH account could not be verified.",
+                )
             config = RemoteProfileConfig(
                 id=profile.profile_id,
                 name=profile.display_name,
                 host=profile.ssh_host_alias,
                 port=22,
-                user=remote_user,
+                user=authority.remote_user,
                 auth=SSHAuthConfig(method="ssh_agent"),
+                workspace_root=authority.workspace_root,
             )
-            transport = self._transport_factory(config, session, remote_user)
+            transport = self._transport_factory(config, session, authority)
             if not callable(getattr(transport, "run", None)) or not callable(
                 getattr(transport, "close", None)
             ):
@@ -865,15 +875,6 @@ class SystemOpenSshRemoteLifecycleV2:
     @staticmethod
     def _close_transport(transport: _RemoteTransport) -> None:
         transport.close()
-
-    @staticmethod
-    def _remote_user(result: RemoteCommandResult) -> str:
-        if not result.ok or type(result.stdout) is not str:
-            raise RemoteConnectionFailedError("The SSH remote user could not be discovered.")
-        lines = result.stdout.splitlines()
-        if len(lines) != 1 or _SYSTEM_REMOTE_USER.fullmatch(lines[0]) is None:
-            raise RemoteConnectionFailedError("The SSH remote user could not be discovered.")
-        return lines[0]
 
     @staticmethod
     def _alias_profile(

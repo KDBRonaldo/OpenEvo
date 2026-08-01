@@ -106,6 +106,26 @@ process group, socket identity, alias, and generation and never adopts an
 ambient master. Cancellation, replacement, disconnect, or app shutdown closes
 and reaps the generation within a hard deadline.
 
+After that master authenticates, the sidecar privately discovers the effective
+`id` username and UID plus the single matching `getent passwd <uid>` home. It
+requires the NSS name/UID to match `id`, the home to be a normalized safe
+absolute path, its physical path to equal its lexical path, and the directory to
+be owned by and writable for the effective UID. The bounded probe output bypasses
+the lifecycle log observer and becomes a sealed, process-local authority bound
+to the exact profile and connection generation. It is never a profile field,
+Local API value, persisted row, event value, diagnostic, or log value.
+
+The v2 workspace and Daemon bundle roots are derived only as
+`<nss-home>/.openevo/workspaces` and
+`<nss-home>/.openevo/daemon-bundles`. `/root`, `/home/<user>`, and safe custom
+homes such as `/srv/research/alice` use the same path. Rich SSH commands repeat
+the account/NSS/home guard before execution, and the Daemon staging script
+independently repeats that validation before creating owner-private directories;
+it pins and rechecks the service-root identity through streaming, hashing, and
+no-overwrite publication. The system-OpenSSH v2 path has no username-derived
+fallback. The raw Core tunnel remains the non-shell `ssh -W` channel and does
+not run a home-derived command.
+
 The separately inventoried native askpass helper accepts only a bounded prompt
 from a descendant of the current owned OpenSSH generation and a single-use
 sidecar authorization. It shows AppKit confirmation or secure-input controls.
@@ -370,6 +390,12 @@ Every renderer-visible failure is a strict code with retryability, affected
 resource, safe summary, and a bounded action such as retry, rescan, review host
 key, rebind, reconnect, install/repair Daemon, or administrator action.
 
+Failure to establish the exact remote account/home authority is always projected
+as `ssh_remote_account_unavailable`, with the fixed summary "Desktop could not
+verify a supported writable remote account home.", retry enabled, and
+`administrator_action`. The original probe, exception, account, UID, NSS record,
+home, and command are discarded from every public and persistent surface.
+
 Raw SSH output/commands, prompt text containing paths, config/identity/trust
 paths, remote paths, Core URLs/tokens, exception text, and secret values do not
 cross the boundary. Startup and runtime diagnostics bind attempt ID, ordered
@@ -383,8 +409,10 @@ ETag, cursor, SSE replay, v1 migration, system OpenSSH, askpass, host-key,
 Daemon, task/admission/attempt, atomic successor, and next-session reuse all
 have focused tests.
 
-Release evidence additionally requires the exact downloaded 0.1.9 DMG on the
-target Tahoe Mac, the real configured SSH alias, exact Daemon Bundle, real
-Codex Subscription task, committed successor, second-session context use,
-quit/relaunch/reconnect, retained and clean local state, and bounded diagnostic
-export. Component or simulator evidence cannot substitute for that path.
+Release evidence additionally requires the exact downloaded 0.1.10 DMG on the
+target Tahoe Mac, the real configured SSH alias, successful private validation
+of a safe non-conventional NSS home without recording that path, exact Daemon
+Bundle, real Codex Subscription task, committed successor, second-session
+context use, quit/relaunch/reconnect, retained and clean local state, and
+bounded diagnostic export. Component or simulator evidence cannot substitute
+for that path.

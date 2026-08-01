@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -43,19 +44,6 @@ from openevo.deployment.ssh import (
 )
 from tests.managed_runtime_testkit import write_test_managed_runtime_archive
 
-
-_ROOT_ADMISSION = """if [ "$root" = "/root/.openevo/daemon-bundles" ]; then
-    [ "$(id -u)" = "0" ] || exit 64
-    [ "$(id -un)" = "root" ] || exit 64
-else
-    relative_root=${root#/home/}
-    remote_user=${relative_root%%/*}
-    [ -n "$remote_user" ]
-    [ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
-    [ "$(id -un)" = "$remote_user" ] || exit 64
-    [ "$(id -u)" != "0" ] || exit 64
-fi
-"""
 _MANIFEST_DIGEST = "8" * 64
 
 
@@ -234,15 +222,47 @@ def _staged(*, digest: str, size: int) -> StagedDaemonBundle:
     )
 
 
-def _minimal_tool_path(tmp_path: Path) -> Path:
-    tools = tmp_path / "tools"
-    tools.mkdir()
+def _minimal_tool_path(
+    tmp_path: Path,
+    *,
+    home: Path,
+    user: str = "researcher",
+    uid: int | None = None,
+    nss_record: str | None = None,
+) -> Path:
+    effective_uid = os.getuid() if uid is None else uid
+    tools = tmp_path.resolve() / "tools"
+    tools.mkdir(parents=True)
     for name in DOCKER_USER_CONTAINER_V1.required_commands:
-        if name == "/bin/sh":
+        if name in {"/bin/sh", "getent", "id"}:
             continue
         executable = shutil.which(name)
         assert executable is not None
         (tools / name).symlink_to(executable)
+    id_script = tools / "id"
+    id_script.write_text(
+        "#!/bin/sh\n"
+        f"case \"$1\" in -un) printf '%s\\n' {shlex.quote(user)} ;; "
+        f"-u) printf '%s\\n' {effective_uid} ;; *) exit 64 ;; esac\n",
+        encoding="utf-8",
+    )
+    id_script.chmod(0o700)
+    getent_script = tools / "getent"
+    record = (
+        f"{user}:x:{effective_uid}:1000:OpenEvo Test:{home}:/bin/sh"
+        if nss_record is None
+        else nss_record
+    )
+    record_command = (
+        f"printf '%s\\n' {shlex.quote(record)}" if record else ":"
+    )
+    getent_script.write_text(
+        "#!/bin/sh\n"
+        f"[ \"$1\" = passwd ] && [ \"$2\" = {effective_uid} ] || exit 2\n"
+        f"{record_command}\n",
+        encoding="utf-8",
+    )
+    getent_script.chmod(0o700)
     return tools
 
 
@@ -254,13 +274,11 @@ def _run_stage_script(
     expected_size: int,
     tool_path: Path,
 ) -> subprocess.CompletedProcess[bytes]:
-    script = _STAGE_SCRIPT.replace(_ROOT_ADMISSION, ":")
-    assert script != _STAGE_SCRIPT
     return subprocess.run(
         [
             "/bin/sh",
             "-c",
-            script,
+            _STAGE_SCRIPT,
             "openevo-daemon-stage-v1",
             str(root),
             digest,
@@ -281,11 +299,15 @@ def test_host_profile_declares_clean_host_tools_without_python_rsync_or_scp() ->
     assert "python" not in DOCKER_USER_CONTAINER_V1.required_commands
     assert "rsync" not in DOCKER_USER_CONTAINER_V1.required_commands
     assert "scp" not in DOCKER_USER_CONTAINER_V1.required_commands
+    assert "sudo" not in DOCKER_USER_CONTAINER_V1.required_commands
+    assert "apt" not in DOCKER_USER_CONTAINER_V1.required_commands
+    assert "getent" in DOCKER_USER_CONTAINER_V1.required_commands
+    assert "set -f" in _STAGE_SCRIPT
     assert 'cat > "$tmp"' in _STAGE_SCRIPT
     assert 'mkdir -- "$lock"' in _STAGE_SCRIPT
     assert 'ln -- "$tmp" "$target"' in _STAGE_SCRIPT
-    assert '[ "$(id -un)" = "$remote_user" ]' in _STAGE_SCRIPT
-    assert '[ "$(id -un)" = "root" ]' in _STAGE_SCRIPT
+    assert 'passwd_record=$(getent passwd "$uid" 2>/dev/null)' in _STAGE_SCRIPT
+    assert '[ "$root" = "$home/.openevo/daemon-bundles" ]' in _STAGE_SCRIPT
     assert "trap cleanup 0" in _STAGE_SCRIPT
 
 
@@ -294,8 +316,9 @@ def test_stage_script_works_with_only_declared_tools_and_reuses_exact_bundle(
 ) -> None:
     payload = b"\x7fELF\0clean-host-bundle"
     digest = hashlib.sha256(payload).hexdigest()
-    root = tmp_path / ".openevo" / "daemon-bundles"
-    tools = _minimal_tool_path(tmp_path)
+    home = tmp_path.resolve()
+    root = home / ".openevo" / "daemon-bundles"
+    tools = _minimal_tool_path(tmp_path, home=home)
 
     first = _run_stage_script(
         root=root,
@@ -329,8 +352,9 @@ def test_stage_script_failures_leave_no_partial_publication(
 ) -> None:
     payload = b"\x7fELF\0complete"
     digest = hashlib.sha256(payload).hexdigest()
-    root = tmp_path / ".openevo" / "daemon-bundles"
-    tools = _minimal_tool_path(tmp_path)
+    home = tmp_path.resolve()
+    root = home / ".openevo" / "daemon-bundles"
+    tools = _minimal_tool_path(tmp_path, home=home)
     if failure == "concurrent":
         root.mkdir(parents=True, mode=0o700)
         (root / ".bundle-stage.lock").mkdir(mode=0o700)
@@ -350,6 +374,250 @@ def test_stage_script_failures_leave_no_partial_publication(
     assert not list(root.glob(".incoming-*"))
     if failure != "concurrent":
         assert not (root / ".bundle-stage.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "service_root",
+    [
+        "/root/.openevo/daemon-bundles",
+        "/home/alice/.openevo/daemon-bundles",
+        "/srv/research/alice/.openevo/daemon-bundles",
+    ],
+)
+def test_stage_command_accepts_safe_system_home_roots(service_root: str) -> None:
+    command = build_daemon_bundle_stage_command(
+        service_root=service_root,
+        sha256="a" * 64,
+        size=12,
+        transfer_id="b" * 32,
+    )
+
+    assert service_root in command
+
+
+@pytest.mark.parametrize(
+    "service_root",
+    [
+        "/srv/research/alice/.openevo/daemon-bundle",
+        "/srv/research/../alice/.openevo/daemon-bundles",
+        "/srv/research alice/.openevo/daemon-bundles",
+        f"/{'a' * 4097}/.openevo/daemon-bundles",
+    ],
+)
+def test_stage_command_rejects_unsupported_home_roots(service_root: str) -> None:
+    with pytest.raises(DaemonBundleTransportContractError):
+        build_daemon_bundle_stage_command(
+            service_root=service_root,
+            sha256="a" * 64,
+            size=12,
+            transfer_id="b" * 32,
+        )
+
+
+@pytest.mark.parametrize(
+    "requested_suffix",
+    [
+        ".openevo/daemon-bundle",
+        ".openevo/daemon-bundles/extra",
+        ".other/daemon-bundles",
+    ],
+)
+def test_stage_script_rejects_wrong_root_suffix_before_publication(
+    tmp_path: Path,
+    requested_suffix: str,
+) -> None:
+    home = tmp_path.resolve()
+    root = home / requested_suffix
+    tools = _minimal_tool_path(tmp_path, home=home)
+    payload = b"bundle"
+
+    result = _run_stage_script(
+        root=root,
+        payload=payload,
+        digest=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        tool_path=tools,
+    )
+
+    assert result.returncode != 0
+    assert not root.exists()
+
+
+@pytest.mark.parametrize("drift", ["name", "uid", "home", "zero", "multiple"])
+def test_stage_script_rejects_nss_drift_without_publication(
+    tmp_path: Path,
+    drift: str,
+) -> None:
+    home = tmp_path.resolve()
+    root = home / ".openevo" / "daemon-bundles"
+    uid = os.getuid()
+    record = f"researcher:x:{uid}:1000:OpenEvo Test:{home}:/bin/sh"
+    if drift == "name":
+        record = f"somebody-else:x:{uid}:1000:OpenEvo Test:{home}:/bin/sh"
+    elif drift == "uid":
+        record = f"researcher:x:{uid + 1}:1000:OpenEvo Test:{home}:/bin/sh"
+    elif drift == "home":
+        other_home = home / "other-home"
+        other_home.mkdir()
+        record = f"researcher:x:{uid}:1000:OpenEvo Test:{other_home}:/bin/sh"
+    elif drift == "zero":
+        record = ""
+    elif drift == "multiple":
+        record = f"{record}\n{record}"
+    tools = _minimal_tool_path(tmp_path, home=home, nss_record=record)
+    payload = b"bundle"
+
+    result = _run_stage_script(
+        root=root,
+        payload=payload,
+        digest=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        tool_path=tools,
+    )
+
+    assert result.returncode != 0
+    assert not root.exists()
+
+
+def test_stage_script_rejects_symlinked_physical_home(tmp_path: Path) -> None:
+    base = tmp_path.resolve()
+    physical_home = base / "physical-home"
+    physical_home.mkdir()
+    home = base / "account-home"
+    home.symlink_to(physical_home, target_is_directory=True)
+    root = home / ".openevo" / "daemon-bundles"
+    tools = _minimal_tool_path(base / "tool-fixture", home=home)
+    payload = b"bundle"
+
+    result = _run_stage_script(
+        root=root,
+        payload=payload,
+        digest=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        tool_path=tools,
+    )
+
+    assert result.returncode != 0
+    assert not (physical_home / ".openevo").exists()
+
+
+def test_stage_script_rejects_unsafe_nss_home_component(tmp_path: Path) -> None:
+    home = tmp_path.resolve() / "unsafe home"
+    home.mkdir()
+    root = home / ".openevo" / "daemon-bundles"
+    tools = _minimal_tool_path(tmp_path.resolve() / "tool-fixture", home=home)
+    payload = b"bundle"
+
+    result = _run_stage_script(
+        root=root,
+        payload=payload,
+        digest=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        tool_path=tools,
+    )
+
+    assert result.returncode != 0
+    assert not (home / ".openevo").exists()
+
+
+def test_stage_script_rejects_wrong_owner_and_nonwritable_home(tmp_path: Path) -> None:
+    base = tmp_path.resolve()
+    payload = b"bundle"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    wrong_owner_home = base / "wrong-owner"
+    wrong_owner_home.mkdir()
+    wrong_owner_tools = _minimal_tool_path(
+        base / "wrong-owner-tools",
+        home=wrong_owner_home,
+        uid=os.getuid() + 1,
+    )
+    wrong_owner = _run_stage_script(
+        root=wrong_owner_home / ".openevo" / "daemon-bundles",
+        payload=payload,
+        digest=digest,
+        expected_size=len(payload),
+        tool_path=wrong_owner_tools,
+    )
+
+    nonwritable_home = base / "nonwritable"
+    nonwritable_home.mkdir(mode=0o500)
+    nonwritable_tools = _minimal_tool_path(
+        base / "nonwritable-tools",
+        home=nonwritable_home,
+    )
+    try:
+        nonwritable = _run_stage_script(
+            root=nonwritable_home / ".openevo" / "daemon-bundles",
+            payload=payload,
+            digest=digest,
+            expected_size=len(payload),
+            tool_path=nonwritable_tools,
+        )
+    finally:
+        nonwritable_home.chmod(0o700)
+
+    assert wrong_owner.returncode != 0
+    assert nonwritable.returncode != 0
+    assert not (wrong_owner_home / ".openevo").exists()
+    assert not (nonwritable_home / ".openevo").exists()
+
+
+def test_stage_script_rejects_symlinked_service_root(tmp_path: Path) -> None:
+    home = tmp_path.resolve()
+    service_parent = home / ".openevo"
+    service_parent.mkdir(mode=0o700)
+    alternate = home / "alternate-root"
+    alternate.mkdir(mode=0o700)
+    root = service_parent / "daemon-bundles"
+    root.symlink_to(alternate, target_is_directory=True)
+    tools = _minimal_tool_path(tmp_path, home=home)
+    payload = b"bundle"
+
+    result = _run_stage_script(
+        root=root,
+        payload=payload,
+        digest=hashlib.sha256(payload).hexdigest(),
+        expected_size=len(payload),
+        tool_path=tools,
+    )
+
+    assert result.returncode != 0
+    assert not list(alternate.glob("bundle-*"))
+
+
+def test_stage_script_detects_service_root_inode_replacement_during_stream(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path.resolve()
+    root = home / ".openevo" / "daemon-bundles"
+    displaced_root = home / ".openevo" / "daemon-bundles-displaced"
+    tools = _minimal_tool_path(tmp_path, home=home)
+    cat_tool = tools / "cat"
+    real_cat = cat_tool.resolve()
+    cat_tool.unlink()
+    cat_tool.write_text(
+        "#!/bin/sh\n"
+        f"{shlex.quote(str(real_cat))} \"$@\"\n"
+        f"/bin/mv {shlex.quote(str(root))} {shlex.quote(str(displaced_root))}\n"
+        f"/bin/mkdir -m 700 {shlex.quote(str(root))}\n",
+        encoding="utf-8",
+    )
+    cat_tool.chmod(0o700)
+    payload = b"bundle"
+    digest = hashlib.sha256(payload).hexdigest()
+
+    result = _run_stage_script(
+        root=root,
+        payload=payload,
+        digest=digest,
+        expected_size=len(payload),
+        tool_path=tools,
+    )
+
+    assert result.returncode != 0
+    assert not (root / f"bundle-{digest}").exists()
+    assert not (displaced_root / f"bundle-{digest}").exists()
 
 
 def test_opened_bundle_rejects_symlink_and_detects_content_change(tmp_path: Path) -> None:

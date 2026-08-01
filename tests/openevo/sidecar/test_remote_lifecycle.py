@@ -36,6 +36,10 @@ from openevo.deployment.host_keys import (
 )
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import SSHAuthConfig, SystemOpenSshAliasProfile
+from openevo.deployment.remote_home import (
+    RemoteHomeAuthority,
+    parse_remote_home_probe,
+)
 
 
 TIMESTAMP = "2026-07-14T12:00:00.000000Z"
@@ -544,10 +548,25 @@ def test_remote_profile_projection_has_no_credential_or_local_path() -> None:
 
 
 class _SystemSession:
-    def __init__(self, alias: str, *, remote_user: str = "researcher") -> None:
+    def __init__(
+        self,
+        alias: str,
+        *,
+        profile_id: str,
+        connection_generation: int,
+        remote_user: str = "researcher",
+        remote_home: str = "/srv/research/alice",
+        discovery_error: SystemOpenSshSessionError | None = None,
+    ) -> None:
         self.ssh_host_alias = alias
+        self.profile_id = profile_id
+        self.connection_generation = connection_generation
         self.remote_user = remote_user
+        self.remote_home = remote_home
+        self.discovery_error = discovery_error
         self.commands: list[str] = []
+        self.discoveries: list[float] = []
+        self.authorities: list[RemoteHomeAuthority] = []
 
     def snapshot(self) -> object:
         return object()
@@ -561,12 +580,39 @@ class _SystemSession:
             stdout=f"{self.remote_user}\n",
         )
 
+    def discover_remote_home_authority(
+        self,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteHomeAuthority:
+        self.discoveries.append(timeout_seconds)
+        if self.discovery_error is not None:
+            raise self.discovery_error
+        uid = 1001
+        record = (
+            "openevo-remote-home-v1\n"
+            f"{self.remote_user}\n{uid}\n{self.remote_user}\n{uid}\n"
+            f"{self.remote_home}\n{self.remote_home}\n{uid}\n1\n"
+        ).encode("utf-8")
+        authority = parse_remote_home_probe(
+            profile_id=self.profile_id,
+            connection_generation=self.connection_generation,
+            return_code=0,
+            stdout=record,
+            stderr=b"",
+        )
+        self.authorities.append(authority)
+        return authority
+
 
 class _SystemSessionOwner:
     def __init__(self) -> None:
         self.active: _SystemSession | None = None
         self.failures: list[SystemOpenSshSessionError] = []
+        self.discovery_failures: list[SystemOpenSshSessionError] = []
+        self.remote_homes: dict[int, str] = {}
         self.connections: list[tuple[SystemOpenSshAliasProfile, int]] = []
+        self.sessions: list[_SystemSession] = []
         self.disconnects = 0
         self.prompt_observer: Callable[[AskpassPromptObservation], None] | None = None
         self.output_observer: LifecycleRawOutputObserverV2 | None = None
@@ -584,7 +630,19 @@ class _SystemSessionOwner:
         self.output_observer = output_observer
         if self.failures:
             raise self.failures.pop(0)
-        self.active = _SystemSession(profile.ssh_host_alias)
+        self.active = _SystemSession(
+            profile.ssh_host_alias,
+            profile_id=profile.profile_id,
+            connection_generation=connection_generation,
+            remote_home=self.remote_homes.get(
+                connection_generation,
+                "/srv/research/alice",
+            ),
+            discovery_error=(
+                self.discovery_failures.pop(0) if self.discovery_failures else None
+            ),
+        )
+        self.sessions.append(self.active)
         return object()
 
     def active_session(self) -> _SystemSession:
@@ -624,13 +682,17 @@ class _SystemHostTrust:
         return None
 
 
-def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -> None:
+def test_v2_lifecycle_uses_literal_alias_and_verified_remote_home_authority() -> None:
     owner = _SystemSessionOwner()
-    seen: list[tuple[object, object, str]] = []
+    seen: list[tuple[object, object, RemoteHomeAuthority]] = []
     transport = _SystemTransport()
 
-    def transport_factory(config: object, session: object, remote_user: str) -> object:
-        seen.append((config, session, remote_user))
+    def transport_factory(
+        config: object,
+        session: object,
+        authority: RemoteHomeAuthority,
+    ) -> object:
+        seen.append((config, session, authority))
         return transport
 
     lifecycle = SystemOpenSshRemoteLifecycleV2(
@@ -648,14 +710,19 @@ def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -
         ssh_host_alias="gpu-via-config",
     )
     assert generation == profile.connection_generation
-    config, session, remote_user = seen[0]
+    config, session, authority = seen[0]
     assert config.host == "gpu-via-config"
-    assert config.user == remote_user == "researcher"
+    assert config.user == authority.remote_user == "researcher"
     assert config.port == 22
     assert config.path is None
+    assert config.workspace_root == "/srv/research/alice/.openevo/workspaces"
+    assert config.effective_workspace_root == config.workspace_root
+    assert "/srv/research/alice" not in repr(config)
     assert session is owner.active
     assert owner.active is not None
-    assert owner.active.commands == ["id -un"]
+    assert owner.active.commands == []
+    assert owner.active.discoveries == [30.0]
+    assert owner.active.authorities == [authority]
     assert (
         lifecycle.active_transport(profile.profile_id, profile.connection_generation) is transport
     )
@@ -664,6 +731,69 @@ def test_v2_lifecycle_uses_only_the_literal_alias_and_discovered_remote_user() -
 
     lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
     assert transport.closed
+    assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_rediscovers_home_for_every_connection_generation() -> None:
+    owner = _SystemSessionOwner()
+    owner.remote_homes = {
+        2: "/srv/research/alice",
+        3: "/EvoLab/accounts/alice",
+    }
+    seen: list[tuple[object, RemoteHomeAuthority, _SystemTransport]] = []
+
+    def transport_factory(
+        config: object,
+        _session: object,
+        authority: RemoteHomeAuthority,
+    ) -> _SystemTransport:
+        transport = _SystemTransport()
+        seen.append((config, authority, transport))
+        return transport
+
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=transport_factory,
+    )
+
+    lifecycle.connect(_system_profile(generation=2))
+    lifecycle.connect(_system_profile(generation=3))
+
+    assert len(seen) == 2
+    assert seen[0][1] is not seen[1][1]
+    assert seen[0][1].connection_generation == 2
+    assert seen[1][1].connection_generation == 3
+    assert seen[0][0].workspace_root == "/srv/research/alice/.openevo/workspaces"
+    assert seen[1][0].workspace_root == "/EvoLab/accounts/alice/.openevo/workspaces"
+    assert owner.sessions[0].discoveries == [30.0]
+    assert owner.sessions[1].discoveries == [30.0]
+    assert seen[0][2].closed
+
+
+def test_v2_lifecycle_discovery_failure_prevents_transport_and_disconnects() -> None:
+    owner = _SystemSessionOwner()
+    owner.discovery_failures.append(
+        SystemOpenSshSessionError(
+            "ssh_remote_account_unavailable",
+            "The remote SSH account could not be verified.",
+        )
+    )
+    factory_calls: list[object] = []
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *arguments: factory_calls.append(arguments)
+        or _SystemTransport(),
+    )
+
+    with pytest.raises(SystemOpenSshSessionError) as captured:
+        lifecycle.connect(_system_profile())
+
+    assert captured.value.code == "ssh_remote_account_unavailable"
+    assert factory_calls == []
+    assert owner.sessions[0].commands == []
+    assert owner.sessions[0].discoveries == [30.0]
     assert owner.disconnects == 1
 
 

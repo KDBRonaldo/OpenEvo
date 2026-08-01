@@ -23,6 +23,36 @@ to both the expected generation and an idempotency key. This catalog is a UI
 hint: the selected exact alias is later passed to system OpenSSH, which remains
 the connection and configuration authority.
 
+## System OpenSSH remote-home authority
+
+Once the owned OpenSSH master authenticates, `SystemOpenSshSession` runs one
+fixed private account probe through that exact master. The probe binds the
+effective `id` username/UID to a single NSS `getent passwd <uid>` record and
+requires a safe normalized, physically identical, owner-matching, writable home.
+Its bounded stdout/stderr bypass lifecycle observation. The parsed
+`RemoteHomeAuthority` is sealed to the profile ID and connection generation and
+exists only in process; no renderer DTO, Desktop Local API model, profile row,
+event, diagnostic, or log contains the home or its derived roots.
+
+`SystemOpenSshRemoteLifecycleV2` derives the private workspace root as
+`<home>/.openevo/workspaces` and gives the same authority to the follower and
+deployment transport. The follower guards each rich remote shell command by
+rechecking the effective account, NSS home, physical path, owner, and
+writability. `SshRemoteExecutorTransport` requires an exact profile ID,
+generation, user, and explicit workspace-root match and derives Daemon staging
+only as `<home>/.openevo/daemon-bundles`; only the legacy explicit maintainer
+transport retains the conventional username helper. The Daemon stage performs
+its own equivalent admission, rejects symlink/drift/replacement, and rechecks
+the owner-private root identity around transfer and publication. The Core tunnel
+is deliberately different: it stays a raw, non-shell `ssh -W` channel because
+it executes no home-derived command.
+
+An unsupported or drifting remote account fails closed as
+`ssh_remote_account_unavailable`. The release provider replaces all private
+details with the fixed writable-home summary and `administrator_action` before
+operation, profile, event, or persistence projection. SSH and Daemon process
+logs pass through the absolute-host-path sanitizer before storage.
+
 ## V2 provider state and Preview import
 
 The Desktop v2 local-state composition owns a separate owner-private

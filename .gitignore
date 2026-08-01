@@ -98,6 +98,7 @@ ipython_config.py
 .openevo-wheel-smoke/
 
 # Project local
+.worktrees/
 *.log
 *.out
 *.pkl

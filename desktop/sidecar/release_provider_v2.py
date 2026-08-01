@@ -2833,6 +2833,12 @@ class DesktopReleaseProviderV2:
                 True,
                 "retry",
             ),
+            "ssh_remote_account_unavailable": (
+                "ssh_remote_account_unavailable",
+                "Desktop could not verify a supported writable remote account home.",
+                True,
+                "administrator_action",
+            ),
             "core_connection_failed": (
                 "core_connection_failed",
                 "Desktop could not negotiate the OpenEvo Daemon.",

@@ -34,6 +34,13 @@ from desktop.sidecar.lifecycle_logs_v2 import (
 )
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import SystemOpenSshAliasProfile
+from openevo.deployment.remote_home import (
+    REMOTE_HOME_PROBE_OUTPUT_LIMIT,
+    RemoteHomeAuthority,
+    build_remote_home_guarded_command,
+    build_remote_home_probe_command,
+    parse_remote_home_probe,
+)
 from openevo.deployment.host_keys import (
     PendingSystemHostKeyReview,
     SystemHostKeyFailureCode,
@@ -951,6 +958,38 @@ class SystemOpenSshSession:
             stderr=_decode_output(completed.stderr),
         )
 
+    def discover_remote_home_authority(
+        self,
+        *,
+        timeout_seconds: float = 30.0,
+    ) -> RemoteHomeAuthority:
+        """Privately bind the effective remote NSS account to this master."""
+
+        try:
+            snapshot = self.snapshot()
+            command = build_remote_home_probe_command()
+            completed = self._run_session_subprocess(
+                self.command_argv(command),
+                self._base_environment(),
+                timeout_seconds,
+                observe_output=False,
+                max_capture_bytes=REMOTE_HOME_PROBE_OUTPUT_LIMIT,
+            )
+            if self.snapshot() != snapshot:
+                raise ValueError("SSH session binding changed during account discovery")
+            return parse_remote_home_probe(
+                profile_id=snapshot.profile_id,
+                connection_generation=snapshot.connection_generation,
+                return_code=completed.returncode,
+                stdout=completed.stdout,
+                stderr=completed.stderr,
+            )
+        except Exception:
+            raise _session_error(
+                "ssh_remote_account_unavailable",
+                "The remote SSH account could not be verified.",
+            ) from None
+
     def follower_environment(self) -> dict[str, str]:
         """Return the closed environment for followers of this exact master."""
 
@@ -1167,22 +1206,33 @@ class SystemOpenSshSession:
         argv: list[str],
         environment: dict[str, str],
         timeout_seconds: float,
+        *,
+        observe_output: bool = True,
+        max_capture_bytes: int = _MAX_CAPTURE_BYTES,
     ) -> subprocess.CompletedProcess[bytes]:
+        _validate_capture_limit(max_capture_bytes)
         if self._uses_default_runner:
             return _run_bounded_subprocess(
                 argv,
                 environment,
                 timeout_seconds,
-                output_observer=self._output_observer,
+                output_observer=self._output_observer if observe_output else None,
+                max_capture_bytes=max_capture_bytes,
             )
         completed = self._runner(argv, environment, timeout_seconds)
-        if type(completed.stdout) is bytes:
+        if type(completed.stdout) is bytes and type(completed.stderr) is bytes:
+            if len(completed.stdout) + len(completed.stderr) > max_capture_bytes:
+                raise _session_error(
+                    "ssh_output_limit_exceeded",
+                    "SSH command output exceeded its limit.",
+                )
+        if observe_output and type(completed.stdout) is bytes:
             _notify_output_observer(
                 self._output_observer,
                 "ssh_stdout",
                 completed.stdout,
             )
-        if type(completed.stderr) is bytes:
+        if observe_output and type(completed.stderr) is bytes:
             _notify_output_observer(
                 self._output_observer,
                 "ssh_stderr",
@@ -1396,31 +1446,53 @@ class SystemOpenSshFollowerTransportAuthority:
 
     _MAX_ISSUED = 64
 
-    def __init__(self, session: SystemOpenSshSession, *, remote_user: str) -> None:
+    def __init__(
+        self,
+        session: SystemOpenSshSession,
+        *,
+        remote_home_authority: RemoteHomeAuthority,
+    ) -> None:
         if type(session) is not SystemOpenSshSession:
             raise TypeError("system OpenSSH follower requires an exact session")
-        if (
-            type(remote_user) is not str
-            or not remote_user
-            or len(remote_user) > 128
-            or any(
-                not (character.isascii() and (character.isalnum() or character in "._%+-"))
-                for character in remote_user
-            )
-        ):
-            raise ValueError("system OpenSSH remote user is invalid")
-        session.snapshot()
+        if type(remote_home_authority) is not RemoteHomeAuthority:
+            raise TypeError("system OpenSSH remote account authority is invalid")
+        snapshot = session.snapshot()
         self._session = session
-        self.remote_user = remote_user
+        self._remote_home_authority = remote_home_authority
+        self._connection_generation = snapshot.connection_generation
         self.ssh_host_alias = session.ssh_host_alias
         self._guard = threading.Lock()
         self._issued: dict[tuple[str, ...], int] = {}
+        if not self._matches(snapshot):
+            raise ValueError("system OpenSSH remote account authority is inconsistent")
+
+    @property
+    def remote_user(self) -> str:
+        return self._remote_home_authority.remote_user
+
+    @property
+    def remote_home_authority(self) -> RemoteHomeAuthority:
+        return self._remote_home_authority
+
+    @property
+    def connection_generation(self) -> int:
+        self.verify_authority()
+        return self._connection_generation
 
     def verify_authority(self) -> None:
-        self._session.snapshot()
+        if not self._matches(self._session.snapshot()):
+            raise _session_error(
+                "ssh_remote_account_unavailable",
+                "The remote SSH account could not be verified.",
+            )
 
     def command_argv(self, remote_command: str) -> list[str]:
-        return self._issue(self._session.command_argv(remote_command))
+        self.verify_authority()
+        guarded = build_remote_home_guarded_command(
+            self._remote_home_authority,
+            remote_command,
+        )
+        return self._issue(self._session.command_argv(guarded))
 
     def rsync_argv(
         self,
@@ -1511,6 +1583,19 @@ class SystemOpenSshFollowerTransportAuthority:
             stream_fd=stream_fd,
             environment=self._session.follower_environment(),
         )
+
+    def _matches(self, snapshot: SystemOpenSshSessionSnapshot) -> bool:
+        try:
+            return self._remote_home_authority.matches(
+                profile_id=snapshot.profile_id,
+                connection_generation=snapshot.connection_generation,
+                remote_user=self._remote_home_authority.remote_user,
+            )
+        except Exception:
+            return False
+
+    def __repr__(self) -> str:
+        return "SystemOpenSshFollowerTransportAuthority(<sealed>)"
 
     def _issue(self, argv: list[str]) -> list[str]:
         self.verify_authority()
@@ -1767,9 +1852,11 @@ def _run_bounded_subprocess(
     timeout_seconds: float,
     *,
     output_observer: LifecycleRawOutputObserverV2 | None = None,
+    max_capture_bytes: int = _MAX_CAPTURE_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("SSH subprocess timeout is invalid")
+    _validate_capture_limit(max_capture_bytes)
     process = subprocess.Popen(
         argv,
         stdin=subprocess.DEVNULL,
@@ -1784,6 +1871,7 @@ def _run_bounded_subprocess(
         argv,
         timeout_seconds,
         output_observer=output_observer,
+        max_capture_bytes=max_capture_bytes,
     )
 
 
@@ -1793,9 +1881,11 @@ def _run_verified_bounded_subprocess(
     timeout_seconds: float,
     *,
     output_observer: LifecycleRawOutputObserverV2 | None = None,
+    max_capture_bytes: int = _MAX_CAPTURE_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     if not argv:
         raise ValueError("verified SSH subprocess argv is empty")
+    _validate_capture_limit(max_capture_bytes)
     executable = VerifiedSystemExecutable.open(argv[0])
     try:
         executable.verify_path_binding()
@@ -1816,6 +1906,7 @@ def _run_verified_bounded_subprocess(
             argv,
             timeout_seconds,
             output_observer=output_observer,
+            max_capture_bytes=max_capture_bytes,
         )
     finally:
         executable.close()
@@ -1827,9 +1918,11 @@ def _collect_bounded_process(
     timeout_seconds: float,
     *,
     output_observer: LifecycleRawOutputObserverV2 | None = None,
+    max_capture_bytes: int = _MAX_CAPTURE_BYTES,
 ) -> subprocess.CompletedProcess[bytes]:
     if not 0 < timeout_seconds <= 3600:
         raise ValueError("SSH subprocess timeout is invalid")
+    _validate_capture_limit(max_capture_bytes)
     assert process.stdout is not None and process.stderr is not None
     deadline = time.monotonic() + timeout_seconds
     selector = selectors.DefaultSelector()
@@ -1845,13 +1938,13 @@ def _collect_bounded_process(
             for key, _events in selector.select(min(remaining, 0.05)):
                 chunk = os.read(
                     key.fd,
-                    min(_CAPTURE_CHUNK_BYTES, _MAX_CAPTURE_BYTES - captured + 1),
+                    min(_CAPTURE_CHUNK_BYTES, max_capture_bytes - captured + 1),
                 )
                 if not chunk:
                     selector.unregister(key.fileobj)
                     continue
                 captured += len(chunk)
-                if captured > _MAX_CAPTURE_BYTES:
+                if captured > max_capture_bytes:
                     raise _session_error(
                         "ssh_output_limit_exceeded",
                         "SSH command output exceeded its limit.",
@@ -1883,6 +1976,11 @@ def _collect_bounded_process(
         stdout=b"".join(chunks["stdout"]),
         stderr=b"".join(chunks["stderr"]),
     )
+
+
+def _validate_capture_limit(value: int) -> None:
+    if type(value) is not int or not 1 <= value <= _MAX_CAPTURE_BYTES:
+        raise ValueError("SSH subprocess capture limit is invalid")
 
 
 def _captured_master_stderr(process: OwnedSshMasterProcess) -> bytes:
