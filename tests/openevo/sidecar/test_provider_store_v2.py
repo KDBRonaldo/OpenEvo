@@ -1543,6 +1543,75 @@ def test_recovery_rejects_cancellation_intent_that_remains_cancellable(
         DesktopProviderStoreV2(root, clock=_Clock())
 
 
+@pytest.mark.parametrize("terminal_status", ["succeeded", "failed"])
+def test_recovery_rejects_non_cancelled_terminal_with_cancellation_intent(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation("project-cancel-terminal-corruption"),
+        idempotency_key="cancel-terminal-corruption-create-0001",
+    )
+    running = store.claim_next_lifecycle_operation()
+    assert running is not None
+    requested = store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=running.operation.etag,
+        idempotency_key="cancel-terminal-corruption-request-0001",
+    )
+    cancelled = store.finish_lifecycle_operation(
+        store_module.LifecycleOperationCompletionV2(
+            operation_id=queued.operation_id,
+            expected_etag=requested.etag,
+            status="cancelled",
+            result=None,
+            failure=None,
+        )
+    )
+    store.close()
+
+    result = (
+        store_module._canonical_json_bytes(
+            {
+                "result_kind": "project",
+                "project_id": "core-project-cancel-terminal-corruption",
+            }
+        )
+        if terminal_status == "succeeded"
+        else None
+    )
+    failure = (
+        store_module._canonical_json_bytes(
+            contract_models.DesktopErrorV2(
+                code="corrupt_terminal_winner",
+                summary="A non-cancelled terminal result replaced durable cancellation.",
+                retryable=False,
+                action="none",
+                affected_resource_id=queued.operation_id,
+            )
+        )
+        if terminal_status == "failed"
+        else None
+    )
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        connection.execute(
+            """
+            UPDATE lifecycle_operations
+            SET status = ?, result_json = ?, failure_json = ?
+            WHERE operation_id = ?
+            """,
+            (terminal_status, result, failure, cancelled.operation_id),
+        )
+
+    with pytest.raises(
+        store_module.ProviderDataV2Error,
+        match="terminal lifecycle operation conflicts with cancellation intent",
+    ):
+        DesktopProviderStoreV2(root, clock=_Clock())
+
+
 def test_profile_disconnect_reservation_is_an_atomic_non_cancellable_barrier(
     tmp_path: Path,
 ) -> None:

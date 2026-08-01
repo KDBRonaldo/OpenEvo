@@ -239,14 +239,15 @@ nonterminal lifecycle operation may own a given local resource at a time. A
 non-cancellable barrier is monotonic and cannot be reopened by a later phase
 update. Recovery requires exactly one canonical cancellation record iff the
 operation carries cancellation intent, and cancellation intent cannot coexist
-with `cancellable=true`. Once cancellation is durably accepted it wins every
-later success/failure terminal race; an
-ambiguous renderer response is replayed with the original action ID against the
-latest observed operation ETag without creating another lifecycle authority.
-If that replay loses a concurrent ETag race, renderer refreshes once and retries
-with the same action ID, or reconciles the terminal observation. The same replay
-is used when the user explicitly retries before a relaunch, and the unresolved
-action remains visible as a reconcile control. A profile
+with `cancellable=true` or a recovered `succeeded`/`failed` terminal state; a
+terminal operation carrying cancellation intent must be `cancelled`. Once
+cancellation is durably accepted it wins every later success/failure terminal
+race. The renderer handles an ETag race on both the initial cancellation send
+and a replayed ambiguous send by refreshing once and retrying with the original
+action ID, or reconciling the terminal observation, without creating another
+lifecycle authority. The same replay is used when the user explicitly retries
+before a relaunch, and the unresolved action remains visible as a reconcile
+control. A profile
 disconnect and project create/activation work that depends on that profile are
 mutually exclusive reservations in either ordering; restart recovery therefore
 cannot strand project work behind an explicitly disconnecting profile.

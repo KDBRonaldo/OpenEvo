@@ -4210,6 +4210,13 @@ class DesktopProviderStoreV2:
             raise ProviderDataV2Error("queued lifecycle operation requests cancellation")
         if row["status"] == "cancelled" and not row["cancellation_requested"]:
             raise ProviderDataV2Error("cancelled lifecycle operation lacks cancellation intent")
+        if (
+            row["cancellation_requested"]
+            and row["status"] in {"succeeded", "failed"}
+        ):
+            raise ProviderDataV2Error(
+                "terminal lifecycle operation conflicts with cancellation intent"
+            )
         if row["cancellation_requested"] and row["cancellable"]:
             raise ProviderDataV2Error(
                 "lifecycle cancellation intent remained cancellable"

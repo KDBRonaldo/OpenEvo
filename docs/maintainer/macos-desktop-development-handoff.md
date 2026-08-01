@@ -890,12 +890,14 @@ lifecycle owner. A durably accepted cancellation wins a later success/failure
 terminal race, and an ambiguous cancellation response is replayed with the same
 action ID and the latest observed lifecycle ETag rather than being abandoned or
 minting a second operation. This also applies to an explicit retry in the same
-renderer session. A concurrent 412 causes one refresh and one retry with that
-same action ID, or terminal reconciliation if the refresh observes completion.
+renderer session. A concurrent 412 on either the initial send or a replay causes
+one refresh and one retry with that same action ID, or terminal reconciliation
+if the refresh observes completion.
 Only the canonical operation-only cancellation digest is accepted; unknown or
 early pre-release digest forms fail startup closed rather than being rewritten.
 Recovery binds exactly one canonical cancellation record to cancellation intent,
-rejects contradictory cancellable flags, and never lets a later lifecycle phase
+rejects contradictory cancellable flags and any succeeded/failed terminal
+winner paired with cancellation intent, and never lets a later lifecycle phase
 reopen a non-cancellable barrier. A profile-disconnect reservation atomically crosses its
 non-cancellable generation/Core-authority barrier, so it never advertises or
 accepts cancellation while queued or running. Profile disconnect and

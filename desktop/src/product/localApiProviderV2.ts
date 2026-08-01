@@ -465,7 +465,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       resourceScope,
       request,
       authority: { resource_generation: 0, etag: current.etag },
-      send: (actionId) => this.lifecycleOperations.cancel(id, actionId),
+      send: (actionId) => this.sendLifecycleCancellationWithRefreshV2(id, actionId),
     });
     await this.completeDirectMutationV2(dispatched.entry, dispatched.value, async () => {
       await this.lifecycleOperations.refresh(id);
@@ -1306,22 +1306,28 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       await this.completeDirectMutationV2(entry, operation);
       return operation;
     }
-    let cancelled: LifecycleOperationV2;
-    try {
-      cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
-    } catch (error) {
-      if (!(error instanceof DesktopApiErrorV2) || error.status !== 412) throw error;
-      const refreshed = await this.lifecycleOperations.refresh(operationId);
-      if (isLifecycleTerminalV2(refreshed)) {
-        await this.completeDirectMutationV2(entry, refreshed);
-        return refreshed;
-      }
-      cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
-    }
+    const cancelled = await this.sendLifecycleCancellationWithRefreshV2(
+      operationId,
+      entry.action_id,
+    );
     await this.completeDirectMutationV2(entry, cancelled, async () => {
       await this.lifecycleOperations.refresh(operationId);
     });
     return cancelled;
+  }
+
+  private async sendLifecycleCancellationWithRefreshV2(
+    operationId: string,
+    actionId: string,
+  ): Promise<LifecycleOperationV2> {
+    try {
+      return await this.lifecycleOperations.cancel(operationId, actionId);
+    } catch (error) {
+      if (!(error instanceof DesktopApiErrorV2) || error.status !== 412) throw error;
+      const refreshed = await this.lifecycleOperations.refresh(operationId);
+      if (isLifecycleTerminalV2(refreshed)) return refreshed;
+      return this.lifecycleOperations.cancel(operationId, actionId);
+    }
   }
 
   private async reconcileLifecycleTerminalV2(
