@@ -1459,6 +1459,7 @@ class SystemOpenSshFollowerTransportAuthority:
         snapshot = session.snapshot()
         self._session = session
         self._remote_home_authority = remote_home_authority
+        self._connection_generation = snapshot.connection_generation
         self.ssh_host_alias = session.ssh_host_alias
         self._guard = threading.Lock()
         self._issued: dict[tuple[str, ...], int] = {}
@@ -1472,6 +1473,11 @@ class SystemOpenSshFollowerTransportAuthority:
     @property
     def remote_home_authority(self) -> RemoteHomeAuthority:
         return self._remote_home_authority
+
+    @property
+    def connection_generation(self) -> int:
+        self.verify_authority()
+        return self._connection_generation
 
     def verify_authority(self) -> None:
         if not self._matches(self._session.snapshot()):

@@ -209,15 +209,15 @@ git push origin HEAD:stable
 - Modify: `tests/openevo/remote/test_ssh_transport.py`
 - Modify: `tests/deployment/test_daemon_bundle_transport.py`
 
-- [ ] **Step 1: Write failing rich-transport tests**
+- [x] **Step 1: Write failing rich-transport tests**
 
 Extend the fake follower with a sealed authority. Test root, conventional, and `/srv/research/alice` roots. Reject mismatched profile ID, generation, user, workspace, or follower binding. Prove the legacy non-system transport alone retains `daemon_bundle_service_root_for_user` and cannot become a fallback after system-authority failure. Prove rich commands are guarded and Core tunnel argv remains exact non-shell `ssh -W`.
 
-- [ ] **Step 2: Write failing Daemon-stage tests**
+- [x] **Step 2: Write failing Daemon-stage tests**
 
 Give the shell harness a controlled `getent`. Execute the real stage script against a controlled custom home and prove first publish plus idempotent reuse. Add root/conventional/custom cases; wrong root suffix; NSS name/UID/home drift; zero/multiple records; physical mismatch; wrong owner; non-writable home; root symlink and inode replacement. Retain every existing size/digest/link-count/mode/cancellation/lock/cleanup test. Require `getent` in the host profile and keep Python/rsync/scp/sudo/package managers absent.
 
-- [ ] **Step 3: Observe RED**
+- [x] **Step 3: Observe RED**
 
 ```bash
 uv run pytest -q tests/openevo/remote/test_ssh_transport.py \
@@ -225,22 +225,22 @@ uv run pytest -q tests/openevo/remote/test_ssh_transport.py \
   -k 'system_openssh or custom_home or nss or service_root or declared_tools'
 ```
 
-- [ ] **Step 4: Bind `SshRemoteExecutorTransport` to the authority**
+- [x] **Step 4: Bind `SshRemoteExecutorTransport` to the authority**
 
 Extend the system follower protocol with read-only authority/binding access. For system OpenSSH, validate profile ID, follower session generation, user, and exact explicit workspace against that authority, then use `authority.daemon_bundle_root`. Convert any mismatch to `SshTransportError(INVALID_REQUEST)` without a sensitive chain. Only the explicit legacy branch calls `daemon_bundle_service_root_for_user(profile.user)`.
 
-- [ ] **Step 5: Generalize and harden `_STAGE_SCRIPT`**
+- [x] **Step 5: Generalize and harden `_STAGE_SCRIPT`**
 
 Widen `_valid_bundle_root` only to safe absolute homes plus `/.openevo/daemon-bundles`; add `getent` to `DOCKER_USER_CONTAINER_V1.required_commands`. Replace the root-versus-`/home` admission with exact effective user/UID/NSS record, seven-field/single-record, safe lexical home, physical home, owner, writability, and fixed-suffix checks. Create `.openevo`/service root owner-private without following symlinks; require physical equality, owner, `0700`, and stable device/inode around lock, stream, hash, and publication. Preserve hardlink no-overwrite publication and canonical receipt.
 
-- [ ] **Step 6: Run full suites GREEN**
+- [x] **Step 6: Run full suites GREEN**
 
 ```bash
 uv run pytest -q tests/openevo/remote/test_ssh_transport.py
 uv run pytest -q tests/deployment/test_daemon_bundle_transport.py
 ```
 
-- [ ] **Step 7: Commit and push**
+- [x] **Step 7: Commit and push**
 
 ```bash
 git add src/openevo/deployment/ssh.py src/openevo/deployment/daemon_bundle_transport.py \

@@ -16,15 +16,14 @@ from pydantic import SecretStr
 DAEMON_BUNDLE_HOST_PROFILE_ID = "docker_user_container_v1"
 _MAX_BUNDLE_BYTES = 4 * 1024 * 1024 * 1024
 _MAX_JSON_BYTES = 16 * 1024
+_MAX_REMOTE_HOME_BYTES = 4_096
 _DIGEST_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
 _COMMIT_PATTERN = re.compile(r"[0-9a-f]{40}\Z")
 _GENERATION_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 _VERSION_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_-]{0,127}\Z")
 _REMOTE_PATH_PATTERN = re.compile(r"/(?:[A-Za-z0-9._@%+=,-]+/)*[A-Za-z0-9._@%+=,-]+\Z")
 _REMOTE_USER_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._%+-]{0,127}\Z", re.ASCII)
-_BUNDLE_ROOT_PATTERN = re.compile(
-    r"(?:/root|/home/[A-Za-z0-9._@%+=,-]+)/\.openevo/daemon-bundles\Z"
-)
+_BUNDLE_ROOT_SUFFIX = "/.openevo/daemon-bundles"
 _TRANSFER_PATTERN = re.compile(r"[0-9a-f]{32}\Z")
 _ERROR_CODE_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,127}\Z")
 
@@ -48,6 +47,7 @@ class DaemonBundleHostProfile:
                 "/bin/sh",
                 "cat",
                 "chmod",
+                "getent",
                 "id",
                 "ln",
                 "mkdir",
@@ -67,6 +67,7 @@ DOCKER_USER_CONTAINER_V1 = DaemonBundleHostProfile(
         "/bin/sh",
         "cat",
         "chmod",
+        "getent",
         "id",
         "ln",
         "mkdir",
@@ -782,7 +783,10 @@ def _valid_remote_path(value: object) -> bool:
 
 
 def _valid_bundle_root(value: object) -> bool:
-    return _valid_remote_path(value) and _BUNDLE_ROOT_PATTERN.fullmatch(value) is not None
+    if not _valid_remote_path(value) or not value.endswith(_BUNDLE_ROOT_SUFFIX):
+        return False
+    home = value[: -len(_BUNDLE_ROOT_SUFFIX)]
+    return _valid_remote_path(home) and len(home.encode("ascii")) <= _MAX_REMOTE_HOME_BYTES
 
 
 def _valid_digest(value: object) -> bool:
@@ -833,6 +837,7 @@ def _load_closed_json(payload: str) -> object:
 
 _STAGE_SCRIPT = r"""
 set -eu
+set -f
 LC_ALL=C
 export LC_ALL
 umask 077
@@ -842,6 +847,177 @@ expected_digest=$2
 expected_size=$3
 transfer_id=$4
 host_profile=$5
+
+user=$(id -un 2>/dev/null)
+uid=$(id -u 2>/dev/null)
+case "$user" in
+    ""|*[!A-Za-z0-9._%+-]*) exit 64 ;;
+esac
+case "$user" in
+    [A-Za-z0-9]*) ;;
+    *) exit 64 ;;
+esac
+[ "${#user}" -le 128 ] || exit 64
+case "$uid" in
+    ""|*[!0-9]*) exit 64 ;;
+esac
+[ "${#uid}" -le 10 ] || exit 64
+case "$uid" in
+    0|[1-9]|[1-9][0-9]*) ;;
+    *) exit 64 ;;
+esac
+if [ "${#uid}" -eq 10 ]; then
+    [ "$uid" -le 4294967294 ] || exit 64
+fi
+
+passwd_record=$(getent passwd "$uid" 2>/dev/null)
+case "$passwd_record" in
+    *'
+'*) exit 64 ;;
+esac
+old_ifs=$IFS
+IFS=:
+set -- $passwd_record
+IFS=$old_ifs
+[ "$#" -eq 7 ] || exit 64
+nss_user=$1
+nss_uid=$3
+home=$6
+[ "$nss_user" = "$user" ] || exit 64
+[ "$nss_uid" = "$uid" ] || exit 64
+[ "${#home}" -le 4096 ] || exit 64
+case "$home" in
+    /) exit 64 ;;
+    /*) ;;
+    *) exit 64 ;;
+esac
+relative_home=${home#/}
+old_ifs=$IFS
+IFS=/
+set -- $relative_home
+IFS=$old_ifs
+[ "$#" -ge 1 ] || exit 64
+for component do
+    case "$component" in
+        ""|"."|".."|*[!A-Za-z0-9._@%+=,-]*) exit 64 ;;
+    esac
+done
+[ "$root" = "$home/.openevo/daemon-bundles" ] || exit 64
+[ -d "$home" ] || exit 64
+[ -w "$home" ] || exit 64
+physical_home=$(
+    CDPATH=
+    export CDPATH
+    cd -P "$home" 2>/dev/null
+    pwd -P
+)
+[ "$physical_home" = "$home" ] || exit 64
+home_meta=$(stat -c '%F|%u|%d|%i' -- "$home")
+old_ifs=$IFS
+IFS='|'
+set -- $home_meta
+IFS=$old_ifs
+[ "$#" -eq 4 ]
+[ "$1" = "directory" ]
+[ "$2" = "$uid" ]
+home_identity="$3:$4"
+
+service_parent="$home/.openevo"
+if [ -e "$service_parent" ] || [ -L "$service_parent" ]; then
+    parent_admission=$(stat -c '%F|%u' -- "$service_parent")
+    [ "$parent_admission" = "directory|$uid" ] || exit 64
+else
+    mkdir -- "$service_parent"
+fi
+chmod 700 -- "$service_parent"
+parent_physical=$(
+    CDPATH=
+    export CDPATH
+    cd -P "$service_parent" 2>/dev/null
+    pwd -P
+)
+[ "$parent_physical" = "$service_parent" ] || exit 64
+parent_meta=$(stat -c '%F|%u|%a|%h|%d|%i' -- "$service_parent")
+old_ifs=$IFS
+IFS='|'
+set -- $parent_meta
+IFS=$old_ifs
+[ "$#" -eq 6 ]
+[ "$1" = "directory" ]
+[ "$2" = "$uid" ]
+[ "$3" = "700" ]
+[ "$4" -ge 2 ]
+parent_identity="$5:$6"
+
+if [ -e "$root" ] || [ -L "$root" ]; then
+    root_admission=$(stat -c '%F|%u' -- "$root")
+    [ "$root_admission" = "directory|$uid" ] || exit 64
+else
+    mkdir -- "$root"
+fi
+chmod 700 -- "$root"
+root_physical=$(
+    CDPATH=
+    export CDPATH
+    cd -P "$root" 2>/dev/null
+    pwd -P
+)
+[ "$root_physical" = "$root" ] || exit 64
+root_meta=$(stat -c '%F|%u|%a|%h|%d|%i' -- "$root")
+old_ifs=$IFS
+IFS='|'
+set -- $root_meta
+IFS=$old_ifs
+[ "$#" -eq 6 ]
+[ "$1" = "directory" ]
+[ "$2" = "$uid" ]
+[ "$3" = "700" ]
+[ "$4" -ge 2 ]
+root_identity="$5:$6"
+
+verify_account_binding() {
+    [ "$(id -un 2>/dev/null)" = "$user" ] || return 1
+    [ "$(id -u 2>/dev/null)" = "$uid" ] || return 1
+    current_passwd_record=$(getent passwd "$uid" 2>/dev/null) || return 1
+    case "$current_passwd_record" in
+        *'
+'*) return 1 ;;
+    esac
+    [ "$current_passwd_record" = "$passwd_record" ] || return 1
+    [ -d "$home" ] || return 1
+    [ -w "$home" ] || return 1
+    current_physical_home=$(
+        CDPATH=
+        export CDPATH
+        cd -P "$home" 2>/dev/null
+        pwd -P
+    ) || return 1
+    [ "$current_physical_home" = "$home" ] || return 1
+    [ "$(stat -c '%F|%u|%d:%i' -- "$home")" = "directory|$uid|$home_identity" ]
+}
+
+verify_directory_bindings() {
+    verify_account_binding || return 1
+    [ "$(stat -c '%F|%u|%a|%d:%i' -- "$service_parent")" = \
+        "directory|$uid|700|$parent_identity" ] || return 1
+    [ "$(stat -c '%F|%u|%a|%d:%i' -- "$root")" = \
+        "directory|$uid|700|$root_identity" ] || return 1
+    current_parent_physical=$(
+        CDPATH=
+        export CDPATH
+        cd -P "$service_parent" 2>/dev/null
+        pwd -P
+    ) || return 1
+    [ "$current_parent_physical" = "$service_parent" ] || return 1
+    current_root_physical=$(
+        CDPATH=
+        export CDPATH
+        cd -P "$root" 2>/dev/null
+        pwd -P
+    ) || return 1
+    [ "$current_root_physical" = "$root" ]
+}
+
 lock="$root/.bundle-stage.lock"
 tmp="$root/.incoming-$transfer_id"
 target="$root/bundle-$expected_digest"
@@ -856,41 +1032,18 @@ trap 'exit 129' 1
 trap 'exit 130' 2
 trap 'exit 143' 15
 
-if [ "$root" = "/root/.openevo/daemon-bundles" ]; then
-    [ "$(id -u)" = "0" ] || exit 64
-    [ "$(id -un)" = "root" ] || exit 64
-else
-    relative_root=${root#/home/}
-    remote_user=${relative_root%%/*}
-    [ -n "$remote_user" ]
-    [ "$root" = "/home/$remote_user/.openevo/daemon-bundles" ] || exit 64
-    [ "$(id -un)" = "$remote_user" ] || exit 64
-    [ "$(id -u)" != "0" ] || exit 64
-fi
-
-mkdir -p -- "$root"
-root_meta=$(stat -c '%F|%u|%a|%h|%d|%i' -- "$root")
-old_ifs=$IFS
-IFS='|'
-set -- $root_meta
-IFS=$old_ifs
-[ "$#" -eq 6 ]
-[ "$1" = "directory" ]
-[ "$2" = "$(id -u)" ]
-[ "$3" = "700" ]
-[ "$4" -ge 2 ]
-root_identity="$5:$6"
-
+verify_directory_bindings
 mkdir -- "$lock"
 lock_held=1
-[ "$(stat -c '%F|%u|%a' -- "$lock")" = "directory|$(id -u)|700" ]
-[ "$(stat -c '%d:%i' -- "$root")" = "$root_identity" ]
+[ "$(stat -c '%F|%u|%a' -- "$lock")" = "directory|$uid|700" ]
+verify_directory_bindings
 
 set -C
 cat > "$tmp"
 set +C
+verify_directory_bindings
 chmod 700 -- "$tmp"
-[ "$(stat -c '%d:%i' -- "$root")" = "$root_identity" ]
+verify_directory_bindings
 
 tmp_meta=$(stat -c '%F|%u|%a|%h|%s' -- "$tmp")
 old_ifs=$IFS
@@ -899,13 +1052,14 @@ set -- $tmp_meta
 IFS=$old_ifs
 [ "$#" -eq 5 ]
 [ "$1" = "regular file" ]
-[ "$2" = "$(id -u)" ]
+[ "$2" = "$uid" ]
 [ "$3" = "700" ]
 [ "$4" = "1" ]
 [ "$5" = "$expected_size" ]
 actual_digest=$(sha256sum -- "$tmp")
 actual_digest=${actual_digest%% *}
 [ "$actual_digest" = "$expected_digest" ]
+verify_directory_bindings
 
 reused=false
 if [ -e "$target" ] || [ -L "$target" ]; then
@@ -916,7 +1070,7 @@ if [ -e "$target" ] || [ -L "$target" ]; then
     IFS=$old_ifs
     [ "$#" -eq 5 ]
     [ "$1" = "regular file" ]
-    [ "$2" = "$(id -u)" ]
+    [ "$2" = "$uid" ]
     [ "$3" = "700" ]
     [ "$4" = "1" ]
     [ "$5" = "$expected_size" ]
@@ -925,12 +1079,13 @@ if [ -e "$target" ] || [ -L "$target" ]; then
     [ "$target_digest" = "$expected_digest" ]
     reused=true
 else
+    verify_directory_bindings
     ln -- "$tmp" "$target"
     rm -- "$tmp"
     tmp=
 fi
 
-[ "$(stat -c '%d:%i' -- "$root")" = "$root_identity" ]
+verify_directory_bindings
 final_meta=$(stat -c '%F|%u|%a|%h|%s' -- "$target")
 old_ifs=$IFS
 IFS='|'
@@ -938,13 +1093,14 @@ set -- $final_meta
 IFS=$old_ifs
 [ "$#" -eq 5 ]
 [ "$1" = "regular file" ]
-[ "$2" = "$(id -u)" ]
+[ "$2" = "$uid" ]
 [ "$3" = "700" ]
 [ "$4" = "1" ]
 [ "$5" = "$expected_size" ]
 final_digest=$(sha256sum -- "$target")
 final_digest=${final_digest%% *}
 [ "$final_digest" = "$expected_digest" ]
+verify_directory_bindings
 
 printf '{"executable_path":"%s","host_profile":"%s","reused":%s,"schema_version":1,"sha256":"%s","size":%s}\n' \
     "$target" "$host_profile" "$reused" "$expected_digest" "$expected_size"

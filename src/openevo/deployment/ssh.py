@@ -94,6 +94,7 @@ from openevo.deployment.managed_runtime_assets import (
 )
 from openevo.deployment.preflight import RemoteCommandResult
 from openevo.deployment.profile import RemoteProfileConfig, SystemOpenSshAliasProfile
+from openevo.deployment.remote_home import RemoteHomeAuthority
 from openevo.deployment.system_executables import (
     MACOS_SYSTEM_COMMAND_PATH,
     OWNED_SUBPROCESS_BIRTH_ARGUMENT,
@@ -124,6 +125,8 @@ class SystemOpenSshFollowerAuthority(Protocol):
 
     ssh_host_alias: str
     remote_user: str
+    connection_generation: int
+    remote_home_authority: RemoteHomeAuthority
 
     def command_argv(self, remote_command: str) -> list[str]: ...
 
@@ -1340,6 +1343,10 @@ class SshRemoteExecutorTransport:
                 host_key_invalid = True
             if host_key_invalid:
                 raise SshTransportError(SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED)
+            try:
+                daemon_bundle_service_root = daemon_bundle_service_root_for_user(profile.user)
+            except DaemonBundleTransportContractError:
+                raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         else:
             try:
                 required = (
@@ -1362,16 +1369,24 @@ class SshRemoteExecutorTransport:
                     )
                     or profile.host != system_openssh_authority.ssh_host_alias
                     or profile.user != system_openssh_authority.remote_user
+                    or profile.workspace_root is None
                 ):
                     raise ValueError("system OpenSSH authority is inconsistent")
                 _validate_remote_identity(profile.user, "user", _REMOTE_USER_RE)
+                remote_home_authority = system_openssh_authority.remote_home_authority
+                connection_generation = system_openssh_authority.connection_generation
+                if type(remote_home_authority) is not RemoteHomeAuthority:
+                    raise ValueError("system OpenSSH remote account authority is invalid")
+                remote_home_authority.require_binding(
+                    profile_id=profile.id,
+                    connection_generation=connection_generation,
+                    remote_user=profile.user,
+                    workspace_root=profile.workspace_root,
+                )
                 system_openssh_authority.verify_authority()
+                daemon_bundle_service_root = remote_home_authority.daemon_bundle_root
             except Exception:
                 raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
-        try:
-            daemon_bundle_service_root = daemon_bundle_service_root_for_user(profile.user)
-        except DaemonBundleTransportContractError:
-            raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST) from None
         self._profile = profile
         self._daemon_bundle_service_root = daemon_bundle_service_root
         self._trusted_host = trusted_host
