@@ -13,13 +13,14 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import select
 import stat
 import struct
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
 from types import ModuleType
-from typing import Iterator, Sequence
+from typing import Callable, Iterator, Sequence
 
 from openevo.runtime.managed import (
     MANAGED_RUNTIME_ARCHIVE_RELEASE,
@@ -101,80 +102,223 @@ def _read_descriptor(descriptor: int) -> bytes:
     return b"".join(chunks)
 
 
+def _directory_identity(metadata: os.stat_result) -> tuple[int, ...]:
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+@contextmanager
+def _directory_mutation_monitor(
+    descriptor: int,
+) -> Iterator[Callable[[], bool]]:
+    if sys.platform == "darwin":
+        queue = select.kqueue()
+        event = select.kevent(
+            descriptor,
+            filter=select.KQ_FILTER_VNODE,
+            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+            fflags=(
+                select.KQ_NOTE_WRITE
+                | select.KQ_NOTE_RENAME
+                | select.KQ_NOTE_DELETE
+                | select.KQ_NOTE_ATTRIB
+                | select.KQ_NOTE_EXTEND
+                | select.KQ_NOTE_LINK
+                | select.KQ_NOTE_REVOKE
+            ),
+        )
+        try:
+            queue.control([event], 0, 0)
+            yield lambda: bool(queue.control(None, 1, 0))
+        except OSError as exc:
+            raise ResourceCompositionError(
+                "Controlled release input directory could not be monitored"
+            ) from exc
+        finally:
+            queue.close()
+        return
+
+    if sys.platform == "linux":
+        library = ctypes.CDLL(None, use_errno=True)
+        initialize = library.inotify_init1
+        initialize.argtypes = [ctypes.c_int]
+        initialize.restype = ctypes.c_int
+        add_watch = library.inotify_add_watch
+        add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+        add_watch.restype = ctypes.c_int
+        monitor = initialize(os.O_CLOEXEC | os.O_NONBLOCK)
+        if monitor < 0:
+            error = ctypes.get_errno()
+            raise ResourceCompositionError(
+                "Controlled release input directory could not be monitored"
+            ) from OSError(error, os.strerror(error))
+        try:
+            mask = (
+                0x0000_0002  # IN_MODIFY
+                | 0x0000_0004  # IN_ATTRIB
+                | 0x0000_0008  # IN_CLOSE_WRITE
+                | 0x0000_0040  # IN_MOVED_FROM
+                | 0x0000_0080  # IN_MOVED_TO
+                | 0x0000_0100  # IN_CREATE
+                | 0x0000_0200  # IN_DELETE
+                | 0x0000_0400  # IN_DELETE_SELF
+                | 0x0000_0800  # IN_MOVE_SELF
+            )
+            watch = add_watch(
+                monitor,
+                os.fsencode(f"/proc/self/fd/{descriptor}"),
+                mask,
+            )
+            if watch < 0:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error))
+
+            def changed() -> bool:
+                try:
+                    return bool(os.read(monitor, 64 * 1024))
+                except BlockingIOError:
+                    return False
+
+            yield changed
+        except OSError as exc:
+            raise ResourceCompositionError(
+                "Controlled release input directory could not be monitored"
+            ) from exc
+        finally:
+            os.close(monitor)
+        return
+
+    yield lambda: False
+
+
 @contextmanager
 def _controlled_file_snapshot(
     path: Path, *, executable: bool = False, changed_error: str | None = None
 ) -> Iterator[tuple[bytes, int, os.stat_result]]:
-    _reject_symlink_components(path)
+    absolute = path.absolute()
+    _reject_symlink_components(absolute)
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = (
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    )
     try:
-        descriptor = os.open(path, flags)
+        parent_descriptor = os.open(absolute.parent, directory_flags)
     except OSError as exc:
         raise ResourceCompositionError(f"Controlled release input is unavailable: {path}") from exc
     try:
-        before = os.fstat(descriptor)
-        pathname = os.stat(path, follow_symlinks=False)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or (before.st_dev, before.st_ino) != (pathname.st_dev, pathname.st_ino)
-            or (executable and not before.st_mode & stat.S_IXUSR)
-        ):
-            raise ResourceCompositionError(f"Controlled release input is not trusted: {path}")
-        payload = _read_descriptor(descriptor)
-        try:
-            after = os.fstat(descriptor)
-            current = os.stat(path, follow_symlinks=False)
-        except OSError as exc:
-            raise ResourceCompositionError(
-                changed_error or f"Controlled release input changed while reading: {path}"
-            ) from exc
-        if (
-            (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
-            != (
-                before.st_dev,
-                before.st_ino,
-                before.st_size,
-                before.st_mtime_ns,
-                before.st_ctime_ns,
-            )
-            or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
-            or len(payload) != before.st_size
-        ):
-            raise ResourceCompositionError(
-                changed_error or f"Controlled release input changed while reading: {path}"
-            )
-        yield payload, descriptor, before
-        try:
-            after = os.fstat(descriptor)
-            current = os.stat(path, follow_symlinks=False)
-        except OSError as exc:
-            raise ResourceCompositionError(
-                changed_error or f"Controlled release input changed while held open: {path}"
-            ) from exc
-        if (
-            after.st_dev,
-            after.st_ino,
-            after.st_mode,
-            after.st_nlink,
-            after.st_size,
-            after.st_mtime_ns,
-            after.st_ctime_ns,
-        ) != (
-            before.st_dev,
-            before.st_ino,
-            before.st_mode,
-            before.st_nlink,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino):
-            raise ResourceCompositionError(
-                changed_error or f"Controlled release input changed while held open: {path}"
-            )
+        with _directory_mutation_monitor(parent_descriptor) as directory_changed:
+            parent_before = os.fstat(parent_descriptor)
+            try:
+                descriptor = os.open(absolute.name, flags, dir_fd=parent_descriptor)
+            except OSError as exc:
+                raise ResourceCompositionError(
+                    f"Controlled release input is unavailable: {path}"
+                ) from exc
+            try:
+                before = os.fstat(descriptor)
+                pathname = os.stat(
+                    absolute.name,
+                    dir_fd=parent_descriptor,
+                    follow_symlinks=False,
+                )
+                if (
+                    not stat.S_ISDIR(parent_before.st_mode)
+                    or not stat.S_ISREG(before.st_mode)
+                    or before.st_nlink != 1
+                    or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                    or (before.st_dev, before.st_ino) != (pathname.st_dev, pathname.st_ino)
+                    or (executable and not before.st_mode & stat.S_IXUSR)
+                ):
+                    raise ResourceCompositionError(
+                        f"Controlled release input is not trusted: {path}"
+                    )
+                payload = _read_descriptor(descriptor)
+                try:
+                    after = os.fstat(descriptor)
+                    current = os.stat(
+                        absolute.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    parent_after = os.fstat(parent_descriptor)
+                except OSError as exc:
+                    raise ResourceCompositionError(
+                        changed_error or f"Controlled release input changed while reading: {path}"
+                    ) from exc
+                if (
+                    (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    )
+                    != (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    )
+                    or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                    or _directory_identity(parent_after) != _directory_identity(parent_before)
+                    or directory_changed()
+                    or len(payload) != before.st_size
+                ):
+                    raise ResourceCompositionError(
+                        changed_error or f"Controlled release input changed while reading: {path}"
+                    )
+                yield payload, descriptor, before
+                try:
+                    after = os.fstat(descriptor)
+                    current = os.stat(
+                        absolute.name,
+                        dir_fd=parent_descriptor,
+                        follow_symlinks=False,
+                    )
+                    parent_after = os.fstat(parent_descriptor)
+                except OSError as exc:
+                    raise ResourceCompositionError(
+                        changed_error
+                        or f"Controlled release input changed while held open: {path}"
+                    ) from exc
+                if (
+                    (
+                        after.st_dev,
+                        after.st_ino,
+                        after.st_mode,
+                        after.st_nlink,
+                        after.st_size,
+                        after.st_mtime_ns,
+                        after.st_ctime_ns,
+                    )
+                    != (
+                        before.st_dev,
+                        before.st_ino,
+                        before.st_mode,
+                        before.st_nlink,
+                        before.st_size,
+                        before.st_mtime_ns,
+                        before.st_ctime_ns,
+                    )
+                    or (current.st_dev, current.st_ino) != (before.st_dev, before.st_ino)
+                    or _directory_identity(parent_after) != _directory_identity(parent_before)
+                    or directory_changed()
+                ):
+                    raise ResourceCompositionError(
+                        changed_error
+                        or f"Controlled release input changed while held open: {path}"
+                    )
+            finally:
+                os.close(descriptor)
     finally:
-        os.close(descriptor)
+        os.close(parent_descriptor)
 
 
 def _read_controlled_file(path: Path, *, executable: bool = False) -> bytes:
