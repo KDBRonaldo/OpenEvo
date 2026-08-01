@@ -191,13 +191,29 @@ class _CoreConnector:
         self.calls: list[tuple[str, int]] = []
         self.version = _core_version()
         self.failure: DesktopCoreBridgeErrorV2 | None = None
+        self.connect_started: Event | None = None
+        self.connect_release: Event | None = None
+        self.connect_cancelled = Event()
+        self.cancel_events: list[Event | None] = []
 
     def connect_profile(
         self,
         profile_id: str,
         profile_connection_generation: int,
+        *,
+        cancel_event: Event | None = None,
     ) -> core_v2.VersionResponseV2:
         self.calls.append((profile_id, profile_connection_generation))
+        self.cancel_events.append(cancel_event)
+        if self.connect_started is not None:
+            self.connect_started.set()
+            if cancel_event is None:
+                assert self.connect_release is not None
+                assert self.connect_release.wait(2)
+            else:
+                assert cancel_event.wait(2)
+                self.connect_cancelled.set()
+                raise RuntimeError("connector cancelled")
         if self.failure is not None:
             raise self.failure
         return self.version
@@ -460,7 +476,7 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
         assert expired.json()["code"] == "lifecycle_log_cursor_expired"
 
         current = client.get(f"/desktop/v2/operations/{operation_id}", headers=_headers()).json()
-        assert current["cancellable"] is False
+        assert current["cancellable"] is True
         stale_cancel = client.post(
             f"/desktop/v2/operations/{operation_id}/cancel",
             headers=_headers(
@@ -473,20 +489,6 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
             json={"schema_version": "2", "expected_operation_id": operation_id},
         )
         assert stale_cancel.status_code == 412, stale_cancel.text
-
-        blocked_cancel = client.post(
-            f"/desktop/v2/operations/{operation_id}/cancel",
-            headers=_headers(
-                **{
-                    "X-OpenEvo-Resource-Generation": "0",
-                    "If-Match": current["etag"],
-                    "Idempotency-Key": "cancel-observable-operation-02",
-                }
-            ),
-            json={"schema_version": "2", "expected_operation_id": operation_id},
-        )
-        assert blocked_cancel.status_code == 409, blocked_cancel.text
-        assert blocked_cancel.json()["code"] == "local_resource_conflict"
         lifecycle.connect_release.set()
         terminal = _wait_lifecycle_operation(client, running.json())
         assert terminal["status"] == "succeeded"
@@ -518,6 +520,60 @@ def test_lifecycle_routes_expose_pending_logs_cancel_ack_and_cursor_expiry(
         )
     finally:
         lifecycle.connect_release.set()
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_profile_connect_cancellation_reaches_remote_install_stream(
+    tmp_path: Path,
+) -> None:
+    provider, store, _lifecycle, connector = _provider(tmp_path)
+    connector.connect_started = Event()
+    connector.connect_release = Event()
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "cancel-streaming-connect-profile-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        operation_id = started.json()["operation_id"]
+        assert connector.connect_started.wait(2)
+
+        current = client.get(
+            f"/desktop/v2/operations/{operation_id}",
+            headers=_headers(),
+        ).json()
+        assert current["status"] == "running"
+        assert current["cancellable"] is True
+        cancelled = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": current["etag"],
+                    "Idempotency-Key": "cancel-streaming-connect-operation-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert cancelled.status_code == 202, cancelled.text
+        assert connector.connect_cancelled.wait(2)
+        terminal = _wait_lifecycle_operation(client, started.json())
+        assert terminal["status"] == "cancelled"
+        assert len(connector.cancel_events) == 1
+        assert isinstance(connector.cancel_events[0], Event)
+    finally:
+        connector.connect_release.set()
         client.close()
         provider.close()
         store.close()

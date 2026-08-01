@@ -114,6 +114,8 @@ class _CoreProfileConnectorV2(Protocol):
         self,
         profile_id: str,
         profile_connection_generation: int,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> core_v2.VersionResponseV2: ...
 
     def close(self) -> None: ...
@@ -1165,7 +1167,7 @@ class DesktopReleaseProviderV2:
         context.checkpoint(
             "connecting",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=False,
+            cancellable=True,
         )
         self._deactivate_profile_project(
             started.profile_id,
@@ -1309,12 +1311,13 @@ class DesktopReleaseProviderV2:
         context.checkpoint(
             "remote_preflight",
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
-            cancellable=False,
+            cancellable=True,
         )
         try:
             remote = self._core_connector.connect_profile(
                 started.profile_id,
                 started.connection_generation,
+                cancel_event=context.cancellation_event,
             )
             context.checkpoint(
                 "negotiating_core",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import threading
 import time
 
 import httpx
@@ -218,6 +219,43 @@ def test_adapter_enters_noncancellable_phase_before_replacing_daemon(
     assert transport.operation_order.index("progress:waiting_for_daemon:False") < (
         transport.operation_order.index("daemon_start")
     )
+
+
+def test_adapter_cancellation_stops_managed_runtime_stream_before_daemon_start(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    transport.managed_runtime_block = True
+    adapter = DesktopCoreSshBridgeAdapterV2(_Lifecycle(transport), _bootstrap(tmp_path))
+    cancel_event = threading.Event()
+    result: list[object] = []
+
+    def ensure() -> None:
+        try:
+            result.append(
+                adapter.ensure_core(
+                    PROFILE_ID,
+                    7,
+                    deadline=time.monotonic() + 5,
+                    cancel_event=cancel_event,
+                )
+            )
+        except BaseException as exc:
+            result.append(exc)
+
+    thread = threading.Thread(target=ensure)
+    thread.start()
+    assert transport.managed_runtime_entered.wait(timeout=1)
+    cancel_event.set()
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert transport.managed_runtime_cancelled.is_set()
+    assert isinstance(result[0], DesktopCoreBridgeErrorV2)
+    assert result[0].error.code == "core_activation_cancelled"
+    assert transport.stage_calls[0]["cancel_event"] is cancel_event
+    assert transport.managed_runtime_calls[0]["cancel_event"] is cancel_event
+    assert "daemon_start" not in transport.operation_order
 
 
 def test_adapter_rejects_stale_profile_generation_before_remote_work(

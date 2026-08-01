@@ -225,11 +225,13 @@ class _DeferredCoreSshBridgeAdapterV2:
         profile_connection_generation: int,
         *,
         deadline: float,
+        cancel_event: threading.Event | None = None,
     ) -> CoreHostAttachmentV2:
         return self._resolve().ensure_core(
             profile_id,
             profile_connection_generation,
             deadline=deadline,
+            cancel_event=cancel_event,
         )
 
     def open_tunnel(
@@ -328,7 +330,11 @@ class DesktopCoreProfileConnectorV2:
         self,
         profile_id: str,
         profile_connection_generation: int,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> core_v2.VersionResponseV2:
+        if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+            raise TypeError("Core v2 profile cancellation authority is invalid")
         with self._transition:
             if self._closed:
                 raise _runtime_v2_error(
@@ -345,6 +351,7 @@ class DesktopCoreProfileConnectorV2:
                     profile_id,
                     profile_connection_generation,
                     deadline=deadline,
+                    cancel_event=cancel_event,
                 )
                 self._observe_progress("opening_project_tunnel")
                 session_id = f"core-profile-{secrets.token_hex(20)}"

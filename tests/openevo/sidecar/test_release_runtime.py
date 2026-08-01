@@ -587,6 +587,7 @@ class _ProfileConnectorAdapterV2:
         self.requests: list[httpx.Request] = []
         self.closed: list[str] = []
         self.ensure_deadlines: list[float] = []
+        self.ensure_cancel_events: list[threading.Event | None] = []
 
     def ensure_core(
         self,
@@ -594,9 +595,11 @@ class _ProfileConnectorAdapterV2:
         profile_connection_generation: int,
         *,
         deadline: float,
+        cancel_event: threading.Event | None = None,
     ) -> CoreHostAttachmentV2:
         assert deadline > time.monotonic()
         self.ensure_deadlines.append(deadline)
+        self.ensure_cancel_events.append(cancel_event)
         return CoreHostAttachmentV2(
             profile_id=profile_id,
             profile_connection_generation=profile_connection_generation,
@@ -672,6 +675,16 @@ def test_v2_profile_connector_default_deadline_covers_managed_runtime_install() 
 
     assert len(adapter.ensure_deadlines) == 1
     assert adapter.ensure_deadlines[0] - before >= 899.0
+
+
+def test_v2_profile_connector_forwards_exact_lifecycle_cancellation_authority() -> None:
+    adapter = _ProfileConnectorAdapterV2()
+    connector = release_runtime.DesktopCoreProfileConnectorV2(adapter)
+    cancel_event = threading.Event()
+
+    connector.connect_profile("profile-1", 3, cancel_event=cancel_event)
+
+    assert adapter.ensure_cancel_events == [cancel_event]
 
 
 def test_v2_profile_connector_refuses_degraded_daemon_readiness() -> None:

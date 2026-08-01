@@ -116,8 +116,10 @@ required macOS candidate step and fails when the Apple `sshd`, SSH tools, C
 compiler, loopback fixture, askpass broker, or any asserted workflow is
 unavailable. The gate creates an owner-private fixture beneath the current
 account's canonical home and runs the production alias-only master, command,
-rsync, control, and `-W` tunnel builders through exact `/usr/bin/ssh` and
-`/usr/bin/rsync`. It covers a controlled agent, `IdentityFile`, encrypted-key
+control, and `-W` tunnel builders through exact `/usr/bin/ssh`.
+It streams fixture bytes through the owned SSH command's stdin and does not
+require local or remote `rsync`. It covers a controlled agent, `IdentityFile`,
+encrypted-key
 askpass, a real password prompt (successful authentication only when the host
 account supports the generated fixture value), ProxyJump, ProxyCommand,
 first-host accept/cancel, strict first-use refusal, changed and repeatedly

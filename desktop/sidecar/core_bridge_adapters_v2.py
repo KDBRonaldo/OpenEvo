@@ -71,6 +71,7 @@ class _CoreSshTransport(Protocol):
         manifest_sha256: str,
         manifest_size: int,
         timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
     ) -> StagedDaemonBundle: ...
 
     def daemon_bundle_identity(
@@ -78,6 +79,7 @@ class _CoreSshTransport(Protocol):
         bundle: StagedDaemonBundle,
         *,
         timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
     ) -> DaemonBundleIdentity: ...
 
     def observe_daemon_bundle_service(
@@ -86,6 +88,7 @@ class _CoreSshTransport(Protocol):
         *,
         canonical_manifest_sha256: str,
         timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
     ) -> DaemonBundleServicePredecessor: ...
 
     def ensure_managed_runtime_from_daemon(
@@ -100,6 +103,7 @@ class _CoreSshTransport(Protocol):
         oci_index_id: str,
         aliases: tuple[str, ...],
         timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
     ) -> object: ...
 
     def stop_daemon_bundle(
@@ -344,7 +348,10 @@ class DesktopCoreSshBridgeAdapterV2:
         profile_connection_generation: int,
         *,
         deadline: float,
+        cancel_event: threading.Event | None = None,
     ) -> CoreHostAttachmentV2:
+        activation_cancel = cancel_event or threading.Event()
+        _require_activation_not_cancelled(activation_cancel)
         daemon = self._bootstrap.daemon_bundle
         runtime = self._bootstrap.managed_runtime_archive
         if daemon is None or runtime is None:
@@ -392,6 +399,7 @@ class DesktopCoreSshBridgeAdapterV2:
                 manifest_sha256=daemon.manifest_sha256,
                 manifest_size=manifest_size,
                 timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
             )
             self._observe_progress(
                 "transferring",
@@ -407,6 +415,7 @@ class DesktopCoreSshBridgeAdapterV2:
             identity = transport.daemon_bundle_identity(
                 staged,
                 timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
             )
             _verify_daemon_identity(daemon, identity)
             self._require_same_transport(profile_id, profile_connection_generation, transport)
@@ -414,6 +423,7 @@ class DesktopCoreSshBridgeAdapterV2:
                 staged,
                 canonical_manifest_sha256=daemon.manifest_sha256,
                 timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+                cancel_event=activation_cancel,
             )
             self._require_same_transport(profile_id, profile_connection_generation, transport)
             transport.ensure_managed_runtime_from_daemon(
@@ -426,6 +436,7 @@ class DesktopCoreSshBridgeAdapterV2:
                 oci_index_id=runtime.oci_index_id,
                 aliases=MANAGED_RUNTIME_ARCHIVE_RELEASE.aliases,
                 timeout_seconds=min(_remaining(deadline), _MAX_MANAGED_RUNTIME_SECONDS),
+                cancel_event=activation_cancel,
             )
             self._observe_progress(
                 "transferring",
@@ -442,6 +453,7 @@ class DesktopCoreSshBridgeAdapterV2:
                 cancellable=True,
             )
             self._require_same_transport(profile_id, profile_connection_generation, transport)
+            _require_activation_not_cancelled(activation_cancel)
             self._observe_progress(
                 "starting_daemon",
                 local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
@@ -1201,6 +1213,8 @@ def _ssh_error(
     *,
     affected_resource_id: str,
 ) -> DesktopCoreBridgeErrorV2:
+    if error.code is SshTransportErrorCode.CANCELLED:
+        return _activation_cancelled_error(affected_resource_id)
     if error.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED:
         return _adapter_error(
             "core_ssh_authority_invalid",
@@ -1221,6 +1235,24 @@ def _ssh_error(
     return _adapter_error(
         "daemon_bootstrap_failed",
         "The OpenEvo Daemon could not be prepared over system SSH.",
+        retryable=True,
+        action="retry",
+        affected_resource_id=affected_resource_id,
+    )
+
+
+def _require_activation_not_cancelled(cancel_event: threading.Event) -> None:
+    if not isinstance(cancel_event, threading.Event) or cancel_event.is_set():
+        raise _activation_cancelled_error(None)
+
+
+def _activation_cancelled_error(
+    affected_resource_id: str | None,
+) -> DesktopCoreBridgeErrorV2:
+    return _adapter_error(
+        "core_activation_cancelled",
+        "The OpenEvo Daemon activation was cancelled before publication.",
+        status=409,
         retryable=True,
         action="retry",
         affected_resource_id=affected_resource_id,

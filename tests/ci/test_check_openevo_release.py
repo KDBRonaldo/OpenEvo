@@ -2878,6 +2878,10 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     )
     assert "$RUNNER_TEMP" not in candidate_ssh_step
 
+    testing_guide = Path("docs/maintainer/testing.md").read_text(encoding="utf-8")
+    assert "streams fixture bytes through the owned SSH command's stdin" in testing_guide
+    assert "rsync, control, and `-W` tunnel builders" not in testing_guide
+
     version_step = text.split(
         "      - name: Resolve exact product version and runner architecture\n",
         maxsplit=1,
