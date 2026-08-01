@@ -34,6 +34,13 @@ maintenance operations. Lifecycle output may include actual sanitized SSH and
 Daemon stdout/stderr. Commands, environment values, credentials, tokens, Core
 endpoints, and absolute host paths remain forbidden.
 
+Core v2 provider tests also exercise Attempt cancellation through the real HTTP
+contract: stale Task ETags fail with 412, an admitted Attempt is cancelled
+without execution, an interruption between durable cancellation and Operation
+commit recovers under the same action key, exact replay returns the same
+Operation, and key/request reuse fails closed. The execution-owner suite keeps
+the running cancellation versus terminal-capture race coverage.
+
 The real-science runner treats a sidecar relaunch as a new Local API instance.
 It must repeat strict release and authenticated-session negotiation, require all
 candidate composition fields to remain identical, require the instance-bound

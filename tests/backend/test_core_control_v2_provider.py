@@ -626,6 +626,116 @@ def test_task_close_uses_etag_and_durable_idempotent_operation(
         restarted_provider.close()
 
 
+def test_attempt_cancel_uses_etag_and_recovers_durable_idempotent_operation(
+    runtime: _Runtime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    admitted = runtime.client.post(
+        "/v2/tasks",
+        headers={**runtime.headers, "Idempotency-Key": "cancel-task-submit"},
+        json=_request(runtime.authority).model_dump(mode="json"),
+    )
+    task = admitted.json()
+    task_id = task["task_id"]
+    attempt_id = task["attempts"][0]["attempt_id"]
+    action = {
+        "schema_version": "2",
+        "task_admission_id": task["admission"]["task_admission_id"],
+        "admission_sha256": task["admission"]["admission_sha256"],
+    }
+
+    stale = runtime.client.post(
+        f"/v2/tasks/{task_id}/attempts/{attempt_id}/cancel",
+        headers={
+            **runtime.headers,
+            "Idempotency-Key": "cancel-stale",
+            "If-Match": f'\"{"0" * 64}\"',
+        },
+        json=action,
+    )
+    assert stale.status_code == 412
+    assert stale.json()["code"] == "task_etag_changed"
+
+    original_commit = runtime.store.commit_action
+
+    def fail_commit_action(**_arguments: object):
+        raise RuntimeError("injected post-cancel provider interruption")
+
+    monkeypatch.setattr(runtime.store, "commit_action", fail_commit_action)
+    with pytest.raises(RuntimeError, match="post-cancel provider interruption"):
+        runtime.client.post(
+            f"/v2/tasks/{task_id}/attempts/{attempt_id}/cancel",
+            headers={
+                **runtime.headers,
+                "Idempotency-Key": "cancel-task",
+                "If-Match": task["etag"],
+            },
+            json=action,
+        )
+    assert (
+        runtime.client.get(f"/v2/tasks/{task_id}", headers=runtime.headers).json()["state"]
+        == "cancelled"
+    )
+
+    monkeypatch.setattr(runtime.store, "commit_action", original_commit)
+    cancelled = runtime.client.post(
+        f"/v2/tasks/{task_id}/attempts/{attempt_id}/cancel",
+        headers={
+            **runtime.headers,
+            "Idempotency-Key": "cancel-task",
+            "If-Match": task["etag"],
+        },
+        json=action,
+    )
+    assert cancelled.status_code == 202
+    assert cancelled.json()["kind"] == "attempt_cancel"
+    assert cancelled.json()["status"] == "succeeded"
+    assert cancelled.headers["etag"] == cancelled.json()["etag"]
+
+    replay = runtime.client.post(
+        f"/v2/tasks/{task_id}/attempts/{attempt_id}/cancel",
+        headers={
+            **runtime.headers,
+            "Idempotency-Key": "cancel-task",
+            "If-Match": task["etag"],
+        },
+        json=action,
+    )
+    assert replay.status_code == 202
+    assert replay.json() == cancelled.json()
+
+    operation = runtime.client.get(
+        f"/v2/operations/{cancelled.json()['operation_id']}",
+        headers=runtime.headers,
+    )
+    assert operation.status_code == 200
+    assert operation.json() == cancelled.json()
+
+    different_action = runtime.client.post(
+        f"/v2/tasks/{task_id}/attempts/{attempt_id}/cancel",
+        headers={
+            **runtime.headers,
+            "Idempotency-Key": "cancel-task-different-action",
+            "If-Match": task["etag"],
+        },
+        json=action,
+    )
+    assert different_action.status_code == 412
+    assert different_action.json()["code"] == "task_etag_changed"
+
+    reused = runtime.client.post(
+        f"/v2/tasks/{task_id}/attempts/{attempt_id}/cancel",
+        headers={
+            **runtime.headers,
+            "Idempotency-Key": "cancel-task",
+            "If-Match": f'\"{"f" * 64}\"',
+        },
+        json=action,
+    )
+    assert reused.status_code == 409
+    assert reused.json()["code"] == "task_idempotency_key_reused"
+
+
 def test_project_create_idempotency_etag_and_cursor_are_closed(
     runtime: _Runtime,
 ) -> None:

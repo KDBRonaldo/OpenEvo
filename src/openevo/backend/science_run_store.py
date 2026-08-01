@@ -3978,6 +3978,120 @@ class ScienceTaskStoreV2:
             )
             return _load_v2_attempt_execution(connection, attempt_id)
 
+    def request_attempt_cancellation_action(
+        self,
+        *,
+        task_id: str,
+        attempt_id: str,
+        request: m2.TaskActionRequestV2,
+        expected_etag: str,
+        allow_cancelled_recovery: bool,
+        now: datetime,
+    ) -> ScienceAttemptExecutionRecordV2:
+        """Atomically validate public mutation authority and request cancellation."""
+
+        task_id = _v2_resource_id(task_id, label="task")
+        attempt_id = _v2_resource_id(attempt_id, label="attempt")
+        request = _validate_v2_model(m2.TaskActionRequestV2, request)
+        if re.fullmatch(r'"[0-9a-f]{64}"', expected_etag, flags=re.ASCII) is None:
+            raise ValueError("v2 Task expected ETag is invalid")
+        if type(allow_cancelled_recovery) is not bool:
+            raise TypeError("v2 Attempt cancellation recovery flag must be exact bool")
+        with self._lock, self._transaction() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            attempt = _load_v2_attempt(
+                connection,
+                task_id=task_id,
+                attempt_id=attempt_id,
+            )
+            if (
+                request.task_admission_id != task.admission.task_admission_id
+                or request.admission_sha256 != task.admission.admission_sha256
+            ):
+                raise ScienceTaskPreconditionFailedV2(
+                    "v2 Attempt cancellation does not bind the immutable admission"
+                )
+            if attempt != task.attempts[-1]:
+                raise ScienceTaskTerminalV2("only the latest v2 Attempt may be cancelled")
+            record = _load_v2_attempt_execution_optional(connection, attempt_id)
+            if record is not None and record.task_id != task_id:
+                raise ScienceTaskStoreV2Error("v2 Attempt execution belongs to another Task")
+            if (
+                allow_cancelled_recovery
+                and record is not None
+                and record.state in {"cancelling", "cancelled"}
+                and task.state in {"cancelling", "cancelled"}
+                and task.authoritative_attempt_id is None
+                and task.successor_transition is None
+            ):
+                return record
+            if task.etag != expected_etag:
+                raise ScienceTaskETagChangedV2("v2 Task ETag changed")
+            if record is not None and record.state in {"cancelling", "cancelled"}:
+                raise ScienceTaskTerminalV2(
+                    "v2 Attempt cancellation belongs to another action"
+                )
+            timestamp = _v2_timestamp(now)
+            if record is None:
+                if (
+                    task.state not in {"admitted", "failed", "cancelled"}
+                    or task.authoritative_attempt_id is not None
+                    or task.successor_transition is not None
+                ):
+                    raise ScienceTaskTerminalV2(
+                        "v2 Attempt cannot be cancelled in the current Task state"
+                    )
+                active = connection.execute(
+                    "SELECT 1 FROM attempt_executions WHERE task_id = ? "
+                    "AND state IN ('preparing', 'running', 'cancelling') LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if active is not None:
+                    raise ScienceTaskConflictV2(
+                        "v2 Task already has an active Attempt execution"
+                    )
+                cancelling = ScienceAttemptExecutionRecordV2(
+                    task_id=task_id,
+                    attempt_id=attempt_id,
+                    state="cancelling",
+                    created_at=timestamp,
+                    updated_at=timestamp,
+                )
+                connection.execute(
+                    "INSERT INTO attempt_executions(attempt_id, task_id, state, "
+                    "receipt_sha256, session_result_sha256, session_result_json, "
+                    "execution_json, resource_version) "
+                    "VALUES (?, ?, ?, NULL, NULL, NULL, ?, 1)",
+                    (attempt_id, task_id, cancelling.state, _v2_model_bytes(cancelling)),
+                )
+            else:
+                _validate_v2_execution_ownership(task, record)
+                if (
+                    record.state not in {"preparing", "running"}
+                    or task.state not in {"preparing", "running"}
+                    or task.authoritative_attempt_id is not None
+                ):
+                    raise ScienceTaskTerminalV2(
+                        "v2 Attempt cancellation lost authoritative ownership"
+                    )
+                cancelling = _replace_v2_execution_record(
+                    record,
+                    state="cancelling",
+                    updated_at=timestamp,
+                )
+                _update_v2_attempt_execution(connection, cancelling)
+            cancelling_task = _replace_v2_task(
+                task,
+                state="cancelling",
+                updated_at=timestamp,
+            )
+            connection.execute(
+                "UPDATE tasks SET task_json = ?, resource_version = resource_version + 1 "
+                "WHERE task_id = ?",
+                (_v2_model_bytes(cancelling_task), task_id),
+            )
+            return _load_v2_attempt_execution(connection, attempt_id)
+
     def finish_attempt_cancelled(
         self,
         *,

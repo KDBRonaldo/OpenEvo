@@ -16,6 +16,7 @@ from openevo.backend.contracts.v2.models import (
     EvolutionRevisionRefV2,
     ProjectHeadRefV2,
     RuntimeContextSnapshotRefV2,
+    TaskActionRequestV2,
     TaskSubmitRequestV2,
     WorkspaceSnapshotRefV2,
     WorkspaceArchiveDeclarationV2,
@@ -1387,9 +1388,15 @@ def test_task_owner_cancellation_wins_before_terminal_capture(tmp_path) -> None:
             },
         )
         assert runner.started.wait(timeout=5)
+        running = owner.invoke("getCoreTaskV2", {"task_id": task.task_id})
         cancelled = owner.cancel_attempt(
             task.task_id,
             task.attempts[0].attempt_id,
+            TaskActionRequestV2(
+                task_admission_id=task.admission.task_admission_id,
+                admission_sha256=task.admission.admission_sha256,
+            ),
+            expected_etag=running.etag,
         )
         assert cancelled.state in {"cancelling", "cancelled"}
         _wait_task_state(owner, task.task_id, "cancelled")

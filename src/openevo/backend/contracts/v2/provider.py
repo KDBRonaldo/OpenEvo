@@ -276,6 +276,7 @@ class CoreControlProviderV2:
             "listCoreTaskAttemptsV2": self._list_task_attempts,
             "appendCoreTaskAttemptV2": self._append_task_attempt,
             "getCoreTaskAttemptV2": self._get_task_attempt,
+            "cancelCoreTaskAttemptV2": self._cancel_task_attempt,
             "getCoreTaskTimelineV2": self._task_timeline,
             "getCoreTaskContextV2": self._task_context,
             "closeCoreTaskV2": self._close_task,
@@ -308,7 +309,6 @@ class CoreControlProviderV2:
                 *self._handlers,
                 "retryCoreSuccessorTransitionV2",
                 "abandonCoreSuccessorTransitionV2",
-                "cancelCoreTaskAttemptV2",
                 "getCoreTaskLogsV2",
                 "listCoreTaskArtifactsV2",
                 "getCoreArtifactV2",
@@ -1172,6 +1172,97 @@ class CoreControlProviderV2:
                 "attempt_id": _string(arguments["attempt_id"]),
             },
         )
+
+    def _cancel_task_attempt(self, arguments: Mapping[str, object]) -> Response:
+        _keys(
+            arguments,
+            "task_id",
+            "attempt_id",
+            "request",
+            "if_match",
+            "idempotency_key",
+        )
+        task_id = _string(arguments["task_id"])
+        attempt_id = _string(arguments["attempt_id"])
+        request = _model(m.TaskActionRequestV2, arguments["request"])
+        if_match = _string(arguments["if_match"])
+        idempotency_key = _string(arguments["idempotency_key"])
+        action_scope = f"attempt-cancel:{task_id}:{attempt_id}"
+        request_json = _canonical_action_request(
+            {
+                "action": "attempt_cancel",
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "request": request.model_dump(mode="json"),
+                "if_match": if_match,
+            }
+        )
+        operation_seed = hashlib.sha256(
+            action_scope.encode("utf-8")
+            + b"\0"
+            + idempotency_key.encode("utf-8")
+            + b"\0"
+            + request_json
+        ).hexdigest()
+        with (
+            self._lock,
+            self.store.action_execution_fence(
+                coordination_scope=f"task:{task_id}",
+            ),
+        ):
+            try:
+                reservation = self.store.begin_action(
+                    action_scope=action_scope,
+                    idempotency_key=idempotency_key,
+                    request_json=request_json,
+                )
+            except ProjectIdempotencyConflictV2 as exc:
+                raise _http_error(
+                    409,
+                    code="task_idempotency_key_reused",
+                    message="The idempotency key was used for another Task action.",
+                    category="task",
+                    retryable=False,
+                    repair_action="user_action_required",
+                ) from exc
+            if reservation.operation is not None:
+                return _operation_response(reservation.operation, status_code=202)
+            cancelled = self._task_owner.invoke(
+                "cancelCoreTaskAttemptV2",
+                {
+                    "task_id": task_id,
+                    "attempt_id": attempt_id,
+                    "request": request,
+                    "expected_etag": if_match,
+                    "allow_cancelled_recovery": reservation.resumed,
+                },
+            )
+            if not isinstance(cancelled, m.TaskV2):
+                raise RuntimeError("v2 Task owner returned the wrong cancelled Task type")
+            provisional = m.OperationV2(
+                operation_id=f"operation-{operation_seed[:32]}",
+                kind="attempt_cancel",
+                status="succeeded",
+                progress_completed=1,
+                progress_total=1,
+                error=None,
+                created_at=cancelled.updated_at,
+                updated_at=cancelled.updated_at,
+                etag=f'"{"0" * 64}"',
+            )
+            operation = m.OperationV2.model_validate(
+                {
+                    **provisional.model_dump(mode="python"),
+                    "etag": operation_etag_for(provisional),
+                }
+            )
+            committed = self.store.commit_action(
+                action_scope=action_scope,
+                idempotency_key=idempotency_key,
+                request_json=request_json,
+                operation=operation,
+            )
+            return _operation_response(committed, status_code=202)
 
     def _task_timeline(self, arguments: Mapping[str, object]) -> m.TimelinePageV2:
         _keys(arguments, "task_id", "limit", "after")

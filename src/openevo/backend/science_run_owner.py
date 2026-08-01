@@ -266,6 +266,7 @@ class CoreScienceTaskOwnerV2:
     def invoke(self, operation_id: str, arguments: Mapping[str, object]) -> object:
         handlers: dict[str, Callable[[Mapping[str, object]], object]] = {
             "appendCoreTaskAttemptV2": self._append_attempt,
+            "cancelCoreTaskAttemptV2": self._cancel_attempt,
             "getCoreTaskAdmissionV2": self._get_admission,
             "getCoreTaskAttemptV2": self._get_attempt,
             "getCoreTaskV2": self._get_task,
@@ -997,28 +998,21 @@ class CoreScienceTaskOwnerV2:
         self,
         task_id: str,
         attempt_id: str,
+        request: m2.TaskActionRequestV2,
+        *,
+        expected_etag: str,
+        allow_cancelled_recovery: bool = False,
     ) -> m2.TaskV2:
         """Durably request cancellation and wake the one owning executor."""
 
         try:
             with self._lifecycle_lock:
-                record = self._ledger.get_attempt_execution_optional(
-                    task_id,
-                    attempt_id,
-                )
-                if record is None:
-                    task = self._ledger.get_task(task_id)
-                    attempt = self._ledger.get_attempt(task_id, attempt_id)
-                    if attempt != task.attempts[-1]:
-                        raise ScienceTaskTerminalV2("only the latest v2 Attempt may be cancelled")
-                    record = self._ledger.begin_attempt_execution(
-                        task_id=task_id,
-                        attempt_id=attempt_id,
-                        now=self._clock(),
-                    )
-                self._ledger.request_attempt_cancellation(
+                self._ledger.request_attempt_cancellation_action(
                     task_id=task_id,
                     attempt_id=attempt_id,
+                    request=request,
+                    expected_etag=expected_etag,
+                    allow_cancelled_recovery=allow_cancelled_recovery,
                     now=self._clock(),
                 )
                 cancellation = self._cancel_events.get(attempt_id)
@@ -1122,6 +1116,31 @@ class CoreScienceTaskOwnerV2:
         return self._ledger.get_attempt(
             _v2_string_argument(arguments["task_id"], label="task ID"),
             _v2_string_argument(arguments["attempt_id"], label="attempt ID"),
+        )
+
+    def _cancel_attempt(self, arguments: Mapping[str, object]) -> m2.TaskV2:
+        _require_v2_argument_keys(
+            arguments,
+            {
+                "task_id",
+                "attempt_id",
+                "request",
+                "expected_etag",
+                "allow_cancelled_recovery",
+            },
+        )
+        allow_cancelled_recovery = arguments["allow_cancelled_recovery"]
+        if type(allow_cancelled_recovery) is not bool:
+            raise TypeError("v2 Attempt cancellation recovery flag must be exact bool")
+        return self.cancel_attempt(
+            _v2_string_argument(arguments["task_id"], label="task ID"),
+            _v2_string_argument(arguments["attempt_id"], label="attempt ID"),
+            _v2_request_model(m2.TaskActionRequestV2, arguments["request"]),
+            expected_etag=_v2_string_argument(
+                arguments["expected_etag"],
+                label="Task expected ETag",
+            ),
+            allow_cancelled_recovery=allow_cancelled_recovery,
         )
 
     def _worker_loop(self) -> None:

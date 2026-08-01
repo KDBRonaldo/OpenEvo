@@ -229,6 +229,16 @@ generation, and `If-Match` where applicable. Lists/logs are bounded and
 cursor-based. SSE events are replayable and bind event ID to canonical payload
 digest.
 
+Core Attempt cancellation is an implemented v2 mutation. The provider reserves
+the exact task/attempt/action identity before changing execution state, validates
+the immutable admission and Task ETag in the same Task-store transaction, and
+persists `cancelling` before signalling the owning executor. An admitted Attempt
+that has not started is cancelled without launching it. If the provider exits
+after the Task mutation but before committing its `attempt_cancel` Operation,
+an exact idempotent retry recovers that same terminal operation; changed request
+or ETag identity fails closed. Cancellation and terminal capture therefore keep
+the existing single-winner rule.
+
 Profile connect/disconnect, host-key review, native workspace preparation,
 project create, and project activation return durable Desktop lifecycle
 operation authority with HTTP 202. Renderer mutation intent is persisted before
