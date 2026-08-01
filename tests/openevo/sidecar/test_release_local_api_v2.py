@@ -1323,6 +1323,127 @@ def test_profile_connect_failure_racing_cancellation_does_not_stop_worker(
         store.close()
 
 
+def test_profile_retry_cannot_overtake_cancelled_failure_terminal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, store, lifecycle, _connector = _provider(tmp_path)
+    lifecycle.connect_errors.append(
+        SystemOpenSshSessionError(
+            "ssh_connection_failed",
+            "simulated connection failure",
+        )
+    )
+    failure_published = Event()
+    release_terminal = Event()
+    original_fail = provider._fail_profile_connect
+
+    def fail_before_terminal(
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        failure_code: str,
+        *,
+        abort_transport: bool = False,
+    ):
+        failure = original_fail(
+            profile,
+            failure_code,
+            abort_transport=abort_transport,
+        )
+        if not failure_published.is_set():
+            failure_published.set()
+            assert release_terminal.wait(2)
+        return failure
+
+    monkeypatch.setattr(provider, "_fail_profile_connect", fail_before_terminal)
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "failure-before-cancel-connect-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        assert failure_published.wait(2)
+        operation_id = started.json()["operation_id"]
+        running = client.get(
+            f"/desktop/v2/operations/{operation_id}",
+            headers=_headers(),
+        ).json()
+        failed_profile = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert running["status"] == "running"
+        assert failed_profile["connection_generation"] == 2
+        assert failed_profile["connection_state"] == "failed"
+
+        cancelled = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": running["etag"],
+                    "Idempotency-Key": "cancel-after-published-failure-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert cancelled.status_code == 202, cancelled.text
+
+        overtaking = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "2",
+                    "If-Match": str(failed_profile["etag"]),
+                    "Idempotency-Key": "overtaking-profile-connect-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 2},
+        )
+        assert overtaking.status_code == 409, overtaking.text
+        assert overtaking.json() == {
+            "schema_version": "2",
+            "code": "lifecycle_operation_in_progress",
+            "summary": "Another lifecycle operation still owns this local resource.",
+            "retryable": True,
+            "action": "retry",
+            "affected_resource_id": profile["profile_id"],
+        }
+
+        release_terminal.set()
+        assert _wait_lifecycle_operation(client, started.json())["status"] == "cancelled"
+        after_cancel = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        reconnected = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "2",
+                    "If-Match": str(after_cancel["etag"]),
+                    "Idempotency-Key": "connect-after-overtaking-rejected-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 2},
+        )
+        assert reconnected.status_code == 202, reconnected.text
+        assert _wait_lifecycle_operation(client, reconnected.json())["status"] == "succeeded"
+    finally:
+        release_terminal.set()
+        client.close()
+        provider.close()
+        store.close()
+
+
 def test_profile_connect_retry_is_durable_and_does_not_repeat_ssh(tmp_path: Path) -> None:
     provider, store, lifecycle, _connector = _provider(tmp_path)
     client = _app_client(provider)

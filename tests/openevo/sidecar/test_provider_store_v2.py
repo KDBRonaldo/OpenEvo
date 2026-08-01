@@ -1260,6 +1260,14 @@ def test_running_profile_cancellation_atomically_overrides_same_generation_failu
         ),
     )
     assert failed.connection_state == "failed"
+    with pytest.raises(store_module.ProviderConflictV2, match="active lifecycle"):
+        store.reserve_lifecycle_operation(
+            _connect_reservation(failed),
+            idempotency_key="connect-before-cancel-terminal-0001",
+        )
+    assert [
+        item.operation_id for item in store.list_pending_lifecycle_operations()
+    ] == [requested.operation_id]
 
     terminal = store.finish_lifecycle_operation(
         store_module.LifecycleOperationCompletionV2(
@@ -1289,6 +1297,79 @@ def test_running_profile_cancellation_atomically_overrides_same_generation_failu
     assert cancelled_profile.connection_state == "disconnected"
     assert cancelled_profile.failure is None
     store.close()
+
+
+def test_running_lifecycle_cancellation_replays_with_the_latest_etag(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation("project-cancel-replay"),
+        idempotency_key="cancel-replay-project-create-0001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    requested = store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=work.operation.etag,
+        idempotency_key="cancel-replay-running-operation-0001",
+    )
+
+    assert (
+        store.request_lifecycle_cancellation(
+            queued.operation_id,
+            if_match=requested.etag,
+            idempotency_key="cancel-replay-running-operation-0001",
+        )
+        == requested
+    )
+    store.close()
+
+
+def test_recovery_rejects_multiple_active_lifecycle_owners_for_one_resource(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    first = store.reserve_lifecycle_operation(
+        _project_reservation("project-active-first"),
+        idempotency_key="active-first-project-create-0001",
+    )
+    second = store.reserve_lifecycle_operation(
+        _project_reservation("project-active-second"),
+        idempotency_key="active-second-project-create-0001",
+    )
+    store.close()
+
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        first_request = connection.execute(
+            "SELECT request_sha256, request_json FROM lifecycle_operations "
+            "WHERE operation_id = ?",
+            (first.operation_id,),
+        ).fetchone()
+        assert first_request is not None
+        connection.execute(
+            "UPDATE lifecycle_operations "
+            "SET resource_id = ?, request_sha256 = ?, request_json = ? "
+            "WHERE operation_id = ?",
+            (
+                first.resource.resource_id,
+                first_request[0],
+                first_request[1],
+                second.operation_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE lifecycle_idempotency_records SET request_sha256 = ? "
+            "WHERE operation_id = ? AND action = 'reserve'",
+            (first_request[0], second.operation_id),
+        )
+
+    with pytest.raises(
+        store_module.ProviderDataV2Error,
+        match="multiple lifecycle operations",
+    ):
+        DesktopProviderStoreV2(root, clock=_Clock())
 
 
 def test_lifecycle_progress_logs_terminal_retry_and_acknowledgement_are_durable(

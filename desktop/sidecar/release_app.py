@@ -55,6 +55,7 @@ from desktop.sidecar.provider_store_v2 import (
     ProviderContractV2Error,
     ProviderCursorExpiredV2,
     ProviderIdempotencyConflictV2,
+    ProviderLifecycleResourceBusyV2,
     ProviderNotFoundV2,
     ProviderPreconditionFailedV2,
     ProviderStoreV2Error,
@@ -1138,6 +1139,15 @@ def create_release_desktop_local_api_v2_app(
                 summary="The action key is already bound to another request.",
                 retryable=False,
                 action="none",
+            )
+        if isinstance(exc, ProviderLifecycleResourceBusyV2):
+            return _v2_error_response(
+                status_code=409,
+                code="lifecycle_operation_in_progress",
+                summary="Another lifecycle operation still owns this local resource.",
+                retryable=True,
+                action="retry",
+                affected_resource_id=exc.resource_id,
             )
         if isinstance(exc, ProviderConflictV2):
             return _v2_error_response(

@@ -477,6 +477,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     if (entry.accepted_operation_id === null) {
       const recovered = await this.recoverReservedLifecycleOperationV2(entry);
       if (recovered === null) {
+        if (await this.reconcileReservedCancellationV2(entry)) return;
         throw new MutationIntentConflictV2(
           "Return to the original action to retry this exact unresolved mutation",
           entry,
@@ -1261,23 +1262,32 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     return { entry: accepted, operation: this.observeOperation(operation) };
   }
 
-  private async reconcileReservedCancellationV2(entry: PendingMutationIntentV2): Promise<void> {
-    if (entry.state !== "reserved") return;
+  private async reconcileReservedCancellationV2(entry: PendingMutationIntentV2): Promise<boolean> {
+    if (entry.state !== "reserved") return false;
     if (entry.mutation_kind === "lifecycle_cancel" && entry.resource_scope.startsWith("lifecycle_operation:")) {
       const operationId = opaqueIdV2Schema.parse(entry.resource_scope.slice("lifecycle_operation:".length));
       const operation = this.lifecycleOperations.get(operationId)?.operation
         ?? await this.lifecycleOperations.refresh(operationId);
       if (isLifecycleTerminalV2(operation)) {
         await this.completeDirectMutationV2(entry, operation);
+      } else {
+        const cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
+        await this.completeDirectMutationV2(entry, cancelled, async () => {
+          await this.lifecycleOperations.refresh(operationId);
+        });
       }
+      return true;
     }
     if (entry.mutation_kind === "core_operation_cancel" && entry.resource_scope.startsWith("core_operation:")) {
       const operationId = opaqueIdV2Schema.parse(entry.resource_scope.slice("core_operation:".length));
       const operation = this.coreOperations.get(operationId) ?? await this.coreOperations.refresh(operationId);
       if (isCoreOperationTerminalV2(operation)) {
         await this.completeDirectMutationV2(entry, operation);
+        return true;
       }
+      return false;
     }
+    return false;
   }
 
   private async reconcileLifecycleTerminalV2(

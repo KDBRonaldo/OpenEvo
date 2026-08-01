@@ -262,6 +262,47 @@ def test_running_cancellation_fences_a_late_success(tmp_path: Path) -> None:
     store.close()
 
 
+def test_cancellation_wins_a_failure_terminal_etag_race(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def fail(_context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        raise RuntimeError("simulated runner failure")
+
+    store = DesktopProviderStoreV2(tmp_path / "provider", clock=_Clock())
+    original_finish = store.finish_lifecycle_operation
+    cancellation_injected = False
+
+    def finish_after_cancellation(completion):
+        nonlocal cancellation_injected
+        if not cancellation_injected and completion.status == "failed":
+            cancellation_injected = True
+            current = store.get_lifecycle_operation(completion.operation_id)
+            requested = store.request_lifecycle_cancellation(
+                current.operation_id,
+                if_match=current.etag,
+                idempotency_key="cancel-failure-terminal-race-0001",
+            )
+            assert requested.status == "running"
+            assert not requested.cancellable
+        return original_finish(completion)
+
+    monkeypatch.setattr(store, "finish_lifecycle_operation", finish_after_cancellation)
+    executor = DesktopLifecycleExecutorV2(store, runners=_runners(fail))
+    executor.start()
+    operation = executor.reserve(
+        _reservation("project-failure-cancel-race"),
+        idempotency_key="failure-cancel-race-project-0001",
+    )
+
+    terminal = _wait_terminal(store, operation.operation_id)
+    assert cancellation_injected
+    assert terminal.status == "cancelled"
+    assert terminal.failure is None
+    executor.close()
+    store.close()
+
+
 def test_pending_cancel_stops_at_the_non_cancellable_mutation_barrier(
     tmp_path: Path,
 ) -> None:

@@ -118,6 +118,14 @@ class ProviderConflictV2(ProviderStoreV2Error):
     """A local migration or resource identity conflicts."""
 
 
+class ProviderLifecycleResourceBusyV2(ProviderConflictV2):
+    """A nonterminal lifecycle operation already owns the local resource."""
+
+    def __init__(self, resource_id: str) -> None:
+        super().__init__("local resource already has an active lifecycle operation")
+        self.resource_id = resource_id
+
+
 class ProviderNotFoundV2(ProviderStoreV2Error):
     """A local v2 resource does not exist."""
 
@@ -1013,6 +1021,22 @@ class DesktopProviderStoreV2:
         if recoverable_count >= self._max_lifecycle_operations:
             raise ProviderCapacityV2Error("lifecycle operation capacity is full")
 
+        active_resource = connection.execute(
+            """
+            SELECT operation_id
+            FROM lifecycle_operations
+            WHERE resource_kind = ? AND resource_id = ?
+              AND status IN ('queued', 'running')
+            LIMIT 1
+            """,
+            (
+                request.resource.resource_kind,
+                request.resource.resource_id,
+            ),
+        ).fetchone()
+        if active_resource is not None:
+            raise ProviderLifecycleResourceBusyV2(request.resource.resource_id)
+
         if request.kind in {
             "profile_connect",
             "profile_disconnect",
@@ -1429,7 +1453,14 @@ class DesktopProviderStoreV2:
         self._validate_profile_id(operation_id)
         self._validate_etag(if_match)
         self._validate_idempotency_key(idempotency_key)
+        # The durable action means "cancel this exact operation".  If-Match
+        # fences the first successful commit, but is not part of the replay
+        # identity: after an ambiguous response a relaunched renderer must be
+        # able to use the latest observed ETag with the same action key.
         request_sha256 = hashlib.sha256(
+            _canonical_json_bytes({"operation_id": operation_id})
+        ).hexdigest()
+        legacy_request_sha256 = hashlib.sha256(
             _canonical_json_bytes({"operation_id": operation_id, "if_match": if_match})
         ).hexdigest()
         with self._transaction(
@@ -1446,7 +1477,13 @@ class DesktopProviderStoreV2:
                 (LOCAL_PRINCIPAL, operation_id, idempotency_key),
             ).fetchone()
             if replay is not None:
-                if not hmac.compare_digest(replay["request_sha256"], request_sha256):
+                if not (
+                    hmac.compare_digest(replay["request_sha256"], request_sha256)
+                    or hmac.compare_digest(
+                        replay["request_sha256"],
+                        legacy_request_sha256,
+                    )
+                ):
                     raise ProviderIdempotencyConflictV2("lifecycle cancellation key was reused")
                 return self._lifecycle_operation_from_row(
                     self._require_lifecycle_operation_row(connection, operation_id)
@@ -1528,6 +1565,13 @@ class DesktopProviderStoreV2:
                 raise ProviderPreconditionFailedV2("lifecycle operation ETag changed")
             if current.status != "running":
                 raise ProviderConflictV2("only a running lifecycle operation can finish")
+            if (
+                cast(int, row["cancellation_requested"]) == 1
+                and validated.status != "cancelled"
+            ):
+                raise ProviderPreconditionFailedV2(
+                    "lifecycle cancellation changed the terminal outcome"
+                )
             version = self._next_lifecycle_version(row)
             timestamp = self._timestamp()
             phase = "finalizing" if validated.status == "succeeded" else current.phase
@@ -3229,6 +3273,7 @@ class DesktopProviderStoreV2:
     def _validate_lifecycle_recovery(self, connection: sqlite3.Connection) -> None:
         operation_rows: dict[str, sqlite3.Row] = {}
         operations: dict[str, m.LifecycleOperationV2] = {}
+        active_resources: set[tuple[str, str]] = set()
         for raw_row in connection.execute(
             f"""
             SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
@@ -3240,6 +3285,16 @@ class DesktopProviderStoreV2:
             operation = self._lifecycle_operation_from_row(row)
             if operation.operation_id in operations:
                 raise ProviderDataV2Error("duplicate lifecycle operation identity")
+            if operation.status in {"queued", "running"}:
+                resource = (
+                    operation.resource.resource_kind,
+                    operation.resource.resource_id,
+                )
+                if resource in active_resources:
+                    raise ProviderDataV2Error(
+                        "multiple lifecycle operations own one active resource"
+                    )
+                active_resources.add(resource)
             operation_rows[operation.operation_id] = row
             operations[operation.operation_id] = operation
 
@@ -4772,6 +4827,7 @@ __all__ = [
     "ProviderCursorExpiredV2",
     "ProviderDataV2Error",
     "ProviderIdempotencyConflictV2",
+    "ProviderLifecycleResourceBusyV2",
     "ProviderNotFoundV2",
     "ProviderPreconditionFailedV2",
     "ProviderSchemaV2Error",

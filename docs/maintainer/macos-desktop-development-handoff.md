@@ -885,7 +885,11 @@ operation phase, progress, bounded logs, cancellation state, terminal result,
 and acknowledgement handshake before or atomically with external work. A
 restart reconciles the same authority through the existing remote lifecycle and
 Core bridge ledgers; it does not issue a replacement create merely because the
-original caller disappeared.
+original caller disappeared. Each local resource has at most one nonterminal
+lifecycle owner. A durably accepted cancellation wins a later success/failure
+terminal race, and an ambiguous cancellation response is replayed with the same
+action ID and the latest observed lifecycle ETag rather than being abandoned or
+minting a second operation.
 
 Retained Core bridge state follows the same split. An exact `0.1.9` mapping is
 readable only as predecessor evidence; it never grants live mutation authority.

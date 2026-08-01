@@ -232,7 +232,11 @@ user-visible process output, but the sidecar removes credentials, Desktop/Core
 capabilities, loopback endpoints, and host paths before persistence or API
 projection. Cancellation is accepted only before a durable non-cancellable
 mutation barrier; after that barrier it returns a typed conflict instead of
-reporting an already-applied external mutation as cancelled.
+reporting an already-applied external mutation as cancelled. One nonterminal
+lifecycle operation may own a given local resource at a time. Once cancellation
+is durably accepted it wins every later success/failure terminal race; an
+ambiguous renderer response is replayed with the original action ID against the
+latest observed operation ETag without creating another lifecycle authority.
 
 Sidecar restart invalidates process-local SSH/Core authority before lifecycle
 execution resumes. If a queued or running project create/activation owns work on

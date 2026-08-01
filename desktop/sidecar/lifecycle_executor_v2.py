@@ -511,7 +511,7 @@ class DesktopLifecycleExecutorV2:
         terminal_result = result
         terminal_failure = failure
         for _attempt in range(3):
-            if terminal_status == "succeeded" and current.cancellation_requested:
+            if terminal_status != "cancelled" and current.cancellation_requested:
                 terminal_status = "cancelled"
                 terminal_result = None
                 terminal_failure = None

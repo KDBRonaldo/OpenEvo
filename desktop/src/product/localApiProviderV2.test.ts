@@ -175,6 +175,7 @@ function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
     createProfile: vi.fn(),
     createProject: vi.fn(),
     connectProfile: vi.fn(),
+    cancelLifecycleOperation: vi.fn(),
     getLifecycleOperationByAction: vi.fn().mockRejectedValue(new DesktopApiErrorV2(404, {
       schema_version: "2",
       code: "resource_not_found",
@@ -797,6 +798,79 @@ describe("Desktop v2 product provider", () => {
       terminal.operation_id,
       expect.objectContaining({ expected_terminal_status: "succeeded" }),
       expect.objectContaining({ ifMatch: terminal.etag }),
+    );
+    expect(native.journalValue()).toBeNull();
+  });
+
+  it("replays a reserved lifecycle cancellation after an ambiguous relaunch", async () => {
+    const native = nativeFixture();
+    const running = {
+      ...lifecycleOperation(),
+      status: "running" as const,
+      phase: "connecting" as const,
+      phase_index: 3,
+      started_at: NOW,
+    };
+    const firstClient = clientFixture();
+    vi.mocked(firstClient.getLifecycleOperation).mockResolvedValue(running);
+    vi.mocked(firstClient.cancelLifecycleOperation).mockRejectedValue(
+      new TypeError("cancellation response connection closed"),
+    );
+    const firstProvider = createLocalApiDesktopProductProviderV2({
+      client: firstClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const firstRefresh = await firstProvider.refresh();
+    if (firstRefresh.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(firstProvider.cancelLifecycleOperation(running.operation_id, {
+      actionId: "cancel-lifecycle-ambiguous-0001",
+      streamEpoch: firstRefresh.snapshot.stream.epoch,
+    })).rejects.toThrow(/response connection closed/i);
+    expect(JSON.parse(native.journalValue()!)).toMatchObject({
+      entries: [{
+        action_id: "cancel-lifecycle-ambiguous-0001",
+        mutation_kind: "lifecycle_cancel",
+        state: "reserved",
+        accepted_operation_id: null,
+      }],
+    });
+
+    const advanced = {
+      ...running,
+      progress: { kind: "indeterminate" as const },
+      updated_at: "2026-07-23T06:00:01Z",
+      etag: `"${"c".repeat(64)}"`,
+    };
+    const accepted = {
+      ...advanced,
+      cancellable: false,
+      updated_at: "2026-07-23T06:00:02Z",
+      etag: `"${"d".repeat(64)}"`,
+    };
+    const recoveredClient = clientFixture();
+    vi.mocked(recoveredClient.getLifecycleOperation)
+      .mockResolvedValueOnce(advanced)
+      .mockResolvedValue(accepted);
+    vi.mocked(recoveredClient.cancelLifecycleOperation).mockResolvedValue(accepted);
+    const recoveredProvider = createLocalApiDesktopProductProviderV2({
+      client: recoveredClient,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    await expect(recoveredProvider.refresh()).resolves.toMatchObject({ status: "fresh" });
+    expect(recoveredClient.cancelLifecycleOperation).toHaveBeenCalledWith(
+      running.operation_id,
+      { schema_version: "2", expected_operation_id: running.operation_id },
+      {
+        resourceGeneration: 0,
+        ifMatch: advanced.etag,
+        idempotencyKey: "cancel-lifecycle-ambiguous-0001",
+      },
     );
     expect(native.journalValue()).toBeNull();
   });
