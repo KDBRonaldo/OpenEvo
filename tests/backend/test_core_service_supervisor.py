@@ -2696,6 +2696,27 @@ def test_self_deployed_probe_proves_container_toolkit_before_vllm_or_model_prepa
     )
 
 
+def test_vllm_image_inspect_accepts_containerd_manifest_identity() -> None:
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
+    manifest_digest = profile.vllm_image.split("@", 1)[1]
+    result = ProbeCommandResult(
+        0,
+        json.dumps(
+            [
+                {
+                    "Id": manifest_digest,
+                    "RepoDigests": [profile.vllm_image],
+                    "Architecture": "amd64",
+                    "Os": "linux",
+                }
+            ]
+        ).encode("utf-8"),
+        b"",
+    )
+
+    assert supervisor_module._verified_vllm_image_inspect(result, profile) == manifest_digest
+
+
 @pytest.mark.parametrize(
     ("architecture", "operating_system"),
     (("arm64", "linux"), ("amd64", "windows")),

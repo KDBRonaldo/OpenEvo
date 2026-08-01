@@ -1553,11 +1553,12 @@ def _verified_vllm_image_inspect(
     image_id = image.get("Id")
     repo_digests = image.get("RepoDigests")
     expected_digest = profile.vllm_image.split("@", 1)[1]
+    canonical_repo_digest = profile.vllm_image.removeprefix("docker.io/")
     if (
-        image_id != profile.vllm_image_config_digest
+        image_id not in {profile.vllm_image_config_digest, expected_digest}
         or not isinstance(repo_digests, list)
         or not any(
-            isinstance(item, str) and item.endswith(f"vllm/vllm-openai@{expected_digest}")
+            isinstance(item, str) and item in {profile.vllm_image, canonical_repo_digest}
             for item in repo_digests
         )
     ):
