@@ -1966,6 +1966,44 @@ async def test_cleanup_retry_reconciliation_retries_owned_runtime_and_roots(
 
 
 @pytest.mark.asyncio
+async def test_cleanup_retry_reconciliation_does_not_race_dispatcher_owned_session(
+    tmp_path: Path,
+) -> None:
+    calls: list[str] = []
+    manager = _postrun_manager(calls=calls)
+    manager._dispatcher = SessionDispatcher(
+        max_init_workers=1,
+        max_run_workers=1,
+        max_postrun_workers=1,
+    )
+    managed = _managed_postrun_session(tmp_path, _session_result())
+
+    class OwnedRuntime:
+        runtime_id = "dispatcher-owned-runtime"
+        container_id = None
+
+        async def stop(self) -> None:
+            calls.append("stop_runtime")
+
+    managed.runtime = OwnedRuntime()
+    managed.stage = SessionStage.POSTRUN
+    managed.inflight = True
+    manager._dispatcher._sessions[managed.session_id] = managed
+    manager._register_cleanup_retry(managed)
+
+    await manager._reconcile_cleanup_retries()
+
+    assert managed.session_id in manager._cleanup_retries
+    assert "remove_session_dir" not in calls
+
+    manager._dispatcher._sessions.pop(managed.session_id)
+    await manager._reconcile_cleanup_retries()
+
+    assert managed.session_id not in manager._cleanup_retries
+    assert calls.count("remove_session_dir") == 1
+
+
+@pytest.mark.asyncio
 async def test_cleanup_ownership_persists_for_new_manager_startup_reconciliation(
     tmp_path: Path,
 ) -> None:

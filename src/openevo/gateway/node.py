@@ -7056,6 +7056,9 @@ class GatewayNodeManager:
             self._cleanup_reconcile_lock = lock
         async with lock:
             for session_id, ownership in list(retries.items()):
+                dispatcher = getattr(self, "_dispatcher", None)
+                if dispatcher is not None and await dispatcher.owns_session(session_id):
+                    continue
                 try:
                     await self._reconcile_cleanup_ownership(ownership)
                 except Exception as exc:

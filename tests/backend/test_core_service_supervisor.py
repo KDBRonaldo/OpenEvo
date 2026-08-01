@@ -665,6 +665,9 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         child_cwd = tmp_path / "core-services" / "child-cwd"
         assert all(spec.cwd == os.fspath(child_cwd) for spec in backend.spawned)
         assert child_cwd.stat().st_mode & 0o777 == 0o700
+        service_tmp = tmp_path / "core-services" / "tmp"
+        assert all(spec.env["TMPDIR"] == os.fspath(service_tmp) for spec in backend.spawned)
+        assert service_tmp.stat().st_mode & 0o777 == 0o700
         credential = backend.spawned[0].internal_identity
         assert credential is not None
         assert credential.credential not in repr(backend.spawned[0])
@@ -1887,6 +1890,13 @@ def test_self_deployed_starts_verified_inference_and_core_service_group(
         gateway = next(spec for spec in backend.spawned if spec.service_id == "gateway")
         assert _argv_option(gateway.argv, "--managed-execution-mode") == "self-deployed"
         assert gateway.codex_credential_authority is None
+        service_tmp = tmp_path / "core-services" / "tmp"
+        assert all(
+            spec.env["TMPDIR"] == os.fspath(service_tmp)
+            for spec in backend.spawned
+            if spec.component is not ServiceComponent.INFERENCE
+        )
+        assert service_tmp.stat().st_mode & 0o777 == 0o700
         binding = supervisor.run_binding()
         assert binding.execution_mode is ServiceExecutionMode.SELF_DEPLOYED
         assert binding.codex_model == "Qwen/Qwen3-0.6B"

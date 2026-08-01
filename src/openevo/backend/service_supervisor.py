@@ -2985,6 +2985,8 @@ class CoreServiceSupervisor:
             self._max_restart_operations = max_restart_operations
             self._root.ensure_directory("child-cwd")
             self._child_cwd = self._root.path / "child-cwd"
+            self._root.ensure_directory("tmp")
+            self._service_tmp = self._root.path / "tmp"
             self._root.ensure_directory("workspace-handoffs")
             self._workspace_handoff_root = self._root.path / "workspace-handoffs"
             self._handles: dict[str, ProcessIdentity] = {}
@@ -4220,7 +4222,9 @@ class CoreServiceSupervisor:
                 },
             },
         }
+        self._root.ensure_directory("tmp")
         base_env = _controlled_environment()
+        base_env["TMPDIR"] = os.fspath(self._service_tmp)
         if self._run_admission_url is not None:
             base_env[CORE_RUN_ADMISSION_URL_ENV] = self._run_admission_url
         common_plans = (
