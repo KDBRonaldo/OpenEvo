@@ -589,6 +589,78 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
+  it("offers reconciliation for a reserved lifecycle cancellation", async () => {
+    const operation = {
+      schema_version: "2" as const,
+      operation_id: "lifecycle-cancel-ambiguous-1",
+      kind: "profile_connect" as const,
+      resource: { resource_kind: "profile" as const, resource_id: "profile-gpu" },
+      request_sha256: DIGEST,
+      status: "running" as const,
+      phase: "connecting" as const,
+      phase_index: 3,
+      phase_total: 17,
+      progress: { kind: "indeterminate" as const },
+      cancellable: false,
+      result: null,
+      failure: null,
+      log_sequence_high_watermark: 0,
+      created_at: NOW,
+      started_at: NOW,
+      updated_at: NOW,
+      finished_at: null,
+      etag: ETAG,
+    };
+    const resumeMutationIntent = vi.fn(async () => {});
+    const provider = {
+      ...providerFixture(baseSnapshot()),
+      listLifecycleOperations: () => [{
+        operation,
+        logs: [],
+        droppedBeforeSequence: 0,
+        hasOlderLogs: false,
+        hasNewerLogs: false,
+      }],
+      listMutationIntents: () => [{
+        action_id: "connect-lifecycle-original-ui-0001",
+        mutation_kind: "profile_connect" as const,
+        resource_scope: "profile:profile-gpu",
+        request_sha256: DIGEST,
+        authority_sha256: DIGEST,
+        provider_stream_instance: "provider-instance-test",
+        provider_stream_epoch: 1,
+        chain_step: "single" as const,
+        accepted_operation_id: operation.operation_id,
+        completed_operation_ids: [],
+        state: "accepted" as const,
+        created_at: NOW,
+        updated_at: NOW,
+      }, {
+        action_id: "cancel-lifecycle-ambiguous-ui-0001",
+        mutation_kind: "lifecycle_cancel" as const,
+        resource_scope: `lifecycle_operation:${operation.operation_id}`,
+        request_sha256: DIGEST,
+        authority_sha256: DIGEST,
+        provider_stream_instance: "provider-instance-test",
+        provider_stream_epoch: 1,
+        chain_step: "single" as const,
+        accepted_operation_id: null,
+        completed_operation_ids: [],
+        state: "reserved" as const,
+        created_at: NOW,
+        updated_at: NOW,
+      }],
+      resumeMutationIntent,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+
+    await click("Resume / reconcile");
+    expect(resumeMutationIntent).toHaveBeenCalledWith(
+      "cancel-lifecycle-ambiguous-ui-0001",
+    );
+  });
+
   it("keeps diagnostic collection observable as its own Core resource", async () => {
     const snapshot = authoritySnapshot();
     const diagnostic = {

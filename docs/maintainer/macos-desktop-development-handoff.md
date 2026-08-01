@@ -889,7 +889,11 @@ original caller disappeared. Each local resource has at most one nonterminal
 lifecycle owner. A durably accepted cancellation wins a later success/failure
 terminal race, and an ambiguous cancellation response is replayed with the same
 action ID and the latest observed lifecycle ETag rather than being abandoned or
-minting a second operation.
+minting a second operation. This also applies to an explicit retry in the same
+renderer session, and early schema-v3 cancellation records are lazily normalized
+to that operation-only replay identity. Profile disconnect and profile-dependent
+project create/activation are serialized in both reservation orderings so that
+restart recovery cannot defer the project forever behind an explicit disconnect.
 
 Retained Core bridge state follows the same split. An exact `0.1.9` mapping is
 readable only as predecessor evidence; it never grants live mutation authority.

@@ -1037,6 +1037,8 @@ class DesktopProviderStoreV2:
         if active_resource is not None:
             raise ProviderLifecycleResourceBusyV2(request.resource.resource_id)
 
+        self._require_lifecycle_dependencies_available(connection, request)
+
         if request.kind in {
             "profile_connect",
             "profile_disconnect",
@@ -1460,9 +1462,6 @@ class DesktopProviderStoreV2:
         request_sha256 = hashlib.sha256(
             _canonical_json_bytes({"operation_id": operation_id})
         ).hexdigest()
-        legacy_request_sha256 = hashlib.sha256(
-            _canonical_json_bytes({"operation_id": operation_id, "if_match": if_match})
-        ).hexdigest()
         with self._transaction(
             write=True,
             operation="cancelLifecycleOperationV2",
@@ -1477,14 +1476,40 @@ class DesktopProviderStoreV2:
                 (LOCAL_PRINCIPAL, operation_id, idempotency_key),
             ).fetchone()
             if replay is not None:
-                if not (
-                    hmac.compare_digest(replay["request_sha256"], request_sha256)
-                    or hmac.compare_digest(
-                        replay["request_sha256"],
-                        legacy_request_sha256,
+                if replay["operation_id"] != operation_id:
+                    raise ProviderDataV2Error(
+                        "lifecycle cancellation replay belongs to another operation"
                     )
-                ):
-                    raise ProviderIdempotencyConflictV2("lifecycle cancellation key was reused")
+                if not hmac.compare_digest(replay["request_sha256"], request_sha256):
+                    # Early schema-v3 candidates included If-Match in this digest.
+                    # The exact operation/action/key row already proves the only
+                    # semantic cancellation request, so migrate it lazily to the
+                    # operation-only identity that permits a latest-ETag replay.
+                    if not self._is_digest(replay["request_sha256"]):
+                        raise ProviderDataV2Error(
+                            "lifecycle cancellation replay digest is invalid"
+                        )
+                    changed = connection.execute(
+                        """
+                        UPDATE lifecycle_idempotency_records
+                        SET request_sha256 = ?
+                        WHERE principal = ? AND action = 'cancel'
+                          AND resource_scope = ? AND idempotency_key = ?
+                          AND operation_id = ? AND request_sha256 = ?
+                        """,
+                        (
+                            request_sha256,
+                            LOCAL_PRINCIPAL,
+                            operation_id,
+                            idempotency_key,
+                            operation_id,
+                            replay["request_sha256"],
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        raise ProviderDataV2Error(
+                            "lifecycle cancellation replay changed during migration"
+                        )
                 return self._lifecycle_operation_from_row(
                     self._require_lifecycle_operation_row(connection, operation_id)
                 )
@@ -3298,6 +3323,42 @@ class DesktopProviderStoreV2:
             operation_rows[operation.operation_id] = row
             operations[operation.operation_id] = operation
 
+        active_disconnects = {
+            operation.resource.resource_id
+            for operation in operations.values()
+            if operation.status in {"queued", "running"}
+            and operation.kind == "profile_disconnect"
+        }
+        if active_disconnects:
+            active_project_profiles: dict[str, set[str]] = {}
+            for raw_profile in connection.execute(
+                f"SELECT {_PROFILE_SELECT_COLUMNS} FROM profiles ORDER BY profile_id"
+            ):
+                profile = self._profile_from_row(cast(sqlite3.Row, raw_profile))
+                if (
+                    isinstance(profile, m.RemoteWorkspaceProfileV2)
+                    and profile.active_project_id is not None
+                ):
+                    active_project_profiles.setdefault(profile.active_project_id, set()).add(
+                        profile.profile_id
+                    )
+            for operation_id, operation in operations.items():
+                if operation.status not in {"queued", "running"} or operation.kind not in {
+                    "project_create",
+                    "project_activate",
+                }:
+                    continue
+                request = self._lifecycle_request_from_row(operation_rows[operation_id])
+                profile_ids = (
+                    {request.request.profile_id}
+                    if isinstance(request, LifecycleProjectCreateRequestV2)
+                    else active_project_profiles.get(request.project_id, set())
+                )
+                if profile_ids & active_disconnects:
+                    raise ProviderDataV2Error(
+                        "profile disconnect conflicts with dependent lifecycle work"
+                    )
+
         grouped_logs: dict[str, tuple[int, int, int, int, int]] = {}
         for raw_row in connection.execute(
             """
@@ -3814,6 +3875,74 @@ class DesktopProviderStoreV2:
         )
         self._update_profile(connection, updated, version=version)
         return updated
+
+    def _require_lifecycle_dependencies_available(
+        self,
+        connection: sqlite3.Connection,
+        reservation: LifecycleOperationReservationV2,
+    ) -> None:
+        request = reservation.request
+        if isinstance(request, LifecycleProfileDisconnectRequestV2):
+            profile_row = self._require_profile_row(connection, request.profile_id)
+            profile = self._profile_from_row(profile_row)
+            if not isinstance(profile, m.RemoteWorkspaceProfileV2):
+                return
+            for raw_row in connection.execute(
+                f"""
+                SELECT {_LIFECYCLE_OPERATION_SELECT_COLUMNS}
+                FROM lifecycle_operations
+                WHERE kind IN ('project_create', 'project_activate')
+                  AND status IN ('queued', 'running')
+                ORDER BY created_at, operation_id
+                """
+            ):
+                project_request = self._lifecycle_request_from_row(
+                    cast(sqlite3.Row, raw_row)
+                )
+                depends_on_profile = (
+                    isinstance(project_request, LifecycleProjectCreateRequestV2)
+                    and project_request.request.profile_id == profile.profile_id
+                ) or (
+                    isinstance(project_request, LifecycleProjectActivateRequestV2)
+                    and profile.active_project_id == project_request.project_id
+                )
+                if depends_on_profile:
+                    raise ProviderLifecycleResourceBusyV2(profile.profile_id)
+            return
+
+        profile_ids: set[str]
+        if isinstance(request, LifecycleProjectCreateRequestV2):
+            profile_ids = {request.request.profile_id}
+        elif isinstance(request, LifecycleProjectActivateRequestV2):
+            profile_ids = {
+                profile.profile_id
+                for raw_profile in connection.execute(
+                    f"SELECT {_PROFILE_SELECT_COLUMNS} FROM profiles ORDER BY profile_id"
+                )
+                if isinstance(
+                    profile := self._profile_from_row(cast(sqlite3.Row, raw_profile)),
+                    m.RemoteWorkspaceProfileV2,
+                )
+                and profile.active_project_id == request.project_id
+            }
+        else:
+            return
+        if not profile_ids:
+            return
+        active_disconnects = {
+            cast(str, row[0])
+            for row in connection.execute(
+                """
+                SELECT resource_id
+                FROM lifecycle_operations
+                WHERE kind = 'profile_disconnect'
+                  AND status IN ('queued', 'running')
+                """
+            ).fetchall()
+        }
+        conflict = profile_ids & active_disconnects
+        if conflict:
+            raise ProviderLifecycleResourceBusyV2(sorted(conflict)[0])
 
     def _cancel_profile_lifecycle_transition(
         self,

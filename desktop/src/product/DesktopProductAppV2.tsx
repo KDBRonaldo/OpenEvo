@@ -354,8 +354,13 @@ export function DesktopProductAppV2({
           </div>
           <div className="v2-global-operation-list">
             {lifecycleStates.map((state) => {
-              const intent = mutationIntents.find((candidate) => candidate.accepted_operation_id === state.operation.operation_id
-                || candidate.completed_operation_ids.includes(state.operation.operation_id));
+              const cancellationIntent = mutationIntents.find((candidate) => candidate.state === "reserved"
+                && candidate.mutation_kind === "lifecycle_cancel"
+                && candidate.resource_scope === `lifecycle_operation:${state.operation.operation_id}`);
+              const intent = cancellationIntent ?? mutationIntents.find(
+                (candidate) => candidate.accepted_operation_id === state.operation.operation_id
+                  || candidate.completed_operation_ids.includes(state.operation.operation_id),
+              );
               return (
                 <LifecycleOperationPanelV2
                   key={state.operation.operation_id}

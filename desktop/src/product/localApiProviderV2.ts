@@ -449,13 +449,20 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   async cancelLifecycleOperation(operationId: string, intent: ProductMutationIntentV2): Promise<LifecycleOperationV2> {
     const snapshot = this.requireIntent(intent);
     const id = opaqueIdV2Schema.parse(operationId);
+    const resourceScope = `lifecycle_operation:${id}`;
+    const reserved = this.mutationIntents.list().find((entry) => entry.state === "reserved"
+      && entry.mutation_kind === "lifecycle_cancel"
+      && entry.resource_scope === resourceScope);
+    if (reserved !== undefined) {
+      return this.observeOperation(await this.replayReservedLifecycleCancellationV2(reserved));
+    }
     const current = this.lifecycleOperations.get(id)?.operation ?? await this.lifecycleOperations.refresh(id);
     const request = { schema_version: "2", expected_operation_id: id } as const;
     const dispatched = await this.dispatchMutationV2({
       snapshot,
       intent,
       mutationKind: "lifecycle_cancel",
-      resourceScope: `lifecycle_operation:${id}`,
+      resourceScope,
       request,
       authority: { resource_generation: 0, etag: current.etag },
       send: (actionId) => this.lifecycleOperations.cancel(id, actionId),
@@ -1265,17 +1272,7 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   private async reconcileReservedCancellationV2(entry: PendingMutationIntentV2): Promise<boolean> {
     if (entry.state !== "reserved") return false;
     if (entry.mutation_kind === "lifecycle_cancel" && entry.resource_scope.startsWith("lifecycle_operation:")) {
-      const operationId = opaqueIdV2Schema.parse(entry.resource_scope.slice("lifecycle_operation:".length));
-      const operation = this.lifecycleOperations.get(operationId)?.operation
-        ?? await this.lifecycleOperations.refresh(operationId);
-      if (isLifecycleTerminalV2(operation)) {
-        await this.completeDirectMutationV2(entry, operation);
-      } else {
-        const cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
-        await this.completeDirectMutationV2(entry, cancelled, async () => {
-          await this.lifecycleOperations.refresh(operationId);
-        });
-      }
+      await this.replayReservedLifecycleCancellationV2(entry);
       return true;
     }
     if (entry.mutation_kind === "core_operation_cancel" && entry.resource_scope.startsWith("core_operation:")) {
@@ -1288,6 +1285,32 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       return false;
     }
     return false;
+  }
+
+  private async replayReservedLifecycleCancellationV2(
+    entry: PendingMutationIntentV2,
+  ): Promise<LifecycleOperationV2> {
+    if (entry.state !== "reserved"
+      || entry.mutation_kind !== "lifecycle_cancel"
+      || !entry.resource_scope.startsWith("lifecycle_operation:")) {
+      throw new DesktopContractErrorV2("Lifecycle cancellation retry identity is invalid");
+    }
+    const operationId = opaqueIdV2Schema.parse(entry.resource_scope.slice("lifecycle_operation:".length));
+    const expectedRequest = { schema_version: "2", expected_operation_id: operationId } as const;
+    if (entry.request_sha256 !== sha256Utf8V2(canonicalJsonV2(expectedRequest))) {
+      throw new DesktopContractErrorV2("Lifecycle cancellation request identity changed");
+    }
+    const operation = this.lifecycleOperations.get(operationId)?.operation
+      ?? await this.lifecycleOperations.refresh(operationId);
+    if (isLifecycleTerminalV2(operation)) {
+      await this.completeDirectMutationV2(entry, operation);
+      return operation;
+    }
+    const cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
+    await this.completeDirectMutationV2(entry, cancelled, async () => {
+      await this.lifecycleOperations.refresh(operationId);
+    });
+    return cancelled;
   }
 
   private async reconcileLifecycleTerminalV2(

@@ -237,6 +237,11 @@ lifecycle operation may own a given local resource at a time. Once cancellation
 is durably accepted it wins every later success/failure terminal race; an
 ambiguous renderer response is replayed with the original action ID against the
 latest observed operation ETag without creating another lifecycle authority.
+The same replay is used when the user explicitly retries before a relaunch, and
+the unresolved action remains visible as a reconcile control. A profile
+disconnect and project create/activation work that depends on that profile are
+mutually exclusive reservations in either ordering; restart recovery therefore
+cannot strand project work behind an explicitly disconnecting profile.
 
 Sidecar restart invalidates process-local SSH/Core authority before lifecycle
 execution resumes. If a queued or running project create/activation owns work on

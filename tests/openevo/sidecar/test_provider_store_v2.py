@@ -175,6 +175,24 @@ def _connect_reservation(
     )
 
 
+def _disconnect_reservation(
+    profile: contract_models.RemoteWorkspaceProfileV2,
+) -> object:
+    return store_module.LifecycleOperationReservationV2(
+        kind="profile_disconnect",
+        resource={"resource_kind": "profile", "resource_id": profile.profile_id},
+        request=store_module.LifecycleProfileDisconnectRequestV2(
+            request_kind="profile_disconnect",
+            profile_id=profile.profile_id,
+            request=ProfileConnectionActionV2(
+                expected_connection_generation=profile.connection_generation
+            ),
+            resource_generation=profile.connection_generation,
+            if_match=profile.etag,
+        ),
+    )
+
+
 def test_release_state_uses_a_separate_v2_namespace_and_exact_schema(
     tmp_path: Path,
 ) -> None:
@@ -1323,6 +1341,179 @@ def test_running_lifecycle_cancellation_replays_with_the_latest_etag(
         )
         == requested
     )
+    store.close()
+
+
+def test_legacy_lifecycle_cancellation_replays_with_the_latest_etag(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation("project-legacy-cancel-replay"),
+        idempotency_key="legacy-cancel-replay-project-create-0001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    requested = store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=work.operation.etag,
+        idempotency_key="legacy-cancel-replay-running-operation-0001",
+    )
+    legacy_digest = hashlib.sha256(
+        store_module._canonical_json_bytes(
+            {"operation_id": queued.operation_id, "if_match": work.operation.etag}
+        )
+    ).hexdigest()
+    store.close()
+
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        connection.execute(
+            "UPDATE lifecycle_idempotency_records SET request_sha256 = ? "
+            "WHERE action = 'cancel' AND operation_id = ?",
+            (legacy_digest, queued.operation_id),
+        )
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    assert (
+        reopened.request_lifecycle_cancellation(
+            queued.operation_id,
+            if_match=requested.etag,
+            idempotency_key="legacy-cancel-replay-running-operation-0001",
+        )
+        == requested
+    )
+    reopened.close()
+
+    canonical_digest = hashlib.sha256(
+        store_module._canonical_json_bytes({"operation_id": queued.operation_id})
+    ).hexdigest()
+    with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
+        assert connection.execute(
+            "SELECT request_sha256 FROM lifecycle_idempotency_records "
+            "WHERE action = 'cancel' AND operation_id = ?",
+            (queued.operation_id,),
+        ).fetchone() == (canonical_digest,)
+
+
+def test_profile_disconnect_cannot_overtake_dependent_project_work(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="disconnect-owner-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=created.connection_generation
+        ),
+        action="connect",
+        resource_generation=created.connection_generation,
+        if_match=created.etag,
+        idempotency_key="disconnect-owner-profile-connect-0001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    project_id = "project-blocks-profile-disconnect"
+    project_request = contract_models.ProjectCreateV2(
+        profile_id=connected.profile_id,
+        profile_connection_generation=connected.connection_generation,
+        display_name="Disconnect owner",
+        config=_science_config(),
+    )
+    project = store.reserve_lifecycle_operation(
+        store_module.LifecycleOperationReservationV2(
+            kind="project_create",
+            resource={"resource_kind": "project", "resource_id": project_id},
+            request=store_module.LifecycleProjectCreateRequestV2(
+                request_kind="project_create",
+                project_id=project_id,
+                action_id="disconnect-owner-project-action-0001",
+                request=project_request,
+                resource_generation=connected.connection_generation,
+            ),
+        ),
+        idempotency_key="disconnect-owner-project-create-0001",
+    )
+
+    with pytest.raises(
+        store_module.ProviderLifecycleResourceBusyV2,
+        match="active lifecycle",
+    ):
+        store.reserve_lifecycle_operation(
+            _disconnect_reservation(connected),
+            idempotency_key="disconnect-overtakes-project-0001",
+        )
+    assert store.get_profile(connected.profile_id) == connected
+    assert [item.operation_id for item in store.list_pending_lifecycle_operations()] == [
+        project.operation_id
+    ]
+    store.close()
+
+
+def test_project_work_cannot_overtake_profile_disconnect(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="project-owner-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=created.connection_generation
+        ),
+        action="connect",
+        resource_generation=created.connection_generation,
+        if_match=created.etag,
+        idempotency_key="project-owner-profile-connect-0001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    disconnect = store.reserve_lifecycle_operation(
+        _disconnect_reservation(connected),
+        idempotency_key="project-owner-profile-disconnect-0001",
+    )
+    project_id = "project-overtakes-profile-disconnect"
+    project_request = contract_models.ProjectCreateV2(
+        profile_id=connected.profile_id,
+        profile_connection_generation=connected.connection_generation,
+        display_name="Project owner",
+        config=_science_config(),
+    )
+
+    with pytest.raises(
+        store_module.ProviderLifecycleResourceBusyV2,
+        match="active lifecycle",
+    ):
+        store.reserve_lifecycle_operation(
+            store_module.LifecycleOperationReservationV2(
+                kind="project_create",
+                resource={"resource_kind": "project", "resource_id": project_id},
+                request=store_module.LifecycleProjectCreateRequestV2(
+                    request_kind="project_create",
+                    project_id=project_id,
+                    action_id="project-overtakes-disconnect-action-0001",
+                    request=project_request,
+                    resource_generation=connected.connection_generation,
+                ),
+            ),
+            idempotency_key="project-overtakes-profile-disconnect-0001",
+        )
+    assert [item.operation_id for item in store.list_pending_lifecycle_operations()] == [
+        disconnect.operation_id
+    ]
     store.close()
 
 

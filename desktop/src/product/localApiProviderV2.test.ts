@@ -875,6 +875,66 @@ describe("Desktop v2 product provider", () => {
     expect(native.journalValue()).toBeNull();
   });
 
+  it("reuses a reserved lifecycle cancellation on explicit retry after the ETag advances", async () => {
+    const native = nativeFixture();
+    const running = {
+      ...lifecycleOperation(),
+      status: "running" as const,
+      phase: "connecting" as const,
+      phase_index: 3,
+      started_at: NOW,
+    };
+    const advanced = {
+      ...running,
+      progress: { kind: "indeterminate" as const },
+      updated_at: "2026-07-23T06:00:01Z",
+      etag: `"${"c".repeat(64)}"`,
+    };
+    const accepted = {
+      ...advanced,
+      cancellable: false,
+      updated_at: "2026-07-23T06:00:02Z",
+      etag: `"${"d".repeat(64)}"`,
+    };
+    const client = clientFixture();
+    vi.mocked(client.getLifecycleOperation)
+      .mockResolvedValueOnce(running)
+      .mockResolvedValueOnce(advanced)
+      .mockResolvedValue(accepted);
+    vi.mocked(client.cancelLifecycleOperation)
+      .mockRejectedValueOnce(new TypeError("cancellation response connection closed"))
+      .mockResolvedValue(accepted);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(provider.cancelLifecycleOperation(running.operation_id, {
+      actionId: "cancel-lifecycle-explicit-original-0001",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    })).rejects.toThrow(/response connection closed/i);
+    await expect(provider.getLifecycleOperation(running.operation_id)).resolves.toEqual(advanced);
+
+    await expect(provider.cancelLifecycleOperation(running.operation_id, {
+      actionId: "cancel-lifecycle-explicit-new-0002",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    })).resolves.toEqual(accepted);
+    expect(client.cancelLifecycleOperation).toHaveBeenLastCalledWith(
+      running.operation_id,
+      { schema_version: "2", expected_operation_id: running.operation_id },
+      {
+        resourceGeneration: 0,
+        ifMatch: advanced.etag,
+        idempotencyKey: "cancel-lifecycle-explicit-original-0001",
+      },
+    );
+    expect(native.journalValue()).toBeNull();
+  });
+
   it("recovers a terminal lifecycle operation, clears native intent first, and acknowledges once", async () => {
     const disconnected = profile();
     const connected = profile({
