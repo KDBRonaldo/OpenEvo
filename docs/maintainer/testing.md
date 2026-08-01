@@ -135,6 +135,10 @@ and require restart recovery of failed or running disconnect work to persist
 `ssh_cleanup_authority_lost` instead of `disconnected`. The same matrix covers
 failed-connect rollback, Daemon negotiation failure, accepted cancellation,
 and provider shutdown so an outer failure cannot hide unproven SSH cleanup.
+Fault injection also makes active Core project deactivation fail before both a
+disconnect and a connection replacement. Both cases must still attempt the
+owned master cleanup, retain the exact Core tunnel for an in-process retry, and
+publish `ssh_cleanup_failed` until both cleanup phases are proven complete.
 
 The hermetic local-`sshd` fixture supplies its generated SSH config with a
 test-only `-F` adapter after separately asserting that the production plans are

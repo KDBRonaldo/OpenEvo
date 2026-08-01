@@ -201,6 +201,13 @@ class _CoreBridgeV2(Protocol):
     def close(self) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _CoreProjectCleanupAuthorityV2:
+    desktop_project_id: str
+    profile_id: str
+    profile_connection_generation: int
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _NativeWorkspacePrepareAuthorityV2:
     action_id: str
@@ -420,6 +427,7 @@ class DesktopReleaseProviderV2:
         self._own_resources = own_resources
         self._guard = threading.RLock()
         self._ssh_profile_transition = threading.Lock()
+        self._pending_core_project_cleanup: _CoreProjectCleanupAuthorityV2 | None = None
         self._native_workspace_sources: dict[
             str,
             _NativeWorkspacePrepareAuthorityV2,
@@ -1217,11 +1225,15 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=True,
         )
-        self._deactivate_profile_project(
-            started.profile_id,
-            started.connection_generation - 1,
-            started.active_project_id,
-        )
+        try:
+            self._deactivate_profile_project(
+                started.profile_id,
+                started.connection_generation - 1,
+                started.active_project_id,
+            )
+        except Exception:
+            self._abort_profile_transport(started)
+            raise self._fail_profile_connect(started, "ssh_cleanup_failed") from None
         try:
             self._lifecycle.connect(
                 started,
@@ -1271,17 +1283,23 @@ class DesktopReleaseProviderV2:
             local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
             cancellable=False,
         )
-        self._deactivate_profile_project(
-            started.profile_id,
-            started.connection_generation - 1,
-            started.active_project_id,
-        )
+        cleanup_failed = False
+        try:
+            self._deactivate_profile_project(
+                started.profile_id,
+                started.connection_generation - 1,
+                started.active_project_id,
+            )
+        except Exception:
+            cleanup_failed = True
         try:
             self._lifecycle.disconnect(
                 started.profile_id,
                 started.connection_generation,
             )
         except Exception:
+            cleanup_failed = True
+        if cleanup_failed:
             error = local_v2.DesktopErrorV2(
                 code="ssh_cleanup_failed",
                 summary="The system OpenSSH connection could not be closed safely.",
@@ -3025,19 +3043,64 @@ class DesktopReleaseProviderV2:
         active_project_id: str | None,
     ) -> None:
         del profile_id, profile_connection_generation, active_project_id
-        activation = self._bridge.active_activation
-        if activation is None:
-            return
-        desktop_project_id = getattr(activation, "desktop_project_id", None)
-        generation = getattr(activation, "profile_connection_generation", None)
-        if type(desktop_project_id) is not str or type(generation) is not int:
+        with self._guard:
+            authority = self._pending_core_project_cleanup
+        if authority is None:
+            activation = self._bridge.active_activation
+            if activation is None:
+                return
+            desktop_project_id = getattr(activation, "desktop_project_id", None)
+            activation_profile_id = getattr(activation, "profile_id", None)
+            generation = getattr(activation, "profile_connection_generation", None)
+            if (
+                type(desktop_project_id) is not str
+                or not desktop_project_id
+                or type(activation_profile_id) is not str
+                or not activation_profile_id
+                or type(generation) is not int
+                or generation < 1
+            ):
+                raise _provider_error(
+                    "core_authority_invalid",
+                    "The active project tunnel has invalid authority.",
+                    status=502,
+                    action="install_repair_daemon",
+                )
+            authority = _CoreProjectCleanupAuthorityV2(
+                desktop_project_id=desktop_project_id,
+                profile_id=activation_profile_id,
+                profile_connection_generation=generation,
+            )
+            with self._guard:
+                pending = self._pending_core_project_cleanup
+                if pending is None:
+                    self._pending_core_project_cleanup = authority
+                elif pending != authority:
+                    raise _provider_error(
+                        "core_authority_invalid",
+                        "The active project tunnel cleanup authority changed.",
+                        status=502,
+                        action="install_repair_daemon",
+                    )
+                else:
+                    authority = pending
+        if (
+            type(authority.desktop_project_id) is not str
+            or type(authority.profile_connection_generation) is not int
+        ):
             raise _provider_error(
                 "core_authority_invalid",
                 "The active project tunnel has invalid authority.",
                 status=502,
                 action="install_repair_daemon",
             )
-        self._bridge.deactivate_project(desktop_project_id, generation)
+        self._bridge.deactivate_project(
+            authority.desktop_project_id,
+            authority.profile_connection_generation,
+        )
+        with self._guard:
+            if self._pending_core_project_cleanup == authority:
+                self._pending_core_project_cleanup = None
 
     def _connected_profile(
         self,

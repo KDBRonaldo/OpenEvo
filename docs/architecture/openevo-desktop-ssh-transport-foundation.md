@@ -56,11 +56,13 @@ not a Desktop release dependency.
 Disconnect cleanup is monotonic in v0.1.10. The session, owner, and rich
 transport retain the exact master and independently completed cleanup phases
 until the process is proven reaped; a later action may retry those same handles
-without re-closing completed phases. A sidecar restart cannot reconstruct that
-private authority. A profile whose cleanup was failed or interrupted is
-therefore durably quarantined as `ssh_cleanup_authority_lost` with
-`administrator_action`, rather than being projected as disconnected or
-silently replaced.
+without re-closing completed phases. The active Core SSH tunnel is a separate
+owned cleanup phase: project deactivation failure cannot skip master cleanup,
+and its exact retained tunnel is retried before a later disconnect succeeds. A
+sidecar restart cannot reconstruct that private authority. A profile whose
+cleanup was failed or interrupted is therefore durably quarantined as
+`ssh_cleanup_authority_lost` with `administrator_action`, rather than being
+projected as disconnected or silently replaced.
 
 ## Frozen 0.1.8 Foundation
 

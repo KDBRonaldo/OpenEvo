@@ -254,10 +254,56 @@ class _CoreConnector:
 
 
 class _Bridge:
-    active_activation = None
+    def __init__(self) -> None:
+        self.active_activation = None
+        self.retained_activation = None
+        self.deactivate_errors: list[Exception] = []
+        self.deactivate_calls: list[tuple[str, int]] = []
+
+    def deactivate_project(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+    ) -> None:
+        self.deactivate_calls.append(
+            (desktop_project_id, profile_connection_generation)
+        )
+        activation = self.active_activation
+        if activation is not None:
+            assert activation.desktop_project_id == desktop_project_id
+            assert (
+                activation.profile_connection_generation
+                == profile_connection_generation
+            )
+            self.active_activation = None
+        else:
+            activation = self.retained_activation
+            assert activation is not None
+            assert activation.desktop_project_id == desktop_project_id
+            assert (
+                activation.profile_connection_generation
+                == profile_connection_generation
+            )
+        if self.deactivate_errors:
+            self.retained_activation = activation
+            raise self.deactivate_errors.pop(0)
+        self.retained_activation = None
 
     def close(self) -> None:
         return None
+
+
+class _BridgeActivation:
+    def __init__(
+        self,
+        *,
+        desktop_project_id: str,
+        profile_id: str,
+        profile_connection_generation: int,
+    ) -> None:
+        self.desktop_project_id = desktop_project_id
+        self.profile_id = profile_id
+        self.profile_connection_generation = profile_connection_generation
 
 
 def _provider(
@@ -266,6 +312,7 @@ def _provider(
     max_lifecycle_log_entries: int | None = None,
     event_broker: DesktopEventBrokerV2 | None = None,
     own_resources: bool = False,
+    bridge: _Bridge | None = None,
 ) -> tuple[DesktopReleaseProviderV2, DesktopProviderStoreV2, _Lifecycle, _CoreConnector]:
     store_options = {}
     if max_lifecycle_log_entries is not None:
@@ -282,7 +329,7 @@ def _provider(
         catalog=_Catalog(),
         lifecycle=lifecycle,
         core_connector=connector,
-        bridge=_Bridge(),
+        bridge=bridge or _Bridge(),
         bridge_store=None,
         workspace_import_store=None,
         event_broker=event_broker or DesktopEventBrokerV2(clock=lambda: NOW),
@@ -1141,6 +1188,193 @@ def test_profile_disconnect_cleanup_failure_never_reports_success(
         assert disconnected["failure"] is None
         assert lifecycle.active is None
         assert [call[0] for call in lifecycle.calls].count("disconnect") == 2
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_profile_disconnect_core_cleanup_failure_still_closes_ssh_and_retries(
+    tmp_path: Path,
+) -> None:
+    bridge = _Bridge()
+    provider, store, lifecycle, _connector = _provider(tmp_path, bridge=bridge)
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        connected_response = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-before-core-cleanup-failure-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert connected_response.status_code == 202, connected_response.text
+        assert (
+            _wait_lifecycle_operation(client, connected_response.json())["status"]
+            == "succeeded"
+        )
+        connected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        bridge.active_activation = _BridgeActivation(
+            desktop_project_id="desktop-project-core-cleanup",
+            profile_id=str(profile["profile_id"]),
+            profile_connection_generation=int(connected["connection_generation"]),
+        )
+        bridge.deactivate_errors.append(RuntimeError("Core tunnel is still running"))
+
+        response = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        connected["connection_generation"]
+                    ),
+                    "If-Match": str(connected["etag"]),
+                    "Idempotency-Key": "disconnect-core-cleanup-failure-1",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": connected[
+                    "connection_generation"
+                ],
+            },
+        )
+
+        assert response.status_code == 202, response.text
+        terminal = _wait_lifecycle_operation(client, response.json())
+        assert terminal["status"] == "failed"
+        assert terminal["failure"]["code"] == "ssh_cleanup_failed"
+        failed = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert failed["connection_state"] == "failed"
+        assert failed["failure"] == terminal["failure"]
+        assert lifecycle.active is None
+        assert [call[0] for call in lifecycle.calls].count("disconnect") == 1
+
+        retry = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        failed["connection_generation"]
+                    ),
+                    "If-Match": str(failed["etag"]),
+                    "Idempotency-Key": "disconnect-core-cleanup-retry-1",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": failed["connection_generation"],
+            },
+        )
+        assert retry.status_code == 202, retry.text
+        assert _wait_lifecycle_operation(client, retry.json())["status"] == "succeeded"
+        disconnected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert disconnected["connection_state"] == "disconnected"
+        assert bridge.retained_activation is None
+        assert len(bridge.deactivate_calls) == 2
+        assert [call[0] for call in lifecycle.calls].count("disconnect") == 2
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_profile_reconnect_core_cleanup_failure_aborts_prior_ssh_and_retries(
+    tmp_path: Path,
+) -> None:
+    bridge = _Bridge()
+    provider, store, lifecycle, _connector = _provider(tmp_path, bridge=bridge)
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        first = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-before-reconnect-core-cleanup-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert first.status_code == 202, first.text
+        assert _wait_lifecycle_operation(client, first.json())["status"] == "succeeded"
+        connected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        bridge.active_activation = _BridgeActivation(
+            desktop_project_id="desktop-project-reconnect-cleanup",
+            profile_id=str(profile["profile_id"]),
+            profile_connection_generation=int(connected["connection_generation"]),
+        )
+        bridge.deactivate_errors.append(RuntimeError("Core tunnel is still running"))
+
+        reconnect = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        connected["connection_generation"]
+                    ),
+                    "If-Match": str(connected["etag"]),
+                    "Idempotency-Key": "reconnect-core-cleanup-failure-1",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": connected[
+                    "connection_generation"
+                ],
+            },
+        )
+        assert reconnect.status_code == 202, reconnect.text
+        terminal = _wait_lifecycle_operation(client, reconnect.json())
+        assert terminal["status"] == "failed"
+        assert terminal["failure"]["code"] == "ssh_cleanup_failed"
+        failed = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert failed["connection_state"] == "failed"
+        assert lifecycle.active is None
+        assert [call[0] for call in lifecycle.calls].count("connect") == 1
+        assert [call[0] for call in lifecycle.calls].count("disconnect") == 1
+
+        retry = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        failed["connection_generation"]
+                    ),
+                    "If-Match": str(failed["etag"]),
+                    "Idempotency-Key": "reconnect-core-cleanup-retry-1",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": failed["connection_generation"],
+            },
+        )
+        assert retry.status_code == 202, retry.text
+        assert _wait_lifecycle_operation(client, retry.json())["status"] == "succeeded"
+        disconnected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert disconnected["connection_state"] == "disconnected"
+        assert bridge.retained_activation is None
+        assert len(bridge.deactivate_calls) == 2
     finally:
         client.close()
         provider.close()

@@ -930,11 +930,12 @@ class DesktopCoreBridgeV2:
         self._acquire_transition(deadline)
         try:
             with self._lock:
-                session = self._active_session_locked(
+                session, was_active = self._deactivation_session_locked(
                     desktop_project_id, profile_connection_generation
                 )
-                self._active = None
-                self._generation += 1
+                if was_active:
+                    self._active = None
+                    self._generation += 1
             self._retire_or_retain(session, deadline=deadline, suppress_errors=False)
         finally:
             self._transition_lock.release()
@@ -2492,6 +2493,62 @@ class DesktopCoreBridgeV2:
             )
         return session
 
+    def _deactivation_session_locked(
+        self,
+        desktop_project_id: str,
+        profile_connection_generation: int,
+    ) -> tuple[_ActiveSessionV2, bool]:
+        """Resolve active or retained cleanup authority for an exact retry."""
+
+        _require_opaque(desktop_project_id)
+        if type(profile_connection_generation) is not int:
+            raise TypeError("profile connection generation must be an exact integer")
+        if self._closed:
+            raise _bridge_error(
+                "active_core_project_required",
+                "Connect and activate this remote project before continuing.",
+                status=409,
+                retryable=True,
+                action="reconnect",
+                affected_resource_id=desktop_project_id,
+            )
+        active = self._active
+        if active is not None:
+            activation = active.activation
+            if (
+                activation.desktop_project_id == desktop_project_id
+                and activation.profile_connection_generation
+                == profile_connection_generation
+                and activation.bridge_generation == self._generation
+            ):
+                return active, True
+        retained = tuple(
+            session
+            for session in self._retained
+            if session.activation.desktop_project_id == desktop_project_id
+            and session.activation.profile_connection_generation
+            == profile_connection_generation
+        )
+        if len(retained) == 1:
+            return retained[0], False
+        if active is None:
+            raise _bridge_error(
+                "active_core_project_required",
+                "Connect and activate this remote project before continuing.",
+                status=409,
+                retryable=True,
+                action="reconnect",
+                affected_resource_id=desktop_project_id,
+            )
+        raise _bridge_error(
+            "active_core_project_mismatch",
+            "A newer profile or project generation owns the active Core tunnel.",
+            status=409,
+            retryable=True,
+            action="reconnect",
+            affected_resource_id=desktop_project_id,
+        )
+
     def _ensure_current_locked(self, session: _ActiveSessionV2) -> None:
         if (
             self._closed
@@ -2648,6 +2705,11 @@ class DesktopCoreBridgeV2:
                     self._retained.append(session)
             if not suppress_errors or not isinstance(exc, Exception):
                 raise
+        else:
+            with self._lock:
+                self._retained[:] = [
+                    retained for retained in self._retained if retained is not session
+                ]
 
     @staticmethod
     def _close_client(client: CoreControlClientV2, *, suppress_errors: bool) -> None:

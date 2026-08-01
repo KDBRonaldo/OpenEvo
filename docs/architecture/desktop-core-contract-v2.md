@@ -109,13 +109,15 @@ and reaps the generation within a hard deadline.
 The cleanup deadline is not a success boundary. If the master has not been
 reaped, the session remains cleanup-only and unavailable to followers, while
 the session owner and rich transport retain it for a later disconnect action.
-Completed transport/session cleanup phases are monotonic, so retry does not
-discard or repeat an already completed phase. Only proof of full cleanup may
-retire that authority. Cancellation remains the operation-terminal authority,
-but its profile rollback preserves `ssh_cleanup_failed` so cancellation cannot
-manufacture a disconnected state. Provider shutdown persists the same failure
-before closing its store whenever lifecycle teardown retains an active cleanup
-identity.
+Core tunnel/client cleanup and rich-transport/session cleanup are independent:
+an error in project deactivation still closes the SSH master, and an SSH close
+error does not discard retryable Core-tunnel authority. Completed cleanup
+phases are monotonic, so retry does not discard or repeat an already completed
+phase. Only proof of full cleanup may retire that authority. Cancellation
+remains the operation-terminal authority, but its profile rollback preserves
+`ssh_cleanup_failed` so cancellation cannot manufacture a disconnected state.
+Provider shutdown persists the same failure before closing its store whenever
+lifecycle teardown retains an active cleanup identity.
 
 After that master authenticates, the sidecar privately discovers the effective
 `id` username and UID plus the single matching `getent passwd <uid>` home. It

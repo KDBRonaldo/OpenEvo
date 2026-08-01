@@ -143,7 +143,9 @@ because the handle is absent. If Desktop relaunches before cleanup is proven,
 the profile is persistently quarantined for administrator action. Failed
 connect/Daemon rollback and provider shutdown use the same profile authority;
 accepted cancellation still owns its operation terminal but cannot erase that
-cleanup failure.
+cleanup failure. Active Core-tunnel retirement and master retirement are
+attempted independently; either unproven phase keeps the action failed and the
+same-process retry authority intact.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner

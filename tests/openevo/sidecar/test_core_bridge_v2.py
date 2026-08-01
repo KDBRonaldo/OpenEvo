@@ -967,6 +967,68 @@ def test_bridge_close_retains_failed_tunnel_cleanup_for_an_exact_retry(
         assert len(tunnels.closed) == 1
 
 
+def test_bridge_deactivate_retries_the_exact_retained_tunnel_cleanup(
+    tmp_path: Path,
+) -> None:
+    class _FailOnceTunnelFactory(_TunnelFactory):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_attempts = 0
+
+        def open_tunnel(
+            self,
+            *,
+            profile_id: str,
+            profile_connection_generation: int,
+            remote_port: int,
+            session_id: str,
+            deadline: float,
+        ) -> CoreTunnelHandleV2:
+            assert deadline > 0
+            self.opened.append(
+                (profile_id, profile_connection_generation, remote_port, session_id)
+            )
+
+            def close() -> None:
+                self.close_attempts += 1
+                if self.close_attempts == 1:
+                    raise RuntimeError("transient close failure")
+                self.closed.append(session_id)
+
+            return CoreTunnelHandleV2(
+                endpoint="http://127.0.0.1:49201",
+                profile_id=profile_id,
+                profile_connection_generation=profile_connection_generation,
+                session_id=session_id,
+                close_callback=close,
+            )
+
+    tunnels = _FailOnceTunnelFactory()
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=tunnels,
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(_base_handler([])),
+        )
+        bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-project-0001",
+        )
+
+        with pytest.raises(DesktopCoreBridgeErrorV2) as first_close:
+            bridge.deactivate_project("desktop-project-1", 3)
+        assert first_close.value.error.code == "core_tunnel_close_failed"
+        assert bridge.active_activation is None
+
+        bridge.deactivate_project("desktop-project-1", 3)
+        assert tunnels.close_attempts == 2
+        assert len(tunnels.closed) == 1
+        bridge.close()
+        assert tunnels.close_attempts == 2
+
+
 def test_invalid_mutation_type_is_rejected_before_replay_identity_is_persisted(
     tmp_path: Path,
 ) -> None:
