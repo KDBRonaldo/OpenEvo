@@ -232,13 +232,17 @@ user-visible process output, but the sidecar removes credentials, Desktop/Core
 capabilities, loopback endpoints, and host paths before persistence or API
 projection. Cancellation is accepted only before a durable non-cancellable
 mutation barrier; after that barrier it returns a typed conflict instead of
-reporting an already-applied external mutation as cancelled. One nonterminal
-lifecycle operation may own a given local resource at a time. Once cancellation
-is durably accepted it wins every later success/failure terminal race; an
+reporting an already-applied external mutation as cancelled. Profile disconnect
+crosses its generation and Core-authority invalidation barrier atomically with
+reservation, so queued and running disconnect authority is non-cancellable. One
+nonterminal lifecycle operation may own a given local resource at a time. Once
+cancellation is durably accepted it wins every later success/failure terminal race; an
 ambiguous renderer response is replayed with the original action ID against the
 latest observed operation ETag without creating another lifecycle authority.
-The same replay is used when the user explicitly retries before a relaunch, and
-the unresolved action remains visible as a reconcile control. A profile
+If that replay loses a concurrent ETag race, renderer refreshes once and retries
+with the same action ID, or reconciles the terminal observation. The same replay
+is used when the user explicitly retries before a relaunch, and the unresolved
+action remains visible as a reconcile control. A profile
 disconnect and project create/activation work that depends on that profile are
 mutually exclusive reservations in either ordering; restart recovery therefore
 cannot strand project work behind an explicitly disconnecting profile.
@@ -251,7 +255,9 @@ disconnected generation. The executor defers the parent, completes the
 prerequisite through system OpenSSH, and resumes the same parent operation and
 Core mutation identity without requiring a second renderer action. An already
 pending profile lifecycle operation is resumed instead of duplicated, and an
-explicitly disconnected profile is never inferred to be restart-owned.
+explicitly disconnected profile is never inferred to be restart-owned. A parent
+with durable cancellation intent is never eligible to create a reconnect
+prerequisite.
 
 ## Core Control API v2 Identity Model
 

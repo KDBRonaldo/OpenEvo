@@ -890,10 +890,17 @@ lifecycle owner. A durably accepted cancellation wins a later success/failure
 terminal race, and an ambiguous cancellation response is replayed with the same
 action ID and the latest observed lifecycle ETag rather than being abandoned or
 minting a second operation. This also applies to an explicit retry in the same
-renderer session, and early schema-v3 cancellation records are lazily normalized
-to that operation-only replay identity. Profile disconnect and profile-dependent
-project create/activation are serialized in both reservation orderings so that
-restart recovery cannot defer the project forever behind an explicit disconnect.
+renderer session. A concurrent 412 causes one refresh and one retry with that
+same action ID, or terminal reconciliation if the refresh observes completion.
+Only the canonical operation-only cancellation digest is
+accepted; unknown or early pre-release digest forms fail startup closed rather
+than being rewritten. A profile-disconnect reservation atomically crosses its
+non-cancellable generation/Core-authority barrier, so it never advertises or
+accepts cancellation while queued or running. Profile disconnect and
+profile-dependent project create/activation are serialized in both reservation
+orderings so that restart recovery cannot defer the project forever behind an
+explicit disconnect. Restart recovery also excludes a project operation with
+durable cancellation intent from automatic reconnect prerequisites.
 
 Retained Core bridge state follows the same split. An exact `0.1.9` mapping is
 readable only as predecessor evidence; it never grants live mutation authority.

@@ -893,6 +893,11 @@ describe("Desktop v2 product provider", () => {
     const accepted = {
       ...advanced,
       cancellable: false,
+      updated_at: "2026-07-23T06:00:03Z",
+      etag: `"${"e".repeat(64)}"`,
+    };
+    const fresher = {
+      ...advanced,
       updated_at: "2026-07-23T06:00:02Z",
       etag: `"${"d".repeat(64)}"`,
     };
@@ -900,9 +905,18 @@ describe("Desktop v2 product provider", () => {
     vi.mocked(client.getLifecycleOperation)
       .mockResolvedValueOnce(running)
       .mockResolvedValueOnce(advanced)
+      .mockResolvedValueOnce(fresher)
       .mockResolvedValue(accepted);
     vi.mocked(client.cancelLifecycleOperation)
       .mockRejectedValueOnce(new TypeError("cancellation response connection closed"))
+      .mockRejectedValueOnce(new DesktopApiErrorV2(412, {
+        schema_version: "2",
+        code: "resource_changed",
+        summary: "The lifecycle operation ETag changed.",
+        retryable: true,
+        action: "retry",
+        affected_resource_id: running.operation_id,
+      }))
       .mockResolvedValue(accepted);
     const provider = createLocalApiDesktopProductProviderV2({
       client,
@@ -923,7 +937,8 @@ describe("Desktop v2 product provider", () => {
       actionId: "cancel-lifecycle-explicit-new-0002",
       streamEpoch: refreshed.snapshot.stream.epoch,
     })).resolves.toEqual(accepted);
-    expect(client.cancelLifecycleOperation).toHaveBeenLastCalledWith(
+    expect(client.cancelLifecycleOperation).toHaveBeenNthCalledWith(
+      2,
       running.operation_id,
       { schema_version: "2", expected_operation_id: running.operation_id },
       {
@@ -932,6 +947,76 @@ describe("Desktop v2 product provider", () => {
         idempotencyKey: "cancel-lifecycle-explicit-original-0001",
       },
     );
+    expect(client.cancelLifecycleOperation).toHaveBeenNthCalledWith(
+      3,
+      running.operation_id,
+      { schema_version: "2", expected_operation_id: running.operation_id },
+      {
+        resourceGeneration: 0,
+        ifMatch: fresher.etag,
+        idempotencyKey: "cancel-lifecycle-explicit-original-0001",
+      },
+    );
+    expect(native.journalValue()).toBeNull();
+  });
+
+  it("reconciles a terminal lifecycle operation when a reserved cancellation loses its ETag race", async () => {
+    const native = nativeFixture();
+    const running = {
+      ...lifecycleOperation(),
+      status: "running" as const,
+      phase: "connecting" as const,
+      phase_index: 3,
+      started_at: NOW,
+    };
+    const advanced = {
+      ...running,
+      updated_at: "2026-07-23T06:00:01Z",
+      etag: `"${"c".repeat(64)}"`,
+    };
+    const terminal = {
+      ...advanced,
+      status: "cancelled" as const,
+      cancellable: false,
+      updated_at: "2026-07-23T06:00:02Z",
+      finished_at: "2026-07-23T06:00:02Z",
+      etag: `"${"d".repeat(64)}"`,
+    };
+    const client = clientFixture();
+    vi.mocked(client.getLifecycleOperation)
+      .mockResolvedValueOnce(running)
+      .mockResolvedValueOnce(advanced)
+      .mockResolvedValue(terminal);
+    vi.mocked(client.cancelLifecycleOperation)
+      .mockRejectedValueOnce(new TypeError("cancellation response connection closed"))
+      .mockRejectedValueOnce(new DesktopApiErrorV2(412, {
+        schema_version: "2",
+        code: "resource_changed",
+        summary: "The lifecycle operation ETag changed.",
+        retryable: true,
+        action: "retry",
+        affected_resource_id: running.operation_id,
+      }));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native,
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+    const refreshed = await provider.refresh();
+    if (refreshed.status !== "fresh") throw new Error("fixture refresh failed");
+
+    await expect(provider.cancelLifecycleOperation(running.operation_id, {
+      actionId: "cancel-lifecycle-terminal-race-original-0001",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    })).rejects.toThrow(/response connection closed/i);
+    await expect(provider.getLifecycleOperation(running.operation_id)).resolves.toEqual(advanced);
+
+    await expect(provider.cancelLifecycleOperation(running.operation_id, {
+      actionId: "cancel-lifecycle-terminal-race-new-0002",
+      streamEpoch: refreshed.snapshot.stream.epoch,
+    })).resolves.toEqual(terminal);
+    expect(client.cancelLifecycleOperation).toHaveBeenCalledTimes(2);
     expect(native.journalValue()).toBeNull();
   });
 

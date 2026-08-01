@@ -1065,7 +1065,7 @@ class DesktopProviderStoreV2:
                 created_at, started_at, updated_at, finished_at, etag
             ) VALUES (
                 ?, ?, ?, ?, ?, ?, ?, 'queued', 'queued', 1, 17, ?,
-                1, NULL, NULL, 0, 0, 0, 0, ?, ?, NULL, ?, NULL, ?
+                ?, NULL, NULL, 0, 0, 0, 0, ?, ?, NULL, ?, NULL, ?
             )
             """,
             (
@@ -1077,6 +1077,7 @@ class DesktopProviderStoreV2:
                 request_document,
                 phase_plan,
                 progress,
+                int(request.kind != "profile_disconnect"),
                 version,
                 timestamp,
                 timestamp,
@@ -1481,37 +1482,19 @@ class DesktopProviderStoreV2:
                         "lifecycle cancellation replay belongs to another operation"
                     )
                 if not hmac.compare_digest(replay["request_sha256"], request_sha256):
-                    # Early schema-v3 candidates included If-Match in this digest.
-                    # The exact operation/action/key row already proves the only
-                    # semantic cancellation request, so migrate it lazily to the
-                    # operation-only identity that permits a latest-ETag replay.
-                    if not self._is_digest(replay["request_sha256"]):
-                        raise ProviderDataV2Error(
-                            "lifecycle cancellation replay digest is invalid"
-                        )
-                    changed = connection.execute(
-                        """
-                        UPDATE lifecycle_idempotency_records
-                        SET request_sha256 = ?
-                        WHERE principal = ? AND action = 'cancel'
-                          AND resource_scope = ? AND idempotency_key = ?
-                          AND operation_id = ? AND request_sha256 = ?
-                        """,
-                        (
-                            request_sha256,
-                            LOCAL_PRINCIPAL,
-                            operation_id,
-                            idempotency_key,
-                            operation_id,
-                            replay["request_sha256"],
-                        ),
-                    ).rowcount
-                    if changed != 1:
-                        raise ProviderDataV2Error(
-                            "lifecycle cancellation replay changed during migration"
-                        )
+                    raise ProviderDataV2Error(
+                        "lifecycle cancellation replay digest is invalid"
+                    )
+                operation_row = self._require_lifecycle_operation_row(
+                    connection,
+                    operation_id,
+                )
+                if cast(int, operation_row["cancellation_requested"]) != 1:
+                    raise ProviderDataV2Error(
+                        "lifecycle cancellation replay lacks operation state"
+                    )
                 return self._lifecycle_operation_from_row(
-                    self._require_lifecycle_operation_row(connection, operation_id)
+                    operation_row
                 )
             row = self._require_lifecycle_operation_row(connection, operation_id)
             current = self._lifecycle_operation_from_row(row)
@@ -2553,6 +2536,8 @@ class DesktopProviderStoreV2:
         pending: tuple[LifecycleOperationWorkV2, ...],
     ) -> LifecycleOperationWorkV2 | None:
         for work in pending:
+            if work.cancellation_requested:
+                continue
             request = work.request
             if isinstance(request, LifecycleProjectCreateRequestV2):
                 if request.request.profile_id == profile.profile_id:
@@ -3310,6 +3295,14 @@ class DesktopProviderStoreV2:
             operation = self._lifecycle_operation_from_row(row)
             if operation.operation_id in operations:
                 raise ProviderDataV2Error("duplicate lifecycle operation identity")
+            if operation.kind == "profile_disconnect" and (
+                operation.cancellable
+                or cast(int, row["cancellation_requested"]) != 0
+                or operation.status == "cancelled"
+            ):
+                raise ProviderDataV2Error(
+                    "profile disconnect crossed an invalid cancellation boundary"
+                )
             if operation.status in {"queued", "running"}:
                 resource = (
                     operation.resource.resource_kind,
@@ -3447,6 +3440,7 @@ class DesktopProviderStoreV2:
                 raise ProviderDataV2Error("lifecycle log timestamp is outside its operation")
 
         reservation_counts = {operation_id: 0 for operation_id in operations}
+        cancellation_counts = {operation_id: 0 for operation_id in operations}
         for raw_row in connection.execute(
             """
             SELECT principal, action, resource_scope, idempotency_key,
@@ -3481,10 +3475,31 @@ class DesktopProviderStoreV2:
                         "lifecycle reservation idempotency authority differs"
                     )
                 reservation_counts[operation_id] += 1
-            elif row["resource_scope"] != operation_id:
-                raise ProviderDataV2Error("lifecycle cancellation idempotency authority differs")
+            else:
+                expected_cancellation_sha256 = hashlib.sha256(
+                    _canonical_json_bytes({"operation_id": operation_id})
+                ).hexdigest()
+                if (
+                    row["resource_scope"] != operation_id
+                    or not hmac.compare_digest(
+                        row["request_sha256"],
+                        expected_cancellation_sha256,
+                    )
+                ):
+                    raise ProviderDataV2Error(
+                        "lifecycle cancellation idempotency authority differs"
+                    )
+                cancellation_counts[operation_id] += 1
         if any(count != 1 for count in reservation_counts.values()):
             raise ProviderDataV2Error("lifecycle operation lacks one reservation authority")
+        if any(
+            cancellation_counts[operation_id]
+            != cast(int, operation_rows[operation_id]["cancellation_requested"])
+            for operation_id in operations
+        ):
+            raise ProviderDataV2Error(
+                "lifecycle cancellation record differs from operation state"
+            )
 
         for raw_row in connection.execute(
             """

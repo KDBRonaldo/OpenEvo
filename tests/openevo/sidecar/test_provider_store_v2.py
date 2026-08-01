@@ -884,6 +884,76 @@ def test_restart_atomically_reserves_project_profile_reconnect_prerequisite(
         restarted_again.close()
 
 
+def test_restart_does_not_reconnect_for_a_cancelled_project_operation(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="cancelled-restart-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(expected_connection_generation=1),
+        action="connect",
+        resource_generation=1,
+        if_match=created.etag,
+        idempotency_key="cancelled-restart-profile-connect-0001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+    project_operation = store.reserve_lifecycle_operation(
+        store_module.LifecycleOperationReservationV2(
+            kind="project_create",
+            resource={
+                "resource_kind": "project",
+                "resource_id": "desktop-project-cancelled-restart",
+            },
+            request=store_module.LifecycleProjectCreateRequestV2(
+                request_kind="project_create",
+                project_id="desktop-project-cancelled-restart",
+                action_id="cancelled-restart-project-action-0001",
+                request=contract_models.ProjectCreateV2(
+                    profile_id=connected.profile_id,
+                    profile_connection_generation=connected.connection_generation,
+                    display_name="Cancelled restart",
+                    config=_science_config(),
+                ),
+                resource_generation=connected.connection_generation,
+            ),
+        ),
+        idempotency_key="cancelled-restart-project-reserve-0001",
+    )
+    claimed = store.claim_next_lifecycle_operation()
+    assert claimed is not None
+    requested = store.request_lifecycle_cancellation(
+        project_operation.operation_id,
+        if_match=claimed.operation.etag,
+        idempotency_key="cancelled-restart-project-cancel-0001",
+    )
+    assert requested.status == "running"
+    assert requested.cancellable is False
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        recovered = reopened.reconcile_process_restart()
+        assert len(recovered) == 1
+        assert recovered[0].connection_state == "disconnected"
+        pending = reopened.reconcile_lifecycle_operations()
+        assert [work.operation.operation_id for work in pending] == [
+            project_operation.operation_id
+        ]
+        assert pending[0].cancellation_requested is True
+    finally:
+        reopened.close()
+
+
 def test_capacity_is_bounded_but_exact_retry_survives_full_store(
     tmp_path: Path,
 ) -> None:
@@ -1344,8 +1414,10 @@ def test_running_lifecycle_cancellation_replays_with_the_latest_etag(
     store.close()
 
 
-def test_legacy_lifecycle_cancellation_replays_with_the_latest_etag(
+@pytest.mark.parametrize("digest_kind", ["forged", "legacy_if_match"])
+def test_noncanonical_lifecycle_cancellation_digest_fails_recovery_closed(
     tmp_path: Path,
+    digest_kind: str,
 ) -> None:
     root = tmp_path / "provider-v2"
     store = DesktopProviderStoreV2(root, clock=_Clock())
@@ -1355,45 +1427,134 @@ def test_legacy_lifecycle_cancellation_replays_with_the_latest_etag(
     )
     work = store.claim_next_lifecycle_operation()
     assert work is not None
-    requested = store.request_lifecycle_cancellation(
+    store.request_lifecycle_cancellation(
         queued.operation_id,
         if_match=work.operation.etag,
         idempotency_key="legacy-cancel-replay-running-operation-0001",
     )
-    legacy_digest = hashlib.sha256(
-        store_module._canonical_json_bytes(
-            {"operation_id": queued.operation_id, "if_match": work.operation.etag}
-        )
-    ).hexdigest()
     store.close()
 
+    noncanonical_digest = (
+        "f" * 64
+        if digest_kind == "forged"
+        else hashlib.sha256(
+            store_module._canonical_json_bytes(
+                {"operation_id": queued.operation_id, "if_match": work.operation.etag}
+            )
+        ).hexdigest()
+    )
     with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
         connection.execute(
             "UPDATE lifecycle_idempotency_records SET request_sha256 = ? "
             "WHERE action = 'cancel' AND operation_id = ?",
-            (legacy_digest, queued.operation_id),
+            (noncanonical_digest, queued.operation_id),
         )
 
-    reopened = DesktopProviderStoreV2(root, clock=_Clock())
-    assert (
-        reopened.request_lifecycle_cancellation(
-            queued.operation_id,
-            if_match=requested.etag,
-            idempotency_key="legacy-cancel-replay-running-operation-0001",
-        )
-        == requested
+    with pytest.raises(
+        store_module.ProviderDataV2Error,
+        match="cancellation idempotency authority differs",
+    ):
+        DesktopProviderStoreV2(root, clock=_Clock())
+
+
+def test_lifecycle_cancellation_record_requires_matching_operation_state(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    queued = store.reserve_lifecycle_operation(
+        _project_reservation("project-forged-cancellation-state"),
+        idempotency_key="forged-cancel-state-project-create-0001",
     )
-    reopened.close()
+    store.close()
 
-    canonical_digest = hashlib.sha256(
+    cancellation_digest = hashlib.sha256(
         store_module._canonical_json_bytes({"operation_id": queued.operation_id})
     ).hexdigest()
     with sqlite3.connect(root / store_module.DATABASE_FILENAME) as connection:
-        assert connection.execute(
-            "SELECT request_sha256 FROM lifecycle_idempotency_records "
-            "WHERE action = 'cancel' AND operation_id = ?",
-            (queued.operation_id,),
-        ).fetchone() == (canonical_digest,)
+        connection.execute(
+            """
+            INSERT INTO lifecycle_idempotency_records(
+                principal, action, resource_scope, idempotency_key,
+                request_sha256, operation_id, created_at
+            ) VALUES (?, 'cancel', ?, ?, ?, ?, ?)
+            """,
+            (
+                store_module.LOCAL_PRINCIPAL,
+                queued.operation_id,
+                "forged-cancel-state-request-0001",
+                cancellation_digest,
+                queued.operation_id,
+                queued.created_at,
+            ),
+        )
+
+    with pytest.raises(
+        store_module.ProviderDataV2Error,
+        match="cancellation record differs from operation state",
+    ):
+        DesktopProviderStoreV2(root, clock=_Clock())
+
+
+def test_profile_disconnect_reservation_is_an_atomic_non_cancellable_barrier(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    created = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="disconnect-barrier-profile-create-0001",
+    )
+    connecting = store.begin_profile_action(
+        created.profile_id,
+        ProfileConnectionActionV2(
+            expected_connection_generation=created.connection_generation
+        ),
+        action="connect",
+        resource_generation=created.connection_generation,
+        if_match=created.etag,
+        idempotency_key="disconnect-barrier-profile-connect-0001",
+    )
+    connected = store.complete_profile_connection(
+        created.profile_id,
+        connection_generation=connecting.connection_generation,
+        core_version=_core_version(),
+    )
+
+    disconnect = store.reserve_lifecycle_operation(
+        _disconnect_reservation(connected),
+        idempotency_key="disconnect-barrier-reserve-0001",
+    )
+
+    assert disconnect.status == "queued"
+    assert disconnect.cancellable is False
+    transitioned = store.get_profile(connected.profile_id)
+    assert transitioned.connection_state == "disconnecting"
+    with pytest.raises(
+        store_module.ProviderConflictV2,
+        match="not safely cancellable",
+    ):
+        store.request_lifecycle_cancellation(
+            disconnect.operation_id,
+            if_match=disconnect.etag,
+            idempotency_key="disconnect-barrier-cancel-0001",
+        )
+    assert store.get_profile(connected.profile_id) == transitioned
+    assert store.get_lifecycle_operation(disconnect.operation_id) == disconnect
+    running = store.claim_next_lifecycle_operation()
+    assert running is not None
+    assert running.operation.operation_id == disconnect.operation_id
+    assert running.operation.cancellable is False
+    with pytest.raises(
+        store_module.ProviderConflictV2,
+        match="not safely cancellable",
+    ):
+        store.request_lifecycle_cancellation(
+            running.operation.operation_id,
+            if_match=running.operation.etag,
+            idempotency_key="disconnect-barrier-running-cancel-0001",
+        )
+    store.close()
 
 
 def test_profile_disconnect_cannot_overtake_dependent_project_work(

@@ -1306,7 +1306,18 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       await this.completeDirectMutationV2(entry, operation);
       return operation;
     }
-    const cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
+    let cancelled: LifecycleOperationV2;
+    try {
+      cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
+    } catch (error) {
+      if (!(error instanceof DesktopApiErrorV2) || error.status !== 412) throw error;
+      const refreshed = await this.lifecycleOperations.refresh(operationId);
+      if (isLifecycleTerminalV2(refreshed)) {
+        await this.completeDirectMutationV2(entry, refreshed);
+        return refreshed;
+      }
+      cancelled = await this.lifecycleOperations.cancel(operationId, entry.action_id);
+    }
     await this.completeDirectMutationV2(entry, cancelled, async () => {
       await this.lifecycleOperations.refresh(operationId);
     });
