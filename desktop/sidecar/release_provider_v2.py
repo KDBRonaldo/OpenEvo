@@ -113,6 +113,8 @@ class _RemoteLifecycleV2(Protocol):
         cancel_event: threading.Event | None = None,
     ) -> Literal["connected", "rejected"]: ...
 
+    def cleanup_authority(self) -> tuple[str, int] | None: ...
+
     def close(self) -> None: ...
 
 
@@ -543,7 +545,26 @@ class DesktopReleaseProviderV2:
         for resource in (
             self._bridge,
             self._core_connector,
-            self._lifecycle,
+        ):
+            close = getattr(resource, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        try:
+            self._lifecycle.close()
+        except BaseException as exc:
+            if failure is None:
+                failure = exc
+            try:
+                self._persist_shutdown_cleanup_failure()
+            except BaseException as persistence_exc:
+                if failure is None:
+                    failure = persistence_exc
+        for resource in (
             self._event_broker,
             self._bridge_store,
             self._store,
@@ -559,6 +580,25 @@ class DesktopReleaseProviderV2:
                     failure = exc
         if failure is not None:
             raise failure
+
+    def _persist_shutdown_cleanup_failure(self) -> None:
+        authority = self._lifecycle.cleanup_authority()
+        if authority is None:
+            return
+        profile_id, connection_generation = authority
+        error = local_v2.DesktopErrorV2(
+            code="ssh_cleanup_failed",
+            summary="The system OpenSSH connection could not be closed safely.",
+            retryable=True,
+            action="retry",
+            affected_resource_id=profile_id,
+        )
+        failed = self._store.fail_profile_cleanup(
+            profile_id,
+            connection_generation=connection_generation,
+            failure=error,
+        )
+        self._publish_profile(failed)
 
     @property
     def workspace_import_store(self) -> WorkspaceImportStore | None:
@@ -1189,6 +1229,8 @@ class DesktopReleaseProviderV2:
             )
             context.check_cancelled()
         except SystemOpenSshSessionError as exc:
+            if exc.code == "ssh_cleanup_failed":
+                raise self._fail_profile_connect(started, exc.code) from None
             self._propagate_profile_cancellation(context, started)
             review = exc.host_key_review
             if review is not None and exc.code == "ssh_host_key_changed":
@@ -1357,7 +1399,11 @@ class DesktopReleaseProviderV2:
             )
         except DesktopReleaseProviderV2Error as exc:
             self._propagate_profile_cancellation(context, started)
-            self._abort_profile_transport(started)
+            if not self._abort_profile_transport(started):
+                raise self._fail_profile_connect(
+                    started,
+                    "ssh_cleanup_failed",
+                ) from None
             failed = self._store.fail_profile_connection(
                 started.profile_id,
                 connection_generation=started.connection_generation,
@@ -2859,6 +2905,8 @@ class DesktopReleaseProviderV2:
         *,
         abort_transport: bool = False,
     ) -> DesktopReleaseProviderV2Error:
+        if abort_transport and not self._abort_profile_transport(profile):
+            failure_code = "ssh_cleanup_failed"
         known: dict[str, tuple[str, str, bool, local_v2.DesktopActionV2]] = {
             "ssh_prompt_cancelled": (
                 "ssh_prompt_cancelled",
@@ -2877,6 +2925,12 @@ class DesktopReleaseProviderV2:
                 "Desktop could not verify a supported writable remote account home.",
                 True,
                 "administrator_action",
+            ),
+            "ssh_cleanup_failed": (
+                "ssh_cleanup_failed",
+                "The system OpenSSH connection could not be closed safely.",
+                True,
+                "retry",
             ),
             "core_connection_failed": (
                 "core_connection_failed",
@@ -2901,13 +2955,18 @@ class DesktopReleaseProviderV2:
             action=action,
             affected_resource_id=profile.profile_id,
         )
-        if abort_transport:
-            self._abort_profile_transport(profile)
-        failed = self._store.fail_profile_connection(
-            profile.profile_id,
-            connection_generation=profile.connection_generation,
-            failure=error,
-        )
+        if error.code == "ssh_cleanup_failed":
+            failed = self._store.fail_profile_cleanup(
+                profile.profile_id,
+                connection_generation=profile.connection_generation,
+                failure=error,
+            )
+        else:
+            failed = self._store.fail_profile_connection(
+                profile.profile_id,
+                connection_generation=profile.connection_generation,
+                failure=error,
+            )
         self._publish_profile(failed)
         return DesktopReleaseProviderV2Error(503, error)
 
@@ -2925,7 +2984,8 @@ class DesktopReleaseProviderV2:
             )
         if error.affected_resource_id is None:
             error = error.model_copy(update={"affected_resource_id": profile.profile_id})
-        self._abort_profile_transport(profile)
+        if not self._abort_profile_transport(profile):
+            return self._fail_profile_connect(profile, "ssh_cleanup_failed")
         failed = self._store.fail_profile_connection(
             profile.profile_id,
             connection_generation=profile.connection_generation,
@@ -2937,14 +2997,15 @@ class DesktopReleaseProviderV2:
     def _abort_profile_transport(
         self,
         profile: local_v2.RemoteWorkspaceProfileV2,
-    ) -> None:
+    ) -> bool:
         try:
             self._lifecycle.disconnect(
                 profile.profile_id,
                 profile.connection_generation + 1,
             )
         except Exception:
-            pass
+            return False
+        return True
 
     def _propagate_profile_cancellation(
         self,
@@ -2953,7 +3014,8 @@ class DesktopReleaseProviderV2:
     ) -> None:
         if not context.cancellation_event.is_set():
             return
-        self._abort_profile_transport(profile)
+        if not self._abort_profile_transport(profile):
+            raise self._fail_profile_connect(profile, "ssh_cleanup_failed") from None
         context.check_cancelled()
 
     def _deactivate_profile_project(

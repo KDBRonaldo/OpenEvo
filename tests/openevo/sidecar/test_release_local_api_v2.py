@@ -116,6 +116,7 @@ class _Lifecycle:
         self.calls: list[tuple[str, str, int]] = []
         self.connect_errors: list[Exception] = []
         self.disconnect_errors: list[Exception] = []
+        self.close_errors: list[Exception] = []
         self.review_outcome = "connected"
         self.review_cancel_events: list[Event | None] = []
         self.prompt_observer = None
@@ -207,7 +208,12 @@ class _Lifecycle:
             raise RuntimeError("not active")
         return object()
 
+    def cleanup_authority(self) -> tuple[str, int] | None:
+        return self.active
+
     def close(self) -> None:
+        if self.close_errors:
+            raise self.close_errors.pop(0)
         self.active = None
 
 
@@ -259,6 +265,7 @@ def _provider(
     *,
     max_lifecycle_log_entries: int | None = None,
     event_broker: DesktopEventBrokerV2 | None = None,
+    own_resources: bool = False,
 ) -> tuple[DesktopReleaseProviderV2, DesktopProviderStoreV2, _Lifecycle, _CoreConnector]:
     store_options = {}
     if max_lifecycle_log_entries is not None:
@@ -284,7 +291,7 @@ def _provider(
         build_channel="release",
         instance_id="instance-v2",
         clock=lambda: NOW,
-        own_resources=False,
+        own_resources=own_resources,
     )
     return provider, store, lifecycle, connector
 
@@ -1195,6 +1202,52 @@ def test_profile_connect_preserves_typed_daemon_bootstrap_failure(
         store.close()
 
 
+def test_daemon_failure_cannot_hide_failed_ssh_transport_cleanup(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, connector = _provider(tmp_path)
+    connector.failure = DesktopCoreBridgeErrorV2(
+        504,
+        local_v2.DesktopErrorV2(
+            code="daemon_bootstrap_timeout",
+            summary="The OpenEvo Daemon operation exceeded its deadline.",
+            retryable=True,
+            action="retry",
+            affected_resource_id=None,
+        ),
+    )
+    lifecycle.disconnect_errors.append(RuntimeError("owned master is still running"))
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-daemon-cleanup-failure-0001",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        terminal = _wait_lifecycle_operation(client, started.json())
+        assert terminal["status"] == "failed"
+        assert terminal["failure"]["code"] == "ssh_cleanup_failed"
+        failed = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert failed["connection_state"] == "failed"
+        assert failed["failure"] == terminal["failure"]
+        assert lifecycle.active == (profile["profile_id"], 2)
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
 def test_legacy_profile_rebind_requires_the_current_ssh_catalog_generation(
     tmp_path: Path,
 ) -> None:
@@ -1249,6 +1302,193 @@ def test_legacy_profile_rebind_requires_the_current_ssh_catalog_generation(
         assert current.json()["ssh_host_alias"] == "gpu-lab"
         assert current.json()["catalog_generation"] == 1
     finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_profile_connect_cleanup_failure_requires_a_disconnect_retry(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, _connector = _provider(tmp_path)
+    lifecycle.connect_errors.append(
+        SystemOpenSshSessionError(
+            "ssh_cleanup_failed",
+            "owned master is still running",
+        )
+    )
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        lifecycle.active = (profile["profile_id"], 2)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-cleanup-failure-0001",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        terminal = _wait_lifecycle_operation(client, started.json())
+        assert terminal["status"] == "failed"
+        assert terminal["failure"]["code"] == "ssh_cleanup_failed"
+
+        failed = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert failed["connection_state"] == "failed"
+        assert failed["failure"] == terminal["failure"]
+        assert lifecycle.active == (profile["profile_id"], 2)
+
+        replay = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-cleanup-failure-0001",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert replay.status_code == 202, replay.text
+        assert replay.json()["operation_id"] == terminal["operation_id"]
+        assert [call[0] for call in lifecycle.calls].count("connect") == 1
+
+        retry = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        failed["connection_generation"]
+                    ),
+                    "If-Match": str(failed["etag"]),
+                    "Idempotency-Key": "connect-cleanup-disconnect-0001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": failed["connection_generation"],
+            },
+        )
+        assert retry.status_code == 202, retry.text
+        assert _wait_lifecycle_operation(client, retry.json())["status"] == "succeeded"
+        disconnected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert disconnected["connection_state"] == "disconnected"
+        assert lifecycle.active is None
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_provider_shutdown_persists_unproven_ssh_cleanup(
+    tmp_path: Path,
+) -> None:
+    provider, _store, lifecycle, _connector = _provider(
+        tmp_path,
+        own_resources=True,
+    )
+    client = _app_client(provider)
+    profile = _create_profile(client)
+    started = client.post(
+        f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+        headers=_headers(
+            **{
+                "X-OpenEvo-Resource-Generation": "1",
+                "If-Match": str(profile["etag"]),
+                "Idempotency-Key": "connect-before-shutdown-cleanup-0001",
+            }
+        ),
+        json={"schema_version": "2", "expected_connection_generation": 1},
+    )
+    assert started.status_code == 202, started.text
+    assert _wait_lifecycle_operation(client, started.json())["status"] == "succeeded"
+    client.close()
+    lifecycle.close_errors.append(RuntimeError("owned master is still running"))
+
+    with pytest.raises(RuntimeError, match="owned master"):
+        provider.close()
+
+    reopened = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=lambda: NOW)
+    try:
+        failed = reopened.get_profile(str(profile["profile_id"]))
+        assert failed.connection_state == "failed"
+        assert failed.failure is not None
+        assert failed.failure.code == "ssh_cleanup_failed"
+        reopened.reconcile_process_restart()
+        quarantined = reopened.get_profile(str(profile["profile_id"]))
+        assert quarantined.connection_state == "failed"
+        assert quarantined.failure is not None
+        assert quarantined.failure.code == "ssh_cleanup_authority_lost"
+    finally:
+        reopened.close()
+        lifecycle.close()
+
+
+def test_profile_connect_cancellation_cannot_erase_failed_transport_cleanup(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, _connector = _provider(tmp_path)
+    lifecycle.connect_started = Event()
+    lifecycle.connect_release = Event()
+    lifecycle.block_connect_until_cancel = True
+    lifecycle.disconnect_errors.append(RuntimeError("owned master is still running"))
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        lifecycle.active = (profile["profile_id"], 2)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "connect-cancel-cleanup-failure-0001",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        assert lifecycle.connect_started.wait(2)
+        running = client.get(
+            f"/desktop/v2/operations/{started.json()['operation_id']}",
+            headers=_headers(),
+        ).json()
+        cancelled = client.post(
+            f"/desktop/v2/operations/{running['operation_id']}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": str(running["etag"]),
+                    "Idempotency-Key": "cancel-connect-cleanup-failure-0001",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_operation_id": running["operation_id"],
+            },
+        )
+        assert cancelled.status_code == 202, cancelled.text
+        terminal = _wait_lifecycle_operation(client, started.json())
+        assert terminal["status"] == "cancelled"
+        failed = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert failed["connection_state"] == "failed"
+        assert failed["failure"]["code"] == "ssh_cleanup_failed"
+        assert lifecycle.active == (profile["profile_id"], 2)
+    finally:
+        lifecycle.connect_release.set()
         client.close()
         provider.close()
         store.close()

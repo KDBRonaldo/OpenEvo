@@ -140,7 +140,10 @@ Disconnect is also action-idempotent without weakening process ownership. A
 cleanup failure is visible on both the terminal operation and profile, retains
 the exact master for a new in-process action, and never becomes successful just
 because the handle is absent. If Desktop relaunches before cleanup is proven,
-the profile is persistently quarantined for administrator action.
+the profile is persistently quarantined for administrator action. Failed
+connect/Daemon rollback and provider shutdown use the same profile authority;
+accepted cancellation still owns its operation terminal but cannot erase that
+cleanup failure.
 
 Maintainers can manually dispatch `OpenEvo Desktop unsigned draft prerelease`
 from one reviewed `stable` commit. The workflow builds only its macOS runner

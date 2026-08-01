@@ -409,7 +409,12 @@ cleanup failure retains the same process/session authority for a new idempotent
 disconnect action in the same sidecar process. If a process restart destroys
 that retry authority before cleanup is proven, the profile remains failed with
 a typed non-retryable administrator action; restart reconciliation MUST NOT
-project it as disconnected or create a replacement connection.
+project it as disconnected or create a replacement connection. Durable
+cancellation may still own the lifecycle operation's terminal status, but it
+MUST NOT erase an `ssh_cleanup_failed` profile or infer successful cleanup.
+The same durable cleanup failure is required when app shutdown cannot close an
+owned master; resource teardown must persist it before closing the provider
+store.
 
 A changed host key MUST block connection until the user explicitly reviews and
 accepts the new identity. Desktop MUST NOT silently replace a user trust record.

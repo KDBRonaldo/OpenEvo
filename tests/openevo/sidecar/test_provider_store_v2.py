@@ -1529,6 +1529,69 @@ def test_running_profile_cancellation_atomically_overrides_same_generation_failu
     store.close()
 
 
+def test_running_profile_cancellation_preserves_unproven_ssh_cleanup(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "provider-v2"
+    store = DesktopProviderStoreV2(root, clock=_Clock())
+    profile = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="cancel-cleanup-profile-create-0001",
+    )
+    queued = store.reserve_lifecycle_operation(
+        _connect_reservation(profile),
+        idempotency_key="cancel-cleanup-profile-connect-0001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    requested = store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=work.operation.etag,
+        idempotency_key="cancel-cleanup-profile-request-0001",
+    )
+    cleanup_failure = contract_models.DesktopErrorV2(
+        code="ssh_cleanup_failed",
+        summary="The system OpenSSH connection could not be closed safely.",
+        retryable=True,
+        action="retry",
+        affected_resource_id=profile.profile_id,
+    )
+    store.fail_profile_connection(
+        profile.profile_id,
+        connection_generation=profile.connection_generation + 1,
+        failure=cleanup_failure,
+    )
+
+    terminal = store.finish_lifecycle_operation(
+        store_module.LifecycleOperationCompletionV2(
+            operation_id=requested.operation_id,
+            expected_etag=requested.etag,
+            status="cancelled",
+            result=None,
+            failure=None,
+        )
+    )
+
+    assert terminal.status == "cancelled"
+    retained = store.get_profile(profile.profile_id)
+    assert retained.connection_state == "failed"
+    assert retained.failure == cleanup_failure
+    store.close()
+
+    reopened = DesktopProviderStoreV2(root, clock=_Clock())
+    try:
+        assert [item.profile_id for item in reopened.reconcile_process_restart()] == [
+            profile.profile_id
+        ]
+        quarantined = reopened.get_profile(profile.profile_id)
+        assert quarantined.connection_state == "failed"
+        assert quarantined.failure is not None
+        assert quarantined.failure.code == "ssh_cleanup_authority_lost"
+    finally:
+        reopened.close()
+
+
 def test_running_lifecycle_cancellation_replays_with_the_latest_etag(
     tmp_path: Path,
 ) -> None:

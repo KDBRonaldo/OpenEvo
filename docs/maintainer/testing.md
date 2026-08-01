@@ -132,7 +132,9 @@ worker to outlive their first cleanup deadline. They require the session owner
 and rich transport to retain the same authority for a later action, require a
 fresh disconnect action to finish without repeating completed cleanup phases,
 and require restart recovery of failed or running disconnect work to persist
-`ssh_cleanup_authority_lost` instead of `disconnected`.
+`ssh_cleanup_authority_lost` instead of `disconnected`. The same matrix covers
+failed-connect rollback, Daemon negotiation failure, accepted cancellation,
+and provider shutdown so an outer failure cannot hide unproven SSH cleanup.
 
 The hermetic local-`sshd` fixture supplies its generated SSH config with a
 test-only `-F` adapter after separately asserting that the production plans are

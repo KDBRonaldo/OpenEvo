@@ -649,6 +649,15 @@ class SystemOpenSshRemoteLifecycleV2:
                 raise RemoteConnectionFailedError("The requested remote profile is not connected.")
             return active.transport
 
+    def cleanup_authority(self) -> tuple[str, int] | None:
+        """Return only the profile identity whose process cleanup is still owned."""
+
+        with self._state:
+            active = self._active
+            if active is None:
+                return None
+            return active.profile_id, active.connection_generation
+
     def disconnect(self, profile_id: str, connection_generation: int) -> None:
         with self._transition:
             self._require_open()
@@ -883,7 +892,13 @@ class SystemOpenSshRemoteLifecycleV2:
                 cleanup_started=True,
                 transport_closed=transport is None,
             )
-        self._close_active()
+        try:
+            self._close_active()
+        except Exception as exc:
+            raise SystemOpenSshSessionError(
+                "ssh_cleanup_failed",
+                "The failed system OpenSSH connection could not be closed safely.",
+            ) from exc
 
     def _close_active(self) -> None:
         with self._state:

@@ -768,6 +768,10 @@ def test_v2_lifecycle_retries_the_same_cleanup_authority_after_failure() -> None
     with pytest.raises(SystemOpenSshSessionError, match="did not stop"):
         lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
 
+    assert lifecycle.cleanup_authority() == (
+        profile.profile_id,
+        profile.connection_generation,
+    )
     assert transport.close_calls == 1
     assert owner.active is not None
     with pytest.raises(RemoteConnectionFailedError, match="not connected"):
@@ -778,6 +782,7 @@ def test_v2_lifecycle_retries_the_same_cleanup_authority_after_failure() -> None
     assert transport.close_calls == 1
     assert owner.disconnects == 2
     assert owner.active is None
+    assert lifecycle.cleanup_authority() is None
 
 
 def test_v2_lifecycle_forwards_exact_connection_cancellation_authority() -> None:
@@ -856,6 +861,34 @@ def test_v2_lifecycle_discovery_failure_prevents_transport_and_disconnects() -> 
     assert owner.sessions[0].commands == []
     assert owner.sessions[0].discoveries == [30.0]
     assert owner.disconnects == 1
+
+
+def test_v2_lifecycle_discovery_failure_retains_typed_cleanup_authority() -> None:
+    owner = _SystemSessionOwner()
+    owner.discovery_failures.append(
+        SystemOpenSshSessionError(
+            "ssh_remote_account_unavailable",
+            "The remote SSH account could not be verified.",
+        )
+    )
+    owner.disconnect_errors.append(RuntimeError("owned master is still running"))
+    lifecycle = SystemOpenSshRemoteLifecycleV2(
+        cast(object, owner),
+        cast(object, _SystemHostTrust()),
+        transport_factory=lambda *_: _SystemTransport(),
+    )
+    profile = _system_profile()
+
+    with pytest.raises(SystemOpenSshSessionError) as captured:
+        lifecycle.connect(profile)
+
+    assert captured.value.code == "ssh_cleanup_failed"
+    assert owner.active is not None
+    with pytest.raises(RemoteConnectionFailedError, match="not connected"):
+        lifecycle.active_transport(profile.profile_id, profile.connection_generation)
+
+    lifecycle.disconnect(profile.profile_id, profile.connection_generation + 1)
+    assert owner.active is None
 
 
 def test_v2_lifecycle_disconnect_is_restart_idempotent_without_an_owned_session() -> None:

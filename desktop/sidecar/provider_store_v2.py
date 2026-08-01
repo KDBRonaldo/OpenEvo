@@ -2400,6 +2400,85 @@ class DesktopProviderStoreV2:
             self._update_profile(connection, updated, version=version)
             return updated
 
+    def fail_profile_cleanup(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        failure: m.DesktopErrorV2,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Persist unproven owned cleanup from any live profile phase."""
+
+        self._validate_profile_id(profile_id)
+        if (
+            type(failure) is not m.DesktopErrorV2
+            or failure.code != "ssh_cleanup_failed"
+            or not failure.retryable
+            or failure.action != "retry"
+            or failure.affected_resource_id != profile_id
+        ):
+            raise ProviderContractV2Error("profile cleanup failure has the wrong type")
+        with self._transaction(write=True, operation="failProfileCleanupV2") as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own a cleanup failure")
+            if current.connection_generation != connection_generation:
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.connection_state == "failed" and current.failure == failure:
+                return current
+            if (
+                current.connection_state == "failed"
+                and current.failure is not None
+                and current.failure.code == "ssh_cleanup_authority_lost"
+            ):
+                raise ProviderConflictV2(
+                    "profile cleanup authority was lost; administrator action is required"
+                )
+            if current.connection_state not in {
+                "connecting",
+                "prompt_pending",
+                "host_key_review",
+                "bootstrapping",
+                "negotiating",
+                "connected",
+                "disconnecting",
+                "failed",
+            }:
+                raise ProviderConflictV2("profile has no live cleanup authority")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state="failed",
+                prompt=None,
+                trust=m.SshTrustStateV2(
+                    connection_generation=current.connection_generation,
+                    state="unverified",
+                    review_id=None,
+                    review_sha256=None,
+                    key_fingerprints=[],
+                    repair_support="not_needed",
+                ),
+                failure=failure,
+                active_project_id=current.active_project_id,
+                core_api_major=None,
+                core_openapi_sha256=None,
+                core_event_schema_sha256=None,
+                core_registry_sha256=None,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
     def complete_profile_rejection(
         self,
         profile_id: str,
@@ -4136,6 +4215,14 @@ class DesktopProviderStoreV2:
                 "profile cancellation generation changed"
             )
         if current.connection_state == "disconnected":
+            return
+        if (
+            current.connection_state == "failed"
+            and current.failure is not None
+            and current.failure.code == "ssh_cleanup_failed"
+        ):
+            # Durable cancellation owns the operation terminal, but it cannot
+            # turn unproven process cleanup into a disconnected profile.
             return
         if current.connection_state not in {
             "connecting",
