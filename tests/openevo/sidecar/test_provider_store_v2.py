@@ -1227,6 +1227,70 @@ def test_profile_connect_cancellation_atomically_restores_disconnected_state(
     store.close()
 
 
+def test_running_profile_cancellation_atomically_overrides_same_generation_failure(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    profile = store.create_system_profile(
+        _profile(),
+        catalog_generation=1,
+        idempotency_key="cancel-racing-failure-profile-create-0001",
+    )
+    queued = store.reserve_lifecycle_operation(
+        _connect_reservation(profile),
+        idempotency_key="cancel-racing-failure-profile-connect-0001",
+    )
+    work = store.claim_next_lifecycle_operation()
+    assert work is not None
+    assert work.operation.operation_id == queued.operation_id
+    requested = store.request_lifecycle_cancellation(
+        queued.operation_id,
+        if_match=work.operation.etag,
+        idempotency_key="cancel-racing-failure-request-0001",
+    )
+    failed = store.fail_profile_connection(
+        profile.profile_id,
+        connection_generation=profile.connection_generation + 1,
+        failure=contract_models.DesktopErrorV2(
+            code="ssh_connection_failed",
+            summary="System OpenSSH could not establish the remote workspace connection.",
+            retryable=True,
+            action="retry",
+            affected_resource_id=profile.profile_id,
+        ),
+    )
+    assert failed.connection_state == "failed"
+
+    terminal = store.finish_lifecycle_operation(
+        store_module.LifecycleOperationCompletionV2(
+            operation_id=requested.operation_id,
+            expected_etag=requested.etag,
+            status="cancelled",
+            result=None,
+            failure=None,
+        )
+    )
+
+    assert terminal.status == "cancelled"
+    assert (
+        store.finish_lifecycle_operation(
+            store_module.LifecycleOperationCompletionV2(
+                operation_id=requested.operation_id,
+                expected_etag=requested.etag,
+                status="cancelled",
+                result=None,
+                failure=None,
+            )
+        )
+        == terminal
+    )
+    cancelled_profile = store.get_profile(profile.profile_id)
+    assert cancelled_profile.connection_generation == profile.connection_generation + 1
+    assert cancelled_profile.connection_state == "disconnected"
+    assert cancelled_profile.failure is None
+    store.close()
+
+
 def test_lifecycle_progress_logs_terminal_retry_and_acknowledgement_are_durable(
     tmp_path: Path,
 ) -> None:

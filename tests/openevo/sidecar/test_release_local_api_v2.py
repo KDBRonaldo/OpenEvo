@@ -1220,6 +1220,109 @@ def test_legacy_profile_rebind_requires_the_current_ssh_catalog_generation(
         store.close()
 
 
+def test_profile_connect_failure_racing_cancellation_does_not_stop_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, store, lifecycle, _connector = _provider(tmp_path)
+    lifecycle.connect_errors.append(
+        SystemOpenSshSessionError(
+            "ssh_connection_failed",
+            "simulated connection failure",
+        )
+    )
+    failure_entered = Event()
+    release_failure = Event()
+    original_fail = provider._fail_profile_connect
+
+    def fail_after_cancellation(
+        profile: local_v2.RemoteWorkspaceProfileV2,
+        failure_code: str,
+        *,
+        abort_transport: bool = False,
+    ):
+        if not failure_entered.is_set():
+            failure_entered.set()
+            assert release_failure.wait(2)
+        return original_fail(
+            profile,
+            failure_code,
+            abort_transport=abort_transport,
+        )
+
+    monkeypatch.setattr(provider, "_fail_profile_connect", fail_after_cancellation)
+    client = _app_client(provider)
+    try:
+        profile = _create_profile(client)
+        started = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "1",
+                    "If-Match": str(profile["etag"]),
+                    "Idempotency-Key": "cancel-racing-failure-connect-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 1},
+        )
+        assert started.status_code == 202, started.text
+        assert failure_entered.wait(2)
+        operation_id = started.json()["operation_id"]
+        running = client.get(
+            f"/desktop/v2/operations/{operation_id}",
+            headers=_headers(),
+        ).json()
+        assert running["status"] == "running"
+        cancelled = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": running["etag"],
+                    "Idempotency-Key": "cancel-racing-failure-operation-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert cancelled.status_code == 202, cancelled.text
+        release_failure.set()
+        terminal = _wait_lifecycle_operation(client, started.json())
+        assert terminal["status"] == "cancelled"
+
+        after_cancel = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert after_cancel["connection_generation"] == 2
+        assert after_cancel["connection_state"] == "disconnected"
+        assert after_cancel["failure"] is None
+
+        reconnected = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "2",
+                    "If-Match": str(after_cancel["etag"]),
+                    "Idempotency-Key": "connect-after-racing-cancellation-1",
+                }
+            ),
+            json={"schema_version": "2", "expected_connection_generation": 2},
+        )
+        assert reconnected.status_code == 202, reconnected.text
+        assert _wait_lifecycle_operation(client, reconnected.json())["status"] == "succeeded"
+        connected = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}",
+            headers=_headers(),
+        ).json()
+        assert connected["connection_generation"] == 3
+        assert connected["connection_state"] == "connected"
+    finally:
+        release_failure.set()
+        client.close()
+        provider.close()
+        store.close()
+
+
 def test_profile_connect_retry_is_durable_and_does_not_repeat_ssh(tmp_path: Path) -> None:
     provider, store, lifecycle, _connector = _provider(tmp_path)
     client = _app_client(provider)

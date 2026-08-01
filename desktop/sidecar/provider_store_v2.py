@@ -3792,6 +3792,12 @@ class DesktopProviderStoreV2:
             "prompt_pending",
             "bootstrapping",
             "negotiating",
+            # A runner can observe a transport failure immediately before the
+            # executor observes the durable cancellation request.  The exact
+            # operation/resource/generation checks above prove that this
+            # transient failure belongs to the lifecycle being cancelled, so
+            # cancellation remains the authoritative terminal outcome.
+            "failed",
         }:
             raise ProviderConflictV2(
                 "profile cannot be cancelled from its current state"
