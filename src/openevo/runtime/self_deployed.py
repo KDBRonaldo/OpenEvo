@@ -265,12 +265,15 @@ _QWEN3_06B_PROFILE = SelfDeployedModelProfile(
         "--tensor-parallel-size",
         "1",
         "--disable-log-stats",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "hermes",
     ),
     required_files=_QWEN3_06B_FILES,
     model_snapshot_manifest_sha256=(
         "25e6685d8f97d7221452a7fe0d58df5efa9f67045cc7fb54cec7c270c8f12383"
     ),
-    profile_sha256="87e6848899498da3775c8f5998ec376f6c16c6e4e864294c84d3493254f0a284",
+    profile_sha256="c9458b77eef092be684ac41265478a2a9a0264fbabaf5a66aa47c968aa3827c0",
 )
 
 RELEASE_SELF_DEPLOYED_MODEL_PROFILES: Final[

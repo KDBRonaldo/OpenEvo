@@ -44,6 +44,11 @@ def test_release_self_deployed_profile_is_exact_and_content_addressed() -> None:
     assert profile.profile_sha256 == profile.computed_profile_sha256
     assert profile.maximum_context_tokens == 8192
     assert profile.minimum_free_vram_bytes >= 8 * 1024**3
+    assert profile.serving_arguments[-3:] == (
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "hermes",
+    )
     assert profile.required_files[-2].path == "tokenizer_config.json"
     assert tuple(item.path for item in profile.required_files) == tuple(
         sorted(item.path for item in profile.required_files)

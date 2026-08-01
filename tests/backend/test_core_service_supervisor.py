@@ -1877,6 +1877,8 @@ def test_self_deployed_starts_verified_inference_and_core_service_group(
         assert "TORCHINDUCTOR_CACHE_DIR=/tmp/torchinductor" in inference_argv
         assert "USER=openevo" in inference_argv
         assert "LOGNAME=openevo" in inference_argv
+        assert "--enable-auto-tool-choice" in inference_argv
+        assert _argv_option(inference_argv, "--tool-call-parser") == "hermes"
         inference = snapshot.service("inference")
         assert inference.status is ServiceStatus.RUNNING
         assert inference.model_preparation is not None
