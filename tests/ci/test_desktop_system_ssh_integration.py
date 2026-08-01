@@ -238,6 +238,7 @@ def test_candidate_workflow_runs_required_real_system_ssh_gate() -> None:
     workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
 
     assert "tests/ci/test_desktop_system_ssh_integration.py" in workflow
+    assert "tests/deployment/test_remote_home.py" in workflow
     assert "tests/openevo/remote/test_system_host_keys.py" in workflow
     assert "tests/openevo/sidecar/test_askpass_broker.py" in workflow
     assert "tests/openevo/sidecar/test_system_ssh_session.py" in workflow

@@ -38,6 +38,7 @@ from openevo.deployment.remote_home import (
     REMOTE_HOME_PROBE_OUTPUT_LIMIT,
     RemoteHomeAuthority,
     build_remote_home_guarded_command,
+    build_remote_home_guarded_rsync_path,
     build_remote_home_probe_command,
     parse_remote_home_probe,
 )
@@ -1542,8 +1543,15 @@ class SystemOpenSshFollowerTransportAuthority:
         )
         shell_index = base.index("-e")
         argv = [base[0], *arguments]
-        if remote_rsync_path is not None:
-            argv.extend(("--rsync-path", remote_rsync_path))
+        argv.extend(
+            (
+                "--rsync-path",
+                build_remote_home_guarded_rsync_path(
+                    self._remote_home_authority,
+                    remote_rsync_path or RSYNC_EXECUTABLE,
+                ),
+            )
+        )
         argv.extend(("-e", base[shell_index + 1], base[-2], base[-1]))
         return self._issue(argv)
 

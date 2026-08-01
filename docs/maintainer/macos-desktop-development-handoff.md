@@ -914,8 +914,13 @@ literal `evolab` alias but failed before Daemon compatibility because the
 transport inferred `/home/<user>` instead of using the effective account's
 custom NSS home. The implemented source boundary now performs private
 generation-bound `id`/`getent` discovery, derives both fixed OpenEvo roots from
-that authority, guards rich commands, independently validates Daemon staging,
-leaves raw `ssh -W` non-shell, and has no v2 username fallback. The primary
+that authority, guards rich commands and every default or lease-prefixed rsync
+server command, independently validates Daemon staging, leaves raw `ssh -W`
+non-shell, and has no v2 username fallback. The rsync envelope is explicitly
+compatible with macOS openrsync's first tokenization and OpenSSH's subsequent
+remote-command join; paths that already select remote rsync use fixed
+`/usr/bin/printf` and `/usr/bin/base64` only to carry the bounded guard and
+trusted server prefix without consuming the rsync protocol stream. The primary
 transport/stage commit is `7b5788a67`; sanitized public failure coverage is
 `1a21c2cb6`.
 

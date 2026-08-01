@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
 import posixpath
 import re
@@ -194,24 +195,85 @@ def build_remote_home_guarded_command(
 ) -> str:
     """Guard one trusted rich command with the sealed remote account binding."""
 
-    if (
-        type(authority) is not RemoteHomeAuthority
-        or authority._seal is not _AUTHORITY_SEAL
-        or not _valid_remote_command(remote_command)
-    ):
-        raise RemoteHomeAuthorityError(_COMMAND_INVALID_MESSAGE)
+    return _build_remote_home_guarded_invocation(
+        authority,
+        remote_command,
+        script=_REMOTE_HOME_GUARD_SCRIPT,
+        marker="openevo-remote-home-guard-v1",
+    )
+
+
+def build_remote_home_guarded_rsync_path(
+    authority: RemoteHomeAuthority,
+    remote_command: str,
+) -> str:
+    """Guard an rsync server command while preserving its appended arguments."""
+
+    _require_valid_guard_request(authority, remote_command)
+    return _join_openrsync_remote_command(
+        (
+            "/bin/sh",
+            "-c",
+            _REMOTE_HOME_RSYNC_BOOTSTRAP_SCRIPT,
+            "openevo-remote-home-rsync-bootstrap-v1",
+            _base64_payload(_REMOTE_HOME_RSYNC_GUARD_SCRIPT),
+            authority.remote_user,
+            str(authority.uid),
+            authority._home,
+            _base64_payload(remote_command),
+        )
+    )
+
+
+def _build_remote_home_guarded_invocation(
+    authority: RemoteHomeAuthority,
+    remote_command: str,
+    *,
+    script: str,
+    marker: str,
+) -> str:
+    _require_valid_guard_request(authority, remote_command)
     return shlex.join(
         [
             "/bin/sh",
             "-c",
-            _REMOTE_HOME_GUARD_SCRIPT,
-            "openevo-remote-home-guard-v1",
+            script,
+            marker,
             authority.remote_user,
             str(authority.uid),
             authority._home,
             remote_command,
         ]
     )
+
+
+def _require_valid_guard_request(
+    authority: RemoteHomeAuthority,
+    remote_command: str,
+) -> None:
+    if (
+        type(authority) is not RemoteHomeAuthority
+        or authority._seal is not _AUTHORITY_SEAL
+        or not _valid_remote_command(remote_command)
+    ):
+        raise RemoteHomeAuthorityError(_COMMAND_INVALID_MESSAGE)
+
+
+def _base64_payload(value: str) -> str:
+    return base64.b64encode(value.encode("utf-8", errors="strict")).decode("ascii")
+
+
+def _join_openrsync_remote_command(arguments: tuple[str, ...]) -> str:
+    # openrsync tokenizes --rsync-path once, then OpenSSH concatenates those
+    # argv elements for the remote login shell. Preserve one literal quoting
+    # layer across the first parser so the second parser recovers exact argv.
+    protected: list[str] = []
+    for argument in arguments:
+        remote_shell_word = shlex.quote(argument)
+        if '"' in remote_shell_word or "\\" in remote_shell_word:
+            raise RuntimeError("internal openrsync command argument is unsupported")
+        protected.append('"' + remote_shell_word + '"')
+    return " ".join(protected)
 
 
 def _valid_profile_id(value: object) -> bool:
@@ -353,7 +415,7 @@ printf '%s\n' \
 """.strip()
 
 
-_REMOTE_HOME_GUARD_SCRIPT = r"""
+_REMOTE_HOME_GUARD_VALIDATION_SCRIPT = r"""
 set -eu
 set -f
 LC_ALL=C
@@ -362,8 +424,10 @@ export LC_ALL
 expected_user=$1
 expected_uid=$2
 expected_home=$3
-remote_command=$4
+remote_command_argument=$4
+shift 4
 
+validate_remote_account() {
 user=$(id -un 2>/dev/null)
 uid=$(id -u 2>/dev/null)
 [ "$user" = "$expected_user" ] || exit 64
@@ -397,8 +461,54 @@ physical_home=$(
 [ "$physical_home" = "$expected_home" ] || exit 64
 owner_uid=$(stat -c %u -- "$home" 2>/dev/null)
 [ "$owner_uid" = "$expected_uid" ] || exit 64
+}
 
-exec /bin/sh -c "$remote_command"
+validate_remote_account
+""".strip()
+
+
+_REMOTE_HOME_GUARD_SCRIPT = (
+    _REMOTE_HOME_GUARD_VALIDATION_SCRIPT
+    + r"""
+
+[ "$#" -eq 0 ] || exit 64
+
+exec /bin/sh -c "$remote_command_argument"
+"""
+).strip()
+
+
+_REMOTE_HOME_RSYNC_GUARD_SCRIPT = (
+    _REMOTE_HOME_GUARD_VALIDATION_SCRIPT
+    + r"""
+
+[ "$#" -ge 1 ] || exit 64
+[ "$1" = "--server" ] || exit 64
+
+remote_command=$(
+  /usr/bin/printf %s "$remote_command_argument" | /usr/bin/base64 --decode
+)
+[ -n "$remote_command" ] || exit 64
+
+exec /bin/sh -c "$remote_command \"\$@\"" \
+  openevo-remote-home-rsync-command-v1 "$@" 0<&3
+"""
+).strip()
+
+
+_REMOTE_HOME_RSYNC_BOOTSTRAP_SCRIPT = r"""
+set -eu
+set -f
+IFS=:
+LC_ALL=C
+export LC_ALL
+
+exec 3<&0
+guard_payload=$1
+shift
+/usr/bin/printf %s $guard_payload |
+  /usr/bin/base64 --decode |
+  /bin/sh -s -- $@
 """.strip()
 
 
@@ -407,6 +517,7 @@ __all__ = (
     "RemoteHomeAuthority",
     "RemoteHomeAuthorityError",
     "build_remote_home_guarded_command",
+    "build_remote_home_guarded_rsync_path",
     "build_remote_home_probe_command",
     "parse_remote_home_probe",
 )

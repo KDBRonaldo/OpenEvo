@@ -119,12 +119,15 @@ The v2 workspace and Daemon bundle roots are derived only as
 `<nss-home>/.openevo/workspaces` and
 `<nss-home>/.openevo/daemon-bundles`. `/root`, `/home/<user>`, and safe custom
 homes such as `/srv/research/alice` use the same path. Rich SSH commands repeat
-the account/NSS/home guard before execution, and the Daemon staging script
-independently repeats that validation before creating owner-private directories;
-it pins and rechecks the service-root identity through streaming, hashing, and
-no-overwrite publication. The system-OpenSSH v2 path has no username-derived
-fallback. The raw Core tunnel remains the non-shell `ssh -W` channel and does
-not run a home-derived command.
+the account/NSS/home guard before execution. Every system-OpenSSH rsync server
+command, including the default server command and transfer-lease prefixes,
+repeats the same guard before starting rsync; its transport envelope preserves
+the server arguments across macOS openrsync tokenization and OpenSSH's remote
+command join. The Daemon staging script independently repeats that validation
+before creating owner-private directories; it pins and rechecks the
+service-root identity through streaming, hashing, and no-overwrite publication.
+The system-OpenSSH v2 path has no username-derived fallback. The raw Core tunnel
+remains the non-shell `ssh -W` channel and does not run a home-derived command.
 
 The separately inventoried native askpass helper accepts only a bounded prompt
 from a descendant of the current owned OpenSSH generation and a single-use

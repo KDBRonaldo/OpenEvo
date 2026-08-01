@@ -39,6 +39,7 @@ from openevo.deployment.host_keys import (
 from openevo.deployment.remote_home import (
     REMOTE_HOME_PROBE_OUTPUT_LIMIT,
     build_remote_home_guarded_command,
+    build_remote_home_guarded_rsync_path,
     build_remote_home_probe_command,
     parse_remote_home_probe,
 )
@@ -47,6 +48,7 @@ from openevo.deployment.ssh import (
     build_system_openssh_environment,
 )
 from openevo.deployment.system_executables import (
+    RSYNC_EXECUTABLE,
     SSH_EXECUTABLE,
     SSH_KEYGEN_EXECUTABLE,
     SYSTEM_OPENSSH_OWNER_ARGUMENT,
@@ -479,6 +481,43 @@ def test_follower_authority_guards_rich_commands_but_not_core_tunnel(
         assert follower.remote_user == "researcher"
         assert repr(follower) == "SystemOpenSshFollowerTransportAuthority(<sealed>)"
         assert "/srv/research/alice" not in repr(follower)
+    finally:
+        session.close()
+        launcher.close_socket()
+
+
+@pytest.mark.parametrize(
+    "remote_rsync_path",
+    [None, "/usr/bin/python3 -I -c 'trusted lease' /usr/bin/rsync"],
+)
+def test_follower_authority_guards_every_rsync_server_command(
+    short_tmp_path: Path,
+    remote_rsync_path: str | None,
+) -> None:
+    session, _process, _inspector, launcher, runner = _session(short_tmp_path)
+    local = short_tmp_path / "upload"
+    local.mkdir()
+    try:
+        session.start()
+        runner.stdout = _remote_home_record()
+        authority = session.discover_remote_home_authority(timeout_seconds=2.0)
+        follower = SystemOpenSshFollowerTransportAuthority(
+            session,
+            remote_home_authority=authority,
+        )
+
+        argv = follower.rsync_argv(
+            local_path=local,
+            remote_path="/srv/research/alice/.openevo/workspaces/project",
+            arguments=("--archive",),
+            remote_rsync_path=remote_rsync_path,
+        )
+
+        rsync_path_index = argv.index("--rsync-path")
+        assert argv[rsync_path_index + 1] == build_remote_home_guarded_rsync_path(
+            authority,
+            remote_rsync_path or RSYNC_EXECUTABLE,
+        )
     finally:
         session.close()
         launcher.close_socket()
