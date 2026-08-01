@@ -76,6 +76,7 @@ from openevo.runtime.managed import (
     verified_managed_runtime_image_reference,
 )
 from openevo.runtime.self_deployed import (
+    RELEASE_SELF_DEPLOYED_MODEL_PROFILES,
     SelfDeployedModelProfile,
     require_release_self_deployed_model_profile,
 )
@@ -3415,6 +3416,13 @@ class CoreServiceSupervisor:
                 finally:
                     for listener in listeners.values():
                         listener.close()
+            inference_profile: SelfDeployedModelProfile | None = None
+            if self_deployed_runtime is not None:
+                inference_profile = self_deployed_runtime.profile
+                if inference_profile is None:
+                    raise SupervisorStateError(
+                        "Self-Deployed runtime profile disappeared after planning"
+                    )
             self._install_planned_records(
                 execution_mode,
                 generation_digest,
@@ -3422,18 +3430,9 @@ class CoreServiceSupervisor:
                 runtime_identity_digest=runtime.identity_digest,
                 runtime_readiness_code=runtime.code,
                 group_status_message=None,
+                inference_profile=inference_profile,
             )
-            if self_deployed_runtime is not None:
-                profile = self_deployed_runtime.profile
-                if profile is None:
-                    raise SupervisorStateError(
-                        "Self-Deployed runtime profile disappeared after planning"
-                    )
-                inference_record = self._record("inference")
-                inference_record.model_ref = profile.model_id
-                inference_record.model_status = "ready"
-                inference_record.model_updated_at = _timestamp()
-                inference_record.model_next_interface = "run_task"
+            if inference_profile is not None:
                 for message in preparation_messages:
                     self._append_log("inference", "info", message)
                 self._persist()
@@ -4594,8 +4593,16 @@ class CoreServiceSupervisor:
         runtime_identity_digest: str | None,
         runtime_readiness_code: ServiceRunReadinessCode,
         group_status_message: str | None,
+        inference_profile: SelfDeployedModelProfile | None = None,
     ) -> None:
         now = _timestamp()
+        has_inference = any(spec.component is ServiceComponent.INFERENCE for spec in specs)
+        if has_inference != (inference_profile is not None) or (
+            has_inference and execution_mode is not ServiceExecutionMode.SELF_DEPLOYED
+        ):
+            raise SupervisorStateError(
+                "planned inference service lacks its exact Self-Deployed profile"
+            )
         self._ledger.execution_mode = execution_mode
         self._ledger.generation_digest = generation_digest
         self._ledger.runtime_identity_digest = runtime_identity_digest
@@ -4613,6 +4620,17 @@ class CoreServiceSupervisor:
                 argv_digest=spec.argv_digest,
                 env_digest=spec.env_digest,
                 port=spec.port,
+                model_ref=(
+                    inference_profile.model_id
+                    if spec.component is ServiceComponent.INFERENCE
+                    and inference_profile is not None
+                    else None
+                ),
+                model_status=("ready" if spec.component is ServiceComponent.INFERENCE else None),
+                model_updated_at=(now if spec.component is ServiceComponent.INFERENCE else None),
+                model_next_interface=(
+                    "run_task" if spec.component is ServiceComponent.INFERENCE else None
+                ),
             )
             for spec in specs
         ]
@@ -5204,7 +5222,43 @@ class CoreServiceSupervisor:
                 record.model_next_interface,
             )
             if record.component is ServiceComponent.INFERENCE:
-                if not all(model_fields) or record.model_status != "unresolved":
+                if ledger.execution_mode is not ServiceExecutionMode.SELF_DEPLOYED or not all(
+                    model_fields
+                ):
+                    raise SupervisorStateError("inference model preparation state is invalid")
+                model_status = record.model_status
+                if model_status == "unresolved":
+                    valid_model_state = (
+                        record.model_next_interface == "model_preparer_v1"
+                        and record.status in {ServiceStatus.UNAVAILABLE, ServiceStatus.STOPPED}
+                        and ledger.runtime_identity_digest is None
+                        and ledger.runtime_readiness_code is None
+                    )
+                else:
+                    release_model = any(
+                        profile.model_id == record.model_ref
+                        for profile in RELEASE_SELF_DEPLOYED_MODEL_PROFILES.values()
+                    )
+                    if model_status == "ready":
+                        valid_model_state = (
+                            release_model
+                            and record.model_next_interface == "run_task"
+                            and ledger.runtime_identity_digest is not None
+                            and ledger.runtime_readiness_code
+                            in {None, ServiceRunReadinessCode.READY}
+                        )
+                    elif model_status == "failed":
+                        valid_model_state = (
+                            release_model
+                            and record.model_next_interface == "retry_service_ensure"
+                            and record.status in {ServiceStatus.UNAVAILABLE, ServiceStatus.STOPPED}
+                            and ledger.runtime_identity_digest is None
+                            and ledger.runtime_readiness_code
+                            not in {None, ServiceRunReadinessCode.READY}
+                        )
+                    else:
+                        valid_model_state = False
+                if not valid_model_state:
                     raise SupervisorStateError("inference model preparation state is invalid")
             elif any(value is not None for value in model_fields):
                 raise SupervisorStateError("non-inference service has model preparation state")

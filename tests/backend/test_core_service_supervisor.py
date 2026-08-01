@@ -1881,6 +1881,61 @@ def test_self_deployed_starts_verified_inference_and_core_service_group(
         supervisor.close()
 
 
+def test_self_deployed_ready_ledger_reopens_after_clean_shutdown(
+    tmp_path: Path,
+    framework_lock: Path,
+) -> None:
+    first, _, _, _ = _supervisor(tmp_path, framework_lock)
+    snapshot = first.ensure(
+        ServiceExecutionMode.SELF_DEPLOYED,
+        model_ref="qwen3-0.6b-v1",
+        runtime_image="openevo/science-runtime:0.1.1",
+    )
+    assert snapshot.run_ready is True
+    first.close()
+
+    recovered, _, _, _ = _supervisor(tmp_path, framework_lock)
+    try:
+        services = recovered.list()
+        inference = next(service for service in services if service.id == "inference")
+        assert inference.status is ServiceStatus.STOPPED
+        assert inference.model_preparation is not None
+        assert inference.model_preparation.status == "ready"
+        assert inference.model_preparation.next_interface == "run_task"
+    finally:
+        recovered.close()
+
+
+def test_every_persisted_self_deployed_ledger_state_is_recoverable(
+    tmp_path: Path,
+    framework_lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    supervisor, _, _, _ = _supervisor(tmp_path, framework_lock)
+    original_persist = supervisor._persist
+    invalid_states: list[str] = []
+
+    def persist_checked() -> None:
+        try:
+            supervisor._validate_loaded_ledger(supervisor._ledger)
+        except SupervisorStateError as exc:
+            invalid_states.append(str(exc))
+        original_persist()
+
+    monkeypatch.setattr(supervisor, "_persist", persist_checked)
+    try:
+        snapshot = supervisor.ensure(
+            ServiceExecutionMode.SELF_DEPLOYED,
+            model_ref="qwen3-0.6b-v1",
+            runtime_image="openevo/science-runtime:0.1.1",
+        )
+        assert snapshot.run_ready is True
+    finally:
+        supervisor.close()
+
+    assert invalid_states == []
+
+
 def test_self_deployed_preparation_is_observable_without_waiting_for_probe(
     tmp_path: Path,
     framework_lock: Path,
