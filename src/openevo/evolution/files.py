@@ -51,9 +51,23 @@ class ArtifactFileStore:
             self.root,
             os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
         )
+        dataset_descriptor: int | None = None
         contexts_descriptor: int | None = None
         materialization_descriptor: int | None = None
         try:
+            dataset_descriptor = os.open(
+                "datasets",
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+                dir_fd=root_descriptor,
+            )
+            dataset_opened = os.fstat(dataset_descriptor)
+            if dataset_opened.st_uid != os.geteuid() or not stat.S_ISDIR(
+                dataset_opened.st_mode
+            ):
+                raise ValueError("dataset materialization root must be an owned directory")
+            os.fchmod(dataset_descriptor, 0o700)
+            if stat.S_IMODE(os.fstat(dataset_descriptor).st_mode) != 0o700:
+                raise ValueError("dataset materialization root must have mode 0700")
             contexts_descriptor = os.open(
                 "contexts",
                 os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
@@ -80,6 +94,7 @@ class ArtifactFileStore:
             os.fchmod(materialization_descriptor, 0o700)
             if stat.S_IMODE(os.fstat(materialization_descriptor).st_mode) != 0o700:
                 raise ValueError("context materialization root must have mode 0700")
+            os.fsync(dataset_descriptor)
             os.fsync(contexts_descriptor)
             os.fsync(materialization_descriptor)
             os.fsync(root_descriptor)
@@ -92,6 +107,8 @@ class ArtifactFileStore:
                 os.close(materialization_descriptor)
             if contexts_descriptor is not None:
                 os.close(contexts_descriptor)
+            if dataset_descriptor is not None:
+                os.close(dataset_descriptor)
             os.close(root_descriptor)
 
     def safe_path(self, *parts: str) -> Path:

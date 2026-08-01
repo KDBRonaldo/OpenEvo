@@ -453,6 +453,17 @@ def test_context_materialization_directory_is_core_managed(tmp_path):
         files.context_materialization_dir("../../outside")
 
 
+def test_initialize_makes_dataset_materialization_root_private(tmp_path):
+    artifact_root = tmp_path / "managed"
+    dataset_root = artifact_root / "datasets"
+    dataset_root.mkdir(parents=True)
+    dataset_root.chmod(0o775)
+
+    ArtifactFileStore(artifact_root).initialize()
+
+    assert dataset_root.stat().st_mode & 0o777 == 0o700
+
+
 def test_ingest_event_is_idempotent(tmp_path):
     db_path = tmp_path / "evolution.db"
     store = EvolutionStore(db_path=db_path, artifact_root=tmp_path / "artifacts")
