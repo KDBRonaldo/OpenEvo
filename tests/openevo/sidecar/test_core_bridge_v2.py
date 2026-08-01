@@ -157,6 +157,7 @@ class _HostService:
     def __init__(self, generation: int = 3) -> None:
         self.generation = generation
         self.calls: list[tuple[str, int]] = []
+        self.cancel_events: list[threading.Event | None] = []
 
     def ensure_core(
         self,
@@ -164,9 +165,11 @@ class _HostService:
         profile_connection_generation: int,
         *,
         deadline: float,
+        cancel_event: threading.Event | None = None,
     ) -> CoreHostAttachmentV2:
         assert deadline > 0
         self.calls.append((profile_id, profile_connection_generation))
+        self.cancel_events.append(cancel_event)
         if profile_connection_generation != self.generation:
             raise RuntimeError("stale generation")
         return CoreHostAttachmentV2(
@@ -305,6 +308,71 @@ def test_activation_bootstraps_only_through_private_project_tunnel_and_persists_
         assert not hasattr(bridge, "backend_url")
         bridge.close()
     assert len(tunnels.closed) == 1
+
+
+def test_activation_forwards_the_exact_cancellation_event_to_core_host_service(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    host = _HostService()
+    cancel_event = threading.Event()
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=host,
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(_base_handler(requests)),
+        )
+
+        bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-project-cancel-authority-0001",
+            cancel_event=cancel_event,
+        )
+
+        assert host.cancel_events == [cancel_event]
+        bridge.close()
+
+
+def test_activation_cancellation_interrupts_transition_lock_wait(
+    tmp_path: Path,
+) -> None:
+    host = _HostService()
+    cancel_event = threading.Event()
+    outcome: list[BaseException] = []
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=host,
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(_base_handler([])),
+        )
+        assert bridge._transition_lock.acquire(blocking=False)
+
+        def activate() -> None:
+            try:
+                bridge.activate_project(
+                    "desktop-project-1",
+                    _create_request(),
+                    idempotency_key="activate-project-lock-cancel-0001",
+                    cancel_event=cancel_event,
+                )
+            except BaseException as exc:
+                outcome.append(exc)
+
+        thread = threading.Thread(target=activate)
+        thread.start()
+        cancel_event.set()
+        thread.join(timeout=1)
+        bridge._transition_lock.release()
+
+        assert not thread.is_alive()
+        assert len(outcome) == 1
+        assert isinstance(outcome[0], DesktopCoreBridgeErrorV2)
+        assert outcome[0].error.code == "core_activation_cancelled"
+        assert host.calls == []
+        bridge.close()
 
 
 def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Path) -> None:

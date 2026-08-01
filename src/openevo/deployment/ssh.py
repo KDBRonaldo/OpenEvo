@@ -2666,6 +2666,7 @@ class SshRemoteExecutorTransport:
             isinstance(timeout_seconds, bool)
             or not isinstance(timeout_seconds, (int, float))
             or not 0 < timeout_seconds <= 300
+            or self._system_openssh_authority is not None
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         payload = self._run_secret_with_remote_failure(

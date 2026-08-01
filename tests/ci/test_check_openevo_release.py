@@ -2884,6 +2884,16 @@ def test_desktop_candidate_workflow_roundtrips_exact_unsigned_draft_prerelease()
     sidecar_guide = Path("desktop/sidecar/README.md").read_text(encoding="utf-8")
     assert "Frozen Local API v1 implementation (0.1.8 historical)" in sidecar_guide
     assert "### Current implementation" not in sidecar_guide
+    assert "creates the real Local API v1" not in sidecar_guide
+    assert "supplies the production adapters used by packaged\nrelease composition" not in (
+        sidecar_guide
+    )
+    frozen_bridge = Path("docs/architecture/desktop-core-bridge-v1.md").read_text(
+        encoding="utf-8"
+    )
+    assert "0.1.8 historical" in frozen_bridge
+    assert "## Release Wiring Status" not in frozen_bridge
+    assert "Packaged startup composes" not in frozen_bridge
 
     version_step = text.split(
         "      - name: Resolve exact product version and runner architecture\n",

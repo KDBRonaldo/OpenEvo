@@ -328,27 +328,30 @@ The remainder of this document describes the frozen v0.1.8 Local API v1 and its
 read-only migration inputs. It is not the packaged v0.1.10 composition. The
 active release path is the v2 provider, bridge, lifecycle, and system-OpenSSH
 authority documented above and in `docs/architecture/desktop-core-contract-v2.md`.
+Any present-tense implementation detail below describes only the frozen v0.1.8
+boundary; none of it is release authority for v0.1.10.
 
-The sidecar also owns the renderer-facing Desktop Local API and the process-owned
-connection to remote OpenEvo Core. The canonical public contract is defined once
-in `contracts/v1/app.py`; release implementations must use its provider injection
-point instead of registering another route table.
+In the v0.1.8 historical composition, the sidecar also owned the renderer-facing
+Desktop Local API and the process-owned connection to remote OpenEvo Core. That
+frozen public contract was defined once in `contracts/v1/app.py`; the historical
+release implementation used its provider injection point instead of registering
+another route table.
 
 ### Historical implementation
 
-`release_app.create_release_desktop_local_api_app()` creates the real Local API v1
-application. It owns one `DesktopProviderStore` and one `WorkspaceImportStore`
-for the process lifetime and
-requires the native host to supply a Desktop session token, native instance ID,
+`release_app.create_release_desktop_local_api_app()` created the v0.1.8 Local API
+v1 application. It owned one `DesktopProviderStore` and one
+`WorkspaceImportStore` for the process lifetime and required the native host to
+supply a Desktop session token, native instance ID,
 readiness key, source commit, and private state root.
 The launcher assigns that root to the `state-v2` Desktop storage namespace. This
 name is independent of the Local API v1 contract. On macOS it is rooted at
 `~/Library/Application Support/org.openevo.desktop`; v0.1.7 preserves and does
 not read or alter the old Preview `~/.openevo/desktop/local-api-v1` state.
-The release application wraps the complete FastAPI/Starlette stack with CORS,
+The historical release application wrapped the complete FastAPI/Starlette stack with CORS,
 including the server-error boundary, so bounded error responses remain readable
-by the packaged renderer. Only
-the exact packaged Tauri origins (`tauri://localhost` and
+by the v0.1.8 packaged renderer. Only
+the exact historical Tauri origins (`tauri://localhost` and
 `http://tauri.localhost`), used methods, the standard CORS-safelisted headers,
 the renderer contract headers, and the browser-generated `Cache-Control` and
 `Pragma` headers required by the renderer's `cache: "no-store"` requests are
@@ -357,12 +360,12 @@ wildcards, credentials, lookalike origins, unknown methods, and unknown headers
 are rejected. CORS preflight is handled before Desktop session authentication,
 while ordinary `/desktop/v1/*` requests still require the exact ephemeral
 session header.
-Embedded callers get an ASGI shutdown close hook by default. The packaged
-launcher explicitly sets `close_on_shutdown=False` and becomes the single
+Embedded callers got an ASGI shutdown close hook by default. The v0.1.8 packaged
+launcher explicitly set `close_on_shutdown=False` and became the single
 provider shutdown owner so listener/provider cleanup failures can be converted
 to a fixed `shutdown_failed` process diagnostic instead of being absorbed by
 Uvicorn lifespan state.
-For the packaged process only, the launcher temporarily installs a signal
+For the v0.1.8 packaged process only, the launcher temporarily installed a signal
 replay handler around Uvicorn and explicit cleanup. Uvicorn can therefore turn
 Tauri's `SIGTERM` into graceful server exit without the replayed signal killing
 the process before provider cleanup completes.
@@ -377,21 +380,21 @@ thread cannot report close completion while bridge shutdown or relay join is
 still active. Provider shutdown applies the same first-failure aggregation
 across executor, runtime, lifecycle, provider store, and workspace store.
 
-Before the Local API reaches readiness, packaged startup failures use the closed
+Before the historical Local API reached readiness, v0.1.8 packaged startup failures used the closed
 `OPENEVO_STARTUP_V1` stderr contract. Only fixed stage/code pairs and an
 optional numeric errno are recognized. Paths, argv, environment values,
 credentials, URLs, exception messages, tracebacks, and arbitrary process output
 are never surfaced. Release smoke tooling uses a bounded OS pipe, scans at most
 32 KiB, and emits at most eight allowlisted records, so this contract does not
 create telemetry, an unbounded process log, or a secret-bearing diagnostics
-channel. The packaged Python launcher records only the last fixed release
+channel. The v0.1.8 packaged Python launcher recorded only the last fixed release
 composition phase, covering embedded Core assets, provider/credential stores,
 SSH lifecycle, workspace storage, Core bridge composition, Local API routing,
 native Local API routing, static application mounting, native frame handoff,
 listener setup, and server startup. A failure emits that phase's closed
 `*_failed` code; the original exception and its cause remain private.
 
-The current provider implements:
+The frozen v0.1.8 provider implemented:
 
 - public `GET /version` with `provider_kind=desktop_sidecar` and the canonical
   OpenAPI digest;
@@ -601,15 +604,15 @@ Local project projection.
 IDs in stable identity order, with the same recovery-row upper bound, for
 assembling `DesktopStateV1` without an unbounded query.
 
-The production release resolver supports only `ssh_agent`. Native password and
+The v0.1.8 release resolver supported only `ssh_agent`. Native password and
 private-key authentication are reserved contract values and are rejected by
 create, patch, and connect; startup clears historical credential-slot status.
-The packaged sidecar has no credential vault or native credential handoff route.
+The v0.1.8 packaged sidecar had no credential vault or native credential handoff route.
 Authenticated proxy and Hugging Face token slots are unavailable. Profile proxy
 URLs and `no_proxy` are projected into the remote profile, but user information
 in proxy URLs is rejected by the contract.
 
-When release composition supplies an active `DesktopCoreBridgeV1`, the provider
+When the v0.1.8 composition supplied an active `DesktopCoreBridgeV1`, the provider
 forwards capability and validation reads plus Core-owned runs, timelines, logs,
 artifacts, services, diagnostics, maintenance, and operations through that
 bridge. Run admission first matches the saved Local project ETag; capability and
@@ -627,11 +630,11 @@ generation cannot downgrade its replacement. Remote business errors and
 also represents request deadline expiry and therefore does not prove tunnel
 loss.
 
-When release composition also supplies `DesktopEventBrokerV1`, the provider
+When the v0.1.8 composition also supplied `DesktopEventBrokerV1`, the provider
 serves its bounded SSE subscription directly and maps expired cursors to the
 frozen 410 reset response. Project activation now uses the durable bounded
-executor and project-bound bridge described above. Packaged startup now creates
-the production SSH adapter, bridge store, bridge, event broker, and Core event
+executor and project-bound bridge described above. The v0.1.8 packaged startup
+created its SSH adapter, bridge store, bridge, event broker, and Core event
 relay from the exact embedded Core wheel/framework-lock pair. It advertises the
 complete frozen release feature set: `remote_profiles`, `project_validation`,
 `operation_events`, `run_observability`, `artifact_inspection`,
@@ -659,7 +662,7 @@ reloads authoritative resources through the frozen Local API after each
 invalidation.
 
 Local doctor/repair/workspace-sync operations and Local operation logs remain
-outside this release composition. The renderer therefore does not advertise
+outside that historical v0.1.8 release composition. Its renderer therefore did not advertise
 those controls. Cancellation is implemented for an existing nonterminal Local
 connect/bootstrap/activation operation through its operation ID and strong ETag;
 it advances the session generation, retires the operation's connection or
@@ -667,8 +670,8 @@ project binding, and ignores any late worker completion. A successful SSH check
 alone still reports Core as `offline` with `core_not_started`; only project
 activation can publish an online project-bound tunnel.
 
-`core_bridge_adapters_v1.py` supplies the production adapters used by packaged
-release composition. `CoreBootstrapConfigV1`
+For v0.1.8, `core_bridge_adapters_v1.py` supplied the production adapters used by
+that historical packaged release composition. `CoreBootstrapConfigV1`
 accepts composition-sealed local wheel and framework-lock paths together with
 their exact byte sizes and SHA-256 digests, plus the source commit, requested
 port, and replacement policy. Local paths are private in representations; no
@@ -721,7 +724,7 @@ rsync lease. A busy lease preserves the complete incoming directory and marker
 for retry. Once acquired, the lease FD remains held through publication and
 retirement; prepare and stale recovery count or skip active incoming slots
 without consuming another process's authority.
-The remaining deadline then runs the real isolated Core bootstrap/attach flow.
+The remaining deadline then ran the actual isolated v0.1.8 Core bootstrap/attach flow.
 The returned bearer is bound to the profile plus complete remote release,
 registry, generation, port, and status-proof identity with a one-way host
 identity. Transport object identity is checked after preflight, staging, and
@@ -760,7 +763,7 @@ with the bound ownership. The yielded object must remain the store's unlinked,
 regular, read-only descriptor-backed stream; the adapter never accepts or
 returns a host path, URI, or archive bytes object.
 
-`release_runtime.py` is the single production composition owner. It derives
+For v0.1.8, `release_runtime.py` was the single composition owner. It derived
 `openevo/wheels` from the absolute PyInstaller extraction root, opens that
 directory without following its final component, and requires an owner-controlled
 non-writable directory containing exactly one wheel and one canonical
@@ -771,7 +774,7 @@ form the exact lock-to-wheel binding before any remote connection can start.
 The runtime allocates `core-bridge-v1` under the private provider state root and
 owns shutdown of bridge, relay, broker, and persistence.
 
-The production workspace archive source is deliberately dynamic rather than a
+The v0.1.8 workspace archive source was deliberately dynamic rather than a
 startup snapshot. Under the provider reference guard, every upload read finds
 the exact durable native import binding for the supplied opaque reference,
 requires exactly one owning project, derives its private ownership, and only
@@ -922,7 +925,7 @@ mapping commit failed, a same-A retry commits the finalized A mapping; a later
 Local B edit first commits that proven A generation, then issues one distinct
 A-to-B patch from A's latest ETag without another project create.
 
-`core_bridge_store_v1.py` is the production persistence implementation of that
+`core_bridge_store_v1.py` was the v0.1.8 persistence implementation of that
 callback protocol. It owns a dedicated sidecar-private state directory rather
 than extending the public provider database. The directory must remain a real,
 owner-held mode-`0700` inode. Its database and owner-lock files are no-follow,
@@ -1036,8 +1039,8 @@ bridge method exposes only `DesktopCoreBridgeErrorV1`: exact Core `ApiErrorV1`
 values are retained, strict-client local errors become closed `ApiErrorV1`
 values, and deferred event-iterator failures use the same boundary.
 
-The bridge and `DesktopCoreBridgeStoreV1` are wired into the packaged release by
-`release_runtime.py`. That composition owns the host service, production SSH
+The bridge and `DesktopCoreBridgeStoreV1` were wired into the v0.1.8 packaged
+release by `release_runtime.py`. That composition owned the host service, SSH
 and HTTP tunnel adapters, adopted archive source, event broker/relay, and the
 dedicated bridge-state root. It is attached to `DesktopReleaseProvider` before
 the Local API advertises the complete release feature set. Missing composition
@@ -1112,7 +1115,7 @@ broker atomically prevents publication, clears all memory charges, and
 terminates all existing subscriptions.
 
 `DesktopReleaseProvider` returns a `StreamingResponse` over this subscription
-when the broker is part of release composition. It uses no-cache/no-buffering
+when the broker was part of the v0.1.8 release composition. It used no-cache/no-buffering
 headers, rejects an unknown cursor before sending HTTP 200, and closes the
 broker before bridge and store shutdown so connected renderers terminate. The
 provider's state-change publisher emits the complete current `DesktopStateV1`;
@@ -1120,7 +1123,7 @@ it remains an invalidation signal, and the renderer still reloads authoritative
 resources.
 
 This module does not infer resource state or cache partial Core payloads. The
-release composition remains responsible for mapping validated Core events to
+v0.1.8 release composition remained responsible for mapping validated Core events to
 ETag/digest-bound Local invalidations and for publishing Desktop-owned state and
 operation changes. The renderer responds to those invalidations by reloading
 the authoritative resource snapshot.
@@ -1235,7 +1238,7 @@ decoding, so percent or JSON Unicode escapes cannot bypass credential
 sanitization or place private values in a request URL/access log. Release providers currently generate
 `Idempotency-Key`, `Last-Event-ID`, and SSE `id` values as visible ASCII. The
 client rejects non-ASCII or control characters instead of percent-encoding
-them; this is a temporary release implementation constraint, not a broader Core
+them; this was a temporary v0.1.8 implementation constraint, not a broader Core
 opaque-ID contract change.
 
 Core SSE declares `SseFrameV1` as its wire contract. The client bounds each

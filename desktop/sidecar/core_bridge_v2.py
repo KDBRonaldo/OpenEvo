@@ -382,6 +382,7 @@ class CoreHostServiceV2(Protocol):
         profile_connection_generation: int,
         *,
         deadline: float,
+        cancel_event: threading.Event,
     ) -> CoreHostAttachmentV2: ...
 
 
@@ -702,13 +703,17 @@ class DesktopCoreBridgeV2:
         request: local_v2.ProjectCreateV2,
         *,
         idempotency_key: str,
+        cancel_event: threading.Event | None = None,
     ) -> CoreActivationV2:
         _require_opaque(desktop_project_id)
         if type(request) is not local_v2.ProjectCreateV2:
             raise TypeError("activation requires an exact Desktop ProjectCreateV2")
         _require_idempotency_key(idempotency_key)
+        if cancel_event is not None and not isinstance(cancel_event, threading.Event):
+            raise TypeError("activation cancellation authority is invalid")
+        activation_cancel = cancel_event or threading.Event()
         deadline = time.monotonic() + self._activation_timeout
-        self._acquire_transition(deadline)
+        self._acquire_transition(deadline, cancel_event=activation_cancel)
         tunnel: CoreTunnelHandleV2 | None = None
         client: CoreControlClientV2 | None = None
         published = False
@@ -728,6 +733,7 @@ class DesktopCoreBridgeV2:
                     request.profile_id,
                     request.profile_connection_generation,
                     deadline=deadline,
+                    cancel_event=activation_cancel,
                 ),
                 failure_code="core_host_unavailable",
                 failure_summary="Desktop could not attach the compatible OpenEvo Daemon.",
@@ -2567,15 +2573,41 @@ class DesktopCoreBridgeV2:
                 action="retry",
             ) from None
 
-    def _acquire_transition(self, deadline: float) -> None:
-        if not self._transition_lock.acquire(timeout=_remaining(deadline)):
-            raise _bridge_error(
-                "core_bridge_busy",
-                "Another Core project transition is still in progress.",
-                status=409,
-                retryable=True,
-                action="retry",
-            )
+    def _acquire_transition(
+        self,
+        deadline: float,
+        *,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _bridge_error(
+                    "core_activation_cancelled",
+                    "The OpenEvo Daemon activation was cancelled before publication.",
+                    status=409,
+                    retryable=True,
+                    action="retry",
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise _bridge_error(
+                    "core_bridge_busy",
+                    "Another Core project transition is still in progress.",
+                    status=409,
+                    retryable=True,
+                    action="retry",
+                )
+            if self._transition_lock.acquire(timeout=min(remaining, 0.05)):
+                if cancel_event is not None and cancel_event.is_set():
+                    self._transition_lock.release()
+                    raise _bridge_error(
+                        "core_activation_cancelled",
+                        "The OpenEvo Daemon activation was cancelled before publication.",
+                        status=409,
+                        retryable=True,
+                        action="retry",
+                    )
+                return
 
     def _retire(
         self,

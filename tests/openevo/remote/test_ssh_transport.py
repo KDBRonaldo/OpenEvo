@@ -461,6 +461,27 @@ def test_system_openssh_legacy_core_asset_transfer_fails_before_remote_mutation(
     transport.close()
 
 
+def test_system_openssh_legacy_python_runtime_selection_fails_before_remote_mutation() -> None:
+    authority = RecordingSystemOpenSshAuthority()
+    transport = SshRemoteExecutorTransport(
+        _profile(
+            host="gpu-lab",
+            port=22,
+            user="alice",
+            workspace_root=authority.remote_home_authority.workspace_root,
+        ),
+        system_openssh_authority=authority,
+    )
+
+    with pytest.raises(SshTransportError) as captured:
+        transport.select_core_python_runtime(timeout_seconds=30)
+
+    assert captured.value.code is SshTransportErrorCode.INVALID_REQUEST
+    assert authority.commands == []
+    assert authority.runs == []
+    transport.close()
+
+
 def test_system_openssh_legacy_runtime_transfer_fails_before_remote_mutation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

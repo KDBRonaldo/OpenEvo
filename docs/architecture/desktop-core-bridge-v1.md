@@ -1,5 +1,10 @@
 # Desktop Active-Tunnel Core Bridge v1
 
+> Frozen v0.1.8 historical contract and read-only migration input. It is not the
+> packaged v0.1.10 composition; current release authority is defined by
+> `desktop-core-contract-v2.md`. Present-tense implementation details below are
+> descriptions of the frozen historical boundary only.
+
 `desktop/sidecar/core_bridge_v1.py` is the release-sidecar ownership boundary
 between saved Desktop project intent and the frozen Core Control API v1 client.
 It implements the bridge contract without starting science runs, harnesses, or
@@ -410,13 +415,13 @@ Run list/get/cancel/retry/timeline/log/context, artifacts, services, Core
 operations and referenced logs, diagnostics, maintenance, and events have
 strict `CoreControlClientV1` bridge methods. Every method accepts the complete
 saved Local `ProjectV1` and verifies it against the active generation before
-transport, but bridge availability alone does not make a release feature. The
-current bridge implements strict forwarding methods for Core-owned diagnostics,
+transport, but bridge availability alone did not make a v0.1.8 release feature. The
+frozen bridge implemented strict forwarding methods for Core-owned diagnostics,
 project doctor/repair, managed service restart, referenced logs, and
 completed-diagnostic cleanup in addition to service observations. The matching
-production Daemon release composition publishes those maintenance owners, so
-the matching renderer provider exposes their controls. Development or
-incomplete compositions keep maintenance unavailable and direct calls return
+historical v0.1.8 Daemon release composition published those maintenance owners,
+so its renderer provider exposed their controls. Development or incomplete
+historical compositions kept maintenance unavailable and direct calls returned
 typed `provider_capability_unavailable`.
 Unsupported cache scopes and unavailable owners never fall back to SSH or local
 simulation. The provider holds its project-session transition lock from
@@ -430,21 +435,21 @@ method exposes `CoreClientErrorV1`: an exact Core `ApiErrorV1`, including HTTP
 error is converted to a closed user-safe `ApiErrorV1`. The same rule covers
 deferred SSE iteration. The bridge does not synthesize readiness.
 
-## Release Wiring Status
+## Historical v0.1.8 Release Wiring
 
-Packaged startup composes `DesktopCoreSshBridgeAdapterV1`,
+The v0.1.8 packaged startup composed `DesktopCoreSshBridgeAdapterV1`,
 `DesktopCoreBridgeStoreV1`, `DesktopCoreBridgeV1`,
 `DesktopEventBrokerV1`, and the Core event relay through the single owner in
-`release_runtime.py`. The exact embedded wheel/framework-lock pair is verified
-before construction, and the dedicated bridge state is rooted under the private
-Desktop provider state. When both the owned bridge and broker are present, the
-release sidecar advertises the complete feature set:
+`release_runtime.py`. The exact embedded wheel/framework-lock pair was verified
+before construction, and the dedicated bridge state was rooted under the private
+Desktop provider state. When both the owned bridge and broker were present, the
+historical release sidecar advertised the complete feature set:
 `remote_profiles`, `project_validation`, `operation_events`, `run_observability`,
 `artifact_inspection`, `service_control`, `diagnostics`, and `maintenance`.
-Development or incomplete compositions may omit the last three flags. A missing
+Development or incomplete historical compositions could omit the last three flags. A missing
 or invalid asset pair, bridge, broker, or active
-project fails closed; there is no reduced release composition or direct-backend
-fallback.
+project failed closed; there was no reduced v0.1.8 release composition or
+direct-backend fallback.
 
 The relay opens Core SSE with the complete active Local project binding. It
 advances the Core cursor but drops heartbeat frames and publishes one complete
@@ -453,7 +458,7 @@ authority for event payload and resource state; Desktop neither projects those
 payloads into a second event model nor persists a second Core event log.
 
 The bridge remains covered across process restart, scratch/imported workspace
-activation, finalize recovery, unknown abort replay, production runtime
+activation, finalize recovery, unknown abort replay, historical v0.1.8 runtime
 composition, and provider routing. Adapter protocol tests use controlled SSH and
 HTTP transports; real remote GPU/Codex subscription evidence is a separate
 release E2E gate rather than an excuse for a runtime fallback.

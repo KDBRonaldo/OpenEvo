@@ -147,6 +147,7 @@ class _CoreBridgeV2(Protocol):
         request: local_v2.ProjectCreateV2,
         *,
         idempotency_key: str,
+        cancel_event: threading.Event | None = None,
     ) -> object: ...
 
     def deactivate_project(
@@ -1344,7 +1345,10 @@ class DesktopReleaseProviderV2:
                 cancellable=False,
             )
             negotiated = self._exact_core_version(remote, started.profile_id)
-            self._reactivate_saved_project(started)
+            self._reactivate_saved_project(
+                started,
+                cancel_event=context.cancellation_event,
+            )
         except DesktopReleaseProviderV2Error as exc:
             self._propagate_profile_cancellation(context, started)
             self._abort_profile_transport(started)
@@ -1535,6 +1539,7 @@ class DesktopReleaseProviderV2:
             desktop_project_id,
             request,
             idempotency_key=action_id,
+            cancel_event=context.cancellation_event,
         )
         context.check_cancelled()
         project = getattr(activation, "project", None)
@@ -2793,6 +2798,8 @@ class DesktopReleaseProviderV2:
     def _reactivate_saved_project(
         self,
         profile: local_v2.RemoteWorkspaceProfileV2,
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         core_project_id = profile.active_project_id
         if core_project_id is None:
@@ -2833,6 +2840,7 @@ class DesktopReleaseProviderV2:
                 f"{profile.profile_id}-{profile.connection_generation}",
                 "reconnect-project",
             ),
+            cancel_event=cancel_event,
         )
         project = getattr(activation, "project", None)
         if type(project) is not core_v2.ProjectV2 or project.project_id != core_project_id:

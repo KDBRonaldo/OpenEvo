@@ -64,6 +64,8 @@ class _RoutingBridge:
         self.mapping = None
         self.activation_started: Event | None = None
         self.activation_release: Event | None = None
+        self.activation_cancel_events: list[Event | None] = []
+        self.block_activation_until_cancel = False
 
     def activate_project(
         self,
@@ -71,7 +73,9 @@ class _RoutingBridge:
         request: local_v2.ProjectCreateV2,
         *,
         idempotency_key: str,
+        cancel_event: Event | None = None,
     ) -> object:
+        self.activation_cancel_events.append(cancel_event)
         self.calls.append(
             (
                 "activate_project",
@@ -81,6 +85,21 @@ class _RoutingBridge:
                 idempotency_key,
             )
         )
+        if self.block_activation_until_cancel:
+            assert self.activation_started is not None
+            assert cancel_event is not None
+            self.activation_started.set()
+            assert cancel_event.wait(2)
+            raise DesktopCoreBridgeErrorV2(
+                409,
+                local_v2.DesktopErrorV2(
+                    code="core_activation_cancelled",
+                    summary="The remote OpenEvo Daemon activation was cancelled.",
+                    retryable=True,
+                    action="retry",
+                    affected_resource_id=desktop_project_id,
+                ),
+            )
         if self.activation_started is not None and self.activation_release is not None:
             self.activation_started.set()
             assert self.activation_release.wait(16)
@@ -1273,6 +1292,63 @@ def test_project_create_returns_before_a_sixteen_second_bridge_activation(
         assert terminal["status"] == "succeeded"
     finally:
         bridge.activation_release.set()
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_project_create_cancellation_interrupts_the_exact_bridge_operation(
+    tmp_path: Path,
+) -> None:
+    provider, store, _lifecycle, bridge = _provider(tmp_path)
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    bridge.activation_started = Event()
+    bridge.block_activation_until_cancel = True
+    try:
+        profile = _connected_profile(client)
+        created = client.post(
+            "/desktop/v2/projects",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(profile["connection_generation"]),
+                    "Idempotency-Key": "routing-cancel-project-create-01",
+                }
+            ),
+            json=_project_create(profile),
+        )
+        assert created.status_code == 202, created.text
+        assert bridge.activation_started.wait(2)
+        operation_id = created.json()["operation_id"]
+        current = client.get(
+            f"/desktop/v2/operations/{operation_id}", headers=_headers()
+        ).json()
+
+        cancelled = client.post(
+            f"/desktop/v2/operations/{operation_id}/cancel",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": "0",
+                    "If-Match": current["etag"],
+                    "Idempotency-Key": "routing-cancel-project-operation-01",
+                }
+            ),
+            json={"schema_version": "2", "expected_operation_id": operation_id},
+        )
+        assert cancelled.status_code == 202, cancelled.text
+        terminal = _wait_lifecycle_operation(client, created.json())
+
+        assert terminal["status"] == "cancelled"
+        assert len(bridge.activation_cancel_events) == 1
+        assert isinstance(bridge.activation_cancel_events[0], Event)
+        assert bridge.activation_cancel_events[0].is_set()
+        assert bridge.active_activation is None
+    finally:
         client.close()
         provider.close()
         store.close()
