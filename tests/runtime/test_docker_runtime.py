@@ -684,6 +684,7 @@ async def test_user_container_runtime_uses_and_verifies_translated_session_bind(
     )
     session_dir = Path(authority.runtime_container_root) / "sessions" / "science-session"
     session_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         "science-session",
@@ -706,6 +707,8 @@ async def test_user_container_runtime_uses_and_verifies_translated_session_bind(
             present = True
             return 0, runtime_container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
+            if any("HostConfig.NetworkMode" in str(value) for value in args):
+                return 0, json.dumps(f"container:{daemon_container_id}"), None
             if any("json .Mounts" in str(value) for value in args):
                 return (
                     0,
@@ -755,6 +758,7 @@ async def test_user_container_runtime_uses_and_verifies_translated_session_bind(
     await runtime.start()
 
     create = next(call.args for call in run_command.await_args_list if call.args[1] == "create")
+    assert create[create.index("--network") + 1] == f"container:{daemon_container_id}"
     session_mount = create[create.index("--mount") + 1]
     assert session_mount == (
         f"type=bind,source={authority.translate(session_dir)},target={runtime.runtime_session_dir}"
@@ -790,6 +794,7 @@ async def test_user_container_runtime_rejects_daemon_source_path_aba_wrong_objec
     )
     session_dir = Path(authority.runtime_container_root) / "sessions" / "science-session"
     session_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
     runtime = DockerRuntime(
         RuntimeSpec(image="runtime:latest", container_user="host"),
         "science-session",
@@ -812,6 +817,8 @@ async def test_user_container_runtime_rejects_daemon_source_path_aba_wrong_objec
             present = True
             return 0, runtime_container_id + "\n", None
         if args[1:3] == ("container", "inspect"):
+            if any("HostConfig.NetworkMode" in str(value) for value in args):
+                return 0, json.dumps(f"container:{daemon_container_id}"), None
             if any("json .Mounts" in str(value) for value in args):
                 return (
                     0,
@@ -930,6 +937,47 @@ async def test_user_container_runtime_rejects_changed_session_bind(
 
     with pytest.raises(RuntimeError, match="session Docker bind"):
         await runtime._verify_created_session_mount()
+
+
+@pytest.mark.asyncio
+async def test_user_container_runtime_rejects_changed_network_namespace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hostname = "1" * 12
+    daemon_container_id = hostname + ("2" * 52)
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    authority = discover_docker_host_path(
+        _docker_host_inspect_output(
+            data_root,
+            hostname=hostname,
+            container_id=daemon_container_id,
+            source="/srv/openevo-data",
+        ),
+        namespace="core-release",
+        hostname=hostname,
+        minimum_available_bytes=0,
+    )
+    session_dir = Path(authority.runtime_container_root) / "sessions" / "science-session"
+    session_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(docker_module.DockerEngineAuthority, "open", lambda: object())
+    runtime = DockerRuntime(
+        RuntimeSpec(image="runtime:latest", container_user="host"),
+        "science-session",
+        session_dir,
+        docker_host_path=authority,
+    )
+    runtime._container_id = "3" * 64
+    runtime._ownership_state = "verified"
+    monkeypatch.setattr(
+        runtime,
+        "_run_local_command",
+        AsyncMock(return_value=(0, json.dumps("host"), None)),
+    )
+
+    with pytest.raises(RuntimeError, match="network namespace"):
+        await runtime._verify_created_network_mode()
 
 
 @pytest.mark.asyncio

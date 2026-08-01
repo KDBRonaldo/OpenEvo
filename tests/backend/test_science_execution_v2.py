@@ -26,6 +26,7 @@ from openevo.backend.contracts.v2.models import (
 from openevo.backend.contracts.v2.store import ProjectRecordV2
 from openevo.backend.science_execution_v2 import (
     ScienceAttemptCancelledV2,
+    ScienceAttemptExecutionV2Error,
     ScienceAttemptExecutionEvidenceV2,
     ScienceAttemptExecutionReceiptV2,
     ScienceAttemptExecutionRecordV2,
@@ -1219,6 +1220,32 @@ class _Rollout:
         self.closed = True
 
 
+class _FailedTerminalRollout(_Rollout):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.cancelled_task_ids: list[str] = []
+
+    def submit_task(self, payload):
+        task_id = super().submit_task(payload)
+        assert self.result is not None
+        self.result = SessionResult(
+            session_id=self.result.session_id,
+            task_id=self.result.task_id,
+            status="ERROR",
+            trajectory=Trajectory(
+                status="ERROR",
+                error="agent process exited with status 1",
+            ),
+            error="agent process exited with status 1",
+            metadata=self.result.metadata,
+        )
+        return task_id
+
+    def cancel_task(self, task_id: str):
+        self.cancelled_task_ids.append(task_id)
+        return {"task_id": task_id, "status": "cancelled"}
+
+
 class _NotifyingExecutor:
     def __init__(self, delegate, completed: threading.Event) -> None:
         self.delegate = delegate
@@ -1388,6 +1415,100 @@ def test_executor_captures_one_real_workspace_result_and_releases_generation(
             )
         ]
     assert rollout.closed is True
+    handoffs.close()
+    ledger.close()
+    workspaces.close()
+
+
+def test_executor_preserves_failed_terminal_result_without_cancelling_it(tmp_path) -> None:
+    clock = _Clock()
+    registry = verified_builtin_registry(tmp_path / "registry")
+    config = _self_deployed_project_config()
+    binding = _self_deployed_service_binding(registry.snapshot.registry_digest)
+    project_id = "project-failed-terminal"
+    workspaces = WorkspaceStoreV2(tmp_path / "workspaces")
+    workspace = workspaces.ensure_empty_snapshot(project_id)
+    verified = resolve_genesis_execution_snapshot(
+        settings=EffectiveExecutionSettings(
+            execution_mode=config.execution.mode,
+            capture_mode=config.execution.capture_mode,
+            harness_id=config.execution.harness_id,
+            model_ref=config.execution.codex_model,
+            token_limit=config.execution.token_limit,
+            task_network_allow_internet=config.execution.task_network_allow_internet,
+        ),
+        service_binding=binding,
+    )
+    execution_sha256 = canonical_digest(verified.snapshot)
+    effective = EffectiveExecutionSnapshotRefV2(
+        effective_execution_snapshot_id=f"exec-{execution_sha256}",
+        project_id=project_id,
+        execution_mode=config.execution.mode,
+        capture_mode=config.execution.capture_mode,
+        token_level_metrics_available=False,
+        producer_id=verified.producer_id,
+        snapshot_sha256=execution_sha256,
+    )
+    head = _head(
+        project_id,
+        registry_sha256=registry.snapshot.registry_digest,
+        workspace=workspace,
+        effective_execution=effective,
+    )
+    authority = ScienceProjectAdmissionAuthorityV2(
+        project_id=project_id,
+        active_project_head=head,
+        project_config_sha256=project_config_sha256_for(config),
+        workspace_snapshot=workspace,
+        normalized_evolution_intent_sha256=canonical_digest(config.evolution),
+    )
+    ledger = ScienceTaskStoreV2(tmp_path / "state")
+    task = _admit(ledger, clock, authority)
+    attempt = task.attempts[0]
+    ledger.begin_attempt_execution(
+        task_id=task.task_id,
+        attempt_id=attempt.attempt_id,
+        now=clock(),
+    )
+    project = ProjectRecordV2(
+        project_id=project_id,
+        display_name="Failed terminal project",
+        config=config,
+        project_config_sha256=project_config_sha256_for(config),
+        created_at="2026-07-23T02:00:00.000000Z",
+        updated_at="2026-07-23T02:00:00.000000Z",
+        resource_version=1,
+    )
+    handoffs = WorkspaceHandoffStoreV2(tmp_path / "workspace-handoffs")
+    services = _Services(binding)
+    session_root = tmp_path / "gateway-sessions"
+    session_root.mkdir(mode=0o700)
+    rollout = _FailedTerminalRollout(handoffs, binding, session_root)
+    executor = ScienceAttemptExecutorV2(
+        catalog=_Catalog(project),
+        workspaces=workspaces,
+        workspace_handoffs=handoffs,
+        ledger=ledger,
+        services=services,
+        executable_registry=registry,
+        rollout_factory=lambda _binding: rollout,
+        clock=clock,
+        poll_interval_seconds=0,
+        max_poll_attempts=2,
+    )
+
+    with pytest.raises(ScienceAttemptExecutionV2Error) as raised:
+        executor.execute(
+            task=task,
+            attempt=attempt,
+            cancellation=threading.Event(),
+        )
+
+    assert raised.value.code == "rollout_task_failed"
+    assert raised.value.retryable is True
+    assert rollout.cancelled_task_ids == []
+    assert rollout.closed is True
+    assert services.released is True
     handoffs.close()
     ledger.close()
     workspaces.close()

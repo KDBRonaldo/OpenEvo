@@ -596,6 +596,7 @@ class ScienceAttemptExecutorV2:
         rollout: RolloutClientProtocol | None = None
         submitted = False
         terminal_received = False
+        primary_error: BaseException | None = None
         try:
             if config.execution.mode == "self-deployed":
                 snapshot, service_lease = self._services.ensure_run_binding(
@@ -700,12 +701,16 @@ class ScienceAttemptExecutorV2:
                     "rollout_task_identity_changed",
                     retryable=False,
                 )
-            session_result = self._wait_for_terminal_result(
+            terminal_status = self._wait_for_terminal_status(
                 rollout,
                 compiled=compiled,
                 cancellation=cancellation,
             )
             terminal_received = True
+            session_result = self._validate_terminal_result(
+                terminal_status,
+                compiled=compiled,
+            )
             evidence, receipt = _execution_terminal_bundle(
                 compiled=compiled,
                 binding=binding,
@@ -728,19 +733,40 @@ class ScienceAttemptExecutorV2:
                 receipt=receipt,
                 record=record,
             )
-        except Exception:
+        except BaseException as exc:
+            primary_error = exc
             if submitted and not terminal_received and rollout is not None:
-                _cancel_rollout_task(rollout, _rollout_task_id(attempt))
+                try:
+                    _cancel_rollout_task(rollout, _rollout_task_id(attempt))
+                except Exception as cancellation_error:
+                    exc.add_note(
+                        f"rollout cancellation also failed: {type(cancellation_error).__name__}"
+                    )
             raise
         finally:
+            cleanup_errors: list[Exception] = []
             if rollout is not None:
                 close = getattr(rollout, "close", None)
                 if callable(close):
-                    close()
+                    try:
+                        close()
+                    except Exception as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
             if service_lease is not None:
                 close = getattr(service_lease, "close", None)
                 if callable(close):
-                    close()
+                    try:
+                        close()
+                    except Exception as cleanup_error:
+                        cleanup_errors.append(cleanup_error)
+            if cleanup_errors:
+                if primary_error is not None:
+                    for cleanup_error in cleanup_errors:
+                        primary_error.add_note(
+                            f"attempt cleanup also failed: {type(cleanup_error).__name__}"
+                        )
+                else:
+                    raise cleanup_errors[0]
 
     def _verify_effective_execution(
         self,
@@ -779,13 +805,13 @@ class ScienceAttemptExecutorV2:
                 retryable=False,
             )
 
-    def _wait_for_terminal_result(
+    def _wait_for_terminal_status(
         self,
         rollout: RolloutClientProtocol,
         *,
         compiled: CompiledScienceAttemptV2,
         cancellation: _CancellationSignal,
-    ) -> SessionResult:
+    ) -> TaskStatus:
         task_id = compiled.rollout.request.task_id
         for poll_index in range(self._max_poll_attempts):
             if poll_index and cancellation.wait(self._poll_interval):
@@ -807,28 +833,52 @@ class ScienceAttemptExecutorV2:
                 )
             if status.status == "running":
                 continue
-            if (
-                status.status != "completed"
-                or status.total_sessions != 1
-                or status.completed_sessions != 1
-                or len(status.results) != 1
-            ):
-                raise ScienceAttemptExecutionV2Error(
-                    "rollout_task_failed",
-                    retryable=True,
-                )
-            result = canonical_subscription_session_result(status.results[0])
-            if (
-                result.task_id != task_id
-                or result.metadata.get("policy_version") != compiled.policy_version
-            ):
-                raise ScienceAttemptExecutionV2Error(
-                    "rollout_terminal_evidence_changed",
-                    retryable=False,
-                )
-            return result
-        _cancel_rollout_task(rollout, task_id)
+            return status
         raise ScienceAttemptExecutionV2Error("rollout_poll_timeout", retryable=True)
+
+    @staticmethod
+    def _validate_terminal_result(
+        status: TaskStatus,
+        *,
+        compiled: CompiledScienceAttemptV2,
+    ) -> SessionResult:
+        if (
+            status.status != "completed"
+            or status.total_sessions != 1
+            or status.completed_sessions != 1
+            or len(status.results) != 1
+        ):
+            raise ScienceAttemptExecutionV2Error(
+                "rollout_task_failed",
+                retryable=True,
+            )
+        candidate = status.results[0]
+        if (
+            candidate.status is not SessionStatus.COMPLETED
+            or candidate.trajectory.status != "COMPLETED"
+            or candidate.error is not None
+            or candidate.trajectory.error is not None
+        ):
+            raise ScienceAttemptExecutionV2Error(
+                "rollout_task_failed",
+                retryable=True,
+            )
+        try:
+            result = canonical_subscription_session_result(candidate)
+        except (TypeError, ValueError) as exc:
+            raise ScienceAttemptExecutionV2Error(
+                "rollout_terminal_evidence_invalid",
+                retryable=False,
+            ) from exc
+        if (
+            result.task_id != compiled.rollout.request.task_id
+            or result.metadata.get("policy_version") != compiled.policy_version
+        ):
+            raise ScienceAttemptExecutionV2Error(
+                "rollout_terminal_evidence_changed",
+                retryable=False,
+            )
+        return result
 
 
 def _execution_terminal_bundle(

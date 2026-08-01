@@ -964,6 +964,37 @@ class DockerRuntime(BaseRuntime):
         ):
             raise RuntimeError("managed session Docker bind configuration changed")
 
+    def _effective_network_mode(self) -> str | None:
+        if not self.spec.allow_internet:
+            return "none"
+        network = self.spec.network
+        if network == "host" and self._docker_host_path is not None:
+            return f"container:{self._docker_host_path.container_id}"
+        return network or None
+
+    async def _verify_created_network_mode(self) -> None:
+        if self._docker_host_path is None:
+            return
+        expected = self._effective_network_mode()
+        if expected is None:
+            return
+        rc, stdout, _ = await self._run_local_command(
+            DOCKER_EXECUTABLE_PATH,
+            "container",
+            "inspect",
+            "--format",
+            "{{json .HostConfig.NetworkMode}}",
+            self._container_ref,
+            capture=True,
+            timeout=self._STOP_TIMEOUT,
+        )
+        try:
+            observed = json.loads(str(stdout or ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("managed runtime network inspect returned invalid JSON") from exc
+        if rc != 0 or observed != expected:
+            raise RuntimeError("managed runtime network namespace changed")
+
     async def start(self) -> None:
         if self._docker_host_path is None:
             await self._start()
@@ -1024,10 +1055,9 @@ class DockerRuntime(BaseRuntime):
             # to --user. Start at the existing session root so preparation can
             # create the managed workspace with the host user's ownership.
             create_args.extend(["--workdir", self.runtime_session_dir])
-        if not self.spec.allow_internet:
-            create_args.extend(["--network", "none"])
-        elif self.spec.network:
-            create_args.extend(["--network", self.spec.network])
+        network_mode = self._effective_network_mode()
+        if network_mode is not None:
+            create_args.extend(["--network", network_mode])
         if self.spec.gpus > 0:
             create_args.extend(["--gpus", str(self.spec.gpus)])
         if self.spec.cpus is not None:
@@ -1067,6 +1097,7 @@ class DockerRuntime(BaseRuntime):
             create_args.extend(["-v", vol])
         create_args.extend(["--restart", "no", create_image, "sleep", "infinity"])
         try:
+            await self._verify_docker_host_authority()
             rc, _, stderr = await self._run_local_command(
                 *create_args,
                 capture=True,
@@ -1098,6 +1129,13 @@ class DockerRuntime(BaseRuntime):
                 "cleanup/recovery state was retained"
             )
         if self._docker_host_path is not None:
+            try:
+                await self._verify_created_network_mode()
+            except Exception as exc:
+                await self.stop()
+                raise RuntimeError(
+                    "docker did not preserve the verified network namespace"
+                ) from exc
             try:
                 await self._verify_created_session_mount()
             except Exception as exc:
