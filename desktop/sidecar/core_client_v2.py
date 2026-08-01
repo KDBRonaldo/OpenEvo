@@ -51,12 +51,12 @@ MAX_CORE_CLOSE_WAIT_SECONDS: Final = 5.0
 MAX_CORE_CLOSE_QUEUE_SIZE: Final = 256
 CORE_CLOSE_WORKER_COUNT: Final = 4
 CORE_BLOCKING_IO_WORKER_COUNT: Final = 8
-MAX_CORE_REQUEST_DEADLINE_SECONDS: Final = 300.0
+MAX_CORE_REQUEST_DEADLINE_SECONDS: Final = 7200.0
 MAX_JSON_NESTING: Final = 64
 
-CORE_OPENAPI_SHA256: Final = "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+CORE_OPENAPI_SHA256: Final = "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86"
 CORE_EVENTS_SCHEMA_SHA256: Final = (
-    "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+    "0e5465c110fd42964f53f076a4bbeed55e899b27f235b5e26c3d478356c5b7d2"
 )
 
 _BEARER = re.compile(r"[A-Za-z0-9._~+/\-]{43,510}={0,2}\Z", re.ASCII)
@@ -2054,14 +2054,7 @@ class CoreControlClientV2:
         except CoreMutationOutcomeUnknownV2:
             raise
         except CoreClientErrorV2 as exc:
-            if (
-                mutation
-                and sent
-                and (
-                    response is None
-                    or 200 <= response.status_code < 300
-                )
-            ):
+            if mutation and sent and (response is None or 200 <= response.status_code < 300):
                 raise CoreMutationOutcomeUnknownV2 from None
             raise exc
         except (httpx.HTTPError, OSError, RuntimeError, TypeError, UnicodeError, ValueError):
@@ -2089,9 +2082,7 @@ class CoreControlClientV2:
         )
         try:
             adapter = TypeAdapter(response_model)
-            if not _json_matches_schema_types(
-                value, adapter.json_schema(mode="validation")
-            ):
+            if not _json_matches_schema_types(value, adapter.json_schema(mode="validation")):
                 raise ValueError("Core response JSON types differ from the contract")
             # JSON arrays are the canonical wire form of tuple-backed framework
             # contracts. Scalar/container strictness is enforced above before
@@ -2122,9 +2113,7 @@ class CoreControlClientV2:
                 error_code=CoreClientLocalErrorCodeV2.INVALID_ERROR_RESPONSE,
             )
             adapter = TypeAdapter(v2.ApiErrorV2)
-            if not _json_matches_schema_types(
-                value, adapter.json_schema(mode="validation")
-            ):
+            if not _json_matches_schema_types(value, adapter.json_schema(mode="validation")):
                 raise ValueError("Core error JSON types differ from the contract")
             error = adapter.validate_json(body)
             if error.http_status != response.status_code:
@@ -2612,6 +2601,18 @@ class CoreProjectBootstrapClientV2:
     def capabilities(self, execution_mode: v2.ExecutionModeV2) -> v2.CapabilitiesResponseV2:
         return self._client.capabilities(execution_mode)
 
+    def list_services(self, *, limit: int = 50) -> v2.ServicePageV2:
+        return self._client.list_services(limit=limit)
+
+    def service_logs(
+        self,
+        service_id: str,
+        *,
+        limit: int = 100,
+        after: str | None = None,
+    ) -> v2.LogPageV2:
+        return self._client.service_logs(service_id, limit=limit, after=after)
+
     def create_project(
         self,
         request: v2.ProjectCreateV2,
@@ -2702,9 +2703,7 @@ def _ensure_project_create_response(
     )
     if request.config.workspace.kind == "native_folder_snapshot":
         invalid_authority = (
-            head is not None
-            or project.admission_etag is not None
-            or project.state != "not_ready"
+            head is not None or project.admission_etag is not None or project.state != "not_ready"
         )
     else:
         invalid_authority = (
@@ -3209,22 +3208,18 @@ def _json_matches_schema_types(
         if not isinstance(definitions, Mapping):
             return False
         target = definitions.get(name)
-        return isinstance(target, Mapping) and _json_matches_schema_types(
-            value, target, root
-        )
+        return isinstance(target, Mapping) and _json_matches_schema_types(value, target, root)
 
     for keyword in ("anyOf", "oneOf"):
         choices = schema.get(keyword)
         if isinstance(choices, list):
             return any(
-                isinstance(choice, Mapping)
-                and _json_matches_schema_types(value, choice, root)
+                isinstance(choice, Mapping) and _json_matches_schema_types(value, choice, root)
                 for choice in choices
             )
     all_of = schema.get("allOf")
     if isinstance(all_of, list) and not all(
-        isinstance(choice, Mapping)
-        and _json_matches_schema_types(value, choice, root)
+        isinstance(choice, Mapping) and _json_matches_schema_types(value, choice, root)
         for choice in all_of
     ):
         return False
@@ -3262,8 +3257,7 @@ def _json_matches_schema_types(
         if isinstance(item_schema, Mapping):
             start = len(prefix_items) if isinstance(prefix_items, list) else 0
             return all(
-                _json_matches_schema_types(item, item_schema, root)
-                for item in value[start:]
+                _json_matches_schema_types(item, item_schema, root) for item in value[start:]
             )
         return item_schema is not False or not value
     if expected == "object":

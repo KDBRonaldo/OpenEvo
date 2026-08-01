@@ -25,8 +25,10 @@ from desktop.sidecar.core_client_v2 import (
     CoreControlClientV2,
     CoreMutationOutcomeUnknownV2,
     CoreProjectBootstrapClientV2,
+    CoreProjectBootstrapResultV2,
     CoreTunnelConnectionV2,
 )
+from desktop.sidecar.lifecycle_logs_v2 import LifecycleRawOutputObserverV2
 from desktop.sidecar.release_capabilities import (
     ReleaseAuthorityNegotiationError,
     validate_persisted_core_v2_authority,
@@ -36,7 +38,7 @@ from openevo.backend.contracts.v2 import models as core_v2
 
 DEFAULT_BRIDGE_TIMEOUT_SECONDS = 60.0
 MAX_BRIDGE_TIMEOUT_SECONDS = 300.0
-MAX_ACTIVATION_TIMEOUT_SECONDS = 900.0
+MAX_ACTIVATION_TIMEOUT_SECONDS = 7200.0
 MAX_MAPPING_HISTORY_PROOF_GENERATIONS = 256
 
 _OPAQUE_ID = TypeAdapter(core_v2.OpaqueId)
@@ -44,6 +46,9 @@ _DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _ETAG = re.compile(r'"[0-9a-f]{64}"\Z', re.ASCII)
 _SOURCE_COMMIT = re.compile(r"[0-9a-f]{7,64}\Z", re.ASCII)
 _HEADER = re.compile(r"[\x21-\x7e]{16,256}\Z", re.ASCII)
+_MODEL_DOWNLOAD_PROGRESS = re.compile(
+    r"Model download progress: [0-9]{1,3}% \(([0-9]+)/([0-9]+) bytes\)\.\Z"
+)
 
 
 class CoreBridgeMutationStateV2(StrEnum):
@@ -219,9 +224,7 @@ class CoreProjectMappingV2:
         project = self.core_project
         version = self.core_version
         try:
-            negotiated = validate_persisted_core_v2_authority(
-                version.model_dump(mode="json")
-            )
+            negotiated = validate_persisted_core_v2_authority(version.model_dump(mode="json"))
         except ReleaseAuthorityNegotiationError as exc:
             raise ValueError("Core mapping version is not release authority") from exc
         if negotiated != version:
@@ -391,6 +394,8 @@ _TUNNEL_CLOSE_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="openevo-core-v2-tunnel-close",
 )
 _TUNNEL_CLOSE_CAPACITY = threading.BoundedSemaphore(32)
+_PROJECT_CREATE_CAPACITY = threading.BoundedSemaphore(8)
+_PROJECT_CREATE_PROGRESS_POLL_SECONDS = 0.25
 
 
 class CoreTunnelHandleV2:
@@ -607,6 +612,7 @@ class DesktopCoreBridgeV2:
             None,
         ]
         | None = None,
+        output_observer: LifecycleRawOutputObserverV2 | None = None,
         timeout: float = DEFAULT_BRIDGE_TIMEOUT_SECONDS,
         activation_timeout: float | None = None,
     ) -> None:
@@ -622,12 +628,15 @@ class DesktopCoreBridgeV2:
             raise ValueError("Core bridge timeouts are outside their finite bounds")
         if progress_observer is not None and not callable(progress_observer):
             raise TypeError("Core bridge lifecycle progress observer is invalid")
+        if output_observer is not None and not callable(output_observer):
+            raise TypeError("Core bridge lifecycle output observer is invalid")
         self._host_service = host_service
         self._tunnel_factory = tunnel_factory
         self._persistence = persistence
         self._transport_factory = transport_factory
         self._event_publisher = event_publisher
         self._progress_observer = progress_observer
+        self._output_observer = output_observer
         self._timeout = float(timeout)
         self._activation_timeout = float(resolved_activation)
         self._lock = threading.RLock()
@@ -670,6 +679,14 @@ class DesktopCoreBridgeV2:
             if callable(set_host_progress):
                 set_host_progress(observer)
             self._progress_observer = observer
+
+    def set_output_observer(self, observer: LifecycleRawOutputObserverV2) -> None:
+        if not callable(observer):
+            raise TypeError("Core bridge lifecycle output observer is invalid")
+        with self._lock:
+            if self._active is not None or self._output_observer is not None:
+                raise RuntimeError("Core bridge lifecycle output observer cannot be changed")
+            self._output_observer = observer
 
     def __exit__(self, *_exc: object) -> None:
         self.close()
@@ -912,12 +929,15 @@ class DesktopCoreBridgeV2:
         phase: local_v2.LifecyclePhaseV2,
         *,
         cancellable: bool,
+        progress: local_v2.LifecycleProgressV2 | None = None,
     ) -> None:
         observer = self._progress_observer
         if observer is not None:
             observer(
                 phase,
-                local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
+                progress
+                if progress is not None
+                else local_v2.LifecycleProgressIndeterminateV2(kind="indeterminate"),
                 cancellable,
             )
 
@@ -1921,7 +1941,12 @@ class DesktopCoreBridgeV2:
                     affected_resource_id=desktop_project_id,
                 )
             try:
-                result = bootstrap.create_project(create, idempotency_key=idempotency_key)
+                result = self._create_project_with_progress(
+                    bootstrap,
+                    create,
+                    idempotency_key=idempotency_key,
+                    deadline=deadline,
+                )
             except CoreMutationOutcomeUnknownV2:
                 self._mark_unknown(replay)
                 raise
@@ -1933,6 +1958,127 @@ class DesktopCoreBridgeV2:
             return result.connection, version
         finally:
             self._close_bootstrap(bootstrap, suppress_errors=True)
+
+    def _create_project_with_progress(
+        self,
+        bootstrap: CoreProjectBootstrapClientV2,
+        create: core_v2.ProjectCreateV2,
+        *,
+        idempotency_key: str,
+        deadline: float,
+    ) -> CoreProjectBootstrapResultV2:
+        if not _PROJECT_CREATE_CAPACITY.acquire(blocking=False):
+            raise _bridge_error(
+                "core_project_create_capacity_exhausted",
+                "Desktop cannot schedule another remote project creation.",
+                status=503,
+                retryable=True,
+                action="retry",
+            )
+
+        def create_owned() -> CoreProjectBootstrapResultV2:
+            return bootstrap.create_project(create, idempotency_key=idempotency_key)
+
+        future: Future[CoreProjectBootstrapResultV2] = Future()
+
+        def run_owned() -> None:
+            try:
+                if not future.set_running_or_notify_cancel():
+                    return
+                try:
+                    result = create_owned()
+                except BaseException as exc:
+                    future.set_exception(exc)
+                else:
+                    future.set_result(result)
+            finally:
+                _PROJECT_CREATE_CAPACITY.release()
+
+        try:
+            worker = threading.Thread(
+                target=run_owned,
+                name="openevo-core-v2-project-create",
+                daemon=True,
+            )
+            worker.start()
+        except BaseException:
+            _PROJECT_CREATE_CAPACITY.release()
+            raise
+        observed_sequences: dict[str, int] = {}
+        observed_cursors: dict[str, str] = {}
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                future.cancel()
+                raise CoreMutationOutcomeUnknownV2
+            try:
+                return future.result(timeout=min(_PROJECT_CREATE_PROGRESS_POLL_SECONDS, remaining))
+            except FutureTimeoutError:
+                self._observe_project_create_services(
+                    bootstrap,
+                    observed_sequences,
+                    observed_cursors,
+                )
+
+    def _observe_project_create_services(
+        self,
+        bootstrap: CoreProjectBootstrapClientV2,
+        observed_sequences: dict[str, int],
+        observed_cursors: dict[str, str],
+    ) -> None:
+        if self._output_observer is None and self._progress_observer is None:
+            return
+        try:
+            services = bootstrap.list_services(limit=100)
+            for service in services.items:
+                after: str | None = observed_cursors.get(service.service_id)
+                pages = 0
+                while pages < 8:
+                    page = bootstrap.service_logs(
+                        service.service_id,
+                        limit=100,
+                        after=after,
+                    )
+                    pages += 1
+                    for entry in page.items:
+                        if entry.sequence <= observed_sequences.get(service.service_id, 0):
+                            continue
+                        observed_sequences[service.service_id] = entry.sequence
+                        self._observe_project_create_log(service.service_id, entry)
+                    if not page.has_more:
+                        break
+                    if page.next_cursor is None or page.next_cursor == after:
+                        break
+                    after = page.next_cursor
+                    observed_cursors[service.service_id] = after
+        except (CoreClientErrorV2, CoreMutationOutcomeUnknownV2):
+            return
+
+    def _observe_project_create_log(
+        self,
+        service_id: str,
+        entry: core_v2.LogEntryV2,
+    ) -> None:
+        output = self._output_observer
+        if output is not None:
+            source = "daemon_stderr" if entry.stream == "stderr" else "daemon_stdout"
+            output(source, f"[{service_id}] {entry.message}\n".encode("utf-8"))
+        match = _MODEL_DOWNLOAD_PROGRESS.fullmatch(entry.message)
+        if match is None:
+            return
+        completed = int(match.group(1))
+        total = int(match.group(2))
+        if not 0 <= completed <= total or total <= 0:
+            return
+        self._observe_lifecycle_progress(
+            "creating_remote_project",
+            cancellable=False,
+            progress=local_v2.LifecycleProgressBytesV2(
+                kind="bytes",
+                completed=completed,
+                total=total,
+            ),
+        )
 
     def _load_or_reserve_mutation(
         self,
@@ -2517,8 +2663,7 @@ class DesktopCoreBridgeV2:
             activation = active.activation
             if (
                 activation.desktop_project_id == desktop_project_id
-                and activation.profile_connection_generation
-                == profile_connection_generation
+                and activation.profile_connection_generation == profile_connection_generation
                 and activation.bridge_generation == self._generation
             ):
                 return active, True
@@ -2526,8 +2671,7 @@ class DesktopCoreBridgeV2:
             session
             for session in self._retained
             if session.activation.desktop_project_id == desktop_project_id
-            and session.activation.profile_connection_generation
-            == profile_connection_generation
+            and session.activation.profile_connection_generation == profile_connection_generation
         )
         if len(retained) == 1:
             return retained[0], False
@@ -2579,7 +2723,7 @@ class DesktopCoreBridgeV2:
         return CoreProjectBootstrapClientV2(
             connection,
             transport=self._new_transport(),
-            timeout=min(self._timeout, _remaining(deadline)),
+            timeout=_remaining(deadline),
         )
 
     def _new_transport(self) -> httpx.BaseTransport | None:

@@ -567,6 +567,7 @@ def test_v2_release_runtime_is_deferred_and_owns_only_v2_bridge_state(
     )
     try:
         assert type(runtime) is DesktopReleaseCoreRuntimeV2
+        assert runtime.core_bridge._activation_timeout == 7200.0
         assert runtime.bridge_store.state_root.name == "core-bridge-v2"
         assert not missing_assets.exists()
         with pytest.raises(DesktopCoreBridgeErrorV2) as exc_info:

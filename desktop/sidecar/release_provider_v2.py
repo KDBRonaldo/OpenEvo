@@ -2679,6 +2679,9 @@ class DesktopReleaseProviderV2:
             set_progress = getattr(authority, "set_progress_observer", None)
             if callable(set_progress):
                 set_progress(progress_observer)
+        set_bridge_output = getattr(self._bridge, "set_output_observer", None)
+        if callable(set_bridge_output):
+            set_bridge_output(output_observer)
 
     def _profile_for_lifecycle(
         self,

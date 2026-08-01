@@ -48,7 +48,7 @@ from openevo.runtime.managed import MANAGED_RUNTIME_ARCHIVE_RELEASE
 _HOST_IDENTITY_DOMAIN = b"openevo-desktop-core-host-identity-v2\0"
 _MAX_REMOTE_OPERATION_SECONDS = 300.0
 _MAX_MANAGED_RUNTIME_SECONDS = 900.0
-_MAX_HTTP_IO_SECONDS = 60.0
+_MAX_HTTP_IO_SECONDS = 7200.0
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z", re.ASCII)
 _SOURCE_COMMIT = re.compile(r"[0-9a-f]{40}\Z", re.ASCII)
 _WHEEL_FILENAME = re.compile(r"[A-Za-z0-9_.+-]+\.whl\Z", re.ASCII)

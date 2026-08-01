@@ -102,6 +102,7 @@ _MAX_DAEMON_MANIFEST_BYTES = 1024 * 1024
 _RELAY_MIN_BACKOFF_SECONDS = 0.1
 _RELAY_MAX_BACKOFF_SECONDS = 2.0
 _RELEASE_ACTIVATION_TIMEOUT_SECONDS = 900.0
+_RELEASE_V2_PROJECT_ACTIVATION_TIMEOUT_SECONDS = 7200.0
 _V2_PROVIDER_STATE_DIRECTORY = "provider-v2"
 
 
@@ -265,9 +266,7 @@ class _DeferredCoreSshBridgeAdapterV2:
                     503,
                     local_v2.DesktopErrorV2(
                         code="release_assets_initialization_failed",
-                        summary=(
-                            "OpenEvo Desktop could not verify its remote release assets."
-                        ),
+                        summary=("OpenEvo Desktop could not verify its remote release assets."),
                         retryable=True,
                         action="install_repair_daemon",
                         affected_resource_id=None,
@@ -826,6 +825,7 @@ class DesktopReleaseCoreRuntimeV2:
         if failure is not None:
             raise failure
 
+
 def _load_release_assets_manifest(
     asset_root: Path | str,
     *,
@@ -1308,9 +1308,7 @@ def create_release_core_runtime_v2(
         raise TypeError("v2 Core runtime requires generation-bound system OpenSSH")
     if startup_phase is not None:
         startup_phase("core_bridge_store_v2")
-    bridge_store = DesktopCoreBridgeStoreV2(
-        provider_store.state_root / "core-bridge-v2"
-    )
+    bridge_store = DesktopCoreBridgeStoreV2(provider_store.state_root / "core-bridge-v2")
     broker: DesktopEventBrokerV2 | None = None
     connector: DesktopCoreProfileConnectorV2 | None = None
     bridge: DesktopCoreBridgeV2 | None = None
@@ -1340,7 +1338,7 @@ def create_release_core_runtime_v2(
             persistence=bridge_store,
             transport_factory=adapter.new_http_transport,
             event_publisher=broker,
-            activation_timeout=_RELEASE_ACTIVATION_TIMEOUT_SECONDS,
+            activation_timeout=_RELEASE_V2_PROJECT_ACTIVATION_TIMEOUT_SECONDS,
         )
         if startup_phase is not None:
             startup_phase("core_runtime_v2")
@@ -1349,9 +1347,7 @@ def create_release_core_runtime_v2(
             connector=connector,
             event_broker=broker,
             bridge_store=bridge_store,
-            managed_runtime_available=(
-                runtime_asset_root is not None or packaged_resource_assets
-            ),
+            managed_runtime_available=(runtime_asset_root is not None or packaged_resource_assets),
         )
     except BaseException:
         if bridge is not None:

@@ -227,9 +227,7 @@ def _store(tmp_path: Path) -> DesktopCoreBridgeStoreV2:
 def _rewrite_single_mapping_release(database: Path, release_version: str) -> None:
     with sqlite3.connect(database) as connection:
         for table in ("mappings", "mapping_history"):
-            rows = connection.execute(
-                f"SELECT rowid, document_json FROM {table}"
-            ).fetchall()
+            rows = connection.execute(f"SELECT rowid, document_json FROM {table}").fetchall()
             assert len(rows) == 1
             rowid, encoded = rows[0]
             document = json.loads(bytes(encoded))
@@ -402,7 +400,7 @@ def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Pat
             "creating_remote_project",
             "verifying_project",
             "activating",
-        "activating",
+            "activating",
         ]
         assert [local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases] == sorted(
             local_v2.LIFECYCLE_PHASES.index(phase) for phase in phases
@@ -415,6 +413,184 @@ def test_activation_reports_explicit_project_lifecycle_checkpoints(tmp_path: Pat
             False,
             False,
         ]
+        bridge.close()
+
+
+def test_activation_streams_remote_service_logs_and_byte_progress_while_create_waits(
+    tmp_path: Path,
+) -> None:
+    requests: list[httpx.Request] = []
+    log_polled = threading.Event()
+    create_thread_daemon: list[bool] = []
+    output: list[tuple[str, bytes]] = []
+    progress: list[tuple[str, object, bool]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        if request.url.path == "/v2/system/status":
+            return httpx.Response(200, json=_status())
+        if request.url.path == "/v2/projects" and request.method == "POST":
+            create_thread_daemon.append(threading.current_thread().daemon)
+            assert log_polled.wait(2)
+            return httpx.Response(201, json=_project().model_dump(mode="json"))
+        if request.url.path == "/v2/services":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "2",
+                    "items": [
+                        {
+                            "schema_version": "2",
+                            "service_id": "inference",
+                            "kind": "model",
+                            "status": "starting",
+                            "updated_at": "2026-07-23T06:00:00Z",
+                            "etag": '"' + "1" * 64 + '"',
+                        }
+                    ],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+        if request.url.path == "/v2/services/inference/logs":
+            log_polled.set()
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "2",
+                    "items": [
+                        {
+                            "sequence": 1,
+                            "occurred_at": "2026-07-23T06:00:01Z",
+                            "stream": "stdout",
+                            "message": ("Model download progress: 25% (32/128 bytes)."),
+                        }
+                    ],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+        if request.url.path == "/v2/projects/project-1":
+            return httpx.Response(200, json=_project().model_dump(mode="json"))
+        if request.url.path == "/v2/capabilities":
+            return httpx.Response(200, json=_capabilities())
+        raise AssertionError(f"unexpected Core request: {request.method} {request.url.path}")
+
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(handler),
+            progress_observer=lambda phase, value, cancellable: progress.append(
+                (phase, value, cancellable)
+            ),
+            output_observer=lambda source, chunk: output.append((source, chunk)),
+            activation_timeout=5,
+        )
+
+        activation = bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-stream-progress-0001",
+        )
+
+        assert activation.project == _project()
+        assert log_polled.is_set()
+        assert create_thread_daemon == [True]
+        assert output == [
+            (
+                "daemon_stdout",
+                b"[inference] Model download progress: 25% (32/128 bytes).\n",
+            )
+        ]
+        byte_progress = [
+            value
+            for phase, value, cancellable in progress
+            if phase == "creating_remote_project"
+            and isinstance(value, local_v2.LifecycleProgressBytesV2)
+            and cancellable is False
+        ]
+        assert byte_progress == [
+            local_v2.LifecycleProgressBytesV2(
+                kind="bytes",
+                completed=32,
+                total=128,
+            )
+        ]
+        bridge.close()
+
+
+def test_project_create_log_polling_resumes_after_the_bounded_page_window(
+    tmp_path: Path,
+) -> None:
+    class PagedBootstrap:
+        def list_services(self, *, limit: int = 50) -> m.ServicePageV2:
+            assert limit == 100
+            return m.ServicePageV2(
+                items=[
+                    m.ServiceV2(
+                        service_id="inference",
+                        kind="model",
+                        status="starting",
+                        updated_at="2026-07-23T06:00:00Z",
+                        etag='"' + "1" * 64 + '"',
+                    )
+                ],
+                next_cursor=None,
+                has_more=False,
+            )
+
+        def service_logs(
+            self,
+            service_id: str,
+            *,
+            limit: int,
+            after: str | None,
+        ) -> m.LogPageV2:
+            assert service_id == "inference"
+            assert limit == 100
+            start = 0 if after is None else int(after.removeprefix("cursor-"))
+            end = min(start + limit, 1_000)
+            has_more = end < 1_000
+            return m.LogPageV2(
+                items=[
+                    m.LogEntryV2(
+                        sequence=sequence,
+                        occurred_at="2026-07-23T06:00:01Z",
+                        stream="stdout",
+                        message=f"managed inference log {sequence}",
+                    )
+                    for sequence in range(start + 1, end + 1)
+                ],
+                next_cursor=f"cursor-{end}" if has_more else None,
+                has_more=has_more,
+            )
+
+    output: list[tuple[str, bytes]] = []
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            output_observer=lambda source, chunk: output.append((source, chunk)),
+        )
+        sequences: dict[str, int] = {}
+        cursors: dict[str, str] = {}
+
+        bridge._observe_project_create_services(PagedBootstrap(), sequences, cursors)
+        assert len(output) == 800
+        assert cursors == {"inference": "cursor-800"}
+
+        bridge._observe_project_create_services(PagedBootstrap(), sequences, cursors)
+        assert len(output) == 1_000
+        assert output[-1] == (
+            "daemon_stdout",
+            b"[inference] managed inference log 1000\n",
+        )
+        assert sequences == {"inference": 1_000}
         bridge.close()
 
 
@@ -571,8 +747,7 @@ def test_reconnect_upgrades_v019_historical_mapping_before_current_mutation(
     store.close()
     _rewrite_single_mapping_release(database, "0.1.9")
     post_count = sum(
-        request.method == "POST" and request.url.path == "/v2/projects"
-        for request in requests
+        request.method == "POST" and request.url.path == "/v2/projects" for request in requests
     )
 
     with DesktopCoreBridgeStoreV2(database.parent) as reopened:
