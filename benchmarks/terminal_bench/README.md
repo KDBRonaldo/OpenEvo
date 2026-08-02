@@ -103,6 +103,11 @@ prior replay examples. New directions are normalized at the generation boundary
 with their norm absorbed into the magnitude, preserving the exact effective
 model. Serving still loads exactly one cumulative adapter; replay does not
 introduce task routing or a bank of independently selected LoRAs.
+Because upstream SD-LoRA is rehearsal-free, the OpenEvo artifact explicitly
+records `paper_equivalent=false`, `rehearsal_free=false`, and
+`retention_strategy=bounded_trajectory_replay`. Results must call this the
+replay-assisted SD-LoRA adaptation rather than attribute them to the original
+paper method.
 
 For an ordered stream of `N` tasks, the command runs the base model once on all
 tasks, then evaluates every ordinary sequential-LoRA generation and every
@@ -119,6 +124,10 @@ not a performance claim. Performance evidence requires the predeclared task
 stream, repeated attempts or another justified uncertainty protocol, and the
 complete task-level report retained with the exact model, Codex, image, and
 artifact identities.
+
+The completed MemEvolve and replay-assisted SD-LoRA smokes, task-level outcomes,
+report hashes, and limitations are recorded in
+[`docs/dev/memory-method-experiment-results.md`](../../docs/dev/memory-method-experiment-results.md).
 
 ## Frozen Gate Data
 
