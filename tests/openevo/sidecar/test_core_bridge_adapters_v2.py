@@ -272,6 +272,23 @@ def test_adapter_rejects_stale_profile_generation_before_remote_work(
     assert not transport.operation_order
 
 
+def test_adapter_classifies_daemon_stage_follower_failure_as_retryable_connection(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    transport.stage_error = SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+    adapter = DesktopCoreSshBridgeAdapterV2(_Lifecycle(transport), _bootstrap(tmp_path))
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as caught:
+        adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    assert caught.value.error.code == "core_connection_failed"
+    assert caught.value.status_code == 503
+    assert caught.value.error.retryable is True
+    assert caught.value.error.action == "reconnect"
+    assert caught.value.error.affected_resource_id == PROFILE_ID
+
+
 def test_adapter_opens_only_verified_tunnel_transport_and_closes_owned_session(
     tmp_path: Path,
     verified_tunnel_auth: None,

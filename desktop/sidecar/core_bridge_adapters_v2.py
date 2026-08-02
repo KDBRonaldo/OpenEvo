@@ -1232,6 +1232,15 @@ def _ssh_error(
 ) -> DesktopCoreBridgeErrorV2:
     if error.code is SshTransportErrorCode.CANCELLED:
         return _activation_cancelled_error(affected_resource_id)
+    if error.code is SshTransportErrorCode.CONNECTION_FAILED:
+        return _adapter_error(
+            "core_connection_failed",
+            "Desktop could not reach the active system-SSH connection.",
+            status=503,
+            retryable=True,
+            action="reconnect",
+            affected_resource_id=affected_resource_id,
+        )
     if error.code is SshTransportErrorCode.HOST_KEY_VERIFICATION_FAILED:
         return _adapter_error(
             "core_ssh_authority_invalid",
