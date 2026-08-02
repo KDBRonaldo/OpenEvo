@@ -753,7 +753,7 @@ def command_matches(command):
         return True
     if (
         len(parsed) == 3
-        and parsed[0] in {"/bin/bash", "/bin/sh"}
+        and parsed[0] in {"/bin/bash", "/usr/bin/bash", "/bin/sh"}
         and parsed[1] in {"-c", "-lc"}
     ):
         try:

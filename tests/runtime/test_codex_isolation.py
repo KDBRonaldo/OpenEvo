@@ -178,6 +178,19 @@ def test_canary_event_validator_accepts_exact_completed_command(
     assert result.stderr == ""
 
 
+def test_canary_event_validator_accepts_pinned_codex_usr_bin_bash_wrapper(
+    tmp_path: Path,
+) -> None:
+    result = _run_validator(
+        tmp_path,
+        _canary_events(shell_wrapper="/usr/bin/bash"),
+    )
+
+    assert result.returncode == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+
+
 def test_canary_event_validator_accepts_codex_stdin_notice(tmp_path: Path) -> None:
     result = _run_validator(
         tmp_path,
@@ -329,9 +342,10 @@ def _canary_events(
     extra_event_type: str | None = None,
     command_suffix: str = "",
     final_text: str = "done",
+    shell_wrapper: str = "/bin/bash",
 ) -> bytes:
     invocation = f"/bin/sh {_SCRIPT_PATH} {_NONCE}{command_suffix}"
-    command = f"/bin/bash -c {shlex.quote(invocation)}"
+    command = f"{shell_wrapper} -c {shlex.quote(invocation)}"
     events: list[dict[str, object]] = [
         {"type": "thread.started", "thread_id": "thread_1"},
         {"type": "turn.started"},
