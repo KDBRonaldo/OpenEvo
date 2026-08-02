@@ -21,6 +21,7 @@ from desktop.sidecar.core_bridge_adapters_v2 import (
 from desktop.sidecar.core_bridge_v2 import DesktopCoreBridgeErrorV2
 from openevo.deployment import core_control
 from openevo.deployment.daemon_bundle_transport import DaemonBundleServicePredecessor
+from openevo.deployment.ssh import SshTransportError, SshTransportErrorCode
 from openevo.runtime.managed import MANAGED_RUNTIME_ARCHIVE_RELEASE
 from tests.openevo.sidecar.test_core_bridge_adapters_v1 import (
     DEPENDENCY_LOCK_DIGEST,
@@ -302,6 +303,36 @@ def test_adapter_opens_only_verified_tunnel_transport_and_closes_owned_session(
     assert transport.tunnel.close_calls == 1
     with pytest.raises(DesktopCoreBridgeErrorV2):
         adapter.new_http_transport()
+
+
+def test_adapter_classifies_verified_tunnel_ssh_failure_as_retryable_connection(
+    tmp_path: Path,
+    verified_tunnel_auth: None,
+) -> None:
+    transport = FakeCoreTransport()
+    adapter = DesktopCoreSshBridgeAdapterV2(_Lifecycle(transport), _bootstrap(tmp_path))
+    attachment = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    tunnel = adapter.open_tunnel(
+        profile_id=PROFILE_ID,
+        profile_connection_generation=7,
+        remote_port=attachment.remote_port,
+        session_id="session-ssh-failure",
+        deadline=time.monotonic() + 5,
+    )
+
+    def fail_authority_check() -> None:
+        raise SshTransportError(SshTransportErrorCode.CONNECTION_FAILED)
+
+    transport.tunnel.verify_authority = fail_authority_check  # type: ignore[method-assign]
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as caught:
+        adapter.new_http_transport()
+
+    assert caught.value.error.code == "core_connection_failed"
+    assert caught.value.error.retryable is True
+    assert caught.value.error.action == "reconnect"
+    assert caught.value.error.affected_resource_id == PROFILE_ID
+    tunnel.close(deadline=time.monotonic() + 5)
 
 
 def test_adapter_retries_one_retryable_verified_tunnel_open(

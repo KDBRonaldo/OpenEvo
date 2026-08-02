@@ -1117,7 +1117,7 @@ def test_running_project_create_reconnects_and_resumes_after_sidecar_restart(
     disconnected = recovered_profiles[0]
     lifecycle = _Lifecycle()
     bridge = _RoutingBridge()
-    bridge.activation_connection_failures = 1
+    bridge.activation_connection_failures = 2
     provider = DesktopReleaseProviderV2(
         store=reopened,
         catalog=_Catalog(),
@@ -1152,6 +1152,7 @@ def test_running_project_create_reconnects_and_resumes_after_sidecar_restart(
             ("connect", disconnected.ssh_host_alias, disconnected.connection_generation + 1)
         ]
         assert [call[0] for call in bridge.calls] == [
+            "activate_project",
             "activate_project",
             "activate_project",
         ]

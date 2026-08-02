@@ -1606,33 +1606,32 @@ class DesktopReleaseProviderV2:
             "remote_preflight",
             cancellable=True,
         )
-        try:
-            activation = self._bridge.activate_project(
-                desktop_project_id,
-                request,
-                idempotency_key=action_id,
-                cancel_event=context.cancellation_event,
-            )
-        except DesktopCoreBridgeErrorV2 as exc:
-            failure = exc.error
-            # A restarted sidecar can finish the profile prerequisite before its
-            # first fresh project tunnel is usable. The bridge reuses the exact
-            # action-bound mutation ledger on this single generation-proven retry.
-            if not (
-                recovered_after_reconnect
-                and failure.code == "core_connection_failed"
-                and failure.retryable
-                and failure.action == "reconnect"
-                and failure.affected_resource_id in {None, desktop_project_id}
-            ):
-                raise
-            context.check_cancelled()
-            activation = self._bridge.activate_project(
-                desktop_project_id,
-                request,
-                idempotency_key=action_id,
-                cancel_event=context.cancellation_event,
-            )
+        activation_attempts = 3 if recovered_after_reconnect else 1
+        for attempt in range(activation_attempts):
+            try:
+                activation = self._bridge.activate_project(
+                    desktop_project_id,
+                    request,
+                    idempotency_key=action_id,
+                    cancel_event=context.cancellation_event,
+                )
+                break
+            except DesktopCoreBridgeErrorV2 as exc:
+                failure = exc.error
+                # A restarted sidecar can finish the profile prerequisite while
+                # short-lived mux followers from the fresh generation are still
+                # settling. Reuse the exact action-bound mutation ledger for at
+                # most two generation-proven connection retries.
+                if not (
+                    attempt + 1 < activation_attempts
+                    and failure.code == "core_connection_failed"
+                    and failure.retryable
+                    and failure.action == "reconnect"
+                    and failure.affected_resource_id
+                    in {None, desktop_project_id, profile.profile_id}
+                ):
+                    raise
+                context.check_cancelled()
         context.check_cancelled()
         project = getattr(activation, "project", None)
         if type(project) is not core_v2.ProjectV2:

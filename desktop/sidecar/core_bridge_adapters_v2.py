@@ -655,6 +655,23 @@ class DesktopCoreSshBridgeAdapterV2:
         )
         try:
             active.tunnel.verify_authority()
+        except SshTransportError as exc:
+            if exc.code is SshTransportErrorCode.CONNECTION_FAILED:
+                raise _adapter_error(
+                    "core_connection_failed",
+                    "Desktop could not reach the active project tunnel.",
+                    status=503,
+                    retryable=True,
+                    action="reconnect",
+                    affected_resource_id=active.authority.profile_id,
+                ) from None
+            raise _adapter_error(
+                "core_tunnel_identity_mismatch",
+                "The private Core tunnel no longer matches its attachment.",
+                status=409,
+                action="reconnect",
+                affected_resource_id=active.authority.profile_id,
+            ) from None
         except BaseException as exc:
             if not isinstance(exc, Exception):
                 raise
