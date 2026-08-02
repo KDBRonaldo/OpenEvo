@@ -21,10 +21,8 @@ from openevo.evolution.agent_system import (
 )
 from openevo.evolution.framework import canonical_digest
 from openevo.evolution.harness_service import (
-    CODEX_PROXY_BASE_URL_ENV,
-    codex_proxy_base_url_from_environment,
-    codex_proxy_cli_overrides,
-    configure_codex_proxy_child_environment,
+    core_gateway_base_url_from_environment,
+    core_gateway_chat_completion,
 )
 from openevo.evolution.models import (
     ArtifactRegisterRequest,
@@ -2742,6 +2740,17 @@ def _generate_reflector_markdown(
 ) -> str:
     provider = llm_config["provider"]
     if provider == _REFLECTOR_PROVIDER_CODEX_CLI:
+        proxy_base_url = core_gateway_base_url_from_environment()
+        if proxy_base_url is not None:
+            return core_gateway_chat_completion(
+                proxy_base_url=proxy_base_url,
+                model=str(llm_config["model"]),
+                system_instruction=system_message,
+                prompt=prompt,
+                timeout_seconds=float(llm_config["timeout_seconds"]),
+                temperature=float(llm_config["temperature"]),
+                max_tokens=llm_config.get("max_tokens"),
+            )
         return _generate_agent_system_reflection_with_codex_cli(
             llm_config,
             prompt_input=codex_prompt,
@@ -2856,11 +2865,6 @@ def _generate_agent_system_reflection_with_codex_cli(
     with tempfile.TemporaryDirectory(prefix=temp_prefix) as tmp:
         tmpdir = Path(tmp)
         output_path = tmpdir / "last-message.md"
-        proxy_base_url = codex_proxy_base_url_from_environment()
-        proxy_codex_home: Path | None = None
-        if proxy_base_url is not None:
-            proxy_codex_home = tmpdir / "codex"
-            proxy_codex_home.mkdir(mode=0o700)
         args = [
             str(llm_config["codex_bin"]),
             "exec",
@@ -2876,11 +2880,6 @@ def _generate_agent_system_reflection_with_codex_cli(
             str(tmpdir),
             "--output-last-message",
             str(output_path),
-            *(
-                codex_proxy_cli_overrides(proxy_base_url)
-                if proxy_base_url is not None
-                else ()
-            ),
             "--model",
             str(llm_config["model"]),
             "-",
@@ -2890,11 +2889,7 @@ def _generate_agent_system_reflection_with_codex_cli(
                 args,
                 check=True,
                 capture_output=True,
-                env=_codex_cli_reflector_env(
-                    llm_config,
-                    proxy_base_url=proxy_base_url,
-                    proxy_codex_home=proxy_codex_home,
-                ),
+                env=_codex_cli_reflector_env(llm_config),
                 input=prompt_input,
                 text=True,
                 timeout=llm_config["timeout_seconds"],
@@ -2950,21 +2945,10 @@ def _codex_cli_skill_bundle_reflector_prompt(prompt: str) -> str:
     )
 
 
-def _codex_cli_reflector_env(
-    llm_config: dict[str, Any],
-    *,
-    proxy_base_url: str | None,
-    proxy_codex_home: Path | None,
-) -> dict[str, str]:
+def _codex_cli_reflector_env(llm_config: dict[str, Any]) -> dict[str, str]:
     env = dict(os.environ)
-    for key in (*_REFLECTOR_PROXY_ENV_VARS, CODEX_PROXY_BASE_URL_ENV):
+    for key in _REFLECTOR_PROXY_ENV_VARS:
         env.pop(key, None)
-    if proxy_base_url is not None:
-        if proxy_codex_home is None:
-            raise ValueError("Codex reflector proxy requires a private Codex home")
-        env = configure_codex_proxy_child_environment(env)
-        env["CODEX_HOME"] = os.fspath(proxy_codex_home)
-        return env
     codex_home = llm_config.get("codex_home")
     if isinstance(codex_home, str) and codex_home.strip():
         env["CODEX_HOME"] = codex_home.strip()

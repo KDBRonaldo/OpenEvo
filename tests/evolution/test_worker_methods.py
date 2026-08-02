@@ -1501,37 +1501,21 @@ def test_agent_system_reflector_uses_managed_proxy_for_self_deployed_worker(
     tmp_path,
     monkeypatch,
 ):
-    from openevo.evolution.harness_service import CODEX_PROXY_BASE_URL_ENV
+    from openevo.evolution.harness_service import CORE_GATEWAY_BASE_URL_ENV
 
-    captured: dict[str, Any] = {}
-
-    def fake_run(
-        args: list[str],
-        *,
-        check: bool,
-        capture_output: bool,
-        env: dict[str, str],
-        input: str,
-        text: bool,
-        timeout: float,
-    ) -> subprocess.CompletedProcess[str]:
-        captured["args"] = args
-        captured["env"] = env
-        output_path = Path(args[args.index("--output-last-message") + 1])
-        codex_home = Path(env["CODEX_HOME"])
-        captured["private_codex_home"] = (
-            codex_home.parent == output_path.parent
-            and not (codex_home / "auth.json").exists()
-        )
-        output_path.write_text(
-            "# Self-Deployed Agent System\n\n"
-            "Validate local model evidence after every evolution step.\n",
-            encoding="utf-8",
-        )
-        return subprocess.CompletedProcess(args, 0, stdout="{}", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-    monkeypatch.setenv(CODEX_PROXY_BASE_URL_ENV, "http://127.0.0.1:18345/v1")
+    captured = _patch_reflector_llm(
+        monkeypatch,
+        "# Self-Deployed Agent System\n\n"
+        "Validate local model evidence after every evolution step.\n",
+    )
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Self-Deployed reflector must not invoke host Codex")
+        ),
+    )
+    monkeypatch.setenv(CORE_GATEWAY_BASE_URL_ENV, "http://127.0.0.1:18345/v1")
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-leak")
     monkeypatch.setenv("OPENAI_BASE_URL", "http://ambient.invalid")
     job = _job(
@@ -1549,18 +1533,9 @@ def test_agent_system_reflector_uses_managed_proxy_for_self_deployed_worker(
 
     artifact = run_method(job, artifact_root=tmp_path / "artifacts")[0]
 
-    args = captured["args"]
-    overrides = [args[index + 1] for index, value in enumerate(args) if value == "-c"]
-    assert 'model_provider="openevo_reflector_proxy"' in overrides
-    assert (
-        'model_providers.openevo_reflector_proxy.base_url="http://127.0.0.1:18345/v1"'
-        in overrides
-    )
-    assert 'model_providers.openevo_reflector_proxy.wire_api="responses"' in overrides
-    assert captured["env"]["OPENAI_API_KEY"] != "ambient-key-must-not-leak"
-    assert "OPENAI_BASE_URL" not in captured["env"]
-    assert CODEX_PROXY_BASE_URL_ENV not in captured["env"]
-    assert captured["private_codex_home"] is True
+    assert captured["url"] == "http://127.0.0.1:18345/v1/chat/completions"
+    assert captured["headers"]["Authorization"] != "Bearer ambient-key-must-not-leak"
+    assert captured["client_kwargs"]["trust_env"] is False
     assert artifact.manifest["reflector_provider"] == "codex_cli"
 
 

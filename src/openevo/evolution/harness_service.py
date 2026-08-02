@@ -11,8 +11,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Protocol
+from typing import Any, Protocol
 from urllib.parse import urlsplit
+
+import httpx
 
 from openevo.codex_models import codex_cli_model_name, validate_codex_model_ref
 from openevo.evolution.framework.execution import (
@@ -37,9 +39,8 @@ _DISABLED_FEATURES = (
     "unified_exec",
     "standalone_web_search",
 )
-CODEX_PROXY_BASE_URL_ENV = "OPENEVO_CODEX_PROXY_BASE_URL"
+CORE_GATEWAY_BASE_URL_ENV = "OPENEVO_EVOLUTION_HARNESS_GATEWAY_BASE_URL"
 _CODEX_PROXY_API_KEY = "openevo-internal-reflector"
-_CODEX_PROXY_PROVIDER_ID = "openevo_reflector_proxy"
 
 
 class HarnessInferenceError(RuntimeError):
@@ -118,7 +119,6 @@ class _CodexHarnessServiceBase:
         *,
         model: str,
         workspace: Path,
-        provider_overrides: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         disabled = tuple(
             part
@@ -139,7 +139,6 @@ class _CodexHarnessServiceBase:
             "--skip-git-repo-check",
             "--cd",
             os.fspath(workspace),
-            *provider_overrides,
             "--model",
             model,
             "-",
@@ -279,121 +278,40 @@ class CodexSubscriptionHarnessService(_CodexHarnessServiceBase):
             raise HarnessInferenceError("Codex harness inference produced no response")
         return response
 
-
-
-class CodexProxyHarnessService(_CodexHarnessServiceBase):
-    """Run model-only Codex turns through one generation-bound local Gateway."""
+class CoreGatewayHarnessService:
+    """Run model-only turns through one generation-bound local Gateway."""
 
     def __init__(
         self,
         *,
         proxy_base_url: str,
-        codex_binary: str = "codex",
-        temporary_root: Path | None = None,
-        runner: CodexInvocationRunner | None = None,
     ) -> None:
-        super().__init__(
-            codex_binary=codex_binary,
-            temporary_root=temporary_root,
-            runner=runner,
-        )
-        self._proxy_base_url = _validated_proxy_base_url(proxy_base_url)
+        self._proxy_base_url = _validated_core_gateway_base_url(proxy_base_url)
 
     def infer(self, request: HarnessInferenceRequest) -> HarnessInferenceResponse:
         checked = HarnessInferenceRequest.model_validate(request)
-        self._validate_request(checked)
-        model = self._model_name(checked.model_name)
-        prompt = _render_prompt(checked)
-
-        run_root: Path | None = None
-        run_identity = None
-        failure: BaseException | None = None
-        response: HarnessInferenceResponse | None = None
-        redactor = CredentialRedactor(())
-        try:
-            run_root = Path(
-                mkdtemp(
-                    prefix="openevo-method-codex-proxy-",
-                    dir=self._temporary_root,
-                )
-            )
-            os.chmod(run_root, 0o700)
-            run_identity = capture_session_root_identity(run_root)
-            codex_home = run_root / "codex"
-            workspace = run_root / "workspace"
-            home = run_root / "home"
-            temporary = run_root / "tmp"
-            for directory in (codex_home, workspace, home, temporary):
-                directory.mkdir(mode=0o700)
-            result = self._runner.run(
-                self._argv(
-                    model=model,
-                    workspace=workspace,
-                    provider_overrides=codex_proxy_cli_overrides(
-                        self._proxy_base_url
-                    ),
-                ),
-                input_bytes=prompt,
-                env=_controlled_codex_environment(
-                    codex_home=codex_home,
-                    home=home,
-                    temporary=temporary,
-                    proxy_api_key=_CODEX_PROXY_API_KEY,
-                ),
-                cwd=workspace,
-                timeout_seconds=checked.timeout_seconds,
-            )
-            if result.returncode != 0:
-                detail = _redacted_detail(
-                    result.stderr or result.stdout,
-                    redactor=redactor,
-                )
-                suffix = f": {detail}" if detail else ""
-                raise HarnessInferenceError(
-                    f"Codex harness inference failed{suffix}"
-                )
-            response = HarnessInferenceResponse(
-                request_id=checked.request_id,
-                text=redactor.redact(_completed_agent_message(result.stdout)),
-                capture_mode="transcript",
-            )
-        except HarnessInferenceError as exc:
-            failure = exc
-        except (OSError, ValueError, SessionFileSecurityError) as exc:
-            failure = HarnessInferenceError(
-                "Codex harness inference could not be executed safely"
-            )
-            failure.__cause__ = exc
-        finally:
-            cleanup_error: BaseException | None = None
-            if run_root is not None and run_identity is not None:
-                try:
-                    remove_session_tree(run_root, run_identity)
-                except (OSError, SessionFileSecurityError) as exc:
-                    cleanup_error = exc
-            if cleanup_error is not None:
-                cleanup_failure = HarnessInferenceError(
-                    "Codex harness private state could not be cleaned safely"
-                )
-                cleanup_failure.__cause__ = cleanup_error
-                if failure is None:
-                    failure = cleanup_failure
-                else:
-                    failure.add_note(str(cleanup_failure))
-
-        if failure is not None:
-            raise failure
-        if response is None:
-            raise HarnessInferenceError("Codex harness inference produced no response")
-        return response
+        _CodexHarnessServiceBase._validate_request(checked)
+        model = _CodexHarnessServiceBase._model_name(checked.model_name)
+        text = core_gateway_chat_completion(
+            proxy_base_url=self._proxy_base_url,
+            model=model,
+            system_instruction=checked.system_instruction,
+            prompt=checked.prompt,
+            timeout_seconds=checked.timeout_seconds,
+        )
+        return HarnessInferenceResponse(
+            request_id=checked.request_id,
+            text=text,
+            capture_mode="transcript",
+        )
 
 
-def _validated_proxy_base_url(value: str) -> str:
+def _validated_core_gateway_base_url(value: str) -> str:
     try:
         parsed = urlsplit(value)
         port = parsed.port
     except (TypeError, ValueError) as exc:
-        raise ValueError("Codex proxy base URL is invalid") from exc
+        raise ValueError("Core Gateway base URL is invalid") from exc
     if (
         parsed.scheme != "http"
         or parsed.hostname != "127.0.0.1"
@@ -406,37 +324,72 @@ def _validated_proxy_base_url(value: str) -> str:
         or parsed.fragment
         or parsed.netloc != f"127.0.0.1:{port}"
     ):
-        raise ValueError("Codex proxy base URL must be a canonical loopback /v1 URL")
+        raise ValueError("Core Gateway base URL must be a canonical loopback /v1 URL")
     return f"http://127.0.0.1:{port}/v1"
 
 
-def codex_proxy_base_url_from_environment() -> str | None:
-    value = os.environ.get(CODEX_PROXY_BASE_URL_ENV)
-    return None if value is None else _validated_proxy_base_url(value)
+def core_gateway_base_url_from_environment() -> str | None:
+    value = os.environ.get(CORE_GATEWAY_BASE_URL_ENV)
+    return None if value is None else _validated_core_gateway_base_url(value)
 
 
-def codex_proxy_cli_overrides(proxy_base_url: str) -> tuple[str, ...]:
-    base_url = _validated_proxy_base_url(proxy_base_url)
-    prefix = f"model_providers.{_CODEX_PROXY_PROVIDER_ID}"
-    return (
-        "-c",
-        f'model_provider="{_CODEX_PROXY_PROVIDER_ID}"',
-        "-c",
-        f'{prefix}.name="OpenEvo Reflector Proxy"',
-        "-c",
-        f'{prefix}.base_url="{base_url}"',
-        "-c",
-        f'{prefix}.env_key="OPENAI_API_KEY"',
-        "-c",
-        f'{prefix}.wire_api="responses"',
-    )
+def core_gateway_chat_completion(
+    *,
+    proxy_base_url: str,
+    model: str,
+    system_instruction: str,
+    prompt: str,
+    timeout_seconds: float,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> str:
+    base_url = _validated_core_gateway_base_url(proxy_base_url)
+    messages: list[dict[str, str]] = []
+    if system_instruction:
+        messages.append({"role": "system", "content": system_instruction})
+    messages.append({"role": "user", "content": prompt})
+    payload: dict[str, Any] = {"model": model, "messages": messages}
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    try:
+        with httpx.Client(timeout=timeout_seconds, trust_env=False) as client:
+            response = client.post(
+                f"{base_url}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {_CODEX_PROXY_API_KEY}",
+                    "content-type": "application/json",
+                },
+                json=payload,
+            )
+            response.raise_for_status()
+            content = _chat_completion_content(response.json())
+    except (httpx.HTTPError, TypeError, ValueError, RecursionError) as exc:
+        raise HarnessInferenceError(
+            "Core Gateway harness inference failed"
+        ) from exc
+    if not content.strip():
+        raise HarnessInferenceError("Core Gateway harness returned empty content")
+    if len(content.encode("utf-8")) > 1_048_576:
+        raise HarnessInferenceError("Core Gateway harness response exceeded its limit")
+    return content.strip()
 
 
-def configure_codex_proxy_child_environment(env: dict[str, str]) -> dict[str, str]:
-    controlled = dict(env)
-    controlled.pop(CODEX_PROXY_BASE_URL_ENV, None)
-    controlled["OPENAI_API_KEY"] = _CODEX_PROXY_API_KEY
-    return controlled
+def _chat_completion_content(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+    message = first.get("message")
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    return content if isinstance(content, str) else ""
 
 
 def _render_prompt(request: HarnessInferenceRequest) -> bytes:
@@ -451,7 +404,6 @@ def _controlled_codex_environment(
     codex_home: Path,
     home: Path,
     temporary: Path,
-    proxy_api_key: str | None = None,
 ) -> dict[str, str]:
     env = {
         "CODEX_HOME": os.fspath(codex_home),
@@ -461,8 +413,6 @@ def _controlled_codex_environment(
         "PYTHONSAFEPATH": "1",
         "TMPDIR": os.fspath(temporary),
     }
-    if proxy_api_key is not None:
-        env["OPENAI_API_KEY"] = proxy_api_key
     for key in ("LANG", "LC_ALL"):
         value = os.environ.get(key)
         if value:

@@ -4,15 +4,16 @@ import json
 import os
 from pathlib import Path
 
+import httpx
 import pytest
 
 from openevo.evolution import cli as evolution_cli
 from openevo.evolution.framework import HarnessInferenceRequest
 from openevo.evolution.harness_service import (
-    CODEX_PROXY_BASE_URL_ENV,
+    CORE_GATEWAY_BASE_URL_ENV,
     CodexInvocationResult,
-    CodexProxyHarnessService,
     CodexSubscriptionHarnessService,
+    CoreGatewayHarnessService,
     HarnessInferenceError,
 )
 from openevo.evolution.parametric.trainer_service import (
@@ -67,35 +68,6 @@ class _RecordingRunner:
             {
                 "argv": argv,
                 "auth": (codex_home / "auth.json").read_bytes(),
-                "codex_home": codex_home,
-                "cwd": cwd,
-                "env": env,
-                "input_bytes": input_bytes,
-                "timeout_seconds": timeout_seconds,
-            }
-        )
-        return self.result
-
-
-class _ProxyRecordingRunner:
-    def __init__(self, result: CodexInvocationResult) -> None:
-        self.result = result
-        self.calls: list[dict[str, object]] = []
-
-    def run(
-        self,
-        argv: tuple[str, ...],
-        *,
-        input_bytes: bytes,
-        env: dict[str, str],
-        cwd: Path,
-        timeout_seconds: float,
-    ) -> CodexInvocationResult:
-        codex_home = Path(env["CODEX_HOME"])
-        self.calls.append(
-            {
-                "argv": argv,
-                "auth_exists": (codex_home / "auth.json").exists(),
                 "codex_home": codex_home,
                 "cwd": cwd,
                 "env": env,
@@ -201,24 +173,44 @@ def test_codex_harness_service_uses_closed_subscription_cli_surface(
     assert list(scratch.iterdir()) == []
 
 
-def test_codex_proxy_harness_service_uses_only_verified_loopback_gateway(
-    tmp_path: Path,
+def test_core_gateway_harness_service_uses_only_verified_loopback_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner = _ProxyRecordingRunner(
-        CodexInvocationResult(
-            returncode=0,
-            stdout=_completed_events("locally evolved memory"),
-            stderr=b"",
-        )
-    )
-    scratch = tmp_path / "proxy-harness-scratch"
-    scratch.mkdir(mode=0o700)
-    service = CodexProxyHarnessService(
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured["client_kwargs"] = kwargs
+
+        def __enter__(self) -> "FakeClient":
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+        def post(
+            self,
+            url: str,
+            *,
+            headers: dict[str, str],
+            json: dict[str, object],
+        ) -> httpx.Response:
+            captured["url"] = url
+            captured["headers"] = headers
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "choices": [
+                        {"message": {"content": "locally evolved memory"}}
+                    ]
+                },
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(httpx, "Client", FakeClient)
+    service = CoreGatewayHarnessService(
         proxy_base_url="http://127.0.0.1:18345/v1",
-        codex_binary="/managed/bin/codex",
-        temporary_root=scratch,
-        runner=runner,
     )
     monkeypatch.setenv("OPENAI_API_KEY", "ambient-key-must-not-leak")
     monkeypatch.setenv("OPENAI_BASE_URL", "http://ambient.invalid")
@@ -236,32 +228,21 @@ def test_codex_proxy_harness_service_uses_only_verified_loopback_gateway(
     )
 
     assert response.text == "locally evolved memory"
-    assert len(runner.calls) == 1
-    call = runner.calls[0]
-    argv = call["argv"]
-    assert isinstance(argv, tuple)
-    overrides = [
-        argv[index + 1]
-        for index, value in enumerate(argv)
-        if value == "-c"
-    ]
-    assert 'model_provider="openevo_reflector_proxy"' in overrides
-    assert (
-        'model_providers.openevo_reflector_proxy.base_url="http://127.0.0.1:18345/v1"'
-        in overrides
-    )
-    assert 'model_providers.openevo_reflector_proxy.env_key="OPENAI_API_KEY"' in overrides
-    assert 'model_providers.openevo_reflector_proxy.wire_api="responses"' in overrides
-    assert argv[argv.index("--model") + 1] == "Qwen/Qwen3-0.6B"
-    assert call["auth_exists"] is False
-    env = call["env"]
-    assert isinstance(env, dict)
-    assert env["OPENAI_API_KEY"] != "ambient-key-must-not-leak"
-    assert "OPENAI_BASE_URL" not in env
-    assert "HTTPS_PROXY" not in env
-    assert CODEX_PROXY_BASE_URL_ENV not in env
-    assert call["cwd"] != call["codex_home"]
-    assert list(scratch.iterdir()) == []
+    assert captured["url"] == "http://127.0.0.1:18345/v1/chat/completions"
+    assert captured["json"] == {
+        "model": "Qwen/Qwen3-0.6B",
+        "messages": [
+            {
+                "role": "system",
+                "content": "Analyze reusable memory architecture failures.",
+            },
+            {"role": "user", "content": "Trajectory evidence goes here."},
+        ],
+    }
+    headers = captured["headers"]
+    assert isinstance(headers, dict)
+    assert headers["Authorization"] != "Bearer ambient-key-must-not-leak"
+    assert captured["client_kwargs"] == {"timeout": 19.0, "trust_env": False}
 
 
 @pytest.mark.parametrize(
@@ -275,11 +256,11 @@ def test_codex_proxy_harness_service_uses_only_verified_loopback_gateway(
         "http://user@127.0.0.1:18345/v1",
     ],
 )
-def test_codex_proxy_harness_service_rejects_noncanonical_gateway_url(
+def test_core_gateway_harness_service_rejects_noncanonical_gateway_url(
     proxy_base_url: str,
 ) -> None:
-    with pytest.raises(ValueError, match="proxy base URL"):
-        CodexProxyHarnessService(proxy_base_url=proxy_base_url)
+    with pytest.raises(ValueError, match="Gateway base URL"):
+        CoreGatewayHarnessService(proxy_base_url=proxy_base_url)
 
 
 def test_codex_harness_service_redacts_credential_from_failure(
@@ -444,7 +425,7 @@ def test_worker_injects_core_codex_harness_service(
     assert artifact_root.stat().st_mode & 0o777 == 0o700
 
 
-def test_worker_injects_core_codex_proxy_harness_for_self_deployed_generation(
+def test_worker_injects_core_gateway_harness_for_self_deployed_generation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -465,7 +446,7 @@ def test_worker_injects_core_codex_proxy_harness_for_self_deployed_generation(
         return False
 
     monkeypatch.delenv("OPENEVO_INTERNAL_SERVICE_IDENTITY_FD", raising=False)
-    monkeypatch.setenv(CODEX_PROXY_BASE_URL_ENV, "http://127.0.0.1:18345/v1")
+    monkeypatch.setenv(CORE_GATEWAY_BASE_URL_ENV, "http://127.0.0.1:18345/v1")
     monkeypatch.setattr(evolution_cli, "EvolutionWorkerClient", _Client)
     monkeypatch.setattr(evolution_cli, "run_once", fake_run_once)
     monkeypatch.setattr(
@@ -486,4 +467,4 @@ def test_worker_injects_core_codex_proxy_harness_for_self_deployed_generation(
     assert result == 0
     _client, kwargs = observed["run_once"]
     services = kwargs["method_services"]
-    assert isinstance(services.harness, CodexProxyHarnessService)
+    assert isinstance(services.harness, CoreGatewayHarnessService)

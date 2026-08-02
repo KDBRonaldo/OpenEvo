@@ -8,9 +8,9 @@ import time
 from openevo.evolution.framework import load_verified_framework_registry
 from openevo.evolution.framework.execution import MethodExecutionServices
 from openevo.evolution.harness_service import (
-    CodexProxyHarnessService,
     CodexSubscriptionHarnessService,
-    codex_proxy_base_url_from_environment,
+    CoreGatewayHarnessService,
+    core_gateway_base_url_from_environment,
 )
 from openevo.evolution.parametric.trainer_service import (
     SubprocessSdLoraTrainerService,
@@ -121,11 +121,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         ):
             raise RuntimeError("worker framework lock does not match the service generation")
-    proxy_base_url = codex_proxy_base_url_from_environment()
+    proxy_base_url = core_gateway_base_url_from_environment()
     harness_service = (
         CodexSubscriptionHarnessService()
         if proxy_base_url is None
-        else CodexProxyHarnessService(proxy_base_url=proxy_base_url)
+        else CoreGatewayHarnessService(proxy_base_url=proxy_base_url)
     )
     with EvolutionWorkerClient(
         args.base_url,
