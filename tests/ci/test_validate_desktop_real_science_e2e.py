@@ -127,7 +127,7 @@ def _candidate() -> tuple[dict[str, object], bytes]:
         "desktop_contract": {
             "release_version": "0.1.10",
             "mutation_major": 2,
-            "openapi_sha256": "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760",
+            "openapi_sha256": "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af",
             "event_schema_sha256": "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b",
             "feature_flags": [
                 "core_control_v2",

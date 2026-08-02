@@ -7,7 +7,7 @@ import { expect, test, type Page, type Route } from "@playwright/test";
 
 const DESKTOP_ENDPOINT = "http://127.0.0.1:43117";
 const DESKTOP_SESSION_TOKEN = "release-readonly-session-token-000000000001";
-const OPENAPI_SHA256 = "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760";
+const OPENAPI_SHA256 = "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af";
 const EVENT_SCHEMA_SHA256 = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
 const FEATURE_SET_SHA256 = "67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda";
 const FEATURE_FLAGS = [

@@ -50,7 +50,7 @@ const RELEASE_ASSETS_DIRECTORY: &str = "openevo-release-assets";
 const NATIVE_SIDECAR_PROTOCOL: &str = "openevo-native-sidecar-v2";
 const DESKTOP_LOCAL_API_NAME: &str = "openevo-desktop-local-api";
 const DESKTOP_LOCAL_API_OPENAPI_SHA256: &str =
-    "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760";
+    "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af";
 const DESKTOP_LOCAL_API_EVENT_SCHEMA_SHA256: &str =
     "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b";
 const DESKTOP_RELEASE_VERSION: &str = "0.1.10";

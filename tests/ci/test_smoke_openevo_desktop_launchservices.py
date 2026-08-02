@@ -14,7 +14,7 @@ import pytest
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[2] / "scripts/ci/smoke_openevo_desktop_launchservices.py"
 )
-RELEASE_OPENAPI_SHA256 = "f0996184595992a22ec6abd257d9040342c9d2f7a31a9882b4a0597061594760"
+RELEASE_OPENAPI_SHA256 = "fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af"
 RELEASE_EVENT_SCHEMA_SHA256 = "515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b"
 RELEASE_FEATURE_FLAGS = [
     "core_control_v2",

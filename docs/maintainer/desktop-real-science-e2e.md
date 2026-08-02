@@ -123,13 +123,17 @@ Local API v2:
    groups. macOS uses a non-reaping `kqueue` process-exit observer so the group
    leader remains authoritative until descendants have been closed.
 
-v0.1.10 intentionally does not call the unavailable v2 Task-artifact collection
-endpoint during ordinary refresh or release verification. Artifact content,
-SSH commands, process environments, backend tokens, Core URLs, and absolute
-host paths are not exposed to the renderer or used as fallback evidence. The
-lifecycle log route is the narrow exception for process output: it may carry
-bounded, terminal-control-stripped, sanitized SSH and Daemon stdout/stderr, but
-never command lines or environment values and never as success authority. The
+v0.1.10 ordinary refresh and release verification do not depend on the v2
+Task-artifact collection endpoints. Core now serves the authoritative task
+artifact collection plus project-scoped artifact metadata and content routes;
+the Desktop bridge uses only the active project tunnel when those resources are
+requested. Artifact content, SSH commands, process environments, backend
+tokens, Core URLs, and absolute host paths are not used as fallback evidence.
+Artifact content remains renderer-visible only through its closed Desktop v2
+projection. The lifecycle log route is the narrow exception for process
+output: it may carry bounded, terminal-control-stripped, sanitized SSH and
+Daemon stdout/stderr, but never command lines or environment values and never
+as success authority. The
 committed Evolution Revision's typed `artifact_count` remains the Task-output
 boundary.
 
