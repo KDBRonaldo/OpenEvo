@@ -177,6 +177,11 @@ ExpeL/Reflexion-style synthesis，并要求输出包含这些二级标题：
 - `## When Applicable`
 - `## Retired Or Superseded`
 
+若受支持的 reflector 返回了非空 Markdown、但漏掉其中部分标题，worker 会保留模型正文，
+按固定的中性条目补齐缺失章节，再重新执行五章节校验。Manifest 的
+`structure_completion` 会明确记录是否补齐以及补齐了哪些章节；空输出仍然失败，补齐不会
+伪造 trajectory evidence。
+
 输入：
 
 - 一个或多个类型为 `dataset` 的 input artifact；
@@ -190,7 +195,8 @@ ExpeL/Reflexion-style synthesis，并要求输出包含这些二级标题：
 - `ArtifactRegisterRequest(type=text_memory)`；
 - `uri=file://.../memory.md`；
 - manifest 包含 `method`、source dataset IDs、record/reflected record counts、
-  success/failure counts、prior memory count 和 `promotion_support`。所有 input
+  success/failure counts、prior memory count、`structure_completion` 和
+  `promotion_support`。所有 input
   artifact IDs 仍记录在 lineage 中，便于追踪 prior memory artifact。
 
 `text_memory` 会作为文本 prepend 到 agent instruction，因此 subscription transcript runs

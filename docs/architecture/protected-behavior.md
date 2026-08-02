@@ -13,7 +13,7 @@ The following behavior must remain observable after file and import moves:
 
 | Method | Protected evidence |
 | --- | --- |
-| `text_memory_expel_reflector` | Prompt evidence, success/failure filtering, prior memory, the 20-record default, five required sections, artifact payload, lineage, compatibility, and missing-dataset failure. |
+| `text_memory_expel_reflector` | Prompt evidence, success/failure filtering, prior memory, the 20-record default, five required sections (including auditable deterministic completion of missing headings in non-empty model output), artifact payload, lineage, compatibility, and missing-dataset failure. |
 | `skill_bundle_reflector` | Prompt evidence, latest base skill, the 20-record default, `SKILL.md` payload, artifact lineage, redaction, and missing-dataset failure. |
 | `agent_system_gepa_reflector` | Default and configured mutation strategies, candidate-count bounds, candidate prompts and payloads, report archive, unpromoted candidates, and missing-dataset failure. |
 

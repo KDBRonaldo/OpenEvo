@@ -68,6 +68,21 @@ _TEXT_MEMORY_EXPEL_REQUIRED_SECTIONS = (
     "When Applicable",
     "Retired Or Superseded",
 )
+_TEXT_MEMORY_EXPEL_EMPTY_SECTION_ITEMS = {
+    "Do": "No additional reusable action was supported by the selected trajectories.",
+    "Avoid": "No recurring failure mode was supported by the selected trajectories.",
+    "Validate": (
+        "Before reusing this memory, verify its guidance against the current task and "
+        "available checks."
+    ),
+    "When Applicable": (
+        "Apply this memory only when the current task matches the reflected trajectory "
+        "conditions."
+    ),
+    "Retired Or Superseded": (
+        "No prior memory was identified as contradicted or superseded."
+    ),
+}
 _HUMAN_FEEDBACK_AVAILABLE_STATUS = "available_for_evolution"
 _HUMAN_FEEDBACK_SUMMARY_LIMIT = 8
 _HUMAN_FEEDBACK_VALUES_PER_FIELD_LIMIT = 4
@@ -352,6 +367,9 @@ def text_memory_expel_reflector(
         job=job,
         manifests=manifests,
     )
+    memory_markdown, structure_completion = _complete_text_memory_expel_sections(
+        memory_markdown
+    )
     _require_text_memory_expel_sections(memory_markdown)
 
     output_dir = artifact_root / "workers" / job.job_id / "text_memory_expel_reflector"
@@ -390,6 +408,7 @@ def text_memory_expel_reflector(
                 "failure_count": failure_count,
                 "prior_memory_count": len(prior_memory_texts),
                 "required_sections": required_sections,
+                "structure_completion": structure_completion,
                 "reflector_provider": llm_config["provider"],
                 "reflector_model": llm_config["model"],
                 "reflection_audit": audit_report,
@@ -3038,8 +3057,8 @@ def _guard_generic_reflector_output(
     )
 
 
-def _require_text_memory_expel_sections(markdown: str) -> None:
-    missing = [
+def _missing_text_memory_expel_sections(markdown: str) -> list[str]:
+    return [
         section
         for section in _TEXT_MEMORY_EXPEL_REQUIRED_SECTIONS
         if not re.search(
@@ -3048,6 +3067,29 @@ def _require_text_memory_expel_sections(markdown: str) -> None:
             flags=re.MULTILINE,
         )
     ]
+
+
+def _complete_text_memory_expel_sections(
+    markdown: str,
+) -> tuple[str, dict[str, Any]]:
+    missing = _missing_text_memory_expel_sections(markdown)
+    if not missing:
+        return markdown, {"added_sections": [], "applied": False}
+
+    lines = [markdown.rstrip()]
+    for section in missing:
+        lines.extend(
+            [
+                "",
+                f"## {section}",
+                f"- {_TEXT_MEMORY_EXPEL_EMPTY_SECTION_ITEMS[section]}",
+            ]
+        )
+    return "\n".join(lines), {"added_sections": missing, "applied": True}
+
+
+def _require_text_memory_expel_sections(markdown: str) -> None:
+    missing = _missing_text_memory_expel_sections(markdown)
     if missing:
         raise ValueError(
             "text_memory_expel_reflector missing required memory sections: "

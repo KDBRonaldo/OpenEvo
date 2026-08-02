@@ -738,6 +738,10 @@ def test_text_memory_expel_reflector_writes_structured_memory(
     assert artifact.manifest["success_count"] == 2
     assert artifact.manifest["failure_count"] == 1
     assert artifact.manifest["prior_memory_count"] == 1
+    assert artifact.manifest["structure_completion"] == {
+        "added_sections": [],
+        "applied": False,
+    }
     assert artifact.manifest["required_sections"] == [
         "Do",
         "Avoid",
@@ -776,7 +780,7 @@ def test_text_memory_expel_reflector_writes_structured_memory(
     assert "## Avoid" in prompt
 
 
-def test_text_memory_expel_reflector_rejects_missing_required_sections(
+def test_text_memory_expel_reflector_completes_missing_required_sections(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -797,8 +801,23 @@ def test_text_memory_expel_reflector_rejects_missing_required_sections(
         },
     )
 
-    with pytest.raises(ValueError, match="missing required memory sections"):
-        run_method(job, artifact_root=tmp_path / "artifacts")
+    [artifact] = run_method(job, artifact_root=tmp_path / "artifacts")
+
+    memory = Path(artifact.uri.removeprefix("file://")).read_text(encoding="utf-8")
+    assert "## Do\n- Rerun the exact test." in memory
+    for section in artifact.manifest["required_sections"]:
+        assert f"## {section}" in memory
+    assert "No recurring failure mode was supported" in memory
+    assert "No prior memory was identified as contradicted or superseded" in memory
+    assert artifact.manifest["structure_completion"] == {
+        "added_sections": [
+            "Avoid",
+            "Validate",
+            "When Applicable",
+            "Retired Or Superseded",
+        ],
+        "applied": True,
+    }
 
 
 @pytest.mark.parametrize(
