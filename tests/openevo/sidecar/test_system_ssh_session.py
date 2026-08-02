@@ -351,6 +351,7 @@ def test_injected_runner_keeps_account_discovery_private_but_observes_normal_run
     try:
         session.start()
         runner.stdout = _remote_home_record()
+        runner.stderr = b"private remote stderr\n"
 
         authority = session.discover_remote_home_authority(timeout_seconds=2.0)
 
@@ -359,6 +360,7 @@ def test_injected_runner_keeps_account_discovery_private_but_observes_normal_run
         assert authority.remote_user == "researcher"
         assert authority.workspace_root == "/srv/research/alice/.openevo/workspaces"
         assert runner.calls[-1][0][-1] == build_remote_home_probe_command()
+        assert "private remote stderr" not in repr(authority)
         assert observed == []
 
         runner.stdout = b"ordinary stdout\n"
@@ -382,12 +384,12 @@ def test_injected_runner_keeps_account_discovery_private_but_observes_normal_run
     ("return_code", "stdout", "stderr", "error"),
     [
         (1, _remote_home_record(), b"", None),
-        (0, _remote_home_record(), b"private remote stderr", None),
+        (0, _remote_home_record(), b"x" * REMOTE_HOME_PROBE_OUTPUT_LIMIT, None),
         (0, b"x" * (REMOTE_HOME_PROBE_OUTPUT_LIMIT + 1), b"", None),
         (0, "not bytes", b"", None),
         (0, b"", b"", subprocess.TimeoutExpired("private probe", 1.0)),
     ],
-    ids=("nonzero", "stderr", "over-budget", "wrong-type", "timeout"),
+    ids=("nonzero", "stderr-over-budget", "stdout-over-budget", "wrong-type", "timeout"),
 )
 def test_injected_discovery_failure_is_sanitized_and_never_observed(
     short_tmp_path: Path,

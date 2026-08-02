@@ -157,7 +157,7 @@ def test_authority_binding_is_exact_and_errors_are_private() -> None:
     "kwargs",
     [
         {"return_code": 1},
-        {"stderr": b"private diagnostic"},
+        {"stderr": b"x" * REMOTE_HOME_PROBE_OUTPUT_LIMIT},
         {"stdout": b""},
         {"stdout": _record()[:-1]},
         {"stdout": _record() + b"extra\n"},
@@ -185,6 +185,22 @@ def test_probe_rejects_invalid_process_results_without_echoing_them(
     assert str(captured.value) == "Remote account home probe is invalid."
     assert captured.value.__cause__ is None
     assert "private diagnostic" not in repr(captured.value)
+
+
+def test_probe_accepts_bounded_openssh_diagnostics_without_retaining_them() -> None:
+    diagnostic = b"private proxy diagnostic\n"
+
+    authority = parse_remote_home_probe(
+        profile_id="profile-1",
+        connection_generation=7,
+        return_code=0,
+        stdout=_record(),
+        stderr=diagnostic,
+    )
+
+    assert authority.remote_user == "researcher"
+    assert authority.workspace_root == "/srv/research/alice/.openevo/workspaces"
+    assert diagnostic.decode().strip() not in repr(authority)
 
 
 @pytest.mark.parametrize(

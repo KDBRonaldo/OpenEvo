@@ -128,7 +128,6 @@ def parse_remote_home_probe(
             or isinstance(return_code, bool)
             or return_code != 0
             or len(stdout) + len(stderr) > REMOTE_HOME_PROBE_OUTPUT_LIMIT
-            or stderr
             or not stdout
             or not stdout.endswith(b"\n")
             or not _valid_profile_id(profile_id)

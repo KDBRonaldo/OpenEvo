@@ -52,6 +52,10 @@ An unsupported or drifting remote account fails closed as
 details with the fixed writable-home summary and `administrator_action` before
 operation, profile, event, or persistence projection. SSH and Daemon process
 logs pass through the absolute-host-path sanitizer before storage.
+Successful account discovery accepts bounded OpenSSH or proxy diagnostics on
+its private stderr stream because the user's system SSH configuration remains
+authoritative; only the exact closed stdout record can seal the home authority,
+and discovery stderr is neither observed nor retained.
 
 ## V2 provider state and Preview import
 
