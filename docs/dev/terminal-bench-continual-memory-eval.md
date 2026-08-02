@@ -4,6 +4,9 @@ This note records the first controlled evaluation of OpenEvo's internal
 `parametric_memory_sd_lora` method. It is development evidence, not a release
 gate or an official Terminal Bench submission.
 
+The consolidated textual- and parametric-memory results are in
+[Terminal Bench 2.1 Memory Method Results](memory-method-experiment-results.md).
+
 ## Scope
 
 The experiment isolates parametric memory:
@@ -12,8 +15,8 @@ The experiment isolates parametric memory:
 - disabled evolution targets: `text_memory`, `skill_bundle`, and
   `agent_system`;
 - inference path: OpenEvo Core `CodexHarness` -> OpenEvo Gateway -> local vLLM;
-- compared conditions: fixed base model, ordinary sequential LoRA, and
-  SD-LoRA continual memory;
+- compared conditions: fixed base model, ordinary sequential LoRA, and the
+  OpenEvo replay-assisted SD-LoRA adaptation;
 - one ordered training generation per task, with every learned generation
   evaluated on every task in the fixed stream.
 
@@ -21,6 +24,23 @@ The benchmark does not expose another inference API. It installs a pinned host
 Codex payload into each Harbor container and verifies its version and hashes
 before the task starts. Training is a fixed Daemon-owned subprocess and uses
 successful prior trajectories as user-task adapter data.
+
+## Algorithm Fidelity
+
+The original SD-LoRA method is rehearsal-free. Its plain formulation adds a new
+low-rank direction for each task, so rank growth is part of the upstream method;
+the upstream rank-reduction and knowledge-distillation variants control that
+growth without replay.
+
+OpenEvo retains the direction/magnitude decomposition and one cumulative
+adapter, but adds bounded successful-trajectory replay as its retention signal.
+The artifact therefore records `paper_equivalent=false`,
+`rehearsal_free=false`, and
+`retention_strategy=bounded_trajectory_replay`. Historical directions remain
+frozen while their magnitudes and the new direction are trained. This document
+uses "replay-assisted SD-LoRA adaptation" for OpenEvo results; it does not claim
+performance for the original rehearsal-free algorithm. Rank reduction and
+knowledge distillation are not implemented in the current method.
 
 ## Algorithm Sanity Check
 
@@ -109,7 +129,7 @@ without an infrastructure exception.
 |---|---|---:|---:|---:|---:|
 | Base | `[0, 0]` | 0.000 | 0.000 | n/a | n/a |
 | Ordinary sequential LoRA | `[[0, 0], [0, 0]]` | 0.000 | 0.000 | 0.000 | 0.000 |
-| SD-LoRA | `[[0, 0], [0, 0]]` | 0.000 | 0.000 | 0.000 | 0.000 |
+| Replay-assisted SD-LoRA adaptation | `[[0, 0], [0, 0]]` | 0.000 | 0.000 | 0.000 | 0.000 |
 
 Neither adapter method improved reward in this smoke. The resource measurements
 were:
@@ -140,7 +160,7 @@ SHA-256 is
 
 This run establishes the lifecycle boundary: user trajectories become a
 Daemon-trained cumulative adapter, the next generation validates and extends
-the prior SD-LoRA state, vLLM loads each cumulative PEFT adapter, and ordinary
+the prior continual state, vLLM loads each cumulative PEFT adapter, and ordinary
 task inference remains on the existing Core harness path. It does not establish
 a Terminal Bench performance gain.
 
@@ -151,7 +171,7 @@ rewards and distinguish infrastructure failures from verifier failures and
 model failures. Serving latency, if evaluated, needs an isolated request-level
 measurement rather than Harbor wall time.
 
-## Corrected Continual-Learning Gain Smoke
+## Corrected Replay-Assisted Gain Smoke
 
 On 2026-08-01, a second controlled run addressed the two main defects exposed
 by the first smoke:
@@ -178,8 +198,8 @@ magnitude learning rates were `1e-4` and `1e-2`, respectively.
 | Condition / generation | `prove-plus-comm` | `regex-log` | Mean |
 |---|---:|---:|---:|
 | Fixed base | 0 | 0 | 0.000 |
-| SD-LoRA generation 0 | 1 | 0 | 0.500 |
-| SD-LoRA generation 1 | 1 | 1 | 1.000 |
+| Replay-assisted generation 0 | 1 | 0 | 0.500 |
+| Replay-assisted generation 1 | 1 | 1 | 1.000 |
 
 The resulting reward matrix was `[[1, 0], [1, 1]]`. Final average and anytime
 average were both 1.000, backward transfer was 0.000, and forgetting was
@@ -197,14 +217,15 @@ serving commands used `--max-loras 1`. Generation 1 loaded one rank-32
 cumulative adapter, not two task adapters, and every condition reproduced the
 same per-task Gateway contract digest.
 
-The canonical report is
-`/tmp/tb21-sd-lora-normalized-two-task-20260801-v3/report.json`, with SHA-256
+The source report has SHA-256
 `0e69820410ba56a707d2269ede5a22cdd7cbe3f36d373db216f9f4aad0627ff8`.
+Its claim-relevant fields are retained in the
+[canonical result record](memory-method-experiment-results.md#corrected-positive-smoke-results).
 
-This is positive end-to-end evidence that the corrected SD-LoRA path can learn
-two selected base failures without forgetting the first one. It remains a
-conditional two-task, one-attempt smoke: the tasks and successful teacher
-trajectories are not an unbiased sample, ordinary LoRA was not rerun under this
-larger budget, and no confidence interval is available. It therefore does not
-replace the larger frozen, repeated Terminal Bench performance gate described
-above.
+This is positive end-to-end evidence that the replay-assisted OpenEvo path can
+learn two selected base failures without forgetting the first one. It is not a
+result for rehearsal-free SD-LoRA. It remains a conditional two-task,
+one-attempt smoke: the tasks and successful teacher trajectories are not an
+unbiased sample, ordinary LoRA was not rerun under this larger budget, and no
+confidence interval is available. It therefore does not replace the larger
+frozen, repeated Terminal Bench performance gate described above.

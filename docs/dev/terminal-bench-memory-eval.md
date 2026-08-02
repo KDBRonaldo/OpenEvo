@@ -14,6 +14,9 @@ Terminal Bench 2.1.
 > current contracts; use the remainder of this note only to interpret earlier
 > Terminal Bench runs.
 
+The consolidated, task-level MemEvolve and continual-parametric results are in
+[Terminal Bench 2.1 Memory Method Results](memory-method-experiment-results.md).
+
 ## Method Choices
 
 The first textual-memory backend is `text_memory_expel_reflector`. It follows
@@ -192,6 +195,32 @@ The batch rooted at `/tmp/tb21-text-memory-failed-batch-20260630-190312`
 continued into `query-optimize`, but that first attempt was interrupted after
 more than 14 minutes without agent output. That interrupted `query-optimize`
 trial is not counted; the completed `query-optimize` run above is counted.
+
+## Declarative MemEvolve Conditional Result
+
+The later `text_memory_memevolve` run used the same 21-task conditional pool,
+`gpt-5.5` Codex subscription inference, one attempt per condition, and only the
+`text_memory` evolution target. It is a declarative static-Markdown adaptation:
+artifact manifests record `adaptation_scope=declarative_text_memory_v1` and
+`paper_equivalent=false`. It does not execute the upstream MemEvolve provider
+runtime.
+
+After correcting two baseline verifier timeouts with successful baseline
+reruns, the paired result was:
+
+- corrected baseline pass@1: 2/21;
+- declarative MemEvolve pass@1: 9/21;
+- absolute gain: 7 tasks and 33.33 percentage points;
+- transitions: 7 fail-to-pass, 2 pass-to-pass, 12 fail-to-fail, and 0
+  pass-to-fail.
+
+The corrected summary has SHA-256
+`1ba21c752d91d184fdd0aac8f5050e6597b212679ae06791293a18b390916b8e`.
+See the
+[canonical task-level record](memory-method-experiment-results.md#task-level-results)
+for all 21 outcomes, the uncorrected-summary identity, implementation status,
+and limitations. This result is not directly comparable to the five-attempt
+ExpeL-family evidence above and is not an unbiased full-suite score.
 
 ## Parametric Memory
 
