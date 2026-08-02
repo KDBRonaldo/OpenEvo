@@ -66,6 +66,7 @@ class _RoutingBridge:
         self.activation_release: Event | None = None
         self.activation_cancel_events: list[Event | None] = []
         self.block_activation_until_cancel = False
+        self.activation_connection_failures = 0
 
     def activate_project(
         self,
@@ -85,6 +86,18 @@ class _RoutingBridge:
                 idempotency_key,
             )
         )
+        if self.activation_connection_failures > 0:
+            self.activation_connection_failures -= 1
+            raise DesktopCoreBridgeErrorV2(
+                503,
+                local_v2.DesktopErrorV2(
+                    code="core_connection_failed",
+                    summary="Desktop could not reach the active project tunnel.",
+                    retryable=True,
+                    action="reconnect",
+                    affected_resource_id=desktop_project_id,
+                ),
+            )
         if self.block_activation_until_cancel:
             assert self.activation_started is not None
             assert cancel_event is not None
@@ -1104,6 +1117,7 @@ def test_running_project_create_reconnects_and_resumes_after_sidecar_restart(
     disconnected = recovered_profiles[0]
     lifecycle = _Lifecycle()
     bridge = _RoutingBridge()
+    bridge.activation_connection_failures = 1
     provider = DesktopReleaseProviderV2(
         store=reopened,
         catalog=_Catalog(),
@@ -1137,9 +1151,12 @@ def test_running_project_create_reconnects_and_resumes_after_sidecar_restart(
         assert lifecycle.calls == [
             ("connect", disconnected.ssh_host_alias, disconnected.connection_generation + 1)
         ]
-        assert [call[0] for call in bridge.calls] == ["activate_project"]
-        assert bridge.calls[0][3] == disconnected.connection_generation + 1
-        assert bridge.calls[0][4] == action_id
+        assert [call[0] for call in bridge.calls] == [
+            "activate_project",
+            "activate_project",
+        ]
+        assert all(call[3] == disconnected.connection_generation + 1 for call in bridge.calls)
+        assert all(call[4] == action_id for call in bridge.calls)
     finally:
         client.close()
         provider.close()
@@ -1325,9 +1342,7 @@ def test_project_create_cancellation_interrupts_the_exact_bridge_operation(
         assert created.status_code == 202, created.text
         assert bridge.activation_started.wait(2)
         operation_id = created.json()["operation_id"]
-        current = client.get(
-            f"/desktop/v2/operations/{operation_id}", headers=_headers()
-        ).json()
+        current = client.get(f"/desktop/v2/operations/{operation_id}", headers=_headers()).json()
 
         cancelled = client.post(
             f"/desktop/v2/operations/{operation_id}/cancel",

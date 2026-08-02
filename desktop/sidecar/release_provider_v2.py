@@ -1599,18 +1599,40 @@ class DesktopReleaseProviderV2:
                     "profile_connection_generation": profile.connection_generation,
                 }
             )
+        recovered_after_reconnect = persisted.resource_generation < profile.connection_generation
         desktop_project_id = persisted.project_id
         self._checkpoint_lifecycle_forward(
             context,
             "remote_preflight",
             cancellable=True,
         )
-        activation = self._bridge.activate_project(
-            desktop_project_id,
-            request,
-            idempotency_key=action_id,
-            cancel_event=context.cancellation_event,
-        )
+        try:
+            activation = self._bridge.activate_project(
+                desktop_project_id,
+                request,
+                idempotency_key=action_id,
+                cancel_event=context.cancellation_event,
+            )
+        except DesktopCoreBridgeErrorV2 as exc:
+            failure = exc.error
+            # A restarted sidecar can finish the profile prerequisite before its
+            # first fresh project tunnel is usable. The bridge reuses the exact
+            # action-bound mutation ledger on this single generation-proven retry.
+            if not (
+                recovered_after_reconnect
+                and failure.code == "core_connection_failed"
+                and failure.retryable
+                and failure.action == "reconnect"
+                and failure.affected_resource_id in {None, desktop_project_id}
+            ):
+                raise
+            context.check_cancelled()
+            activation = self._bridge.activate_project(
+                desktop_project_id,
+                request,
+                idempotency_key=action_id,
+                cancel_event=context.cancellation_event,
+            )
         context.check_cancelled()
         project = getattr(activation, "project", None)
         if type(project) is not core_v2.ProjectV2:
