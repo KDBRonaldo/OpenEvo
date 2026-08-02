@@ -261,6 +261,12 @@ for each step while retaining one renderer action identity.
 
 Lifecycle operations expose ordered phases, typed progress, a cancellable flag,
 recoverable SSE updates, acknowledgement, and bounded SSH/Daemon process logs.
+Core may acknowledge a scratch project create with an exact `not_ready` project
+while managed execution services are still becoming ready. After validating the
+immutable project intent, Sidecar records that create mutation as applied before
+it polls the bound project to `ready`; the readiness wait continues to project
+service logs and byte progress through the same lifecycle operation. A Sidecar
+restart resumes the wait by project ID and must not issue another create mutation.
 Normal refresh reads at most the current 200-entry tail using an observed log
 sequence watermark; older pagination is explicit user action. Logs may contain
 user-visible process output, but the sidecar removes credentials, Desktop/Core

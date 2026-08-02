@@ -2724,22 +2724,24 @@ def _ensure_project_create_response(
         or project.config != request.config
         or project.project_config_sha256 != v2.project_config_sha256_for(request.config)
     )
+    pending_authority = (
+        head is None and project.admission_etag is None and project.state == "not_ready"
+    )
     if request.config.workspace.kind == "native_folder_snapshot":
-        invalid_authority = (
-            head is not None or project.admission_etag is not None or project.state != "not_ready"
-        )
+        invalid_authority = not pending_authority
     else:
-        invalid_authority = (
-            head is None
-            or project.admission_etag is None
-            or project.state != "ready"
-            or head.project_id != project.project_id
-            or head.generation != 0
-            or head.predecessor_project_head_id is not None
-            or head.registry_sha256 != version.registry_sha256
-            or head.runtime_context_snapshot.runtime_contract_sha256
-            != version.runtime_contract_sha256
+        ready_authority = (
+            head is not None
+            and project.admission_etag is not None
+            and project.state == "ready"
+            and head.project_id == project.project_id
+            and head.generation == 0
+            and head.predecessor_project_head_id is None
+            and head.registry_sha256 == version.registry_sha256
+            and head.runtime_context_snapshot.runtime_contract_sha256
+            == version.runtime_contract_sha256
         )
+        invalid_authority = not (pending_authority or ready_authority)
     if common_mismatch or invalid_authority:
         _raise_local(CoreClientLocalErrorCodeV2.INVALID_RESPONSE, 502)
 

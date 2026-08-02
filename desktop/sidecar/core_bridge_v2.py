@@ -1925,10 +1925,12 @@ class DesktopCoreBridgeV2:
             profile_connection_generation=request.profile_connection_generation,
             session_id=tunnel.session_id,
         )
+        observed_sequences: dict[str, int] = {}
+        observed_cursors: dict[str, str] = {}
         if replay.state is CoreBridgeMutationStateV2.APPLIED:
             assert replay.response_resource_id is not None
             connection = bootstrap_connection.bind(replay.response_resource_id)
-            probe = self._new_client(connection, deadline)
+            probe = self._new_project_create_client(connection, deadline)
             try:
                 version = self._call_core(probe.version, desktop_project_id)
                 project = self._call_core(probe.get_project, desktop_project_id)
@@ -1940,6 +1942,16 @@ class DesktopCoreBridgeV2:
                         action="install_repair_daemon",
                         affected_resource_id=desktop_project_id,
                     )
+                self._wait_for_scratch_project_ready(
+                    probe,
+                    request=create,
+                    initial=project,
+                    expected_version=version,
+                    deadline=deadline,
+                    affected_resource_id=desktop_project_id,
+                    observed_sequences=observed_sequences,
+                    observed_cursors=observed_cursors,
+                )
             finally:
                 self._close_client(probe, suppress_errors=True)
             return connection, version
@@ -1962,6 +1974,8 @@ class DesktopCoreBridgeV2:
                     create,
                     idempotency_key=idempotency_key,
                     deadline=deadline,
+                    observed_sequences=observed_sequences,
+                    observed_cursors=observed_cursors,
                 )
             except CoreMutationOutcomeUnknownV2:
                 self._mark_unknown(replay)
@@ -1971,6 +1985,24 @@ class DesktopCoreBridgeV2:
                 response=result.project,
                 response_resource_id=result.project.project_id,
             )
+            if (
+                create.config.workspace.kind != "native_folder_snapshot"
+                and result.project.state != "ready"
+            ):
+                probe = self._new_project_create_client(result.connection, deadline)
+                try:
+                    self._wait_for_scratch_project_ready(
+                        probe,
+                        request=create,
+                        initial=result.project,
+                        expected_version=version,
+                        deadline=deadline,
+                        affected_resource_id=desktop_project_id,
+                        observed_sequences=observed_sequences,
+                        observed_cursors=observed_cursors,
+                    )
+                finally:
+                    self._close_client(probe, suppress_errors=True)
             return result.connection, version
         finally:
             self._close_bootstrap(bootstrap, suppress_errors=True)
@@ -1982,6 +2014,8 @@ class DesktopCoreBridgeV2:
         *,
         idempotency_key: str,
         deadline: float,
+        observed_sequences: dict[str, int],
+        observed_cursors: dict[str, str],
     ) -> CoreProjectBootstrapResultV2:
         if not _PROJECT_CREATE_CAPACITY.acquire(blocking=False):
             raise _bridge_error(
@@ -2020,8 +2054,6 @@ class DesktopCoreBridgeV2:
         except BaseException:
             _PROJECT_CREATE_CAPACITY.release()
             raise
-        observed_sequences: dict[str, int] = {}
-        observed_cursors: dict[str, str] = {}
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -2036,9 +2068,64 @@ class DesktopCoreBridgeV2:
                     observed_cursors,
                 )
 
+    def _wait_for_scratch_project_ready(
+        self,
+        client: CoreControlClientV2,
+        *,
+        request: core_v2.ProjectCreateV2,
+        initial: core_v2.ProjectV2,
+        expected_version: core_v2.VersionResponseV2,
+        deadline: float,
+        affected_resource_id: str,
+        observed_sequences: dict[str, int],
+        observed_cursors: dict[str, str],
+    ) -> core_v2.ProjectV2:
+        """Finish a durable scratch create after Core acknowledges it as not ready."""
+
+        if request.config.workspace.kind == "native_folder_snapshot":
+            return initial
+        negotiated = self._call_core(client.version, affected_resource_id)
+        if negotiated != expected_version:
+            raise _bridge_error(
+                "core_authority_changed",
+                "The negotiated Core authority changed while creating the project.",
+                status=502,
+                action="install_repair_daemon",
+                affected_resource_id=affected_resource_id,
+            )
+        project = initial
+        while True:
+            self._validate_project_intent(
+                project,
+                request,
+                allow_pending_scratch=True,
+            )
+            if project.state == "ready":
+                return project
+            if (
+                project.state != "not_ready"
+                or project.active_project_head is not None
+                or project.admission_etag is not None
+            ):
+                raise _bridge_error(
+                    "core_project_readiness_invalid",
+                    "The Core project entered an invalid creation readiness state.",
+                    status=502,
+                    action="install_repair_daemon",
+                    affected_resource_id=affected_resource_id,
+                )
+            self._observe_project_create_services(
+                client,
+                observed_sequences,
+                observed_cursors,
+            )
+            remaining = _remaining(deadline)
+            time.sleep(min(_PROJECT_CREATE_PROGRESS_POLL_SECONDS, remaining))
+            project = self._call_core(client.get_project, affected_resource_id)
+
     def _observe_project_create_services(
         self,
-        bootstrap: CoreProjectBootstrapClientV2,
+        bootstrap: CoreControlClientV2 | CoreProjectBootstrapClientV2,
         observed_sequences: dict[str, int],
         observed_cursors: dict[str, str],
     ) -> None:
@@ -2547,6 +2634,8 @@ class DesktopCoreBridgeV2:
     def _validate_project_intent(
         project: core_v2.ProjectV2,
         request: core_v2.ProjectCreateV2,
+        *,
+        allow_pending_scratch: bool = False,
     ) -> None:
         common_mismatch = (
             project.display_name != request.display_name
@@ -2560,6 +2649,8 @@ class DesktopCoreBridgeV2:
                 )
             else:
                 invalid_authority = project.admission_etag is None
+        elif allow_pending_scratch and project.active_project_head is None:
+            invalid_authority = project.state != "not_ready" or project.admission_etag is not None
         else:
             invalid_authority = (
                 project.active_project_head is None or project.admission_etag is None
@@ -2731,6 +2822,17 @@ class DesktopCoreBridgeV2:
             connection,
             transport=self._new_transport(),
             timeout=min(self._timeout, _remaining(deadline)),
+        )
+
+    def _new_project_create_client(
+        self,
+        connection: CoreTunnelConnectionV2,
+        deadline: float,
+    ) -> CoreControlClientV2:
+        return CoreControlClientV2(
+            connection,
+            transport=self._new_transport(),
+            timeout=_remaining(deadline),
         )
 
     def _new_bootstrap_client(

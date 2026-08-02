@@ -24,6 +24,7 @@ from tests.openevo.sidecar.test_core_client_v2 import (
     _canonical,
     _config,
     _head,
+    _not_ready_scratch_project,
     _project,
     _sse,
     _version,
@@ -370,6 +371,215 @@ def test_activation_bootstraps_only_through_private_project_tunnel_and_persists_
         assert not hasattr(bridge, "backend_url")
         bridge.close()
     assert len(tunnels.closed) == 1
+
+
+def test_activation_persists_not_ready_create_before_readiness_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "desktop.sidecar.core_bridge_v2._PROJECT_CREATE_PROGRESS_POLL_SECONDS",
+        0.001,
+    )
+    pending = _not_ready_scratch_project()
+    ready = _project()
+    first_requests: list[httpx.Request] = []
+
+    def first_handler(request: httpx.Request) -> httpx.Response:
+        first_requests.append(request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        if request.url.path == "/v2/system/status":
+            return httpx.Response(200, json=_status())
+        if request.url.path == "/v2/projects" and request.method == "POST":
+            return httpx.Response(201, json=pending.model_dump(mode="json"))
+        if request.url.path == "/v2/projects/project-1":
+            raise httpx.ConnectError("readiness tunnel interrupted", request=request)
+        raise AssertionError(f"unexpected Core request: {request.method} {request.url.path}")
+
+    action_id = "activate-project-not-ready-recovery-0001"
+    with _store(tmp_path) as store:
+        first = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(first_handler),
+        )
+        with pytest.raises(DesktopCoreBridgeErrorV2) as interrupted:
+            first.activate_project(
+                "desktop-project-1",
+                _create_request(),
+                idempotency_key=action_id,
+            )
+        first.close()
+
+        assert interrupted.value.error.code == "core_connection_failed"
+        replay = store.load_mutation(
+            "desktop-project-1",
+            "create_project_v2",
+            action_id,
+        )
+        assert replay is not None
+        assert replay.state.value == "applied"
+        assert replay.response_resource_id == "project-1"
+
+        recovery_requests: list[httpx.Request] = []
+
+        def recovery_handler(request: httpx.Request) -> httpx.Response:
+            recovery_requests.append(request)
+            if request.url.path == "/version":
+                return httpx.Response(200, json=_version())
+            if request.url.path == "/v2/system/status":
+                return httpx.Response(200, json=_status())
+            if request.url.path == "/v2/projects/project-1":
+                return httpx.Response(200, json=ready.model_dump(mode="json"))
+            if request.url.path == "/v2/capabilities":
+                return httpx.Response(200, json=_capabilities())
+            raise AssertionError(
+                f"unexpected recovery request: {request.method} {request.url.path}"
+            )
+
+        recovered = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(recovery_handler),
+        )
+        activation = recovered.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key=action_id,
+        )
+
+        assert activation.project == ready
+        assert not any(
+            request.method == "POST" and request.url.path == "/v2/projects"
+            for request in recovery_requests
+        )
+        recovered.close()
+
+    assert (
+        sum(
+            request.method == "POST" and request.url.path == "/v2/projects"
+            for request in first_requests
+        )
+        == 1
+    )
+
+
+def test_activation_waits_for_not_ready_scratch_and_streams_service_progress(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "desktop.sidecar.core_bridge_v2._PROJECT_CREATE_PROGRESS_POLL_SECONDS",
+        0.001,
+    )
+    pending = _not_ready_scratch_project()
+    ready = _project()
+    requests: list[httpx.Request] = []
+    project_reads = 0
+    output: list[tuple[str, bytes]] = []
+    progress: list[tuple[str, object, bool]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal project_reads
+        requests.append(request)
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        if request.url.path == "/v2/system/status":
+            return httpx.Response(200, json=_status())
+        if request.url.path == "/v2/projects" and request.method == "POST":
+            return httpx.Response(201, json=pending.model_dump(mode="json"))
+        if request.url.path == "/v2/projects/project-1":
+            project_reads += 1
+            project = pending if project_reads == 1 else ready
+            return httpx.Response(200, json=project.model_dump(mode="json"))
+        if request.url.path == "/v2/services":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "2",
+                    "items": [
+                        {
+                            "schema_version": "2",
+                            "service_id": "inference",
+                            "kind": "model",
+                            "status": "starting",
+                            "updated_at": "2026-07-23T06:00:00Z",
+                            "etag": '"' + "1" * 64 + '"',
+                        }
+                    ],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+        if request.url.path == "/v2/services/inference/logs":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "2",
+                    "items": [
+                        {
+                            "sequence": 1,
+                            "occurred_at": "2026-07-23T06:00:01Z",
+                            "stream": "stdout",
+                            "message": "Model download progress: 25% (32/128 bytes).",
+                        }
+                    ],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+        if request.url.path == "/v2/capabilities":
+            return httpx.Response(200, json=_capabilities())
+        raise AssertionError(f"unexpected Core request: {request.method} {request.url.path}")
+
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(handler),
+            output_observer=lambda source, chunk: output.append((source, chunk)),
+            progress_observer=lambda phase, value, cancellable: progress.append(
+                (phase, value, cancellable)
+            ),
+        )
+
+        activation = bridge.activate_project(
+            "desktop-project-1",
+            _create_request(),
+            idempotency_key="activate-project-not-ready-progress-0001",
+        )
+
+        assert activation.project == ready
+        assert project_reads >= 2
+        assert (
+            sum(
+                request.method == "POST" and request.url.path == "/v2/projects"
+                for request in requests
+            )
+            == 1
+        )
+        assert output == [
+            (
+                "daemon_stdout",
+                b"[inference] Model download progress: 25% (32/128 bytes).\n",
+            )
+        ]
+        assert any(
+            phase == "creating_remote_project"
+            and value
+            == local_v2.LifecycleProgressBytesV2(
+                kind="bytes",
+                completed=32,
+                total=128,
+            )
+            and cancellable is False
+            for phase, value, cancellable in progress
+        )
+        bridge.close()
 
 
 def test_activation_forwards_the_exact_cancellation_event_to_core_host_service(

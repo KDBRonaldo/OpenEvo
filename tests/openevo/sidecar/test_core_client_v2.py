@@ -162,6 +162,17 @@ def _project(project_id: str = "project-1") -> m.ProjectV2:
     )
 
 
+def _not_ready_scratch_project(project_id: str = "project-1") -> m.ProjectV2:
+    return _project(project_id).model_copy(
+        update={
+            "active_project_head": None,
+            "admission_etag": None,
+            "state": "not_ready",
+            "etag": '"' + "6" * 64 + '"',
+        }
+    )
+
+
 def _published_v019_project(project_id: str = "project-1") -> m.ProjectV2:
     payload = _project(project_id).model_dump(mode="json")
     head = payload["active_project_head"]
@@ -477,6 +488,37 @@ def test_bootstrap_freezes_request_and_binds_core_created_project() -> None:
                 m.ProjectCreateV2(display_name="Changed", config=_config()),
                 idempotency_key="create-project-0002",
             )
+
+
+def test_bootstrap_accepts_exact_not_ready_scratch_identity_for_durable_recovery() -> None:
+    request = m.ProjectCreateV2(display_name="Project", config=_config())
+    pending = _not_ready_scratch_project()
+
+    def handler(http_request: httpx.Request) -> httpx.Response:
+        if http_request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        assert http_request.url.path == "/v2/projects"
+        return httpx.Response(201, json=pending.model_dump(mode="json"))
+
+    connection = CoreBootstrapTunnelConnectionV2(
+        endpoint="http://127.0.0.1:49201",
+        bearer_token=_TOKEN,
+        profile_id="profile-1",
+        profile_connection_generation=3,
+        session_id="session-1",
+    )
+    with CoreProjectBootstrapClientV2(
+        connection,
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        client.version()
+        result = client.create_project(
+            request,
+            idempotency_key="create-project-not-ready-0001",
+        )
+
+    assert result.project == pending
+    assert result.connection.project_id == pending.project_id
 
 
 def test_capabilities_accept_json_arrays_but_reject_scalar_coercion() -> None:
