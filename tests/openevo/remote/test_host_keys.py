@@ -262,16 +262,18 @@ def test_store_allows_only_the_standard_macos_application_support_space(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     home = tmp_path / "Research User"
-    home.mkdir()
+    tmp_path.chmod(0o700)
+    home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
-    state_root = (
-        home
-        / "Library"
-        / "Application Support"
-        / "org.openevo.desktop"
-        / "state-v2"
-    )
+    state_root = home / "Library" / "Application Support" / "org.openevo.desktop" / "state-v2"
     state_root.mkdir(parents=True, mode=0o700)
+    for directory in (
+        home / "Library",
+        home / "Library" / "Application Support",
+        home / "Library" / "Application Support" / "org.openevo.desktop",
+        state_root,
+    ):
+        directory.chmod(0o700)
     ProviderKnownHostStore(
         state_root / "ssh-host-keys",
         secure_ancestor=state_root,
@@ -286,11 +288,7 @@ def test_store_allows_only_the_standard_macos_application_support_space(
         )
 
     lookalike_root = (
-        tmp_path
-        / "Library"
-        / "Application Support"
-        / "org.openevo.desktop"
-        / "state-v2"
+        tmp_path / "Library" / "Application Support" / "org.openevo.desktop" / "state-v2"
     )
     with pytest.raises(ValueError, match="path contains unsupported"):
         ProviderKnownHostStore(
@@ -501,15 +499,15 @@ def test_macos_store_paths_normalize_only_fixed_system_aliases(
     assert host_keys_module._canonical_darwin_system_alias(
         Path("/var/folders/user/state")
     ) == Path("/private/var/folders/user/state")
-    assert host_keys_module._canonical_darwin_system_alias(
-        Path("/tmp/openevo/state")
-    ) == Path("/private/tmp/openevo/state")
+    assert host_keys_module._canonical_darwin_system_alias(Path("/tmp/openevo/state")) == Path(
+        "/private/tmp/openevo/state"
+    )
     assert host_keys_module._canonical_darwin_system_alias(
         Path("/private/var/folders/user/state")
     ) == Path("/private/var/folders/user/state")
-    assert host_keys_module._canonical_darwin_system_alias(
-        Path("/Users/alice/state")
-    ) == Path("/Users/alice/state")
+    assert host_keys_module._canonical_darwin_system_alias(Path("/Users/alice/state")) == Path(
+        "/Users/alice/state"
+    )
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS system aliases")
@@ -524,11 +522,7 @@ def test_store_accepts_inode_bound_macos_var_alias() -> None:
             runner=KeyscanRunner(""),
         )
 
-        expected = (
-            Path("/private")
-            / requested_ancestor.relative_to("/")
-            / "known-hosts"
-        )
+        expected = Path("/private") / requested_ancestor.relative_to("/") / "known-hosts"
         assert store._root == expected
         requested = os.stat(requested_ancestor)
         opened = os.fstat(store._anchor._ancestor_fd)

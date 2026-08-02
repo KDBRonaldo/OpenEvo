@@ -16,6 +16,7 @@ from openevo.runtime.managed import (
     MANAGED_RUNTIME_RELEASES,
     MANAGED_SUBSCRIPTION_PREPARE_COMMAND,
 )
+from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 
 
 def _project(
@@ -69,6 +70,8 @@ def _project(
 def _binding(
     execution_mode: ServiceExecutionMode = ServiceExecutionMode.CODEX_SUBSCRIPTION_TRANSCRIPT,
 ) -> ServiceRunBinding:
+    self_deployed = execution_mode is ServiceExecutionMode.SELF_DEPLOYED
+    profile = require_release_self_deployed_model_profile("qwen3-0.6b-v1")
     identity = InternalServiceIdentity(
         service_id="core-control",
         generation_digest="b" * 64,
@@ -78,7 +81,7 @@ def _binding(
     )
     return ServiceRunBinding(
         execution_mode=execution_mode,
-        codex_model="gpt-5.5",
+        codex_model=profile.model_id if self_deployed else "gpt-5.5",
         runtime_image="openevo/science-runtime:0.1.1",
         runtime_image_immutable_reference=(
             MANAGED_RUNTIME_RELEASES["managed_science"].trusted_digest
@@ -90,6 +93,16 @@ def _binding(
         rollout_url="http://127.0.0.1:18100",
         evolution_backend_url="http://127.0.0.1:18200",
         gateway_url="http://127.0.0.1:18300",
+        self_deployed_profile_id=profile.profile_id if self_deployed else None,
+        self_deployed_profile_sha256=profile.profile_sha256 if self_deployed else None,
+        self_deployed_model_revision=(profile.model_revision if self_deployed else None),
+        self_deployed_model_snapshot_sha256=(
+            profile.model_snapshot_manifest_sha256 if self_deployed else None
+        ),
+        self_deployed_vllm_image=profile.vllm_image if self_deployed else None,
+        self_deployed_vllm_image_config_digest=(
+            profile.vllm_image_config_digest if self_deployed else None
+        ),
         _identity=identity,
     )
 
@@ -118,10 +131,7 @@ def test_project_compiles_to_single_session_existing_experiment_path(tmp_path: P
     )
     assert execution.config.runtime.container_user == "host"
     assert execution.config.runtime.env == {"HOME": MANAGED_HOME, "PATH": MANAGED_PATH}
-    assert (
-        execution.config.runtime.prepare[0].command
-        == MANAGED_SUBSCRIPTION_PREPARE_COMMAND
-    )
+    assert execution.config.runtime.prepare[0].command == MANAGED_SUBSCRIPTION_PREPARE_COMMAND
     assert "/openevo/session/logs/agent" in MANAGED_SUBSCRIPTION_PREPARE_COMMAND
     assert execution.config.tasks[0].instruction == project.task.objective
     assert execution.config.tasks[0].workspace is None

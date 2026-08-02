@@ -343,9 +343,11 @@ def test_trainer_service_recovers_exact_receipted_process_and_workdir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
     workers_root = artifact_root / "workers"
+    workers_root.mkdir(mode=0o700)
     work_dir = workers_root / f"sd-lora-{'a' * 32}"
-    work_dir.mkdir(mode=0o700, parents=True)
+    work_dir.mkdir(mode=0o700)
     request_id = f"sd-lora-{'b' * 24}"
     receipt = _process_receipt(65432, request_id)
     receipt_path = work_dir / f".{request_id}.active.json"

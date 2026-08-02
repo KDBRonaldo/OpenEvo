@@ -163,6 +163,7 @@ def _runtime_payload(
 def _assets(tmp_path: Path) -> tuple[Path, str, Path, str]:
     wheel = tmp_path / WHEEL_NAME
     wheel.write_bytes(b"sealed wheel bytes")
+    wheel.chmod(0o600)
     wheel_digest = hashlib.sha256(wheel.read_bytes()).hexdigest()
     lock = tmp_path / "framework-lock.json"
     lock.write_text(
@@ -179,6 +180,7 @@ def _assets(tmp_path: Path) -> tuple[Path, str, Path, str]:
         ),
         encoding="utf-8",
     )
+    lock.chmod(0o600)
     return wheel, wheel_digest, lock, hashlib.sha256(lock.read_bytes()).hexdigest()
 
 

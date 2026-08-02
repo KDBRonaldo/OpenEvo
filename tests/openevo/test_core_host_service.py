@@ -1216,7 +1216,9 @@ def test_observation_accepts_exact_published_v019_daemon_predecessor(
     root = _root(tmp_path)
     (root / "state").mkdir(mode=0o700)
     generation = "3" * 32
-    port = 8765
+    with socket.socket() as available:
+        available.bind(("127.0.0.1", 0))
+        port = int(available.getsockname()[1])
     bearer = "B" * 64
     launcher_process = controller.capture(4000)
     application_process = controller.capture(5000)
