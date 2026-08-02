@@ -26,6 +26,7 @@ from urllib.parse import unquote, urlparse
 import httpx
 
 from openevo.backend.workspace_handoff_v2 import (
+    RuntimeInjectedWorkspaceFileV2,
     WorkspaceHandoffErrorV2,
     WorkspaceHandoffStoreV2,
 )
@@ -1651,6 +1652,52 @@ def _admitted_revision_id(
     return revision_id
 
 
+def _runtime_injected_workspace_files(
+    result: SessionResult,
+) -> tuple[RuntimeInjectedWorkspaceFileV2, ...]:
+    """Project the verified runtime receipt onto ephemeral workspace targets."""
+
+    evolution = result.metadata.get("evolution")
+    if evolution is None:
+        return ()
+    if not isinstance(evolution, dict):
+        raise ValueError("evolution result metadata is invalid")
+    receipt = evolution.get("runtime_injection_receipt")
+    if evolution.get("context_injected") is not True:
+        if receipt is not None:
+            raise ValueError("runtime injection receipt lacks injected context authority")
+        return ()
+    if not isinstance(receipt, dict):
+        raise ValueError("injected context lacks a runtime injection receipt")
+    files = receipt.get("files")
+    if not isinstance(files, list) or len(files) > RUNTIME_READBACK_MAX_FILES:
+        raise ValueError("runtime injection receipt file inventory is invalid")
+    projected: list[RuntimeInjectedWorkspaceFileV2] = []
+    for item in files:
+        if not isinstance(item, dict) or set(item) != {
+            "relative_path",
+            "size_bytes",
+            "sha256",
+        }:
+            raise ValueError("runtime injection receipt file is invalid")
+        relative_path = item.get("relative_path")
+        if not isinstance(relative_path, str):
+            raise ValueError("runtime injection receipt path is invalid")
+        if not relative_path.startswith("agent_system_targets/"):
+            continue
+        target_path = relative_path.removeprefix("agent_system_targets/")
+        projected.append(
+            RuntimeInjectedWorkspaceFileV2(
+                relative_path=target_path,
+                size_bytes=item.get("size_bytes"),
+                sha256=item.get("sha256"),
+            )
+        )
+    if len({item.relative_path for item in projected}) != len(projected):
+        raise ValueError("runtime injection receipt repeats a workspace target")
+    return tuple(projected)
+
+
 async def _runtime_injection_receipt_from_readback(
     *,
     runtime: BaseRuntime,
@@ -1918,10 +1965,7 @@ def _is_codex_subscription_agent(agent) -> bool:
 
 
 def _requires_postruntime_terminal_finalization(request: SessionDispatchRequest) -> bool:
-    return (
-        _is_codex_subscription_agent(request.agent)
-        or request.workspace_handoff is not None
-    )
+    return _is_codex_subscription_agent(request.agent) or request.workspace_handoff is not None
 
 
 def _is_subscription_agent(agent) -> bool:
@@ -2063,9 +2107,7 @@ class GatewayNodeManager:
             self._register_cleanup_retry(
                 managed,
                 eval_runtime=eval_runtime or managed.eval_runtime,
-                finalize_terminal=_requires_postruntime_terminal_finalization(
-                    managed.request
-                ),
+                finalize_terminal=_requires_postruntime_terminal_finalization(managed.request),
             )
         await self._reconcile_cleanup_retries()
         if self.evolution_client is not None:
@@ -2901,6 +2943,8 @@ class GatewayNodeManager:
                     managed,
                 )
                 self._publish_runtime_injection_receipt(managed, receipt)
+                if _requires_postruntime_terminal_finalization(managed.request):
+                    self._persist_terminal_finalization_authority(managed)
             self._redact_core_capture_authority(managed)
 
         except GatewayExecutionTimeout as exc:
@@ -3858,11 +3902,21 @@ class GatewayNodeManager:
         store = self._workspace_handoff_store
         if store is None:
             raise WorkspaceHandoffErrorV2("opaque workspace handoff authority is unavailable")
+        try:
+            runtime_injected_files = _runtime_injected_workspace_files(result)
+        except (TypeError, ValueError) as exc:
+            error = f"workspace acceptance rejected runtime injection authority: {exc}"
+            return self._terminal_result_from_base(
+                result,
+                SessionStatus.ERROR,
+                error,
+            )
         workspace_result = await asyncio.to_thread(
             store.publish_result,
             binding,
             session_id=managed.request.session_id,
             workspace_root=managed.session_dir / "workspace",
+            runtime_injected_files=runtime_injected_files,
             now=datetime.now(timezone.utc),
         )
         return result.model_copy(update={"workspace_result": workspace_result})
@@ -4654,9 +4708,7 @@ class GatewayNodeManager:
             ownership = self._cleanup_ownership_for(
                 managed,
                 eval_runtime=managed.eval_runtime,
-                finalize_terminal=_requires_postruntime_terminal_finalization(
-                    managed.request
-                ),
+                finalize_terminal=_requires_postruntime_terminal_finalization(managed.request),
             )
         finalization_state = ownership.finalization_state
         if finalization_state is not None:
@@ -6684,9 +6736,8 @@ class GatewayNodeManager:
             }:
                 raise ValueError("terminal pending status is invalid")
             request = SessionDispatchRequest.model_validate(finalization_payload["request"])
-            if (
-                request.session_id != session_id
-                or not _requires_postruntime_terminal_finalization(request)
+            if request.session_id != session_id or not _requires_postruntime_terminal_finalization(
+                request
             ):
                 raise ValueError("terminal finalization request is invalid")
             agent_payload = finalization_payload["agent_result"]

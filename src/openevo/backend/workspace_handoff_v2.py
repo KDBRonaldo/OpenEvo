@@ -29,10 +29,12 @@ from pydantic import BaseModel, Field, model_validator
 from openevo.backend.contracts.v1.models import WorkspaceArchiveDeclarationV1
 from openevo.backend.contracts.v1.workspace import (
     WorkspaceArchiveError,
+    restore_runtime_injected_workspace_files,
     verify_and_materialize_workspace,
 )
 from openevo.backend.contracts.v2 import models as m2
 from openevo.backend.contracts.v2.snapshots import canonical_contract_bytes
+from openevo.evolution.agent_system import normalize_agent_system_target_path
 from openevo.evolution.materialization_root_lock import MaterializationRootLock
 from openevo.workspace_archive import (
     WorkspaceArchiveBuildError,
@@ -190,6 +192,20 @@ class WorkspaceResultReceiptV2(_HandoffModel):
         expected = hashlib.sha256(self.canonical_manifest_bytes()).hexdigest()
         if self.result_manifest_sha256 != expected:
             raise ValueError("workspace result receipt digest is invalid")
+        return self
+
+
+class RuntimeInjectedWorkspaceFileV2(_HandoffModel):
+    """Private authority for one native harness file injected by Core."""
+
+    relative_path: str = Field(min_length=1, max_length=256)
+    size_bytes: int = Field(ge=0, le=m2.MAX_SNAPSHOT_BYTES)
+    sha256: str = Field(pattern=_SHA256_PATTERN)
+
+    @model_validator(mode="after")
+    def _canonical_agent_system_path(self) -> RuntimeInjectedWorkspaceFileV2:
+        if normalize_agent_system_target_path(self.relative_path) != self.relative_path:
+            raise ValueError("runtime-injected workspace path must be canonical")
         return self
 
 
@@ -445,10 +461,20 @@ class WorkspaceHandoffStoreV2:
         *,
         session_id: str,
         workspace_root: Path | str,
+        runtime_injected_files: tuple[RuntimeInjectedWorkspaceFileV2, ...] = (),
         now: datetime,
     ) -> WorkspaceResultReceiptV2:
         binding = _exact_model(WorkspaceHandoffBindingV2, binding)
         session_id = _resource_id(session_id, label="session")
+        if not isinstance(runtime_injected_files, tuple):
+            raise TypeError("runtime-injected workspace inventory must be a tuple")
+        runtime_injected_files = tuple(
+            _exact_model(RuntimeInjectedWorkspaceFileV2, item) for item in runtime_injected_files
+        )
+        if len({item.relative_path for item in runtime_injected_files}) != len(
+            runtime_injected_files
+        ):
+            raise ValueError("runtime-injected workspace paths must be unique")
         with self._lock, self._reader() as connection:
             row, recovered = self._load_row(connection, binding.handoff_id)
             if recovered != binding or row["session_id"] != session_id:
@@ -465,6 +491,27 @@ class WorkspaceHandoffStoreV2:
                 raise WorkspaceHandoffConflictV2(
                     "workspace result publication is already in progress"
                 )
+
+        if runtime_injected_files:
+            absolute_workspace = Path(workspace_root).expanduser().absolute()
+            parent_fd = _open_private_directory(absolute_workspace.parent)
+            try:
+                restore_runtime_injected_workspace_files(
+                    self.root / _INPUT_DIRECTORY / _archive_name(binding.handoff_id),
+                    _v1_declaration(binding.input_archive),
+                    archive_root_fd=self._inputs_fd,
+                    archive_name=_archive_name(binding.handoff_id),
+                    workspace_parent_fd=parent_fd,
+                    workspace_name=absolute_workspace.name,
+                    injected_files={
+                        item.relative_path: (item.size_bytes, item.sha256)
+                        for item in runtime_injected_files
+                    },
+                )
+            except (WorkspaceArchiveError, OSError) as exc:
+                raise WorkspaceHandoffConflictV2(str(exc)) from exc
+            finally:
+                os.close(parent_fd)
 
         temporary = f".workspace-handoff-{secrets.token_hex(16)}.tmp"
         descriptor = -1
@@ -1277,6 +1324,7 @@ def _v1_declaration(
 
 
 __all__ = [
+    "RuntimeInjectedWorkspaceFileV2",
     "WorkspaceHandoffBindingV2",
     "WorkspaceHandoffConflictV2",
     "WorkspaceHandoffErrorV2",

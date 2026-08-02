@@ -157,6 +157,20 @@ authoritative artifact bytes, then compares every ordered file digest,
 instruction digest, artifact runtime path, and tree digest before allowing the
 session to succeed.
 
+Harness-native instruction targets under the runtime workdir are a transient
+Core overlay, not user workspace output. After runtime absence is proven and
+the readback receipt has pinned each target's exact bytes, the opaque workspace
+handoff restores any pre-existing target from the immutable input archive or
+removes a target that did not previously exist. Parent directories created only
+for that overlay are removed when empty. The restore uses a verified private
+input materialization and FD-relative, no-follow, idempotent transitions, so a
+terminal-finalization retry observes either the injected bytes or the restored
+input bytes and can safely continue. A target with any third state fails closed;
+an injected context without its durable readback receipt cannot publish a
+workspace result. This keeps `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, and OpenHands
+microagent injection available to the active harness without leaking it into
+the successor workspace snapshot.
+
 For a custom target directory, non-Linux Core host, or third-party runtime,
 Gateway preserves the public backend download path. It ignores backend-returned
 inventory and downloads below a held private temporary root with a concurrent

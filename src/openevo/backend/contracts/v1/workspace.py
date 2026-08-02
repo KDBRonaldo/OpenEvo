@@ -10,6 +10,7 @@ import stat
 import sys
 import unicodedata
 import uuid
+from typing import Mapping
 
 from .models import WorkspaceArchiveDeclarationV1
 
@@ -19,6 +20,7 @@ _ZERO_BLOCK = b"\0" * _BLOCK_SIZE
 _OCTAL_7 = re.compile(rb"^[0-7]{7}\0$")
 _OCTAL_11 = re.compile(rb"^[0-7]{11}\0$")
 _CHECKSUM = re.compile(rb"^[0-7]{6}\0 $")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$", re.ASCII)
 _RENAME_NOREPLACE = 1
 _RENAME_EXCL = 0x00000004
 
@@ -87,9 +89,7 @@ def verify_and_materialize_workspace(
             temporary_identity,
         )
         if not _same_identity(os.fstat(temporary_fd), temporary_identity):
-            raise WorkspaceArchiveError(
-                "published workspace snapshot binding changed"
-            )
+            raise WorkspaceArchiveError("published workspace snapshot binding changed")
     except Exception:
         if published:
             _remove_tree_at(
@@ -179,6 +179,143 @@ def verify_materialized_workspace(
         if snapshot_fd is not None:
             os.close(snapshot_fd)
         stream.close()
+
+
+def restore_runtime_injected_workspace_files(
+    archive_path: Path,
+    declaration: WorkspaceArchiveDeclarationV1,
+    *,
+    archive_root_fd: int,
+    archive_name: str,
+    workspace_parent_fd: int,
+    workspace_name: str,
+    injected_files: Mapping[str, tuple[int, str]],
+) -> None:
+    """Restore Core-injected instruction files from the immutable input workspace.
+
+    The runtime is required to be absent before this operation.  A verified copy of
+    the input archive is materialized beside the working workspace and owns every
+    replacement/discard until the accepted workspace archive has been built.  Each
+    transition is idempotent so terminal-finalization recovery may retry after a
+    process exit at any instruction boundary.
+    """
+
+    if not injected_files:
+        return
+    if (
+        not isinstance(workspace_name, str)
+        or "/" in workspace_name
+        or workspace_name in {"", ".", ".."}
+    ):
+        raise WorkspaceArchiveError("runtime-injected workspace root is invalid")
+    if len(injected_files) > 128:
+        raise WorkspaceArchiveError("runtime-injected workspace inventory exceeds its bound")
+    normalized: dict[str, tuple[int, str]] = {}
+    for path, authority in injected_files.items():
+        if not isinstance(path, str):
+            raise WorkspaceArchiveError("runtime-injected workspace path is invalid")
+        _validate_logical_path(path)
+        if (
+            not isinstance(authority, tuple)
+            or len(authority) != 2
+            or isinstance(authority[0], bool)
+            or not isinstance(authority[0], int)
+            or not 0 <= authority[0] <= declaration.policy.max_extracted_bytes
+            or not isinstance(authority[1], str)
+            or _SHA256.fullmatch(authority[1]) is None
+        ):
+            raise WorkspaceArchiveError("runtime-injected workspace authority is invalid")
+        normalized[path] = authority
+    if len(normalized) != len(injected_files):
+        raise WorkspaceArchiveError("runtime-injected workspace paths must be unique")
+
+    _validate_directory_metadata(
+        os.fstat(workspace_parent_fd),
+        mode=0o700,
+        label="workspace parent",
+    )
+    baseline_name = f".workspace-runtime-baseline-{uuid.uuid4().hex}.tmp"
+    baseline_identity: os.stat_result | None = None
+    baseline_fd: int | None = None
+    workspace_fd: int | None = None
+    try:
+        os.mkdir(baseline_name, mode=0o700, dir_fd=workspace_parent_fd)
+        baseline_identity = os.stat(
+            baseline_name,
+            dir_fd=workspace_parent_fd,
+            follow_symlinks=False,
+        )
+        baseline_fd = os.open(
+            baseline_name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=workspace_parent_fd,
+        )
+        if not _same_identity(os.fstat(baseline_fd), baseline_identity):
+            raise WorkspaceArchiveError("runtime baseline binding changed")
+        _validate_directory_metadata(os.fstat(baseline_fd), mode=0o700, label="runtime baseline")
+        _require_entry_binding(workspace_parent_fd, baseline_name, baseline_identity)
+
+        parent_paths = frozenset(
+            "/".join(parts[:depth])
+            for path in normalized
+            for parts in (path.split("/"),)
+            for depth in range(1, len(parts))
+        )
+        stream, archive_identity = _open_verified_archive(
+            archive_path,
+            declaration,
+            parent_fd=archive_root_fd,
+            entry_name=archive_name,
+        )
+        try:
+            selected_files, present_directories = _parse_and_verify_archive(
+                stream,
+                declaration,
+                extract_root_fd=None,
+                verify_root_fd=None,
+                selected_root_fd=baseline_fd,
+                selected_paths=frozenset(normalized),
+                selected_directories=parent_paths,
+            )
+            os.fsync(baseline_fd)
+            _finish_verified_archive(
+                archive_path,
+                stream,
+                archive_identity,
+                declaration,
+                parent_fd=archive_root_fd,
+                entry_name=archive_name,
+            )
+        finally:
+            stream.close()
+
+        workspace_fd = os.open(
+            workspace_name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=workspace_parent_fd,
+        )
+        _validate_directory_metadata(os.fstat(workspace_fd), mode=0o700, label="working workspace")
+        _require_entry_binding(workspace_parent_fd, baseline_name, baseline_identity)
+        _restore_runtime_injected_files(
+            workspace_fd,
+            baseline_fd,
+            normalized,
+            selected_files=selected_files,
+            present_directories=present_directories,
+        )
+        _require_entry_binding(workspace_parent_fd, baseline_name, baseline_identity)
+        os.fsync(workspace_fd)
+    finally:
+        if workspace_fd is not None:
+            os.close(workspace_fd)
+        if baseline_fd is not None:
+            os.close(baseline_fd)
+        if baseline_identity is not None:
+            _remove_tree_at(
+                workspace_parent_fd,
+                baseline_name,
+                expected_identity=baseline_identity,
+            )
 
 
 def _open_verified_archive(
@@ -296,16 +433,23 @@ def _parse_and_verify_archive(
     *,
     extract_root_fd: int | None,
     verify_root_fd: int | None,
-) -> None:
+    selected_root_fd: int | None = None,
+    selected_paths: frozenset[str] = frozenset(),
+    selected_directories: frozenset[str] = frozenset(),
+) -> tuple[dict[str, str], set[str]]:
     reader = _DigestingReader(stream)
-    _parse_archive(
+    selection = _parse_archive(
         reader,
         declaration,
         extract_root_fd=extract_root_fd,
         verify_root_fd=verify_root_fd,
+        selected_root_fd=selected_root_fd,
+        selected_paths=selected_paths,
+        selected_directories=selected_directories,
     )
     if reader.hexdigest() != declaration.content_sha256:
         raise WorkspaceArchiveError("workspace archive digest differs from its declaration")
+    return selection
 
 
 def _parse_archive(
@@ -314,7 +458,18 @@ def _parse_archive(
     *,
     extract_root_fd: int | None,
     verify_root_fd: int | None,
-) -> None:
+    selected_root_fd: int | None,
+    selected_paths: frozenset[str],
+    selected_directories: frozenset[str],
+) -> tuple[dict[str, str], set[str]]:
+    if selected_root_fd is None and (selected_paths or selected_directories):
+        raise WorkspaceArchiveError("selected workspace extraction root is missing")
+    if selected_root_fd is not None and (
+        extract_root_fd is not None or verify_root_fd is not None
+    ):
+        raise WorkspaceArchiveError("workspace extraction authorities overlap")
+    selected_files: dict[str, str] = {}
+    present_selected_directories: set[str] = set()
     entries: set[str] = set()
     directories: set[str] = set()
     expected_children: dict[str, set[str]] = {"": set()}
@@ -354,6 +509,12 @@ def _parse_archive(
             raise WorkspaceArchiveError("workspace archive exceeds its extracted byte budget")
 
         if entry.directory:
+            if logical_path in selected_paths:
+                raise WorkspaceArchiveError(
+                    "runtime-injected input workspace target is not a regular file"
+                )
+            if logical_path in selected_directories:
+                present_selected_directories.add(logical_path)
             directories.add(logical_path)
             expected_children.setdefault(logical_path, set())
             if extract_root_fd is not None:
@@ -372,8 +533,25 @@ def _parse_archive(
         output_fd: int | None = None
         verified_fd: int | None = None
         try:
+            if logical_path in selected_directories:
+                raise WorkspaceArchiveError(
+                    "runtime-injected input workspace parent is not a directory"
+                )
             if extract_root_fd is not None:
                 output_fd = _create_file_at(extract_root_fd, logical_path)
+            elif selected_root_fd is not None and logical_path in selected_paths:
+                selected_name = f"selected-{len(selected_files):08d}"
+                output_fd = os.open(
+                    selected_name,
+                    os.O_WRONLY
+                    | os.O_CREAT
+                    | os.O_EXCL
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    0o600,
+                    dir_fd=selected_root_fd,
+                )
+                selected_files[logical_path] = selected_name
             if verify_root_fd is not None:
                 verified_fd = _open_file_at(verify_root_fd, logical_path)
                 _validate_file_metadata(os.fstat(verified_fd), size=entry.size, mode=entry.mode)
@@ -406,6 +584,7 @@ def _parse_archive(
         raise WorkspaceArchiveError("workspace extracted size differs from its declaration")
     if verify_root_fd is not None:
         _validate_tree_shape(verify_root_fd, expected_children)
+    return selected_files, present_selected_directories
 
 
 class _Entry:
@@ -640,6 +819,318 @@ def _validate_tree_shape(root_fd: int, expected_children: dict[str, set[str]]) -
             os.close(directory_fd)
 
 
+def _restore_runtime_injected_files(
+    workspace_fd: int,
+    baseline_fd: int,
+    injected_files: Mapping[str, tuple[int, str]],
+    *,
+    selected_files: Mapping[str, str],
+    present_directories: set[str],
+) -> None:
+    parent_paths: set[str] = set()
+    for path, (expected_size, expected_sha256) in injected_files.items():
+        parts = path.split("/")
+        parent_paths.update("/".join(parts[:depth]) for depth in range(1, len(parts)))
+        selected_name = selected_files.get(path)
+        baseline = (
+            None
+            if selected_name is None
+            else _open_optional_runtime_file(
+                baseline_fd,
+                selected_name,
+                label="input workspace",
+            )
+        )
+        if selected_name is not None and baseline is None:
+            raise WorkspaceArchiveError("selected input workspace file disappeared")
+        current = _open_optional_runtime_file(workspace_fd, path, label="working workspace")
+        try:
+            if baseline is None and current is None:
+                continue
+            baseline_state = None if baseline is None else _runtime_file_state(baseline)
+            current_state = None if current is None else _runtime_file_state(current)
+            if baseline_state is not None and current_state == baseline_state:
+                continue
+            if (
+                current_state is None
+                or current_state[0] != expected_size
+                or current_state[1] != expected_sha256
+            ):
+                raise WorkspaceArchiveError("runtime-injected workspace file changed")
+            assert current is not None
+            if baseline is None:
+                _discard_runtime_file(current, baseline_fd)
+            else:
+                _replace_runtime_file(current, baseline, baseline_fd)
+        finally:
+            _close_runtime_file(current)
+            _close_runtime_file(baseline)
+
+    for path in sorted(parent_paths, key=lambda value: (-value.count("/"), value)):
+        if path in present_directories:
+            continue
+        _discard_empty_runtime_directory(workspace_fd, baseline_fd, path)
+
+
+def _open_optional_parent(root_fd: int, path: str, *, label: str) -> int | None:
+    current_fd = os.dup(root_fd)
+    try:
+        if not path:
+            return current_fd
+        for part in path.split("/"):
+            try:
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=current_fd,
+                )
+            except FileNotFoundError:
+                os.close(current_fd)
+                return None
+            except OSError as exc:
+                raise WorkspaceArchiveError(f"{label} runtime-injection parent is unsafe") from exc
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        if current_fd >= 0:
+            os.close(current_fd)
+        raise
+
+
+def _open_optional_runtime_file(
+    root_fd: int,
+    path: str,
+    *,
+    label: str,
+) -> tuple[int, str, int, os.stat_result] | None:
+    parent, _, name = path.rpartition("/")
+    parent_fd = _open_optional_parent(root_fd, parent, label=label)
+    if parent_fd is None:
+        return None
+    descriptor = -1
+    try:
+        try:
+            before = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            os.close(parent_fd)
+            return None
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_uid != os.geteuid()
+            or before.st_nlink != 1
+        ):
+            raise WorkspaceArchiveError(f"{label} runtime-injection file is unsafe")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_NONBLOCK", 0),
+            dir_fd=parent_fd,
+        )
+        opened = os.fstat(descriptor)
+        if not _same_file_state(opened, before):
+            raise WorkspaceArchiveError(f"{label} runtime-injection file changed")
+        _require_entry_binding(parent_fd, name, before)
+        return parent_fd, name, descriptor, before
+    except WorkspaceArchiveError:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+        raise
+    except OSError as exc:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+        raise WorkspaceArchiveError(f"{label} runtime-injection file is unsafe") from exc
+
+
+def _close_runtime_file(
+    opened: tuple[int, str, int, os.stat_result] | None,
+) -> None:
+    if opened is None:
+        return
+    os.close(opened[2])
+    os.close(opened[0])
+
+
+def _runtime_file_state(
+    opened: tuple[int, str, int, os.stat_result],
+) -> tuple[int, str, int]:
+    parent_fd, name, descriptor, identity = opened
+    current = os.fstat(descriptor)
+    if not _same_file_state(current, identity):
+        raise WorkspaceArchiveError("runtime-injected workspace file changed")
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < current.st_size:
+        chunk = os.pread(descriptor, min(1024 * 1024, current.st_size - offset), offset)
+        if not chunk:
+            raise WorkspaceArchiveError("runtime-injected workspace file is truncated")
+        digest.update(chunk)
+        offset += len(chunk)
+    if not _same_file_state(os.fstat(descriptor), identity):
+        raise WorkspaceArchiveError("runtime-injected workspace file changed")
+    _require_entry_binding(parent_fd, name, identity)
+    return current.st_size, digest.hexdigest(), stat.S_IMODE(current.st_mode)
+
+
+def _replace_runtime_file(
+    current: tuple[int, str, int, os.stat_result],
+    baseline: tuple[int, str, int, os.stat_result],
+    baseline_root_fd: int,
+) -> None:
+    current_parent, current_name, _current_fd, current_identity = current
+    _baseline_parent, _baseline_name, baseline_source_fd, baseline_identity = baseline
+    temporary_name = f".runtime-restore-{uuid.uuid4().hex}.tmp"
+    temporary_fd = -1
+    moved = False
+    try:
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=baseline_root_fd,
+        )
+        offset = 0
+        while offset < baseline_identity.st_size:
+            chunk = os.pread(
+                baseline_source_fd,
+                min(1024 * 1024, baseline_identity.st_size - offset),
+                offset,
+            )
+            if not chunk:
+                raise WorkspaceArchiveError("input workspace restore source is truncated")
+            _write_all(temporary_fd, chunk)
+            offset += len(chunk)
+        os.fchmod(temporary_fd, stat.S_IMODE(baseline_identity.st_mode))
+        os.fsync(temporary_fd)
+        temporary_identity = os.fstat(temporary_fd)
+        _validate_file_metadata(
+            temporary_identity,
+            size=baseline_identity.st_size,
+            mode=stat.S_IMODE(baseline_identity.st_mode),
+        )
+        _require_entry_binding(baseline_root_fd, temporary_name, temporary_identity)
+        _runtime_file_state(current)
+        os.replace(
+            temporary_name,
+            current_name,
+            src_dir_fd=baseline_root_fd,
+            dst_dir_fd=current_parent,
+        )
+        moved = True
+        os.fsync(current_parent)
+        _require_entry_binding(current_parent, current_name, temporary_identity)
+        restored = _open_optional_runtime_file(
+            current_parent,
+            current_name,
+            label="restored workspace",
+        )
+        try:
+            if restored is None or _runtime_file_state(restored) != _runtime_file_state(baseline):
+                raise WorkspaceArchiveError("runtime-injected workspace restore changed")
+        finally:
+            _close_runtime_file(restored)
+    except WorkspaceArchiveError:
+        raise
+    except OSError as exc:
+        raise WorkspaceArchiveError(
+            "runtime-injected workspace file could not be restored"
+        ) from exc
+    finally:
+        if temporary_fd >= 0:
+            os.close(temporary_fd)
+        if not moved:
+            try:
+                os.unlink(temporary_name, dir_fd=baseline_root_fd)
+            except FileNotFoundError:
+                pass
+
+
+def _discard_runtime_file(
+    current: tuple[int, str, int, os.stat_result],
+    quarantine_root_fd: int,
+) -> None:
+    parent_fd, name, descriptor, identity = current
+    quarantine_name = f".runtime-discard-{uuid.uuid4().hex}"
+    _runtime_file_state(current)
+    try:
+        _rename_noreplace_between(
+            name,
+            quarantine_name,
+            source_directory_fd=parent_fd,
+            destination_directory_fd=quarantine_root_fd,
+        )
+        os.fsync(parent_fd)
+        os.fsync(quarantine_root_fd)
+        _require_entry_binding(quarantine_root_fd, quarantine_name, identity)
+        if not _same_identity(os.fstat(descriptor), identity):
+            raise WorkspaceArchiveError("discarded runtime-injection file changed")
+    except WorkspaceArchiveError:
+        raise
+    except OSError as exc:
+        raise WorkspaceArchiveError(
+            "runtime-injected workspace file could not be removed"
+        ) from exc
+
+
+def _discard_empty_runtime_directory(
+    workspace_fd: int,
+    quarantine_root_fd: int,
+    path: str,
+) -> None:
+    parent, _, name = path.rpartition("/")
+    parent_fd = _open_optional_parent(workspace_fd, parent, label="working workspace")
+    if parent_fd is None:
+        return
+    descriptor = -1
+    try:
+        try:
+            identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if not stat.S_ISDIR(identity.st_mode) or identity.st_uid != os.geteuid():
+            raise WorkspaceArchiveError("runtime-injection parent directory is unsafe")
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=parent_fd,
+        )
+        if not _same_identity(os.fstat(descriptor), identity):
+            raise WorkspaceArchiveError("runtime-injection parent directory changed")
+        _require_entry_binding(parent_fd, name, identity)
+        if os.listdir(descriptor):
+            return
+        quarantine_name = f".runtime-discard-{uuid.uuid4().hex}"
+        _rename_noreplace_between(
+            name,
+            quarantine_name,
+            source_directory_fd=parent_fd,
+            destination_directory_fd=quarantine_root_fd,
+        )
+        os.fsync(parent_fd)
+        os.fsync(quarantine_root_fd)
+        _require_entry_binding(quarantine_root_fd, quarantine_name, identity)
+        if not _same_identity(os.fstat(descriptor), identity):
+            raise WorkspaceArchiveError("discarded runtime-injection directory changed")
+    except WorkspaceArchiveError:
+        raise
+    except OSError as exc:
+        raise WorkspaceArchiveError(
+            "runtime-injection parent directory could not be removed"
+        ) from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(parent_fd)
+
+
 def _read_exact(fd: int, size: int) -> bytes:
     chunks: list[bytes] = []
     remaining = size
@@ -808,6 +1299,21 @@ def _quarantine_entry_noreplace(parent_fd: int, name: str) -> str:
 
 
 def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> None:
+    _rename_noreplace_between(
+        source,
+        destination,
+        source_directory_fd=directory_fd,
+        destination_directory_fd=directory_fd,
+    )
+
+
+def _rename_noreplace_between(
+    source: str,
+    destination: str,
+    *,
+    source_directory_fd: int,
+    destination_directory_fd: int,
+) -> None:
     libc = ctypes.CDLL(None, use_errno=True)
     if sys.platform == "linux":
         rename = getattr(libc, "renameat2", None)
@@ -833,9 +1339,9 @@ def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> No
     )
     rename.restype = ctypes.c_int
     result = rename(
-        directory_fd,
+        source_directory_fd,
         os.fsencode(source),
-        directory_fd,
+        destination_directory_fd,
         os.fsencode(destination),
         flag,
     )
@@ -846,6 +1352,7 @@ def _rename_noreplace(source: str, destination: str, *, directory_fd: int) -> No
 
 __all__ = [
     "WorkspaceArchiveError",
+    "restore_runtime_injected_workspace_files",
     "verify_and_materialize_workspace",
     "verify_materialized_workspace",
     "verify_workspace_archive",

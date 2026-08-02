@@ -12,6 +12,7 @@ import pytest
 
 from openevo.backend.contracts.v2.models import WorkspaceSnapshotRefV2
 from openevo.backend.workspace_handoff_v2 import (
+    RuntimeInjectedWorkspaceFileV2,
     WorkspaceHandoffConflictV2,
     WorkspaceHandoffIntegrityErrorV2,
     WorkspaceHandoffRequestV2,
@@ -247,6 +248,155 @@ def test_workspace_result_rejects_symlink_and_retains_no_receipt(tmp_path) -> No
             now=NOW,
         )
     assert store.get_result(binding.handoff_id) is None
+    store.close()
+
+
+def _injected_file(relative_path: str, payload: bytes) -> RuntimeInjectedWorkspaceFileV2:
+    return RuntimeInjectedWorkspaceFileV2(
+        relative_path=relative_path,
+        size_bytes=len(payload),
+        sha256=hashlib.sha256(payload).hexdigest(),
+    )
+
+
+def _claimed_materialized_handoff(tmp_path, source):
+    store = WorkspaceHandoffStoreV2(tmp_path / "handoffs")
+    request = _request(source, tmp_path)
+    binding = store.reserve(request, source, now=NOW)
+    store.claim(
+        binding,
+        session_id="sk-openevo-session-1",
+        generation_sha256=request.service_generation_sha256,
+        registry_sha256=request.registry_sha256,
+        framework_lock_sha256=request.framework_lock_sha256,
+    )
+    session = tmp_path / "session"
+    session.mkdir(mode=0o700)
+    store.materialize_input(
+        binding,
+        session_id="sk-openevo-session-1",
+        destination_parent=session,
+    )
+    return store, binding, session / "workspace"
+
+
+def test_workspace_result_removes_unchanged_runtime_injection_and_empty_parents(
+    tmp_path,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    store, binding, workspace = _claimed_materialized_handoff(tmp_path, source)
+    injected = b"# Evolved agent system\n"
+    target = workspace / ".openhands" / "microagents" / "openevo.md"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(injected)
+
+    receipt = store.publish_result(
+        binding,
+        session_id="sk-openevo-session-1",
+        workspace_root=workspace,
+        runtime_injected_files=(_injected_file(".openhands/microagents/openevo.md", injected),),
+        now=NOW,
+    )
+
+    assert receipt.output_archive == binding.input_archive
+    assert list(workspace.iterdir()) == []
+    store.close()
+
+
+def test_workspace_result_restores_preexisting_runtime_injection_target(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    original = b"# Repository instructions\n"
+    (source / "AGENTS.md").write_bytes(original)
+    (source / "AGENTS.md").chmod(0o755)
+    store, binding, workspace = _claimed_materialized_handoff(tmp_path, source)
+    injected = b"# Evolved agent system\n"
+    (workspace / "AGENTS.md").write_bytes(injected)
+    (workspace / "AGENTS.md").chmod(0o644)
+
+    receipt = store.publish_result(
+        binding,
+        session_id="sk-openevo-session-1",
+        workspace_root=workspace,
+        runtime_injected_files=(_injected_file("AGENTS.md", injected),),
+        now=NOW,
+    )
+
+    assert receipt.output_archive == binding.input_archive
+    assert (workspace / "AGENTS.md").read_bytes() == original
+    assert (workspace / "AGENTS.md").stat().st_mode & 0o777 == 0o755
+    store.close()
+
+
+def test_workspace_result_rejects_a_changed_runtime_injection_target(tmp_path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    store, binding, workspace = _claimed_materialized_handoff(tmp_path, source)
+    injected = b"# Evolved agent system\n"
+    (workspace / "AGENTS.md").write_bytes(b"agent changed it\n")
+
+    with pytest.raises(
+        WorkspaceHandoffConflictV2,
+        match="runtime-injected workspace file changed",
+    ):
+        store.publish_result(
+            binding,
+            session_id="sk-openevo-session-1",
+            workspace_root=workspace,
+            runtime_injected_files=(_injected_file("AGENTS.md", injected),),
+            now=NOW,
+        )
+
+    assert store.get_result(binding.handoff_id) is None
+    store.close()
+
+
+def test_workspace_runtime_injection_restore_is_idempotent_after_archive_failure(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    original = b"# Repository instructions\n"
+    (source / "AGENTS.md").write_bytes(original)
+    store, binding, workspace = _claimed_materialized_handoff(tmp_path, source)
+    injected = b"# Evolved agent system\n"
+    (workspace / "AGENTS.md").write_bytes(injected)
+    import openevo.backend.workspace_handoff_v2 as handoff_module
+
+    original_writer = handoff_module.write_workspace_archive
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise WorkspaceArchiveBuildError("injected archive failure")
+        return original_writer(*args, **kwargs)
+
+    monkeypatch.setattr(handoff_module, "write_workspace_archive", fail_once)
+    runtime_injected_files = (_injected_file("AGENTS.md", injected),)
+
+    with pytest.raises(WorkspaceHandoffConflictV2):
+        store.publish_result(
+            binding,
+            session_id="sk-openevo-session-1",
+            workspace_root=workspace,
+            runtime_injected_files=runtime_injected_files,
+            now=NOW,
+        )
+    assert (workspace / "AGENTS.md").read_bytes() == original
+
+    receipt = store.publish_result(
+        binding,
+        session_id="sk-openevo-session-1",
+        workspace_root=workspace,
+        runtime_injected_files=runtime_injected_files,
+        now=NOW,
+    )
+    assert receipt.output_archive == binding.input_archive
+    assert attempts == 2
     store.close()
 
 

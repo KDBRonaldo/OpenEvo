@@ -83,8 +83,12 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
     workspace = session_dir / "workspace"
     artifacts = session_dir / "artifacts"
     workspace.mkdir(parents=True)
+    session_dir.chmod(0o700)
+    workspace.chmod(0o700)
     artifacts.mkdir()
     (workspace / "answer.txt").write_text("after\n", encoding="utf-8")
+    injected_agent_system = b"# Evolved agent system\n"
+    (workspace / "AGENTS.md").write_bytes(injected_agent_system)
     dispatch = SessionDispatchRequest(
         session_id=session_id,
         task_id=binding.task_id,
@@ -117,6 +121,21 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
                 )
             ],
         ),
+        metadata={
+            "evolution": {
+                "context_id": "context-handoff",
+                "context_injected": True,
+                "runtime_injection_receipt": {
+                    "files": [
+                        {
+                            "relative_path": "agent_system_targets/AGENTS.md",
+                            "size_bytes": len(injected_agent_system),
+                            "sha256": hashlib.sha256(injected_agent_system).hexdigest(),
+                        }
+                    ]
+                },
+            }
+        },
     )
     manager = GatewayNodeManager(
         node_id="gateway-handoff",
@@ -133,6 +152,24 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
         service_identity=identity,
     )
     try:
+        rejected = await manager._attach_workspace_result_after_runtime_absence(
+            managed,
+            result.model_copy(
+                update={
+                    "metadata": {
+                        "evolution": {
+                            "context_id": "context-handoff",
+                            "context_injected": True,
+                        }
+                    }
+                }
+            ),
+        )
+        assert rejected.status is SessionStatus.ERROR
+        assert rejected.workspace_result is None
+        assert store.get_result(binding.handoff_id) is None
+        assert (workspace / "AGENTS.md").read_bytes() == injected_agent_system
+
         attached = await manager._attach_workspace_result_after_runtime_absence(
             managed,
             result,
@@ -140,6 +177,7 @@ async def test_gateway_publishes_workspace_before_terminal_cleanup_and_retries(
         assert attached.workspace_result is not None
         assert attached.workspace_result.output_archive.entry_count == 1
         assert attached.workspace_result.output_archive.extracted_byte_size == 6
+        assert not (workspace / "AGENTS.md").exists()
         with store.open_result(attached.workspace_result) as stream:
             assert hashlib.sha256(stream.read()).hexdigest() == (
                 attached.workspace_result.output_archive.content_sha256
