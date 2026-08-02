@@ -722,11 +722,14 @@ def _copy_verified_archive(
             dir_fd=parent_fd,
         )
         metadata = os.fstat(source_fd)
+        source_identity = _archive_file_identity(metadata)
+        source_mode = stat.S_IMODE(metadata.st_mode)
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.getuid()
+            or metadata.st_uid not in {0, os.getuid()}
             or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) & 0o077
+            or source_mode & 0o022
+            or source_mode & 0o111
             or metadata.st_size != expected_size
         ):
             raise ValueError("managed runtime archive metadata is invalid")
@@ -751,6 +754,7 @@ def _copy_verified_archive(
             raise ValueError("managed runtime archive exceeds its release size")
         os.fsync(destination_fd)
         destination_metadata = os.fstat(destination_fd)
+        source_after = os.fstat(source_fd)
         current = os.stat(requested.name, dir_fd=parent_fd, follow_symlinks=False)
         if (
             observed != expected_size
@@ -760,12 +764,8 @@ def _copy_verified_archive(
             or destination_metadata.st_nlink != 1
             or stat.S_IMODE(destination_metadata.st_mode) != 0o400
             or destination_metadata.st_size != expected_size
-            or (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino)
-            or current.st_uid != os.getuid()
-            or current.st_nlink != 1
-            or not stat.S_ISREG(current.st_mode)
-            or stat.S_IMODE(current.st_mode) & 0o077
-            or current.st_size != expected_size
+            or _archive_file_identity(source_after) != source_identity
+            or _archive_file_identity(current) != source_identity
         ):
             raise ValueError("managed runtime archive changed during snapshot")
     finally:

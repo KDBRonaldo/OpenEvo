@@ -189,6 +189,15 @@ Bootstrap reports sanitize stdout and stderr from remote steps before storing
 them, redacting configured proxy/PIP credentials and URL userinfo while
 preserving enough command failure text for diagnosis.
 
+The packaged managed-runtime archive is ordinary read-only application media,
+so a copied `.app` may expose it as mode `0644` and may be owned by either the
+installing user or root. Cold remote installation snapshots that exact release
+asset into a private mode-`0400` temporary file before transfer. The snapshot
+still requires a link-count-one regular non-executable file with no group or
+other write bits, the frozen size and digest, and unchanged descriptor/path
+identity before and after the streaming copy; symlinks, hard links, mutable
+media, and mid-copy metadata changes fail closed.
+
 This is intentionally process-scoped. Bootstrap does not configure the Docker
 daemon, systemd units, registry mirrors, host-wide pip config, or shell profile
 files. In particular, `docker pull` and the managed runtime `docker build`

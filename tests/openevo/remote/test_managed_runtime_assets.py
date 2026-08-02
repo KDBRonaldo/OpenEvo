@@ -76,6 +76,26 @@ def test_snapshot_streams_exact_private_archive_and_rejects_late_replacement(
             pass
 
 
+def test_snapshot_accepts_stable_packaged_read_only_archive(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"offline-managed-runtime"
+    release = _release(payload)
+    monkeypatch.setattr(assets, "MANAGED_RUNTIME_ARCHIVE_RELEASE", release)
+    archive = tmp_path / FILENAME
+    archive.write_bytes(payload)
+    archive.chmod(0o644)
+
+    with assets.snapshot_managed_runtime_archive(
+        archive_path=str(archive),
+        archive_sha256=release.sha256,
+        archive_size=release.byte_size,
+    ) as snapshot:
+        assert snapshot.archive_path.read_bytes() == payload
+        assert snapshot.archive_path.stat().st_mode & 0o777 == 0o400
+
+
 def test_snapshot_rejects_archive_made_public_after_open(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -120,7 +140,10 @@ def test_snapshot_does_not_wrap_consumer_failure(
             raise RuntimeError("consumer failed")
 
 
-@pytest.mark.parametrize("mutation", ["symlink", "hardlink", "writable", "oversize"])
+@pytest.mark.parametrize(
+    "mutation",
+    ["symlink", "hardlink", "writable", "executable", "oversize"],
+)
 def test_snapshot_rejects_unsealed_archive(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -140,6 +163,8 @@ def test_snapshot_rejects_unsealed_archive(
         os.link(archive, tmp_path / "second-link")
     elif mutation == "writable":
         archive.chmod(0o660)
+    elif mutation == "executable":
+        archive.chmod(0o700)
     else:
         archive.write_bytes(payload + b"x")
 

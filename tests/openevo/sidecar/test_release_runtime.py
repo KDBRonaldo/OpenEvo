@@ -47,6 +47,7 @@ from desktop.sidecar.release_runtime import (
 from desktop.sidecar.remote_lifecycle import DesktopRemoteLifecycle
 from desktop.sidecar.workspace_imports import WorkspaceImportStore
 from openevo.backend.contracts.v1 import models as core_v1
+from openevo.deployment import managed_runtime_assets
 from openevo.deployment.host_keys import ProviderKnownHostStore
 from tests.openevo.sidecar.test_core_bridge_v2 import _status as _core_v2_status
 from tests.openevo.sidecar.test_core_client_v2 import (
@@ -376,6 +377,34 @@ def test_packaged_release_manifest_binds_all_lazy_bootstrap_assets(
     assert config.daemon_bundle is not None
     assert config.managed_runtime_archive is not None
     assert config.managed_runtime_archive.sha256 == expected_runtime.sha256
+
+
+def test_packaged_runtime_archive_can_be_snapshotted_for_cold_install(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_root = tmp_path / "openevo-release-assets"
+    wheel_root, expected_runtime = _packaged_release_assets(release_root, monkeypatch)
+    monkeypatch.setattr(
+        managed_runtime_assets,
+        "MANAGED_RUNTIME_ARCHIVE_RELEASE",
+        expected_runtime,
+    )
+    config = load_core_bootstrap_config(
+        wheel_root,
+        release_assets_root=release_root,
+        source_commit=SOURCE_COMMIT,
+        packaged_resource_assets=True,
+    )
+    runtime = config.managed_runtime_archive
+    assert runtime is not None
+
+    with managed_runtime_assets.snapshot_managed_runtime_archive(
+        archive_path=runtime.local_path,
+        archive_sha256=runtime.sha256,
+        archive_size=runtime.byte_size,
+    ) as snapshot:
+        assert snapshot.archive_path.stat().st_mode & 0o777 == 0o400
 
 
 def test_packaged_release_assets_accept_root_owned_read_only_media(
