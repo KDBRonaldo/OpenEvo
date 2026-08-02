@@ -32,6 +32,7 @@ from openevo.backend.science_successor import (
     SealedTranscriptDatasetV2,
     SuccessorMaterializationV2,
     ValidatedScienceOutputsV2,
+    workspace_result_artifact_id,
 )
 from openevo.backend.service_supervisor import (
     ServiceExecutionMode,
@@ -425,6 +426,8 @@ class ProductionScienceSuccessorPreparerV2:
             dataset_id=dataset.dataset_id,
             artifact_id=dataset.artifact_id,
             manifest_sha256=canonical_digest(manifest),
+            content_sha256=manifest["records_sha256"],
+            byte_size=manifest["records_byte_size"],
             record_count=dataset.trace_count,
             task_id=context.task.task_id,
             task_admission_id=context.task.admission.task_admission_id,
@@ -891,6 +894,16 @@ class ProductionScienceSuccessorPreparerV2:
             project_id=context.task.project_id,
             task_id=context.task.task_id,
             accepted_attempt_id=context.accepted_attempt.attempt_id,
+            artifact_id=workspace_result_artifact_id(
+                project_id=context.task.project_id,
+                task_id=context.task.task_id,
+                accepted_attempt_id=context.accepted_attempt.attempt_id,
+                workspace_snapshot_id=snapshot.workspace_snapshot_id,
+                workspace_manifest_sha256=snapshot.manifest_sha256,
+                content_sha256=archive.content_sha256,
+            ),
+            content_sha256=archive.content_sha256,
+            byte_size=archive.byte_size,
             workspace_snapshot=snapshot,
         )
 

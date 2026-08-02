@@ -30,6 +30,7 @@ MAX_REVISION_MANIFEST_BYTES = 1024 * 1024
 MAX_TASK_EXECUTION_ENVELOPE_BYTES = 64 * 1024
 MAX_TASK_EXECUTION_ITEMS = 128
 MAX_EXECUTION_SNAPSHOT_BYTES = 64 * 1024
+MAX_TASK_ARTIFACT_BYTES = 16 * 1024 * 1024 * 1024
 
 
 class RevisionError(ValueError):
@@ -548,6 +549,57 @@ class SuccessorArtifactContributionV2(_AtomicSuccessorContract):
     )(_stable_id)
 
 
+class TaskArtifactPublicationV2(_AtomicSuccessorContract):
+    """Public-safe immutable artifact metadata sealed by one Task successor."""
+
+    project_id: str
+    task_id: str
+    artifact_id: str
+    artifact_type: Literal[
+        "dataset",
+        "workspace_result",
+        "text_memory",
+        "skill_bundle",
+        "agent_system",
+        "parametric_memory",
+    ]
+    manifest_sha256: str
+    content_sha256: str
+    media_type: str = Field(
+        pattern=(
+            r"^[a-z0-9][a-z0-9!#$&^_.+-]*/"
+            r"[a-z0-9][a-z0-9!#$&^_.+-]*$"
+        )
+    )
+    byte_size: int = Field(ge=0, le=MAX_TASK_ARTIFACT_BYTES)
+    created_at: datetime
+
+    _ids = field_validator(
+        "project_id",
+        "task_id",
+        "artifact_id",
+    )(_stable_id)
+    _digests = field_validator(
+        "manifest_sha256",
+        "content_sha256",
+    )(_digest)
+    _created = field_validator("created_at")(_canonical_utc_datetime)
+
+    @model_validator(mode="after")
+    def _content_contract(self) -> TaskArtifactPublicationV2:
+        expected_media_type = {
+            "dataset": "application/x-ndjson",
+            "workspace_result": "application/vnd.openevo.workspace-tar",
+            "text_memory": "application/vnd.openevo.artifact-tree",
+            "skill_bundle": "application/vnd.openevo.artifact-tree",
+            "agent_system": "application/vnd.openevo.artifact-tree",
+            "parametric_memory": "application/vnd.openevo.artifact-tree",
+        }[self.artifact_type]
+        if self.media_type != expected_media_type:
+            raise ValueError("Task artifact publication media type is invalid")
+        return self
+
+
 class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
     """Closed receipt for one fully prepared adjacent science successor."""
 
@@ -605,6 +657,11 @@ class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
     artifacts: tuple[SuccessorArtifactContributionV2, ...] = Field(
         default=(),
         max_length=128,
+        exclude_if=lambda value: not value,
+    )
+    task_artifacts: tuple[TaskArtifactPublicationV2, ...] = Field(
+        default=(),
+        max_length=130,
         exclude_if=lambda value: not value,
     )
 
@@ -728,6 +785,32 @@ class AtomicSuccessorManifestV2(_AtomicSuccessorContract):
                 raise ValueError(
                     "atomic successor artifact composition is invalid"
                 )
+        if self.task_artifacts:
+            dataset, workspace, *method_artifacts = self.task_artifacts
+            produced = tuple(item for item in self.artifacts if item.origin == "produced")
+            if (
+                dataset.artifact_type != "dataset"
+                or dataset.artifact_id != self.dataset_artifact_id
+                or dataset.manifest_sha256 != self.dataset_manifest_sha256
+                or workspace.artifact_type != "workspace_result"
+                or workspace.manifest_sha256 != self.workspace_manifest_sha256
+                or any(
+                    item.project_id != self.project_id or item.task_id != self.task_id
+                    for item in self.task_artifacts
+                )
+                or len({item.artifact_id for item in self.task_artifacts})
+                != len(self.task_artifacts)
+                or len({item.created_at for item in self.task_artifacts}) != 1
+                or tuple(
+                    (item.artifact_id, item.artifact_type)
+                    for item in method_artifacts
+                )
+                != tuple(
+                    (item.artifact_id, item.artifact_type)
+                    for item in produced
+                )
+            ):
+                raise ValueError("atomic successor Task artifact publication is invalid")
         if len(canonical_json(self).encode("utf-8")) > MAX_REVISION_MANIFEST_BYTES:
             raise ValueError("atomic successor manifest exceeds the byte limit")
         return self
@@ -771,6 +854,11 @@ class AtomicEvolutionAbandonManifestV2(_AtomicSuccessorContract):
     artifacts: tuple[SuccessorArtifactContributionV2, ...] = Field(
         default=(),
         max_length=128,
+        exclude_if=lambda value: not value,
+    )
+    task_artifacts: tuple[TaskArtifactPublicationV2, ...] = Field(
+        default=(),
+        max_length=1,
         exclude_if=lambda value: not value,
     )
 
@@ -861,6 +949,15 @@ class AtomicEvolutionAbandonManifestV2(_AtomicSuccessorContract):
                 raise ValueError(
                     "evolution abandon artifact composition is invalid"
                 )
+        if self.task_artifacts:
+            workspace = self.task_artifacts[0]
+            if (
+                workspace.project_id != self.project_id
+                or workspace.task_id != self.task_id
+                or workspace.artifact_type != "workspace_result"
+                or workspace.manifest_sha256 != self.workspace_manifest_sha256
+            ):
+                raise ValueError("evolution abandon Task artifact publication is invalid")
         if len(canonical_json(self).encode("utf-8")) > MAX_REVISION_MANIFEST_BYTES:
             raise ValueError("atomic evolution abandon manifest exceeds the byte limit")
         return self
@@ -1134,6 +1231,7 @@ __all__ = [
     "RevisionNotFoundError",
     "RevisionRecord",
     "SuccessorArtifactContributionV2",
+    "TaskArtifactPublicationV2",
     "TaskAdmissionConflictError",
     "TaskAdmissionIntent",
     "TaskAdmissionRecord",

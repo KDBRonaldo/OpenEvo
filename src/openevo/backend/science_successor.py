@@ -93,6 +93,8 @@ class SealedTranscriptDatasetV2(_ScienceSuccessorModel):
     dataset_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
     artifact_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
     manifest_sha256: str = Field(pattern=_SCIENCE_SHA256_PATTERN)
+    content_sha256: str = Field(pattern=_SCIENCE_SHA256_PATTERN)
+    byte_size: int = Field(ge=0, le=m2.MAX_SNAPSHOT_BYTES)
     record_count: int = Field(ge=1, le=10_000_000)
     task_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
     task_admission_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
@@ -256,13 +258,51 @@ class AcceptedWorkspaceResultV2(_ScienceSuccessorModel):
     project_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
     task_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
     accepted_attempt_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
+    artifact_id: str = Field(pattern=_SCIENCE_ID_PATTERN)
+    content_sha256: str = Field(pattern=_SCIENCE_SHA256_PATTERN)
+    byte_size: int = Field(ge=0, le=m2.MAX_SNAPSHOT_BYTES)
     workspace_snapshot: m2.WorkspaceSnapshotRefV2
 
     @model_validator(mode="after")
     def _workspace_project(self) -> AcceptedWorkspaceResultV2:
         if self.workspace_snapshot.project_id != self.project_id:
             raise ValueError("accepted workspace result belongs to another project")
+        if self.artifact_id != workspace_result_artifact_id(
+            project_id=self.project_id,
+            task_id=self.task_id,
+            accepted_attempt_id=self.accepted_attempt_id,
+            workspace_snapshot_id=self.workspace_snapshot.workspace_snapshot_id,
+            workspace_manifest_sha256=self.workspace_snapshot.manifest_sha256,
+            content_sha256=self.content_sha256,
+        ):
+            raise ValueError("accepted workspace result artifact identity is invalid")
         return self
+
+
+def workspace_result_artifact_id(
+    *,
+    project_id: str,
+    task_id: str,
+    accepted_attempt_id: str,
+    workspace_snapshot_id: str,
+    workspace_manifest_sha256: str,
+    content_sha256: str,
+) -> str:
+    payload = json.dumps(
+        {
+            "accepted_attempt_id": accepted_attempt_id,
+            "content_sha256": content_sha256,
+            "project_id": project_id,
+            "task_id": task_id,
+            "workspace_manifest_sha256": workspace_manifest_sha256,
+            "workspace_snapshot_id": workspace_snapshot_id,
+        },
+        ensure_ascii=True,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"workspace-result-{hashlib.sha256(payload).hexdigest()}"
 
 
 class ScienceSuccessorTransitionAttemptV2(_ScienceSuccessorModel):
@@ -446,4 +486,5 @@ __all__ = [
     "SuccessorMaterializationV2",
     "ValidatedScienceOutputsV2",
     "science_successor_plan_sha256",
+    "workspace_result_artifact_id",
 ]

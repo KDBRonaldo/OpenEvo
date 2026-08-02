@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import logging
@@ -82,6 +82,7 @@ from openevo.evolution.revisions import (
     AtomicEvolutionAbandonManifestV2,
     AtomicSuccessorCommitV2,
     AtomicSuccessorManifestV2,
+    TaskArtifactPublicationV2,
     atomic_successor_manifest_sha256,
 )
 from openevo.experiments import EvolutionHttpClient, RolloutHttpClient
@@ -445,6 +446,36 @@ class CoreScienceTaskOwnerV2:
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="getCoreSuccessorCommitV2")
 
+    def list_task_artifact_publications(
+        self,
+        task_id: str,
+    ) -> tuple[TaskArtifactPublicationV2, ...]:
+        try:
+            return self._ledger.task_artifact_publications(task_id)
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="listCoreTaskArtifactsV2")
+
+    def get_project_artifact_publication(
+        self,
+        project_id: str,
+        artifact_id: str,
+    ) -> TaskArtifactPublicationV2:
+        try:
+            publication = self._ledger.project_artifact_publication(
+                project_id,
+                artifact_id,
+            )
+        except Exception as exc:
+            _raise_v2_owner_error(exc, operation_id="getCoreArtifactV2")
+        if publication is None:
+            raise CoreTaskControlError(
+                "artifact_not_found",
+                "The requested v2 artifact was not found.",
+                http_status=404,
+                retryable=False,
+            )
+        return publication
+
     def successor_transition_attempts(
         self,
         successor_transition_id: str,
@@ -598,11 +629,16 @@ class CoreScienceTaskOwnerV2:
                 context=context,
                 workspace=workspace,
             )
+            published_at = _successor_publication_time(
+                context.transition,
+                self._clock(),
+            )
             manifest = _build_atomic_evolution_abandon_manifest(
                 context=context,
                 workspace=workspace,
                 successor=successor,
                 inherited_commit=inherited_commit,
+                published_at=published_at,
             )
             commit = AtomicSuccessorCommitV2(
                 manifest_sha256=atomic_successor_manifest_sha256(manifest),
@@ -615,7 +651,7 @@ class CoreScienceTaskOwnerV2:
                 expected_transition_attempt_id=(context.transition_attempt.transition_attempt_id),
                 successor=successor,
                 commit=commit,
-                now=self._clock(),
+                now=published_at,
                 allow_cancelled_recovery=allow_cancelled_recovery,
             )
             try:
@@ -772,6 +808,10 @@ class CoreScienceTaskOwnerV2:
                 validated=validated,
                 materialized=materialized,
             )
+            published_at = _successor_publication_time(
+                context.transition,
+                self._clock(),
+            )
             manifest = _build_atomic_successor_manifest(
                 context=context,
                 dataset=dataset,
@@ -780,6 +820,7 @@ class CoreScienceTaskOwnerV2:
                 validated=validated,
                 materialized=materialized,
                 successor=successor,
+                published_at=published_at,
             )
             commit = AtomicSuccessorCommitV2(
                 manifest_sha256=atomic_successor_manifest_sha256(manifest),
@@ -790,7 +831,7 @@ class CoreScienceTaskOwnerV2:
                 expected_transition_attempt_id=(transition_attempt.transition_attempt_id),
                 successor=successor,
                 commit=commit,
-                now=self._clock(),
+                now=published_at,
             )
         except Exception as exc:
             logger.error(
@@ -1456,6 +1497,7 @@ def _build_atomic_successor_manifest(
     validated: ValidatedScienceOutputsV2,
     materialized: SuccessorMaterializationV2,
     successor: m2.ProjectHeadRefV2,
+    published_at: datetime,
 ) -> AtomicSuccessorManifestV2:
     predecessor = context.task.admission.predecessor_project_head
     execution = successor.effective_execution_snapshot
@@ -1500,7 +1542,74 @@ def _build_atomic_successor_manifest(
         materialized_context_manifest_sha256=(materialized.materialized_context_manifest_sha256),
         method_artifact_ids=tuple(item.artifact_id for item in validated.composition),
         artifacts=validated.composition,
+        task_artifacts=_task_artifact_publications(
+            context=context,
+            dataset=dataset,
+            workspace=workspace,
+            outputs=outputs,
+            published_at=published_at,
+        ),
     )
+
+
+def _task_artifact_publications(
+    *,
+    context: ScienceSuccessorPreparationContextV2,
+    dataset: SealedTranscriptDatasetV2,
+    workspace: AcceptedWorkspaceResultV2,
+    outputs: tuple[ScienceMethodOutputV2, ...],
+    published_at: datetime,
+) -> tuple[TaskArtifactPublicationV2, ...]:
+    common = {
+        "project_id": context.task.project_id,
+        "task_id": context.task.task_id,
+        "created_at": published_at,
+    }
+    return (
+        TaskArtifactPublicationV2(
+            **common,
+            artifact_id=dataset.artifact_id,
+            artifact_type="dataset",
+            manifest_sha256=dataset.manifest_sha256,
+            content_sha256=dataset.content_sha256,
+            media_type="application/x-ndjson",
+            byte_size=dataset.byte_size,
+        ),
+        TaskArtifactPublicationV2(
+            **common,
+            artifact_id=workspace.artifact_id,
+            artifact_type="workspace_result",
+            manifest_sha256=workspace.workspace_snapshot.manifest_sha256,
+            content_sha256=workspace.content_sha256,
+            media_type="application/vnd.openevo.workspace-tar",
+            byte_size=workspace.byte_size,
+        ),
+        *(
+            TaskArtifactPublicationV2(
+                **common,
+                artifact_id=output.artifact_id,
+                artifact_type=output.artifact_type,
+                manifest_sha256=output.manifest_sha256,
+                content_sha256=output.manifest_sha256,
+                media_type="application/vnd.openevo.artifact-tree",
+                byte_size=output.byte_size,
+            )
+            for output in outputs
+        ),
+    )
+
+
+def _successor_publication_time(
+    transition: m2.SuccessorTransitionV2,
+    candidate: datetime,
+) -> datetime:
+    if not isinstance(candidate, datetime) or candidate.tzinfo is None:
+        raise ValueError("v2 successor publication clock must be timezone-aware")
+    normalized = candidate.astimezone(timezone.utc)
+    previous = datetime.fromisoformat(
+        transition.updated_at.replace("Z", "+00:00")
+    ).astimezone(timezone.utc)
+    return normalized if normalized > previous else previous + timedelta(microseconds=1)
 
 
 def _build_v2_abandoned_successor_project_head(
@@ -1551,6 +1660,7 @@ def _build_atomic_evolution_abandon_manifest(
     workspace: AcceptedWorkspaceResultV2,
     successor: m2.ProjectHeadRefV2,
     inherited_commit: AtomicSuccessorCommitV2 | None,
+    published_at: datetime,
 ) -> AtomicEvolutionAbandonManifestV2:
     predecessor = context.task.admission.predecessor_project_head
     if predecessor.generation == 0:
@@ -1647,6 +1757,19 @@ def _build_atomic_evolution_abandon_manifest(
         materialized_context_manifest_sha256=(materialized_context_manifest_sha256),
         method_artifact_ids=method_artifact_ids,
         artifacts=artifacts,
+        task_artifacts=(
+            TaskArtifactPublicationV2(
+                project_id=context.task.project_id,
+                task_id=context.task.task_id,
+                artifact_id=workspace.artifact_id,
+                artifact_type="workspace_result",
+                manifest_sha256=workspace.workspace_snapshot.manifest_sha256,
+                content_sha256=workspace.content_sha256,
+                media_type="application/vnd.openevo.workspace-tar",
+                byte_size=workspace.byte_size,
+                created_at=published_at,
+            ),
+        ),
     )
 
 

@@ -38,6 +38,7 @@ from openevo.backend.science_execution import (
 from openevo.backend.science_successor import (
     ScienceSuccessorCleanupContextV2,
     ScienceSuccessorCleanupReceiptV2,
+    workspace_result_artifact_id,
 )
 import openevo.backend.science_run_owner as task_owner_module
 import openevo.backend.science_run_store as task_store_module
@@ -312,6 +313,8 @@ class _Preparer(ScienceSuccessorPreparerV2):
             dataset_id="dataset-1",
             artifact_id="artifact-dataset-1",
             manifest_sha256="b" * 64,
+            content_sha256="8" * 64,
+            byte_size=4096,
             record_count=12,
             task_id=context.task.task_id,
             task_admission_id=context.task.admission.task_admission_id,
@@ -354,6 +357,8 @@ class _Preparer(ScienceSuccessorPreparerV2):
             dataset_id=dataset_id,
             artifact_id="artifact-dataset-1",
             manifest_sha256=manifest_sha256,
+            content_sha256="8" * 64,
+            byte_size=4096,
             record_count=12,
             task_id=context.task.task_id,
             task_admission_id=context.task.admission.task_admission_id,
@@ -431,14 +436,26 @@ class _Preparer(ScienceSuccessorPreparerV2):
         context: ScienceSuccessorPreparationContextV2,
     ) -> AcceptedWorkspaceResultV2:
         self._enter("workspace")
+        snapshot = _workspace(
+            context.task.project_id,
+            self.workspace_seed,
+        )
+        content_sha256 = "9" * 64
         return AcceptedWorkspaceResultV2(
             project_id=context.task.project_id,
             task_id=context.task.task_id,
             accepted_attempt_id=context.accepted_attempt.attempt_id,
-            workspace_snapshot=_workspace(
-                context.task.project_id,
-                self.workspace_seed,
+            artifact_id=workspace_result_artifact_id(
+                project_id=context.task.project_id,
+                task_id=context.task.task_id,
+                accepted_attempt_id=context.accepted_attempt.attempt_id,
+                workspace_snapshot_id=snapshot.workspace_snapshot_id,
+                workspace_manifest_sha256=snapshot.manifest_sha256,
+                content_sha256=content_sha256,
             ),
+            content_sha256=content_sha256,
+            byte_size=snapshot.byte_size,
+            workspace_snapshot=snapshot,
         )
 
     def discard_transition_outputs(
@@ -558,6 +575,8 @@ class _LegacyMigrationChainPreparer(_Preparer):
             dataset_id=f"dataset-{task_id}",
             artifact_id=f"artifact-dataset-{task_id}",
             manifest_sha256=self._digest(f"dataset:{task_id}"),
+            content_sha256=self._digest(f"dataset-content:{task_id}"),
+            byte_size=4096,
             record_count=12,
             task_id=task_id,
             task_admission_id=context.task.admission.task_admission_id,
@@ -2106,7 +2125,9 @@ def test_commit_closure_rejects_enabled_successor_without_typed_composition(
     receipt = owner.successor_commit(committed.transition.successor_transition_id)
     assert receipt is not None
     try:
-        manifest = receipt.manifest.model_copy(update={"artifacts": ()})
+        manifest = receipt.manifest.model_copy(
+            update={"artifacts": (), "task_artifacts": ()}
+        )
         forged = AtomicSuccessorCommitV2(
             manifest_sha256=atomic_successor_manifest_sha256(manifest),
             manifest=manifest,
@@ -2132,6 +2153,46 @@ def test_commit_closure_rejects_enabled_successor_without_typed_composition(
         owner.close()
 
 
+def test_commit_closure_rejects_canonical_successor_without_task_artifacts(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path, _Preparer())
+    _predecessor, task = _admit(owner)
+    committed = owner.run_successor_transition(
+        task.task_id,
+        accepted_attempt_id=task.attempts[0].attempt_id,
+        plan=_plan(task),
+    )
+    receipt = owner.successor_commit(committed.transition.successor_transition_id)
+    assert receipt is not None
+    try:
+        manifest = receipt.manifest.model_copy(update={"task_artifacts": ()})
+        forged = AtomicSuccessorCommitV2(
+            manifest_sha256=atomic_successor_manifest_sha256(manifest),
+            manifest=manifest,
+        )
+        database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+        with sqlite3.connect(database) as connection:
+            connection.row_factory = sqlite3.Row
+            with pytest.raises(
+                ScienceTaskPreconditionFailedV2,
+                match="Task artifact",
+            ):
+                task_store_module._validate_v2_successor_commit_closure(
+                    connection=connection,
+                    task=owner.invoke(
+                        "getCoreTaskV2",
+                        {"task_id": task.task_id},
+                    ),
+                    transition=committed,
+                    successor=(committed.transition.successor_project_head),
+                    commit=forged,
+                    require_task_artifacts=True,
+                )
+    finally:
+        owner.close()
+
+
 def _downgrade_successor_chain_to_legacy_schema(
     database: Path,
 ) -> dict[str, str]:
@@ -2148,7 +2209,9 @@ def _downgrade_successor_chain_to_legacy_schema(
                 AtomicSuccessorCommitV2,
                 bytes(row["commit_json"]),
             )
-            legacy_manifest = commit.manifest.model_copy(update={"artifacts": ()})
+            legacy_manifest = commit.manifest.model_copy(
+                update={"artifacts": (), "task_artifacts": ()}
+            )
             legacy_commit = AtomicSuccessorCommitV2(
                 manifest_sha256=atomic_successor_manifest_sha256(legacy_manifest),
                 manifest=legacy_manifest,
@@ -2426,7 +2489,9 @@ def test_restart_migrates_legacy_successor_to_typed_composition(
     receipt = owner.successor_commit(committed.transition.successor_transition_id)
     assert receipt is not None
     original_artifacts = receipt.manifest.artifacts
-    legacy_manifest = receipt.manifest.model_copy(update={"artifacts": ()})
+    legacy_manifest = receipt.manifest.model_copy(
+        update={"artifacts": (), "task_artifacts": ()}
+    )
     legacy_commit = AtomicSuccessorCommitV2(
         manifest_sha256=atomic_successor_manifest_sha256(legacy_manifest),
         manifest=legacy_manifest,
@@ -2508,6 +2573,72 @@ def test_restart_migrates_legacy_successor_to_typed_composition(
         restarted.close()
 
 
+def test_restart_accepts_pre_publication_canonical_successor_receipt(
+    tmp_path: Path,
+) -> None:
+    owner = _owner(tmp_path, _Preparer())
+    _predecessor, task = _admit(owner)
+    committed = owner.run_successor_transition(
+        task.task_id,
+        accepted_attempt_id=task.attempts[0].attempt_id,
+        plan=_plan(task),
+    )
+    receipt = owner.successor_commit(committed.transition.successor_transition_id)
+    assert receipt is not None
+    historical_manifest = receipt.manifest.model_copy(update={"task_artifacts": ()})
+    historical_commit = AtomicSuccessorCommitV2(
+        manifest_sha256=atomic_successor_manifest_sha256(historical_manifest),
+        manifest=historical_manifest,
+    )
+    owner.close()
+
+    database = tmp_path / "science-tasks-v2" / "science-tasks-v2.sqlite3"
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        attempt_row = connection.execute(
+            "SELECT transition_attempt_id, attempt_json "
+            "FROM successor_transition_attempts "
+            "WHERE successor_transition_id = ? ORDER BY ordinal DESC LIMIT 1",
+            (committed.transition.successor_transition_id,),
+        ).fetchone()
+        assert attempt_row is not None
+        attempt = task_store_module._v2_model_from_bytes(
+            task_store_module.ScienceSuccessorTransitionAttemptV2,
+            bytes(attempt_row["attempt_json"]),
+        )
+        historical_attempt = attempt.model_copy(
+            update={"commit_manifest_sha256": historical_commit.manifest_sha256}
+        )
+        connection.execute(
+            "UPDATE successor_commits SET manifest_sha256 = ?, commit_json = ? "
+            "WHERE successor_transition_id = ?",
+            (
+                historical_commit.manifest_sha256,
+                task_store_module._v2_model_bytes(historical_commit),
+                committed.transition.successor_transition_id,
+            ),
+        )
+        connection.execute(
+            "UPDATE successor_transition_attempts SET attempt_json = ? "
+            "WHERE transition_attempt_id = ?",
+            (
+                task_store_module._v2_model_bytes(historical_attempt),
+                attempt.transition_attempt_id,
+            ),
+        )
+        connection.commit()
+
+    restarted = _owner(tmp_path, _Preparer())
+    try:
+        recovered = restarted.successor_commit(
+            committed.transition.successor_transition_id
+        )
+        assert recovered == historical_commit
+        assert restarted.list_task_artifact_publications(task.task_id) == ()
+    finally:
+        restarted.close()
+
+
 def test_restart_rejects_relabeling_current_commit_as_legacy(
     tmp_path: Path,
 ) -> None:
@@ -2520,7 +2651,9 @@ def test_restart_rejects_relabeling_current_commit_as_legacy(
     )
     receipt = owner.successor_commit(committed.transition.successor_transition_id)
     assert receipt is not None
-    legacy_manifest = receipt.manifest.model_copy(update={"artifacts": ()})
+    legacy_manifest = receipt.manifest.model_copy(
+        update={"artifacts": (), "task_artifacts": ()}
+    )
     legacy_manifest_sha256 = atomic_successor_manifest_sha256(legacy_manifest)
     assert legacy_manifest_sha256 != receipt.manifest_sha256
     owner.close()

@@ -56,6 +56,7 @@ from openevo.evolution.framework.capabilities import (
     build_evolution_capabilities,
 )
 from openevo.evolution.framework.profiles import execution_profile_for_release_mode
+from openevo.evolution.revisions import TaskArtifactPublicationV2
 
 from . import models as m
 from .app import CoreControlHTTPErrorV2
@@ -306,6 +307,9 @@ class CoreControlProviderV2:
             "getCoreTaskTimelineV2": self._task_timeline,
             "getCoreTaskLogsV2": self._task_logs,
             "getCoreTaskContextV2": self._task_context,
+            "listCoreTaskArtifactsV2": self._task_artifacts,
+            "getCoreArtifactV2": self._get_artifact,
+            "getCoreArtifactContentV2": self._get_artifact_content,
             "closeCoreTaskV2": self._close_task,
             "listCoreServicesV2": self._list_services,
             "getCoreServiceV2": self._get_service,
@@ -1334,6 +1338,54 @@ class CoreControlProviderV2:
             workspace_snapshot=task.admission.workspace_snapshot,
         )
 
+    def _task_artifacts(self, arguments: Mapping[str, object]) -> m.ArtifactPageV2:
+        _keys(arguments, "task_id", "limit", "after")
+        task_id = _string(arguments["task_id"])
+        publications = self._task_owner.list_task_artifact_publications(task_id)
+        artifacts = [_artifact_model(item) for item in publications]
+        selected, next_cursor, has_more = _page_items(
+            artifacts,
+            limit=_limit(arguments["limit"]),
+            after=_optional_string(arguments["after"]),
+            query=f"task-artifacts:{task_id}",
+        )
+        return m.ArtifactPageV2(
+            items=selected,
+            next_cursor=next_cursor,
+            has_more=has_more,
+        )
+
+    def _get_artifact(self, arguments: Mapping[str, object]) -> m.ArtifactV2:
+        _keys(arguments, "project_id", "artifact_id")
+        project_id = _string(arguments["project_id"])
+        artifact_id = _string(arguments["artifact_id"])
+        self.store.get_project(project_id)
+        publication = self._task_owner.get_project_artifact_publication(
+            project_id,
+            artifact_id,
+        )
+        return _artifact_model(publication)
+
+    def _get_artifact_content(
+        self,
+        arguments: Mapping[str, object],
+    ) -> m.ArtifactContentV2:
+        _keys(arguments, "project_id", "artifact_id")
+        project_id = _string(arguments["project_id"])
+        artifact_id = _string(arguments["artifact_id"])
+        self.store.get_project(project_id)
+        publication = self._task_owner.get_project_artifact_publication(
+            project_id,
+            artifact_id,
+        )
+        artifact = _artifact_model(publication)
+        return m.ArtifactContentV2(
+            artifact=artifact,
+            media_type=publication.media_type,
+            content_sha256=publication.content_sha256,
+            byte_size=publication.byte_size,
+        )
+
     def _close_task(self, arguments: Mapping[str, object]) -> Response:
         _keys(arguments, "task_id", "request", "if_match", "idempotency_key")
         task_id = _string(arguments["task_id"])
@@ -1646,8 +1698,10 @@ def _task_owner_http_error(
     *,
     operation_id: str,
 ) -> CoreControlHTTPErrorV2:
-    category: Literal["task", "transition", "contract"] = "task"
-    if "Transition" in operation_id or exc.code.startswith("successor_"):
+    category: Literal["task", "transition", "artifact", "contract"] = "task"
+    if operation_id in _ARTIFACT_OPERATIONS:
+        category = "artifact"
+    elif "Transition" in operation_id or exc.code.startswith("successor_"):
         category = "transition"
     if exc.code == "event_cursor_expired":
         category = "contract"
@@ -1933,6 +1987,19 @@ def _timestamp(value: datetime) -> str:
     if not isinstance(value, datetime) or value.tzinfo is None:
         raise TypeError("Core v2 timestamp requires an aware datetime")
     return value.astimezone(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _artifact_model(publication: TaskArtifactPublicationV2) -> m.ArtifactV2:
+    if type(publication) is not TaskArtifactPublicationV2:
+        raise RuntimeError("Core artifact authority returned the wrong publication type")
+    return m.ArtifactV2(
+        artifact_id=publication.artifact_id,
+        project_id=publication.project_id,
+        artifact_type=publication.artifact_type,
+        manifest_sha256=publication.manifest_sha256,
+        byte_size=publication.byte_size,
+        created_at=_timestamp(publication.created_at),
+    )
 
 
 def _require_exact_schema_snapshots() -> None:

@@ -44,6 +44,7 @@ from openevo.evolution.revisions import (
     AtomicSuccessorCommitV2,
     AtomicSuccessorManifestV2,
     SuccessorArtifactContributionV2,
+    TaskArtifactPublicationV2,
     atomic_successor_manifest_sha256,
 )
 from openevo.internal_auth import (
@@ -2800,6 +2801,8 @@ class ScienceTaskStoreV2:
                 transition=transition,
                 successor=successor,
                 commit=commit,
+                publication_timestamp=timestamp,
+                require_task_artifacts=True,
             )
             if (
                 int(connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0])
@@ -3151,6 +3154,8 @@ class ScienceTaskStoreV2:
                 transition=transition,
                 successor=successor,
                 commit=commit,
+                publication_timestamp=timestamp,
+                require_task_artifacts=True,
             )
             if (
                 int(connection.execute("SELECT COUNT(*) FROM project_heads").fetchone()[0])
@@ -3445,6 +3450,85 @@ class ScienceTaskStoreV2:
             if row["manifest_sha256"] != commit.manifest_sha256 or not valid_terminal:
                 raise ScienceTaskStoreV2Error("v2 successor commit row is inconsistent")
             return commit
+
+    def task_artifact_publications(
+        self,
+        task_id: str,
+    ) -> tuple[TaskArtifactPublicationV2, ...]:
+        """Read one Task's public-safe artifact receipts from one consistent closure."""
+
+        task_id = _v2_resource_id(task_id, label="task")
+        with self._lock, self._reader() as connection:
+            task = _load_v2_task_closure(connection, task_id)
+            reference = task.successor_transition
+            if reference is None:
+                return ()
+            transition = _load_v2_successor_transition(
+                connection,
+                reference.successor_transition_id,
+            )
+            if transition.state not in {"committed", "cancelled"}:
+                return ()
+            commit = _load_v2_successor_commit(
+                connection,
+                reference.successor_transition_id,
+            )
+            if (
+                commit.manifest.task_id != task.task_id
+                or commit.manifest.project_id != task.project_id
+            ):
+                raise ScienceTaskStoreV2Error(
+                    "v2 Task artifact publication differs from its Task closure"
+                )
+            return commit.manifest.task_artifacts
+
+    def project_artifact_publication(
+        self,
+        project_id: str,
+        artifact_id: str,
+    ) -> TaskArtifactPublicationV2 | None:
+        """Resolve one project-scoped artifact from immutable successor receipts."""
+
+        project_id = _v2_resource_id(project_id, label="project")
+        artifact_id = _v2_resource_id(artifact_id, label="artifact")
+        with self._lock, self._reader() as connection:
+            _load_v2_project_authority(connection, project_id)
+            rows = connection.execute(
+                "SELECT successor_commits.successor_transition_id "
+                "FROM successor_commits "
+                "JOIN successor_transitions USING(successor_transition_id) "
+                "WHERE successor_transitions.project_id = ? "
+                "ORDER BY successor_commits.successor_transition_id LIMIT ?",
+                (project_id, _MAX_V2_TASKS + 1),
+            ).fetchall()
+            if len(rows) > _MAX_V2_TASKS:
+                raise ScienceTaskStoreV2Error(
+                    "v2 project artifact publication inventory exceeds its bound"
+                )
+            match: TaskArtifactPublicationV2 | None = None
+            for row in rows:
+                transition_id = str(row["successor_transition_id"])
+                transition = _load_v2_successor_transition(
+                    connection,
+                    transition_id,
+                )
+                commit = _load_v2_successor_commit(connection, transition_id)
+                if (
+                    transition.transition.project_id != project_id
+                    or commit.manifest.project_id != project_id
+                ):
+                    raise ScienceTaskStoreV2Error(
+                        "v2 project artifact publication differs from its project closure"
+                    )
+                for publication in commit.manifest.task_artifacts:
+                    if publication.artifact_id != artifact_id:
+                        continue
+                    if match is not None:
+                        raise ScienceTaskStoreV2Error(
+                            "v2 project artifact identity was published more than once"
+                        )
+                    match = publication
+            return match
 
     def successor_commit_for_project_head(
         self,
@@ -5850,7 +5934,9 @@ def _migrate_v2_successor_commit_authority(
         )
         if semantics_version == 1:
             legacy_manifest = AtomicSuccessorManifestV2.model_validate(
-                migrated_manifest.model_copy(update={"artifacts": ()}).model_dump(mode="python")
+                migrated_manifest.model_copy(
+                    update={"artifacts": (), "task_artifacts": ()}
+                ).model_dump(mode="python")
             )
             if legacy_manifest_sha256 != atomic_successor_manifest_sha256(legacy_manifest):
                 raise ScienceTaskStoreV2Error("legacy v2 successor provenance digest differs")
@@ -6114,6 +6200,7 @@ def _load_v2_successor_transition(
             transition=transition,
             successor=reference.successor_project_head,
             commit=commit,
+            publication_timestamp=transition.updated_at,
         )
     elif commit_row is not None or reference.successor_project_head is not None:
         raise ScienceTaskStoreV2Error("noncommitted v2 successor transition exposes a successor")
@@ -6570,7 +6657,9 @@ def _v2_successor_commit_semantics(
     ):
         raise ScienceTaskStoreV2Error("legacy v2 successor provenance is invalid")
     legacy_manifest = AtomicSuccessorManifestV2.model_validate(
-        manifest.model_copy(update={"artifacts": ()}).model_dump(mode="python")
+        manifest.model_copy(
+            update={"artifacts": (), "task_artifacts": ()}
+        ).model_dump(mode="python")
     )
     if str(legacy_sha256) != atomic_successor_manifest_sha256(legacy_manifest):
         raise ScienceTaskStoreV2Error("legacy v2 successor provenance digest is inconsistent")
@@ -6748,6 +6837,8 @@ def _validate_v2_successor_commit_closure(
     transition: m2.SuccessorTransitionV2,
     successor: m2.ProjectHeadRefV2,
     commit: AtomicSuccessorCommitV2,
+    publication_timestamp: str | None = None,
+    require_task_artifacts: bool = False,
 ) -> None:
     reference = transition.transition
     admission = reference.task_admission
@@ -6825,6 +6916,17 @@ def _validate_v2_successor_commit_closure(
         connection,
         manifest,
     )
+    if require_task_artifacts and not manifest.task_artifacts:
+        raise ScienceTaskPreconditionFailedV2(
+            "canonical v2 successor lacks Task artifact publications"
+        )
+    if publication_timestamp is not None and any(
+        _v2_timestamp(item.created_at) != publication_timestamp
+        for item in manifest.task_artifacts
+    ):
+        raise ScienceTaskPreconditionFailedV2(
+            "canonical v2 Task artifact publication timestamp changed"
+        )
     if type(manifest) is AtomicSuccessorManifestV2:
         if transition.state == "cancelled":
             raise ScienceTaskPreconditionFailedV2(

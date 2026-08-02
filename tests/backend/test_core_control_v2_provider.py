@@ -416,7 +416,7 @@ def test_project_task_attempt_context_and_events_are_authoritative(
     assert b"event: attempt_appended\n" in second_frame
 
 
-def test_authority_drift_and_unfinished_features_fail_closed(
+def test_authority_drift_and_missing_task_artifacts_fail_closed(
     runtime: _Runtime,
 ) -> None:
     stale = _request(runtime.authority).model_copy(
@@ -431,13 +431,13 @@ def test_authority_drift_and_unfinished_features_fail_closed(
     assert response.json()["code"] == "task_submission_stale"
     assert runtime.owner.ownership_counts() == (0, 0, 0)
 
-    for path in (
+    missing = runtime.client.get(
         "/v2/tasks/missing/artifacts",
-    ):
-        unavailable = runtime.client.get(path, headers=runtime.headers)
-        assert unavailable.status_code == 503
-        assert unavailable.json()["code"] == "feature_not_ready"
-        assert "missing" not in unavailable.json()["message"]
+        headers=runtime.headers,
+    )
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "task_not_found"
+    assert missing.json()["category"] == "artifact"
 
 
 def test_task_and_daemon_logs_are_bounded_authoritative_pages(
@@ -1000,8 +1000,6 @@ def test_provider_exposes_only_authoritative_services_and_fails_closed_elsewhere
     assert daemon.headers["etag"] == daemon.json()["etag"]
 
     unfinished = (
-        ("GET", "/v2/tasks/unavailable/artifacts", None),
-        ("GET", "/v2/projects/project-1/artifacts/artifact-1", None),
         (
             "POST",
             "/v2/diagnostics",
@@ -1023,6 +1021,15 @@ def test_provider_exposes_only_authoritative_services_and_fails_closed_elsewhere
         assert response.status_code == 503
         assert response.json()["code"] == "feature_not_ready"
         assert "unavailable" not in response.json()["message"]
+
+    for path in (
+        "/v2/projects/project-1/artifacts/artifact-1",
+        "/v2/projects/project-1/artifacts/artifact-1/content",
+    ):
+        missing_artifact = runtime.client.get(path, headers=runtime.headers)
+        assert missing_artifact.status_code == 404
+        assert missing_artifact.json()["code"] == "artifact_not_found"
+        assert missing_artifact.json()["category"] == "artifact"
 
     capabilities = runtime.client.get(
         "/v2/capabilities",
@@ -1178,6 +1185,33 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
             "committing",
             "committed",
         ]
+
+        artifact_page = client.get(
+            f"/v2/tasks/{task_id}/artifacts",
+            headers=headers,
+        )
+        assert artifact_page.status_code == 200
+        assert [item["artifact_type"] for item in artifact_page.json()["items"]] == [
+            "dataset",
+            "workspace_result",
+            "text_memory",
+        ]
+        assert artifact_page.json()["has_more"] is False
+        for artifact in artifact_page.json()["items"]:
+            fetched_artifact = client.get(
+                f"/v2/projects/{authority.project_id}/artifacts/{artifact['artifact_id']}",
+                headers=headers,
+            )
+            assert fetched_artifact.status_code == 200
+            assert fetched_artifact.json() == artifact
+            content = client.get(
+                f"/v2/projects/{authority.project_id}/artifacts/"
+                f"{artifact['artifact_id']}/content",
+                headers=headers,
+            )
+            assert content.status_code == 200
+            assert content.json()["artifact"] == artifact
+            assert content.json()["byte_size"] == artifact["byte_size"]
 
         next_authority = owner.project_admission_authority(authority.project_id)
         second = client.post(
