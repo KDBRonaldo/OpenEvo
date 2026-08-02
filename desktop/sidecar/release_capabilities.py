@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 from typing import Mapping
@@ -50,6 +51,23 @@ class ReleaseAuthorityNegotiationError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True)
+class PersistedCoreAuthorityPolicyV2:
+    """One exact immutable predecessor that may be decoded but never mutated."""
+
+    release_version: str
+    core_mutation_api_major: int
+    supported_majors: tuple[int, ...]
+    build_id: str
+    source_commit: str
+    openapi_sha256: str
+    event_schema_sha256: str
+    required_core_feature_flags: tuple[str, ...]
+    feature_set_sha256: str
+    registry_sha256: str
+    runtime_contract_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class ReleaseAuthorityPolicyV2:
     release_version: str
     desktop_mutation_api_major: int
@@ -66,6 +84,7 @@ class ReleaseAuthorityPolicyV2:
     allow_direct_core_url: bool
     allow_legacy_route_fallback: bool
     require_registry_identity: bool
+    retained_core_authorities: tuple[PersistedCoreAuthorityPolicyV2, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,9 +115,48 @@ _V0110_POLICY_FIELDS = {
     "forbidden_provider_kinds",
     "release_version",
     "require_registry_identity",
+    "retained_core_authorities",
     "required_core_feature_flags",
     "required_desktop_feature_flags",
 }
+
+_RETAINED_CORE_AUTHORITY_FIELDS = {
+    "build_id",
+    "core_control_mutation_major",
+    "event_schema_sha256",
+    "feature_set_sha256",
+    "openapi_sha256",
+    "registry_sha256",
+    "release_version",
+    "required_core_feature_flags",
+    "runtime_contract_sha256",
+    "source_commit",
+    "supported_majors",
+}
+
+_PUBLISHED_V019_CORE_AUTHORITY = PersistedCoreAuthorityPolicyV2(
+    release_version="0.1.9",
+    core_mutation_api_major=2,
+    supported_majors=(2,),
+    build_id="4b42bb11dcd5b3aa66d9de112b101e3f248c6d4e722956f16588f1b288e0559c",
+    source_commit="54650e477a76dd07b0a511ad5450c3b8ea615556",
+    openapi_sha256="f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b",
+    event_schema_sha256=("464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"),
+    required_core_feature_flags=(
+        "atomic_successor_v2",
+        "event_replay_v2",
+        "project_genesis_v2",
+        "project_heads_v2",
+        "task_admission_v2",
+        "task_execution_v2",
+        "verified_capabilities",
+        "verified_registry",
+        "workspace_snapshots_v2",
+    ),
+    feature_set_sha256="ba514a0165727757d147ab09d9ee934a0c0eab2411ec5e2244d49237146d3f56",
+    registry_sha256="0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874",
+    runtime_contract_sha256=("535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"),
+)
 
 
 def _exact_string_tuple(value: object, *, field: str) -> tuple[str, ...]:
@@ -113,6 +171,89 @@ def _exact_string_tuple(value: object, *, field: str) -> tuple[str, ...]:
     if result != tuple(sorted(result)):
         raise RuntimeError(f"v0.1.10 release authority field {field} must be sorted")
     return result
+
+
+def _exact_lower_hex(value: object, *, field: str, length: int) -> str:
+    if (
+        type(value) is not str
+        or len(value) != length
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise RuntimeError(f"v0.1.10 release authority field {field} is invalid")
+    return value
+
+
+def _retained_core_authorities(value: object) -> tuple[PersistedCoreAuthorityPolicyV2, ...]:
+    if type(value) is not list or len(value) != 1 or type(value[0]) is not dict:
+        raise RuntimeError("v0.1.10 retained Core authority list is invalid")
+    item = value[0]
+    if set(item) != _RETAINED_CORE_AUTHORITY_FIELDS:
+        raise RuntimeError("v0.1.10 retained Core authority is not closed")
+    features = _exact_string_tuple(
+        item["required_core_feature_flags"],
+        field="retained_core_authorities.required_core_feature_flags",
+    )
+    feature_set_sha256 = _exact_lower_hex(
+        item["feature_set_sha256"],
+        field="retained_core_authorities.feature_set_sha256",
+        length=64,
+    )
+    computed_feature_set = hashlib.sha256(
+        json.dumps(
+            list(features),
+            ensure_ascii=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if feature_set_sha256 != computed_feature_set:
+        raise RuntimeError("v0.1.10 retained Core feature identity is invalid")
+    authority = PersistedCoreAuthorityPolicyV2(
+        release_version=item["release_version"] if type(item["release_version"]) is str else "",
+        core_mutation_api_major=(
+            item["core_control_mutation_major"]
+            if type(item["core_control_mutation_major"]) is int
+            else -1
+        ),
+        supported_majors=(
+            tuple(item["supported_majors"])
+            if type(item["supported_majors"]) is list
+            and all(type(major) is int for major in item["supported_majors"])
+            else ()
+        ),
+        build_id=_exact_lower_hex(
+            item["build_id"], field="retained_core_authorities.build_id", length=64
+        ),
+        source_commit=_exact_lower_hex(
+            item["source_commit"],
+            field="retained_core_authorities.source_commit",
+            length=40,
+        ),
+        openapi_sha256=_exact_lower_hex(
+            item["openapi_sha256"],
+            field="retained_core_authorities.openapi_sha256",
+            length=64,
+        ),
+        event_schema_sha256=_exact_lower_hex(
+            item["event_schema_sha256"],
+            field="retained_core_authorities.event_schema_sha256",
+            length=64,
+        ),
+        required_core_feature_flags=features,
+        feature_set_sha256=feature_set_sha256,
+        registry_sha256=_exact_lower_hex(
+            item["registry_sha256"],
+            field="retained_core_authorities.registry_sha256",
+            length=64,
+        ),
+        runtime_contract_sha256=_exact_lower_hex(
+            item["runtime_contract_sha256"],
+            field="retained_core_authorities.runtime_contract_sha256",
+            length=64,
+        ),
+    )
+    if authority != _PUBLISHED_V019_CORE_AUTHORITY:
+        raise RuntimeError("v0.1.10 retained Core authority is not the published v0.1.9 release")
+    return (authority,)
 
 
 def load_v0110_release_authority_policy(
@@ -156,6 +297,7 @@ def load_v0110_release_authority_policy(
     core_features = _exact_string_tuple(
         policy["required_core_feature_flags"], field="required_core_feature_flags"
     )
+    retained_core_authorities = _retained_core_authorities(policy["retained_core_authorities"])
     expected_scalars = {
         "release_version": "0.1.10",
         "desktop_local_mutation_major": 2,
@@ -190,9 +332,7 @@ def load_v0110_release_authority_policy(
         "task_admission_v2",
     )
     if desktop_features != required_desktop_features:
-        raise RuntimeError(
-            "v0.1.10 release authority has an incomplete Desktop feature set"
-        )
+        raise RuntimeError("v0.1.10 release authority has an incomplete Desktop feature set")
     required_forbidden = {
         "contract_simulator",
         "direct_backend",
@@ -219,6 +359,7 @@ def load_v0110_release_authority_policy(
         allow_direct_core_url=False,
         allow_legacy_route_fallback=False,
         require_registry_identity=True,
+        retained_core_authorities=retained_core_authorities,
     )
 
 
@@ -257,10 +398,14 @@ def _validate_core_v2_authority(
     policy: ReleaseAuthorityPolicyV2 = V0110_RELEASE_AUTHORITY_POLICY,
 ) -> VersionResponseV2:
     registry_identity = payload.get("registry_sha256")
-    if payload.get("schema_version") == "2" and policy.require_registry_identity and (
-        type(registry_identity) is not str
-        or len(registry_identity) != 64
-        or any(character not in "0123456789abcdef" for character in registry_identity)
+    if (
+        payload.get("schema_version") == "2"
+        and policy.require_registry_identity
+        and (
+            type(registry_identity) is not str
+            or len(registry_identity) != 64
+            or any(character not in "0123456789abcdef" for character in registry_identity)
+        )
     ):
         raise ReleaseAuthorityNegotiationError("Core registry identity is unavailable.")
     try:
@@ -275,7 +420,11 @@ def _validate_core_v2_authority(
     ):
         raise ReleaseAuthorityNegotiationError(release_identity_error)
     v2_offer = next(
-        (offer for offer in version.contracts if offer.api_major == policy.core_mutation_api_major),
+        (
+            offer
+            for offer in version.contracts
+            if offer.api_major == policy.core_mutation_api_major
+        ),
         None,
     )
     if v2_offer is None or not v2_offer.mutation_compatible:
@@ -318,12 +467,52 @@ def validate_persisted_core_v2_authority(
     currently negotiated authority.  No other historical release is accepted.
     """
 
-    return _validate_core_v2_authority(
-        payload,
-        allowed_release_versions=(policy.release_version, "0.1.9"),
-        release_identity_error="Core persisted release identity is incompatible.",
-        policy=policy,
+    if payload.get("release_version") == policy.release_version:
+        return negotiate_core_v2_mutation(payload, policy=policy)
+    authority = next(
+        (
+            candidate
+            for candidate in policy.retained_core_authorities
+            if payload.get("release_version") == candidate.release_version
+        ),
+        None,
     )
+    if authority is None:
+        raise ReleaseAuthorityNegotiationError("Core persisted release identity is incompatible.")
+    try:
+        version = VersionResponseV2.model_validate(dict(payload))
+    except ValidationError as exc:
+        raise ReleaseAuthorityNegotiationError(
+            "Core persisted release identity is incompatible."
+        ) from exc
+    offer = next(
+        (
+            candidate
+            for candidate in version.contracts
+            if candidate.api_major == authority.core_mutation_api_major
+        ),
+        None,
+    )
+    if (
+        version.release_version != authority.release_version
+        or version.build_channel != "release"
+        or version.build_id != authority.build_id
+        or version.source_commit != authority.source_commit
+        or tuple(version.supported_majors) != authority.supported_majors
+        or version.mutation_major != authority.core_mutation_api_major
+        or len(version.contracts) != 1
+        or offer is None
+        or not offer.mutation_compatible
+        or offer.openapi_sha256 != authority.openapi_sha256
+        or offer.event_schema_sha256 != authority.event_schema_sha256
+        or tuple(version.feature_flags) != authority.required_core_feature_flags
+        or version.feature_set_sha256 != authority.feature_set_sha256
+        or version.registry_sha256 != authority.registry_sha256
+        or version.runtime_contract_sha256 != authority.runtime_contract_sha256
+        or not version.mutation_compatible
+    ):
+        raise ReleaseAuthorityNegotiationError("Core persisted release identity is incompatible.")
+    return version
 
 
 def validate_v0110_release_composition(
@@ -381,6 +570,7 @@ def negotiate_v0110_mutation_authority(
 __all__ = (
     "RELEASE_EXECUTION_MODE_CAPABILITIES_V1",
     "NegotiatedMutationAuthorityV2",
+    "PersistedCoreAuthorityPolicyV2",
     "ReleaseAuthorityNegotiationError",
     "ReleaseAuthorityPolicyV2",
     "V0110_RELEASE_AUTHORITY_POLICY",

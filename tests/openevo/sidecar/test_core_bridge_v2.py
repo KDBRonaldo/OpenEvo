@@ -233,6 +233,56 @@ def _rewrite_single_mapping_release(database: Path, release_version: str) -> Non
             document = json.loads(bytes(encoded))
             document["daemon_release_version"] = release_version
             document["core_version"]["release_version"] = release_version
+            if release_version == "0.1.9":
+                historical = document["core_version"]
+                historical["supported_majors"] = [2]
+                historical["contracts"] = [
+                    {
+                        "access": "mutation",
+                        "api_major": 2,
+                        "event_schema_sha256": (
+                            "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+                        ),
+                        "mutation_compatible": True,
+                        "openapi_sha256": (
+                            "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+                        ),
+                        "schema_version": "2",
+                    }
+                ]
+                historical["build_id"] = (
+                    "4b42bb11dcd5b3aa66d9de112b101e3f248c6d4e722956f16588f1b288e0559c"
+                )
+                historical["source_commit"] = "54650e477a76dd07b0a511ad5450c3b8ea615556"
+                historical["registry_sha256"] = (
+                    "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"
+                )
+                historical["runtime_contract_sha256"] = (
+                    "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+                )
+                document["daemon_build_id"] = historical["build_id"]
+                document["daemon_source_commit"] = historical["source_commit"]
+                document["daemon_openapi_sha256"] = historical["contracts"][0]["openapi_sha256"]
+                document["daemon_event_schema_sha256"] = historical["contracts"][0][
+                    "event_schema_sha256"
+                ]
+                document["daemon_registry_sha256"] = historical["registry_sha256"]
+                document["daemon_runtime_contract_sha256"] = historical["runtime_contract_sha256"]
+                heads = [
+                    document["active_project_head"],
+                    document["core_project"]["active_project_head"],
+                    *document["project_head_successor_proof"],
+                ]
+                for head in heads:
+                    if head is None:
+                        continue
+                    head["registry_sha256"] = historical["registry_sha256"]
+                    head["runtime_context_snapshot"]["registry_sha256"] = historical[
+                        "registry_sha256"
+                    ]
+                    head["runtime_context_snapshot"]["runtime_contract_sha256"] = historical[
+                        "runtime_contract_sha256"
+                    ]
             canonical = json.dumps(
                 document,
                 ensure_ascii=True,
@@ -244,6 +294,20 @@ def _rewrite_single_mapping_release(database: Path, release_version: str) -> Non
                 f"UPDATE {table} SET document_sha256 = ?, document_json = ? WHERE rowid = ?",
                 (hashlib.sha256(canonical).hexdigest(), canonical, rowid),
             )
+
+
+def _published_v019_project(project: m.ProjectV2) -> m.ProjectV2:
+    payload = project.model_dump(mode="json")
+    head = payload["active_project_head"]
+    assert isinstance(head, dict)
+    head["registry_sha256"] = "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"
+    context = head["runtime_context_snapshot"]
+    assert isinstance(context, dict)
+    context["registry_sha256"] = "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"
+    context["runtime_contract_sha256"] = (
+        "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+    )
+    return m.ProjectV2.model_validate(payload, strict=True)
 
 
 def _base_handler(
@@ -746,6 +810,7 @@ def test_reconnect_upgrades_v019_historical_mapping_before_current_mutation(
     bridge.close()
     store.close()
     _rewrite_single_mapping_release(database, "0.1.9")
+    historical_project = _published_v019_project(first.project)
     post_count = sum(
         request.method == "POST" and request.url.path == "/v2/projects" for request in requests
     )
@@ -755,7 +820,9 @@ def test_reconnect_upgrades_v019_historical_mapping_before_current_mutation(
             host_service=_HostService(),
             tunnel_factory=_TunnelFactory(),
             persistence=reopened,
-            transport_factory=lambda: httpx.MockTransport(_base_handler(requests)),
+            transport_factory=lambda: httpx.MockTransport(
+                _base_handler(requests, project=historical_project)
+            ),
         )
         activation = current.activate_project(
             "desktop-project-1",

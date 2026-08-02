@@ -31,6 +31,7 @@ from desktop.sidecar.core_client_v2 import (
 from desktop.sidecar.lifecycle_logs_v2 import LifecycleRawOutputObserverV2
 from desktop.sidecar.release_capabilities import (
     ReleaseAuthorityNegotiationError,
+    V0110_RELEASE_AUTHORITY_POLICY,
     validate_persisted_core_v2_authority,
 )
 from openevo.backend.contracts.v2 import models as core_v2
@@ -250,13 +251,28 @@ class CoreProjectMappingV2:
         ):
             raise ValueError("Core mapping flattened authority differs from its models")
         head = self.active_project_head
-        if head is not None and (
-            head.project_id != self.core_project_id
-            or head.registry_sha256 != self.daemon_registry_sha256
-            or head.runtime_context_snapshot.runtime_contract_sha256
-            != self.daemon_runtime_contract_sha256
-        ):
-            raise ValueError("Core project head differs from negotiated authority")
+        if head is not None:
+            head_authority = (
+                head.registry_sha256,
+                head.runtime_context_snapshot.runtime_contract_sha256,
+            )
+            allowed_head_authorities = {
+                (
+                    self.daemon_registry_sha256,
+                    self.daemon_runtime_contract_sha256,
+                ),
+                *(
+                    (
+                        authority.registry_sha256,
+                        authority.runtime_contract_sha256,
+                    )
+                    for authority in V0110_RELEASE_AUTHORITY_POLICY.retained_core_authorities
+                ),
+            }
+            if head.project_id != self.core_project_id or head_authority not in (
+                allowed_head_authorities
+            ):
+                raise ValueError("Core project head differs from negotiated authority")
 
 
 def core_project_mapping_document_v2(mapping: CoreProjectMappingV2) -> dict[str, object]:

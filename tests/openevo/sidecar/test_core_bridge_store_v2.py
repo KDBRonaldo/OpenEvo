@@ -109,14 +109,62 @@ def _rewrite_single_mapping_release(root: Path, release_version: str) -> None:
     database = root / DATABASE_FILENAME
     with sqlite3.connect(database) as connection:
         for table in ("mappings", "mapping_history"):
-            rows = connection.execute(
-                f"SELECT rowid, document_json FROM {table}"
-            ).fetchall()
+            rows = connection.execute(f"SELECT rowid, document_json FROM {table}").fetchall()
             assert len(rows) == 1
             rowid, encoded = rows[0]
             document = json.loads(bytes(encoded))
             document["daemon_release_version"] = release_version
             document["core_version"]["release_version"] = release_version
+            if release_version == "0.1.9":
+                historical = document["core_version"]
+                historical["supported_majors"] = [2]
+                historical["contracts"] = [
+                    {
+                        "access": "mutation",
+                        "api_major": 2,
+                        "event_schema_sha256": (
+                            "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+                        ),
+                        "mutation_compatible": True,
+                        "openapi_sha256": (
+                            "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+                        ),
+                        "schema_version": "2",
+                    }
+                ]
+                historical["build_id"] = (
+                    "4b42bb11dcd5b3aa66d9de112b101e3f248c6d4e722956f16588f1b288e0559c"
+                )
+                historical["source_commit"] = "54650e477a76dd07b0a511ad5450c3b8ea615556"
+                historical["registry_sha256"] = (
+                    "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"
+                )
+                historical["runtime_contract_sha256"] = (
+                    "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+                )
+                document["daemon_build_id"] = historical["build_id"]
+                document["daemon_source_commit"] = historical["source_commit"]
+                document["daemon_openapi_sha256"] = historical["contracts"][0]["openapi_sha256"]
+                document["daemon_event_schema_sha256"] = historical["contracts"][0][
+                    "event_schema_sha256"
+                ]
+                document["daemon_registry_sha256"] = historical["registry_sha256"]
+                document["daemon_runtime_contract_sha256"] = historical["runtime_contract_sha256"]
+                heads = [
+                    document["active_project_head"],
+                    document["core_project"]["active_project_head"],
+                    *document["project_head_successor_proof"],
+                ]
+                for head in heads:
+                    if head is None:
+                        continue
+                    head["registry_sha256"] = historical["registry_sha256"]
+                    head["runtime_context_snapshot"]["registry_sha256"] = historical[
+                        "registry_sha256"
+                    ]
+                    head["runtime_context_snapshot"]["runtime_contract_sha256"] = historical[
+                        "runtime_contract_sha256"
+                    ]
             canonical = json.dumps(
                 document,
                 ensure_ascii=True,
@@ -139,6 +187,23 @@ def test_mapping_binds_distinct_v2_authorities_and_has_no_generic_revision() -> 
         replace(mapping, core_project_id="other-project")
     with pytest.raises((TypeError, ValueError)):
         replace(mapping, daemon_registry_sha256="f" * 64)
+
+    head = mapping.active_project_head
+    assert head is not None
+    foreign_head = head.model_copy(
+        update={
+            "registry_sha256": "f" * 64,
+            "runtime_context_snapshot": head.runtime_context_snapshot.model_copy(
+                update={
+                    "registry_sha256": "f" * 64,
+                    "runtime_contract_sha256": "e" * 64,
+                }
+            ),
+        }
+    )
+    foreign_project = mapping.core_project.model_copy(update={"active_project_head": foreign_head})
+    with pytest.raises(ValueError, match="project head differs"):
+        _mapping(project=foreign_project)
 
 
 def test_store_recovers_exact_v019_mapping_only_as_historical_authority(

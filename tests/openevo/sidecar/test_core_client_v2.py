@@ -162,6 +162,20 @@ def _project(project_id: str = "project-1") -> m.ProjectV2:
     )
 
 
+def _published_v019_project(project_id: str = "project-1") -> m.ProjectV2:
+    payload = _project(project_id).model_dump(mode="json")
+    head = payload["active_project_head"]
+    assert isinstance(head, dict)
+    head["registry_sha256"] = "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"
+    context = head["runtime_context_snapshot"]
+    assert isinstance(context, dict)
+    context["registry_sha256"] = "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874"
+    context["runtime_contract_sha256"] = (
+        "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+    )
+    return m.ProjectV2.model_validate(payload, strict=True)
+
+
 def _connection(endpoint: str = "http://127.0.0.1:49201") -> CoreTunnelConnectionV2:
     return CoreTunnelConnectionV2(
         endpoint=endpoint,
@@ -219,6 +233,40 @@ def test_version_is_frozen_and_authentication_stays_on_v2_fixed_origin() -> None
     assert "authorization" not in requests[0].headers
     assert requests[1].headers["authorization"] == f"Bearer {_TOKEN}"
     assert _TOKEN not in repr(_connection())
+
+
+def test_current_client_accepts_only_exact_published_v019_project_head_for_reconnect() -> None:
+    historical = _published_v019_project()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        assert request.url.path == "/v2/projects/project-1"
+        return httpx.Response(200, json=historical.model_dump(mode="json"))
+
+    with _client(handler) as client:
+        client.version()
+        assert client.get_project() == historical
+
+    payload = historical.model_dump(mode="json")
+    head = payload["active_project_head"]
+    assert isinstance(head, dict)
+    head["registry_sha256"] = "f" * 64
+    context = head["runtime_context_snapshot"]
+    assert isinstance(context, dict)
+    context["registry_sha256"] = "f" * 64
+    foreign = m.ProjectV2.model_validate(payload, strict=True)
+
+    def foreign_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        return httpx.Response(200, json=foreign.model_dump(mode="json"))
+
+    with _client(foreign_handler) as client:
+        client.version()
+        with pytest.raises(CoreClientErrorV2) as caught:
+            client.get_project()
+    assert caught.value.error.code == CoreClientLocalErrorCodeV2.AUTHORITY_DRIFT
 
 
 def test_authenticated_calls_require_version_and_changed_version_is_rejected() -> None:

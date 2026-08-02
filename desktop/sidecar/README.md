@@ -119,6 +119,16 @@ exact typed authority result. `event_broker_v2.py` provides bounded canonical
 local replay and subscriber queues. Release-provider routing and renderer-facing
 Local API v2 composition are wired separately.
 
+Startup may decode the one immutable public `0.1.9` Core authority frozen in
+`v0110.retained_core_authorities`, including its real historical Core
+OpenAPI/event, source, build, registry, feature-set, runtime-contract, and major
+identities. That record is predecessor evidence only: live mutation still
+requires exact `0.1.10` negotiation, and the historical mapping can advance only
+as the next mapping generation after reconnecting to the same Core project. A
+retained immutable Project Head or Runtime Context keeps its frozen `0.1.9`
+registry/runtime pair; the strict client accepts that exact pair as read
+authority without treating it as the current Daemon's mutation authority.
+
 ## Release execution modes
 
 The exact sidecar release composition publishes the required

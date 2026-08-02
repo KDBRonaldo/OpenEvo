@@ -854,18 +854,26 @@ reports `core_not_started`, not an online Core.
 ### 0.1.10 retained Core authority recovery
 
 The private Core bridge store distinguishes a persisted observation from live
-mutation authority. It may decode an exact `0.1.9` predecessor mapping only
-when that record still has the complete current v2 contract, feature, event,
-OpenAPI, runtime-contract, and verified-registry shape. The historical record
-cannot be committed, replayed as a no-op write, or used to authorize a remote
-operation. Any other historical release or contract drift fails startup closed.
+mutation authority. It may decode only the exact immutable public `0.1.9`
+predecessor authority frozen in `v0110.retained_core_authorities`: source
+commit, build ID, supported major, Core OpenAPI/event digests, feature-set
+digest, verified-registry digest, and runtime-contract digest must all match the
+published release. It does not relabel a current `0.1.10` contract as `0.1.9`.
+The historical record cannot be committed, replayed as a no-op write, or used
+to authorize a remote operation. Any other historical release or identity drift
+fails startup closed.
 
 On reconnect, Desktop opens the saved Core project through its active SSH
 tunnel and independently negotiates the exact current `0.1.10` Daemon. Only
 after that live negotiation and project-intent verification does it append a
 successor mapping generation. It does not call project creation again. Thus an
 upgrade preserves the Core project identity while replacing historical
-observation evidence; all new writes remain current-release-only.
+observation evidence; all new writes remain current-release-only. The strict
+client may continue to read a Project Head or Runtime Context carrying the one
+frozen `0.1.9` registry/runtime pair, because those objects are immutable and
+distinct from current Daemon authority. New or mixed historical pairs remain
+invalid, and current mutations still bind the live `0.1.10` version and
+registry.
 
 ### 0.1.10 verified remote-home source fix
 

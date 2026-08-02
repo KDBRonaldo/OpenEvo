@@ -906,12 +906,16 @@ orderings so that restart recovery cannot defer the project forever behind an
 explicit disconnect. Restart recovery also excludes a project operation with
 durable cancellation intent from automatic reconnect prerequisites.
 
-Retained Core bridge state follows the same split. An exact `0.1.9` mapping is
-readable only as predecessor evidence; it never grants live mutation authority.
-Reconnect must negotiate an exact current `0.1.10` Daemon over the active
-project tunnel, verify the existing Core project, and append one successor
-mapping generation without another project-create request. Older releases or
-any v2 contract/feature/digest drift remain startup-fatal.
+Retained Core bridge state follows the same split. Only the exact immutable
+public `0.1.9` authority is readable as predecessor evidence: its source commit,
+build ID, actual `0.1.9` Core OpenAPI/event digests, feature-set digest,
+verified-registry digest, runtime-contract digest, and supported major are
+frozen under `v0110.retained_core_authorities`. It never grants live mutation
+authority. Reconnect must negotiate an exact current `0.1.10` Daemon over the
+active project tunnel, verify the existing Core project, and append one
+successor mapping generation without another project-create request. A
+synthetic `0.1.9` label over current contract digests, older releases, or any
+other identity drift remains startup-fatal.
 
 The lifecycle contract covers all implemented Desktop-owned long work:
 

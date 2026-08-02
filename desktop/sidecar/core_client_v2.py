@@ -2287,11 +2287,33 @@ class CoreControlClientV2:
         self._ensure_active_project(head.project_id)
         negotiated = version or self._require_version_authority()
         if (
-            head.registry_sha256 != negotiated.registry_sha256
-            or head.runtime_context_snapshot.runtime_contract_sha256
-            != negotiated.runtime_contract_sha256
+            head.runtime_context_snapshot.registry_sha256 != head.registry_sha256
+            or not self._is_allowed_context_authority(
+                registry_sha256=head.registry_sha256,
+                runtime_contract_sha256=(head.runtime_context_snapshot.runtime_contract_sha256),
+                version=negotiated,
+            )
         ):
             _raise_local(CoreClientLocalErrorCodeV2.AUTHORITY_DRIFT, 502)
+
+    @staticmethod
+    def _is_allowed_context_authority(
+        *,
+        registry_sha256: str,
+        runtime_contract_sha256: str,
+        version: v2.VersionResponseV2,
+    ) -> bool:
+        authority = (registry_sha256, runtime_contract_sha256)
+        if authority == (version.registry_sha256, version.runtime_contract_sha256):
+            return True
+        return any(
+            authority
+            == (
+                historical.registry_sha256,
+                historical.runtime_contract_sha256,
+            )
+            for historical in V0110_RELEASE_AUTHORITY_POLICY.retained_core_authorities
+        )
 
     def _validate_project_authority(
         self,
@@ -2538,9 +2560,10 @@ class CoreControlClientV2:
             context = event.runtime_context_snapshot
             self._ensure_active_project(context.project_id)
             version = self._require_version_authority()
-            if (
-                context.registry_sha256 != version.registry_sha256
-                or context.runtime_contract_sha256 != version.runtime_contract_sha256
+            if not self._is_allowed_context_authority(
+                registry_sha256=context.registry_sha256,
+                runtime_contract_sha256=context.runtime_contract_sha256,
+                version=version,
             ):
                 _raise_local(CoreClientLocalErrorCodeV2.AUTHORITY_DRIFT, 502)
         elif isinstance(event, v2.ProjectHeadActivatedEventV2):

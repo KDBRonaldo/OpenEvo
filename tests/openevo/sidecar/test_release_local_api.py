@@ -314,6 +314,53 @@ def _v0110_core_discovery() -> dict[str, object]:
     }
 
 
+def _published_v019_core_discovery() -> dict[str, object]:
+    features = [
+        "atomic_successor_v2",
+        "event_replay_v2",
+        "project_genesis_v2",
+        "project_heads_v2",
+        "task_admission_v2",
+        "task_execution_v2",
+        "verified_capabilities",
+        "verified_registry",
+        "workspace_snapshots_v2",
+    ]
+    return {
+        "schema_version": "2",
+        "api_name": "openevo-core-control-api",
+        "preferred_major": 2,
+        "supported_majors": [2],
+        "mutation_major": 2,
+        "contracts": [
+            {
+                "schema_version": "2",
+                "api_major": 2,
+                "openapi_sha256": (
+                    "f007726d8b092463a2515500e3cc0c496b52b45e9f24d1fc495b11df9a9a837b"
+                ),
+                "event_schema_sha256": (
+                    "464a52685dacaedc391fb17bb27516e64842e23d89d12d475679d7a41a0668df"
+                ),
+                "access": "mutation",
+                "mutation_compatible": True,
+            }
+        ],
+        "release_version": "0.1.9",
+        "build_id": "4b42bb11dcd5b3aa66d9de112b101e3f248c6d4e722956f16588f1b288e0559c",
+        "source_commit": "54650e477a76dd07b0a511ad5450c3b8ea615556",
+        "build_channel": "release",
+        "provider_kind": "openevo_daemon",
+        "feature_flags": features,
+        "feature_set_sha256": _canonical_feature_digest(features),
+        "registry_sha256": "0c8d466db17fd0dc312a647c34e35bed04eba4e615799effebec761533c30874",
+        "runtime_contract_sha256": (
+            "535e3a05645590c90956769d960884fbbd818280b7517582a72e0b4fb41987f0"
+        ),
+        "mutation_compatible": True,
+    }
+
+
 def test_v0110_release_policy_pins_exact_local_and_core_v2_authority() -> None:
     policy = V0110_RELEASE_AUTHORITY_POLICY
     assert policy.release_version == "0.1.10"
@@ -374,19 +421,28 @@ def test_v0110_core_negotiation_rejects_v1_missing_registry_and_digest_drift() -
 
 
 def test_persisted_core_authority_accepts_only_exact_v019_predecessor_observation() -> None:
-    historical = {**_v0110_core_discovery(), "release_version": "0.1.9"}
+    historical = _published_v019_core_discovery()
 
     assert validate_persisted_core_v2_authority(historical).release_version == "0.1.9"
     with pytest.raises(ReleaseAuthorityNegotiationError, match="release identity"):
         negotiate_core_v2_mutation(historical)
     with pytest.raises(ReleaseAuthorityNegotiationError, match="persisted"):
-        validate_persisted_core_v2_authority(
-            {**historical, "release_version": "0.1.8"}
-        )
-    contracts = cast(list[dict[str, object]], historical["contracts"])
-    contracts[1] = {**contracts[1], "event_schema_sha256": "f" * 64}
-    with pytest.raises(ReleaseAuthorityNegotiationError, match="event schema"):
-        validate_persisted_core_v2_authority(historical)
+        validate_persisted_core_v2_authority({**historical, "release_version": "0.1.8"})
+    for field, drifted in (
+        ("source_commit", "0" * 40),
+        ("build_id", "0" * 64),
+        ("registry_sha256", "0" * 64),
+        ("runtime_contract_sha256", "0" * 64),
+    ):
+        with pytest.raises(ReleaseAuthorityNegotiationError, match="persisted"):
+            validate_persisted_core_v2_authority({**historical, field: drifted})
+
+    current_contract_historical_label = {
+        **_v0110_core_discovery(),
+        "release_version": "0.1.9",
+    }
+    with pytest.raises(ReleaseAuthorityNegotiationError, match="persisted"):
+        validate_persisted_core_v2_authority(current_contract_historical_label)
 
 
 @pytest.mark.parametrize(
@@ -1100,10 +1156,7 @@ def test_release_local_operation_cancel_rejects_unbound_remote_maintenance(
         assert response.json()["next_action"] == (
             "Wait for the operation to finish, then run Check again."
         )
-        assert (
-            provider._store.get_local_operation(operation.operation_id).state
-            == "queued"
-        )
+        assert provider._store.get_local_operation(operation.operation_id).state == "queued"
 
 
 def test_running_profile_connect_cancel_interrupts_lifecycle_and_is_replayable(
