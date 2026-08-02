@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from openevo.codex_models import codex_cli_model_name, validate_codex_model_ref
 from openevo.evolution.framework.execution import (
@@ -36,6 +37,9 @@ _DISABLED_FEATURES = (
     "unified_exec",
     "standalone_web_search",
 )
+CODEX_PROXY_BASE_URL_ENV = "OPENEVO_CODEX_PROXY_BASE_URL"
+_CODEX_PROXY_API_KEY = "openevo-internal-reflector"
+_CODEX_PROXY_PROVIDER_ID = "openevo_reflector_proxy"
 
 
 class HarnessInferenceError(RuntimeError):
@@ -61,7 +65,88 @@ class CodexInvocationRunner(Protocol):
     ) -> CodexInvocationResult: ...
 
 
-class CodexSubscriptionHarnessService:
+class _CodexHarnessServiceBase:
+    def __init__(
+        self,
+        *,
+        codex_binary: str,
+        temporary_root: Path | None,
+        runner: CodexInvocationRunner | None,
+    ) -> None:
+        if (
+            not codex_binary
+            or "\x00" in codex_binary
+            or any(ord(char) < 0x20 for char in codex_binary)
+        ):
+            raise ValueError("Codex harness executable is invalid")
+        if temporary_root is not None and not temporary_root.is_absolute():
+            raise ValueError("Codex harness temporary root must be absolute")
+        self._codex_binary = codex_binary
+        self._temporary_root = temporary_root
+        self._runner = runner or _BoundedCodexInvocationRunner()
+
+    @staticmethod
+    def _validate_request(request: HarnessInferenceRequest) -> None:
+        if request.harness_id != "codex":
+            raise HarnessInferenceError(
+                f"Codex harness service does not support {request.harness_id!r}"
+            )
+        if request.temperature is not None:
+            raise HarnessInferenceError(
+                "Codex harness service does not support temperature control"
+            )
+        if request.max_output_tokens is not None:
+            raise HarnessInferenceError(
+                "Codex harness service does not support max_output_tokens control"
+            )
+
+    @staticmethod
+    def _model_name(value: str | None) -> str:
+        try:
+            validated = validate_codex_model_ref(
+                value or MANAGED_CODEX_DEFAULT_MODEL,
+                field_name="Codex harness model",
+            )
+        except ValueError as exc:
+            raise HarnessInferenceError(
+                "Codex harness service does not support the requested model"
+            ) from exc
+        return codex_cli_model_name(validated)
+
+    def _argv(
+        self,
+        *,
+        model: str,
+        workspace: Path,
+        provider_overrides: tuple[str, ...] = (),
+    ) -> tuple[str, ...]:
+        disabled = tuple(
+            part
+            for feature in _DISABLED_FEATURES
+            for part in ("--disable", feature)
+        )
+        return (
+            self._codex_binary,
+            "exec",
+            "--json",
+            "--strict-config",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            "--sandbox",
+            "read-only",
+            *disabled,
+            "--skip-git-repo-check",
+            "--cd",
+            os.fspath(workspace),
+            *provider_overrides,
+            "--model",
+            model,
+            "-",
+        )
+
+
+class CodexSubscriptionHarnessService(_CodexHarnessServiceBase):
     """Run model-only Codex subscription turns for verified method plugins.
 
     The method request controls generation text and model identity only. Core
@@ -77,21 +162,15 @@ class CodexSubscriptionHarnessService:
         temporary_root: Path | None = None,
         runner: CodexInvocationRunner | None = None,
     ) -> None:
-        if (
-            not codex_binary
-            or "\x00" in codex_binary
-            or any(ord(char) < 0x20 for char in codex_binary)
-        ):
-            raise ValueError("Codex harness executable is invalid")
         source = credential_source or (Path.home() / ".codex" / "auth.json")
         if not source.is_absolute():
             raise ValueError("Codex harness credential source must be absolute")
-        if temporary_root is not None and not temporary_root.is_absolute():
-            raise ValueError("Codex harness temporary root must be absolute")
-        self._codex_binary = codex_binary
+        super().__init__(
+            codex_binary=codex_binary,
+            temporary_root=temporary_root,
+            runner=runner,
+        )
         self._credential_source = source
-        self._temporary_root = temporary_root
-        self._runner = runner or _BoundedCodexInvocationRunner()
 
     def infer(self, request: HarnessInferenceRequest) -> HarnessInferenceResponse:
         checked = HarnessInferenceRequest.model_validate(request)
@@ -200,58 +279,164 @@ class CodexSubscriptionHarnessService:
             raise HarnessInferenceError("Codex harness inference produced no response")
         return response
 
-    @staticmethod
-    def _validate_request(request: HarnessInferenceRequest) -> None:
-        if request.harness_id != "codex":
-            raise HarnessInferenceError(
-                f"Codex harness service does not support {request.harness_id!r}"
-            )
-        if request.temperature is not None:
-            raise HarnessInferenceError(
-                "Codex harness service does not support temperature control"
-            )
-        if request.max_output_tokens is not None:
-            raise HarnessInferenceError(
-                "Codex harness service does not support max_output_tokens control"
-            )
 
-    @staticmethod
-    def _model_name(value: str | None) -> str:
+
+class CodexProxyHarnessService(_CodexHarnessServiceBase):
+    """Run model-only Codex turns through one generation-bound local Gateway."""
+
+    def __init__(
+        self,
+        *,
+        proxy_base_url: str,
+        codex_binary: str = "codex",
+        temporary_root: Path | None = None,
+        runner: CodexInvocationRunner | None = None,
+    ) -> None:
+        super().__init__(
+            codex_binary=codex_binary,
+            temporary_root=temporary_root,
+            runner=runner,
+        )
+        self._proxy_base_url = _validated_proxy_base_url(proxy_base_url)
+
+    def infer(self, request: HarnessInferenceRequest) -> HarnessInferenceResponse:
+        checked = HarnessInferenceRequest.model_validate(request)
+        self._validate_request(checked)
+        model = self._model_name(checked.model_name)
+        prompt = _render_prompt(checked)
+
+        run_root: Path | None = None
+        run_identity = None
+        failure: BaseException | None = None
+        response: HarnessInferenceResponse | None = None
+        redactor = CredentialRedactor(())
         try:
-            validated = validate_codex_model_ref(
-                value or MANAGED_CODEX_DEFAULT_MODEL,
-                field_name="Codex harness model",
+            run_root = Path(
+                mkdtemp(
+                    prefix="openevo-method-codex-proxy-",
+                    dir=self._temporary_root,
+                )
             )
-        except ValueError as exc:
-            raise HarnessInferenceError(
-                "Codex harness service does not support the requested model"
-            ) from exc
-        return codex_cli_model_name(validated)
+            os.chmod(run_root, 0o700)
+            run_identity = capture_session_root_identity(run_root)
+            codex_home = run_root / "codex"
+            workspace = run_root / "workspace"
+            home = run_root / "home"
+            temporary = run_root / "tmp"
+            for directory in (codex_home, workspace, home, temporary):
+                directory.mkdir(mode=0o700)
+            result = self._runner.run(
+                self._argv(
+                    model=model,
+                    workspace=workspace,
+                    provider_overrides=codex_proxy_cli_overrides(
+                        self._proxy_base_url
+                    ),
+                ),
+                input_bytes=prompt,
+                env=_controlled_codex_environment(
+                    codex_home=codex_home,
+                    home=home,
+                    temporary=temporary,
+                    proxy_api_key=_CODEX_PROXY_API_KEY,
+                ),
+                cwd=workspace,
+                timeout_seconds=checked.timeout_seconds,
+            )
+            if result.returncode != 0:
+                detail = _redacted_detail(
+                    result.stderr or result.stdout,
+                    redactor=redactor,
+                )
+                suffix = f": {detail}" if detail else ""
+                raise HarnessInferenceError(
+                    f"Codex harness inference failed{suffix}"
+                )
+            response = HarnessInferenceResponse(
+                request_id=checked.request_id,
+                text=redactor.redact(_completed_agent_message(result.stdout)),
+                capture_mode="transcript",
+            )
+        except HarnessInferenceError as exc:
+            failure = exc
+        except (OSError, ValueError, SessionFileSecurityError) as exc:
+            failure = HarnessInferenceError(
+                "Codex harness inference could not be executed safely"
+            )
+            failure.__cause__ = exc
+        finally:
+            cleanup_error: BaseException | None = None
+            if run_root is not None and run_identity is not None:
+                try:
+                    remove_session_tree(run_root, run_identity)
+                except (OSError, SessionFileSecurityError) as exc:
+                    cleanup_error = exc
+            if cleanup_error is not None:
+                cleanup_failure = HarnessInferenceError(
+                    "Codex harness private state could not be cleaned safely"
+                )
+                cleanup_failure.__cause__ = cleanup_error
+                if failure is None:
+                    failure = cleanup_failure
+                else:
+                    failure.add_note(str(cleanup_failure))
 
-    def _argv(self, *, model: str, workspace: Path) -> tuple[str, ...]:
-        disabled = tuple(
-            part
-            for feature in _DISABLED_FEATURES
-            for part in ("--disable", feature)
-        )
-        return (
-            self._codex_binary,
-            "exec",
-            "--json",
-            "--strict-config",
-            "--ignore-user-config",
-            "--ignore-rules",
-            "--ephemeral",
-            "--sandbox",
-            "read-only",
-            *disabled,
-            "--skip-git-repo-check",
-            "--cd",
-            os.fspath(workspace),
-            "--model",
-            model,
-            "-",
-        )
+        if failure is not None:
+            raise failure
+        if response is None:
+            raise HarnessInferenceError("Codex harness inference produced no response")
+        return response
+
+
+def _validated_proxy_base_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Codex proxy base URL is invalid") from exc
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or not 1 <= port <= 65_535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/v1"
+        or parsed.query
+        or parsed.fragment
+        or parsed.netloc != f"127.0.0.1:{port}"
+    ):
+        raise ValueError("Codex proxy base URL must be a canonical loopback /v1 URL")
+    return f"http://127.0.0.1:{port}/v1"
+
+
+def codex_proxy_base_url_from_environment() -> str | None:
+    value = os.environ.get(CODEX_PROXY_BASE_URL_ENV)
+    return None if value is None else _validated_proxy_base_url(value)
+
+
+def codex_proxy_cli_overrides(proxy_base_url: str) -> tuple[str, ...]:
+    base_url = _validated_proxy_base_url(proxy_base_url)
+    prefix = f"model_providers.{_CODEX_PROXY_PROVIDER_ID}"
+    return (
+        "-c",
+        f'model_provider="{_CODEX_PROXY_PROVIDER_ID}"',
+        "-c",
+        f'{prefix}.name="OpenEvo Reflector Proxy"',
+        "-c",
+        f'{prefix}.base_url="{base_url}"',
+        "-c",
+        f'{prefix}.env_key="OPENAI_API_KEY"',
+        "-c",
+        f'{prefix}.wire_api="responses"',
+    )
+
+
+def configure_codex_proxy_child_environment(env: dict[str, str]) -> dict[str, str]:
+    controlled = dict(env)
+    controlled.pop(CODEX_PROXY_BASE_URL_ENV, None)
+    controlled["OPENAI_API_KEY"] = _CODEX_PROXY_API_KEY
+    return controlled
 
 
 def _render_prompt(request: HarnessInferenceRequest) -> bytes:
@@ -266,6 +451,7 @@ def _controlled_codex_environment(
     codex_home: Path,
     home: Path,
     temporary: Path,
+    proxy_api_key: str | None = None,
 ) -> dict[str, str]:
     env = {
         "CODEX_HOME": os.fspath(codex_home),
@@ -275,6 +461,8 @@ def _controlled_codex_environment(
         "PYTHONSAFEPATH": "1",
         "TMPDIR": os.fspath(temporary),
     }
+    if proxy_api_key is not None:
+        env["OPENAI_API_KEY"] = proxy_api_key
     for key in ("LANG", "LC_ALL"):
         value = os.environ.get(key)
         if value:

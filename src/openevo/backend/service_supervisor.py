@@ -60,6 +60,7 @@ from openevo.backend.contracts.v1.models import (
     ServiceSummaryV1,
 )
 from openevo.projects.science.compiler import MANAGED_RUNTIME_IMAGES
+from openevo.evolution.harness_service import CODEX_PROXY_BASE_URL_ENV
 from openevo.gateway.session_files import (
     CODEX_CREDENTIAL_AUTHORITY_FD_ENV,
     CODEX_CREDENTIAL_SNAPSHOT_FD_ENV,
@@ -4461,6 +4462,8 @@ class CoreServiceSupervisor:
             )
             if service_id == "gateway":
                 service_env[WORKSPACE_HANDOFF_ROOT_ENV] = os.fspath(self._workspace_handoff_root)
+            if service_id == "evolution-worker" and self_deployed:
+                service_env[CODEX_PROXY_BASE_URL_ENV] = f"{gateway_url}/v1"
             service_env = dict(sorted(service_env.items()))
             env_digest = _digest_json(service_env)
             identity_digest = _digest_json(

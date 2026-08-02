@@ -411,10 +411,12 @@ reflector model。默认 provider 是 `openai_chat`：`base_url` 默认读取
 `OPENAI_BASE_URL`，否则使用 `https://api.openai.com/v1`；API key 可直接传入
 `reflector_llm.api_key`，或通过 `api_key_env` 从环境变量读取，默认
 `OPENAI_API_KEY`。如果只有 Codex subscription 登录态，可以设置
-`reflector_llm.provider="codex_cli"`，worker 会调用本机 `codex exec`，清除代理 API
-key/base-url 环境变量，并使用 `reflector_llm.codex_home` 指定的 Codex 登录目录。该 nested
-Codex run 会忽略用户 config、使用 `--ephemeral`、`--sandbox read-only`、
-并禁用 `shell_tool`，因为 dataset transcripts 属于不可信 prompt 内容。该方法不做 promotion 评估，
+`reflector_llm.provider="codex_cli"`，worker 会调用本机 `codex exec`。Subscription
+generation 会清除代理 API key/base-url 环境变量，并使用 Core 隔离出的 Codex 登录目录；
+Self-Deployed generation 则不会读取用户 `~/.codex`，只允许通过 supervisor 注入并验证的
+本代 loopback Gateway `/v1` endpoint 调用本地 serving model。该 nested Codex run 会忽略用户
+config、使用 `--ephemeral`、`--sandbox read-only`、并禁用 `shell_tool`，因为 dataset
+transcripts 属于不可信 prompt 内容。该方法不做 promotion 评估，
 推荐把产出 artifact 先保持 `promoted=false`，通过离线评估或 A/B rollout 后再 promotion。
 
 三个 reflector 方法都会对生成的 agent-system 文本做轻量 audit。默认 audit 会要求

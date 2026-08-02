@@ -667,6 +667,10 @@ def test_subscription_plan_is_deterministic_and_ready_requires_health_and_identi
         assert child_cwd.stat().st_mode & 0o777 == 0o700
         service_tmp = tmp_path / "core-services" / "tmp"
         assert all(spec.env["TMPDIR"] == os.fspath(service_tmp) for spec in backend.spawned)
+        assert all(
+            "OPENEVO_CODEX_PROXY_BASE_URL" not in spec.env
+            for spec in backend.spawned
+        )
         assert service_tmp.stat().st_mode & 0o777 == 0o700
         credential = backend.spawned[0].internal_identity
         assert credential is not None
@@ -1890,6 +1894,17 @@ def test_self_deployed_starts_verified_inference_and_core_service_group(
         gateway = next(spec for spec in backend.spawned if spec.service_id == "gateway")
         assert _argv_option(gateway.argv, "--managed-execution-mode") == "self-deployed"
         assert gateway.codex_credential_authority is None
+        evolution_worker = next(
+            spec for spec in backend.spawned if spec.service_id == "evolution-worker"
+        )
+        assert evolution_worker.env["OPENEVO_CODEX_PROXY_BASE_URL"] == (
+            f"http://127.0.0.1:{gateway.port}/v1"
+        )
+        assert all(
+            "OPENEVO_CODEX_PROXY_BASE_URL" not in spec.env
+            for spec in backend.spawned
+            if spec.service_id != "evolution-worker"
+        )
         service_tmp = tmp_path / "core-services" / "tmp"
         assert all(
             spec.env["TMPDIR"] == os.fspath(service_tmp)

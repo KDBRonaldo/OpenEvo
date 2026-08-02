@@ -133,7 +133,9 @@ ranked renderer order. Adapter fallback identity is recomputed from the trusted
 artifact snapshot by the validator rather than accepted from handler output.
 
 Release reflector schemas require an explicit model and `codex_cli`; direct API
-credentials and endpoints are not user config. Audit policy, evaluator results,
-and promotion support are Core-owned execution-envelope fields. Multi-dataset
-legacy methods use an `explicit_inputs` binding so each existing caller's
-dataset order survives the adapter unchanged.
+credentials and endpoints are not user config. Subscription generations use the
+Core-isolated subscription authority; Self-Deployed generations use only the
+supervisor-bound loopback Gateway and an empty private Codex home. Audit policy,
+evaluator results, and promotion support are Core-owned execution-envelope
+fields. Multi-dataset legacy methods use an `explicit_inputs` binding so each
+existing caller's dataset order survives the adapter unchanged.
