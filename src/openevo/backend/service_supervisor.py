@@ -72,6 +72,7 @@ from openevo.gateway.session_files import (
     stage_codex_subscription_auth,
 )
 from openevo.runtime.managed import (
+    MANAGED_CODEX_BINARY,
     MANAGED_CODEX_VERSION,
     require_immutable_managed_runtime_image,
     verified_managed_runtime_image_reference,
@@ -850,7 +851,11 @@ def _digest_probe_executable(descriptor: int, expected_size: int) -> str:
     return digest.hexdigest()
 
 
-def _valid_codex_version(result: ProbeCommandResult) -> bool:
+def _valid_codex_version(
+    result: ProbeCommandResult,
+    *,
+    expected_version: str | None = None,
+) -> bool:
     if (
         result.returncode != 0
         or len(result.stdout) + len(result.stderr) > _CODEX_VERSION_MAX_BYTES
@@ -863,11 +868,14 @@ def _valid_codex_version(result: ProbeCommandResult) -> bool:
     line = stdout.removesuffix("\r\n").removesuffix("\n")
     if stdout not in {line, f"{line}\n", f"{line}\r\n"}:
         return False
-    return (
-        bool(line)
-        and _CODEX_VERSION_RE.fullmatch(line) is not None
-        and line == f"codex-cli {MANAGED_CODEX_VERSION}"
-    )
+    if not line or _CODEX_VERSION_RE.fullmatch(line) is None:
+        return False
+    if not line.startswith("codex-cli "):
+        return False
+    version = line.removeprefix("codex-cli ")
+    if "-" in version or "+" in version:
+        return False
+    return expected_version is None or version == expected_version
 
 
 def _command_evidence(result: ProbeCommandResult) -> dict[str, object]:
@@ -918,6 +926,10 @@ class LocalManagedScienceRuntimeProbe:
                     ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
                     "Codex CLI is unavailable at the managed Science bootstrap boundary.",
                 )
+            # The host CLI is only an authentication-status client. The exact
+            # task-execution CLI is supplied by the immutable managed image and
+            # is proved independently below. Host package managers may advance
+            # this helper without changing the release execution authority.
             if not _valid_codex_version(codex):
                 return _runtime_not_ready(
                     ServiceRunReadinessCode.CODEX_CLI_UNAVAILABLE,
@@ -1067,6 +1079,39 @@ class LocalManagedScienceRuntimeProbe:
                     ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
                     "Managed Science bootstrap evidence is invalid.",
                 )
+            try:
+                runtime_codex = self._run_docker(
+                    docker_engine,
+                    (
+                        "run",
+                        "--rm",
+                        "--network=none",
+                        "--read-only",
+                        "--cap-drop=ALL",
+                        "--security-opt=no-new-privileges",
+                        "--entrypoint",
+                        MANAGED_CODEX_BINARY,
+                        image_id,
+                        "--version",
+                    ),
+                    deadline,
+                    cancellation,
+                )
+            except Exception:
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                    "Managed Science runtime Codex CLI evidence is unavailable.",
+                )
+            if not _valid_codex_version(
+                runtime_codex,
+                expected_version=MANAGED_CODEX_VERSION,
+            ):
+                credential_snapshot.close()
+                return _runtime_not_ready(
+                    ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
+                    "Managed Science runtime Codex CLI evidence is invalid.",
+                )
             docker_host_path: DockerHostPathSpec | None = None
             if self._runtime_namespace is not None:
                 try:
@@ -1099,9 +1144,12 @@ class LocalManagedScienceRuntimeProbe:
                     {
                         "auth_content_sha256": credential_snapshot.content_sha256,
                         "auth_identity": credential_snapshot.identity,
-                        "codex_executable_identity_digest": (codex_executable.identity_digest),
+                        "host_codex_auth_client_identity_digest": (
+                            codex_executable.identity_digest
+                        ),
+                        "host_codex_auth_client_version_evidence": _command_evidence(codex),
                         "codex_model": request.codex_model,
-                        "codex_version_evidence": _command_evidence(codex),
+                        "codex_version_evidence": _command_evidence(runtime_codex),
                         "runtime_version_evidence": _command_evidence(runtime),
                         "runtime_executable_identity_digest": (docker_executable.identity_digest),
                         "runtime_engine_identity_digest": (docker_engine.identity_digest),
@@ -5971,8 +6019,7 @@ def _process_group_candidate_no_longer_matches(
     except (UnicodeDecodeError, ValueError, IndexError):
         return False
     return state == "Z" or (
-        process_group_id != identity.process_group_id
-        or session_id != identity.session_id
+        process_group_id != identity.process_group_id or session_id != identity.session_id
     )
 
 

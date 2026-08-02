@@ -48,7 +48,11 @@ from openevo.gateway.session_files import (
     PreparedCodexCredentialSnapshot,
     SessionFileSecurityError,
 )
-from openevo.runtime.managed import MANAGED_CODEX_VERSION, MANAGED_RUNTIME_RELEASES
+from openevo.runtime.managed import (
+    MANAGED_CODEX_BINARY,
+    MANAGED_CODEX_VERSION,
+    MANAGED_RUNTIME_RELEASES,
+)
 from openevo.runtime.self_deployed import require_release_self_deployed_model_profile
 from openevo.runtime.docker_host import (
     DOCKER_EXECUTABLE_PATH,
@@ -399,6 +403,24 @@ class FakeProbeCommandRunner:
             )
         if argv == (DOCKER_EXECUTABLE_PATH, "--version"):
             return ProbeCommandResult(0, b"Docker version 27.0.1\n", b"")
+        if argv == (
+            DOCKER_EXECUTABLE_PATH,
+            "run",
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--entrypoint",
+            MANAGED_CODEX_BINARY,
+            f"sha256:{self.image_id}",
+            "--version",
+        ):
+            return ProbeCommandResult(
+                0,
+                f"codex-cli {MANAGED_CODEX_VERSION}\n".encode(),
+                b"",
+            )
         payload = [
             {
                 "Id": f"sha256:{self.image_id}",
@@ -2762,15 +2784,76 @@ def test_local_managed_runtime_probe_binds_image_codex_and_private_auth(
             "inspect",
             "openevo/science-runtime:0.1.1",
         ),
+        (
+            DOCKER_EXECUTABLE_PATH,
+            "run",
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--entrypoint",
+            MANAGED_CODEX_BINARY,
+            MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+            "--version",
+        ),
     ]
     assert all(call[0] != os.fspath(polluted_docker) for call in command_runner.calls)
     assert command_runner.environments[2:] == [
+        docker_cli_environment(),
         docker_cli_environment(),
         docker_cli_environment(),
     ]
     assert "not-read-by-probe" not in readiness.message
     assert readiness.credential_authority is not None
     readiness.credential_authority.close()
+
+
+def test_local_probe_allows_host_auth_client_upgrade_but_proves_pinned_image_codex(
+    tmp_path: Path,
+) -> None:
+    auth = tmp_path / "auth.json"
+    auth.write_text('{"tokens":"not-read-by-probe"}', encoding="utf-8")
+    auth.chmod(0o600)
+    runner = FakeProbeCommandRunner(
+        results={
+            ("codex", "--version"): ProbeCommandResult(
+                0,
+                b"codex-cli 0.146.0\n",
+                b"",
+            )
+        }
+    )
+
+    readiness = LocalManagedScienceRuntimeProbe(
+        command_runner=runner,
+        codex_auth_path=auth,
+    ).verify(
+        ManagedScienceRuntimeRequest(
+            runtime_image="openevo/science-runtime:0.1.1",
+            codex_model="gpt-5.5",
+        ),
+        time.monotonic() + 1,
+    )
+
+    try:
+        assert readiness.ready is True
+        assert (
+            DOCKER_EXECUTABLE_PATH,
+            "run",
+            "--rm",
+            "--network=none",
+            "--read-only",
+            "--cap-drop=ALL",
+            "--security-opt=no-new-privileges",
+            "--entrypoint",
+            MANAGED_CODEX_BINARY,
+            MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+            "--version",
+        ) in runner.calls
+    finally:
+        if readiness.credential_authority is not None:
+            readiness.credential_authority.close()
 
 
 def test_release_probe_discovers_docker_user_container_data_root(
@@ -3242,13 +3325,11 @@ def test_local_probe_rejects_empty_unbounded_or_malformed_codex_version(
 @pytest.mark.parametrize(
     "version_result",
     [
-        ProbeCommandResult(0, b"codex-cli 0.121.0\n", b""),
-        ProbeCommandResult(0, b"codex-cli 0.144.2\n", b""),
         ProbeCommandResult(0, b"codex-cli 0.144.1-beta.1\n", b""),
         ProbeCommandResult(0, b"codex 0.144.1\n", b""),
     ],
 )
-def test_local_probe_rejects_codex_version_outside_managed_runtime_contract(
+def test_local_probe_rejects_unstable_or_noncanonical_host_auth_client_version(
     tmp_path: Path,
     version_result: ProbeCommandResult,
 ) -> None:
@@ -3551,6 +3632,23 @@ def test_local_managed_runtime_probe_rejects_wrong_release_digest_before_run(
             ),
             ProbeCommandResult(1, b"", b"No such image"),
             ServiceRunReadinessCode.RUNTIME_IMAGE_UNAVAILABLE,
+        ),
+        (
+            (
+                DOCKER_EXECUTABLE_PATH,
+                "run",
+                "--rm",
+                "--network=none",
+                "--read-only",
+                "--cap-drop=ALL",
+                "--security-opt=no-new-privileges",
+                "--entrypoint",
+                MANAGED_CODEX_BINARY,
+                MANAGED_RUNTIME_RELEASES["managed_science"].loaded_image_id,
+                "--version",
+            ),
+            ProbeCommandResult(0, b"codex-cli 0.146.0\n", b""),
+            ServiceRunReadinessCode.RUNTIME_EVIDENCE_INVALID,
         ),
     ],
 )

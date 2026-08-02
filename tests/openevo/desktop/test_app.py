@@ -667,6 +667,10 @@ from desktop.server import launcher
 marker = Path(sys.argv[1])
 
 class Provider:
+    def request_shutdown(self):
+        with marker.open("a", encoding="utf-8") as stream:
+            stream.write("requested\\n")
+
     def close(self):
         with marker.open("a", encoding="utf-8") as stream:
             stream.write("closed\\n")
@@ -714,7 +718,7 @@ raise SystemExit(
 
         os.killpg(process.pid, signal.SIGTERM)
         assert process.wait(timeout=5) == 0
-        assert marker.read_text(encoding="utf-8") == "closed\n"
+        assert marker.read_text(encoding="utf-8") == "requested\nclosed\n"
     finally:
         listener.close()
         if process.poll() is None:

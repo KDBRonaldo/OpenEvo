@@ -589,6 +589,11 @@ class DesktopReleaseProviderV2:
         if failure is not None:
             raise failure
 
+    def request_shutdown(self) -> None:
+        """Fence durable lifecycle work before owned child processes receive teardown."""
+
+        self._lifecycle_executor.request_shutdown()
+
     def _persist_shutdown_cleanup_failure(self) -> None:
         authority = self._lifecycle.cleanup_authority()
         if authority is None:

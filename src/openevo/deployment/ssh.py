@@ -153,6 +153,7 @@ logger = logging.getLogger(__name__)
 _TUNNEL_CLOSE_GRACE_SECONDS = 1.0
 _TUNNEL_KILL_GRACE_SECONDS = 1.0
 _TUNNEL_MONITOR_INTERVAL_SECONDS = 0.05
+_MAX_CORE_TUNNEL_IO_SECONDS = 7_200.0
 _MAX_SUBPROCESS_CAPTURE_BYTES = 4 * 1024 * 1024
 _SUBPROCESS_CAPTURE_CHUNK_BYTES = 64 * 1024
 _SUBPROCESS_BIRTH_RECOVERY_SECONDS = 1.0
@@ -775,7 +776,7 @@ class _CoreTunnelEndpoint:
         self._finish_failed_operation(failure)
 
     def open_verified_socket(self, *, timeout_seconds: float) -> socket.socket:
-        if not 0 < timeout_seconds <= 60:
+        if not 0 < timeout_seconds <= _MAX_CORE_TUNNEL_IO_SECONDS:
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         local_stream: socket.socket | None = None
         child_stream: socket.socket | None = None

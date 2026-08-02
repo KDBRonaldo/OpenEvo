@@ -218,6 +218,13 @@ def _close_startup_app(app: FastAPI) -> None:
     close()
 
 
+def _request_startup_app_shutdown(app: FastAPI) -> None:
+    provider = getattr(app.state, "desktop_release_provider", None)
+    request_shutdown = getattr(provider, "request_shutdown", None)
+    if callable(request_shutdown):
+        request_shutdown()
+
+
 def _close_listener(listener: socket.socket) -> None:
     listener.close()
 
@@ -792,9 +799,16 @@ def main(
         raise
     try:
         server = uvicorn.Server(config)
+
+        def request_exit() -> None:
+            try:
+                _request_startup_app_shutdown(app)
+            finally:
+                server.should_exit = True
+
         with _defer_packaged_server_signal_replay(
             enabled=packaged_source_commit is not None,
-            request_exit=lambda: setattr(server, "should_exit", True),
+            request_exit=request_exit,
         ):
             try:
                 server.run(sockets=[listener])

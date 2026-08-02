@@ -296,18 +296,21 @@ class RecordingSystemOpenSshAuthority:
                 payload.extend(chunk)
             digest = hashlib.sha256(payload).hexdigest()
             service_root = self.remote_home_authority.daemon_bundle_root
-            stdout = json.dumps(
-                {
-                    "executable_path": f"{service_root}/bundle-{digest}",
-                    "host_profile": "docker_user_container_v1",
-                    "reused": False,
-                    "schema_version": 1,
-                    "sha256": digest,
-                    "size": len(payload),
-                },
-                separators=(",", ":"),
-                sort_keys=True,
-            ) + "\n"
+            stdout = (
+                json.dumps(
+                    {
+                        "executable_path": f"{service_root}/bundle-{digest}",
+                        "host_profile": "docker_user_container_v1",
+                        "reused": False,
+                        "schema_version": 1,
+                        "sha256": digest,
+                        "size": len(payload),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                + "\n"
+            )
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=stderr)
 
     def start_tunnel(self, argv: list[str], stream_fd: int) -> FakeTunnelProcess:
@@ -2169,6 +2172,24 @@ def test_core_tunnel_uses_parent_owned_socketpair_and_per_connection_ssh_child(
         tunnel.verify_authority()
     assert exited.value.code is SshTransportErrorCode.CONNECTION_FAILED
 
+    tunnel.close()
+    for stream in starter.streams:
+        stream.close()
+
+
+def test_core_tunnel_accepts_release_lifecycle_io_timeout(
+    tmp_path: Path,
+) -> None:
+    starter = RecordingCoreConnectionStarter()
+    tunnel = _transport(
+        tmp_path,
+        core_connection_starter=starter,
+    ).open_core_tunnel(remote_port=8765)
+
+    connection = tunnel.open_verified_socket(timeout_seconds=7200.0)
+
+    assert connection.gettimeout() == 7200.0
+    connection.close()
     tunnel.close()
     for stream in starter.streams:
         stream.close()

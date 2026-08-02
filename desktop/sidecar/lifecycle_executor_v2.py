@@ -46,6 +46,7 @@ _LIFECYCLE_KINDS = frozenset(
     }
 )
 _RESULT_ADAPTER = TypeAdapter(m.LifecycleResultV2)
+_PROCESS_SHUTDOWN_FAILURE_FENCE_SECONDS = 0.5
 
 
 class _LifecycleCancelled(Exception):
@@ -129,10 +130,7 @@ class LifecycleExecutionContextV2:
                     progress,
                     same_phase=target_phase_index == current.phase_index,
                 )
-                if (
-                    retained_progress == current.progress
-                    and cancellable == current.cancellable
-                ):
+                if retained_progress == current.progress and cancellable == current.cancellable:
                     return current
                 phase = current.phase
                 progress = retained_progress
@@ -213,9 +211,7 @@ class LifecycleExecutionContextV2:
         with self._mutation_lock:
             if self._shutdown_requested:
                 return
-            latest = self._store.get_lifecycle_operation_work(
-                self._work.operation.operation_id
-            )
+            latest = self._store.get_lifecycle_operation_work(self._work.operation.operation_id)
             self._work = latest
             if latest.operation.status != "running":
                 return
@@ -236,9 +232,7 @@ class LifecycleExecutionContextV2:
         self._publish(updated)
 
     def _refresh_locked(self) -> None:
-        self._work = self._store.get_lifecycle_operation_work(
-            self._work.operation.operation_id
-        )
+        self._work = self._store.get_lifecycle_operation_work(self._work.operation.operation_id)
 
     def _raise_if_interrupted_locked(self) -> None:
         if self._shutdown_requested:
@@ -347,18 +341,21 @@ class DesktopLifecycleExecutorV2:
         return operation
 
     def close(self) -> None:
+        self.request_shutdown()
         with self._condition:
-            if self._stopping:
-                worker = self._worker
-            else:
-                self._stopping = True
-                context = self._active_context
-                if context is not None:
-                    context.request_shutdown()
-                worker = self._worker
-                self._condition.notify_all()
+            worker = self._worker
         if worker is not None and worker is not threading.current_thread():
             worker.join(timeout=self._close_timeout_seconds)
+
+    def request_shutdown(self) -> None:
+        """Fence durable completion as soon as process shutdown is signalled."""
+
+        with self._condition:
+            self._stopping = True
+            context = self._active_context
+            if context is not None:
+                context.request_shutdown()
+            self._condition.notify_all()
 
     def observe_progress(
         self,
@@ -473,6 +470,13 @@ class DesktopLifecycleExecutorV2:
         except BaseException as exc:
             if context.is_shutdown_requested():
                 return False
+            # An external process-group shutdown can terminate the owned SSH
+            # master before the main-thread signal handler runs. Yield the GIL
+            # briefly so that handler can fence this durable operation before
+            # an infrastructure failure is committed as a terminal outcome.
+            context.cancellation_event.wait(_PROCESS_SHUTDOWN_FAILURE_FENCE_SECONDS)
+            if context.is_shutdown_requested():
+                return False
             context.flush_output()
             current = context.current_work()
             if current.cancellation_requested:
@@ -484,6 +488,8 @@ class DesktopLifecycleExecutorV2:
                 )
             else:
                 failure = self._safe_error(exc, current)
+                if context.is_shutdown_requested():
+                    return False
                 self._finish_with_fence(
                     current,
                     status="failed",
@@ -526,9 +532,7 @@ class DesktopLifecycleExecutorV2:
                     )
                 )
             except ProviderPreconditionFailedV2:
-                current = self._store.get_lifecycle_operation_work(
-                    current.operation.operation_id
-                )
+                current = self._store.get_lifecycle_operation_work(current.operation.operation_id)
                 continue
             self._publish(operation)
             return operation

@@ -133,10 +133,13 @@ def test_reservation_returns_promptly_while_external_work_remains_blocked(
 
     assert elapsed < 0.5
     assert started.wait(1)
-    assert executor.reserve(
-        _reservation("project-slow"),
-        idempotency_key="slow-project-create-0001",
-    ).operation_id == operation.operation_id
+    assert (
+        executor.reserve(
+            _reservation("project-slow"),
+            idempotency_key="slow-project-create-0001",
+        ).operation_id
+        == operation.operation_id
+    )
     release.set()
     assert _wait_terminal(store, operation.operation_id).status == "succeeded"
     executor.close()
@@ -530,6 +533,69 @@ def test_shutdown_leaves_running_authority_for_restart_recovery(tmp_path: Path) 
     )
     assert started.wait(1)
 
+    executor.close()
+
+    assert store.get_lifecycle_operation(operation.operation_id).status == "running"
+    store.close()
+
+
+def test_shutdown_signal_latch_fences_a_concurrent_runner_failure(tmp_path: Path) -> None:
+    started = Event()
+    release = Event()
+
+    def fail_after_signal(
+        _context: LifecycleExecutionContextV2,
+    ) -> m.LifecycleResultV2:
+        started.set()
+        assert release.wait(2)
+        raise RuntimeError("simulated infrastructure loss after process signal")
+
+    store = DesktopProviderStoreV2(tmp_path / "provider", clock=_Clock())
+    executor = DesktopLifecycleExecutorV2(store, runners=_runners(fail_after_signal))
+    executor.start()
+    operation = executor.reserve(
+        _reservation("project-signal-shutdown"),
+        idempotency_key="signal-shutdown-project-create-0001",
+    )
+    assert started.wait(1)
+
+    executor.request_shutdown()
+    release.set()
+    executor.close()
+
+    assert store.get_lifecycle_operation(operation.operation_id).status == "running"
+    store.close()
+
+
+def test_shutdown_signal_during_failure_mapping_fences_terminal_commit(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    failure_mapping_started = Event()
+    release_failure_mapping = Event()
+
+    def fail(_context: LifecycleExecutionContextV2) -> m.LifecycleResultV2:
+        raise RuntimeError("simulated SSH master loss")
+
+    store = DesktopProviderStoreV2(tmp_path / "provider", clock=_Clock())
+    executor = DesktopLifecycleExecutorV2(store, runners=_runners(fail))
+    original_safe_error = executor._safe_error
+
+    def map_after_signal(exc, work):
+        failure_mapping_started.set()
+        assert release_failure_mapping.wait(2)
+        return original_safe_error(exc, work)
+
+    monkeypatch.setattr(executor, "_safe_error", map_after_signal)
+    executor.start()
+    operation = executor.reserve(
+        _reservation("project-signal-mapping-race"),
+        idempotency_key="signal-mapping-race-project-create-0001",
+    )
+    assert failure_mapping_started.wait(1)
+
+    executor.request_shutdown()
+    release_failure_mapping.set()
     executor.close()
 
     assert store.get_lifecycle_operation(operation.operation_id).status == "running"
