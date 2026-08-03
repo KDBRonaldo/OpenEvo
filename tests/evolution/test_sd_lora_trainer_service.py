@@ -338,6 +338,82 @@ def test_trainer_service_exclusively_owns_one_artifact_root(tmp_path: Path) -> N
         pass
 
 
+def test_trainer_service_tightens_existing_owned_workers_root(
+    tmp_path: Path,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
+    workers_root = artifact_root / "workers"
+    workers_root.mkdir(mode=0o755)
+
+    with SubprocessSdLoraTrainerService(artifact_root):
+        pass
+
+    assert workers_root.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.parametrize("workers_kind", ["file", "symlink"])
+def test_trainer_service_rejects_non_directory_workers_root(
+    tmp_path: Path,
+    workers_kind: str,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
+    workers_root = artifact_root / "workers"
+    if workers_kind == "file":
+        workers_root.write_text("not a directory", encoding="utf-8")
+    else:
+        target = tmp_path / "foreign-workers"
+        target.mkdir(mode=0o700)
+        workers_root.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(
+        ValueError,
+        match="parametric trainer workers root must be private and owned",
+    ):
+        SubprocessSdLoraTrainerService(artifact_root)
+
+
+def test_trainer_service_rejects_foreign_owned_workers_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir(mode=0o700)
+    workers_root = artifact_root / "workers"
+    workers_root.mkdir(mode=0o755)
+    real_fstat = os.fstat
+    workers_fd: int | None = None
+
+    def foreign_workers_fstat(fd: int):
+        observed = real_fstat(fd)
+        if workers_fd == fd:
+            values = list(observed)
+            values[4] = observed.st_uid + 1
+            return os.stat_result(values)
+        return observed
+
+    real_open = os.open
+
+    def capture_workers_open(path, flags, *args, **kwargs):
+        nonlocal workers_fd
+        fd = real_open(path, flags, *args, **kwargs)
+        if Path(path) == workers_root:
+            workers_fd = fd
+        return fd
+
+    monkeypatch.setattr(os, "open", capture_workers_open)
+    monkeypatch.setattr(os, "fstat", foreign_workers_fstat)
+
+    with pytest.raises(
+        ValueError,
+        match="parametric trainer workers root must be private and owned",
+    ):
+        SubprocessSdLoraTrainerService(artifact_root)
+
+    assert workers_root.stat().st_mode & 0o777 == 0o755
+
+
 def test_trainer_service_recovers_exact_receipted_process_and_workdir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -379,6 +455,7 @@ def test_trainer_installs_linux_parent_death_signal(
 
     monkeypatch.setenv("OPENEVO_SD_LORA_PARENT_PID", str(parent_pid))
     monkeypatch.setattr(os, "getppid", lambda: parent_pid)
+    monkeypatch.setattr(trainer_module.sys, "platform", "linux")
     monkeypatch.setattr(trainer_module.ctypes, "CDLL", lambda *_args, **_kwargs: _LibC())
 
     trainer_module._install_parent_death_signal()

@@ -331,14 +331,29 @@ class SubprocessSdLoraTrainerService:
         self._training_guard = threading.Lock()
         self._closed = True
         self._workers_root = root / "workers"
-        self._workers_root.mkdir(mode=0o700, exist_ok=True)
-        workers_stat = os.stat(self._workers_root, follow_symlinks=False)
-        if (
-            not stat.S_ISDIR(workers_stat.st_mode)
-            or workers_stat.st_uid != os.geteuid()
-            or stat.S_IMODE(workers_stat.st_mode) != 0o700
-        ):
-            raise ValueError("parametric trainer workers root must be private and owned")
+        try:
+            self._workers_root.mkdir(mode=0o700, exist_ok=True)
+            workers_fd = os.open(
+                self._workers_root,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY,
+            )
+        except OSError as exc:
+            raise ValueError("parametric trainer workers root must be private and owned") from exc
+        try:
+            workers_stat = os.fstat(workers_fd)
+            if not stat.S_ISDIR(workers_stat.st_mode) or workers_stat.st_uid != os.geteuid():
+                raise ValueError("parametric trainer workers root must be private and owned")
+            if stat.S_IMODE(workers_stat.st_mode) != 0o700:
+                os.fchmod(workers_fd, 0o700)
+                workers_stat = os.fstat(workers_fd)
+            if (
+                not stat.S_ISDIR(workers_stat.st_mode)
+                or workers_stat.st_uid != os.geteuid()
+                or stat.S_IMODE(workers_stat.st_mode) != 0o700
+            ):
+                raise ValueError("parametric trainer workers root must be private and owned")
+        finally:
+            os.close(workers_fd)
         lock_path = self._workers_root / _TRAINER_LOCK_NAME
         lock_fd = os.open(
             lock_path,

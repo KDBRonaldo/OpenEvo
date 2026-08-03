@@ -17,6 +17,7 @@ from desktop.sidecar.core_bridge_adapters_v2 import (
     SealedDaemonBundleV2,
     SealedManagedRuntimeArchiveV2,
     VerifiedCoreHttpTransportV2,
+    _ssh_error,
 )
 from desktop.sidecar.core_bridge_v2 import DesktopCoreBridgeErrorV2
 from openevo.deployment import core_control
@@ -287,6 +288,19 @@ def test_adapter_classifies_daemon_stage_follower_failure_as_retryable_connectio
     assert caught.value.error.retryable is True
     assert caught.value.error.action == "reconnect"
     assert caught.value.error.affected_resource_id == PROFILE_ID
+
+
+def test_ssh_error_preserves_nonretryable_daemon_update_required() -> None:
+    error = _ssh_error(
+        SshTransportError(SshTransportErrorCode.DAEMON_UPDATE_REQUIRED),
+        affected_resource_id=PROFILE_ID,
+    )
+
+    assert error.error.code == "daemon_update_required"
+    assert error.status_code == 409
+    assert error.error.retryable is False
+    assert error.error.action == "install_repair_daemon"
+    assert error.error.affected_resource_id == PROFILE_ID
 
 
 def test_adapter_opens_only_verified_tunnel_transport_and_closes_owned_session(

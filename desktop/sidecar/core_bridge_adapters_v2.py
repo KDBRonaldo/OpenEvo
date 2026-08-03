@@ -1258,6 +1258,15 @@ def _ssh_error(
             action="retry",
             affected_resource_id=affected_resource_id,
         )
+    if error.code is SshTransportErrorCode.DAEMON_UPDATE_REQUIRED:
+        return _adapter_error(
+            "daemon_update_required",
+            "The active OpenEvo Daemon is not compatible with this Desktop release.",
+            status=409,
+            retryable=False,
+            action="install_repair_daemon",
+            affected_resource_id=affected_resource_id,
+        )
     return _adapter_error(
         "daemon_bootstrap_failed",
         "The OpenEvo Daemon could not be prepared over system SSH.",
