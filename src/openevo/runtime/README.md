@@ -105,6 +105,16 @@ The synchronous FD walk runs in a controlled worker thread. Timeout or task
 cancellation signals that worker and waits for bounded cleanup before returning
 to the event loop.
 
+On Linux the inotify mutation authority retains one nonblocking, close-on-exec
+descriptor per process and serializes readback generations. This avoids
+recreating an inotify instance for every task when the host's per-UID
+`max_user_instances` quota is near exhaustion. Authority teardown drains and
+validates the corresponding `IN_IGNORED` events; any initialization, watch,
+read, teardown, fork, or unexpected-event failure poisons the descriptor and
+fails closed. A teardown failure after publication is treated as an incomplete
+readback and removes only the exact-identity publication. Cleanup errors never
+replace an earlier body failure; they are attached as secondary diagnostics.
+
 Custom target directories, non-Linux Core hosts, and third-party runtimes keep
 the ordinary two-argument backend download behavior. Gateway ignores backend
 return metadata and confines the destination below a held `0700` temporary root.
