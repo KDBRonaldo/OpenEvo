@@ -234,8 +234,15 @@ class _DirectoryPin:
                 os.close(current_fd)
 
     def close(self) -> None:
+        failure: BaseException | None = None
         while self.descriptors:
-            os.close(self.descriptors.pop())
+            try:
+                os.close(self.descriptors.pop())
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 @dataclass(slots=True)
@@ -261,8 +268,15 @@ class _RelativeDirectoryPin:
             parent_fd = self.descriptors[index]
 
     def close(self) -> None:
+        failure: BaseException | None = None
         while self.descriptors:
-            os.close(self.descriptors.pop())
+            try:
+                os.close(self.descriptors.pop())
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 def _object_identity(value: os.stat_result) -> tuple[int, int]:
@@ -1248,6 +1262,7 @@ class _ReadbackMutationAuthority:
                     self._poison()
             if not self._poisoned and failure is None:
                 teardown_watches = set(self._watches)
+                pending_acks = set(teardown_watches)
                 libc = ctypes.CDLL(None, use_errno=True)
                 remove_watch = libc.inotify_rm_watch
                 remove_watch.argtypes = (ctypes.c_int, ctypes.c_int)
@@ -1265,8 +1280,20 @@ class _ReadbackMutationAuthority:
                     try:
                         payload = os.read(self._descriptor, 64 * 1024)
                         if not payload:
+                            if pending_acks:
+                                failure = RuntimePathSecurityError(
+                                    "trusted runtime readback mutation authority cleanup failed "
+                                    "(read:missing_ack)"
+                                )
+                                self._poison()
                             break
                     except BlockingIOError:
+                        if pending_acks:
+                            failure = RuntimePathSecurityError(
+                                "trusted runtime readback mutation authority cleanup failed "
+                                "(read:missing_ack)"
+                            )
+                            self._poison()
                         break
                     except OSError as exc:
                         failure = RuntimePathSecurityError(
@@ -1291,7 +1318,7 @@ class _ReadbackMutationAuthority:
                         offset += _INOTIFY_EVENT_HEADER.size + name_size
                         if (
                             offset > len(payload)
-                            or watch not in teardown_watches
+                            or watch not in pending_acks
                             or not mask & _IN_IGNORED
                             or mask & (_IN_Q_OVERFLOW | _IN_MUTATION_MASK)
                             or mask & ~(_IN_IGNORED | _IN_ISDIR)
@@ -1302,6 +1329,7 @@ class _ReadbackMutationAuthority:
                             )
                             self._poison()
                             break
+                        pending_acks.remove(watch)
                 self._watches.clear()
         finally:
             self._closed = True
@@ -1475,6 +1503,7 @@ def _copy_readback_regular_file(
     budget.require_byte_capacity(source.stat.st_size)
     source_fd = os.open(source.name, _FILE_READ_FLAGS, dir_fd=source_parent_fd)
     target_fd = -1
+    body_error: BaseException | None = None
     try:
         opened = os.fstat(source_fd)
         if _readback_file_identity(opened) != source.identity:
@@ -1541,10 +1570,26 @@ def _copy_readback_regular_file(
                 identity=_readback_file_identity(target_after),
             ),
         )
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
+        cleanup_error: BaseException | None = None
         if target_fd >= 0:
-            os.close(target_fd)
-        os.close(source_fd)
+            try:
+                os.close(target_fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        try:
+            os.close(source_fd)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if body_error is not None:
+                _record_cleanup_failure(body_error, cleanup_error)
+            else:
+                raise cleanup_error
 
 
 def _copy_readback_directory(
@@ -1576,6 +1621,7 @@ def _copy_readback_directory(
         if source.is_directory:
             child_source_fd = os.open(source.name, _DIRECTORY_FLAGS, dir_fd=source_fd)
             child_target_fd = -1
+            body_error: BaseException | None = None
             try:
                 if _readback_directory_identity(os.fstat(child_source_fd)) != source.identity:
                     raise RuntimePathSecurityError(
@@ -1619,10 +1665,26 @@ def _copy_readback_directory(
                         children=child_entries,
                     )
                 )
+            except BaseException as exc:
+                body_error = exc
+                raise
             finally:
+                cleanup_error: BaseException | None = None
                 if child_target_fd >= 0:
-                    os.close(child_target_fd)
-                os.close(child_source_fd)
+                    try:
+                        os.close(child_target_fd)
+                    except BaseException as exc:
+                        cleanup_error = exc
+                try:
+                    os.close(child_source_fd)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                if cleanup_error is not None:
+                    if body_error is not None:
+                        _record_cleanup_failure(body_error, cleanup_error)
+                    else:
+                        raise cleanup_error
         else:
             file, target_entry = _copy_readback_regular_file(
                 source_fd,

@@ -84,6 +84,17 @@ def _close_test_readback_mutation_descriptor() -> None:
         runtime_base._READBACK_MUTATION_RETAINED_DESCRIPTOR = None
 
 
+def _write_inotify_ignored(write_fd: int, watch: int, *, count: int = 1) -> None:
+    payload = runtime_base._INOTIFY_EVENT_HEADER.pack(
+        watch,
+        runtime_base._IN_IGNORED,
+        0,
+        0,
+    )
+    for _ in range(count):
+        os.write(write_fd, payload)
+
+
 async def _compatibility_readback(
     runtime: object,
     tmp_path: Path,
@@ -678,6 +689,281 @@ def test_copy_to_bind_mount_rejects_final_symlink_without_overwriting_outside(
     assert outside.read_text(encoding="utf-8") == "outside remains"
 
 
+@pytest.mark.parametrize(
+    "pin_factory",
+    [
+        lambda descriptors: runtime_base._DirectoryPin(
+            path=Path("/"),
+            parts=(),
+            descriptors=descriptors,
+            identities=(),
+        ),
+        lambda descriptors: runtime_base._RelativeDirectoryPin(
+            names=(),
+            descriptors=descriptors,
+            identities=(),
+        ),
+    ],
+)
+def test_directory_pin_close_attempts_every_descriptor_after_first_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    pin_factory,
+) -> None:
+    descriptors = [101, 102, 103]
+    pin = pin_factory(descriptors)
+    closed: list[int] = []
+
+    def fail_first_close(descriptor: int) -> None:
+        closed.append(descriptor)
+        if descriptor == 103:
+            raise OSError(errno.EIO, "injected close failure")
+
+    monkeypatch.setattr(runtime_base.os, "close", fail_first_close)
+
+    with pytest.raises(OSError, match="injected close failure"):
+        pin.close()
+
+    assert closed == [103, 102, 101]
+    assert descriptors == []
+
+
+def test_copy_readback_regular_file_closes_source_after_target_close_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_path = source_root / "memory.md"
+    source_path.write_bytes(b"memory")
+    source_parent_fd = os.open(source_root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    target_parent_fd = os.open(target_root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    source_stat = os.stat(source_path, follow_symlinks=False)
+    source = runtime_base._ReadbackSourceEntry(
+        name="memory.md",
+        relative_path="memory.md",
+        stat=source_stat,
+        is_directory=False,
+    )
+    original_open = runtime_base.os.open
+    original_close = runtime_base.os.close
+    opened_source: list[int] = []
+    opened_target: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == "memory.md":
+            if kwargs.get("dir_fd") == source_parent_fd:
+                opened_source.append(descriptor)
+            elif kwargs.get("dir_fd") == target_parent_fd:
+                opened_target.append(descriptor)
+        return descriptor
+
+    target_close_failed = False
+
+    def fail_target_close(descriptor: int) -> None:
+        nonlocal target_close_failed
+        if opened_target and descriptor == opened_target[-1] and not target_close_failed:
+            target_close_failed = True
+            raise OSError(errno.EIO, "injected target close failure")
+        original_close(descriptor)
+
+    monkeypatch.setattr(runtime_base.os, "open", record_open)
+    monkeypatch.setattr(runtime_base.os, "close", fail_target_close)
+
+    try:
+        with pytest.raises(OSError, match="injected target close failure"):
+            runtime_base._copy_readback_regular_file(
+                source_parent_fd,
+                source,
+                target_parent_fd,
+                budget=RuntimeReadbackBudget(),
+                cancellation=threading.Event(),
+            )
+
+        assert opened_source
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(opened_source[-1])
+    finally:
+        for descriptor in opened_target:
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+        original_close(source_parent_fd)
+        original_close(target_parent_fd)
+
+
+def test_copy_readback_regular_file_preserves_body_error_when_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    source_root.mkdir()
+    target_root.mkdir()
+    source_path = source_root / "memory.md"
+    source_path.write_bytes(b"memory")
+    source_parent_fd = os.open(source_root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    target_parent_fd = os.open(target_root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    source_stat = os.stat(source_path, follow_symlinks=False)
+    source = runtime_base._ReadbackSourceEntry(
+        name="memory.md",
+        relative_path="memory.md",
+        stat=source_stat,
+        is_directory=False,
+    )
+    original_open = runtime_base.os.open
+    original_close = runtime_base.os.close
+    opened_source: list[int] = []
+    opened_target: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == "memory.md":
+            if kwargs.get("dir_fd") == source_parent_fd:
+                opened_source.append(descriptor)
+            elif kwargs.get("dir_fd") == target_parent_fd:
+                opened_target.append(descriptor)
+        return descriptor
+
+    target_close_failed = False
+
+    def fail_target_close(descriptor: int) -> None:
+        nonlocal target_close_failed
+        if opened_target and descriptor == opened_target[-1] and not target_close_failed:
+            target_close_failed = True
+            raise OSError(errno.EIO, "injected target close failure")
+        original_close(descriptor)
+
+    def fail_body(*_args, **_kwargs):
+        raise RuntimePathSecurityError("injected body failure")
+
+    monkeypatch.setattr(runtime_base.os, "open", record_open)
+    monkeypatch.setattr(runtime_base.os, "close", fail_target_close)
+    monkeypatch.setattr(runtime_base.os, "pread", fail_body)
+
+    try:
+        with pytest.raises(RuntimePathSecurityError, match="injected body failure") as captured:
+            runtime_base._copy_readback_regular_file(
+                source_parent_fd,
+                source,
+                target_parent_fd,
+                budget=RuntimeReadbackBudget(),
+                cancellation=threading.Event(),
+            )
+
+        assert "injected target close failure" in str(
+            getattr(captured.value, "cleanup_error", "")
+        )
+        assert opened_source
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(opened_source[-1])
+    finally:
+        for descriptor in opened_target:
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+        original_close(source_parent_fd)
+        original_close(target_parent_fd)
+
+
+@pytest.mark.parametrize("body_failure", [False, True])
+def test_copy_readback_directory_closes_child_source_and_preserves_body_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    body_failure: bool,
+) -> None:
+    source_root = tmp_path / "source"
+    target_root = tmp_path / "target"
+    (source_root / "nested").mkdir(parents=True)
+    target_root.mkdir()
+    source_fd = os.open(source_root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    target_fd = os.open(target_root, os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY)
+    original_open = runtime_base.os.open
+    original_close = runtime_base.os.close
+    original_fsync = runtime_base.os.fsync
+    opened_source: list[int] = []
+    opened_target: list[int] = []
+
+    def record_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if path == "nested":
+            if kwargs.get("dir_fd") == source_fd:
+                opened_source.append(descriptor)
+            elif kwargs.get("dir_fd") == target_fd:
+                opened_target.append(descriptor)
+        return descriptor
+
+    target_close_failed = False
+
+    def fail_target_close(descriptor: int) -> None:
+        nonlocal target_close_failed
+        if opened_target and descriptor == opened_target[-1] and not target_close_failed:
+            target_close_failed = True
+            raise OSError(errno.EIO, "injected target close failure")
+        original_close(descriptor)
+
+    def maybe_fail_body(descriptor: int) -> None:
+        if body_failure and opened_target and descriptor == opened_target[-1]:
+            raise RuntimePathSecurityError("injected body failure")
+        original_fsync(descriptor)
+
+    class MutationAuthority:
+        def add(self, _directory_fd: int) -> None:
+            return None
+
+    monkeypatch.setattr(runtime_base.os, "open", record_open)
+    monkeypatch.setattr(runtime_base.os, "close", fail_target_close)
+    monkeypatch.setattr(runtime_base.os, "fsync", maybe_fail_body)
+
+    try:
+        if body_failure:
+            with pytest.raises(
+                RuntimePathSecurityError,
+                match="injected body failure",
+            ) as captured:
+                runtime_base._copy_readback_directory(
+                    source_fd,
+                    target_fd,
+                    relative_prefix="evolution",
+                    expected_owner=os.geteuid(),
+                    budget=RuntimeReadbackBudget(),
+                    cancellation=threading.Event(),
+                    mutation_authority=MutationAuthority(),
+                    depth=0,
+                )
+            assert "injected target close failure" in str(
+                getattr(captured.value, "cleanup_error", "")
+            )
+        else:
+            with pytest.raises(OSError, match="injected target close failure"):
+                runtime_base._copy_readback_directory(
+                    source_fd,
+                    target_fd,
+                    relative_prefix="evolution",
+                    expected_owner=os.geteuid(),
+                    budget=RuntimeReadbackBudget(),
+                    cancellation=threading.Event(),
+                    mutation_authority=MutationAuthority(),
+                    depth=0,
+                )
+
+        assert opened_source
+        with pytest.raises(OSError, match="Bad file descriptor"):
+            os.fstat(opened_source[-1])
+    finally:
+        for descriptor in opened_target:
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+        original_close(source_fd)
+        original_close(target_fd)
+
+
 def test_readback_mutation_authority_retains_one_inotify_instance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -712,6 +998,7 @@ def test_readback_mutation_authority_retains_one_inotify_instance(
 
     def remove_watch(_descriptor: int, watch: int) -> int:
         removed_watches.append(watch)
+        _write_inotify_ignored(write_fd, watch)
         return 0
 
     class FakeLibc:
@@ -847,7 +1134,9 @@ def test_readback_mutation_authority_resets_inherited_lock_after_fork(
     class FakeLibc:
         inotify_init1 = FakeCall(init)
         inotify_add_watch = FakeCall(lambda _descriptor, _path, _mask: 1)
-        inotify_rm_watch = FakeCall(lambda _descriptor, _watch: 0)
+        inotify_rm_watch = FakeCall(
+            lambda _descriptor, watch: (_write_inotify_ignored(write_fd, watch), 0)[1]
+        )
 
     monkeypatch.setattr(runtime_base.sys, "platform", "linux")
     monkeypatch.setattr(runtime_base.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
@@ -940,6 +1229,7 @@ def test_readback_mutation_authority_poisoned_descriptor_is_recreated_after_clea
         if remove_calls == 1:
             ctypes.set_errno(errno.EIO)
             return -1
+        _write_inotify_ignored(write_fd, _watch)
         return 0
 
     class FakeLibc:
@@ -979,6 +1269,66 @@ def test_readback_mutation_authority_poisoned_descriptor_is_recreated_after_clea
         os.close(write_fd)
 
 
+@pytest.mark.parametrize(
+    ("ack_count", "expected"),
+    [
+        (0, "missing_ack"),
+        (2, "unexpected_event"),
+    ],
+)
+def test_readback_mutation_authority_rejects_missing_or_duplicate_teardown_ack(
+    monkeypatch: pytest.MonkeyPatch,
+    ack_count: int,
+    expected: str,
+) -> None:
+    read_fd, write_fd = os.pipe()
+    os.set_blocking(read_fd, False)
+
+    class FakeCall:
+        argtypes: object = None
+        restype: object = None
+
+        def __init__(self, call):
+            self._call = call
+
+        def __call__(self, *args):
+            return self._call(*args)
+
+    def remove_watch(_descriptor: int, watch: int) -> int:
+        _write_inotify_ignored(write_fd, watch, count=ack_count)
+        return 0
+
+    class FakeLibc:
+        inotify_init1 = FakeCall(lambda _flags: os.dup(read_fd))
+        inotify_add_watch = FakeCall(lambda _descriptor, _path, _mask: 1)
+        inotify_rm_watch = FakeCall(remove_watch)
+
+    monkeypatch.setattr(runtime_base.sys, "platform", "linux")
+    monkeypatch.setattr(runtime_base.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
+    monkeypatch.setattr(
+        runtime_base,
+        "_READBACK_MUTATION_RETAINED_DESCRIPTOR",
+        None,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        runtime_base,
+        "_READBACK_MUTATION_RETAINED_PID",
+        None,
+        raising=False,
+    )
+
+    try:
+        authority = runtime_base._ReadbackMutationAuthority()
+        authority.add(read_fd)
+        with pytest.raises(RuntimePathSecurityError, match=expected):
+            authority.close()
+    finally:
+        _close_test_readback_mutation_descriptor()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
 def test_readback_mutation_authority_rejects_late_mutation_before_reuse(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1004,7 +1354,9 @@ def test_readback_mutation_authority_rejects_late_mutation_before_reuse(
     class FakeLibc:
         inotify_init1 = FakeCall(init)
         inotify_add_watch = FakeCall(lambda _descriptor, _path, _mask: 1)
-        inotify_rm_watch = FakeCall(lambda _descriptor, _watch: 0)
+        inotify_rm_watch = FakeCall(
+            lambda _descriptor, watch: (_write_inotify_ignored(write_fd, watch), 0)[1]
+        )
 
     monkeypatch.setattr(runtime_base.sys, "platform", "linux")
     monkeypatch.setattr(runtime_base.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
@@ -1071,7 +1423,9 @@ def test_readback_mutation_authority_poisoned_instance_rejects_reuse(
     class FakeLibc:
         inotify_init1 = FakeCall(lambda _flags: os.dup(read_fd))
         inotify_add_watch = FakeCall(add_watch)
-        inotify_rm_watch = FakeCall(lambda _descriptor, _watch: 0)
+        inotify_rm_watch = FakeCall(
+            lambda _descriptor, watch: (_write_inotify_ignored(write_fd, watch), 0)[1]
+        )
 
     monkeypatch.setattr(runtime_base.sys, "platform", "linux")
     monkeypatch.setattr(runtime_base.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
@@ -1138,7 +1492,9 @@ def test_readback_mutation_authority_lock_wait_observes_cancellation(
     class FakeLibc:
         inotify_init1 = FakeCall(lambda _flags: os.dup(read_fd))
         inotify_add_watch = FakeCall(lambda _descriptor, _path, _mask: 1)
-        inotify_rm_watch = FakeCall(lambda _descriptor, _watch: 0)
+        inotify_rm_watch = FakeCall(
+            lambda _descriptor, watch: (_write_inotify_ignored(write_fd, watch), 0)[1]
+        )
 
     monkeypatch.setattr(runtime_base.sys, "platform", "linux")
     monkeypatch.setattr(runtime_base.ctypes, "CDLL", lambda *_args, **_kwargs: FakeLibc())
