@@ -8,6 +8,7 @@ import {
   desktopBootstrapContextV2Schema,
   projectHeadRefV2Schema,
 } from "../../src/api/v2/schemas";
+import { liveDesktopRequestAllowed } from "./release-live-network-boundary";
 
 const HANDOFF_ENV = "OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF";
 const HANDOFF_PATH = process.env[HANDOFF_ENV];
@@ -445,10 +446,15 @@ async function installNetworkBoundary(
     }
     if (url.origin === liveOrigin) {
       observation.routeKinds.add("desktop_v2");
-      const discovery = url.pathname === "/version" || url.pathname === "/health";
-      const v2 = url.pathname.startsWith("/desktop/v2/");
-      const token = request.headers()["x-openevo-desktop-session"];
-      if (request.method() !== "GET" || (!discovery && !v2) || (v2 && token !== sessionToken)) {
+      if (!liveDesktopRequestAllowed({
+        staticOrigin: STATIC_ORIGIN,
+        liveOrigin,
+        requestOrigin: url.origin,
+        method: request.method(),
+        pathname: url.pathname,
+        headers: request.headers(),
+        sessionToken,
+      })) {
         observation.violations.push("desktop_contract");
         await route.abort("blockedbyclient");
         return;
