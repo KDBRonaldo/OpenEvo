@@ -45,6 +45,7 @@ export interface OperationPanelModelV2 {
   readonly createdAt: string;
   readonly startedAt: string | null;
   readonly finishedAt: string | null;
+  readonly elapsedMillisecondsFloor?: number;
   readonly cancellable: boolean;
   readonly failure: OperationPanelFailureV2 | null;
   readonly logs: readonly OperationPanelLogEntryV2[];
@@ -300,7 +301,12 @@ export function LifecycleOperationPanelV2({
   onResume,
 }: LifecycleOperationPanelV2Props) {
   const [expanded, setExpanded] = useState(false);
-  const elapsed = useElapsedV2(model.createdAt, model.startedAt, model.finishedAt);
+  const elapsed = useElapsedV2(
+    model.createdAt,
+    model.startedAt,
+    model.finishedAt,
+    model.elapsedMillisecondsFloor,
+  );
   const visibleLogs = useMemo(
     () => expanded ? model.logs : model.logs.slice(-COLLAPSED_LOG_LINES),
     [expanded, model.logs],
@@ -416,7 +422,12 @@ export function LifecycleOperationPanelV2({
   );
 }
 
-function useElapsedV2(createdAt: string, startedAt: string | null, finishedAt: string | null): string {
+function useElapsedV2(
+  createdAt: string,
+  startedAt: string | null,
+  finishedAt: string | null,
+  elapsedMillisecondsFloor = 0,
+): string {
   const start = Date.parse(startedAt ?? createdAt);
   const finish = finishedAt === null ? null : Date.parse(finishedAt);
   const [now, setNow] = useState(() => Date.now());
@@ -425,7 +436,7 @@ function useElapsedV2(createdAt: string, startedAt: string | null, finishedAt: s
     const interval = globalThis.setInterval(() => setNow(Date.now()), 1_000);
     return () => globalThis.clearInterval(interval);
   }, [finish]);
-  return durationLabelV2(Math.max(0, (finish ?? now) - start));
+  return durationLabelV2(Math.max(0, elapsedMillisecondsFloor, (finish ?? now) - start));
 }
 
 function durationLabelV2(milliseconds: number): string {

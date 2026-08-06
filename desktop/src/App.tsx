@@ -608,6 +608,7 @@ function nativeStartupPanelModelV2(status: NativeStartupStatusV2): OperationPane
     finishedAt: ["succeeded", "failed", "cancelled"].includes(status.status)
       ? new Date(now).toISOString()
       : null,
+    elapsedMillisecondsFloor: status.elapsed_milliseconds,
     cancellable: status.cancellable,
     failure: status.failure === null ? null : {
       summary: status.failure.message,
