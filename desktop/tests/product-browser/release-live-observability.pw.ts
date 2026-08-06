@@ -471,6 +471,7 @@ async function installNetworkBoundary(
 async function installNativeBridge(page: Page, bootstrap: LiveHandoff["bootstrap"]): Promise<void> {
   await page.addInitScript((context) => {
     const observation: NativeObservation = { commands: [], stages: [], rendererReady: false, unexpected: [] };
+    let mutationIntentJournal: string | null = null;
     Object.defineProperty(window, "__OPENEVO_LIVE_NATIVE_OBSERVATION__", { configurable: false, enumerable: false, writable: false, value: observation });
     Object.defineProperty(window, "__TAURI_INTERNALS__", {
       configurable: false,
@@ -482,6 +483,23 @@ async function installNativeBridge(page: Page, bootstrap: LiveHandoff["bootstrap
           if (command === "begin_sidecar_start") return null;
           if (command === "sidecar_bootstrap_context") return context;
           if (command === "stop_sidecar") return null;
+          if (command === "read_mutation_intent_journal_v2") return mutationIntentJournal;
+          if (command === "compare_and_swap_mutation_intent_journal_v2") {
+            const expectedValue = args.expectedValue;
+            const newValue = args.newValue;
+            if (
+              (expectedValue !== null && typeof expectedValue !== "string")
+              || (newValue !== null && typeof newValue !== "string")
+            ) {
+              observation.unexpected.push("mutation_journal_arguments");
+              throw new Error("Invalid mutation journal arguments");
+            }
+            if (expectedValue !== mutationIntentJournal) {
+              throw { code: "mutation_intent_journal_conflict" };
+            }
+            mutationIntentJournal = newValue;
+            return null;
+          }
           if (command === "renderer_bootstrap_stage") {
             const stage = typeof args.stage === "string" ? args.stage : "";
             const allowed = new Set([
