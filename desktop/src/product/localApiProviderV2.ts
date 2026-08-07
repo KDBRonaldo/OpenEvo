@@ -133,6 +133,11 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
 
   async refresh(): Promise<ProductRefreshResultV2> {
     const sequence = ++this.refreshSequence;
+    // A refresh is the authority boundary for the event stream. Keep the
+    // stream paused from the moment the snapshot load starts so a subscription
+    // registered by the renderer cannot observe an event and supersede the
+    // initial refresh before it publishes its first authoritative snapshot.
+    this.waitingForRefresh = true;
     try {
       await this.mutationIntents.initialize();
       const loaded = await this.loadSnapshot();
