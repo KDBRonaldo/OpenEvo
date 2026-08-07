@@ -66,6 +66,9 @@ type NativeObservation = {
 type NetworkObservation = {
   routeKinds: Set<"desktop_v2" | "packaged_web">;
   violations: string[];
+  liveRequests: string[];
+  liveResponses: string[];
+  failedRequests: string[];
 };
 
 const resultSchema = z.object({
@@ -132,7 +135,7 @@ test("packaged renderer observes the live Desktop v2 authority", async ({ page }
   const startup = await readNativeObservation(page);
   assertClosed(
     startup.stages.includes("product_committed"),
-    `release provider startup failed at ${startup.stages.join(",")}`,
+    `release provider startup failed at ${startup.stages.join(",")}; requests=${network.liveRequests.join("|")}; responses=${network.liveResponses.join("|")}; failed=${network.failedRequests.join("|")}; violations=${network.violations.join("|")}`,
   );
 
   const shell = page.locator(".product-shell");
@@ -408,7 +411,31 @@ async function installNetworkBoundary(
   liveOrigin: string,
   sessionToken: string,
 ): Promise<NetworkObservation> {
-  const observation: NetworkObservation = { routeKinds: new Set(), violations: [] };
+  const observation: NetworkObservation = {
+    routeKinds: new Set(),
+    violations: [],
+    liveRequests: [],
+    liveResponses: [],
+    failedRequests: [],
+  };
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.origin === liveOrigin) {
+      observation.liveRequests.push(`${request.method()} ${url.pathname}${url.search}`);
+    }
+  });
+  page.on("response", (response) => {
+    const url = new URL(response.url());
+    if (url.origin === liveOrigin) {
+      observation.liveResponses.push(`${response.request().method()} ${url.pathname}${url.search} ${response.status()}`);
+    }
+  });
+  page.on("requestfailed", (request) => {
+    const url = new URL(request.url());
+    if (url.origin === liveOrigin) {
+      observation.failedRequests.push(`${request.method()} ${url.pathname}${url.search}`);
+    }
+  });
   await page.route("**/*", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
