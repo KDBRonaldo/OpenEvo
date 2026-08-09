@@ -67,6 +67,9 @@ _IN_MUTATION_MASK: Final[int] = (
     | _IN_MOVE_SELF
 )
 _INOTIFY_EVENT_HEADER: Final[struct.Struct] = struct.Struct("iIII")
+_READBACK_MUTATION_RETAINED_LOCK = threading.Lock()
+_READBACK_MUTATION_RETAINED_DESCRIPTOR: int | None = None
+_READBACK_MUTATION_RETAINED_PID: int | None = None
 _DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_DIRECTORY
 _FILE_READ_FLAGS: Final[int] = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
 _FILE_WRITE_FLAGS: Final[int] = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -74,6 +77,14 @@ _FILE_WRITE_FLAGS: Final[int] = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_
 
 class RuntimePathSecurityError(RuntimeError):
     """Raised when a bind-mount path cannot be proven to stay in its authority."""
+
+
+def _record_cleanup_failure(error: BaseException, cleanup_error: BaseException) -> None:
+    """Preserve the body failure while exposing a secondary cleanup failure."""
+
+    # Keep the original exception as the raised failure on Python versions
+    # without BaseException.add_note while retaining the cleanup diagnostic.
+    setattr(error, "cleanup_error", cleanup_error)
 
 
 @dataclass(slots=True)
@@ -223,8 +234,15 @@ class _DirectoryPin:
                 os.close(current_fd)
 
     def close(self) -> None:
+        failure: BaseException | None = None
         while self.descriptors:
-            os.close(self.descriptors.pop())
+            try:
+                os.close(self.descriptors.pop())
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 @dataclass(slots=True)
@@ -250,8 +268,15 @@ class _RelativeDirectoryPin:
             parent_fd = self.descriptors[index]
 
     def close(self) -> None:
+        failure: BaseException | None = None
         while self.descriptors:
-            os.close(self.descriptors.pop())
+            try:
+                os.close(self.descriptors.pop())
+            except BaseException as exc:
+                if failure is None:
+                    failure = exc
+        if failure is not None:
+            raise failure
 
 
 def _object_identity(value: os.stat_result) -> tuple[int, int]:
@@ -1086,26 +1111,65 @@ class _ReadbackTargetEntry:
 class _ReadbackMutationAuthority:
     """One Linux event generation covering every held source directory."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, cancellation: threading.Event | None = None) -> None:
+        global _READBACK_MUTATION_RETAINED_DESCRIPTOR
+        global _READBACK_MUTATION_RETAINED_PID
+
         if not sys.platform.startswith("linux"):
             raise RuntimePathSecurityError(
                 "trusted runtime readback mutation authority requires Linux"
             )
-        libc = ctypes.CDLL(None, use_errno=True)
-        init = libc.inotify_init1
-        init.argtypes = (ctypes.c_int,)
-        init.restype = ctypes.c_int
-        descriptor = init(_IN_NONBLOCK | _IN_CLOEXEC)
-        if descriptor < 0:
-            error = ctypes.get_errno()
-            raise RuntimePathSecurityError(
-                "trusted runtime readback mutation authority is unavailable"
-            ) from OSError(error, os.strerror(error))
-        self._descriptor = descriptor
+        if cancellation is None:
+            _READBACK_MUTATION_RETAINED_LOCK.acquire()
+        else:
+            while not _READBACK_MUTATION_RETAINED_LOCK.acquire(timeout=0.01):
+                _check_readback_cancel(cancellation)
+            if cancellation.is_set():
+                _READBACK_MUTATION_RETAINED_LOCK.release()
+                raise RuntimePathSecurityError("runtime readback was cancelled")
+        self._lock_held = True
+        self._process_id = os.getpid()
         self._watches: set[int] = set()
         self._closed = False
+        self._poisoned = False
+        try:
+            pid = os.getpid()
+            if _READBACK_MUTATION_RETAINED_PID != pid:
+                if _READBACK_MUTATION_RETAINED_DESCRIPTOR is not None:
+                    os.close(_READBACK_MUTATION_RETAINED_DESCRIPTOR)
+                _READBACK_MUTATION_RETAINED_DESCRIPTOR = None
+                _READBACK_MUTATION_RETAINED_PID = pid
+            if _READBACK_MUTATION_RETAINED_DESCRIPTOR is None:
+                libc = ctypes.CDLL(None, use_errno=True)
+                init = libc.inotify_init1
+                init.argtypes = (ctypes.c_int,)
+                init.restype = ctypes.c_int
+                descriptor = init(_IN_NONBLOCK | _IN_CLOEXEC)
+                if descriptor < 0:
+                    error = ctypes.get_errno()
+                    raise RuntimePathSecurityError(
+                        "trusted runtime readback mutation authority unavailable "
+                        f"(inotify_init1:{errno.errorcode.get(error, 'UNKNOWN')})"
+                    ) from OSError(error, os.strerror(error))
+                _READBACK_MUTATION_RETAINED_DESCRIPTOR = descriptor
+            self._descriptor = _READBACK_MUTATION_RETAINED_DESCRIPTOR
+        except BaseException:
+            self._lock_held = False
+            _READBACK_MUTATION_RETAINED_LOCK.release()
+            raise
+
+    def _ensure_current_process(self) -> None:
+        if self._process_id != os.getpid():
+            raise RuntimePathSecurityError(
+                "trusted runtime readback mutation authority is unavailable after fork"
+            )
 
     def add(self, directory_fd: int) -> None:
+        self._ensure_current_process()
+        if self._poisoned:
+            raise RuntimePathSecurityError(
+                "trusted runtime readback mutation authority is poisoned"
+            )
         if self._closed:
             raise RuntimePathSecurityError("runtime readback mutation authority is closed")
         libc = ctypes.CDLL(None, use_errno=True)
@@ -1119,12 +1183,19 @@ class _ReadbackMutationAuthority:
         )
         if watch < 0:
             error = ctypes.get_errno()
+            self._poison()
             raise RuntimePathSecurityError(
-                "trusted runtime readback mutation authority is unavailable"
+                "trusted runtime readback mutation authority unavailable "
+                f"(inotify_add_watch:{errno.errorcode.get(error, 'UNKNOWN')})"
             ) from OSError(error, os.strerror(error))
         self._watches.add(watch)
 
     def require_quiet(self) -> None:
+        self._ensure_current_process()
+        if self._poisoned:
+            raise RuntimePathSecurityError(
+                "trusted runtime readback mutation authority is poisoned"
+            )
         if self._closed:
             raise RuntimePathSecurityError("runtime readback mutation authority is closed")
         while True:
@@ -1133,16 +1204,20 @@ class _ReadbackMutationAuthority:
             except BlockingIOError:
                 return
             except OSError as exc:
+                self._poison()
                 raise RuntimePathSecurityError(
-                    "runtime readback mutation authority is unavailable"
+                    "trusted runtime readback mutation authority unavailable "
+                    f"(read:{errno.errorcode.get(exc.errno, 'UNKNOWN')})"
                 ) from exc
             if not payload:
+                self._poison()
                 raise RuntimePathSecurityError(
-                    "runtime readback mutation authority is unavailable"
+                    "trusted runtime readback mutation authority unavailable (read:EOF)"
                 )
             offset = 0
             while offset < len(payload):
                 if len(payload) - offset < _INOTIFY_EVENT_HEADER.size:
+                    self._poison()
                     raise RuntimePathSecurityError(
                         "runtime readback mutation evidence is malformed"
                     )
@@ -1152,21 +1227,148 @@ class _ReadbackMutationAuthority:
                 )
                 offset += _INOTIFY_EVENT_HEADER.size + name_size
                 if offset > len(payload):
+                    self._poison()
                     raise RuntimePathSecurityError(
                         "runtime readback mutation evidence is malformed"
                     )
                 if watch not in self._watches or mask & (
                     _IN_Q_OVERFLOW | _IN_IGNORED | _IN_MUTATION_MASK
                 ):
+                    self._poison()
                     raise RuntimePathSecurityError(
                         "runtime readback source tree changed during transfer"
                     )
 
+    def _poison(self) -> None:
+        if self._poisoned:
+            return
+        self._poisoned = True
+        _discard_retained_readback_mutation_descriptor(self._descriptor)
+
     def close(self) -> None:
+        if self._process_id != os.getpid():
+            self._closed = True
+            self._lock_held = False
+            return
         if self._closed:
             return
-        self._closed = True
-        os.close(self._descriptor)
+        failure: RuntimePathSecurityError | None = None
+        try:
+            if not self._poisoned:
+                try:
+                    self.require_quiet()
+                except RuntimePathSecurityError as exc:
+                    failure = exc
+                    self._poison()
+            if not self._poisoned and failure is None:
+                teardown_watches = set(self._watches)
+                pending_acks = set(teardown_watches)
+                libc = ctypes.CDLL(None, use_errno=True)
+                remove_watch = libc.inotify_rm_watch
+                remove_watch.argtypes = (ctypes.c_int, ctypes.c_int)
+                remove_watch.restype = ctypes.c_int
+                for watch in teardown_watches:
+                    if remove_watch(self._descriptor, watch) < 0:
+                        error = ctypes.get_errno()
+                        failure = RuntimePathSecurityError(
+                            "trusted runtime readback mutation authority cleanup failed "
+                            f"(inotify_rm_watch:{errno.errorcode.get(error, 'UNKNOWN')})"
+                        )
+                        self._poison()
+                        break
+                while failure is None:
+                    try:
+                        payload = os.read(self._descriptor, 64 * 1024)
+                        if not payload:
+                            if pending_acks:
+                                failure = RuntimePathSecurityError(
+                                    "trusted runtime readback mutation authority cleanup failed "
+                                    "(read:missing_ack)"
+                                )
+                                self._poison()
+                            break
+                    except BlockingIOError:
+                        if pending_acks:
+                            failure = RuntimePathSecurityError(
+                                "trusted runtime readback mutation authority cleanup failed "
+                                "(read:missing_ack)"
+                            )
+                            self._poison()
+                        break
+                    except OSError as exc:
+                        failure = RuntimePathSecurityError(
+                            "trusted runtime readback mutation authority cleanup failed "
+                            f"(read:{errno.errorcode.get(exc.errno, 'UNKNOWN')})"
+                        )
+                        self._poison()
+                        break
+                    offset = 0
+                    while offset < len(payload):
+                        if len(payload) - offset < _INOTIFY_EVENT_HEADER.size:
+                            failure = RuntimePathSecurityError(
+                                "trusted runtime readback mutation authority cleanup failed "
+                                "(read:malformed)"
+                            )
+                            self._poison()
+                            break
+                        watch, mask, _cookie, name_size = _INOTIFY_EVENT_HEADER.unpack_from(
+                            payload,
+                            offset,
+                        )
+                        offset += _INOTIFY_EVENT_HEADER.size + name_size
+                        if (
+                            offset > len(payload)
+                            or watch not in pending_acks
+                            or not mask & _IN_IGNORED
+                            or mask & (_IN_Q_OVERFLOW | _IN_MUTATION_MASK)
+                            or mask & ~(_IN_IGNORED | _IN_ISDIR)
+                        ):
+                            failure = RuntimePathSecurityError(
+                                "trusted runtime readback mutation authority cleanup failed "
+                                "(read:unexpected_event)"
+                            )
+                            self._poison()
+                            break
+                        pending_acks.remove(watch)
+                self._watches.clear()
+        finally:
+            self._closed = True
+            if failure is not None:
+                self._poison()
+            if self._lock_held:
+                self._lock_held = False
+                _READBACK_MUTATION_RETAINED_LOCK.release()
+        if failure is not None:
+            raise failure
+
+
+def _discard_retained_readback_mutation_descriptor(descriptor: int) -> None:
+    global _READBACK_MUTATION_RETAINED_DESCRIPTOR
+    global _READBACK_MUTATION_RETAINED_PID
+
+    if _READBACK_MUTATION_RETAINED_DESCRIPTOR != descriptor:
+        return
+    try:
+        os.close(descriptor)
+    except OSError:
+        pass
+    _READBACK_MUTATION_RETAINED_DESCRIPTOR = None
+    _READBACK_MUTATION_RETAINED_PID = os.getpid()
+
+
+def _reset_readback_mutation_after_fork() -> None:
+    """Discard inherited readback state without releasing the parent's lock."""
+
+    global _READBACK_MUTATION_RETAINED_LOCK
+
+    descriptor = _READBACK_MUTATION_RETAINED_DESCRIPTOR
+    if descriptor is not None:
+        _discard_retained_readback_mutation_descriptor(descriptor)
+    _READBACK_MUTATION_RETAINED_LOCK = threading.Lock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_readback_mutation_after_fork)
 
 
 def _check_readback_cancel(cancellation: threading.Event) -> None:
@@ -1301,6 +1503,7 @@ def _copy_readback_regular_file(
     budget.require_byte_capacity(source.stat.st_size)
     source_fd = os.open(source.name, _FILE_READ_FLAGS, dir_fd=source_parent_fd)
     target_fd = -1
+    body_error: BaseException | None = None
     try:
         opened = os.fstat(source_fd)
         if _readback_file_identity(opened) != source.identity:
@@ -1367,10 +1570,26 @@ def _copy_readback_regular_file(
                 identity=_readback_file_identity(target_after),
             ),
         )
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
+        cleanup_error: BaseException | None = None
         if target_fd >= 0:
-            os.close(target_fd)
-        os.close(source_fd)
+            try:
+                os.close(target_fd)
+            except BaseException as exc:
+                cleanup_error = exc
+        try:
+            os.close(source_fd)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if body_error is not None:
+                _record_cleanup_failure(body_error, cleanup_error)
+            else:
+                raise cleanup_error
 
 
 def _copy_readback_directory(
@@ -1402,6 +1621,7 @@ def _copy_readback_directory(
         if source.is_directory:
             child_source_fd = os.open(source.name, _DIRECTORY_FLAGS, dir_fd=source_fd)
             child_target_fd = -1
+            body_error: BaseException | None = None
             try:
                 if _readback_directory_identity(os.fstat(child_source_fd)) != source.identity:
                     raise RuntimePathSecurityError(
@@ -1445,10 +1665,26 @@ def _copy_readback_directory(
                         children=child_entries,
                     )
                 )
+            except BaseException as exc:
+                body_error = exc
+                raise
             finally:
+                cleanup_error: BaseException | None = None
                 if child_target_fd >= 0:
-                    os.close(child_target_fd)
-                os.close(child_source_fd)
+                    try:
+                        os.close(child_target_fd)
+                    except BaseException as exc:
+                        cleanup_error = exc
+                try:
+                    os.close(child_source_fd)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+                if cleanup_error is not None:
+                    if body_error is not None:
+                        _record_cleanup_failure(body_error, cleanup_error)
+                    else:
+                        raise cleanup_error
         else:
             file, target_entry = _copy_readback_regular_file(
                 source_fd,
@@ -2130,6 +2366,7 @@ class BaseRuntime(ABC):
         expected_directory: bool,
         cancellation: threading.Event,
     ) -> RuntimeReadback:
+        body_error: BaseException | None = None
         relative_parts = _runtime_relative_parts(runtime_path)
         if relative_parts is None:
             raise RuntimePathSecurityError(
@@ -2195,7 +2432,7 @@ class BaseRuntime(ABC):
             )
             if opened_identity != source_identity:
                 raise RuntimePathSecurityError("runtime readback source changed while opening")
-            mutation_authority = _ReadbackMutationAuthority()
+            mutation_authority = _ReadbackMutationAuthority(cancellation=cancellation)
             mutation_authority.add(session_pin.descriptor)
             for descriptor in source_parents.descriptors:
                 mutation_authority.add(descriptor)
@@ -2362,17 +2599,27 @@ class BaseRuntime(ABC):
             readback_complete = True
             return RuntimeReadback(files=tuple(sorted(files, key=lambda item: item.relative_path)))
         except FileNotFoundError as exc:
-            raise FileNotFoundError(
+            body_error = FileNotFoundError(
                 f"runtime readback source is unavailable: {runtime_path}"
-            ) from exc
-        except RuntimePathSecurityError:
+            )
+            raise body_error from exc
+        except RuntimePathSecurityError as exc:
+            body_error = exc
             raise
         except OSError as exc:
-            raise RuntimePathSecurityError("trusted runtime readback failed closed") from exc
+            body_error = RuntimePathSecurityError("trusted runtime readback failed closed")
+            raise body_error from exc
         finally:
             cleanup_error: BaseException | None = None
             if mutation_authority is not None:
-                mutation_authority.close()
+                try:
+                    mutation_authority.close()
+                except BaseException as exc:
+                    # A failed authority teardown means the publication can no
+                    # longer be trusted, even if all transfer checks completed.
+                    # Conservatively discard the exact-identity publication.
+                    readback_complete = False
+                    cleanup_error = exc
             if (
                 publication_active
                 and not readback_complete
@@ -2389,9 +2636,14 @@ class BaseRuntime(ABC):
                         is_directory=expected_directory,
                     )
                 except BaseException as exc:
-                    cleanup_error = exc
+                    if cleanup_error is None:
+                        cleanup_error = exc
             if payload_fd >= 0:
-                os.close(payload_fd)
+                try:
+                    os.close(payload_fd)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             if staging_fd >= 0 and staging_name is not None and staging_identity is not None:
                 try:
                     _discard_readback_staging(
@@ -2403,18 +2655,42 @@ class BaseRuntime(ABC):
                 except BaseException as exc:
                     if cleanup_error is None:
                         cleanup_error = exc
-                os.close(staging_fd)
+                try:
+                    os.close(staging_fd)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             if target_parent_pin is not None:
-                target_parent_pin.close()
+                try:
+                    target_parent_pin.close()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             if source_fd >= 0:
-                os.close(source_fd)
+                try:
+                    os.close(source_fd)
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
             if source_parents is not None:
-                source_parents.close()
-            session_pin.close()
+                try:
+                    source_parents.close()
+                except BaseException as exc:
+                    if cleanup_error is None:
+                        cleanup_error = exc
+            try:
+                session_pin.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
             if cleanup_error is not None:
-                raise RuntimePathSecurityError(
-                    "runtime readback cleanup could not preserve its authority"
-                ) from cleanup_error
+                if body_error is not None:
+                    _record_cleanup_failure(body_error, cleanup_error)
+                else:
+                    raise RuntimePathSecurityError(
+                        "runtime readback cleanup could not preserve its authority: "
+                        f"{cleanup_error}"
+                    ) from cleanup_error
 
     def _copy_from_bind_mount(self, runtime_path: str, local_path: Path) -> bool:
         relative_parts = _runtime_relative_parts(runtime_path)
@@ -3345,6 +3621,7 @@ def _scan_runtime_download_sync(
     cancellation: threading.Event,
     accounting: _RuntimeDownloadAccounting,
 ) -> RuntimeReadback:
+    body_error: BaseException | None = None
     _check_readback_cancel(cancellation)
     if _directory_identity(os.fstat(parent_fd)) != expected_parent_identity:
         raise RuntimePathSecurityError("runtime compatibility readback parent changed")
@@ -3362,7 +3639,7 @@ def _scan_runtime_download_sync(
                 "runtime compatibility readback target changed while opening"
             )
         if sys.platform.startswith("linux"):
-            mutation_authority = _ReadbackMutationAuthority()
+            mutation_authority = _ReadbackMutationAuthority(cancellation=cancellation)
             mutation_authority.add(parent_fd)
         files = _scan_runtime_download_directory(
             target_fd,
@@ -3390,10 +3667,29 @@ def _scan_runtime_download_sync(
         if mutation_authority is not None:
             mutation_authority.require_quiet()
         return RuntimeReadback(files=tuple(sorted(files, key=lambda item: item.relative_path)))
+    except BaseException as exc:
+        body_error = exc
+        raise
     finally:
+        cleanup_error: BaseException | None = None
         if mutation_authority is not None:
-            mutation_authority.close()
-        os.close(target_fd)
+            try:
+                mutation_authority.close()
+            except BaseException as exc:
+                cleanup_error = exc
+        try:
+            os.close(target_fd)
+        except BaseException as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        if cleanup_error is not None:
+            if body_error is not None:
+                _record_cleanup_failure(body_error, cleanup_error)
+            else:
+                raise RuntimePathSecurityError(
+                    "runtime compatibility readback cleanup failed: "
+                    f"{cleanup_error}"
+                ) from cleanup_error
 
 
 async def _stop_runtime_download_tasks(

@@ -3533,13 +3533,19 @@ def _structural_check() -> None:
         REPOSITORY_ROOT
         / "desktop/tests/product-browser/release-live-observability.pw.ts"
     )
+    renderer_boundary = (
+        REPOSITORY_ROOT
+        / "desktop/tests/product-browser/release-live-network-boundary.ts"
+    )
     try:
         contract_payload = json.loads(contract.read_text(encoding="utf-8"))
         launcher_text = launcher.read_text(encoding="utf-8")
         runner_text = Path(__file__).read_text(encoding="utf-8")
         renderer_text = renderer.read_text(encoding="utf-8")
+        renderer_boundary_text = renderer_boundary.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise E2EFailure("structural_check", "release_sources_unavailable") from exc
+    renderer_contract_text = renderer_text + renderer_boundary_text
     if (
         set(contract_payload)
         != {
@@ -3588,9 +3594,12 @@ def _structural_check() -> None:
             f'add_argument("{flag}")' in runner_text
             for flag in forbidden_release_flags
         )
-        or '/desktop/v2/' not in renderer_text
+        or '/desktop/v2/' not in renderer_contract_text
         or 'z.literal("2")' not in renderer_text
-        or any(marker in renderer_text for marker in forbidden_release_sources[:2])
+        or any(
+            marker in renderer_contract_text
+            for marker in forbidden_release_sources[:2]
+        )
     ):
         raise E2EFailure("structural_check", "v2_system_openssh_boundary_missing")
 

@@ -144,6 +144,46 @@ describe("ReleaseDesktopProductShell", () => {
     expect(stop.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
 
+  it("does not let repeated native startup polls move elapsed time backwards", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-06T08:00:16.000Z"));
+    const pending = deferred<FixtureDesktopProductProvider>();
+    const getStartupStatus = vi.fn(async (): Promise<NativeStartupStatusV2> => ({
+      schema_version: "2",
+      startup_epoch: 3,
+      status: "running",
+      phase: "waiting_for_local_api",
+      phase_index: 3,
+      phase_total: 6,
+      elapsed_milliseconds: 16_000,
+      cancellable: true,
+      failure: null,
+    }));
+
+    root = await renderReleaseShell(
+      () => pending.promise,
+      vi.fn(async () => {}),
+      vi.fn(async () => {}),
+      vi.fn(),
+      getStartupStatus,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getStartupStatus).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain("Elapsed 16s");
+
+    await act(async () => {
+      vi.setSystemTime(new Date("2026-08-06T08:00:16.900Z"));
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+
+    expect(getStartupStatus).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("Elapsed 16s");
+  });
+
   it("keeps both renderer-owned samples interactive while the first provider snapshot is pending", async () => {
     provider = createFixtureDesktopProductProvider({ startOnline: true });
     const initial = await provider.refresh();

@@ -8,6 +8,8 @@ import {
   desktopBootstrapContextV2Schema,
   projectHeadRefV2Schema,
 } from "../../src/api/v2/schemas";
+import { liveDesktopRequestAllowed } from "./release-live-network-boundary";
+import { installReleaseLiveNativeBridgeV2 } from "./release-live-native-bridge";
 
 const HANDOFF_ENV = "OPENEVO_DESKTOP_LIVE_RENDERER_HANDOFF";
 const HANDOFF_PATH = process.env[HANDOFF_ENV];
@@ -64,6 +66,9 @@ type NativeObservation = {
 type NetworkObservation = {
   routeKinds: Set<"desktop_v2" | "packaged_web">;
   violations: string[];
+  liveRequests: string[];
+  liveResponses: string[];
+  failedRequests: string[];
 };
 
 const resultSchema = z.object({
@@ -130,7 +135,7 @@ test("packaged renderer observes the live Desktop v2 authority", async ({ page }
   const startup = await readNativeObservation(page);
   assertClosed(
     startup.stages.includes("product_committed"),
-    `release provider startup failed at ${startup.stages.join(",")}`,
+    `release provider startup failed at ${startup.stages.join(",")}; requests=${network.liveRequests.join("|")}; responses=${network.liveResponses.join("|")}; failed=${network.failedRequests.join("|")}; violations=${network.violations.join("|")}`,
   );
 
   const shell = page.locator(".product-shell");
@@ -406,7 +411,31 @@ async function installNetworkBoundary(
   liveOrigin: string,
   sessionToken: string,
 ): Promise<NetworkObservation> {
-  const observation: NetworkObservation = { routeKinds: new Set(), violations: [] };
+  const observation: NetworkObservation = {
+    routeKinds: new Set(),
+    violations: [],
+    liveRequests: [],
+    liveResponses: [],
+    failedRequests: [],
+  };
+  page.on("request", (request) => {
+    const url = new URL(request.url());
+    if (url.origin === liveOrigin) {
+      observation.liveRequests.push(`${request.method()} ${url.pathname}${url.search}`);
+    }
+  });
+  page.on("response", (response) => {
+    const url = new URL(response.url());
+    if (url.origin === liveOrigin) {
+      observation.liveResponses.push(`${response.request().method()} ${url.pathname}${url.search} ${response.status()}`);
+    }
+  });
+  page.on("requestfailed", (request) => {
+    const url = new URL(request.url());
+    if (url.origin === liveOrigin) {
+      observation.failedRequests.push(`${request.method()} ${url.pathname}${url.search}`);
+    }
+  });
   await page.route("**/*", async (route: Route) => {
     const request = route.request();
     const url = new URL(request.url());
@@ -445,10 +474,15 @@ async function installNetworkBoundary(
     }
     if (url.origin === liveOrigin) {
       observation.routeKinds.add("desktop_v2");
-      const discovery = url.pathname === "/version" || url.pathname === "/health";
-      const v2 = url.pathname.startsWith("/desktop/v2/");
-      const token = request.headers()["x-openevo-desktop-session"];
-      if (request.method() !== "GET" || (!discovery && !v2) || (v2 && token !== sessionToken)) {
+      if (!liveDesktopRequestAllowed({
+        staticOrigin: STATIC_ORIGIN,
+        liveOrigin,
+        requestOrigin: url.origin,
+        method: request.method(),
+        pathname: url.pathname,
+        headers: request.headers(),
+        sessionToken,
+      })) {
         observation.violations.push("desktop_contract");
         await route.abort("blockedbyclient");
         return;
@@ -463,58 +497,7 @@ async function installNetworkBoundary(
 }
 
 async function installNativeBridge(page: Page, bootstrap: LiveHandoff["bootstrap"]): Promise<void> {
-  await page.addInitScript((context) => {
-    const observation: NativeObservation = { commands: [], stages: [], rendererReady: false, unexpected: [] };
-    Object.defineProperty(window, "__OPENEVO_LIVE_NATIVE_OBSERVATION__", { configurable: false, enumerable: false, writable: false, value: observation });
-    Object.defineProperty(window, "__TAURI_INTERNALS__", {
-      configurable: false,
-      enumerable: false,
-      writable: false,
-      value: {
-        invoke: async (command: string, args: Record<string, unknown> = {}) => {
-          observation.commands.push(command);
-          if (command === "begin_sidecar_start") return null;
-          if (command === "sidecar_bootstrap_context") return context;
-          if (command === "stop_sidecar") return null;
-          if (command === "renderer_bootstrap_stage") {
-            const stage = typeof args.stage === "string" ? args.stage : "";
-            const allowed = new Set([
-              "bootstrap_context_validated",
-              "bootstrap_context_failed",
-              "local_api_version_verified",
-              "local_api_version_failed",
-              "provider_adapter_ready",
-              "provider_adapter_failed",
-              "provider_created",
-              "provider_create_failed",
-              "initial_snapshot_failed",
-              "product_committed",
-            ]);
-            if (!allowed.has(stage)) {
-              observation.unexpected.push("bootstrap_stage");
-              throw new Error("Unexpected renderer bootstrap stage");
-            }
-            observation.stages.push(stage);
-            return null;
-          }
-          if (command === "renderer_ready") {
-            if (
-              args.openapiSha256 !== context.negotiated_contract.openapi_sha256
-              || args.eventSchemaSha256 !== context.negotiated_contract.event_schema_sha256
-              || args.releaseVersion !== context.negotiated_contract.release_version
-            ) {
-              observation.unexpected.push("renderer_identity");
-              throw new Error("Renderer readiness identity mismatch");
-            }
-            observation.rendererReady = true;
-            return null;
-          }
-          observation.unexpected.push("native_command");
-          throw new Error("Unexpected native command");
-        },
-      },
-    });
-  }, bootstrap);
+  await page.addInitScript(installReleaseLiveNativeBridgeV2, bootstrap);
 }
 
 async function readNativeObservation(page: Page): Promise<NativeObservation> {

@@ -501,6 +501,9 @@ def test_formal_release_runner_is_v2_system_openssh_only() -> None:
     renderer = Path(
         "desktop/tests/product-browser/release-live-observability.pw.ts"
     ).read_text(encoding="utf-8")
+    renderer += Path(
+        "desktop/tests/product-browser/release-live-network-boundary.ts"
+    ).read_text(encoding="utf-8")
 
     assert "/desktop/v2/" in runner
     assert "--ssh-host-alias" in runner

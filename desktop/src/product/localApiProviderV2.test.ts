@@ -1,6 +1,10 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it, vi } from "vitest";
-import { DesktopApiErrorV2, type DesktopApiClientV2 } from "../api/v2/client";
+import {
+  DesktopApiErrorV2,
+  type DesktopApiClientV2,
+  type FetchLikeV2,
+} from "../api/v2/client";
 import type {
   DesktopStateV2,
   RemoteWorkspaceProfileV2,
@@ -249,6 +253,71 @@ describe("Desktop v2 product provider", () => {
     expect(client.listProjects).not.toHaveBeenCalled();
     expect(client.listTasks).not.toHaveBeenCalled();
     expect(client.listServices).not.toHaveBeenCalled();
+  });
+
+  it("does not let an event subscription stale the first snapshot refresh", async () => {
+    let resolveState!: (value: DesktopStateV2) => void;
+    const pendingState = new Promise<DesktopStateV2>((resolve) => {
+      resolveState = resolve;
+    });
+    const client = clientFixture();
+    vi.mocked(client.state)
+      .mockImplementationOnce(() => pendingState)
+      .mockResolvedValue(state());
+    vi.mocked(client.eventStreamRequest).mockResolvedValue({
+      url: "http://127.0.0.1/desktop/v2/events",
+      headers: {},
+    } as never);
+    const eventPayload = {
+      payload_kind: "ssh_host_catalog_changed",
+      catalog_generation: 3,
+      host_count: 2,
+      warning_count: 1,
+    } as const;
+    const event = {
+      schema_version: "2",
+      event_id: "event-3",
+      sequence: 3,
+      occurred_at: NOW,
+      event_type: "ssh_host_catalog_changed",
+      payload_sha256: "a0e03db5caadb43ec812f99759f0ba45ef2e7f981508b4d5ed0a0870be25e63e",
+      payload: eventPayload,
+    } as const;
+    const fetch = vi.fn<FetchLikeV2>()
+      .mockResolvedValueOnce(new Response([
+        `id: ${event.event_id}`,
+        `event: ${event.event_type}`,
+        `data: ${JSON.stringify(event)}`,
+        "",
+        "",
+      ].join("\n"), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }))
+      .mockResolvedValue(new Response("", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+      fetch,
+      reconnectDelaysMs: [0],
+    });
+    const firstRefresh = provider.refresh();
+    const listenerRefreshes: Promise<unknown>[] = [];
+    const unsubscribe = provider.subscribe(() => {
+      listenerRefreshes.push(provider.refresh());
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    resolveState(state());
+    const result = await firstRefresh;
+    unsubscribe();
+    await Promise.allSettled(listenerRefreshes);
+
+    expect(result.status).toBe("fresh");
   });
 
   it("refreshes completed tasks without calling the unavailable artifact collection", async () => {

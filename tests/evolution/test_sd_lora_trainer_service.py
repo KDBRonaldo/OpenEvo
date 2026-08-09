@@ -382,6 +382,9 @@ def test_trainer_service_rejects_foreign_owned_workers_root(
     artifact_root.mkdir(mode=0o700)
     workers_root = artifact_root / "workers"
     workers_root.mkdir(mode=0o755)
+    # The release workflow runs with umask 077; make the fixture mode explicit
+    # so this test exercises foreign ownership rather than umask behavior.
+    workers_root.chmod(0o755)
     real_fstat = os.fstat
     workers_fd: int | None = None
 
