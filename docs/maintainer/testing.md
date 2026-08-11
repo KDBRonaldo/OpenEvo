@@ -11,28 +11,27 @@ an adjacent successor Project Head chain against a remote host.
 Use focused tests for ordinary changes and broaden the suite when touching
 shared contracts.
 
-Version `0.1.9` is the current public unsigned, non-gating Preview. Its real mounted
-and copied DMG, Tahoe-compatible packaged sidecar, native askpass helper,
-System OpenSSH alias path, packaged renderer, self-contained Daemon Bundle,
-managed runtime, startup diagnostics, and immutable asset roundtrip are current
-Preview evidence. Checked-in, signed exact-candidate evidence also covers two
-real remote Codex subscription Tasks, all three text-evolution targets,
-adjacent successor Project Heads, next-session Runtime Context reuse, and live
-Desktop v2 renderer observability. It is still not G2, G3, G12, or full
-External Beta evidence. Earlier Preview releases remain historical evidence.
+Version `0.1.10` is the current public unsigned, non-gating Preview. Its exact
+mounted, copied, installed, and publicly re-downloaded DMG; packaged sidecar;
+native askpass helper; System OpenSSH alias path; packaged renderer;
+self-contained Daemon Bundle; managed runtime; startup diagnostics; and
+immutable asset roundtrip are current Preview evidence. Checked-in, signed
+exact-candidate evidence also covers two real remote Codex subscription Tasks,
+all three text-evolution targets, adjacent successor Project Heads,
+next-session Runtime Context reuse, and live Desktop v2 renderer observability.
+It additionally proves that project creation returns a durable reservation
+before the renderer deadline, continues for more than 15 seconds, survives an
+SSE reconnect and sidecar relaunch, and reconciles to exactly one Core project,
+one Desktop/Core mapping, and one applied create mutation.
 
-Version `0.1.10` is the active Preview release target. In addition to retaining
-the `0.1.9` system-OpenSSH and two-Task path, it must prove that project creation
-returns a durable operation reservation before the renderer's bounded Local API
-deadline, continues for more than 15 seconds, survives an SSE reconnect and one
-sidecar relaunch, and reconciles to exactly one Core project, one Desktop/Core
-mapping, and one applied create mutation. The same shared operation presentation
-must cover every implemented long-running authority: Desktop-owned profile,
-host-key, Daemon, native-workspace, and project lifecycle work; native startup;
-and Core-owned Tasks, successor transitions, services, diagnostics, and
-maintenance operations. Lifecycle output may include actual sanitized SSH and
-Daemon stdout/stderr. Commands, environment values, credentials, tokens, Core
-endpoints, and absolute host paths remain forbidden.
+The same shared operation presentation covers every implemented long-running
+authority: Desktop-owned profile, host-key, Daemon, native-workspace, and
+project lifecycle work; native startup; and Core-owned Tasks, successor
+transitions, services, diagnostics, and maintenance operations. Lifecycle
+output may include actual sanitized SSH and Daemon stdout/stderr. Commands,
+environment values, credentials, tokens, Core endpoints, and absolute host
+paths remain forbidden. This Preview is still not G2, G3, G12, or full
+External Beta evidence. Earlier Preview releases remain historical evidence.
 
 Core v2 provider tests also exercise Attempt cancellation through the real HTTP
 contract: stale Task ETags fail with 412, an admitted Attempt is cancelled

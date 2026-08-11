@@ -1,6 +1,6 @@
 # Proxy And Network Settings
 
-OpenEvo Desktop 0.1.9 delegates SSH routing to the Mac user's system OpenSSH
+OpenEvo Desktop 0.1.10 delegates SSH routing to the Mac user's system OpenSSH
 configuration. Configure SSH jump hosts or proxy commands in `~/.ssh/config`,
 then select that literal alias in Desktop.
 
@@ -29,7 +29,7 @@ SSH proxy form.
 ## Remote HTTPS And Container Networking
 
 The remote server still needs outbound access required by Codex Subscription,
-Daemon preparation, and the managed runtime. v0.1.9 does not expose remote
+Daemon preparation, and the managed runtime. This Preview does not expose remote
 HTTP/HTTPS proxy credentials or Docker registry-mirror settings in the Desktop
 v2 project/profile UI. If the environment needs them, the server administrator
 must configure the supported host/runtime policy before connection.

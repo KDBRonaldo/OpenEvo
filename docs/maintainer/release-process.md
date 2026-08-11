@@ -100,7 +100,7 @@ all three text-evolution targets, next-session artifact reuse, and packaged
 renderer observability. It retains the non-gating Preview boundary and is not a
 G1-G12 candidate.
 
-Version `0.1.9` is the latest public immutable unsigned exhibition Preview,
+Version `0.1.9` is the previous public immutable unsigned exhibition Preview,
 published on July 27, 2026 from source
 `54650e477a76dd07b0a511ad5450c3b8ea615556`, candidate run `30212086910`, and
 publication run `30214520279` under tag
@@ -121,20 +121,42 @@ observability. It remains unsigned, unnotarized, non-gating, and not a G1-G12
 candidate; the clean-host matrix, both execution modes, protected performance,
 and the remaining External Beta gates are still open.
 
-Version `0.1.10` is the active immutable Preview release target. It keeps the
-`0.1.9` System OpenSSH alias authority and repairs the project-create timeout by
-reserving a durable lifecycle operation before remote work begins. Exact retry,
-renderer reload, SSE reconnect, and sidecar relaunch must preserve the same
-action and operation identities and reconcile to one Core project, one mapping,
-and one applied mutation. The shared progress surface covers all implemented
-long-running work: Desktop-owned profile/host-key/Daemon/native-workspace/project
-lifecycles, native startup, and Core-owned Tasks, successor transitions,
-services, diagnostics, and maintenance operations. Actual sanitized SSH and
-Daemon stdout/stderr may be shown; commands, environment values, credentials,
-tokens, Core endpoints, and absolute host paths may not. Existing duplicate
-projects created by ambiguous `0.1.9` retries are preserved and may be manually
-ignored; migration never deletes them. This paragraph is release intent until
-the guarded publisher completes and immutable identities are recorded.
+Version `0.1.10` is the current public immutable unsigned exhibition Preview,
+published on August 11, 2026 from source
+`69ab670d58c968b8e076283ea9365b74df0a775c`, candidate run `31465722294`
+attempt `2`, and publication run `31481609627` under tag
+`openevo-desktop-v0.1.10-v0110.31465722294.2`. Numeric release
+`368392840` was published from policy commit
+`c827e21765d6f7186b86029281b5d3902da620f7`. Its candidate-manifest and DMG
+SHA-256 values are respectively
+`92938102003fb3d1f8b0fd5284a70a7f76efa27b9f2943f5d299f9bf303ef2a7`
+and `a1c4fa58d9d78b8d240d1ad28d02c8370d439e5fe8b5679643d30946fef5cd5f`.
+
+It keeps the `0.1.9` System OpenSSH alias authority and repairs the
+project-create timeout by reserving a durable lifecycle operation before remote
+work begins. Exact retry, renderer reload, SSE reconnect, and sidecar relaunch
+preserve the same action and operation identities and reconcile to one Core
+project, one mapping, and one applied mutation. The shared progress surface
+covers all implemented long-running work: Desktop-owned
+profile/host-key/Daemon/native-workspace/project lifecycles, native startup, and
+Core-owned Tasks, successor transitions, services, diagnostics, and maintenance
+operations. Actual sanitized SSH and Daemon stdout/stderr may be shown;
+commands, environment values, credentials, tokens, Core endpoints, and absolute
+host paths may not. Existing duplicate projects created by ambiguous `0.1.9`
+retries are preserved and may be manually ignored; migration never deletes
+them.
+
+Checked-in exact-candidate evidence SHA-256
+`cfdf9bb1b8496ea0a50db5e2e94cfa1a476e8fbf0e07c3d29db9ef45b5e9a3d1`
+and OpenSSH signature SHA-256
+`01c6e51db8c9481ee60929c34eeddaebedc346afa1d5b3766c71815863cdf507`
+verify the two real subscription Tasks, generation `0 -> 1 -> 2`, three
+text-evolution outputs per successor, Task-2 Runtime Context reuse, durable
+project creation across reconnect/relaunch, renderer phase/log observation,
+secret-canary absence, exactly-one remote mutation, and complete cleanup. The
+publisher then re-downloaded every public asset and verified metadata, body,
+digests, and the exact source tag. The release remains unsigned, unnotarized,
+non-gating, and not a G1-G12 candidate.
 
 Disconnect is also action-idempotent without weakening process ownership. A
 cleanup failure is visible on both the terminal operation and profile, retains
@@ -158,10 +180,10 @@ unsigned draft prerelease. It uploads all assets, downloads them into a clean
 directory, and validates the exact closed manifest before leaving the draft for
 review.
 
-The checked-in evidence for `0.1.4`, `0.1.6`, `0.1.7`, `0.1.8`, and `0.1.9` is bound to
-each exact candidate manifest and signed by the release host. It proves the
-stated Preview paths, but it does not by itself satisfy G2, G3, G4, G7, G12, or
-the full ordinary-user qualification matrix.
+The checked-in evidence for `0.1.4`, `0.1.6`, `0.1.7`, `0.1.8`, `0.1.9`, and
+`0.1.10` is bound to each exact candidate manifest and signed by the release
+host. It proves the stated Preview paths, but it does not by itself satisfy G2,
+G3, G4, G7, G12, or the full ordinary-user qualification matrix.
 
 Final External Beta publication remains disabled while productization work
 tracked by #131/#163 is in progress. PyPI is not part of either the Preview or

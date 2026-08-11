@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.1.10 Preview - 2026-08-11
+
+### Added
+
+- Reserve project creation and other long-running Desktop work as durable
+  lifecycle operations with stable action/operation identities, bounded
+  progress, elapsed time, cancellation where safe, and sanitized SSH/Daemon
+  process logs.
+- Recover the same project operation across exact retry, renderer reload, SSE
+  reconnect, and sidecar relaunch without creating a second Core project,
+  mapping, or applied mutation.
+- Discover the selected account's effective NSS home privately before staging
+  release assets, including supported custom-home server layouts.
+
+### Changed
+
+- Migrate retained provider schema-v2 state to schema v3 without deleting
+  profiles, projects, or historical read-only Core mappings.
+- Stream the Daemon Bundle and managed runtime through the owned System OpenSSH
+  command instead of requiring a remote rsync follower for the v2 installation
+  path.
+- Require signed exact-candidate evidence for the recovered lifecycle, two real
+  Codex Subscription Tasks, generation `0 -> 1 -> 2`, three text-evolution
+  outputs per successor, Task-2 Runtime Context reuse, packaged-renderer
+  observation, secret-canary absence, and complete cleanup.
+
+### Known Limitations
+
+- This remains an unsigned, unnotarized Apple Silicon exhibition Preview.
+- The supported server is the documented Linux x86-64 Docker user-container
+  profile with a writable home, at least `20,000,000` KiB available on its home
+  filesystem, and Codex already installed and signed in for the selected
+  account.
+- Self-Deployed execution, parameter or adapter evolution, other harnesses,
+  Intel Macs, automatic Codex installation/login, a complete clean-host/network
+  matrix, and the final G1-G12 External Beta gates remain outside this Preview.
+
+The immutable release is available from the
+[OpenEvo Desktop 0.1.10 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.10-v0110.31465722294.2).
+
 ## 0.1.9 Preview - 2026-07-27
 
 ### Added

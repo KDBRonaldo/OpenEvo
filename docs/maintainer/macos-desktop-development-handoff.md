@@ -1,9 +1,9 @@
 # macOS Desktop Development Handoff
 
-Status: completed `0.1.9` startup handoff; `0.1.10` source remediation and
-release validation in progress
+Status: completed `0.1.9` startup handoff and public `0.1.10`
+lifecycle-recovery Preview; remaining External Beta gates stay open
 
-Last updated: 2026-08-01
+Last updated: 2026-08-11
 
 This document transfers Desktop development from the Linux/GPU development
 container to a real Apple Silicon Mac. It is an implementation handoff, not a
@@ -39,14 +39,15 @@ creating the remote project, and a retry used a new mutation identity. The
 `0.1.10` objective is therefore broader than raising a timeout. Every
 implemented long-running workflow must expose durable authority, progress,
 logs, restart recovery, cancellation where safe, and exact idempotent retry.
-Section 11.3 records that release target and its acceptance boundary.
+Section 11.3 records the completed release and its acceptance boundary.
 
 The first source-bound `0.1.10` remote E2E then exposed a second independent
 defect after successful alias authentication: Daemon staging assumed
 `/home/<user>` although the selected account had a valid custom NSS home. The
 source now binds workspace and Daemon roots to a private generation-bound NSS
-home authority. That fix also requires a full replacement build and a repeated
-installed-app remote run; no artifact built before it is a release candidate.
+home authority. The replacement candidate and repeated installed-app remote run
+recorded in section 11.3 are the only `0.1.10` publication authority; no earlier
+artifact is a release candidate.
 
 Do not change the implementation or behavior of any evolution algorithm while
 repairing Desktop packaging, startup, diagnostics, or remote control.
@@ -292,35 +293,35 @@ Do not update lockfiles merely because a newer local tool is available. Any
 intentional dependency or toolchain update needs its own reviewed change and
 release evidence.
 
-## 4. Current Public Release And Active Target
+## 4. Current Public Release And Remaining Target
 
-The current public artifact is the immutable unsigned `0.1.9` Preview:
+The current public artifact is the immutable unsigned `0.1.10` Preview:
 
-- source commit: `54650e477a76dd07b0a511ad5450c3b8ea615556`
-- publication-policy commit: `c5eb33faad49704b5eb611e94399b66e4af868ea`
-- candidate run: `30212086910`, attempt `1`
-- publication run: `30214520279`
-- numeric release ID: `360078032`
-- tag: `openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1`
-- DMG: `OpenEvo-Desktop-0.1.9-aarch64.dmg`
+- source commit: `69ab670d58c968b8e076283ea9365b74df0a775c`
+- publication-policy commit: `c827e21765d6f7186b86029281b5d3902da620f7`
+- candidate run: `31465722294`, attempt `2`
+- publication run: `31481609627`, attempt `1`
+- numeric release ID: `368392840`
+- tag: `openevo-desktop-v0.1.10-v0110.31465722294.2`
+- DMG: `OpenEvo-Desktop-0.1.10-aarch64.dmg`
 - DMG SHA-256:
-  `48ecc88bea4afd5805082a9660d3abc3641172f697b868d1f8cc22498f822cde`
+  `a1c4fa58d9d78b8d240d1ad28d02c8370d439e5fe8b5679643d30946fef5cd5f`
 
 The public release is an immutable prerelease and must not be modified,
-replaced, or relabelled. Version `0.1.8` remains historical evidence for the
-incident below; its mounted-DMG and copied-app smokes did not reproduce the
-real Tahoe startup failure. Version `0.1.9` adds exact-candidate Mac and remote
-evidence, but remains a non-gating Preview rather than proof of the complete
-External Beta contract or G1-G12.
+replaced, or relabelled. Versions `0.1.9` and earlier remain immutable historical
+evidence. The current Preview remains non-gating rather than proof of the
+complete External Beta contract or G1-G12.
 
-The active target is `0.1.10`. It remains an unsigned, unnotarized Apple Silicon
-Preview for macOS 12 or later and the documented Linux `x86_64` Docker
-user-container remote profile. It retains the System OpenSSH configured-alias
-authority, permits UID 0 only inside the already existing approved user
-container, migrates retained provider schema-v2 state to schema v3, and adds
-durable lifecycle operations plus a shared progress/log surface for all
-implemented long-running work. It is not public until the guarded candidate,
-installed-app real-science, evidence-signing, and publication workflows finish.
+Version `0.1.10` is an unsigned, unnotarized Apple Silicon Preview for macOS 12
+or later and the documented Linux `x86_64` Docker user-container remote profile.
+It retains the System OpenSSH configured-alias authority, permits UID 0 only
+inside the already existing approved user container, migrates retained provider
+schema-v2 state to schema v3, and adds durable lifecycle operations plus a
+shared progress/log surface for implemented long-running work. The remaining
+target is the canonical External Beta: complete clean-user/clean-host and
+network matrices, both execution modes, protected performance, broader
+security/recovery/upgrade evidence, signing/notarization, and G1-G12 against one
+new immutable candidate.
 
 ## 5. Reproduced User Failure
 
@@ -645,8 +646,8 @@ macOS Tahoe `26.5.2` machine:
   enable textual memory, skill bundle, and agent system together.
 - The release rehearsal enables all three currently supported targets and
   displays each selected method plus the committed successor Evolution
-  Revision output count. v0.1.9 does not probe an unavailable Task-artifact
-  collection endpoint during ordinary refresh.
+  Revision output count. The Preview does not probe an unavailable
+  Task-artifact collection endpoint during ordinary refresh.
 - A second Task proves that it pins the first Task's successor Project Head and
   exact Runtime Context; evolution changes take effect only for that next Task.
 - The two built-in science examples remain visible without configuration and do
@@ -869,7 +870,7 @@ network matrix, Developer ID signing/notarization, and the final Tauri-to-remote
 single-process E2E remain unsupported or unproven. Local Mac execution remains
 deferred to `0.2.0`; the remaining G1-G12 External Beta gates are still open.
 
-### 11.3 `0.1.10` lifecycle-recovery release target
+### 11.3 Final immutable `0.1.10` lifecycle-recovery Preview
 
 The user-visible trigger was `Desktop Local API request timed out` while
 creating a project. The remote create later succeeded, so retrying minted a
@@ -974,11 +975,11 @@ env -u SSH_AUTH_SOCK PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:$PATH" \
 # 28 passed, 1 third-party deprecation warning
 ```
 
-These results do not validate an app artifact. Discard every earlier local
-`0.1.10` app/DMG/Daemon bundle as a candidate and rebuild all source-bound
-artifacts before repeating installed-app E2E against the custom-home account.
-Only after that run may maintainers fill candidate identities, sign evidence,
-tag, or publish. GitHub repository visibility and any publication/payment state
+Those source results did not validate an app artifact. Maintainers therefore
+discarded every earlier local `0.1.10` app/DMG/Daemon bundle as a candidate,
+rebuilt all source-bound artifacts, and repeated installed-app E2E against the
+custom-home account before filling identities, signing evidence, tagging, or
+publishing. GitHub repository visibility and any publication/payment state
 remain separate from these technical gates.
 
 Release acceptance must prove all of the following against the exact downloaded
@@ -1009,7 +1010,62 @@ candidate installed in `/Applications`:
   evolution outputs per successor, and Task-2 Runtime Context reuse; and
 - profile disconnect and complete local process-group cleanup succeed.
 
-The immutable source commit, candidate/publication runs, tag, DMG SHA-256,
-installed binary identities, signed evidence digests, and final result remain
-blank until those gates actually complete. Do not convert this target section
-into a completion claim early.
+All requirements above passed against the exact candidate from source
+`69ab670d58c968b8e076283ea9365b74df0a775c`. Candidate run
+[`31465722294`](https://github.com/CompLifeLab-ZJU/OpenEvo/actions/runs/31465722294),
+attempt `2`, created numeric release `368392840` as a private draft. The exact
+release identities are:
+
+- public release:
+  [`openevo-desktop-v0.1.10-v0110.31465722294.2`](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.10-v0110.31465722294.2);
+- candidate manifest SHA-256:
+  `92938102003fb3d1f8b0fd5284a70a7f76efa27b9f2943f5d299f9bf303ef2a7`;
+- DMG SHA-256:
+  `a1c4fa58d9d78b8d240d1ad28d02c8370d439e5fe8b5679643d30946fef5cd5f`;
+- installed native executable SHA-256:
+  `51357a777ae2b5e44824acfd9d78c2c47d48d8062c0a6f373b0c72e6e0f060f0`;
+- packaged sidecar SHA-256:
+  `7e9b1815d14a941c6da64101409ca5af265f2917d70ddca489e66bb490661df4`;
+- packaged SSH askpass helper SHA-256:
+  `ad2467798d0de4e5f05af3c80315eabc19e2b2aa0a3ae9b08215bd4b9046a641`;
+- Linux `x86_64` Daemon Bundle SHA-256:
+  `c3f8e6250af443e12d561428f24d6c5e6a1ba516740d92c3676d58af10b55989`;
+- Core wheel SHA-256:
+  `361ea62a568ebe20dccad64b7cd4e5626e845c7460ecf10c9e9ae9a309c6e8ab`;
+- verified executable registry digest:
+  `d20f8c70abdf26c4f25771067fef7b8f1eae99fc817810788579e1f7de861326`;
+- signed real-science evidence SHA-256:
+  `cfdf9bb1b8496ea0a50db5e2e94cfa1a476e8fbf0e07c3d29db9ef45b5e9a3d1`;
+- evidence signature SHA-256:
+  `01c6e51db8c9481ee60929c34eeddaebedc346afa1d5b3766c71815863cdf507`.
+
+The signed two-Task evidence validates the sub-15-second reservation,
+greater-than-15-second terminal lifecycle, ordered sanitized phases/logs, SSE
+reconnect, sidecar relaunch, stable action/operation identity, exactly one Core
+project/mapping/applied mutation, generation `0 -> 1 -> 2`, three successor
+outputs per Task, Task-2 Runtime Context reuse, secret-canary absence, renderer
+observation, disconnect, and process cleanup. Policy commit
+`c827e21765d6f7186b86029281b5d3902da620f7` adds only that evidence and its
+signature above the candidate source.
+
+Publisher run
+[`31481609627`](https://github.com/CompLifeLab-ZJU/OpenEvo/actions/runs/31481609627)
+completed its read-only validation, numeric-ID visibility mutation, and
+immutable public-release verification. It re-downloaded all 22 assets, checked
+their IDs, names, sizes, digests, notes, metadata, and source tag, and retained
+the publication receipts. A separate post-publication Mac check downloaded the
+public `408660606`-byte DMG into a fresh private directory, proved byte equality
+with the installed/tested candidate, launched
+`/Applications/OpenEvo Desktop.app` through LaunchServices, and verified
+release `0.1.10`, source
+`69ab670d58c968b8e076283ea9365b74df0a775c`, Desktop OpenAPI digest
+`fe4ac8415f20e584bf0f9b3240d52ec98bc61366d587a09b91d14b4ae29541af`,
+event-schema digest
+`515b6d90e9ebdf3f5b4f7c4a57a1924dc85011536d9396b1ab3a5dc73fc48b6b`,
+feature-set digest
+`67b6ad24f67de611f32c365079fcf8384c800d0855effaa64e1ff24251a7acda`,
+the native/sidecar binary hashes above, and complete process-tree cleanup.
+Post-publication remote inspection also confirmed that immutable numeric release
+`360078032`, its `0.1.9` tag/source, and DMG digest
+`48ecc88bea4afd5805082a9660d3abc3641172f697b868d1f8cc22498f822cde`
+remain unchanged.
