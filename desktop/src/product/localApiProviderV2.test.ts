@@ -1250,6 +1250,76 @@ describe("Desktop v2 product provider", () => {
     expect(lastCas).toBeLessThan(native.callOrder.indexOf("acknowledge"));
   });
 
+  it("reconciles a historical profile lifecycle result after the profile generation advances", async () => {
+    const current = profile({
+      connection_generation: 6,
+      connection_state: "connected",
+      trust: {
+        ...profile().trust,
+        connection_generation: 6,
+      },
+      etag: `"${"f".repeat(64)}"`,
+      updated_at: "2026-07-23T06:00:02Z",
+    });
+    const terminal = {
+      ...lifecycleOperation(),
+      status: "succeeded" as const,
+      phase: "finalizing" as const,
+      phase_index: 16,
+      progress: null,
+      cancellable: false,
+      result: {
+        result_kind: "profile" as const,
+        profile_id: current.profile_id,
+        connection_generation: 5,
+      },
+      updated_at: "2026-07-23T06:00:01Z",
+      finished_at: "2026-07-23T06:00:01Z",
+      etag: `"${"e".repeat(64)}"`,
+    };
+    const client = clientFixture([current]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([current]),
+      pending_operations: [{
+        schema_version: "2",
+        operation_id: terminal.operation_id,
+        kind: terminal.kind,
+        resource: terminal.resource,
+        request_sha256: terminal.request_sha256,
+        status: terminal.status,
+        phase: terminal.phase,
+        phase_index: terminal.phase_index,
+        phase_total: terminal.phase_total,
+        log_sequence_high_watermark: terminal.log_sequence_high_watermark,
+        updated_at: terminal.updated_at,
+        etag: terminal.etag,
+      }],
+      updated_at: current.updated_at,
+    });
+    vi.mocked(client.getLifecycleOperation).mockResolvedValue(terminal);
+    vi.mocked(client.lifecycleOperationLogs).mockResolvedValue({
+      schema_version: "2",
+      operation_id: terminal.operation_id,
+      dropped_before_sequence: 0,
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.getProfile).mockResolvedValue(current);
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const recovered = await provider.refresh();
+
+    expect(recovered.status).toBe("fresh");
+    expect(client.getProfile).toHaveBeenCalledWith(current.profile_id);
+    expect(client.acknowledgeLifecycleOperation).toHaveBeenCalledTimes(1);
+  });
+
   it("retains diagnostic identity until the exact terminal diagnostic is reconciled", async () => {
     const connected = profile({ connection_state: "connected" });
     const native = nativeFixture();
