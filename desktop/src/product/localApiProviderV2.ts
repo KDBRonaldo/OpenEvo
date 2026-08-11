@@ -1377,8 +1377,10 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     if (result === null) throw new DesktopContractErrorV2("Succeeded lifecycle operation has no result authority");
     if (result.result_kind === "profile") {
       const profile = await this.client.getProfile(result.profile_id);
+      // A terminal result records its historical generation. Later lifecycle
+      // operations may have monotonically advanced the same profile.
       if (profile.profile_kind !== "system_openssh"
-        || profile.connection_generation !== result.connection_generation) {
+        || profile.connection_generation < result.connection_generation) {
         throw new DesktopContractErrorV2("Lifecycle profile result is absent from authoritative refresh");
       }
       return;
