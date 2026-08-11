@@ -117,8 +117,10 @@ Local API v2:
    session. It must display the real project, both Tasks, Project Head,
    Evolution Revision, Runtime Context, Effective Execution, three independent
    target controls with the exact selected methods, and the System OpenSSH
-   workspace. Network access is limited to the packaged origin and authenticated
-   loopback v2 reads.
+   workspace. Network access is limited to the packaged origin, authenticated
+   loopback v2 reads, and the exact idempotent terminal-operation acknowledgement
+   required after native-journal reconciliation; every other renderer mutation
+   remains blocked.
 9. Disconnect the profile and terminate the complete sidecar/renderer process
    groups. macOS uses a non-reaping `kqueue` process-exit observer so the group
    leader remains authoritative until descendants have been closed.
