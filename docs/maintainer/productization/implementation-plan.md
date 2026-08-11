@@ -38,19 +38,21 @@ packaged-app, real-host, protected-performance, or release-candidate gate.
 
 ## Current Priorities
 
-Version `0.1.9` is the current public, installable unsigned exhibition Preview.
-It proves the real mounted and copied DMG, Tahoe-compatible bounded Desktop
-startup, System OpenSSH configured-alias path, packaged sidecar, askpass helper
-and renderer, native startup diagnostics, a self-contained Daemon Bundle,
-managed-runtime packaging, and immutable release asset roundtrip. Signed
-exact-candidate evidence additionally proves two real remote Codex Subscription
-Tasks, all three text-evolution targets, adjacent successor Project Heads, and
-next-session Runtime Context reuse through the live Desktop v2 API and packaged
-renderer. It has no final macOS Tauri-to-remote-host single-process E2E or
-complete clean-host matrix evidence, and it is intentionally non-gating. It
-does not prove G2, G3, G12, or a complete ordinary-user qualification matrix,
-and it is not the candidate that will satisfy G1-G12. Earlier Preview releases
-are retained as historical evidence.
+Version `0.1.10` is the current public, installable unsigned exhibition Preview.
+It proves the real mounted, copied, installed, and publicly re-downloaded DMG;
+Tahoe-compatible bounded Desktop startup; System OpenSSH configured-alias path;
+packaged sidecar, askpass helper, and renderer; native startup diagnostics; a
+self-contained Daemon Bundle; managed-runtime packaging; and immutable release
+asset roundtrip. Signed exact-candidate evidence additionally proves two real
+remote Codex Subscription Tasks, all three text-evolution targets, adjacent
+successor Project Heads, next-session Runtime Context reuse, private custom NSS
+home discovery, and one durable project-create lifecycle across SSE reconnect
+and sidecar relaunch without a duplicate remote mutation. It has no final macOS
+Tauri-to-remote-host single-process E2E or complete clean-host matrix evidence,
+and it is intentionally non-gating. It does not prove G2, G3, G12, or a
+complete ordinary-user qualification matrix, and it is not the candidate that
+will satisfy G1-G12. Earlier Preview releases are retained as historical
+evidence.
 System, Files, and History remain incomplete; the v2 authority cutover, G4, and
 G7-G12 remain open.
 
@@ -130,11 +132,11 @@ artifacts, revisions, recovery, and both execution modes.
 
 **Current state:** a real versioned control API, durable project/run stores,
 remote bootstrap, tunnel routing, Subscription prerequisite checks, and child
-service supervision exist. The published `0.1.9` Preview ships a self-contained
+service supervision exist. The published `0.1.10` Preview ships a self-contained
 Daemon Bundle and has packaging, managed-runtime, managed-upgrade, and signed
-candidate-bound Docker plus Codex science evidence. It has no clean-host matrix
-evidence. Clean-host preparation and lifecycle evidence, mediated
-Subscription authentication, the direct/proxy matrix, Self-Deployed,
+candidate-bound Docker, Codex science, and lifecycle-recovery evidence. It has
+no clean-host matrix evidence. Clean-host preparation and qualification,
+mediated Subscription authentication, the direct/proxy matrix, Self-Deployed,
 upgrade/rollback, and release-grade maintenance operations remain incomplete.
 The maintenance owner is now part of the release composition. Generic
 development/test construction leaves it disabled by default, while the release
@@ -162,11 +164,12 @@ capabilities, task execution, retry/cancel, timeline/transcript, and evolution
 inspection are implemented. First launch exposes two read-only synthetic
 science projects, each demonstrating three cross-session tasks and
 textual-memory, trajectory-to-skill, and agent-system evolution without
-creating authoritative or remote state. The public `0.1.9` Preview launches
+creating authoritative or remote state. The public `0.1.10` Preview launches
 from the real DMG with its packaged renderer, bundle-resident sidecar, native
-askpass helper, System OpenSSH alias path, and native startup diagnostics. G2
+askpass helper, System OpenSSH alias path, native startup diagnostics, and
+durable progress/log/retry authority for implemented long operations. G2
 clean-user lifecycle evidence, Files, History, System maintenance, mediated
-credential choices, and several recovery flows remain incomplete.
+credential choices, and several broader recovery flows remain incomplete.
 
 **Owning issues:** #158, #163, and #203.
 
@@ -186,8 +189,9 @@ GitHub releases present one coherent Desktop-plus-Daemon product.
 documentation, issue state, package inventory, release metadata, dependency
 evidence, and cleanup work still reflect intermediate implementation states.
 The exact source, tag, assets, checksums, and publication evidence for the
-public `0.1.9` Preview must remain available as a non-gating release record;
-earlier Preview releases, including `0.1.8`, remain historical evidence.
+public `0.1.10` Preview must remain available as a non-gating release record.
+The immutable `0.1.9` release and earlier Preview releases remain historical
+evidence.
 
 **Owning issues:** #131 and #193.
 
@@ -202,7 +206,7 @@ G1 and G12. PyPI remains outside this release.
 **Outcome:** one immutable candidate satisfies every G1-G12 gate.
 
 **Current state:** component and subsystem tests exist, and the published
-`0.1.9` Preview has complete packaging, downloaded-release verification, and
+`0.1.10` Preview has complete packaging, downloaded-release verification, and
 signed candidate-bound two-session science evidence, but there is no candidate
 with complete clean-host Desktop/Daemon evidence, both
 execution modes, all evolution gates, protected performance, recovery/security
@@ -220,29 +224,26 @@ independently review product/spec compliance and release risk/evidence.
 
 ## Immediate Execution Order
 
-1. Run the candidate-bound real Codex Subscription Desktop/Daemon science E2E
-   against the exact published product composition, then create a new candidate
-   if any product or evidence change is required.
-2. Give the clean-host workstream one owner and rehearse fresh-host Daemon
+1. Give the clean-host workstream one owner and rehearse fresh-host Daemon
    installation, mediated Codex Subscription authentication, Docker execution,
    and the supported direct/proxy matrix. This is non-gating integration
    evidence, not G3 proof.
-3. Complete and independently review the System recovery owner around
+2. Complete and independently review the System recovery owner around
    authoritative status, diagnostics, reconnect, and bounded repair. The
    production owner is wired; this item now means release evidence and clean
    host validation rather than the initial owner implementation.
-4. Implement and adopt the critical v2 authority migration before extending
+3. Implement and adopt the critical v2 authority migration before extending
    deep Task, Files, or History state on the frozen v1 model.
-5. Complete the Desktop System, Files, History, diagnostics, and recovery views,
+4. Complete the Desktop System, Files, History, diagnostics, and recovery views,
    then prove the full G2 clean-user lifecycle and G10 product quality.
-6. Complete the Self-Deployed reference profile and end-to-end path for G4.
-7. Unify product run admission, workspace result, sealed dataset, evolution
+5. Complete the Self-Deployed reference profile and end-to-end path for G4.
+6. Unify product run admission, workspace result, sealed dataset, evolution
    transition, materialization, and successor project-head commit for G5, G6,
    and G8.
-8. Run the three independent protected-performance gates for G7.
-9. Finish security, data lifecycle, upgrade/rollback, documentation, repository,
+7. Run the three independent protected-performance gates for G7.
+8. Finish security, data lifecycle, upgrade/rollback, documentation, repository,
    dependency, and draft-release evidence for G9, G11, and G12.
-10. Freeze one immutable candidate and run canonical G1-G12, including the final
+9. Freeze one immutable candidate and run canonical G1-G12, including the final
    G3 proof, against that exact candidate.
 
 Every PR follows `AGENTS.md`, links its issue, states protected-algorithm impact,

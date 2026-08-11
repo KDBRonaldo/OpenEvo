@@ -14,7 +14,7 @@ OpenEvo has two user-facing applications:
 - **OpenEvo Daemon** is the Linux service that Desktop installs and controls on
   the selected remote server.
 
-[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1)
+[Download the current Preview](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.10-v0110.31465722294.2)
 | [Read the user guide](docs/user/README.md)
 | [Report a problem](https://github.com/CompLifeLab-ZJU/OpenEvo/issues)
 
@@ -56,7 +56,7 @@ state.
 
 ## Current Preview
 
-The current public release is **OpenEvo Desktop 0.1.9 Preview**. It supports the
+The current public release is **OpenEvo Desktop 0.1.10 Preview**. It supports the
 following exhibition profile:
 
 | Component | Current support |
@@ -73,16 +73,19 @@ Self-deployed inference, parameter or adapter evolution, other harnesses,
 automatic Codex installation/login, Intel Mac builds, and a general clean-host
 matrix are not part of this Preview. It is unsigned and not notarized. Use the
 documented host profile and do not depend on it for production-critical work.
+Project creation and other long operations expose durable progress and
+sanitized process logs; an exact retry or Desktop relaunch recovers the same
+operation rather than issuing a duplicate remote mutation.
 
 ## Install On macOS
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.9 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1).
-2. Download `OpenEvo-Desktop-0.1.9-aarch64.dmg` and `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.10 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.10-v0110.31465722294.2).
+2. Download `OpenEvo-Desktop-0.1.10-aarch64.dmg` and `SHA256SUMS`.
 3. Verify the DMG before opening it:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.9-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.10-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 

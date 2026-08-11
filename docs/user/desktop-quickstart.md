@@ -1,6 +1,6 @@
 # OpenEvo Desktop Quickstart
 
-This guide describes the unsigned `0.1.9` exhibition Preview for Apple Silicon
+This guide describes the unsigned `0.1.10` exhibition Preview for Apple Silicon
 Macs and a compatible Linux Docker server.
 
 ## Before You Start
@@ -8,7 +8,7 @@ Macs and a compatible Linux Docker server.
 You operate OpenEvo through Desktop. You need:
 
 - an Apple Silicon Mac running macOS 12 or later;
-- the `0.1.9` release DMG and its published checksum;
+- the `0.1.10` release DMG and its published checksum;
 - a remote Linux x86-64 server matching the supported Docker user-container
   profile;
 - a literal host alias in your Mac user's `~/.ssh/config` that can connect to
@@ -26,12 +26,12 @@ You do not install or operate the OpenEvo Daemon manually.
 ## Install The Unsigned DMG
 
 1. Open the immutable
-   [OpenEvo Desktop 0.1.9 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.9-v019-system-ssh-final.30212086910.1), and download
-   `OpenEvo-Desktop-0.1.9-aarch64.dmg` plus `SHA256SUMS`.
+   [OpenEvo Desktop 0.1.10 Preview release](https://github.com/CompLifeLab-ZJU/OpenEvo/releases/tag/openevo-desktop-v0.1.10-v0110.31465722294.2), and download
+   `OpenEvo-Desktop-0.1.10-aarch64.dmg` plus `SHA256SUMS`.
 2. Verify the exact DMG checksum from that release:
 
    ```bash
-   grep '  OpenEvo-Desktop-0.1.9-aarch64.dmg$' SHA256SUMS \
+   grep '  OpenEvo-Desktop-0.1.10-aarch64.dmg$' SHA256SUMS \
      | shasum -a 256 -c -
    ```
 
@@ -59,11 +59,12 @@ and **Export diagnostics** creates a bounded support artifact. Send support the
 exported JSON and displayed error code/version—not raw terminal output, SSH
 material, credentials, transcripts, or research data.
 
-Version `0.1.9` repairs the Tahoe packaged-sidecar startup failure seen in
-`0.1.8`. It preserves the current Preview-state namespace and treats old v1
-remote profiles as read-only migration input: rebind such a profile to one
-configured SSH alias before connecting. Older files cannot become v2 mutation
-authority.
+Version `0.1.10` retains the `0.1.9` Tahoe packaged-sidecar repair, migrates
+retained provider schema-v2 state to schema v3, and treats old v1 remote
+profiles as read-only migration input. Rebind such a profile to one configured
+SSH alias before connecting; older files cannot become v2 mutation authority.
+Long-running setup and project operations now retain one durable identity,
+progress history, and sanitized logs across retry or Desktop relaunch.
 
 ## Explore The Built-In Projects
 
@@ -150,8 +151,8 @@ to a bundled method table.
 
 Evolution affects only later Tasks. The second Task pins the first Task's
 successor Project Head and Runtime Context; it never consumes a stale or partial
-successor. v0.1.9 shows the committed Evolution Revision output count but does
-not yet expose Task artifact-content collection in the ordinary renderer.
+successor. This Preview shows the committed Evolution Revision output count but
+does not yet expose Task artifact-content collection in the ordinary renderer.
 
 Transcript capture does not provide token IDs, loss masks, logprobs, or other
 token-level training metrics.
