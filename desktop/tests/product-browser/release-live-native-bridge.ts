@@ -38,6 +38,19 @@ export function installReleaseLiveNativeBridgeV2(
         observation.commands.push(command);
         if (command === "begin_sidecar_start") return null;
         if (command === "sidecar_bootstrap_context") return context;
+        if (command === "sidecar_startup_status") {
+          return {
+            schema_version: "2",
+            startup_epoch: 1,
+            status: "succeeded",
+            phase: "ready",
+            phase_index: 5,
+            phase_total: 6,
+            elapsed_milliseconds: 0,
+            cancellable: false,
+            failure: null,
+          };
+        }
         if (command === "stop_sidecar") return null;
         if (command === "read_mutation_intent_journal_v2") return mutationIntentJournal;
         if (command === "compare_and_swap_mutation_intent_journal_v2") {
