@@ -4,7 +4,7 @@ OpenEvo Desktop is the only application an ordinary user operates. It connects
 through one literal alias from the Mac user's OpenSSH configuration and manages
 the internal OpenEvo Daemon under that remote account.
 
-The packaged v0.1.9 managed Science runtime is Linux amd64. Other Linux
+The packaged v0.1.10 managed Science runtime is Linux amd64. Other Linux
 architectures, container engines/policies, and arbitrary host layouts are not
 supported by this Preview.
 
