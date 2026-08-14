@@ -32,8 +32,10 @@ from openevo.backend.science_run_owner import CoreScienceTaskOwnerV2
 from openevo.backend.service_supervisor import (
     ServiceComponent,
     ServiceStatus,
+    SupervisorBusyError,
     SupervisorLogEntry,
     SupervisorServiceSummary,
+    SupervisorStateError,
 )
 from openevo.backend.science_run_store import (
     ScienceProjectAdmissionAuthorityV2,
@@ -160,6 +162,15 @@ class CoreServiceAuthorityV2(Protocol):
         after_sequence: int = 0,
         limit: int = 100,
     ) -> tuple[SupervisorLogEntry, ...]: ...
+
+    def restart_once(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        expected_service_etag: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary: ...
 
 
 class CoreControlProviderV2:
@@ -317,6 +328,10 @@ class CoreControlProviderV2:
             "getCoreOperationV2": self._get_operation,
             "streamCoreEventsV2": self._events,
         }
+        if service_authority is not None and callable(
+            getattr(service_authority, "restart_once", None)
+        ):
+            self._handlers["restartCoreServiceV2"] = self._restart_service
         if project_authority is not None:
             self._handlers.update(
                 {
@@ -1467,6 +1482,91 @@ class CoreControlProviderV2:
         _keys(arguments, "operation_id")
         operation = self.store.get_operation(_string(arguments["operation_id"]))
         return _operation_response(operation)
+
+    def _restart_service(self, arguments: Mapping[str, object]) -> Response:
+        _keys(arguments, "service_id", "request", "if_match", "idempotency_key")
+        service_id = _string(arguments["service_id"])
+        request = _model(m.ActionRequestV2, arguments["request"])
+        if_match = _string(arguments["if_match"])
+        idempotency_key = _string(arguments["idempotency_key"])
+        authority = self._service_authority
+        if authority is None or not callable(getattr(authority, "restart_once", None)):
+            raise self._feature_not_ready("restartCoreServiceV2")
+        action_scope = f"service-restart:{service_id}"
+        request_json = _canonical_action_request(
+            {
+                "action": "service_restart",
+                "service_id": service_id,
+                "request": request.model_dump(mode="json"),
+                "if_match": if_match,
+            }
+        )
+        operation_seed = hashlib.sha256(
+            action_scope.encode("utf-8")
+            + b"\0"
+            + idempotency_key.encode("utf-8")
+            + b"\0"
+            + request_json
+        ).hexdigest()
+        with self._lock, self.store.action_execution_fence(
+            coordination_scope=f"service:{service_id}"
+        ):
+            reservation = self.store.begin_action(
+                action_scope=action_scope,
+                idempotency_key=idempotency_key,
+                request_json=request_json,
+            )
+            if reservation.operation is not None:
+                return _operation_response(reservation.operation, status_code=202)
+            try:
+                restarted = authority.restart_once(
+                    service_id,
+                    operation_id=f"service-restart-{operation_seed[:32]}",
+                    expected_service_etag=if_match,
+                )
+            except SupervisorBusyError as exc:
+                raise _http_error(
+                    409,
+                    code="service_restart_busy",
+                    message="The managed service group is busy.",
+                    category="service",
+                    retryable=True,
+                    repair_action="retry",
+                ) from exc
+            except SupervisorStateError as exc:
+                raise _http_error(
+                    412,
+                    code="service_restart_precondition_failed",
+                    message="The service restart precondition no longer matches.",
+                    category="service",
+                    retryable=True,
+                    repair_action="retry",
+                ) from exc
+            timestamp = restarted.updated_at
+            provisional = m.OperationV2(
+                operation_id=f"operation-{operation_seed[:32]}",
+                kind="service_restart",
+                status="succeeded",
+                progress_completed=1,
+                progress_total=1,
+                error=None,
+                created_at=timestamp,
+                updated_at=timestamp,
+                etag=f'"{"0" * 64}"',
+            )
+            operation = m.OperationV2.model_validate(
+                {
+                    **provisional.model_dump(mode="python"),
+                    "etag": operation_etag_for(provisional),
+                }
+            )
+            committed = self.store.commit_action(
+                action_scope=action_scope,
+                idempotency_key=idempotency_key,
+                request_json=request_json,
+                operation=operation,
+            )
+            return _operation_response(committed, status_code=202)
 
     def _list_services(self, arguments: Mapping[str, object]) -> m.ServicePageV2:
         _keys(arguments, "limit", "after")

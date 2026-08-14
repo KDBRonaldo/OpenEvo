@@ -541,6 +541,7 @@ class _ServiceLogAuthority:
                 ).hexdigest(),
             ),
         )
+        self.restart_calls: list[tuple[str, str, str]] = []
 
     def list(self) -> tuple[SupervisorServiceSummary, ...]:
         return (self.summary,)
@@ -555,16 +556,30 @@ class _ServiceLogAuthority:
         assert service_id == "gateway"
         return tuple(entry for entry in self.entries if entry.sequence > after_sequence)[:limit]
 
+    def restart_once(
+        self,
+        service_id: str,
+        *,
+        operation_id: str,
+        expected_service_etag: str,
+        total_timeout: float | None = None,
+    ) -> SupervisorServiceSummary:
+        assert total_timeout is None
+        assert expected_service_etag == self.summary.etag
+        self.restart_calls.append((service_id, operation_id, expected_service_etag))
+        return self.summary
+
 
 def test_provider_projects_supervisor_services_and_actual_logs(tmp_path: Path) -> None:
     owner = CoreScienceTaskOwnerV2(state_root=tmp_path / "owner", clock=_Clock())
     store = CoreControlStoreV2(tmp_path / "catalog")
     registry = verified_builtin_registry(tmp_path / "registry")
+    service_authority = _ServiceLogAuthority()
     provider = CoreControlProviderV2(
         store,
         task_owner=owner,
         executable_registry=registry,
-        service_authority=_ServiceLogAuthority(),
+        service_authority=service_authority,
         bearer_token=_TOKEN,
         release_version="0.1.10",
         source_commit="1" * 40,
@@ -599,6 +614,31 @@ def test_provider_projects_supervisor_services_and_actual_logs(tmp_path: Path) -
         assert second.status_code == 200
         assert second.json()["items"][0]["stream"] == "stderr"
         assert second.json()["items"][0]["sequence"] == 2
+
+        restart_headers = {
+            **headers,
+            "If-Match": service_authority.summary.etag,
+            "Idempotency-Key": "restart-gateway",
+        }
+        restart_body = {
+            "schema_version": "2",
+            "expected_project_head_id": "project-head-1",
+        }
+        restarted = client.post(
+            "/v2/services/gateway/restart",
+            headers=restart_headers,
+            json=restart_body,
+        )
+        assert restarted.status_code == 202
+        assert restarted.json()["kind"] == "service_restart"
+        assert restarted.json()["status"] == "succeeded"
+        replay = client.post(
+            "/v2/services/gateway/restart",
+            headers=restart_headers,
+            json=restart_body,
+        )
+        assert replay.json() == restarted.json()
+        assert len(service_authority.restart_calls) == 1
     finally:
         client.close()
         provider.close()
