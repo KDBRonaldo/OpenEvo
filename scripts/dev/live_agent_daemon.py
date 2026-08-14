@@ -101,8 +101,9 @@ class CodexRunner:
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise AgentRunError(f"could not check Codex login status: {exc}") from exc
-        if result.returncode != 0 or "Logged in" not in result.stdout:
-            detail = (result.stderr or result.stdout).strip()[:500]
+        status_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
+        if result.returncode != 0 or "Logged in" not in status_output:
+            detail = status_output.strip()[:500]
             raise AgentRunError(f"Codex is not logged in: {detail or 'login status failed'}")
 
     def run(self, request: dict[str, str]) -> dict[str, Any]:

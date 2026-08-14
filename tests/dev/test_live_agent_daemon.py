@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -70,3 +71,17 @@ def test_extract_event_logs_ignores_agent_message_content() -> None:
         "Codex event: thread.started",
         "Codex event: turn.completed",
     ]
+
+
+def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        MODULE.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout="",
+            stderr="Logged in using ChatGPT\n",
+        ),
+    )
+    MODULE.CodexRunner("codex", 30, None).check_ready()
