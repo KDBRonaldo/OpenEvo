@@ -30,9 +30,55 @@ export interface DevelopmentAgentTurnResult {
   readonly logMessages: readonly string[];
 }
 
+export interface PersistedDevelopmentProject {
+  readonly projectId: string;
+  readonly displayName: string;
+  readonly config: ScienceProjectConfigV2;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PersistedDevelopmentSession {
+  readonly sessionId: string;
+  readonly projectId: string;
+  readonly taskTitle: string;
+  readonly instruction: string;
+  readonly response: string | null;
+  readonly model: string | null;
+  readonly state: "running" | "completed" | "failed";
+  readonly durationMs: number | null;
+  readonly logMessages: readonly string[];
+  readonly error: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PersistedDevelopmentState {
+  readonly activeProjectId: string | null;
+  readonly projects: readonly PersistedDevelopmentProject[];
+  readonly sessions: readonly PersistedDevelopmentSession[];
+}
+
+export interface DevelopmentAgentBackend {
+  loadState(): Promise<PersistedDevelopmentState>;
+  createProject(project: {
+    readonly projectId: string;
+    readonly displayName: string;
+    readonly config: ScienceProjectConfigV2;
+  }): Promise<void>;
+  updateProject(project: {
+    readonly projectId: string;
+    readonly displayName: string;
+    readonly config: ScienceProjectConfigV2;
+  }): Promise<void>;
+  activateProject(projectId: string): Promise<void>;
+  runAgentTurn(request: DevelopmentAgentTurnRequest): Promise<DevelopmentAgentTurnResult>;
+}
+
 interface InMemoryProviderOptions {
   readonly initialSnapshot?: DesktopProductSnapshotV2;
   readonly runAgentTurn?: (request: DevelopmentAgentTurnRequest) => Promise<DevelopmentAgentTurnResult>;
+  readonly developmentBackend?: DevelopmentAgentBackend;
   readonly simulateEvolution?: boolean;
 }
 
@@ -88,11 +134,12 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
  * from the supplied remote runner. It deliberately publishes no evolution artifacts.
  */
 export function createDevelopmentAgentDesktopProductProvider(
-  runAgentTurn: (request: DevelopmentAgentTurnRequest) => Promise<DevelopmentAgentTurnResult>,
+  backend: DevelopmentAgentBackend,
 ): DesktopProductProviderV2 {
   return createInMemoryDesktopProductProvider({
     initialSnapshot: createDevelopmentAgentSnapshot(),
-    runAgentTurn,
+    runAgentTurn: backend.runAgentTurn,
+    developmentBackend: backend,
     simulateEvolution: false,
   });
 }
@@ -103,15 +150,38 @@ function createInMemoryDesktopProductProvider(
   let snapshot = options.initialSnapshot ?? createFixtureSnapshot();
   const simulateEvolution = options.simulateEvolution ?? true;
   const taskLogs = new Map<string, readonly string[]>();
+  let developmentStateLoaded = options.developmentBackend === undefined;
+  let developmentStateLoad: Promise<void> | null = null;
+
+  const ensureDevelopmentState = async (force = false): Promise<void> => {
+    if (developmentStateLoaded && !force) return;
+    if (developmentStateLoad) {
+      await developmentStateLoad;
+      return;
+    }
+    developmentStateLoad ??= options.developmentBackend!.loadState().then((state) => {
+      snapshot = createDevelopmentAgentSnapshot(state);
+      taskLogs.clear();
+      for (const session of state.sessions) taskLogs.set(session.sessionId, session.logMessages);
+      developmentStateLoaded = true;
+    }).finally(() => {
+      developmentStateLoad = null;
+    });
+    await developmentStateLoad;
+  };
 
   return {
     ...unavailableDesktopProductProviderV2,
     featureFlags: simulateEvolution
       ? ["system_openssh_profiles"]
       : ["system_openssh_profiles", "development_agent_bridge"],
-    refresh: async () => ({ status: "fresh", snapshot }),
+    refresh: async () => {
+      await ensureDevelopmentState(options.developmentBackend !== undefined);
+      return { status: "fresh", snapshot };
+    },
     subscribe: () => () => undefined,
     createProject: async (draft) => {
+      await ensureDevelopmentState();
       const sequence = snapshot.projects.length + 1;
       const projectId = `${simulateEvolution ? "fixture" : "development"}-project-${sequence}`;
       const config = simulateEvolution
@@ -131,6 +201,11 @@ function createInMemoryDesktopProductProvider(
         updated_at: NOW,
         etag: ETAG,
       };
+      await options.developmentBackend?.createProject({
+        projectId,
+        displayName: project.display_name,
+        config: project.config,
+      });
       snapshot = {
         ...snapshot,
         projects: [...snapshot.projects, project],
@@ -163,15 +238,22 @@ function createInMemoryDesktopProductProvider(
       } as never;
     },
     updateProject: async (projectId, displayName, config) => {
+      await ensureDevelopmentState();
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project) throw new Error("Fixture project is missing.");
+      const persistedConfig = simulateEvolution ? config : withEvolutionDisabled(config);
       const updated = {
         ...project,
         display_name: displayName,
-        config,
-        project_config_sha256: scienceProjectConfigSha256ForV2(config),
+        config: persistedConfig,
+        project_config_sha256: scienceProjectConfigSha256ForV2(persistedConfig),
         updated_at: NOW,
       };
+      await options.developmentBackend?.updateProject({
+        projectId,
+        displayName,
+        config: persistedConfig,
+      });
       snapshot = {
         ...snapshot,
         projects: snapshot.projects.map((candidate) => candidate.project_id === projectId ? updated : candidate),
@@ -180,8 +262,10 @@ function createInMemoryDesktopProductProvider(
       return updated;
     },
     activateProject: async (projectId) => {
+      await ensureDevelopmentState();
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project?.active_project_head) throw new Error("Fixture project is missing or not activatable.");
+      await options.developmentBackend?.activateProject(projectId);
       snapshot = {
         ...snapshot,
         state: { ...snapshot.state, active_project_id: projectId, updated_at: NOW },
@@ -221,6 +305,7 @@ function createInMemoryDesktopProductProvider(
       validated_at: NOW,
     } as never),
     submitTask: async (projectId) => {
+      await ensureDevelopmentState();
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project?.active_project_head || project.state !== "ready") throw new Error("Fixture project is not ready.");
       const ordinal = snapshot.tasks.filter((candidate) => candidate.project_id === projectId).length + 1;
@@ -232,7 +317,7 @@ function createInMemoryDesktopProductProvider(
             instruction: project.config.task.objective,
           })
         : null;
-      const admittedTask = fixtureTask(project, ordinal);
+      const admittedTask = fixtureTask(project, ordinal, agentTurn?.sessionId);
       const evolutionRound = simulateEvolution
         ? fixtureEvolutionRound(snapshot, project, admittedTask, ordinal)
         : { artifacts: [], presentation: {}, usedArtifactIds: [] };
@@ -661,35 +746,108 @@ export function createFixtureSnapshot(): DesktopProductSnapshotV2 {
   };
 }
 
-function createDevelopmentAgentSnapshot(): DesktopProductSnapshotV2 {
+function createDevelopmentAgentSnapshot(
+  persisted: PersistedDevelopmentState = { activeProjectId: null, projects: [], sessions: [] },
+): DesktopProductSnapshotV2 {
   const fixture = createFixtureSnapshot();
+  const persistedProjectIds = new Set(persisted.projects.map((project) => project.projectId));
+  const activeProjectId = persisted.activeProjectId && persistedProjectIds.has(persisted.activeProjectId)
+    ? persisted.activeProjectId
+    : persisted.projects.at(-1)?.projectId ?? null;
   const profile = {
     ...fixture.profiles[0]!,
     profile_id: "development-agent-profile",
     display_name: "GPU lab (development tunnel)",
     ssh_host_alias: "openevo-lab",
-    active_project_id: null,
+    active_project_id: activeProjectId,
   };
+  const tasks: TaskV2[] = [];
+  const taskPresentation: Record<
+    string,
+    NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["tasks"][string]
+  > = {};
+  const projects = persisted.projects.map((storedProject, projectIndex) => {
+    const config = withEvolutionDisabled(storedProject.config);
+    let activeHead = fixtureGenesisHead(storedProject.projectId, config, projectIndex + 1);
+    const projectSessions = persisted.sessions.filter((session) => session.projectId === storedProject.projectId);
+    for (const [sessionIndex, session] of projectSessions.entries()) {
+      const sessionConfig = {
+        ...config,
+        task: { title: session.taskTitle, objective: session.instruction },
+      };
+      const taskProject = {
+        schema_version: "2" as const,
+        project_id: storedProject.projectId,
+        display_name: storedProject.displayName,
+        config: sessionConfig,
+        project_config_sha256: scienceProjectConfigSha256ForV2(sessionConfig),
+        active_project_head: activeHead,
+        admission_etag: ETAG,
+        state: "ready" as const,
+        created_at: storedProject.createdAt,
+        updated_at: storedProject.updatedAt,
+        etag: ETAG,
+      };
+      const hydratedTask = fixtureTask(taskProject, sessionIndex + 1, session.sessionId);
+      tasks.unshift({
+        ...hydratedTask,
+        successor_transition: null,
+        state: session.state === "completed" ? "closed" : session.state,
+        created_at: session.createdAt,
+        updated_at: session.updatedAt,
+      });
+      taskPresentation[session.sessionId] = {
+        instruction: sessionConfig.task,
+        transcript: [
+          { speaker: "user", text: session.instruction },
+          ...(session.response ? [{ speaker: "agent" as const, text: session.response }] : []),
+          ...(session.error ? [{ speaker: "system" as const, text: session.error }] : []),
+        ],
+        outputFiles: [],
+        usedArtifactIds: [],
+        producedArtifactIds: [],
+      };
+      if (session.state === "completed") {
+        activeHead = fixtureSuccessorHead(activeHead, config, 0);
+      }
+    }
+    return {
+      schema_version: "2" as const,
+      project_id: storedProject.projectId,
+      display_name: storedProject.displayName,
+      config,
+      project_config_sha256: scienceProjectConfigSha256ForV2(config),
+      active_project_head: activeHead,
+      admission_etag: ETAG,
+      state: "ready" as const,
+      created_at: storedProject.createdAt,
+      updated_at: storedProject.updatedAt,
+      etag: ETAG,
+    };
+  });
+  const activeProject = projects.find((project) => project.project_id === activeProjectId) ?? null;
   return {
     ...fixture,
     state: {
       ...fixture.state,
       profiles: [profile] as never,
       active_profile_id: profile.profile_id,
-      active_project_id: null,
+      active_project_id: activeProjectId,
       pending_operations: [],
     },
     profiles: [profile] as never,
-    projects: [],
-    tasks: [],
+    projects,
+    tasks,
     transitions: {},
     timelines: {},
     artifacts: [],
     services: [],
-    capability: null,
+    capability: activeProject
+      ? developmentAgentCapability(activeProject.project_id, activeProject.config.execution.mode)
+      : null,
     validation: null,
     activeOperation: null,
-    fixturePresentation: { tasks: {}, artifacts: {} },
+    fixturePresentation: { tasks: taskPresentation, artifacts: {} },
     stream: { status: "fresh", epoch: 1, lastEventId: null },
   };
 }
@@ -1019,9 +1177,10 @@ function fixtureSuccessorHead(
 function fixtureTask(
   project: DesktopProductSnapshotV2["projects"][number],
   ordinal: number,
+  persistedTaskId?: string,
 ): TaskV2 {
   const head = project.active_project_head!;
-  const taskId = `${project.project_id}-task-${ordinal}`;
+  const taskId = persistedTaskId ?? `${project.project_id}-task-${ordinal}`;
   const admissionWithoutDigest = {
     schema_version: "2" as const,
     task_admission_id: `${project.project_id}-admission-${ordinal}`,

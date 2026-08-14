@@ -24,15 +24,58 @@ const config: ScienceProjectConfigV2 = {
 };
 
 describe("development agent provider", () => {
-  it("shows the real bridge response and does not fabricate evolution output", async () => {
-    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({
-      schema_version: "1",
-      session_id: "dev-session-1",
-      response: "Two plus two is four.",
-      model: null,
-      duration_ms: 42,
-      logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
-    }), { status: 200, headers: { "Content-Type": "application/json" } }));
+  it("restores persisted projects and real transcripts after creating a new provider", async () => {
+    const projects: Record<string, unknown>[] = [];
+    const sessions: Record<string, unknown>[] = [];
+    let activeProjectId: string | null = null;
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null;
+      if (url.endsWith("/state")) {
+        return jsonResponse({
+          schema_version: "1",
+          active_project_id: activeProjectId,
+          projects,
+          sessions,
+        });
+      }
+      if (url.endsWith("/projects") && init?.method === "POST") {
+        activeProjectId = String(body!.project_id);
+        projects.push({
+          project_id: body!.project_id,
+          display_name: body!.display_name,
+          config: body!.config,
+          created_at: "2026-08-14T10:00:00Z",
+          updated_at: "2026-08-14T10:00:00Z",
+        });
+        return jsonResponse({ schema_version: "1" }, 201);
+      }
+      if (url.endsWith("/sessions") && init?.method === "POST") {
+        sessions.push({
+          session_id: "dev-session-1",
+          project_id: body!.project_id,
+          task_title: body!.task_title,
+          instruction: body!.instruction,
+          response: "Two plus two is four.",
+          model: null,
+          state: "completed",
+          duration_ms: 42,
+          logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
+          error: null,
+          created_at: "2026-08-14T10:01:00Z",
+          updated_at: "2026-08-14T10:01:01Z",
+        });
+        return jsonResponse({
+          schema_version: "1",
+          session_id: "dev-session-1",
+          response: "Two plus two is four.",
+          model: null,
+          duration_ms: 42,
+          logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
+        });
+      }
+      throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
+    });
     const provider = createDevelopmentAgentProvider({ fetchImpl });
     const initial = await provider.refresh();
     if (initial.status !== "fresh") throw new Error("development provider was not fresh");
@@ -64,5 +107,22 @@ describe("development agent provider", () => {
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({
       method: "POST",
     }));
+
+    const providerAfterPageReload = createDevelopmentAgentProvider({ fetchImpl });
+    const restored = await providerAfterPageReload.refresh();
+    if (restored.status !== "fresh") throw new Error("restored provider was not fresh");
+    expect(restored.snapshot.projects.map((candidate) => candidate.display_name)).toEqual(["Live project"]);
+    expect(restored.snapshot.tasks.map((candidate) => candidate.task_id)).toEqual(["dev-session-1"]);
+    expect(restored.snapshot.fixturePresentation?.tasks["dev-session-1"]?.transcript).toEqual([
+      { speaker: "user", text: "What is two plus two?" },
+      { speaker: "agent", text: "Two plus two is four." },
+    ]);
   });
 });
+
+function jsonResponse(body: object, status = 200): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}

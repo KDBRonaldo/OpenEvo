@@ -15,16 +15,19 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, Iterator
 
 
-MAX_REQUEST_BYTES = 64 * 1024
+MAX_REQUEST_BYTES = 256 * 1024
 MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 300
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -35,6 +38,10 @@ ALLOWED_REQUEST_FIELDS = {
     "task_title",
     "instruction",
 }
+ALLOWED_PROJECT_FIELDS = {"schema_version", "project_id", "display_name", "config"}
+ALLOWED_PROJECT_UPDATE_FIELDS = {"schema_version", "display_name", "config"}
+PROJECT_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)$")
+ACTIVATE_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)/activate$")
 
 
 class RequestError(ValueError):
@@ -43,6 +50,279 @@ class RequestError(ValueError):
 
 class AgentRunError(RuntimeError):
     pass
+
+
+class StateConflictError(RuntimeError):
+    pass
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def canonical_json(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def validate_project_request(payload: object, *, updating: bool = False) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RequestError("request body must be a JSON object")
+    allowed = ALLOWED_PROJECT_UPDATE_FIELDS if updating else ALLOWED_PROJECT_FIELDS
+    unknown = set(payload) - allowed
+    if unknown:
+        raise RequestError(f"unknown request fields: {', '.join(sorted(unknown))}")
+    if payload.get("schema_version") != "1":
+        raise RequestError("schema_version must be '1'")
+    result: dict[str, Any] = {}
+    if not updating:
+        project_id = payload.get("project_id")
+        if not isinstance(project_id, str) or not ID_PATTERN.fullmatch(project_id):
+            raise RequestError("project_id is invalid")
+        result["project_id"] = project_id
+    display_name = payload.get("display_name")
+    if not isinstance(display_name, str) or not display_name.strip() or len(display_name) > 200:
+        raise RequestError("display_name must be a non-empty string of at most 200 characters")
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        raise RequestError("config must be a JSON object")
+    if len(canonical_json(config).encode("utf-8")) > 192 * 1024:
+        raise RequestError("config is too large")
+    result["display_name"] = display_name.strip()
+    result["config"] = config
+    return result
+
+
+class DevelopmentStateStore:
+    """Small SQLite authority for the development-only Project/Session loop."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.RLock()
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            path.parent.chmod(0o700)
+        except OSError:
+            pass
+        with self._connection() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS development_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS development_projects (
+                    project_id TEXT PRIMARY KEY,
+                    display_name TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS development_sessions (
+                    session_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                    task_title TEXT NOT NULL,
+                    instruction TEXT NOT NULL,
+                    response TEXT,
+                    model TEXT,
+                    state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed')),
+                    duration_ms INTEGER,
+                    logs_json TEXT NOT NULL,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS development_sessions_project_created
+                    ON development_sessions(project_id, created_at, session_id);
+                """
+            )
+            restarted_at = utc_now()
+            connection.execute(
+                """
+                UPDATE development_sessions
+                SET state = 'failed', error = ?, updated_at = ?
+                WHERE state = 'running'
+                """,
+                ("Development daemon restarted before this session completed.", restarted_at),
+            )
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = sqlite3.connect(self.path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            projects = [
+                {
+                    "project_id": row["project_id"],
+                    "display_name": row["display_name"],
+                    "config": json.loads(row["config_json"]),
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+                for row in connection.execute(
+                    "SELECT * FROM development_projects ORDER BY created_at, project_id"
+                )
+            ]
+            sessions = [self._session_record(row) for row in connection.execute(
+                "SELECT * FROM development_sessions ORDER BY created_at, session_id"
+            )]
+            active_row = connection.execute(
+                "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
+            ).fetchone()
+        active_project_id = active_row["value"] if active_row else None
+        if active_project_id not in {project["project_id"] for project in projects}:
+            active_project_id = projects[-1]["project_id"] if projects else None
+        return {
+            "schema_version": "1",
+            "active_project_id": active_project_id,
+            "projects": projects,
+            "sessions": sessions,
+        }
+
+    def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            try:
+                connection.execute(
+                    "INSERT INTO development_projects VALUES (?, ?, ?, ?, ?)",
+                    (
+                        request["project_id"],
+                        request["display_name"],
+                        canonical_json(request["config"]),
+                        now,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise StateConflictError("project_id already exists") from exc
+            self._set_active(connection, request["project_id"])
+        return {**request, "created_at": now, "updated_at": now}
+
+    def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE development_projects
+                SET display_name = ?, config_json = ?, updated_at = ?
+                WHERE project_id = ?
+                """,
+                (request["display_name"], canonical_json(request["config"]), now, project_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(project_id)
+            created = connection.execute(
+                "SELECT created_at FROM development_projects WHERE project_id = ?", (project_id,)
+            ).fetchone()
+        return {"project_id": project_id, **request, "created_at": created["created_at"], "updated_at": now}
+
+    def activate_project(self, project_id: str) -> None:
+        with self._lock, self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
+            ).fetchone() is None:
+                raise KeyError(project_id)
+            self._set_active(connection, project_id)
+
+    @staticmethod
+    def _set_active(connection: sqlite3.Connection, project_id: str) -> None:
+        connection.execute(
+            """
+            INSERT INTO development_metadata(key, value) VALUES ('active_project_id', ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (project_id,),
+        )
+
+    def start_session(self, session_id: str, request: dict[str, str]) -> None:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            project = connection.execute(
+                "SELECT display_name FROM development_projects WHERE project_id = ?",
+                (request["project_id"],),
+            ).fetchone()
+            if project is None:
+                raise KeyError(request["project_id"])
+            if project["display_name"] != request["project_name"]:
+                raise StateConflictError("project_name does not match the persisted project")
+            connection.execute(
+                """
+                INSERT INTO development_sessions(
+                    session_id, project_id, task_title, instruction, response, model,
+                    state, duration_ms, logs_json, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, NULL, ?, ?)
+                """,
+                (
+                    session_id,
+                    request["project_id"],
+                    request["task_title"],
+                    request["instruction"],
+                    canonical_json(["Remote development daemon admitted the session."]),
+                    now,
+                    now,
+                ),
+            )
+
+    def complete_session(self, session_id: str, result: dict[str, Any]) -> None:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE development_sessions
+                SET response = ?, model = ?, state = 'completed', duration_ms = ?,
+                    logs_json = ?, error = NULL, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (
+                    result["response"],
+                    result["model"],
+                    result["duration_ms"],
+                    canonical_json(result["logs"]),
+                    now,
+                    session_id,
+                ),
+            )
+
+    def fail_session(self, session_id: str, error: str) -> None:
+        now = utc_now()
+        logs = ["Remote development daemon admitted the session.", f"Codex failed: {error}"]
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE development_sessions
+                SET state = 'failed', logs_json = ?, error = ?, updated_at = ?
+                WHERE session_id = ?
+                """,
+                (canonical_json(logs), error, now, session_id),
+            )
+
+    @staticmethod
+    def _session_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "session_id": row["session_id"],
+            "project_id": row["project_id"],
+            "task_title": row["task_title"],
+            "instruction": row["instruction"],
+            "response": row["response"],
+            "model": row["model"],
+            "state": row["state"],
+            "duration_ms": row["duration_ms"],
+            "logs": json.loads(row["logs_json"]),
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
 
 def validate_request(payload: object) -> dict[str, str]:
@@ -172,7 +452,6 @@ class CodexRunner:
         duration_ms = round((time.monotonic() - started) * 1000)
         return {
             "schema_version": "1",
-            "session_id": f"dev-session-{secrets.token_hex(8)}",
             "response": response,
             "model": self._model,
             "duration_ms": duration_ms,
@@ -187,10 +466,17 @@ class CodexRunner:
 class DevelopmentAgentServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address: tuple[str, int], token: str, runner: CodexRunner) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        token: str,
+        runner: CodexRunner,
+        store: DevelopmentStateStore,
+    ) -> None:
         super().__init__(address, DevelopmentAgentHandler)
         self.token = token
         self.runner = runner
+        self.store = store
         self.turn_lock = threading.Lock()
 
 
@@ -201,42 +487,118 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if not self._authorized():
             return
-        if self.path != "/openevo-dev-agent/health":
-            self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
+        if self.path == "/openevo-dev-agent/health":
+            self._json(HTTPStatus.OK, {"schema_version": "1", "status": "ready"})
             return
-        self._json(HTTPStatus.OK, {"schema_version": "1", "status": "ready"})
+        if self.path == "/openevo-dev-agent/v1/state":
+            self._json(HTTPStatus.OK, self.server.store.snapshot())
+            return
+        self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
 
     def do_POST(self) -> None:  # noqa: N802
         if not self._authorized():
             return
+        if self.path == "/openevo-dev-agent/v1/projects":
+            try:
+                project = self.server.store.create_project(
+                    validate_project_request(self._read_json())
+                )
+            except RequestError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except StateConflictError as exc:
+                self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.CREATED, {"schema_version": "1", **project})
+            return
+        activate_match = ACTIVATE_PATH_PATTERN.fullmatch(self.path)
+        if activate_match:
+            project_id = activate_match.group(1)
+            if not ID_PATTERN.fullmatch(project_id):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "project_id is invalid")
+                return
+            try:
+                payload = self._read_json()
+                if payload != {"schema_version": "1"}:
+                    raise RequestError("activation request must contain only schema_version '1'")
+                self.server.store.activate_project(project_id)
+            except RequestError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            else:
+                self._json(HTTPStatus.OK, {"schema_version": "1", "project_id": project_id})
+            return
         if self.path != "/openevo-dev-agent/v1/sessions":
             self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
             return
-        try:
-            content_length = int(self.headers.get("Content-Length", ""))
-        except ValueError:
-            self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "Content-Length is invalid")
+        self._run_session()
+
+    def do_PUT(self) -> None:  # noqa: N802
+        if not self._authorized():
             return
-        if content_length <= 0 or content_length > MAX_REQUEST_BYTES:
-            self._json_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "request_too_large", "request body is too large")
+        project_match = PROJECT_PATH_PATTERN.fullmatch(self.path)
+        if not project_match:
+            self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
+            return
+        project_id = project_match.group(1)
+        if not ID_PATTERN.fullmatch(project_id):
+            self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "project_id is invalid")
             return
         try:
-            payload = json.loads(self.rfile.read(content_length).decode("utf-8"))
-            request = validate_request(payload)
-        except (UnicodeDecodeError, json.JSONDecodeError, RequestError) as exc:
+            project = self.server.store.update_project(
+                project_id,
+                validate_project_request(self._read_json(), updating=True),
+            )
+        except RequestError as exc:
+            self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+        except KeyError:
+            self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+        else:
+            self._json(HTTPStatus.OK, {"schema_version": "1", **project})
+
+    def _run_session(self) -> None:
+        try:
+            request = validate_request(self._read_json())
+        except RequestError as exc:
             self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
             return
         if not self.server.turn_lock.acquire(blocking=False):
             self._json_error(HTTPStatus.CONFLICT, "agent_busy", "another development session is running")
             return
+        session_id = f"dev-session-{secrets.token_hex(8)}"
         try:
+            try:
+                self.server.store.start_session(session_id, request)
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+                return
+            except StateConflictError as exc:
+                self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+                return
             result = self.server.runner.run(request)
         except AgentRunError as exc:
+            self.server.store.fail_session(session_id, str(exc))
             self._json_error(HTTPStatus.BAD_GATEWAY, "codex_failed", str(exc))
         else:
+            result = {**result, "session_id": session_id}
+            self.server.store.complete_session(session_id, result)
             self._json(HTTPStatus.OK, result)
         finally:
             self.server.turn_lock.release()
+
+    def _read_json(self) -> object:
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError as exc:
+            raise RequestError("Content-Length is invalid") from exc
+        if content_length <= 0:
+            raise RequestError("request body is empty")
+        if content_length > MAX_REQUEST_BYTES:
+            raise RequestError("request body is too large")
+        try:
+            return json.loads(self.rfile.read(content_length).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RequestError(f"request body is not valid UTF-8 JSON: {exc}") from exc
 
     def _authorized(self) -> bool:
         expected = f"Bearer {self.server.token}"
@@ -267,6 +629,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--codex-binary", default="codex")
+    parser.add_argument(
+        "--state-path",
+        type=Path,
+        default=Path.home() / ".openevo" / "dev-agent" / "state.sqlite3",
+        help="SQLite database used for development Project and Session history",
+    )
     return parser.parse_args()
 
 
@@ -285,8 +653,11 @@ def main() -> int:
     model = os.environ.get("OPENEVO_DEV_CODEX_MODEL", "").strip() or None
     runner = CodexRunner(codex_binary, args.timeout_seconds, model)
     runner.check_ready()
-    server = DevelopmentAgentServer(("127.0.0.1", args.port), token, runner)
+    state_path = args.state_path.expanduser().resolve()
+    store = DevelopmentStateStore(state_path)
+    server = DevelopmentAgentServer(("127.0.0.1", args.port), token, runner, store)
     print(f"Development agent daemon listening on 127.0.0.1:{args.port}", flush=True)
+    print(f"Development state database: {state_path}", flush=True)
     print("It is loopback-only; connect through an SSH local-forward tunnel.", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)

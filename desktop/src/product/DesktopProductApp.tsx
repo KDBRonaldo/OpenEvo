@@ -362,7 +362,7 @@ export function DesktopProductApp({
             <Notice
               tone="warning"
               title="Real-agent development mode"
-              detail="Agent replies come from the remote Codex CLI. Project authority, history, and workspace metadata are local in-memory development state; evolution is disabled."
+              detail="Agent replies come from the remote Codex CLI. Project and Session history are persisted by the remote development daemon; release authority and evolution remain disabled."
             />
           ) : null}
           {actionStatus ? <Notice tone="success" title={developmentAgentBridge ? "Development session updated" : "Remote authority updated"} detail={actionStatus} onDismiss={() => setActionStatus(null)} /> : null}

@@ -1,11 +1,13 @@
 import { z } from "zod";
+import { scienceProjectConfigV2Schema } from "../api/v2/schemas";
 import {
   createDevelopmentAgentDesktopProductProvider,
+  type DevelopmentAgentBackend,
   type DevelopmentAgentTurnRequest,
 } from "./fixtureProvider";
 import type { DesktopProductProviderV2 } from "./providerV2";
 
-const responseSchema = z.object({
+const turnResponseSchema = z.object({
   schema_version: z.literal("1"),
   session_id: z.string().min(1),
   response: z.string().min(1),
@@ -14,42 +16,135 @@ const responseSchema = z.object({
   logs: z.array(z.string()),
 }).strict();
 
+const projectSchema = z.object({
+  project_id: z.string().min(1),
+  display_name: z.string().min(1),
+  config: scienceProjectConfigV2Schema,
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const sessionSchema = z.object({
+  session_id: z.string().min(1),
+  project_id: z.string().min(1),
+  task_title: z.string().min(1),
+  instruction: z.string().min(1),
+  response: z.string().nullable(),
+  model: z.string().nullable(),
+  state: z.enum(["running", "completed", "failed"]),
+  duration_ms: z.number().int().nonnegative().nullable(),
+  logs: z.array(z.string()),
+  error: z.string().nullable(),
+  created_at: z.string().min(1),
+  updated_at: z.string().min(1),
+}).strict();
+
+const stateSchema = z.object({
+  schema_version: z.literal("1"),
+  active_project_id: z.string().min(1).nullable(),
+  projects: z.array(projectSchema),
+  sessions: z.array(sessionSchema),
+}).strict();
+
 export interface DevelopmentAgentProviderOptions {
-  readonly endpoint?: string;
+  readonly baseUrl?: string;
   readonly fetchImpl?: typeof fetch;
 }
 
 /**
- * Browser-only development bridge. The Vite proxy owns the bearer credential and forwards this
- * same-origin request through an SSH tunnel; no remote token or SSH detail reaches renderer code.
+ * Browser-only development bridge. The Vite proxy owns the bearer credential and forwards these
+ * same-origin requests through an SSH tunnel; Project and Session authority live in remote SQLite.
  */
 export function createDevelopmentAgentProvider(
   options: DevelopmentAgentProviderOptions = {},
 ): DesktopProductProviderV2 {
-  const endpoint = options.endpoint ?? "/openevo-dev-agent/v1/sessions";
+  const baseUrl = (options.baseUrl ?? "/openevo-dev-agent/v1").replace(/\/$/, "");
   const fetchImpl = options.fetchImpl ?? fetch;
-  return createDevelopmentAgentDesktopProductProvider(async (request) => {
-    const response = await fetchImpl(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(toRequestBody(request)),
-    });
+
+  const requestJson = async (path: string, init?: RequestInit): Promise<unknown> => {
+    const response = await fetchImpl(`${baseUrl}${path}`, init);
     if (!response.ok) {
       const detail = await response.text();
-      throw new Error(`Remote development agent failed (${response.status}): ${detail || response.statusText}`);
+      throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
     }
-    const payload = responseSchema.parse(await response.json());
-    return {
-      sessionId: payload.session_id,
-      responseText: payload.response,
-      model: payload.model,
-      durationMs: payload.duration_ms,
-      logMessages: payload.logs,
-    };
-  });
+    return response.json();
+  };
+
+  const backend: DevelopmentAgentBackend = {
+    loadState: async () => {
+      const payload = stateSchema.parse(await requestJson("/state"));
+      return {
+        activeProjectId: payload.active_project_id,
+        projects: payload.projects.map((project) => ({
+          projectId: project.project_id,
+          displayName: project.display_name,
+          config: project.config,
+          createdAt: project.created_at,
+          updatedAt: project.updated_at,
+        })),
+        sessions: payload.sessions.map((session) => ({
+          sessionId: session.session_id,
+          projectId: session.project_id,
+          taskTitle: session.task_title,
+          instruction: session.instruction,
+          response: session.response,
+          model: session.model,
+          state: session.state,
+          durationMs: session.duration_ms,
+          logMessages: session.logs,
+          error: session.error,
+          createdAt: session.created_at,
+          updatedAt: session.updated_at,
+        })),
+      };
+    },
+    createProject: async (project) => {
+      await requestJson("/projects", jsonRequest("POST", {
+        schema_version: "1",
+        project_id: project.projectId,
+        display_name: project.displayName,
+        config: project.config,
+      }));
+    },
+    updateProject: async (project) => {
+      await requestJson(`/projects/${encodeURIComponent(project.projectId)}`, jsonRequest("PUT", {
+        schema_version: "1",
+        display_name: project.displayName,
+        config: project.config,
+      }));
+    },
+    activateProject: async (projectId) => {
+      await requestJson(`/projects/${encodeURIComponent(projectId)}/activate`, jsonRequest("POST", {
+        schema_version: "1",
+      }));
+    },
+    runAgentTurn: async (request) => {
+      const payload = turnResponseSchema.parse(await requestJson(
+        "/sessions",
+        jsonRequest("POST", toTurnRequestBody(request)),
+      ));
+      return {
+        sessionId: payload.session_id,
+        responseText: payload.response,
+        model: payload.model,
+        durationMs: payload.duration_ms,
+        logMessages: payload.logs,
+      };
+    },
+  };
+
+  return createDevelopmentAgentDesktopProductProvider(backend);
 }
 
-function toRequestBody(request: DevelopmentAgentTurnRequest) {
+function jsonRequest(method: "POST" | "PUT", body: object): RequestInit {
+  return {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  };
+}
+
+function toTurnRequestBody(request: DevelopmentAgentTurnRequest) {
   return {
     schema_version: "1",
     project_id: request.projectId,

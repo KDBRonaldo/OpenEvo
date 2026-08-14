@@ -138,10 +138,14 @@ the sealed release lifecycle while those pieces are under development. The
 server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
 forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
 while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
-SSH command, or remote address. Projects and session metadata are development
-in-memory state, but the transcript's agent message is the actual Codex CLI
-response. This bridge is reachable only in Vite mode `openevo-live-agent` and is
-not imported by the packaged release entrypoint.
+SSH command, or remote address. The development daemon stores Projects, active
+Project selection, Session state, instructions, Codex responses, model label,
+duration, errors and process-log summaries in the remote SQLite database
+`~/.openevo/dev-agent/state.sqlite3`. The renderer reloads that authority from
+`GET /openevo-dev-agent/v1/state`, so a browser refresh preserves Project and
+conversation history. Evolution artifacts remain disabled. This bridge is
+reachable only in Vite mode `openevo-live-agent` and is not imported by the
+packaged release entrypoint.
 
 The release adapter copies the authenticated
 `DesktopStateV1.execution_mode_capabilities` object into
