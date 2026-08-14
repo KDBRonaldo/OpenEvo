@@ -15,6 +15,27 @@ const NOW = "2026-08-13T08:30:00Z";
 const DIGEST = "a".repeat(64);
 const ETAG = `"${"b".repeat(64)}"`;
 
+export interface DevelopmentAgentTurnRequest {
+  readonly projectId: string;
+  readonly projectName: string;
+  readonly taskTitle: string;
+  readonly instruction: string;
+}
+
+export interface DevelopmentAgentTurnResult {
+  readonly sessionId: string;
+  readonly responseText: string;
+  readonly model: string | null;
+  readonly durationMs: number;
+  readonly logMessages: readonly string[];
+}
+
+interface InMemoryProviderOptions {
+  readonly initialSnapshot?: DesktopProductSnapshotV2;
+  readonly runAgentTurn?: (request: DevelopmentAgentTurnRequest) => Promise<DevelopmentAgentTurnResult>;
+  readonly simulateEvolution?: boolean;
+}
+
 const FIXTURE_EVOLUTION_TARGETS = [
   {
     targetId: "text_memory",
@@ -59,17 +80,43 @@ const FIXTURE_EVOLUTION_TARGETS = [
  * product-preview.html and is never selected by the release bootstrap path.
  */
 export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 {
-  let snapshot = createFixtureSnapshot();
+  return createInMemoryDesktopProductProvider();
+}
+
+/**
+ * Development-only provider that keeps project metadata locally but obtains every agent reply
+ * from the supplied remote runner. It deliberately publishes no evolution artifacts.
+ */
+export function createDevelopmentAgentDesktopProductProvider(
+  runAgentTurn: (request: DevelopmentAgentTurnRequest) => Promise<DevelopmentAgentTurnResult>,
+): DesktopProductProviderV2 {
+  return createInMemoryDesktopProductProvider({
+    initialSnapshot: createDevelopmentAgentSnapshot(),
+    runAgentTurn,
+    simulateEvolution: false,
+  });
+}
+
+function createInMemoryDesktopProductProvider(
+  options: InMemoryProviderOptions = {},
+): DesktopProductProviderV2 {
+  let snapshot = options.initialSnapshot ?? createFixtureSnapshot();
+  const simulateEvolution = options.simulateEvolution ?? true;
+  const taskLogs = new Map<string, readonly string[]>();
 
   return {
     ...unavailableDesktopProductProviderV2,
-    featureFlags: ["system_openssh_profiles"],
+    featureFlags: simulateEvolution
+      ? ["system_openssh_profiles"]
+      : ["system_openssh_profiles", "development_agent_bridge"],
     refresh: async () => ({ status: "fresh", snapshot }),
     subscribe: () => () => undefined,
     createProject: async (draft) => {
       const sequence = snapshot.projects.length + 1;
-      const projectId = `fixture-project-${sequence}`;
-      const config = withFixtureEvolutionDefaults(draft.config);
+      const projectId = `${simulateEvolution ? "fixture" : "development"}-project-${sequence}`;
+      const config = simulateEvolution
+        ? withFixtureEvolutionDefaults(draft.config)
+        : withEvolutionDisabled(draft.config);
       const head = fixtureGenesisHead(projectId, config, sequence);
       const project = {
         schema_version: "2" as const,
@@ -88,7 +135,10 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
         ...snapshot,
         projects: [...snapshot.projects, project],
         state: { ...snapshot.state, active_project_id: projectId, updated_at: NOW },
-        capability: fixtureCapability(projectId, config.execution.mode),
+        profiles: snapshot.profiles.map((profile) => ({ ...profile, active_project_id: projectId })) as never,
+        capability: simulateEvolution
+          ? fixtureCapability(projectId, config.execution.mode)
+          : developmentAgentCapability(projectId, config.execution.mode),
         validation: null,
         stream: { ...snapshot.stream, epoch: snapshot.stream.epoch + 1 },
       };
@@ -136,7 +186,9 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
         ...snapshot,
         state: { ...snapshot.state, active_project_id: projectId, updated_at: NOW },
         profiles: snapshot.profiles.map((profile) => ({ ...profile, active_project_id: projectId })) as never,
-        capability: fixtureCapability(projectId, project.config.execution.mode),
+        capability: simulateEvolution
+          ? fixtureCapability(projectId, project.config.execution.mode)
+          : developmentAgentCapability(projectId, project.config.execution.mode),
         validation: null,
         stream: { ...snapshot.stream, epoch: snapshot.stream.epoch + 1 },
       };
@@ -172,8 +224,18 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project?.active_project_head || project.state !== "ready") throw new Error("Fixture project is not ready.");
       const ordinal = snapshot.tasks.filter((candidate) => candidate.project_id === projectId).length + 1;
+      const agentTurn = options.runAgentTurn
+        ? await options.runAgentTurn({
+            projectId,
+            projectName: project.display_name,
+            taskTitle: project.config.task.title,
+            instruction: project.config.task.objective,
+          })
+        : null;
       const admittedTask = fixtureTask(project, ordinal);
-      const evolutionRound = fixtureEvolutionRound(snapshot, project, admittedTask, ordinal);
+      const evolutionRound = simulateEvolution
+        ? fixtureEvolutionRound(snapshot, project, admittedTask, ordinal)
+        : { artifacts: [], presentation: {}, usedArtifactIds: [] };
       const successorHead = fixtureSuccessorHead(
         project.active_project_head,
         project.config,
@@ -201,6 +263,24 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
         active_project_head: successorHead,
         updated_at: NOW,
       };
+      const agentResponse = agentTurn?.responseText
+        ?? "The fixture session was admitted and completed successfully.";
+      const outputFiles = agentTurn
+        ? []
+        : [{
+            name: "results/fixture-result.md",
+            summary: "Simulated session result.",
+            content: `# Fixture result\n\nSession ${ordinal} completed successfully and published ${evolutionRound.artifacts.length} evolution artifacts.\n`,
+            previousName: ordinal > 1 ? "results/fixture-result.md" : null,
+            diffLines: [
+              { kind: "context" as const, text: "# Fixture result" },
+              { kind: "added" as const, text: `Session ${ordinal} published ${evolutionRound.artifacts.length} evolution artifacts.` },
+            ],
+          }];
+      taskLogs.set(task.task_id, agentTurn?.logMessages ?? [
+        "The immutable Task admission was accepted.",
+        "The simulated agent completed the session.",
+      ]);
       snapshot = {
         ...snapshot,
         projects: snapshot.projects.map((candidate) => candidate.project_id === projectId ? updatedProject : candidate) as never,
@@ -226,18 +306,9 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
               instruction: project.config.task,
               transcript: [
                 { speaker: "user", text: project.config.task.objective },
-                { speaker: "agent", text: "The fixture session was admitted and completed successfully." },
+                { speaker: "agent", text: agentResponse },
               ],
-              outputFiles: [{
-                name: "results/fixture-result.md",
-                summary: "Simulated session result.",
-                content: `# Fixture result\n\nSession ${ordinal} completed successfully and published ${evolutionRound.artifacts.length} evolution artifacts.\n`,
-                previousName: ordinal > 1 ? "results/fixture-result.md" : null,
-                diffLines: [
-                  { kind: "context", text: "# Fixture result" },
-                  { kind: "added", text: `Session ${ordinal} published ${evolutionRound.artifacts.length} evolution artifacts.` },
-                ],
-              }],
+              outputFiles,
               usedArtifactIds: evolutionRound.usedArtifactIds,
               producedArtifactIds: evolutionRound.artifacts.map((artifact) => artifact.artifact_id),
             },
@@ -251,12 +322,14 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
       };
       return task;
     },
-    loadTaskLogs: async () => ({
+    loadTaskLogs: async (taskId) => ({
       schema_version: "2",
-      items: [
-        { sequence: 1, occurred_at: NOW, stream: "system", message: "The immutable Task admission was accepted." },
-        { sequence: 2, occurred_at: NOW, stream: "transcript", message: "The agent completed the evidence review." },
-      ],
+      items: (taskLogs.get(taskId) ?? ["No development runner logs were recorded."]).map((message, index) => ({
+        sequence: index + 1,
+        occurred_at: NOW,
+        stream: index === 0 ? "system" : "transcript",
+        message,
+      })),
       next_cursor: null,
       has_more: false,
     }),
@@ -588,6 +661,39 @@ export function createFixtureSnapshot(): DesktopProductSnapshotV2 {
   };
 }
 
+function createDevelopmentAgentSnapshot(): DesktopProductSnapshotV2 {
+  const fixture = createFixtureSnapshot();
+  const profile = {
+    ...fixture.profiles[0]!,
+    profile_id: "development-agent-profile",
+    display_name: "GPU lab (development tunnel)",
+    ssh_host_alias: "openevo-lab",
+    active_project_id: null,
+  };
+  return {
+    ...fixture,
+    state: {
+      ...fixture.state,
+      profiles: [profile] as never,
+      active_profile_id: profile.profile_id,
+      active_project_id: null,
+      pending_operations: [],
+    },
+    profiles: [profile] as never,
+    projects: [],
+    tasks: [],
+    transitions: {},
+    timelines: {},
+    artifacts: [],
+    services: [],
+    capability: null,
+    validation: null,
+    activeOperation: null,
+    fixturePresentation: { tasks: {}, artifacts: {} },
+    stream: { status: "fresh", epoch: 1, lastEventId: null },
+  };
+}
+
 function artifact(
   artifactId: string,
   artifactType: "text_memory" | "skill_bundle" | "agent_system",
@@ -764,6 +870,22 @@ function fixtureCapability(
   } as never;
 }
 
+function developmentAgentCapability(
+  projectId: string,
+  executionMode: ScienceProjectConfigV2["execution"]["mode"],
+): DesktopProductSnapshotV2["capability"] {
+  const capability = fixtureCapability(projectId, executionMode);
+  if (!capability) return null;
+  return {
+    ...capability,
+    capabilities: {
+      ...capability.capabilities,
+      core_version: "development-agent-bridge",
+      targets: [],
+    },
+  };
+}
+
 function fixtureEvolutionSelections(): ScienceProjectConfigV2["evolution"]["targets"] {
   return Object.fromEntries(FIXTURE_EVOLUTION_TARGETS.map((target) => [target.targetId, {
     enabled: true,
@@ -775,6 +897,18 @@ function fixtureEvolutionSelections(): ScienceProjectConfigV2["evolution"]["targ
 function withFixtureEvolutionDefaults(config: ScienceProjectConfigV2): ScienceProjectConfigV2 {
   if (Object.keys(config.evolution.targets).length > 0) return config;
   return { ...config, evolution: { targets: fixtureEvolutionSelections() } };
+}
+
+function withEvolutionDisabled(config: ScienceProjectConfigV2): ScienceProjectConfigV2 {
+  return {
+    ...config,
+    evolution: {
+      targets: Object.fromEntries(Object.entries(config.evolution.targets).map(([targetId, selection]) => [
+        targetId,
+        { ...selection, enabled: false },
+      ])),
+    },
+  };
 }
 
 function fixtureEvolutionRound(

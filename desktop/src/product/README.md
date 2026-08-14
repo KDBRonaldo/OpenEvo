@@ -115,6 +115,34 @@ build before attaching the native bridge. The plain `npm run dev` command
 remains available for the separate shared observability pages; it is not the
 Desktop native development surface.
 
+For a real remote-development loop, use `npm run dev:live` from Linux/WSL or
+macOS after installing `uv`. This command never imports the fixture provider.
+It launches the same Tauri renderer and authenticated Local API v2 adapter used by the product,
+then lets the sidecar deploy/connect the sealed Daemon over the selected system
+OpenSSH alias. It requires two explicit local inputs:
+
+- `OPENEVO_DEV_RELEASE_ASSETS_ROOT`: a staged `openevo-release-assets`
+  directory containing the Core wheel/framework lock, Linux Daemon bundle and
+  managed runtime archive;
+- `OPENEVO_DEV_ASKPASS_HELPER`: an absolute path to a link-count-one `0755`
+  `openevo-ssh-askpass` executable built for the local host.
+
+The fixed Vite origins are admitted only when the sidecar reports the
+`development` build channel. Release and test compositions retain the closed
+Tauri-only origin set. `npm run dev:fixture` remains the explicit visual-fixture
+loop behind `/product-preview.html`; it is never a live Daemon workflow.
+
+For the narrower "ask the remote Codex once and render its real answer" loop,
+use `npm run dev:agent`. This mode deliberately bypasses project evolution and
+the sealed release lifecycle while those pieces are under development. The
+server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
+forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
+while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
+SSH command, or remote address. Projects and session metadata are development
+in-memory state, but the transcript's agent message is the actual Codex CLI
+response. This bridge is reachable only in Vite mode `openevo-live-agent` and is
+not imported by the packaged release entrypoint.
+
 The release adapter copies the authenticated
 `DesktopStateV1.execution_mode_capabilities` object into
 `DesktopProductSnapshot` without projection. Mode tabs, labels, new-project

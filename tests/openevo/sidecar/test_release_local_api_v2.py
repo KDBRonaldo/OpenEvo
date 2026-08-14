@@ -774,6 +774,35 @@ def test_release_v2_cors_admits_the_exact_renderer_headers_outside_error_boundar
         store.close()
 
 
+def test_development_v2_cors_admits_only_the_fixed_vite_origins(
+    tmp_path: Path,
+) -> None:
+    provider, store, _lifecycle, _connector = _provider(tmp_path)
+    app = create_release_desktop_local_api_v2_app(
+        session_token=SESSION,
+        provider=provider,
+        build_channel="development",
+        close_on_shutdown=False,
+    )
+    client = TestClient(app)
+    try:
+        for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
+            response = client.get("/health", headers={"Origin": origin})
+            assert response.status_code == 200, response.text
+            assert response.headers["access-control-allow-origin"] == origin
+
+        hostile = client.get(
+            "/health",
+            headers={"Origin": "http://localhost:5174"},
+        )
+        assert hostile.status_code == 200, hostile.text
+        assert "access-control-allow-origin" not in hostile.headers
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
 def test_packaged_v2_composition_owns_catalog_state_runtime_and_ssh_authorities(
     tmp_path: Path,
 ) -> None:

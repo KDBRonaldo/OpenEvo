@@ -5,7 +5,10 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:product": "vite --open /product-preview.html",
+    "dev:fixture": "vite --open /product-preview.html",
+    "dev:product": "npm run dev:fixture",
+    "dev:agent": "vite --mode openevo-live-agent --open /product-preview.html",
+    "dev:live": "uv run python ../scripts/dev/run_desktop_live.py",
     "dev:openevo": "vite --mode openevo-desktop",
     "build": "vite build",
     "build:openevo": "vite build --mode openevo-desktop && node scripts/package-openevo-product.mjs",

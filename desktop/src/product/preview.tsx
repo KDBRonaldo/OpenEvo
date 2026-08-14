@@ -2,10 +2,13 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "../styles.css";
 import { DesktopProductApp } from "./DesktopProductApp";
+import { createDevelopmentAgentProvider } from "./developmentAgentProvider";
 import { createFixtureDesktopProductProvider } from "./fixtureProvider";
 
-export function createProductPreviewProvider() {
-  return createFixtureDesktopProductProvider();
+export function createProductPreviewProvider(mode = import.meta.env.MODE) {
+  return mode === "openevo-live-agent"
+    ? createDevelopmentAgentProvider()
+    : createFixtureDesktopProductProvider();
 }
 
 if (!import.meta.env.DEV) {

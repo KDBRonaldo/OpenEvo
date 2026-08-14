@@ -216,6 +216,7 @@ export function DesktopProductApp({
   const diagnostics = provider.listDiagnostics();
   const mutationIntents = provider.listMutationIntents();
   const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
+  const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
 
   const runProject = async (
     project: ProjectV2,
@@ -256,7 +257,9 @@ export function DesktopProductApp({
       await refresh();
       setWorkspace("research");
       setSelectedTaskId(submittedTask.task_id);
-      setActionStatus("Task admitted with immutable Project Head and execution authority.");
+      setActionStatus(developmentAgentBridge
+        ? "The remote Codex response was received and added to this development session."
+        : "Task admitted with immutable Project Head and execution authority.");
     } catch (error) {
       setActionError(userMessageV2(error));
       await refresh();
@@ -355,7 +358,14 @@ export function DesktopProductApp({
         <main className="product-main">
           {loadError ? <Notice tone="error" title="Refresh failed" detail={loadError} /> : null}
           {actionError ? <Notice tone="error" title="Action could not be completed" detail={actionError} onDismiss={() => setActionError(null)} /> : null}
-          {actionStatus ? <Notice tone="success" title="Remote authority updated" detail={actionStatus} onDismiss={() => setActionStatus(null)} /> : null}
+          {developmentAgentBridge ? (
+            <Notice
+              tone="warning"
+              title="Real-agent development mode"
+              detail="Agent replies come from the remote Codex CLI. Project authority, history, and workspace metadata are local in-memory development state; evolution is disabled."
+            />
+          ) : null}
+          {actionStatus ? <Notice tone="success" title={developmentAgentBridge ? "Development session updated" : "Remote authority updated"} detail={actionStatus} onDismiss={() => setActionStatus(null)} /> : null}
           {snapshot.stream.status !== "fresh" ? (
             <Notice tone="warning" title="Refreshing authoritative state" detail="Actions remain paused until Desktop reloads current remote state." />
           ) : null}
@@ -568,7 +578,9 @@ export function DesktopProductApp({
             setWorkspace("research");
             setProjectOpen(false);
             setProjectEditing(false);
-            setActionStatus("Project creation started. Progress and process logs remain available in Operations.");
+            setActionStatus(developmentAgentBridge
+              ? "Project created in local development state. Start a session to call the remote Codex CLI."
+              : "Project creation started. Progress and process logs remain available in Operations.");
           }}
           onError={(error) => setActionError(userMessageV2(error))}
         />

@@ -136,6 +136,11 @@ _SENSITIVE_ENVIRONMENT_NAME = re.compile(
 )
 
 _TAURI_RELEASE_ORIGINS = ("tauri://localhost", "http://tauri.localhost")
+_TAURI_DEVELOPMENT_ORIGINS = (
+    *_TAURI_RELEASE_ORIGINS,
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
 _TAURI_RELEASE_METHODS = ("GET", "POST", "PATCH", "DELETE")
 _TAURI_RELEASE_HEADERS = (
     "Accept",
@@ -154,16 +159,24 @@ _V2_WORKSPACE_STATE_DIRECTORY = "workspace-imports-v2"
 
 
 class _ReleaseDesktopLocalApiApp(FastAPI):
+    cors_origins = _TAURI_RELEASE_ORIGINS
+
     def build_middleware_stack(self) -> ASGIApp:
         # Global wrapping keeps CORS outside Starlette's ServerErrorMiddleware,
         # so the renderer can consume bounded 500 responses as well.
         return CORSMiddleware(
             app=super().build_middleware_stack(),
-            allow_origins=list(_TAURI_RELEASE_ORIGINS),
+            allow_origins=list(self.cors_origins),
             allow_methods=list(_TAURI_RELEASE_METHODS),
             allow_headers=list(_TAURI_RELEASE_HEADERS),
             allow_credentials=False,
         )
+
+
+class _DevelopmentDesktopLocalApiApp(_ReleaseDesktopLocalApiApp):
+    """Admit only the fixed Vite origins used by the native debug shell."""
+
+    cors_origins = _TAURI_DEVELOPMENT_ORIGINS
 
 
 def _cleanup_after_primary_failure(cleanup: Callable[[], None]) -> None:
@@ -1004,6 +1017,7 @@ def create_packaged_release_desktop_local_api_v2_app(
         app = create_release_desktop_local_api_v2_app(
             session_token=session_token,
             provider=provider,
+            build_channel=build_channel,
             close_on_shutdown=close_on_shutdown,
         )
         app.state.desktop_legacy_import_report = local_state.legacy_import
@@ -1030,6 +1044,7 @@ def create_release_desktop_local_api_v2_app(
     *,
     session_token: str,
     provider: DesktopReleaseProviderV2,
+    build_channel: Literal["release", "development", "test"] = "release",
     close_on_shutdown: bool = True,
 ) -> FastAPI:
     """Mount the packaged 0.1.10 provider on Local API v2 only."""
@@ -1042,6 +1057,8 @@ def create_release_desktop_local_api_v2_app(
         raise ValueError("Desktop session token must be 32-4096 characters without controls")
     if type(provider) is not DesktopReleaseProviderV2:
         raise TypeError("Local API v2 requires the exact release provider")
+    if build_channel not in {"release", "development", "test"}:
+        raise ValueError("Local API v2 build channel is invalid")
     if type(close_on_shutdown) is not bool:
         raise TypeError("shutdown ownership must be boolean")
     validate_v0110_release_composition(
@@ -1052,9 +1069,14 @@ def create_release_desktop_local_api_v2_app(
         allow_legacy_route_fallback=False,
     )
     encoded_session_token = session_token.encode("utf-8")
+    app_factory = (
+        _DevelopmentDesktopLocalApiApp
+        if build_channel == "development"
+        else _ReleaseDesktopLocalApiApp
+    )
     app = create_desktop_local_v2_contract_app(
         provider,
-        _app_factory=_ReleaseDesktopLocalApiApp,
+        _app_factory=app_factory,
     )
     app.state.desktop_release_provider = provider
 
