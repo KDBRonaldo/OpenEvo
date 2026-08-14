@@ -2,7 +2,7 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import "../styles.css";
 import type { LifecycleOperationV2, OperationV2 } from "../api/v2/schemas";
-import { DesktopProductAppV2 } from "./DesktopProductAppV2";
+import { DesktopProductApp } from "./DesktopProductApp";
 import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
 import {
   unavailableDesktopProductProviderV2,
@@ -181,6 +181,6 @@ function createLifecyclePreviewProvider(): DesktopProductProviderV2 {
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <DesktopProductAppV2 provider={createLifecyclePreviewProvider()} />
+    <DesktopProductApp provider={createLifecyclePreviewProvider()} />
   </React.StrictMode>,
 );

@@ -54,6 +54,34 @@ export interface DesktopProductSnapshotV2 {
   readonly validation: ProjectValidationV2 | null;
   readonly activeOperation: ProductOperationV2 | null;
   readonly stream: ProductStreamStateV2;
+  /** Development/demo-only readable projections. Real Local API snapshots omit this. */
+  readonly fixturePresentation?: FixturePresentationV2;
+}
+
+export interface FixturePresentationV2 {
+  readonly tasks: Readonly<Record<string, {
+    readonly instruction: { readonly title: string; readonly objective: string } | null;
+    readonly transcript: readonly { readonly speaker: "user" | "agent" | "system"; readonly text: string }[];
+    readonly outputFiles: readonly {
+      readonly name: string;
+      readonly summary: string;
+      readonly content?: string;
+      readonly previousName?: string | null;
+      readonly diffLines?: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
+    }[];
+    readonly usedArtifactIds: readonly string[];
+    readonly producedArtifactIds: readonly string[];
+  }>>;
+  readonly artifacts: Readonly<Record<string, {
+    readonly title: string;
+    readonly sourceTaskId: string | null;
+    readonly targetPath: string | null;
+    readonly status: "created" | "updated" | "unchanged" | "failed" | "incompatible" | "unavailable";
+    readonly statusDetail: string;
+    readonly documents: readonly { readonly path: string; readonly content: string }[];
+    readonly previousArtifactId: string | null;
+    readonly diffLines: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
+  }>>;
 }
 
 export type ProductRefreshResultV2 =

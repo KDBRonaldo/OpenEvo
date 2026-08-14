@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { createFixtureDesktopProductProvider } from "./fixtureProvider";
+import { createFixtureDesktopProductProvider } from "./legacyFixtureProvider";
 import {
   ProductRefreshOrder,
   defineDesktopProductReleaseContract,

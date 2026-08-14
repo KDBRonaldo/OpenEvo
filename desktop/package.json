@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:product": "vite --open /product-preview.html",
     "dev:openevo": "vite --mode openevo-desktop",
     "build": "vite build",
     "build:openevo": "vite build --mode openevo-desktop && node scripts/package-openevo-product.mjs",

@@ -19,7 +19,7 @@ import {
   type DesktopStateV1,
   type RunV1,
 } from "../api/v1/schemas";
-import { DesktopProductApp } from "./DesktopProductApp";
+import { LegacyDesktopProductApp as DesktopProductApp } from "./LegacyDesktopProductApp";
 import { LocalApiDesktopProductProvider } from "./localApiProvider";
 import type { DesktopProductProvider, ProductRefreshResult } from "./provider";
 

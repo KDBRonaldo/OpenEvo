@@ -20,10 +20,7 @@ import {
   DesktopApiError,
   DesktopContractError,
 } from "./api/v1/client";
-import {
-  DesktopApiErrorV2,
-  DesktopContractErrorV2,
-} from "./api/v2/client";
+import { DesktopApiErrorV2, DesktopContractErrorV2 } from "./api/v2/client";
 import { Dashboard } from "./routes/Dashboard";
 import { TasksList } from "./routes/TasksList";
 import { TaskDetail } from "./routes/TaskDetail";
@@ -33,7 +30,7 @@ import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { OpenEvoMark } from "./components/OpenEvoMark";
 import { DesktopProductApp } from "./product/DesktopProductApp";
-import { DesktopProductAppV2 } from "./product/DesktopProductAppV2";
+import { LegacyDesktopProductApp } from "./product/LegacyDesktopProductApp";
 import { SampleScientificProjectView } from "./product/ScientificProjectSample";
 import {
   SAMPLE_SCIENTIFIC_PROJECT,
@@ -69,7 +66,9 @@ import {
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
 
-type DesktopProductProviderAny = DesktopProductProvider | DesktopProductProviderV2;
+type DesktopProductProviderAny =
+  | DesktopProductProvider
+  | DesktopProductProviderV2;
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -78,7 +77,9 @@ function NavItem({ to, label }: { to: string; label: string }) {
       end={to === "/"}
       className={({ isActive }) =>
         `rounded px-3 py-1 text-sm ${
-          isActive ? "bg-slate-900 text-white" : "text-slate-700 hover:bg-slate-100"
+          isActive
+            ? "bg-slate-900 text-white"
+            : "text-slate-700 hover:bg-slate-100"
         }`
       }
     >
@@ -128,7 +129,9 @@ export function SharedDashboardShell() {
           break;
         case "session.state_changed":
           if (data.session_id) {
-            queryClient.invalidateQueries({ queryKey: ["session", data.session_id] });
+            queryClient.invalidateQueries({
+              queryKey: ["session", data.session_id],
+            });
             queryClient.invalidateQueries({
               queryKey: ["session-completions", data.session_id],
             });
@@ -201,16 +204,8 @@ export function OpenEvoDesktopOnlyShell({
     <Routes>
       <Route
         path="*"
-        element={(
+        element={
           provider && isDesktopProductProviderV2(provider) ? (
-            <DesktopProductAppV2
-              provider={provider}
-              onInitialSnapshotFailed={onInitialSnapshotFailed}
-              onReady={onReady}
-              openConnectionSettings={openConnectionSettings}
-              onConnectionSettingsOpened={onConnectionSettingsOpened}
-            />
-          ) : (
             <DesktopProductApp
               provider={provider}
               onInitialSnapshotFailed={onInitialSnapshotFailed}
@@ -218,15 +213,33 @@ export function OpenEvoDesktopOnlyShell({
               openConnectionSettings={openConnectionSettings}
               onConnectionSettingsOpened={onConnectionSettingsOpened}
             />
+          ) : (
+            <LegacyDesktopProductApp
+              provider={provider}
+              onInitialSnapshotFailed={onInitialSnapshotFailed}
+              onReady={onReady}
+              openConnectionSettings={openConnectionSettings}
+              onConnectionSettingsOpened={onConnectionSettingsOpened}
+            />
           )
-        )}
+        }
       />
     </Routes>
   );
 }
 
-export function AppShell({ desktopOnly = false, productProvider }: { desktopOnly?: boolean; productProvider?: DesktopProductProviderAny }) {
-  return desktopOnly ? <OpenEvoDesktopOnlyShell provider={productProvider} /> : <SharedDashboardShell />;
+export function AppShell({
+  desktopOnly = false,
+  productProvider,
+}: {
+  desktopOnly?: boolean;
+  productProvider?: DesktopProductProviderAny;
+}) {
+  return desktopOnly ? (
+    <OpenEvoDesktopOnlyShell provider={productProvider} />
+  ) : (
+    <SharedDashboardShell />
+  );
 }
 
 type ReleaseDesktopStartupState =
@@ -248,27 +261,31 @@ type ReleaseDesktopStartupFailure = {
   readonly nextAction: string | null;
 };
 
-function safeNativeHostFailure(error: unknown): ReleaseDesktopStartupFailure | null {
-  if (typeof error !== "object" || error === null || Array.isArray(error)) return null;
+function safeNativeHostFailure(
+  error: unknown,
+): ReleaseDesktopStartupFailure | null {
+  if (typeof error !== "object" || error === null || Array.isArray(error))
+    return null;
   const record = error as Record<string, unknown>;
   if (
-    Object.keys(record).some((key) => key !== "code" && key !== "message")
-    || typeof record.code !== "string"
-    || !/^[a-z][a-z0-9_]{2,63}$/.test(record.code)
-    || typeof record.message !== "string"
-    || record.message.length < 1
-    || record.message.length > 768
-    || /[^\x20-\x7e]/.test(record.message)
+    Object.keys(record).some((key) => key !== "code" && key !== "message") ||
+    typeof record.code !== "string" ||
+    !/^[a-z][a-z0-9_]{2,63}$/.test(record.code) ||
+    typeof record.message !== "string" ||
+    record.message.length < 1 ||
+    record.message.length > 768 ||
+    /[^\x20-\x7e]/.test(record.message)
   ) {
     return null;
   }
   return {
     message: record.message,
-    nextAction: record.code.includes("missing")
-      || record.code.includes("packaged_")
-      || record.code.includes("bundled_")
-      ? "Reinstall OpenEvo Desktop, then try again."
-      : "Retry startup. If the problem continues, restart OpenEvo Desktop.",
+    nextAction:
+      record.code.includes("missing") ||
+      record.code.includes("packaged_") ||
+      record.code.includes("bundled_")
+        ? "Reinstall OpenEvo Desktop, then try again."
+        : "Retry startup. If the problem continues, restart OpenEvo Desktop.",
   };
 }
 
@@ -281,19 +298,23 @@ function safeStartupFailure(error: unknown): ReleaseDesktopStartupFailure {
         : "Restart OpenEvo Desktop. If the problem continues, install the latest version.",
     };
   }
-  if (error instanceof DesktopContractError
-    || error instanceof ContractVersionUnsupportedError
-    || error instanceof DesktopContractErrorV2) {
+  if (
+    error instanceof DesktopContractError ||
+    error instanceof ContractVersionUnsupportedError ||
+    error instanceof DesktopContractErrorV2
+  ) {
     return {
       message: error.message,
-      nextAction: "Retry startup. If the problem continues, update OpenEvo Desktop.",
+      nextAction:
+        "Retry startup. If the problem continues, update OpenEvo Desktop.",
     };
   }
   const nativeFailure = safeNativeHostFailure(error);
   if (nativeFailure !== null) return nativeFailure;
   return {
     message: "The local OpenEvo Desktop service could not be started.",
-    nextAction: "Retry startup. If the problem continues, restart OpenEvo Desktop.",
+    nextAction:
+      "Retry startup. If the problem continues, restart OpenEvo Desktop.",
   };
 }
 
@@ -317,7 +338,11 @@ function StartupDiagnostics({ startupPending }: { startupPending: boolean }) {
   const revealLogs = useCallback(() => {
     setActionStatus(null);
     void revealDesktopLogDirectory().then((result) => {
-      setActionStatus(result.status === "revealed" ? "Log folder opened." : "Log folder is unavailable.");
+      setActionStatus(
+        result.status === "revealed"
+          ? "Log folder opened."
+          : "Log folder is unavailable.",
+      );
     });
   }, []);
 
@@ -327,7 +352,9 @@ function StartupDiagnostics({ startupPending }: { startupPending: boolean }) {
       setActionStatus(
         result.status === "exported"
           ? "Diagnostics exported."
-          : result.status === "cancelled" ? "Export cancelled." : "Diagnostics export is unavailable.",
+          : result.status === "cancelled"
+            ? "Export cancelled."
+            : "Diagnostics export is unavailable.",
       );
     });
   }, []);
@@ -345,24 +372,45 @@ function StartupDiagnostics({ startupPending }: { startupPending: boolean }) {
         Diagnostics
       </button>
       {open ? (
-        <div id="startup-diagnostics-panel" className="startup-diagnostics-panel">
+        <div
+          id="startup-diagnostics-panel"
+          className="startup-diagnostics-panel"
+        >
           <div className="startup-diagnostics-actions">
-            <button type="button" className="secondary-button" onClick={viewLogs} disabled={loadingLogs}>
-              <BookOpen size={15} /> {loadingLogs ? "Loading logs" : "View logs"}
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={viewLogs}
+              disabled={loadingLogs}
+            >
+              <BookOpen size={15} />{" "}
+              {loadingLogs ? "Loading logs" : "View logs"}
             </button>
             {!startupPending ? (
               <>
-                <button type="button" className="secondary-button" onClick={revealLogs}>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={revealLogs}
+                >
                   <FolderOpen size={15} /> Reveal in Finder
                 </button>
-                <button type="button" className="secondary-button" onClick={exportDiagnostics}>
+                <button
+                  type="button"
+                  className="secondary-button"
+                  onClick={exportDiagnostics}
+                >
                   <Download size={15} /> Export diagnostics
                 </button>
               </>
             ) : null}
           </div>
           {tail ? <StartupLogTail tail={tail} /> : null}
-          {actionStatus ? <p className="startup-diagnostics-status" role="status">{actionStatus}</p> : null}
+          {actionStatus ? (
+            <p className="startup-diagnostics-status" role="status">
+              {actionStatus}
+            </p>
+          ) : null}
         </div>
       ) : null}
     </section>
@@ -371,28 +419,67 @@ function StartupDiagnostics({ startupPending }: { startupPending: boolean }) {
 
 function StartupLogTail({ tail }: { tail: DesktopLogTailV1 }) {
   if (tail.availability === "unavailable") {
-    return <p className="startup-diagnostics-status" role="status">Native logs are unavailable.</p>;
+    return (
+      <p className="startup-diagnostics-status" role="status">
+        Native logs are unavailable.
+      </p>
+    );
   }
   return (
     <div className="startup-log-tail" aria-live="polite">
       {tail.availability === "memory_only" ? (
-        <p className="startup-diagnostics-status">Showing in-memory logs only.</p>
+        <p className="startup-diagnostics-status">
+          Showing in-memory logs only.
+        </p>
       ) : null}
       {tail.dropped_count > 0 ? (
-        <p className="startup-diagnostics-status">{tail.dropped_count} earlier events were not retained.</p>
+        <p className="startup-diagnostics-status">
+          {tail.dropped_count} earlier events were not retained.
+        </p>
       ) : null}
-      {tail.entries.length === 0 ? <p className="startup-diagnostics-status">No diagnostic events available.</p> : null}
+      {tail.entries.length === 0 ? (
+        <p className="startup-diagnostics-status">
+          No diagnostic events available.
+        </p>
+      ) : null}
       {tail.entries.map((entry) => (
         <div className="startup-log-entry" key={entry.sequence}>
-          <div><span>Sequence</span><strong>{entry.sequence}</strong></div>
-          <div><span>Time</span><strong>{entry.occurred_at}</strong></div>
-          <div><span>Source</span><strong>{entry.source}</strong></div>
-          <div><span>Level</span><strong>{entry.level}</strong></div>
-          <div><span>Event</span><strong>{entry.event}</strong></div>
-          <div><span>Code</span><strong>{entry.code ?? "None"}</strong></div>
-          <div><span>Exit code</span><strong>{entry.exit_code ?? "None"}</strong></div>
-          <div><span>Signal</span><strong>{entry.signal ?? "None"}</strong></div>
-          <div><span>Errno</span><strong>{entry.errno ?? "None"}</strong></div>
+          <div>
+            <span>Sequence</span>
+            <strong>{entry.sequence}</strong>
+          </div>
+          <div>
+            <span>Time</span>
+            <strong>{entry.occurred_at}</strong>
+          </div>
+          <div>
+            <span>Source</span>
+            <strong>{entry.source}</strong>
+          </div>
+          <div>
+            <span>Level</span>
+            <strong>{entry.level}</strong>
+          </div>
+          <div>
+            <span>Event</span>
+            <strong>{entry.event}</strong>
+          </div>
+          <div>
+            <span>Code</span>
+            <strong>{entry.code ?? "None"}</strong>
+          </div>
+          <div>
+            <span>Exit code</span>
+            <strong>{entry.exit_code ?? "None"}</strong>
+          </div>
+          <div>
+            <span>Signal</span>
+            <strong>{entry.signal ?? "None"}</strong>
+          </div>
+          <div>
+            <span>Errno</span>
+            <strong>{entry.errno ?? "None"}</strong>
+          </div>
         </div>
       ))}
     </div>
@@ -418,10 +505,10 @@ function ReleaseStartupSample({
   nativeStartupStatus?: NativeStartupStatusV2 | null;
   onCancelStartup?: () => void;
 }) {
-  const [workspace, setWorkspace] = useState<ReadonlySampleWorkspace>("research");
-  const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
-    SAMPLE_SCIENTIFIC_PROJECT.id,
-  );
+  const [workspace, setWorkspace] =
+    useState<ReadonlySampleWorkspace>("research");
+  const [selectedSampleId, setSelectedSampleId] =
+    useState<SampleScientificProjectId>(SAMPLE_SCIENTIFIC_PROJECT.id);
   const selectedSample = sampleScientificProject(selectedSampleId);
   const sampleWorkspaces: ReadonlyArray<{
     readonly id: ReadonlySampleWorkspace;
@@ -434,7 +521,16 @@ function ReleaseStartupSample({
   ];
 
   const handleWorkspaceKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
-    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) {
+    if (
+      ![
+        "ArrowUp",
+        "ArrowDown",
+        "ArrowLeft",
+        "ArrowRight",
+        "Home",
+        "End",
+      ].includes(event.key)
+    ) {
       return;
     }
     const tabs = Array.from(
@@ -443,15 +539,15 @@ function ReleaseStartupSample({
     const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
     if (current < 0 || tabs.length === 0) return;
     event.preventDefault();
-    const next = event.key === "Home"
-      ? 0
-      : event.key === "End"
-        ? tabs.length - 1
-        : (
-            current
-            + (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1)
-            + tabs.length
-          ) % tabs.length;
+    const next =
+      event.key === "Home"
+        ? 0
+        : event.key === "End"
+          ? tabs.length - 1
+          : (current +
+              (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) +
+              tabs.length) %
+            tabs.length;
     tabs[next]?.focus();
     tabs[next]?.click();
   };
@@ -465,7 +561,9 @@ function ReleaseStartupSample({
     >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
-          <span className="product-mark"><OpenEvoMark /></span>
+          <span className="product-mark">
+            <OpenEvoMark />
+          </span>
           <span>OpenEvo</span>
         </div>
         <nav
@@ -538,21 +636,30 @@ function ReleaseStartupSample({
             <div>
               <strong>
                 {startupPending
-                  ? retrying ? "Retrying OpenEvo Desktop" : "Starting OpenEvo Desktop"
+                  ? retrying
+                    ? "Retrying OpenEvo Desktop"
+                    : "Starting OpenEvo Desktop"
                   : "OpenEvo Desktop could not start"}
               </strong>
               {failure ? <span>{failure.message}</span> : null}
               {failure?.nextAction ? <span>{failure.nextAction}</span> : null}
               {connectionRequested ? (
-                <span>Your remote workspace will open when OpenEvo Desktop is ready.</span>
+                <span>
+                  Your remote workspace will open when OpenEvo Desktop is ready.
+                </span>
               ) : null}
             </div>
             {startupPending ? (
               <button type="button" className="secondary-button" disabled>
-                <LoaderCircle className="spin" size={15} /> {retrying ? "Retrying" : "Starting"}
+                <LoaderCircle className="spin" size={15} />{" "}
+                {retrying ? "Retrying" : "Starting"}
               </button>
             ) : (
-              <button type="button" className="secondary-button" onClick={onRetry}>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={onRetry}
+              >
                 <RefreshCw size={15} /> Retry
               </button>
             )}
@@ -561,7 +668,9 @@ function ReleaseStartupSample({
           {startupPending && nativeStartupStatus !== null ? (
             <LifecycleOperationPanelV2
               model={nativeStartupPanelModelV2(nativeStartupStatus)}
-              onCancel={nativeStartupStatus.cancellable ? onCancelStartup : undefined}
+              onCancel={
+                nativeStartupStatus.cancellable ? onCancelStartup : undefined
+              }
             />
           ) : null}
           <div className="initial-sync-sample">
@@ -577,9 +686,13 @@ function ReleaseStartupSample({
   );
 }
 
-function nativeStartupPanelModelV2(status: NativeStartupStatusV2): OperationPanelModelV2 {
+function nativeStartupPanelModelV2(
+  status: NativeStartupStatusV2,
+): OperationPanelModelV2 {
   const now = Date.now();
-  const startedAt = new Date(Math.max(0, now - status.elapsed_milliseconds)).toISOString();
+  const startedAt = new Date(
+    Math.max(0, now - status.elapsed_milliseconds),
+  ).toISOString();
   const phaseLabels: Record<NativeStartupStatusV2["phase"], string> = {
     validating_bundle: "Verifying the packaged local service",
     spawning_sidecar: "Starting the local service process",
@@ -588,13 +701,14 @@ function nativeStartupPanelModelV2(status: NativeStartupStatusV2): OperationPane
     negotiating_contract: "Negotiating the exact Desktop contract",
     ready: "Local service ready",
   };
-  const panelStatus: OperationPanelModelV2["status"] = status.status === "idle"
-    ? "queued"
-    : status.status === "running"
-      ? "running"
-      : status.status === "succeeded"
-        ? "succeeded"
-        : status.status;
+  const panelStatus: OperationPanelModelV2["status"] =
+    status.status === "idle"
+      ? "queued"
+      : status.status === "running"
+        ? "running"
+        : status.status === "succeeded"
+          ? "succeeded"
+          : status.status;
   return {
     operationId: `native-startup-${status.startup_epoch}`,
     title: "Start OpenEvo Desktop local service",
@@ -610,16 +724,20 @@ function nativeStartupPanelModelV2(status: NativeStartupStatusV2): OperationPane
       : null,
     elapsedMillisecondsFloor: status.elapsed_milliseconds,
     cancellable: status.cancellable,
-    failure: status.failure === null ? null : {
-      summary: status.failure.message,
-      retryable: true,
-    },
+    failure:
+      status.failure === null
+        ? null
+        : {
+            summary: status.failure.message,
+            retryable: true,
+          },
     logs: [],
     droppedBeforeSequence: 0,
     hasOlderLogs: false,
     hasNewerLogs: false,
     unresolvedMutation: false,
-    emptyLogMessage: "Native startup output remains available through Diagnostics.",
+    emptyLogMessage:
+      "Native startup output remains available through Diagnostics.",
   };
 }
 
@@ -640,131 +758,152 @@ export function ReleaseDesktopProductShell({
   const readinessGeneration = useRef<number | null>(null);
   const lifecycle = useRef<Promise<void>>(Promise.resolve());
   const startupInFlight = useRef(false);
-  const [startup, setStartup] = useState<ReleaseDesktopStartupState>({ status: "loading", retrying: false });
+  const [startup, setStartup] = useState<ReleaseDesktopStartupState>({
+    status: "loading",
+    retrying: false,
+  });
   const [connectionRequested, setConnectionRequested] = useState(false);
-  const [nativeStartupStatus, setNativeStartupStatus] = useState<NativeStartupStatusV2 | null>(null);
+  const [nativeStartupStatus, setNativeStartupStatus] =
+    useState<NativeStartupStatusV2 | null>(null);
 
-  const reportStageBestEffort = useCallback((stage: ReleaseDesktopBootstrapStage): void => {
-    try {
-      void Promise.resolve(reportStage(stage)).catch(() => {});
-    } catch {
-      // Closed diagnostics cannot alter startup state or readiness authority.
-    }
-  }, [reportStage]);
+  const reportStageBestEffort = useCallback(
+    (stage: ReleaseDesktopBootstrapStage): void => {
+      try {
+        void Promise.resolve(reportStage(stage)).catch(() => {});
+      } catch {
+        // Closed diagnostics cannot alter startup state or readiness authority.
+      }
+    },
+    [reportStage],
+  );
 
-  const enqueueLifecycle = useCallback((operation: () => Promise<void>): Promise<void> => {
-    const next = lifecycle.current.catch(() => {}).then(operation);
-    lifecycle.current = next.catch(() => {});
-    return next;
-  }, []);
+  const enqueueLifecycle = useCallback(
+    (operation: () => Promise<void>): Promise<void> => {
+      const next = lifecycle.current.catch(() => {}).then(operation);
+      lifecycle.current = next.catch(() => {});
+      return next;
+    },
+    [],
+  );
 
   const cancelLifecycle = useCallback(() => {
     // Do not queue cancellation behind an in-flight bootstrap. Tauri's stop
     // command cancels and joins a native start that has not published yet.
     const cancellation = stopProvider().catch(() => {});
-    lifecycle.current = Promise.all([lifecycle.current.catch(() => {}), cancellation]).then(() => {});
+    lifecycle.current = Promise.all([
+      lifecycle.current.catch(() => {}),
+      cancellation,
+    ]).then(() => {});
   }, [stopProvider]);
 
-  const start = useCallback((retrying = false) => {
-    if (startupInFlight.current) return;
-    startupInFlight.current = true;
-    const requestGeneration = generation.current + 1;
-    generation.current = requestGeneration;
-    setNativeStartupStatus(null);
-    setStartup({ status: "loading", retrying });
-    void enqueueLifecycle(async () => {
-      try {
-        // Revoke the previous native session before requesting another
-        // credential from the Tauri host.
-        await stopProvider();
-        if (generation.current !== requestGeneration) return;
-        let provider: DesktopProductProviderAny;
+  const start = useCallback(
+    (retrying = false) => {
+      if (startupInFlight.current) return;
+      startupInFlight.current = true;
+      const requestGeneration = generation.current + 1;
+      generation.current = requestGeneration;
+      setNativeStartupStatus(null);
+      setStartup({ status: "loading", retrying });
+      void enqueueLifecycle(async () => {
         try {
-          provider = await createProvider();
+          // Revoke the previous native session before requesting another
+          // credential from the Tauri host.
+          await stopProvider();
+          if (generation.current !== requestGeneration) return;
+          let provider: DesktopProductProviderAny;
+          try {
+            provider = await createProvider();
+          } catch (error) {
+            reportStageBestEffort("provider_create_failed");
+            throw error;
+          }
+          reportStageBestEffort("provider_created");
+          if (generation.current !== requestGeneration) {
+            await stopProvider();
+            return;
+          }
+          setStartup({
+            status: "committing",
+            provider,
+            generation: requestGeneration,
+          });
         } catch (error) {
-          reportStageBestEffort("provider_create_failed");
-          throw error;
+          try {
+            await stopProvider();
+          } catch {
+            // Native cleanup is bounded; startup remains explicitly retryable.
+          }
+          if (generation.current === requestGeneration) {
+            setStartup({
+              status: "failed",
+              stage: "bootstrap",
+              failure: safeStartupFailure(error),
+            });
+          }
+        } finally {
+          if (generation.current === requestGeneration)
+            startupInFlight.current = false;
         }
-        reportStageBestEffort("provider_created");
-        if (generation.current !== requestGeneration) {
-          await stopProvider();
-          return;
-        }
-        setStartup({ status: "committing", provider, generation: requestGeneration });
-      } catch (error) {
-        try {
-          await stopProvider();
-        } catch {
-          // Native cleanup is bounded; startup remains explicitly retryable.
-        }
-        if (generation.current === requestGeneration) {
-          setStartup({
-            status: "failed",
-            stage: "bootstrap",
-            failure: safeStartupFailure(error),
-          });
-        }
-      } finally {
-        if (generation.current === requestGeneration) startupInFlight.current = false;
-      }
-    });
-  }, [createProvider, enqueueLifecycle, reportStageBestEffort, stopProvider]);
+      });
+    },
+    [createProvider, enqueueLifecycle, reportStageBestEffort, stopProvider],
+  );
 
-  const reportCommittedProduct = useCallback((
-    committingGeneration: number,
-    provider: DesktopProductProviderAny,
-  ) => {
-    if (readinessGeneration.current === committingGeneration) return;
-    readinessGeneration.current = committingGeneration;
-    void enqueueLifecycle(async () => {
+  const reportCommittedProduct = useCallback(
+    (committingGeneration: number, provider: DesktopProductProviderAny) => {
+      if (readinessGeneration.current === committingGeneration) return;
+      readinessGeneration.current = committingGeneration;
+      void enqueueLifecycle(async () => {
+        if (generation.current !== committingGeneration) return;
+        try {
+          // Effects run only after React has committed the product shell. The
+          // native marker therefore proves the packaged product UI, not merely
+          // the bootstrap placeholder, reached the invoking main WebView.
+          reportStageBestEffort("product_committed");
+          await reportReady();
+          if (generation.current === committingGeneration) {
+            setStartup({ status: "ready", provider });
+          }
+        } catch (error) {
+          try {
+            await stopProvider();
+          } catch {
+            // Native cleanup is bounded; startup remains explicitly retryable.
+          }
+          if (generation.current === committingGeneration) {
+            setStartup({
+              status: "failed",
+              stage: "readiness",
+              failure: safeStartupFailure(error),
+            });
+          }
+        }
+      });
+    },
+    [enqueueLifecycle, reportReady, reportStageBestEffort, stopProvider],
+  );
+
+  const reportInitialSnapshotFailed = useCallback(
+    (committingGeneration: number, error: unknown) => {
       if (generation.current !== committingGeneration) return;
-      try {
-        // Effects run only after React has committed the product shell. The
-        // native marker therefore proves the packaged product UI, not merely
-        // the bootstrap placeholder, reached the invoking main WebView.
-        reportStageBestEffort("product_committed");
-        await reportReady();
-        if (generation.current === committingGeneration) {
-          setStartup({ status: "ready", provider });
-        }
-      } catch (error) {
+      generation.current += 1;
+      startupInFlight.current = false;
+      reportStageBestEffort("initial_snapshot_failed");
+      setStartup({
+        status: "failed",
+        stage: "readiness",
+        failure: safeStartupFailure(error),
+      });
+      void enqueueLifecycle(async () => {
         try {
           await stopProvider();
         } catch {
-          // Native cleanup is bounded; startup remains explicitly retryable.
+          // Retry performs another bounded cleanup before creating a provider.
         }
-        if (generation.current === committingGeneration) {
-          setStartup({
-            status: "failed",
-            stage: "readiness",
-            failure: safeStartupFailure(error),
-          });
-        }
-      }
-    });
-  }, [enqueueLifecycle, reportReady, reportStageBestEffort, stopProvider]);
-
-  const reportInitialSnapshotFailed = useCallback((
-    committingGeneration: number,
-    error: unknown,
-  ) => {
-    if (generation.current !== committingGeneration) return;
-    generation.current += 1;
-    startupInFlight.current = false;
-    reportStageBestEffort("initial_snapshot_failed");
-    setStartup({
-      status: "failed",
-      stage: "readiness",
-      failure: safeStartupFailure(error),
-    });
-    void enqueueLifecycle(async () => {
-      try {
-        await stopProvider();
-      } catch {
-        // Retry performs another bounded cleanup before creating a provider.
-      }
-    });
-  }, [enqueueLifecycle, reportStageBestEffort, stopProvider]);
+      });
+    },
+    [enqueueLifecycle, reportStageBestEffort, stopProvider],
+  );
 
   const requestRemoteWorkspace = useCallback(() => {
     setConnectionRequested(true);
@@ -811,11 +950,12 @@ export function ReleaseDesktopProductShell({
     return (
       <OpenEvoDesktopOnlyShell
         provider={startup.provider}
-        onInitialSnapshotFailed={(error) => reportInitialSnapshotFailed(
-          startup.generation,
-          error,
-        )}
-        onReady={() => reportCommittedProduct(startup.generation, startup.provider)}
+        onInitialSnapshotFailed={(error) =>
+          reportInitialSnapshotFailed(startup.generation, error)
+        }
+        onReady={() =>
+          reportCommittedProduct(startup.generation, startup.provider)
+        }
         openConnectionSettings={connectionRequested}
         onConnectionSettingsOpened={connectionSettingsOpened}
       />

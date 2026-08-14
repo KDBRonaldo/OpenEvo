@@ -3,11 +3,11 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DesktopProductApp } from "./DesktopProductApp";
+import { LegacyDesktopProductApp as DesktopProductApp } from "./LegacyDesktopProductApp";
 import {
   createFixtureDesktopProductProvider,
   type FixtureDesktopProductProvider,
-} from "./fixtureProvider";
+} from "./legacyFixtureProvider";
 import {
   PROTEIN_STABILITY_SAMPLE_PROJECT,
   SAMPLE_SCIENTIFIC_PROJECT,
@@ -130,7 +130,7 @@ describe("built-in scientific project sample", () => {
     if (!switcher) throw new Error("Project switcher was not found.");
 
     expect(switcher.value).toContain("project-fixture-1");
-    expect(screenText()).toContain("Research brief");
+    expect(screenText()).toContain("Task draft");
     const realProjectValue = switcher.value;
     const sampleValue = optionValueContaining(switcher, "[Demo]");
 
@@ -139,7 +139,7 @@ describe("built-in scientific project sample", () => {
     expect(screenText()).not.toContain("Research brief");
 
     await selectProject(switcher, realProjectValue);
-    expect(screenText()).toContain("Research brief");
+    expect(screenText()).toContain("Task draft");
     expect(screenText()).not.toContain("Scientific project tour");
   });
 
@@ -155,13 +155,13 @@ describe("built-in scientific project sample", () => {
     const realProjectValue = switcher.value;
     const sampleValue = optionValueContaining(switcher, "[Demo]");
     expect(realProjectValue).not.toBe(sampleValue);
-    expect(screenText()).toContain("Research brief");
+    expect(screenText()).toContain("Task draft");
 
     await selectProject(switcher, sampleValue);
     expect(screenText()).toContain("Scientific project tour");
 
     await selectProject(switcher, realProjectValue);
-    expect(screenText()).toContain("Research brief");
+    expect(screenText()).toContain("Task draft");
     expect(screenText()).not.toContain("Scientific project tour");
   });
 

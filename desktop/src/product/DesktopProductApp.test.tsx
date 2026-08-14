@@ -3,3545 +3,1737 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { DesktopApiError } from "../api/v1/client";
+import type { DesktopProductSnapshotV2 } from "./providerV2";
+import type { OperationV2 } from "../api/v2/schemas";
 import {
-  apiErrorV1Schema,
-  type LocalOperationV1,
-  type ProjectSourceV1,
-  type RunV1,
-} from "../api/v1/schemas";
+  unavailableDesktopProductProviderV2,
+  type DesktopProductProviderV2,
+} from "./providerV2";
+import type { LifecycleOperationStateV2 } from "./lifecycleOperationsV2";
 import { DesktopProductApp } from "./DesktopProductApp";
-import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./fixtureProvider";
-import {
-  DesktopProductAmbiguousMutationError,
-  DesktopProductUserError,
-  type DesktopProductSnapshot,
-  type ProductResourceMutationIntent,
-  type ProductRunRetryRecovery,
-} from "./provider";
-import { sameSessionOutputIdentity } from "./sessionOutputIdentity";
 
-(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+const NOW = "2026-07-23T06:00:00Z";
+const DIGEST = "a".repeat(64);
+const ETAG = `"${"b".repeat(64)}"`;
 
-describe("DesktopProductApp", () => {
+function baseSnapshot(
+  overrides: Partial<DesktopProductSnapshotV2> = {},
+): DesktopProductSnapshotV2 {
+  return {
+    state: {
+      schema_version: "2",
+      profiles: [],
+      active_profile_id: null,
+      active_project_id: null,
+      pending_operations: [],
+      last_event_id: null,
+      updated_at: NOW,
+    },
+    catalog: {
+      schema_version: "2",
+      catalog_generation: 3,
+      hosts: [
+        {
+          schema_version: "2",
+          ssh_host_alias: "gpu-lab",
+          availability: "selectable",
+          source_kind: "literal_host",
+        },
+      ],
+      warnings: [
+        {
+          schema_version: "2",
+          code: "dynamic_hosts_not_enumerated",
+          action: "manual_alias_available",
+          affected_entry_count: 1,
+        },
+      ],
+      scanned_at: NOW,
+    },
+    profiles: [],
+    projects: [],
+    tasks: [],
+    transitions: {},
+    timelines: {},
+    artifacts: [],
+    services: [],
+    capability: null,
+    validation: null,
+    activeOperation: null,
+    stream: { status: "fresh", epoch: 1, lastEventId: null },
+    ...overrides,
+  };
+}
+
+function systemProfile(overrides: Record<string, unknown> = {}) {
+  return {
+    schema_version: "2",
+    profile_kind: "system_openssh",
+    profile_id: "profile-gpu",
+    display_name: "GPU lab",
+    connection_authority: "system_openssh",
+    ssh_host_alias: "gpu-lab",
+    catalog_generation: 3,
+    connection_generation: 4,
+    connection_state: "disconnected",
+    prompt: null,
+    trust: {
+      schema_version: "2",
+      connection_generation: 4,
+      state: "trusted",
+      review_id: null,
+      review_sha256: null,
+      key_fingerprints: [],
+      repair_support: "not_needed",
+    },
+    failure: null,
+    active_project_id: null,
+    core_api_major: null,
+    core_openapi_sha256: null,
+    core_event_schema_sha256: null,
+    core_registry_sha256: null,
+    created_at: NOW,
+    updated_at: NOW,
+    etag: ETAG,
+    ...overrides,
+  };
+}
+
+function authoritySnapshot(
+  state: "ready" | "not_ready" = "ready",
+): DesktopProductSnapshotV2 {
+  const profile = systemProfile({
+    connection_state: "connected",
+    active_project_id: "project-1",
+    core_api_major: 2,
+    core_openapi_sha256: DIGEST,
+    core_event_schema_sha256: DIGEST,
+    core_registry_sha256: DIGEST,
+  });
+  const workspace = {
+    schema_version: "2",
+    workspace_snapshot_id: "workspace-snapshot-1",
+    project_id: "project-1",
+    manifest_sha256: DIGEST,
+    entry_count: 2,
+    byte_size: 64,
+  };
+  const evolution = {
+    schema_version: "2",
+    evolution_revision_id: "evolution-revision-1",
+    project_id: "project-1",
+    manifest_sha256: "c".repeat(64),
+    artifact_count: 2,
+  };
+  const context = {
+    schema_version: "2",
+    runtime_context_snapshot_id: "runtime-context-1",
+    project_id: "project-1",
+    evolution_revision_id: evolution.evolution_revision_id,
+    evolution_revision_manifest_sha256: evolution.manifest_sha256,
+    registry_sha256: DIGEST,
+    runtime_contract_sha256: "d".repeat(64),
+    manifest_sha256: "e".repeat(64),
+  };
+  const execution = {
+    schema_version: "2",
+    effective_execution_snapshot_id: "effective-execution-1",
+    project_id: "project-1",
+    execution_mode: "codex_subscription_transcript",
+    capture_mode: "transcript",
+    token_level_metrics_available: false,
+    producer_id: "subscription-issuer-1",
+    snapshot_sha256: "f".repeat(64),
+  };
+  const head = {
+    schema_version: "2",
+    project_head_id: "project-head-7",
+    project_id: "project-1",
+    generation: 7,
+    predecessor_project_head_id: "project-head-6",
+    workspace_snapshot: workspace,
+    evolution_revision: evolution,
+    runtime_context_snapshot: context,
+    effective_execution_snapshot: execution,
+    registry_sha256: DIGEST,
+    manifest_sha256: "1".repeat(64),
+  };
+  const admission = {
+    schema_version: "2",
+    task_admission_id: "task-admission-1",
+    task_id: "task-1",
+    project_id: "project-1",
+    predecessor_project_head: head,
+    workspace_snapshot: workspace,
+    project_config_sha256: "2".repeat(64),
+    task_envelope_sha256: "3".repeat(64),
+    normalized_evolution_intent_sha256: "4".repeat(64),
+    registry_sha256: DIGEST,
+    admission_sha256: "5".repeat(64),
+    admitted_at: NOW,
+  };
+  const attempt = {
+    schema_version: "2",
+    attempt_id: "attempt-2",
+    ordinal: 2,
+    task_id: "task-1",
+    task_admission_id: "task-admission-1",
+    admission_sha256: admission.admission_sha256,
+    project_id: "project-1",
+    predecessor_project_head_id: head.project_head_id,
+    created_at: NOW,
+  };
+  const transitionRef = {
+    schema_version: "2",
+    successor_transition_id: "successor-transition-8",
+    project_id: "project-1",
+    kind: "run_result",
+    predecessor_project_head: head,
+    expected_successor_generation: 8,
+    plan_sha256: "6".repeat(64),
+    task_admission: admission,
+    accepted_attempt: attempt,
+    successor_project_head: null,
+  };
+  const project = {
+    schema_version: "2",
+    project_id: "project-1",
+    display_name: "Protein study",
+    config: {
+      schema_version: "2",
+      task: {
+        title: "Review evidence",
+        objective: "Review the evidence and update the workspace.",
+      },
+      workspace: { kind: "scratch", display_name: "Research workspace" },
+      execution: {
+        mode: "codex_subscription_transcript",
+        capture_mode: "transcript",
+        token_level_metrics_available: false,
+        harness_id: "codex",
+        codex_model: "gpt-5.3-codex-spark",
+        reasoning_effort: "high",
+        token_limit: 32_000,
+        task_network_allow_internet: true,
+      },
+      evolution: { targets: {} },
+    },
+    project_config_sha256: admission.project_config_sha256,
+    active_project_head: head,
+    admission_etag: ETAG,
+    state,
+    created_at: NOW,
+    updated_at: NOW,
+    etag: ETAG,
+  };
+  const transition = {
+    schema_version: "2",
+    transition: transitionRef,
+    state: state === "ready" ? "committed" : "failed",
+    progress_completed: state === "ready" ? 5 : 2,
+    progress_total: 5,
+    error:
+      state === "ready"
+        ? null
+        : {
+            schema_version: "2",
+            request_id: "request-1",
+            code: "successor_materialization_failed",
+            http_status: 503,
+            message: "The successor could not be materialized.",
+            category: "transition",
+            retryable: true,
+            repair_action: "retry",
+            next_action: "Retry the successor transition.",
+          },
+    created_at: NOW,
+    updated_at: NOW,
+  };
+  const artifacts = [
+    {
+      schema_version: "2",
+      artifact_id: "artifact-memory-2",
+      project_id: "project-1",
+      artifact_type: "text_memory",
+      manifest_sha256: "7".repeat(64),
+      byte_size: 1_248,
+      created_at: NOW,
+    },
+    {
+      schema_version: "2",
+      artifact_id: "artifact-skill-2",
+      project_id: "project-1",
+      artifact_type: "skill_bundle",
+      manifest_sha256: "8".repeat(64),
+      byte_size: 2_816,
+      created_at: NOW,
+    },
+    {
+      schema_version: "2",
+      artifact_id: "artifact-agent-system-2",
+      project_id: "project-1",
+      artifact_type: "agent_system",
+      manifest_sha256: "9".repeat(64),
+      byte_size: 936,
+      created_at: NOW,
+    },
+    {
+      schema_version: "2",
+      artifact_id: "artifact-memory-1",
+      project_id: "project-1",
+      artifact_type: "text_memory",
+      manifest_sha256: "a".repeat(64),
+      byte_size: 824,
+      created_at: "2026-07-22T06:00:00Z",
+    },
+    {
+      schema_version: "2",
+      artifact_id: "artifact-skill-1",
+      project_id: "project-1",
+      artifact_type: "skill_bundle",
+      manifest_sha256: "b".repeat(64),
+      byte_size: 1_712,
+      created_at: "2026-07-22T06:00:00Z",
+    },
+  ] as const;
+  return baseSnapshot({
+    state: {
+      schema_version: "2",
+      profiles: [profile] as never,
+      active_profile_id: profile.profile_id,
+      active_project_id: project.project_id,
+      pending_operations: [],
+      last_event_id: null,
+      updated_at: NOW,
+    },
+    profiles: [profile] as never,
+    projects: [project] as never,
+    tasks: [
+      {
+        schema_version: "2",
+        task_id: "task-1",
+        project_id: "project-1",
+        admission,
+        attempts: [
+          { ...attempt, attempt_id: "attempt-1", ordinal: 1 },
+          attempt,
+        ],
+        authoritative_attempt_id: attempt.attempt_id,
+        successor_transition: transitionRef,
+        state: state === "ready" ? "closed" : "waiting_for_successor",
+        created_at: NOW,
+        updated_at: NOW,
+        etag: ETAG,
+      },
+    ] as never,
+    transitions: {
+      [transitionRef.successor_transition_id]: transition,
+    } as never,
+    artifacts: artifacts as never,
+    fixturePresentation: {
+      tasks: {
+        "task-1": {
+          instruction: project.config.task,
+          transcript: [
+            {
+              speaker: "user",
+              text: "Review the evidence and update the workspace.",
+            },
+            {
+              speaker: "agent",
+              text: "I checked the evidence table, corrected the unsupported claim, and saved a reproducible report.",
+            },
+          ],
+          outputFiles: [
+            {
+              name: "results/evidence-review.md",
+              summary: "Reviewed claims and supporting evidence.",
+              content:
+                "# Evidence review\n\nUnsupported conclusions are marked as hypotheses.",
+              previousName:
+                "workspace-before-session/results/evidence-review.md",
+              diffLines: [
+                { kind: "removed" as const, text: "The mechanism is proven." },
+                {
+                  kind: "added" as const,
+                  text: "Unsupported conclusions are marked as hypotheses.",
+                },
+              ],
+            },
+          ],
+          usedArtifactIds: ["artifact-memory-1", "artifact-skill-1"],
+          producedArtifactIds: [
+            "artifact-memory-2",
+            "artifact-skill-2",
+            "artifact-agent-system-2",
+          ],
+        },
+      },
+      artifacts: {
+        "artifact-memory-2": {
+          title: "Evidence review memory",
+          sourceTaskId: "task-1",
+          targetPath: null,
+          status: "updated",
+          statusDetail:
+            "Added a durable rule for distinguishing measured evidence from inference.",
+          documents: [
+            {
+              path: "memory.md",
+              content:
+                "# Research memory\n\n- Mark every unsupported conclusion as a hypothesis.\n- Preserve sample and assay identifiers when summarizing evidence.",
+            },
+          ],
+          previousArtifactId: "artifact-memory-1",
+          diffLines: [
+            { kind: "context", text: "# Research memory" },
+            { kind: "removed", text: "Summarize the strongest conclusion." },
+            {
+              kind: "added",
+              text: "Mark every unsupported conclusion as a hypothesis.",
+            },
+          ],
+        },
+        "artifact-skill-2": {
+          title: "Trajectory-to-skill: evidence audit",
+          sourceTaskId: "task-1",
+          targetPath: "skills/evidence-audit/SKILL.md",
+          status: "created",
+          statusDetail:
+            "Created a reusable evidence-audit workflow from the successful trajectory.",
+          documents: [
+            {
+              path: "SKILL.md",
+              content:
+                "# Evidence audit\n\n1. Enumerate claims.\n2. Bind each claim to an observed result.\n3. Flag missing or contradictory evidence.",
+            },
+          ],
+          previousArtifactId: null,
+          diffLines: [
+            {
+              kind: "added",
+              text: "Created SKILL.md with a three-step evidence audit.",
+            },
+          ],
+        },
+        "artifact-agent-system-2": {
+          title: "Scientific evidence instruction",
+          sourceTaskId: "task-1",
+          targetPath: "AGENTS.md",
+          status: "unchanged",
+          statusDetail:
+            "The existing agent instruction already covered the observed behavior.",
+          documents: [
+            {
+              path: "AGENTS.md",
+              content:
+                "# Scientific workflow\n\nState the evidence boundary before drawing a conclusion.",
+            },
+          ],
+          previousArtifactId: "artifact-agent-system-1",
+          diffLines: [],
+        },
+        "artifact-memory-1": {
+          title: "Previous research memory",
+          sourceTaskId: "task-previous",
+          targetPath: null,
+          status: "unchanged",
+          statusDetail: "Historical context used by the selected Task.",
+          documents: [
+            {
+              path: "memory.md",
+              content:
+                "# Research memory\n\nSummarize the strongest conclusion.",
+            },
+          ],
+          previousArtifactId: null,
+          diffLines: [],
+        },
+        "artifact-skill-1": {
+          title: "Previous evidence skill",
+          sourceTaskId: "task-previous",
+          targetPath: "skills/evidence-summary/SKILL.md",
+          status: "unchanged",
+          statusDetail: "Historical context used by the selected Task.",
+          documents: [
+            {
+              path: "SKILL.md",
+              content: "# Evidence summary\n\nSummarize the selected results.",
+            },
+          ],
+          previousArtifactId: null,
+          diffLines: [],
+        },
+      },
+    },
+    capability: {
+      schema_version: "2",
+      project_id: "project-1",
+      execution_mode: "codex_subscription_transcript",
+      registry_sha256: DIGEST,
+      capabilities_sha256: DIGEST,
+      capabilities: {
+        schema_version: "1",
+        core_version: "0.1.9",
+        registry_digest: DIGEST,
+        evaluated_profile: {
+          execution_mode: "subscription",
+          capture_mode: "transcript",
+          harness_id: "codex",
+          harness_capabilities: [],
+          runtime_capabilities: [],
+        },
+        targets: [],
+      },
+      fetched_at: NOW,
+    } as never,
+  });
+}
+
+function providerFixture(initial: DesktopProductSnapshotV2) {
+  let current = initial;
+  const provider = {
+    ...unavailableDesktopProductProviderV2,
+    featureFlags: ["system_openssh_profiles"],
+    refresh: vi.fn(async () => ({
+      status: "fresh" as const,
+      snapshot: current,
+    })),
+    subscribe: vi.fn(() => () => undefined),
+    createProfile: vi.fn(async (displayName: string, alias: string) => {
+      const created = systemProfile({
+        display_name: displayName,
+        ssh_host_alias: alias,
+      });
+      current = baseSnapshot({
+        ...current,
+        profiles: [created] as never,
+        state: { ...current.state, profiles: [created] as never },
+        stream: {
+          status: "fresh",
+          epoch: current.stream.epoch + 1,
+          lastEventId: null,
+        },
+      });
+      return created as never;
+    }),
+    connectProfile: vi.fn(
+      async () =>
+        ({
+          schema_version: "2",
+          operation_id: "operation-connect-1",
+          kind: "profile_connect",
+          status: "queued",
+          failure: null,
+          created_at: NOW,
+          updated_at: NOW,
+        }) as never,
+    ),
+    disconnectProfile: vi.fn(
+      async () =>
+        ({
+          schema_version: "2",
+          operation_id: "operation-disconnect-1",
+          kind: "profile_disconnect",
+          status: "queued",
+          failure: null,
+          created_at: NOW,
+          updated_at: NOW,
+        }) as never,
+    ),
+    rebindProfile: vi.fn(async () => systemProfile() as never),
+    reviewHostKey: vi.fn(
+      async () =>
+        ({
+          schema_version: "2",
+          operation_id: "operation-review-1",
+          kind: "host_key_review",
+          status: "queued",
+          failure: null,
+          created_at: NOW,
+          updated_at: NOW,
+        }) as never,
+    ),
+    rescanSshHosts: vi.fn(async () => current.catalog),
+    updateProject: vi.fn(
+      async (
+        projectId: string,
+        displayName: string,
+        config: DesktopProductSnapshotV2["projects"][number]["config"],
+      ) => {
+        const existing = current.projects.find(
+          (project) => project.project_id === projectId,
+        );
+        if (!existing) throw new Error("project is missing");
+        const updated = { ...existing, display_name: displayName, config };
+        current = {
+          ...current,
+          projects: current.projects.map((project) =>
+            project.project_id === projectId ? updated : project,
+          ),
+          stream: {
+            status: "fresh",
+            epoch: current.stream.epoch + 1,
+            lastEventId: null,
+          },
+        };
+        return updated;
+      },
+    ),
+    validateProject: vi.fn(
+      async (projectId: string) =>
+        ({
+          schema_version: "2",
+          project_id: projectId,
+          valid: true,
+          registry_sha256: DIGEST,
+          checks: [],
+          validated_at: NOW,
+        }) as never,
+    ),
+    submitTask: vi.fn(async () => current.tasks[0] as never),
+    getArtifactContent: vi.fn(async (artifactId: string) => {
+      const artifact = current.artifacts.find(
+        (item) => item.artifact_id === artifactId,
+      );
+      if (!artifact) throw new Error("artifact is missing");
+      return {
+        schema_version: "2",
+        artifact,
+        media_type: "text/markdown",
+        content_sha256: artifact.manifest_sha256,
+        byte_size: artifact.byte_size,
+      } as never;
+    }),
+    getArtifactDiff: vi.fn(async (artifactId: string) => {
+      const artifact = current.artifacts.find(
+        (item) => item.artifact_id === artifactId,
+      );
+      if (!artifact) throw new Error("artifact is missing");
+      const previous =
+        current.fixturePresentation?.artifacts[artifactId]
+          ?.previousArtifactId ?? null;
+      return {
+        schema_version: "2",
+        artifact_id: artifactId,
+        previous_artifact_id: previous,
+        current_manifest_sha256: artifact.manifest_sha256,
+        previous_manifest_sha256: previous ? DIGEST : null,
+        status: previous ? "available" : "unavailable",
+      } as never;
+    }),
+  } satisfies DesktopProductProviderV2;
+  return provider;
+}
+
+describe("Desktop v2 product renderer", () => {
   let root: Root | null = null;
-  let provider: FixtureDesktopProductProvider | null = null;
 
   beforeEach(() => {
-    document.body.innerHTML = "";
+    document.body.innerHTML = '<div id="root"></div>';
+    (
+      globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
+    ).IS_REACT_ACT_ENVIRONMENT = true;
   });
 
   afterEach(async () => {
-    provider?.dispose();
-    provider = null;
-    if (root) {
-      await act(async () => root?.unmount());
-      root = null;
-    }
+    if (root) await act(async () => root?.unmount());
+    root = null;
     vi.useRealTimers();
     document.body.innerHTML = "";
   });
 
-  it("keeps the renderer-owned sample visible and real mutations closed after initial sync failure", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    provider.failNextRefresh();
-    const onInitialSnapshotFailed = vi.fn();
-    const onReady = vi.fn();
+  it("opens configured-host setup immediately and never renders manual connection fields", async () => {
+    const provider = providerFixture(baseSnapshot());
+    root = await render(provider);
 
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    root = createRoot(container);
-    await act(async () => {
-      root?.render(
-        <DesktopProductApp
-          provider={provider!}
-          onInitialSnapshotFailed={onInitialSnapshotFailed}
-          onReady={onReady}
-        />,
-      );
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
+    await click("Add remote workspace");
 
-    expect(onInitialSnapshotFailed).toHaveBeenCalledTimes(1);
-    expect(onReady).not.toHaveBeenCalled();
-    expect(screenText()).toContain("Your workspace could not be loaded");
-    expect(screenText()).toContain("Enzyme Kinetics Model Review");
-    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
-    const fallbackSwitcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    expect(fallbackSwitcher?.disabled).toBe(false);
-    expect(Array.from(fallbackSwitcher?.options ?? []).filter((option) =>
-      option.textContent?.includes("[Demo]")
-    )).toHaveLength(2);
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')).toBeNull();
-    expect(optionalButton("Add remote workspace")).not.toBeNull();
-    expect(document.querySelector(".initial-sync-sample")).not.toBeNull();
-    expect(document.querySelector(".initial-sync-sample[inert]")).toBeNull();
-    await clickButton("Task 1");
-    expect(screenText()).toContain("The linearized fit systematically misses high-concentration observations");
-    await clickButton("Evolution");
-    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
-    await clickButton("Trajectory to Skill");
-    await clickButton("Output");
-    expect(screenText()).toContain("SKILL.md");
-    expect(screenText()).not.toContain("Add workspace");
-    expect(screenText()).not.toContain("internal refresh details");
-    const proteinOption = Array.from(fallbackSwitcher?.options ?? []).find((option) =>
-      option.textContent?.includes("Protein Stability Evidence Review")
+    expect(dialog()?.textContent).toContain("Configured SSH host");
+    expect(dialog()?.textContent).toContain("gpu-lab");
+    expect(dialog()?.textContent).toContain(
+      "Some configured hosts cannot be listed",
     );
-    if (!fallbackSwitcher || !proteinOption) throw new Error("Second fallback sample was not found.");
-    await act(async () => {
-      fallbackSwitcher.value = proteinOption.value;
-      fallbackSwitcher.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(screenText()).toContain("How OpenEvo improved this project");
-    await clickButton("Changes");
-    expect(screenText()).toContain("ER-PS-2 → ER-PS-3");
-
-    await clickButton("Add remote workspace");
-    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).toBeNull();
-    expect(screenText()).toContain("Protein Design");
-    expect(screenText()).toContain("Cross-session changes");
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Server connection");
-    expect(onReady).toHaveBeenCalledTimes(1);
-  });
-
-  it("keeps sample and real project identities isolated while switching between them", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    if (!switcher) throw new Error("Project switcher was not found.");
-    const sampleOption = Array.from(switcher.options).find(
-      (option) => option.textContent?.includes("[Demo] Enzyme Kinetics Model Review"),
+    const fieldLabels = [...(dialog()?.querySelectorAll("label") ?? [])]
+      .map((label) => label.textContent ?? "")
+      .join(" ");
+    expect(fieldLabels).not.toMatch(
+      /server address|user name|port|private key|password/i,
     );
-    const realOption = Array.from(switcher.options).find(
-      (option) => option.dataset.projectId === "project-fixture-1",
+    expect(button("Use another SSH alias")).toBeTruthy();
+  });
+
+  it("labels the offline sample head as demo authority instead of an active remote head", async () => {
+    root = await render(providerFixture(baseSnapshot()));
+
+    expect(document.body.textContent).toContain("Demo Project Head");
+    expect(document.body.textContent).not.toContain("Active Project Head");
+  });
+
+  it("keeps one authoritative event subscription across the initial refresh", async () => {
+    const provider = providerFixture(baseSnapshot());
+    root = await render(provider);
+
+    expect(provider.refresh).toHaveBeenCalledTimes(1);
+    expect(provider.subscribe).toHaveBeenCalledTimes(1);
+  });
+
+  it("creates and connects using only the selected SSH alias", async () => {
+    const provider = providerFixture(baseSnapshot());
+    root = await render(provider);
+    await click("Add remote workspace");
+    setInput("Workspace name", "Main GPU");
+    await click("Save and connect");
+
+    expect(provider.createProfile).toHaveBeenCalledWith(
+      "Main GPU",
+      "gpu-lab",
+      expect.objectContaining({ streamEpoch: 1 }),
     );
-    if (!sampleOption || !realOption) {
-      throw new Error("Sample and real project options must both be discoverable.");
-    }
-    expect(sampleOption.value).not.toBe(realOption.value);
-    expect(document.querySelector('[data-testid="sample-research-workspace"]')).toBeNull();
-
-    await act(async () => {
-      switcher.value = sampleOption.value;
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
-    expect(switcher.value).toBe(sampleOption.value);
-    expect(Array.from(switcher.options).some((option) => option.value === realOption.value)).toBe(true);
-
-    await act(async () => {
-      switcher.value = realOption.value;
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(document.querySelector('[data-testid="sample-research-workspace"]')).toBeNull();
-    expect(screenText()).toContain("Protein Design");
-    expect(switcher.value).toBe(realOption.value);
-  });
-
-  it("switches between two renderer-owned demos without provider mutation", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    const connectProfile = vi.spyOn(provider, "connectProfile");
-    const startRun = vi.spyOn(provider, "startRun");
-    const updateProject = vi.spyOn(provider, "updateProject");
-    root = await renderProduct(provider);
-
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    if (!switcher) throw new Error("Project switcher was not found.");
-    const enzymeOption = Array.from(switcher.options).find(
-      (option) => option.textContent?.includes("[Demo] Enzyme Kinetics Model Review"),
+    expect(provider.connectProfile).toHaveBeenCalledWith(
+      "profile-gpu",
+      expect.objectContaining({ streamEpoch: 2 }),
     );
-    const proteinOption = Array.from(switcher.options).find(
-      (option) => option.textContent?.includes("[Demo] Protein Stability Evidence Review"),
+    expect(JSON.stringify(provider.createProfile.mock.calls)).not.toMatch(
+      /username|password|identity|host_path/i,
     );
-    if (!enzymeOption || !proteinOption) {
-      throw new Error("Both demo projects must be discoverable.");
-    }
+  });
 
-    await act(async () => {
-      switcher.value = proteinOption.value;
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+  it("offers explicit rebind for retained Preview profiles", async () => {
+    const legacy = {
+      schema_version: "2",
+      profile_kind: "legacy_explicit",
+      profile_id: "legacy-profile-1",
+      display_name: "Old server",
+      connectable: false,
+      migration_state: "rebind_required",
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    } as const;
+    const snapshot = baseSnapshot({
+      profiles: [legacy],
+      state: { ...baseSnapshot().state, profiles: [legacy] },
     });
-    expect(screenText()).toContain("Protein Stability Evidence Review");
-    expect(screenText()).toContain("Demo data");
-    expect(screenText()).toContain("Generation 2 → 3");
-    expect(document.querySelector('[data-testid="sample-research-workspace"]')).not.toBeNull();
-    await clickButton("Task 1");
-    expect(screenText()).toContain("Confounding and scale differences invalidate the original ranking");
-    await clickButton("Evolution");
-    await clickButton("Changes");
-    expect(screenText()).toContain("ER-PS-2 → ER-PS-3");
-    expect(screenText()).toContain("92% SEC monomer retention");
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    await click("Add remote workspace");
+    await click("Rebind to configured SSH host");
 
-    await act(async () => {
-      switcher.value = enzymeOption.value;
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    expect(screenText()).toContain("Enzyme Kinetics Model Review");
-    expect(document.querySelector('[data-testid="sample-evolution-workspace"]')).not.toBeNull();
-    expect(connectProfile).not.toHaveBeenCalled();
-    expect(startRun).not.toHaveBeenCalled();
-    expect(updateProject).not.toHaveBeenCalled();
+    expect(provider.rebindProfile).toHaveBeenCalledWith(
+      "legacy-profile-1",
+      "gpu-lab",
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
   });
 
-  it("reports readiness once after the initial product snapshot commits", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    const onInitialSnapshotFailed = vi.fn();
-    const onReady = vi.fn();
-
-    const container = document.createElement("div");
-    document.body.appendChild(container);
-    root = createRoot(container);
-    await act(async () => {
-      root?.render(
-        <DesktopProductApp
-          provider={provider!}
-          onInitialSnapshotFailed={onInitialSnapshotFailed}
-          onReady={onReady}
-        />,
-      );
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-
-    expect(onInitialSnapshotFailed).not.toHaveBeenCalled();
-    expect(onReady).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Research brief");
-  });
-
-  it("navigates between Research, Evolution, and System", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Research brief");
-    await clickButton("Evolution");
-    expect(screenText()).toContain("Cross-session changes");
-    await clickButton("System");
-    expect(screenText()).toContain("Remote environment");
-    expect(screenText()).toContain("Current Project Head");
-    expect(screenText()).not.toContain("Current revision");
-    await clickButton("Research");
-    expect(screenText()).toContain("Session history");
-  });
-
-  it("shows bounded session output and filters agent and evolution records", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Session output");
-    expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
-    expect(screenText()).toContain("Memory and skills were prepared for the next session.");
-    expect(document.querySelector(".run-timeline")).not.toBeNull();
-    expect(document.querySelectorAll(".run-timeline li").length).toBeGreaterThan(0);
-    const renderedTimeline = [...document.querySelectorAll<HTMLElement>(".run-timeline li")];
-    const renderedSequences = renderedTimeline.map((entry) => Number(entry.dataset.sequence));
-    expect(renderedSequences).toEqual([...renderedSequences].sort((left, right) => left - right));
-    expect(renderedTimeline.every((entry) => (
-      Boolean(entry.dataset.timelineId)
-      && Boolean(entry.dataset.phase)
-      && Boolean(entry.dataset.status)
-      && /^[a-f0-9]{64}$/.test(entry.dataset.contentSha256 ?? "")
-    ))).toBe(true);
-    const renderedLogs = [...document.querySelectorAll<HTMLElement>(".session-output-entry")];
-    expect(renderedLogs.length).toBeGreaterThan(0);
-    expect(renderedLogs.every((entry) => (
-      Boolean(entry.dataset.logId)
-      && Number.isSafeInteger(Number(entry.dataset.sequence))
-      && Boolean(entry.dataset.stream)
-      && Boolean(entry.dataset.level)
-      && /^[a-f0-9]{64}$/.test(entry.dataset.contentSha256 ?? "")
-      && Boolean(entry.dataset.runId)
-      && Boolean(entry.dataset.occurredAt)
-    ))).toBe(true);
-
-    await clickButton("Evolution logs");
-    expect(screenText()).not.toContain("Evidence synthesis completed with three supported findings.");
-    expect(screenText()).toContain("Memory and skills were prepared for the next session.");
-
-    await clickButton("Agent logs");
-    expect(screenText()).toContain("Evidence synthesis completed with three supported findings.");
-    expect(screenText()).not.toContain("Memory and skills were prepared for the next session.");
-  });
-
-  it("keeps the Daemon project head authoritative while the project projection refreshes", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const current = await provider.refresh();
-    if (current.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const project = current.snapshot.projects[0];
-    const predecessor = current.snapshot.runs[0]?.pinned_revision;
-    if (!project?.remote || !predecessor) throw new Error("Expected revision fixtures.");
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: {
-        ...current.snapshot,
-        projects: [{
-          ...project,
-          remote: { ...project.remote, active_revision: predecessor },
-        }],
+  it("renders changed-host-key evidence and requires an explicit review action", async () => {
+    const profile = systemProfile({
+      connection_state: "host_key_review",
+      trust: {
+        schema_version: "2",
+        connection_generation: 4,
+        state: "changed_key_blocked",
+        review_id: "review-1",
+        review_sha256: DIGEST,
+        key_fingerprints: [
+          {
+            schema_version: "2",
+            algorithm: "ssh-ed25519",
+            sha256_fingerprint: `SHA256:${"A".repeat(43)}`,
+            role: "presented",
+          },
+        ],
+        repair_support: "automatic_replacement_available",
       },
     });
+    const snapshot = baseSnapshot({
+      profiles: [profile] as never,
+      state: { ...baseSnapshot().state, profiles: [profile] as never },
+    });
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    await click("Add remote workspace");
 
-    root = await renderProduct(provider);
-    await clickButton("Evolution");
-
-    expect(document.querySelector(".revision-node.active")?.textContent).toContain("Project Head 1");
-    expect(screenText()).not.toContain("Project Head 2");
-    expect(document.querySelectorAll(".revision-node")).toHaveLength(1);
-    expect(document.querySelector(".artifact-list-heading")?.textContent).toContain("3 selected");
-    expect(screenText()).toContain("Quality 83%");
-    expect(screenText()).not.toContain("Quality 84%");
+    expect(dialog()?.textContent).toContain("Changed host key blocked");
+    expect(dialog()?.textContent).toContain(`SHA256:${"A".repeat(43)}`);
+    await click("Replace changed key and reconnect");
+    expect(provider.reviewHostKey).toHaveBeenCalledWith(
+      "profile-gpu",
+      "replace_changed_key",
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
   });
 
-  it("refreshes live session output after authoritative stream updates", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 20 });
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    expect(screenText()).toContain("Session admitted with an immutable project snapshot.");
-    expect(screenText()).not.toContain("Research execution is using the selected workspace");
-
-    await advance(45);
-    expect(screenText()).toContain("Research execution is using the selected workspace and evidence sources.");
-  });
-
-  it("polls a nonterminal run from queued through running and stops at terminal without SSE", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 1_000 });
-    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
-    const refresh = vi.spyOn(provider, "refresh");
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    expect(screenText()).toContain("Queued");
-
-    await advance(1_005);
-    expect(screenText()).toContain("Preparing");
-    await advance(1_005);
-    expect(screenText()).toContain("Running");
-
-    await advance(1_005);
-    await advance(1_005);
-    await advance(1_005);
-    await advance(1_005);
-    expect(screenText()).toContain("Latest session complete");
-
-    const terminalRefreshCount = refresh.mock.calls.length;
-    await advance(3_000);
-    expect(refresh).toHaveBeenCalledTimes(terminalRefreshCount);
-  });
-
-  it("retries run polling after a transient refresh failure", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 900 });
-    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    provider.failNextRefresh();
-    const beforeFailure = provider.refreshCount();
-
-    await advance(1_005);
-    expect(provider.refreshCount()).toBe(beforeFailure + 1);
-    expect(screenText()).toContain("Queued");
-
-    await advance(1_005);
-    expect(provider.refreshCount()).toBe(beforeFailure + 2);
-    expect(screenText()).toContain("Running");
-  });
-
-  it("stops run polling after an authoritative refresh observes the session offline", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 10_000 });
-    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
-    const refresh = vi.spyOn(provider, "refresh");
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    provider.loseActiveCoreSession();
-    await advance(1_005);
-    expect(screenText()).toContain("Remote workspace is offline");
-    expect(screenText()).not.toContain("Activate this project");
-    expect(button("Connect").disabled).toBe(false);
-
-    const offlineRefreshCount = refresh.mock.calls.length;
-    await advance(5_000);
-    expect(refresh).toHaveBeenCalledTimes(offlineRefreshCount);
-  });
-
-  it("keeps polling serial and rejects its late result after switching projects", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 10_000 });
-    provider.addDraftProject({ subscription: true });
-    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
-    const refresh = vi.spyOn(provider, "refresh");
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    const current = await provider.refresh();
-    if (current.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const stale = {
-      status: "fresh" as const,
-      snapshot: {
-        ...current.snapshot,
-        projects: current.snapshot.projects.filter((item) => item.project_id === "project-fixture-1"),
+  it("retries failed SSH cleanup as disconnect and keeps lost authority blocked", async () => {
+    const retryable = systemProfile({
+      connection_state: "failed",
+      failure: {
+        schema_version: "2",
+        code: "ssh_cleanup_failed",
+        summary: "The system OpenSSH connection could not be closed safely.",
+        retryable: true,
+        action: "retry",
+        affected_resource_id: "profile-gpu",
       },
-    };
-    const pendingPoll = deferred<Awaited<ReturnType<FixtureDesktopProductProvider["refresh"]>>>();
-    refresh.mockImplementationOnce(() => pendingPoll.promise);
-
-    await advance(1_005);
-    const inFlightRefreshCount = refresh.mock.calls.length;
-    await advance(3_000);
-    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount);
-
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    if (!switcher) throw new Error("Project switcher was not found.");
-    await act(async () => {
-      switcher.value = projectOptionValue(switcher, "project-fixture-2");
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
     });
-    await flush();
-    expect(screenText()).toContain("Second research task");
-
-    await act(async () => {
-      pendingPoll.resolve(stale);
-      await Promise.resolve();
-      await Promise.resolve();
+    const retrySnapshot = baseSnapshot({
+      profiles: [retryable] as never,
+      state: { ...baseSnapshot().state, profiles: [retryable] as never },
     });
-    expect(screenText()).toContain("Second research task");
+    const retryProvider = providerFixture(retrySnapshot);
+    root = await render(retryProvider);
+    await click("Add remote workspace");
 
-    await flush();
-    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount + 1);
-    const reconciledRefreshCount = refresh.mock.calls.length;
-    await advance(5_000);
-    expect(refresh).toHaveBeenCalledTimes(reconciledRefreshCount);
-  });
-
-  it("cancels run polling when the renderer unmounts", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, stepDelayMs: 10_000 });
-    vi.spyOn(provider, "subscribe").mockImplementation(() => () => undefined);
-    const refresh = vi.spyOn(provider, "refresh");
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    const current = await provider.refresh();
-    const pendingPoll = deferred<Awaited<ReturnType<FixtureDesktopProductProvider["refresh"]>>>();
-    refresh.mockImplementationOnce(() => pendingPoll.promise);
-    await advance(1_005);
-    const inFlightRefreshCount = refresh.mock.calls.length;
+    await click("Retry disconnect");
+    expect(retryProvider.disconnectProfile).toHaveBeenCalledWith(
+      "profile-gpu",
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
 
     await act(async () => root?.unmount());
     root = null;
-    await act(async () => {
-      pendingPoll.resolve(current);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await advance(5_000);
-
-    expect(refresh).toHaveBeenCalledTimes(inFlightRefreshCount);
-  });
-
-  it("never publishes a superseded run-log request into the next run", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const initial = await provider.refresh();
-    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const previousRun = initial.snapshot.runs[0];
-    if (!previousRun) throw new Error("Expected a completed fixture run.");
-    const staleLogs = (await provider.getRunLogs(previousRun.id)).map((entry, index) => ({
-      ...entry,
-      message: index === 0 ? "STALE PREVIOUS RUN OUTPUT" : entry.message,
-    }));
-    const staleRequest = deferred<typeof staleLogs>();
-    const loadLogs = vi.spyOn(provider, "getRunLogs");
-    loadLogs.mockImplementationOnce(() => staleRequest.promise);
-    root = await renderProduct(provider);
-
-    expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
-    await clickButton("Start session");
-    expect(screenText()).toContain("Session admitted with an immutable project snapshot.");
-
-    await act(async () => {
-      staleRequest.resolve(staleLogs);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(screenText()).not.toContain("STALE PREVIOUS RUN OUTPUT");
-  });
-
-  it("keeps opaque run and nullable attempt identities structurally distinct", () => {
-    expect(sameSessionOutputIdentity(
-      { runId: "run:segment", attemptId: "attempt" },
-      { runId: "run", attemptId: "segment:attempt" },
-    )).toBe(false);
-    expect(sameSessionOutputIdentity(
-      { runId: "run", attemptId: null },
-      { runId: "run", attemptId: "no-attempt" },
-    )).toBe(false);
-  });
-
-  it("hides resolved output synchronously when a colliding attempt identity becomes current", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const initial = await provider.refresh();
-    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const baseRun = initial.snapshot.runs[0];
-    if (!baseRun) throw new Error("Expected a completed fixture run.");
-    const baseLogs = await provider.getRunLogs(baseRun.id);
-    const oldSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", null);
-    const nextSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", "no-attempt");
-    const oldLogs = relabelLogs(baseLogs, "run-collision", null, "OLD NO-ATTEMPT OUTPUT");
-    const nextRequest = deferred<ReturnType<typeof relabelLogs>>();
-    vi.spyOn(provider, "refresh")
-      .mockResolvedValueOnce({ status: "fresh", snapshot: oldSnapshot })
-      .mockResolvedValueOnce({ status: "fresh", snapshot: nextSnapshot });
-    vi.spyOn(provider, "getRunLogs")
-      .mockResolvedValueOnce(oldLogs)
-      .mockImplementationOnce(() => nextRequest.promise);
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("OLD NO-ATTEMPT OUTPUT");
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-
-    expect(screenText()).not.toContain("OLD NO-ATTEMPT OUTPUT");
-    expect(document.querySelector('[aria-label="Refreshing session output"]')).not.toBeNull();
-
-    await act(async () => {
-      nextRequest.resolve(relabelLogs(baseLogs, "run-collision", "no-attempt", "CURRENT ATTEMPT OUTPUT"));
-      await Promise.resolve();
-    });
-    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
-  });
-
-  it("never publishes an old colliding request after a rapid attempt switch", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const initial = await provider.refresh();
-    if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const baseRun = initial.snapshot.runs[0];
-    if (!baseRun) throw new Error("Expected a completed fixture run.");
-    const baseLogs = await provider.getRunLogs(baseRun.id);
-    const oldSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", null);
-    const nextSnapshot = withRunOutputIdentity(initial.snapshot, "run-collision", "no-attempt");
-    const oldRequest = deferred<ReturnType<typeof relabelLogs>>();
-    vi.spyOn(provider, "refresh")
-      .mockResolvedValueOnce({ status: "fresh", snapshot: oldSnapshot })
-      .mockResolvedValueOnce({ status: "fresh", snapshot: nextSnapshot });
-    vi.spyOn(provider, "getRunLogs")
-      .mockImplementationOnce(() => oldRequest.promise)
-      .mockResolvedValueOnce(relabelLogs(baseLogs, "run-collision", "no-attempt", "CURRENT ATTEMPT OUTPUT"));
-    root = await renderProduct(provider);
-
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
-
-    await act(async () => {
-      oldRequest.resolve(relabelLogs(baseLogs, "run-collision", null, "STALE NO-ATTEMPT OUTPUT"));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(screenText()).toContain("CURRENT ATTEMPT OUTPUT");
-    expect(screenText()).not.toContain("STALE NO-ATTEMPT OUTPUT");
-  });
-
-  it("gates sessions offline and completes first-time workspace setup", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ stepDelayMs: 20 });
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Add remote workspace");
-    expect(optionalButton("Create project")).toBeNull();
-    expect(screenText()).not.toContain("Start session");
-    await clickButton("Add remote workspace");
-    setInput("Workspace name", "Lab server");
-    setInput("Server address", "lab.example.test");
-    setInput("User name", "researcher");
-    expect(screenText()).toContain("SSH agent");
-    expect(screenText()).not.toContain("Private key");
-    expect(screenText()).not.toContain("Password");
-    await clickButton("Save workspace");
-    expect(screenText()).toContain("Connect the remote workspace");
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
-
-    await clickButton("Connect");
-    await advance(25);
-    expect(screenText()).toContain("Confirm server identity");
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
-    await clickButton("Trust and continue");
-    expect(screenText()).toContain("Checking environment");
-    await advance(25);
-    expect(screenText()).toContain("Preparing OpenEvo");
-    await advance(25);
-    expect(screenText()).toContain("Online");
-    expect(screenText()).toContain("Create a research project");
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(false);
-
-    await clickButton("Create project");
-    setInput("Project name", "Catalyst study");
-    setInput("Task title", "Compare catalyst candidates");
-    setInput("Objective", "Rank candidates using reproducible evidence.");
-    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
-    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("high");
-    expect(screenText()).not.toContain("Hugging Face model");
-    await clickButton("Prepare evolution");
-    await clickButton("Save and activate");
-    expect(screenText()).toContain("Compare catalyst candidates");
-    expect(button("Start session").title).toBe("Start a new research session");
-    expect(button("Start session").disabled).toBe(false);
-    const snapshot = await provider.refresh();
-    if (snapshot.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(snapshot.snapshot.projects[0]?.execution).toMatchObject({
-      mode: "codex_subscription_transcript",
-      codex_model: "gpt-5.5",
-      reasoning_effort: "high",
-    });
-
-    await clickButton("Evolution");
-    expect(screenText()).not.toContain("Evolution is not configured");
-  });
-
-  it("names the first missing required field in workspace and project setup", async () => {
-    provider = createFixtureDesktopProductProvider({ newUser: true });
-    root = await renderProduct(provider);
-
-    await clickButton("Add remote workspace");
-    const host = labelledControl<HTMLInputElement>("Server address", "input");
-    expect(host.required).toBe(true);
-    expect(screenText()).toContain("Enter the remote server address.");
-    expect(button("Save workspace").getAttribute("aria-describedby")).toBe("workspace-required-fields");
-
-    await act(async () => root?.unmount());
-    root = null;
-    provider.dispose();
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Create project");
-    const objective = labelledControl<HTMLTextAreaElement>("Objective", "textarea");
-    expect(objective.required).toBe(true);
-    expect(screenText()).toContain("Describe the research objective.");
-    expect(button("Prepare evolution").getAttribute("aria-describedby")).toBe("project-required-fields");
-  });
-
-  it("shows the authoritative retired state after editing an active project", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Require a fresh activation after this edit.");
-    await clickButton("Save");
-    await flush();
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects[0]).toMatchObject({
-      state: "draft",
-      remote: null,
-    });
-    expect(refreshed.snapshot.state.active_project).toBeNull();
-    expect(refreshed.snapshot.state.core).toMatchObject({
-      state: "offline",
-      active_tunnel: false,
-      failure: { code: "core_not_started" },
-    });
-    expect(screenText()).toContain("Activate this project");
-    expect(optionalButton("Connect")).toBeNull();
-    expect(button("Start session").disabled).toBe(true);
-    expect(button("Start session").title).toContain("Activate this project");
-  });
-
-  it("preserves an older project's unpinned Codex reasoning effort on unrelated edits", async () => {
-    provider = createFixtureDesktopProductProvider({
-      startOnline: true,
-      projectExecutionMode: "codex_subscription_transcript",
-      projectReasoningEffort: null,
-    });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("default");
-    setInput("Project name", "Preserve Codex default project");
-    setInput("Objective", "Keep the existing Codex default while changing this objective.");
-    const firstEvolutionToggle = document.querySelector<HTMLInputElement>(".target-toggle input[role='switch']");
-    if (!firstEvolutionToggle) throw new Error("Evolution target switch was not found.");
-    await act(async () => firstEvolutionToggle.click());
-    await clickButton("Save");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects[0]?.execution).toMatchObject({
-      mode: "codex_subscription_transcript",
-      codex_model: "gpt-5.5",
-      reasoning_effort: null,
-    });
-  });
-
-  it.each([
-    ["low", null, "low"],
-    ["medium", null, "medium"],
-    ["high", null, "high"],
-    ["extra high", null, "xhigh"],
-    ["Codex default", "high", "default"],
-  ] as const)("saves the selected Codex reasoning effort: %s", async (_label, initialEffort, selection) => {
-    provider = createFixtureDesktopProductProvider({
-      startOnline: true,
-      projectExecutionMode: "codex_subscription_transcript",
-      projectReasoningEffort: initialEffort,
-    });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setSelect("Reasoning effort", selection);
-    setInput("Objective", `Save Codex reasoning effort ${selection}.`);
-    await clickButton("Save");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects[0]?.execution.reasoning_effort).toBe(
-      selection === "default" ? null : selection,
-    );
-  });
-
-  it("resets Codex reasoning effort to the saved value and preserves it across mode switching", async () => {
-    provider = createFixtureDesktopProductProvider({
-      startOnline: true,
-      projectExecutionMode: "codex_subscription_transcript",
-      projectReasoningEffort: null,
-    });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    await clickButton("Self-deployed");
-    await clickButton("Subscription");
-    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("default");
-
-    setSelect("Reasoning effort", "low");
-    await clickButton("Undo");
-    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("default");
-
-    setSelect("Reasoning effort", "medium");
-    await clickButton("Self-deployed");
-    await clickButton("Subscription");
-    expect(labelledControl<HTMLSelectElement>("Reasoning effort", "select").value).toBe("medium");
-    setInput("Objective", "Keep the selected Codex effort after switching modes.");
-    await clickButton("Save");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects[0]?.execution).toMatchObject({
-      mode: "codex_subscription_transcript",
-      reasoning_effort: "medium",
-    });
-  });
-
-  it("keeps new-project setup open and activates only the evolution targets selected by the user", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(before.snapshot.capability).toMatchObject({ status: "ready", executionMode: "self-deployed" });
-    root = await renderProduct(provider);
-
-    await clickAria("Create project");
-    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
-    setInput("Objective", "Keep subscription defaults scoped to this new project.");
-    await clickButton("Prepare evolution");
-
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Remote evolution methods are ready");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
-    expect([...document.querySelectorAll<HTMLOptionElement>("#codex-model-suggestions option")].map((option) => option.value)).toEqual([
-      "gpt-5.5",
-      "gpt-5.3-codex-spark",
-    ]);
-    expect(button("Save and activate").disabled).toBe(false);
-
-    const toggles = [...document.querySelectorAll<HTMLInputElement>(".target-toggle input[role='switch']")];
-    expect(toggles).toHaveLength(3);
-    expect(toggles.every((toggle) => !toggle.checked)).toBe(true);
-    const firstToggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
-    if (!firstToggle) throw new Error("Evolution target switch was not found.");
-    expect(firstToggle.type).toBe("checkbox");
-    expect(firstToggle.disabled).toBe(false);
-    expect(firstToggle.tabIndex).toBe(0);
-    expect(firstToggle.closest("label")).not.toBeNull();
-    firstToggle.focus();
-    expect(document.activeElement).toBe(firstToggle);
-    const firstTrack = firstToggle.nextElementSibling;
-    if (!(firstTrack instanceof HTMLElement) || !firstTrack.classList.contains("switch-track")) {
-      throw new Error("Evolution target switch track was not adjacent to its checkbox.");
-    }
-    await act(async () => firstTrack.click());
-    expect(firstToggle.checked).toBe(true);
-    expect(document.querySelector<HTMLSelectElement>('select[aria-label="Text memory method"]')?.value).toBe("reference_text_memory");
-
-    const prepared = await provider.refresh();
-    if (prepared.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const draft = prepared.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
-    expect(draft?.evolution.targets).toEqual({});
-    expect(draft?.evolution_configuration_state).toBe("pending");
-
-    await clickButton("Save and activate");
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-
-    const activated = await provider.refresh();
-    if (activated.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const created = activated.snapshot.projects.find((project) => project.task.objective === "Keep subscription defaults scoped to this new project.");
-    expect(created?.execution).toMatchObject({
-      mode: "codex_subscription_transcript",
-      codex_model: "gpt-5.5",
-      reasoning_effort: "high",
-    });
-    expect(created?.evolution_configuration_state).toBe("configured");
-    expect(created?.evolution.targets).toEqual({
-      text_memory: { enabled: true, method: "reference_text_memory", config: {} },
-    });
-  });
-
-  it("does not reopen or block a configured project with zero evolution targets", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    provider.clearEvolutionSelections("configured");
-    root = await renderProduct(provider);
-
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(button("Start session").disabled).toBe(false);
-    expect(screenText()).not.toContain("Remote evolution methods are ready");
-    await clickButton("Evolution");
-    expect(screenText()).toContain("Evolution is off");
-    expect(screenText()).not.toContain("Evolution is not configured");
-  });
-
-  it("offers cancellation while a local connection operation is active", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ newUser: false, stepDelayMs: 10_000 });
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const profile = before.snapshot.profiles[0];
-    if (!profile) throw new Error("Expected a remote profile fixture.");
-    await provider.connectProfile(profile.profile_id, {
-      actionId: "connect-cancellable-operation-0001",
-      streamEpoch: before.snapshot.stream.epoch,
-      etag: profile.etag,
-    });
-    const cancelOperation = vi.spyOn(provider, "cancelOperation");
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Connecting securely");
-    expect(button("Cancel operation").disabled).toBe(false);
-    await clickButton("Cancel operation");
-
-    expect(cancelOperation).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Remote workspace is offline");
-  });
-
-  it("shows only release-supported modes when creating a project", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, releaseExecutionModes: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Create project");
-    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
-    expect(button("Subscription").disabled).toBe(false);
-    expect(optionalButton("Self-deployed")).toBeNull();
-    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
-    expect(dialog?.textContent).not.toContain("Self-deployed");
-    expect(dialog?.textContent).not.toContain("not available in this OpenEvo Desktop release");
-    expect(screenText()).not.toContain("Hugging Face model");
-  });
-
-  it("keeps a saved unavailable mode visible, blocks mutations, and lets the user switch away", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, releaseExecutionModes: true });
-    const startRun = vi.spyOn(provider, "startRun");
-    root = await renderProduct(provider);
-
-    expect(button("Start session").disabled).toBe(true);
-    expect(button("Start session").title).toContain("not available in this OpenEvo Desktop release");
-    await clickAria("Project settings");
-    expect(button("Self-deployed").getAttribute("aria-checked")).toBe("true");
-    expect(button("Self-deployed").disabled).toBe(true);
-    expect(button("Subscription").disabled).toBe(false);
-    expect(screenText()).toContain("Choose Subscription to save or run this project.");
-    expect(button("Save").disabled).toBe(true);
-
-    await clickButton("Subscription");
-    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
-    expect(button("Save").disabled).toBe(false);
-    await clickButton("Save");
-    expect(startRun).not.toHaveBeenCalled();
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects[0]?.execution.mode).toBe("codex_subscription_transcript");
-  });
-
-  it("blocks activation for a saved release-unavailable mode", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, releaseExecutionModes: true });
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const project = before.snapshot.projects[0];
-    if (!project) throw new Error("Expected a project fixture.");
-    await provider.updateProject(project.project_id, {
-      name: project.name,
-      task: project.task,
-      source: project.source,
-      execution: project.execution,
-      evolution: project.evolution,
-    }, {
-      actionId: "retire-release-unavailable-project-0001",
-      streamEpoch: before.snapshot.stream.epoch,
-      etag: project.etag,
-    });
-    const activateProject = vi.spyOn(provider, "activateProject");
-    root = await renderProduct(provider);
-
-    expect(optionalButton("Connect")).toBeNull();
-    expect(button("Activate project").disabled).toBe(true);
-    expect(button("Activate project").title).toContain("not available in this OpenEvo Desktop release");
-    expect(activateProject).not.toHaveBeenCalled();
-  });
-
-  it("does not reuse another project's same-mode capabilities after a new-project mode switch", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Self-deployed");
-    expect(screenText()).not.toContain("Managed model");
-    await clickAria("Create project");
-    await clickButton("Self-deployed");
-    expect(button("Self-deployed").getAttribute("aria-checked")).toBe("true");
-    expect(labelledControl<HTMLInputElement>("Hugging Face model", "input").value).toBe("Qwen/Qwen3-8B");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
-    setInput("Objective", "Keep self-deployed defaults scoped to this new project.");
-    await clickButton("Prepare evolution");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Keep self-deployed defaults scoped to this new project.");
-    expect(created?.execution).toMatchObject({ mode: "self-deployed", hf_model: "Qwen/Qwen3-8B" });
-    expect(created?.evolution.targets).toEqual({});
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
-  });
-
-  it("resets a mounted project drawer before creating and never exposes unavailable snapshot sync", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    await clickButton("Folder snapshot");
-    await clickButton("Save");
-    await clickAria("Project settings");
-    expect(optionalButton("Sync snapshot")).toBeNull();
-    setInput("Project name", "Stale project A draft");
-    setInput("Hugging Face model", "example/stale-a-model");
-
-    await clickAria("Create project");
-    expect(screenText()).toContain("New project");
-    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("New research project");
-    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
-    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
-    expect(screenText()).not.toContain("example/stale-a-model");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
-    expect(optionalButton("Sync snapshot")).toBeNull();
-
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("New research project");
-    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
-    expect(optionalButton("Sync snapshot")).toBeNull();
-
-    setInput("Objective", "Create without project A state.");
-    await clickButton("Prepare evolution");
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const created = refreshed.snapshot.projects.find((project) => project.task.objective === "Create without project A state.");
-    expect(created).toMatchObject({
-      name: "New research project",
-      execution: { mode: "codex_subscription_transcript", codex_model: "gpt-5.5" },
-      evolution: { targets: {} },
-    });
-  });
-
-  it("exposes only SSH agent authentication in the release UI", async () => {
-    provider = createFixtureDesktopProductProvider();
-    root = await renderProduct(provider);
-
-    await clickButton("Add remote workspace");
-    expect(screenText()).toContain("Authentication");
-    expect(screenText()).toContain("SSH agent");
-    expect(screenText()).not.toContain("Server password");
-    expect(screenText()).not.toContain("Private key");
-    expect(document.querySelector('input[type="password"]')).toBeNull();
-    expect(document.querySelector(".credential-editor")).toBeNull();
-  });
-
-  it("commits the later revision and pins it in the next session", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
-    root = await renderProduct(provider);
-
-    await clickButton("Start session");
-    expect(screenText()).toContain("Queued");
-    expect(screenText()).toContain("Project Head 2");
-    await advance(45);
-    expect(screenText()).toContain("Running");
-    await advance(60);
-    expect(screenText()).toContain("Preparing next revision");
-    expect(screenText()).toContain("Project Head 2");
-    await advance(25);
-    expect(screenText()).toContain("Project Head 3");
-    expect(screenText()).toContain("Latest session complete");
-    expect(screenText()).toContain("Project Head 3 contains this session's selected evolution outputs.");
-    expect(Array.from(document.querySelectorAll('[role="columnheader"]'), (header) => header.textContent)).toContain("Evolution output");
-    expect(screenText()).not.toContain("Successor");
-
-    const completed = await provider.refresh();
-    if (completed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    const evolvedRun = completed.snapshot.runs.find((run) => run.status === "succeeded" && run.id !== "run-fixture-1");
-    expect(evolvedRun?.pinned_revision?.generation).toBe(2);
-    expect(evolvedRun?.required_revision.revision.generation).toBe(2);
-    expect(evolvedRun?.revision_transition).toBeNull();
-    const evolvedArtifacts = completed.snapshot.artifacts.filter((artifact) => artifact.run_id === evolvedRun?.id);
-    expect(evolvedArtifacts).toHaveLength(3);
-    expect(evolvedArtifacts.every((artifact) => artifact.produced_revision.generation === 3)).toBe(true);
-
-    await clickButton("Session 1");
-    expect(button("Session 1").getAttribute("aria-pressed")).toBe("true");
-    expect(document.querySelector(".active-run-panel .panel-kicker")?.textContent).toBe("Selected session");
-    expect(document.querySelector(".active-run-panel h2")?.textContent).toBe("Session 1");
-    expect(document.querySelector(".completed-summary strong")?.textContent).toBe("Session complete");
-    expect(optionalButton("View changes")).not.toBeNull();
-    await clickButton("View changes");
-    expect(screenText()).toContain("Historical Project Head");
-    expect(document.querySelector(".revision-node")?.textContent).toContain("Project Head 2");
-    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(3);
-
-    await clickButton("Research");
-
-    await clickButton("Session 2");
-    expect(button("Session 2").getAttribute("aria-pressed")).toBe("true");
-    expect(document.querySelector(".active-run-panel h2")?.textContent).toBe("Session 2");
-    expect(document.querySelector(".completed-summary strong")?.textContent).toBe("Latest session complete");
-    expect(optionalButton("View changes")).not.toBeNull();
-
-    await clickButton("Start session");
-    expect(screenText()).toContain("Pinned context");
-    expect(screenText()).toContain("Project Head 3");
-  });
-
-  it("keeps Desktop project identity distinct from Core run and artifact identity", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    const project = refreshed.snapshot.projects[0];
-    if (!project?.remote) throw new Error("Fixture project did not have a remote identity.");
-
-    expect(project.project_id).not.toBe(project.remote.core_project_id);
-    expect(refreshed.snapshot.runs.every((run) => run.project_id === project.remote?.core_project_id)).toBe(true);
-    expect(refreshed.snapshot.artifacts.every((artifact) => artifact.project_id === project.remote?.core_project_id)).toBe(true);
-
-    root = await renderProduct(provider);
-    expect(screenText()).toContain("Latest session complete");
-    await clickButton("Evolution");
-    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(3);
-    expect(screenText()).not.toContain("Parametric memory");
-  });
-
-  it("keeps a terminal fixture run immutable when scheduled steps fire later", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 20 });
-    const initial = await provider.refresh();
-    if (initial.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    const project = initial.snapshot.projects[0];
-    if (!project) throw new Error("Fixture project was not found.");
-    const run = await provider.startRun({ projectId: project.project_id, etag: project.etag, streamEpoch: initial.snapshot.stream.epoch, actionId: "state-machine-start" });
-    await provider.cancelRun(run.id, { etag: run.etag, streamEpoch: initial.snapshot.stream.epoch, actionId: "state-machine-cancel" });
-
-    vi.advanceTimersByTime(25);
-    const transitioned = await provider.refresh();
-    if (transitioned.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    const current = transitioned.snapshot.runs.find((candidate) => candidate.id === run.id);
-
-    expect(current?.status).toBe("cancelled");
-    expect(current?.finished_at).not.toBeNull();
-    expect(current?.current_error).toBeNull();
-    expect(current?.current_attempt?.finished_at).not.toBeNull();
-    expect(current?.current_attempt?.error).toBeNull();
-    expect(current?.attempts.at(-1)?.finished_at).not.toBeNull();
-    expect(current?.attempts.at(-1)?.error).toBeNull();
-  });
-
-  it("shows artifact content, changes, document tabs, and truncation", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, artifactTruncated: true });
-    root = await renderProduct(provider);
-
-    await clickButton("Evolution");
-    await flush();
-    expect(screenText()).toContain("Preview is truncated");
-    await clickButton("Text memory");
-    await flush();
-    expect(screenText()).toContain("Research memory");
-    await clickButton("Skills");
-    await flush();
-    expect(screenText()).toContain("Analysis workflow");
-    expect(screenText()).toContain("Result verification");
-    const contentRoot = document.querySelector<HTMLElement>(".artifact-content-view");
-    expect(contentRoot?.dataset.artifactId).toBeTruthy();
-    expect(contentRoot?.dataset.artifactType).toBe("skill_bundle");
-    expect(contentRoot?.dataset.artifactContentSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(Number(contentRoot?.dataset.totalDocuments)).toBeGreaterThan(1);
-    expect(Number(contentRoot?.dataset.totalUtf8Bytes)).toBeGreaterThan(0);
-    expect(Number(contentRoot?.dataset.returnedUtf8Bytes)).toBeGreaterThan(0);
-    expect(contentRoot?.dataset.truncated).toBe("true");
-    const documentTabs = [...document.querySelectorAll<HTMLElement>(".document-tabs [role=tab]")];
-    expect(documentTabs.length).toBeGreaterThan(1);
-    expect(documentTabs.every((tab) => (
-      Boolean(tab.dataset.documentId)
-      && Boolean(tab.dataset.displayName)
-      && Boolean(tab.dataset.relativePath)
-      && Boolean(tab.dataset.mimeType)
-      && /^[a-f0-9]{64}$/.test(tab.dataset.contentSha256 ?? "")
-      && Number.isSafeInteger(Number(tab.dataset.byteSize))
-      && ["true", "false"].includes(tab.dataset.truncated ?? "")
-    ))).toBe(true);
-    const documentPanel = document.querySelector<HTMLElement>(".artifact-document");
-    expect(documentPanel?.dataset.documentId).toBeTruthy();
-    expect(documentPanel?.dataset.contentSha256).toMatch(/^[a-f0-9]{64}$/);
-    await clickButton("Changes");
-    await flush();
-    expect(screenText()).toContain("Added for Revision 2");
-    const diff = document.querySelector<HTMLElement>(".diff-view");
-    expect(diff?.dataset.artifactId).toBeTruthy();
-    expect(diff?.dataset.previousArtifactId).toBeTruthy();
-    expect(diff?.dataset.artifactContentSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(diff?.dataset.previousArtifactContentSha256).toMatch(/^[a-f0-9]{64}$/);
-    expect(document.querySelector(".diff-hunk-block")).not.toBeNull();
-    const diffLine = document.querySelector<HTMLElement>(".diff-line");
-    expect(diffLine?.dataset.kind).toBeTruthy();
-    expect(diffLine?.querySelector("code")?.textContent).not.toBeNull();
-  });
-
-  it("retries a newly published artifact before showing a terminal error", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const original = provider.getArtifactContent.bind(provider);
-    let calls = 0;
-    const getArtifactContent = vi.fn(async (artifactId: string) => {
-      calls += 1;
-      if (calls === 1) {
-        throw new DesktopApiError(apiErrorV1Schema.parse({
-          schema_version: "1",
-          request_id: "request-artifact-publication-1",
-          http_status: 422,
-          code: "artifact_content_invalid",
-          message: "The artifact payload is still being published.",
-          severity: "warning",
-          category: "artifact",
-          retryable: false,
-          repair_action: "openevo_can_retry",
-          next_action: "Retry the artifact preview.",
-          details: {},
-        }));
-      }
-      return original(artifactId);
-    });
-    Object.assign(provider, { getArtifactContent });
-    root = await renderProduct(provider);
-
-    await clickButton("Evolution");
-    await advance(250);
-    await flush();
-
-    expect(getArtifactContent).toHaveBeenCalledTimes(2);
-    expect(screenText()).toContain("Agent guidance");
-    expect(screenText()).not.toContain("Artifact unavailable");
-  });
-
-  it("shows rename and empty-file document changes without line hunks", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useDocumentLevelArtifactDiff();
-    root = await renderProduct(provider);
-
-    await clickButton("Evolution");
-    await clickButton("Changes");
-    await flush();
-
-    expect(screenText()).toContain("notes.md to evidence.md");
-    expect(screenText()).toContain("Renamed without content changes.");
-    expect(screenText()).toContain("Empty document added.");
-    expect(screenText()).toContain("Empty document removed.");
-    expect(document.querySelectorAll(".diff-hunk")).toHaveLength(3);
-  });
-
-  it("refuses content and changes cross-wired to another selected artifact", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useCrossWiredArtifactPayloads();
-    root = await renderProduct(provider);
-
-    await clickButton("Evolution");
-    await flush();
-    expect(screenText()).toContain("Artifact content identity does not match the selected artifact.");
-    expect(document.querySelector(".artifact-document")).toBeNull();
-    await clickButton("Changes");
-    await flush();
-    expect(screenText()).toContain("Artifact change identity does not match the selected artifact.");
-    expect(document.querySelector(".diff-hunk")).toBeNull();
-  });
-
-  it("refuses content whose parent artifact digest does not match the selection", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const original = provider.getArtifactContent.bind(provider);
-    Object.assign(provider, {
-      getArtifactContent: async (artifactId: string) => ({
-        ...await original(artifactId),
-        artifact_content_sha256: "f".repeat(64),
-      }),
-    });
-    root = await renderProduct(provider);
-
-    await clickButton("Evolution");
-    await flush();
-    expect(screenText()).toContain("Artifact content identity does not match the selected artifact.");
-    expect(document.querySelector(".artifact-document")).toBeNull();
-  });
-
-  it("refuses a diff whose previous artifact identity is unrelated to the selection", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useMismatchedArtifactDiffPreviousIdentity();
-    root = await renderProduct(provider);
-
-    await clickButton("Evolution");
-    await clickButton("Changes");
-    await flush();
-    expect(screenText()).toContain("Artifact change history does not match the selected artifact.");
-    expect(document.querySelector(".diff-hunk")).toBeNull();
-  });
-
-  it("keeps implementation and sensitive operational terms out of the product surface", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-    await clickButton("System");
-    await clickAria("Remote workspace settings");
-
-    const text = screenText().toLowerCase();
-    for (const forbidden of [
-      "benchmark",
-      "core url",
-      "host path",
-      "stdout",
-      "stderr",
-      "method implementation",
-      "process id",
-      "command line",
-    ]) {
-      expect(text).not.toContain(forbidden);
-    }
-    expect(document.querySelector('input[type="password"]')).toBeNull();
-    expect(screenText()).toContain("SSH agent");
-    expect(screenText()).not.toContain("Stored securely");
-  });
-
-  it("blocks mutations while the event stream is stale and recovers from a snapshot refresh", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    await act(async () => provider?.markStreamStale());
-    await flush();
-    expect(button("Start session").disabled).toBe(true);
-    expect(screenText()).toContain("Refresh this view");
-
-    await clickButton("Refresh");
-    expect(button("Start session").disabled).toBe(false);
-
-    await act(async () => provider?.resetEventCursor());
-    await flush();
-    expect(button("Start session").disabled).toBe(false);
-
-    provider.failNextRefresh();
-    await act(async () => provider?.resetEventCursor());
-    await flush();
-    expect(button("Start session").disabled).toBe(true);
-    expect(screenText()).not.toContain("internal refresh details");
-  });
-
-  it("resumes an incomplete evolution setup after refresh and blocks an unsupported saved method", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.clearEvolutionSelections("pending");
-    root = await renderProduct(provider);
-
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Remote evolution methods are ready");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(3);
-    expect(screenText()).toContain("Text memory");
-    await clickAria("Close settings");
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-
-    provider.useUnsupportedSavedMethod();
-    await flush();
-    expect(button("Start session").disabled).toBe(true);
-    expect(screenText()).toContain("unsupported for this project and mode");
-    await clickAria("Project settings");
-    expect(screenText()).toContain("removed_text_memory (no longer available)");
-    const staleToggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
-    if (!staleToggle) throw new Error("Unsupported target toggle was not found.");
-    await act(async () => staleToggle.click());
-    expect(staleToggle.checked).toBe(false);
-    await act(async () => staleToggle.click());
-    const repairedMethod = document.querySelector<HTMLSelectElement>('.target-toggle select[aria-label="Text memory method"]');
-    expect(staleToggle.checked).toBe(true);
-    expect(repairedMethod?.value).toBe("reference_text_memory");
-  });
-
-  it("preserves accepted existing methods and offers supported Core selection resolvers", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useAcceptedSavedMethod();
-    root = await renderProduct(provider);
-
-    expect(button("Start session").disabled).toBe(false);
-    await clickAria("Project settings");
-    expect(screenText()).toContain("hidden_text_memory (existing selection)");
-    const hiddenOption = Array.from(document.querySelectorAll<HTMLOptionElement>("option")).find((item) => item.value === "hidden_text_memory");
-    expect(hiddenOption?.disabled).toBe(true);
-    await clickAria("Close settings");
-
-    provider.useResolverSavedMethod();
-    await flush();
-    expect(button("Start session").disabled).toBe(false);
-    await clickAria("Project settings");
-    const resolver = Array.from(document.querySelectorAll<HTMLOptionElement>("option")).find((item) => item.value === "auto");
-    expect(resolver?.disabled).toBe(false);
-    expect(resolver?.textContent).toContain("Automatic");
-  });
-
-  it("preserves explicit evolution config across mode changes without reusing old-mode capabilities", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useEditableMethodSchemaWithPartialOverride();
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const explicitTargets = before.snapshot.projects[0]?.evolution.targets;
-    if (!explicitTargets) throw new Error("Expected an existing project with explicit evolution targets.");
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    await clickButton("Subscription");
-    expect(screenText()).toContain("Capabilities are unavailable for this project and mode.");
-    await clickButton("Save");
-
-    expect(screenText()).not.toContain("Research configuration");
-    expect(button("Start session").disabled).toBe(true);
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects[0]?.evolution.targets).toEqual(explicitTargets);
-  });
-
-  it("retries unavailable capabilities for the same project and mode without losing the draft", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-    await act(async () => provider?.setCapabilitiesUnavailableUntilRefresh());
-    await flush();
-
-    await clickAria("Project settings");
-    setInput("Objective", "Keep this capability retry draft.");
-    expect(screenText()).toContain("Capabilities are unavailable for this project and mode.");
-    await clickButton("Retry capabilities");
-
-    expect(screenText()).toContain("Keep this capability retry draft.");
-    expect(screenText()).not.toContain("Capabilities are unavailable for this project and mode.");
-  });
-
-  it("edits every ordinary field in a closed remote method config schema", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useEditableMethodSchema();
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-
-    setInput("Reflection prompt", "Retain only verified findings.");
-    setInput("Iterations", "7");
-    setInput("Temperature", "0.25");
-    setSelect("Strategy", "strict");
-    setCheckbox("Include failures", true);
-    setInput("Minimum score", "0.8");
-    setInput("Tags", '["evidence","review"]');
-    await clickButton("Save");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    expect(refreshed.snapshot.projects[0]?.evolution.targets.text_memory?.config).toEqual({
-      prompt: "Retain only verified findings.",
-      iterations: 7,
-      temperature: 0.25,
-      strategy: "strict",
-      include_failures: true,
-      advanced: { minimum_score: 0.8 },
-      tags: ["evidence", "review"],
-    });
-  });
-
-  it("deep-merges method defaults for display while saving only the partial user override", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useEditableMethodSchemaWithPartialOverride();
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-
-    expect(labelledControl<HTMLInputElement>("Reflection prompt", "input").value).toBe("Keep durable findings.");
-    expect(labelledControl<HTMLInputElement>("Iterations", "input").value).toBe("5");
-    expect(labelledControl<HTMLInputElement>("Minimum score", "input").value).toBe("0.5");
-    setInput("Minimum score", "0.8");
-    await clickButton("Save");
-
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    expect(refreshed.snapshot.projects[0]?.evolution.targets.text_memory?.config).toEqual({
-      iterations: 5,
-      advanced: { minimum_score: 0.8 },
-    });
-  });
-
-  it("re-enables a supported saved method without an effective default", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useNullEffectiveDefault();
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-
-    const toggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
-    expect(toggle?.checked).toBe(false);
-    expect(toggle?.disabled).toBe(false);
-    await act(async () => toggle?.click());
-    expect(toggle?.checked).toBe(true);
-    expect(document.querySelector<HTMLSelectElement>('select[aria-label="Text memory method"]')?.value).toBe("reference_text_memory");
-  });
-
-  it("requires an effective default when a disabled target has no saved method", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useNullEffectiveDefaultWithoutSavedMethod();
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-
-    const toggle = document.querySelector<HTMLInputElement>('.target-toggle[data-target-id="text_memory"] input[role="switch"]');
-    expect(toggle?.checked).toBe(false);
-    expect(toggle?.disabled).toBe(true);
-    expect(screenText()).toContain("No supported default is available from the remote registry.");
-  });
-
-  it("renders typed queued, succeeded, failed, and cancelled run outcomes with recovery", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRequest = deferred<RunV1>();
-    const retryRun = vi.fn((_runId: string, _intent: ProductResourceMutationIntent) => retryRequest.promise);
-    Object.assign(provider, { retryRun });
-    const startRun = vi.spyOn(provider, "startRun");
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Model preparation");
-    expect(screenText()).toContain("The selected model is being prepared.");
-    expect(screenText()).toContain("The model worker could not load the selected model.");
-    expect(screenText()).toContain("Complete");
-    expect(screenText()).toContain("Failed");
-    expect(screenText()).toContain("Cancelled");
-    expect(document.querySelectorAll('[role="columnheader"]')).toHaveLength(6);
-    expect(document.querySelectorAll('[role="cell"]').length).toBeGreaterThanOrEqual(24);
-
-    await clickButton("Cancel session");
-    expect(button("Retry session").disabled).toBe(false);
-    await act(async () => {
-      button("Retry session").click();
-      await Promise.resolve();
-    });
-
-    expect(retryRun).toHaveBeenCalledWith("run-failed-model", expect.objectContaining({
-      actionId: expect.any(String),
-      streamEpoch: expect.any(Number),
-      etag: expect.any(String),
-    }));
-    expect(startRun).not.toHaveBeenCalled();
-    expect(button("Start session").disabled).toBe(true);
-    expect(Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
-      .filter((item) => item.textContent?.trim() === "Retry session")
-      .every((item) => item.disabled)).toBe(true);
-
-    await act(async () => {
-      retryRequest.reject(new DesktopProductUserError("The failed session could not be retried."));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await flush();
-
-    expect(screenText()).toContain("Action could not be completed");
-    expect(screenText()).toContain("The failed session could not be retried.");
-    expect(button("Retry session").disabled).toBe(false);
-
-    await clickButton("Retry session");
-    expect(retryRun).toHaveBeenCalledTimes(2);
-    expect(retryRun.mock.calls[1]?.[1].actionId).not.toBe(retryRun.mock.calls[0]?.[1].actionId);
-    expect(startRun).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    "accepted retry persistence",
-    "rejected retry clear",
-  ])("preserves restart guidance after uncertain %s", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-    await clickButton("Cancel session");
-    const restartError = new DesktopProductUserError(
-      "OpenEvo could not save local retry recovery state. Restart Desktop and try again.",
-    );
-    let restartRequired = false;
-    const retryRun = vi.fn(async () => {
-      restartRequired = true;
-      throw restartError;
-    });
-    const getRunRetryRecovery = vi.fn(() => {
-      if (restartRequired) throw restartError;
-      return null;
-    });
-    Object.assign(provider, { retryRun, getRunRetryRecovery });
-
-    await clickButton("Retry session");
-
-    expect(screenText()).toContain("Restart Desktop and try again.");
-    expect(screenText()).not.toContain("The retry outcome is not yet confirmed.");
-    expect(retryRun).toHaveBeenCalledTimes(1);
-    expect(getRunRetryRecovery).toHaveBeenCalled();
-  });
-
-  it("shows the failed preview outcome and retries by appending an attempt to the same run", async () => {
-    provider = createFixtureDesktopProductProvider({
-      startOnline: true,
-      seedFailedRun: true,
-      releaseExecutionModes: true,
-      projectExecutionMode: "codex_subscription_transcript",
-    });
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Latest session failed");
-    expect(screenText()).toContain("Project Head 1");
-    expect(screenText()).not.toContain("Project Head unknown");
-    expect(screenText()).not.toContain("Remote capabilities are unavailable for this project and mode.");
-    expect(screenText()).toContain("The research session failed before evolution outputs were committed.");
-    expect(screenText()).not.toContain("Latest session complete");
-    expect(button("Retry session").disabled).toBe(false);
-
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    const failedRun = before.snapshot.runs[0];
-    if (!failedRun) throw new Error("Failed run fixture was not found.");
-    await clickButton("Retry session");
-
-    const after = await provider.refresh();
-    if (after.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    expect(after.snapshot.runs).toHaveLength(1);
-    expect(after.snapshot.runs[0]?.id).toBe(failedRun.id);
-    expect(after.snapshot.runs[0]?.attempt_count).toBe(2);
-    expect(after.snapshot.runs[0]?.attempts.map((attempt) => attempt.status)).toEqual(["failed", "queued"]);
-    expect(screenText()).toContain("The retry was admitted on the same session.");
-  });
-
-  it("clears an unknown retry error when refresh proves the same run advanced", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const advanced = withAdvancedRetry(before.snapshot);
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: advanced,
-    });
-
-    await clickButton("Retry session");
-    await flush();
-
-    expect(retryRun).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("The retry was admitted.");
-    expect(screenText()).not.toContain("Action could not be completed");
-    expect(screenText()).not.toContain("The retry response was lost.");
-  });
-
-  it("keeps an accepted retry response visible when the following snapshot omits the run", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const advancedSnapshot = withAdvancedRetry(failed.snapshot);
-    const advancedRun = advancedSnapshot.runs.find((run) => run.id === "run-failed-model");
-    if (!advancedRun) throw new Error("Expected the advanced retry run.");
-    const retryRun = vi.fn(async () => advancedRun);
-    Object.assign(provider, { retryRun });
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: {
-        ...failed.snapshot,
-        runs: failed.snapshot.runs.filter((run) => run.id !== advancedRun.id),
+    document.body.innerHTML = '<div id="root"></div>';
+    const quarantined = systemProfile({
+      connection_generation: 5,
+      connection_state: "failed",
+      trust: {
+        ...retryable.trust,
+        connection_generation: 5,
+        state: "unverified",
       },
-    });
-
-    await clickButton("Retry session");
-    await flush();
-
-    expect(retryRun).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("The retry was admitted.");
-    expect(screenText()).not.toContain("Action could not be completed");
-    expect(optionalButton("Retry session")).toBeNull();
-
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-    expect(screenText()).toContain("The retry was admitted.");
-    expect(optionalButton("Retry session")).toBeNull();
-
-    vi.mocked(provider.refresh).mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: withTwoAdvancedRetries(failed.snapshot),
-    });
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-    expect(screenText()).toContain("The retry was admitted.");
-    expect(screenText()).not.toContain("A later retry was admitted.");
-    expect(optionalButton("Retry session")).toBeNull();
-  });
-
-  it("does not reconcile an accepted retry from a different appended attempt or project", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const acceptedSnapshot = withAdvancedRetry(failed.snapshot);
-    const accepted = acceptedSnapshot.runs.find((run) => run.id === "run-failed-model");
-    if (!accepted?.current_attempt) throw new Error("Expected an accepted retry.");
-    const retryRun = vi.fn(async () => accepted);
-    Object.assign(provider, { retryRun });
-    const refresh = vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: failed.snapshot,
-    });
-
-    await clickButton("Retry session");
-    const otherAttemptId = "attempt-run-failed-model-other-retry";
-    const otherAttempt = { ...accepted.current_attempt, id: otherAttemptId };
-    refresh.mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: {
-        ...acceptedSnapshot,
-        runs: acceptedSnapshot.runs.map((run) => run.id === accepted.id ? {
-          ...run,
-          current_attempt_id: otherAttemptId,
-          current_attempt: otherAttempt,
-          attempts: [...run.attempts.slice(0, -1), otherAttempt],
-        } : run),
-      },
-    });
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-
-    expect(screenText()).toContain("The retry was admitted.");
-    expect(screenText()).not.toContain(otherAttemptId);
-    expect(optionalButton("Retry session")).toBeNull();
-  });
-
-  it("polls after an unknown retry until a later authoritative refresh proves advancement", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    await clickButton("Retry session");
-    await flush();
-    expect(screenText()).toContain("Action could not be completed");
-
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: withAdvancedRetry(failed.snapshot),
-    });
-    await advance(1_005);
-
-    expect(screenText()).toContain("The retry was admitted.");
-    expect(screenText()).not.toContain("Action could not be completed");
-    expect(screenText()).not.toContain("The retry response was lost.");
-  });
-
-  it("does not treat a temporarily absent run as retry advancement", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    await clickButton("Retry session");
-    await flush();
-    const retryCalls = retryRun.mock.calls as unknown as Array<[string, ProductResourceMutationIntent]>;
-    const firstActionId = retryCalls[0]?.[1].actionId;
-
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: {
-        ...failed.snapshot,
-        runs: failed.snapshot.runs.filter((run) => run.id !== "run-failed-model"),
-      },
-    });
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-
-    expect(screenText()).toContain("Action could not be completed");
-    expect(screenText()).toContain("The retry response was lost.");
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-    await clickButton("Retry session");
-    expect(retryRun).toHaveBeenCalledTimes(2);
-    expect(retryCalls[1]?.[1].actionId).toBe(firstActionId);
-  });
-
-  it("does not treat status or ETag churn without a new attempt as retry advancement", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    await clickButton("Retry session");
-    await flush();
-    const retryCalls = retryRun.mock.calls as unknown as Array<[string, ProductResourceMutationIntent]>;
-    const originalIntent = retryCalls[0]?.[1];
-
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: {
-        ...failed.snapshot,
-        runs: failed.snapshot.runs.map((run) => run.id === "run-failed-model"
-          ? { ...run, etag: `"${"f".repeat(64)}"` }
-          : run),
-      },
-    });
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-
-    expect(screenText()).toContain("Action could not be completed");
-    expect(screenText()).toContain("The retry response was lost.");
-    await clickButton("Retry session");
-    await flush();
-    expect(retryRun).toHaveBeenCalledTimes(2);
-    expect(retryCalls[1]?.[1]).toEqual(originalIntent);
-  });
-
-  it("does not reconcile a retry when an original attempt was rewritten", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    await clickButton("Retry session");
-    await flush();
-    const advanced = withAdvancedRetry(failed.snapshot);
-    const rewritten = {
-      ...advanced,
-      runs: advanced.runs.map((run) => run.id === "run-failed-model"
-        ? {
-            ...run,
-            attempts: run.attempts.map((attempt, index) => index === 0
-              ? { ...attempt, updated_at: "2026-07-15T00:00:00Z" }
-              : attempt),
-          }
-        : run),
-    };
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({ status: "fresh", snapshot: rewritten });
-
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-
-    expect(screenText()).toContain("Action could not be completed");
-    expect(screenText()).toContain("The retry response was lost.");
-  });
-
-  it("does not reconcile one retry from a snapshot with two appended attempts", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("The retry response was lost.");
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    await clickButton("Retry session");
-    await flush();
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: withTwoAdvancedRetries(failed.snapshot),
-    });
-
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    await flush();
-
-    expect(screenText()).toContain("Action could not be completed");
-    expect(screenText()).toContain("The retry response was lost.");
-  });
-
-  it("starts retry reconciliation polling only after the request becomes ambiguous", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    const retryRequest = deferred<RunV1>();
-    const retryRun = vi.fn(() => retryRequest.promise);
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    await clickButton("Cancel session");
-    const refresh = vi.spyOn(provider, "refresh");
-    await act(async () => {
-      button("Retry session").click();
-      await Promise.resolve();
-    });
-    const refreshesWhileRequestStarted = refresh.mock.calls.length;
-    await advance(2_005);
-    expect(refresh).toHaveBeenCalledTimes(refreshesWhileRequestStarted);
-
-    await act(async () => {
-      retryRequest.reject(new DesktopProductAmbiguousMutationError("The retry response was lost."));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await flush();
-    const refreshesAfterAmbiguousResult = refresh.mock.calls.length;
-    await advance(1_005);
-    expect(refresh.mock.calls.length).toBeGreaterThan(refreshesAfterAmbiguousResult);
-  });
-
-  it("does not poll after a deterministic retry rejection", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({
-      startOnline: true,
-      seedFailedRun: true,
-      releaseExecutionModes: true,
-      projectExecutionMode: "codex_subscription_transcript",
-    });
-    const retryRun = vi.fn(async () => {
-      throw new DesktopApiError(apiErrorV1Schema.parse({
-        schema_version: "1",
-        request_id: "request-retry-rejected-1",
-        http_status: 409,
-        code: "run_retry_rejected",
-        message: "The failed session cannot be retried yet.",
-        severity: "warning",
-        category: "run",
-        retryable: true,
-        repair_action: "openevo_can_retry",
-        next_action: "Try again after the current remote operation finishes.",
-        details: {},
-      }));
-    });
-    Object.assign(provider, { retryRun });
-    root = await renderProduct(provider);
-
-    const refresh = vi.spyOn(provider, "refresh");
-    await clickButton("Retry session");
-    await flush();
-    await advance(1_005);
-    const refreshesAfterSettledWork = refresh.mock.calls.length;
-    await advance(5_005);
-
-    expect(refresh).toHaveBeenCalledTimes(refreshesAfterSettledWork);
-    expect(screenText()).toContain("The failed session cannot be retried yet.");
-  });
-
-  it("does not let a concurrent aggregate erase a deterministic retry rejection", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const retryRun = vi.fn(async () => {
-      throw new DesktopApiError(apiErrorV1Schema.parse({
-        schema_version: "1",
-        request_id: "request-retry-concurrent-1",
-        http_status: 409,
-        code: "run_retry_rejected",
-        message: "This exact retry request was rejected.",
-        severity: "warning",
-        category: "run",
-        retryable: true,
-        repair_action: "openevo_can_retry",
-        next_action: "Review the new remote attempt before retrying.",
-        details: {},
-      }));
-    });
-    Object.assign(provider, { retryRun });
-    vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-      status: "fresh",
-      snapshot: withAdvancedRetry(failed.snapshot),
-    });
-
-    await clickButton("Retry session");
-    await flush();
-
-    expect(screenText()).toContain("This exact retry request was rejected.");
-    expect(screenText()).not.toContain("The retry was admitted on the same session.");
-  });
-
-  it("retains a deterministic retry rejection after an earlier refresh reconciles the pending view", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const retryRequest = deferred<RunV1>();
-    Object.assign(provider, { retryRun: vi.fn(() => retryRequest.promise) });
-    vi.spyOn(provider, "refresh").mockResolvedValue({
-      status: "fresh",
-      snapshot: withAdvancedRetry(failed.snapshot),
-    });
-
-    await act(async () => {
-      button("Retry session").click();
-      await Promise.resolve();
-      provider?.emitAuthoritativeRefresh();
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await flush();
-    await act(async () => {
-      retryRequest.reject(new DesktopApiError(apiErrorV1Schema.parse({
-        schema_version: "1",
-        request_id: "request-retry-after-refresh-1",
-        http_status: 409,
-        code: "run_retry_rejected_after_refresh",
-        message: "The exact retry was rejected after reconciliation started.",
-        severity: "warning",
-        category: "run",
+      failure: {
+        schema_version: "2",
+        code: "ssh_cleanup_authority_lost",
+        summary:
+          "Desktop cannot prove that the previous system OpenSSH master stopped.",
         retryable: false,
-        repair_action: "user_action_required",
-        next_action: "Review the remote session before retrying.",
-        details: {},
-      })));
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await flush();
-
-    expect(screenText()).toContain("The exact retry was rejected after reconciliation started.");
-  });
-
-  it("restores an exact ambiguous retry after the product renderer remounts", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-    await clickButton("Cancel session");
-    const failed = await provider.refresh();
-    if (failed.status !== "fresh") throw new Error("Expected a fresh failed fixture.");
-    const failedRun = failed.snapshot.runs.find((run) => run.id === "run-failed-model");
-    if (!failedRun) throw new Error("Expected a failed run.");
-    const intent = {
-      actionId: "renderer-action-retry-remount-0001",
-      streamEpoch: failed.snapshot.stream.epoch,
-      etag: failedRun.etag,
-    };
-    const recovery: ProductRunRetryRecovery = {
-      schemaVersion: 1,
-      runId: failedRun.id,
-      projectId: failedRun.project_id,
-      intent,
-      originalRun: failedRun,
-      acceptedRun: null,
-    };
-    const retryRun = vi.fn(async () => {
-      throw new DesktopProductAmbiguousMutationError("Still reconciling the original retry.");
-    });
-    Object.assign(provider, { retryRun, getRunRetryRecovery: () => recovery });
-    await act(async () => root?.unmount());
-    root = null;
-
-    root = await renderProduct(provider);
-    await clickButton("Retry session");
-
-    expect(retryRun).toHaveBeenCalledWith(failedRun.id, intent);
-  });
-
-  it("does not let retry completion clear a newer operation error", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, stepDelayMs: 10_000 });
-    provider.useRunStateReviewScenario();
-    root = await renderProduct(provider);
-    await clickButton("Cancel session");
-    const beforeConnect = await provider.refresh();
-    if (beforeConnect.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const profile = beforeConnect.snapshot.profiles[0];
-    const failedRun = beforeConnect.snapshot.runs.find((run) => run.id === "run-failed-model");
-    if (!profile || !failedRun) throw new Error("Expected profile and failed run fixtures.");
-    await act(async () => {
-      await provider?.connectProfile(profile.profile_id, {
-        actionId: "connect-during-retry-0001",
-        streamEpoch: beforeConnect.snapshot.stream.epoch,
-        etag: profile.etag,
-      });
-    });
-    await flush();
-
-    const retryRequest = deferred<RunV1>();
-    const retryRun = vi.fn(() => retryRequest.promise);
-    Object.assign(provider, { retryRun });
-    vi.spyOn(provider, "cancelOperation").mockRejectedValueOnce(
-      new DesktopProductUserError("The connection operation could not be cancelled."),
-    );
-
-    await act(async () => {
-      button("Retry session").click();
-      await Promise.resolve();
-    });
-    await clickButton("Cancel operation");
-    expect(screenText()).toContain("The connection operation could not be cancelled.");
-
-    await act(async () => {
-      retryRequest.resolve(failedRun);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    await flush();
-
-    expect(screenText()).toContain("Action could not be completed");
-    expect(screenText()).toContain("The connection operation could not be cancelled.");
-  });
-
-  it("shows every selected revision member, including multiple artifacts for one target, in stable order", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true, includeParametricMemory: true });
-    provider.useAuthoritativeArtifactOrderingScenario();
-    root = await renderProduct(provider);
-    await clickButton("Evolution");
-    await flush();
-
-    expect(screenText()).toContain("Project Head 4");
-    expect(screenText()).not.toContain("Unselected newer artifact");
-    const artifactNames = Array.from(document.querySelectorAll(".artifact-list-item strong"), (item) => item.textContent);
-    expect(artifactNames).toEqual(["Parametric memory", "Skills", "Text memory", "Text memory", "Agent guidance"]);
-    const artifactSummaries = Array.from(document.querySelectorAll(".artifact-list-item small"), (item) => item.textContent);
-    expect(artifactSummaries).toEqual([
-      "Selected adapter state for the next session.",
-      "Reusable analysis and validation routines.",
-      "Additional selected memory",
-      "Durable findings and constraints from this session.",
-      "Updated operating guidance for the next session.",
-    ]);
-
-    provider.makeRevisionEvidenceUnknown();
-    await flush();
-    expect(screenText()).toContain("Project Head unknown");
-    expect(button("Refetch Project Head").disabled).toBe(false);
-  });
-
-  it("fails closed on conflicting required and transition predecessor revision identities", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useRequiredRevisionIdentityConflict();
-    root = await renderProduct(provider);
-    await clickButton("Evolution");
-    expect(screenText()).toContain("Project Head relation is unknown");
-
-    provider.useTransitionPredecessorIdentityConflict();
-    provider.emitAuthoritativeRefresh();
-    await flush();
-    expect(screenText()).toContain("Project Head relation is unknown");
-    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
-  });
-
-  it("requires complete revision identity for selected artifact membership", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useArtifactMembershipIdentityConflict();
-    root = await renderProduct(provider);
-    await clickButton("Evolution");
-
-    expect(screenText()).toContain("No evolved artifacts yet");
-    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
-  });
-
-  it("does not present a partial paginated artifact collection as complete revision membership", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useAuthoritativeArtifactOrderingScenario();
-    provider.markArtifactCollectionIncomplete();
-    root = await renderProduct(provider);
-    await clickButton("Evolution");
-
-    expect(screenText()).toContain("Artifact collection is incomplete");
-    expect(document.querySelectorAll(".artifact-list-item")).toHaveLength(0);
-    expect(button("Refetch artifacts").disabled).toBe(false);
-  });
-
-  it("does not infer session evolution outputs from an incomplete artifact collection", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.markArtifactCollectionIncomplete();
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Artifact collection is incomplete");
-    expect(screenText()).toContain("Evolution output status is unavailable until all artifact pages are loaded.");
-    expect(screenText()).toContain("Artifacts incomplete");
-    expect(screenText()).toContain("Evolution output");
-    expect(screenText()).not.toContain("No evolution output");
-    expect(screenText()).not.toContain("contains this session's evolution outputs");
-    expect(button("Refetch artifacts").disabled).toBe(false);
-    expect(optionalButton("View changes")).toBeNull();
-  });
-
-  it("reloads typed 409/410/412 failures without replaying stale mutations", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Draft retained across an etag refresh.");
-    provider.failNextProjectSaveWithStatus(412);
-    await clickButton("Save");
-    expect(screenText()).toContain("Draft retained across an etag refresh.");
-    expect(screenText()).toContain("The project changed remotely.");
-    expect(provider.projectUpdateAttempts()).toBe(1);
-    await clickButton("Save");
-    expect(provider.projectUpdateAttempts()).toBe(2);
-    provider.restoreOnlineActiveProject();
-    await flush();
-
-    provider.failNextRunStartWithStatus(409);
-    await clickButton("Start session");
-    expect(provider.runStartAttempts()).toBe(1);
-    expect(button("Re-admit session").disabled).toBe(false);
-    await clickButton("Re-admit session");
-    expect(provider.runStartAttempts()).toBe(2);
-    await clickButton("Cancel session");
-
-    provider.failNextRunStartWithStatus(410);
-    await clickButton("Start session");
-    expect(provider.runStartAttempts()).toBe(3);
-    expect(provider.refreshCount()).toBeGreaterThanOrEqual(4);
-    expect(screenText()).toContain("The event cursor expired.");
-  });
-
-  it("offers re-admission only for an explicitly retryable admission conflict with no equivalent run", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    provider.failNextRunStartWithConflict({
-      code: "idempotency_key_reused",
-      retryable: false,
-      repairAction: "unsupported",
-    });
-    await clickButton("Start session");
-    expect(screenText()).toContain("That action identity belongs to another request.");
-    expect(optionalButton("Re-admit session")).toBeNull();
-
-    provider.failNextRunStartWithConflict({
-      code: "run_admission_conflict",
-      retryable: true,
-      repairAction: "openevo_can_retry",
-      addEquivalentRun: true,
-    });
-    await clickButton("Start session");
-    expect(screenText()).toContain("The original session is already queued.");
-    expect(screenText()).toContain("Active session");
-    expect(optionalButton("Re-admit session")).toBeNull();
-  });
-
-  it("keeps update action identities across uncertain responses and replaces them after a changed precondition", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Keep one project update identity.");
-    provider.failNextProjectSaveWithUnknownError();
-    await clickButton("Save");
-    await clickButton("Save");
-    const uncertainIds = provider.projectUpdateActionIds();
-    expect(uncertainIds[0]).toBe(uncertainIds[1]);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Use a new identity after editing.");
-    provider.failNextProjectSaveWithStatus(412);
-    await clickButton("Save");
-    await clickButton("Save");
-    const allIds = provider.projectUpdateActionIds();
-    expect(allIds[2]).not.toBe(allIds[1]);
-    expect(allIds[3]).not.toBe(allIds[2]);
-
-    await clickAria("Remote workspace settings");
-    setInput("Workspace name", "Keep one profile update identity.");
-    provider.failNextProfileSaveWithUnknownError();
-    await clickButton("Save workspace");
-    await clickButton("Save workspace");
-    expect(provider.profileUpdateActionIds()[0]).toBe(provider.profileUpdateActionIds()[1]);
-  });
-
-  it("keeps create action identities when profile and project responses are uncertain", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ newUser: true, stepDelayMs: 20 });
-    const selectSource = vi.spyOn(provider, "selectProjectSource");
-    const settleSource = vi.spyOn(provider, "settleProjectSource");
-    root = await renderProduct(provider);
-
-    await clickButton("Add remote workspace");
-    setInput("Server address", "lab.example.test");
-    setInput("User name", "researcher");
-    provider.failNextProfileCreateWithUnknownError();
-    await clickButton("Save workspace");
-    provider.emitAuthoritativeRefresh();
-    await flush();
-    await clickButton("Save workspace");
-    expect(provider.profileCreateActionIds()[0]).toBe(provider.profileCreateActionIds()[1]);
-    expect(provider.profileUpdateActionIds()).toHaveLength(0);
-
-    await clickButton("Connect");
-    await advance(25);
-    await clickButton("Trust and continue");
-    await advance(50);
-
-    await clickAria("Create project");
-    setInput("Objective", "Keep one project create identity.");
-    await clickButton("Folder snapshot");
-    const pendingAction = selectSource.mock.calls[0]?.[0].actionId;
-    provider.failNextProjectCreateWithUnknownError();
-    await clickButton("Prepare evolution");
-    expect(settleSource).toHaveBeenCalledWith(pendingAction, "discard");
-    await clickButton("Prepare evolution");
-    expect(provider.projectCreateActionIds()[0]).toBe(provider.projectCreateActionIds()[1]);
-  });
-
-  it.each([409, 412] as const)("retries activation after HTTP %s without creating another project", async (status) => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Create project");
-    setInput("Objective", `Activate the authoritative project after ${status}.`);
-    provider.failNextProjectActivation(status);
-    await clickButton("Prepare evolution");
-
-    expect(provider.projectCreateActionIds()).toHaveLength(1);
-    expect(provider.projectActivationActionIds()).toHaveLength(1);
-    await clickButton("Prepare evolution");
-
-    expect(provider.projectCreateActionIds()).toHaveLength(1);
-    expect(provider.projectActivationActionIds()).toHaveLength(2);
-    expect(provider.projectActivationActionIds()[0]).not.toBe(provider.projectActivationActionIds()[1]);
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Remote evolution methods are ready");
-  });
-
-  it("uses a single-column bounded System layout at the 760px minimum window", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-    await clickButton("System");
-
-    const grid = document.querySelector(".system-grid");
-    expect(grid).not.toBeNull();
-    expect(grid?.children).toHaveLength(1);
-    expect(Array.from(grid?.children ?? []).every((child) => child.classList.contains("product-panel"))).toBe(true);
-  });
-
-  it("replays an uncertain profile create by idempotency key before adopting it", async () => {
-    provider = createFixtureDesktopProductProvider({ newUser: true });
-    root = await renderProduct(provider);
-
-    await clickButton("Add remote workspace");
-    setInput("Server address", "lab.example.test");
-    setInput("User name", "researcher");
-    provider.advanceEpochOnNextRefresh();
-    provider.loseNextProfileCreateResponseAfterCommit();
-    await clickButton("Save workspace");
-    await flush();
-
-    expect(provider.profileCreateActionIds()).toHaveLength(1);
-    expect(provider.profileUpdateActionIds()).toHaveLength(0);
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-
-    await clickButton("Save workspace");
-    await flush();
-
-    expect(provider.profileCreateActionIds()).toHaveLength(2);
-    expect(provider.profileCreateActionIds()[1]).toBe(provider.profileCreateActionIds()[0]);
-    expect(provider.profileUpdateActionIds()).toHaveLength(0);
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(screenText()).toContain("Research server");
-  });
-
-  it("supports radio-group selection and roving artifact tabs", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const selectSource = vi.spyOn(provider, "selectProjectSource");
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-
-    const sourceChoices = document.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Research source"]');
-    const scratch = sourceChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
-    if (!scratch) throw new Error("Selected research source was not found.");
-    scratch.focus();
-    await pressKey(scratch, "ArrowDown");
-    const folder = sourceChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
-    expect(document.activeElement).toBe(folder);
-    expect(folder?.textContent).toContain("Folder snapshot");
-    expect(selectSource).toHaveBeenCalledTimes(1);
-
-    const modelChoices = document.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Model mode"]');
-    const selectedModel = modelChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
-    if (!selectedModel) throw new Error("Selected model choice was not found.");
-    selectedModel.focus();
-    await pressKey(selectedModel, "ArrowRight");
-    const nextModel = document.activeElement;
-    if (!(nextModel instanceof HTMLElement)) throw new Error("Next model tab was not focused.");
-    expect(modelChoices?.querySelector('[role="radio"][aria-checked="true"]')?.textContent).not.toBe(selectedModel.textContent);
-
-    await clickAria("Close settings");
-    await clickButton("Discard changes");
-    await clickButton("Evolution");
-    const artifactTabs = document.querySelector<HTMLElement>('[role="tablist"][aria-label="Artifact view"]');
-    const content = artifactTabs?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]');
-    if (!content) throw new Error("Selected artifact tab was not found.");
-    content.focus();
-    await pressKey(content, "ArrowRight");
-    const changes = document.activeElement;
-    expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Content");
-    if (!(changes instanceof HTMLElement)) throw new Error("Changes tab was not focused.");
-    await pressKey(changes, "Enter");
-    expect(artifactTabs?.querySelector('[role="tab"][aria-selected="true"]')?.textContent).toContain("Changes");
-    expect(changes.getAttribute("aria-controls")).toBe("artifact-view-panel");
-    expect(document.querySelector('#artifact-view-panel[role="tabpanel"]')?.getAttribute("aria-labelledby")).toBe(changes.id);
-  });
-
-  it("restores keyboard focus after a native folder selection settles", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const selected = await provider.selectProjectSource({
-      kind: "native_folder_snapshot",
-      projectId: "project-fixture-1",
-      actionId: "source-focus-fixture",
-      streamEpoch: 1,
-    });
-    const pending = deferred<ProjectSourceV1>();
-    vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-
-    const sourceChoices = document.querySelector<HTMLElement>('[role="radiogroup"][aria-label="Research source"]');
-    const scratch = sourceChoices?.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]');
-    const folder = Array.from(sourceChoices?.querySelectorAll<HTMLButtonElement>('[role="radio"]') ?? [])
-      .find((choice) => choice.textContent?.includes("Folder snapshot"));
-    if (!scratch || !folder) throw new Error("Research source controls were not found.");
-    scratch.focus();
-    await pressKey(scratch, "ArrowDown");
-    expect(folder.disabled).toBe(true);
-
-    await act(async () => pending.resolve(selected));
-    await flush();
-
-    expect(folder.disabled).toBe(false);
-    expect(document.activeElement).toBe(folder);
-  });
-
-  it("exposes typed diagnostics and confirmed recovery actions for degraded services", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    const refresh = vi.spyOn(provider, "refresh");
-    const doctor = vi.spyOn(provider, "doctorProject");
-    const diagnostics = vi.spyOn(provider, "createDiagnostic");
-    const restart = vi.spyOn(provider, "restartService");
-    const repair = vi.spyOn(provider, "repairProject");
-    const cleanup = vi.spyOn(provider, "cleanupCaches");
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Remote services need attention");
-    expect(button("Start session").disabled).toBe(true);
-    expect(button("Start session").title).toContain("Remote services need attention");
-    await clickButton("Open System");
-    await clickButton("System");
-    expect(button("Reconnect").disabled).toBe(false);
-    expect(button("Diagnostics").disabled).toBe(false);
-    expect(document.querySelector('button[aria-label^="Restart "]')).not.toBeNull();
-    expect(screenText()).toContain("Needs attention");
-
-    await clickButton("Check");
-    expect(doctor).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Check remote environment");
-    expect(screenText()).toContain("Complete");
-
-    await clickButton("Diagnostics");
-    expect(diagnostics).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Remote diagnostics");
-    expect(screenText()).toContain("Environment");
-
-    await clickAria("Restart OpenEvo runtime");
-    expect(screenText()).toContain("Restart OpenEvo runtime?");
-    expect(restart).not.toHaveBeenCalled();
-    await clickButton("Confirm");
-    expect(restart).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Restart OpenEvo runtime");
-    expect(button("Repair").disabled).toBe(true);
-    await advance(750);
-
-    await clickButton("Repair");
-    expect(screenText()).toContain("Repair the remote environment?");
-    await clickButton("Confirm");
-    expect(repair).toHaveBeenCalledTimes(1);
-
-    await clickButton("Clean diagnostic history");
-    expect(screenText()).toContain("Clean diagnostic history?");
-    expect(cleanup).not.toHaveBeenCalled();
-    await clickButton("Confirm");
-    expect(cleanup).toHaveBeenCalledTimes(1);
-    expect(cleanup).toHaveBeenCalledWith(
-      {
-        schema_version: "1",
-        scopes: ["completed_diagnostics"],
-        older_than_days: 30,
+        action: "administrator_action",
+        affected_resource_id: "profile-gpu",
       },
-      expect.objectContaining({ actionId: expect.any(String) }),
+    });
+    root = await render(
+      providerFixture(
+        baseSnapshot({
+          profiles: [quarantined] as never,
+          state: { ...baseSnapshot().state, profiles: [quarantined] as never },
+        }),
+      ),
     );
-    await advance(750);
+    await click("Add remote workspace");
 
-    const refreshesBeforeAction = refresh.mock.calls.length;
-    await clickButton("Refresh status");
-    expect(refresh.mock.calls.length).toBeGreaterThan(refreshesBeforeAction);
+    expect(dialog()?.textContent).toContain(
+      "Administrator action is required before this workspace can reconnect.",
+    );
+    const actionLabels = [...(dialog()?.querySelectorAll("button") ?? [])].map(
+      (candidate) => candidate.textContent?.trim(),
+    );
+    expect(actionLabels).not.toContain("Connect");
+    expect(actionLabels).not.toContain("Retry disconnect");
   });
 
-  it("keeps the release System view read-only when maintenance authority is unavailable", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    Object.defineProperty(provider, "systemMaintenanceAvailable", {
-      configurable: true,
-      value: false,
-    });
-    root = await renderProduct(provider);
+  it("distinguishes task, admission, attempt, project head, evolution, runtime, and execution identities", async () => {
+    root = await render(providerFixture(authoritySnapshot()));
 
-    await clickButton("System");
+    await click("Review evidence");
 
-    expect(screenText()).toContain("Remote services need attention");
-    expect(screenText()).toContain("Automated maintenance is unavailable in this Preview.");
-    expect(optionalButton("Check")).toBeNull();
-    expect(optionalButton("Diagnostics")).toBeNull();
-    expect(optionalButton("Repair")).toBeNull();
-    expect(optionalButton("Clean diagnostic history")).toBeNull();
-    expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
-    expect(screenText()).toContain("OpenEvo runtime");
-    expect(button("Refresh status").disabled).toBe(false);
+    expect(document.body.textContent).toContain("Task task-1");
+    expect(document.body.textContent).toContain("Task Admission");
+    expect(document.body.textContent).toContain("task-admission-1");
+    expect(document.body.textContent).toContain("Attempt 2");
+    expect(document.body.textContent).toContain("attempt-2");
+    expect(document.body.textContent).toContain("Project Head");
+    expect(document.body.textContent).toContain("project-head-7");
+    expect(document.body.textContent).toContain("Generation 7");
+    expect(document.body.textContent).toContain("Evolution Revision");
+    expect(document.body.textContent).toContain("evolution-revision-1");
+    expect(document.body.textContent).toContain("Runtime Context Snapshot");
+    expect(document.body.textContent).toContain("runtime-context-1");
+    expect(document.body.textContent).toContain("Effective Execution Snapshot");
+    expect(document.body.textContent).toContain("effective-execution-1");
+    expect(document.body.textContent).toContain("Successor Transition");
+    expect(document.body.textContent).toContain("successor-transition-8");
   });
 
-  it("polls a local maintenance operation from queued through running to succeeded", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    const originalDoctor = provider.doctorProject.bind(provider);
-    let completed: Awaited<ReturnType<typeof provider.doctorProject>> | null = null;
-    let lookupCount = 0;
-    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
-      completed = await originalDoctor(...arguments_);
-      return {
-        ...completed,
-        state: "queued",
-        checks: [],
-        result: null,
-        started_at: null,
-        finished_at: null,
-      };
-    });
-    const lookup = vi.spyOn(provider, "getLocalOperation").mockImplementation(async () => {
-      if (!completed) throw new Error("The completed maintenance result is unavailable.");
-      lookupCount += 1;
-      return lookupCount === 1
-        ? {
-            ...completed,
-            state: "running",
-            checks: [],
-            result: null,
-            finished_at: null,
-          }
-        : completed;
-    });
-    root = await renderProduct(provider);
+  it("opens one Task as a result detail with transcript, files, artifacts, and transition", async () => {
+    root = await render(providerFixture(authoritySnapshot()));
 
-    await clickButton("System");
-    await clickButton("Check");
-    expect(screenText()).toContain("Queued");
-    expect(lookup).not.toHaveBeenCalled();
+    await click("Review evidence");
 
-    await advance(755);
-    expect(lookup).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Running");
-    expect(document.querySelector(".system-activity-state-icon.running")).not.toBeNull();
+    expect(
+      document.querySelector('[data-testid="session-detail-workspace"]'),
+    ).toBeTruthy();
+    expect(document.body.textContent).toContain("Task result");
+    expect(document.body.textContent).toContain("Review evidence");
+    expect(document.body.textContent).toContain("I checked the evidence table");
+    expect(document.body.textContent).toContain("results/evidence-review.md");
+    expect(document.body.textContent).toContain("Evolution produced");
+    expect(document.body.textContent).toContain("artifact-memory-2");
+    expect(document.body.textContent).toContain("Context used");
+    expect(document.body.textContent).toContain("artifact-memory-1");
+    expect(document.body.textContent).toContain("authoritative · closed");
+    expect(document.body.textContent).toContain("superseded");
+    expect(document.body.textContent).toContain("successor-transition-8");
 
-    await clickButton("Research");
-    await advance(755);
-    expect(lookup).toHaveBeenCalledTimes(2);
-    await clickButton("System");
-    expect(screenText()).toContain("Complete");
-    expect(document.querySelector(".system-activity-state-icon.succeeded")).not.toBeNull();
+    await click("artifact-memory-2");
+    expect(
+      document.querySelector('[data-testid="session-result-inspector"]'),
+    ).toBeTruthy();
+    expect(document.body.textContent).toContain(
+      "Compared with artifact-memory-1",
+    );
+    expect(document.body.textContent).toContain(
+      "Mark every unsupported conclusion as a hypothesis",
+    );
+
+    await click("results/evidence-review.md");
+    expect(document.body.textContent).toContain(
+      "workspace-before-session/results/evidence-review.md",
+    );
+    expect(document.body.textContent).toContain("The mechanism is proven");
+    await click("Current content");
+    expect(document.body.textContent).toContain(
+      "Unsupported conclusions are marked as hypotheses",
+    );
+    expect(document.body.textContent).not.toContain("Task draft");
+    expect(document.body.textContent).not.toContain("Session history");
+
+    await click("Back to Protein study");
+
+    expect(
+      document.querySelector('[data-testid="session-detail-workspace"]'),
+    ).toBeFalsy();
+    expect(document.body.textContent).toContain("Task draft");
+    expect(document.body.textContent).toContain("Session history");
   });
 
-  it.each(["failed", "cancelled"] as const)(
-    "renders a %s maintenance outcome without success treatment",
-    async (outcome) => {
-      provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-      const originalDoctor = provider.doctorProject.bind(provider);
-      const typedError = apiErrorV1Schema.parse({
-        schema_version: "1",
-        request_id: "request-system-maintenance-failed",
-        code: "maintenance_failed",
-        http_status: 503,
-        message: "The remote maintenance operation failed.",
-        severity: "blocking",
-        category: "service",
-        retryable: true,
-        repair_action: "user_action_required",
-        next_action: "Review System diagnostics before retrying.",
-        details: {},
-        logs_ref: null,
-      });
-      vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
-        const completed = await originalDoctor(...arguments_);
-        return {
-          ...completed,
-          state: outcome,
-          checks: [],
-          result: null,
-          error: outcome === "failed" ? typedError : null,
-        };
-      });
-      root = await renderProduct(provider);
+  it("browses memory, skill, and agent-system previews and their changes", async () => {
+    const provider = providerFixture(authoritySnapshot());
+    root = await render(provider);
+    await click("Evolution");
 
-      await clickButton("System");
-      await clickButton("Check");
+    expect(document.body.textContent).toContain("Cross-session changes");
+    expect(document.body.textContent).toContain("Evidence review memory");
+    expect(document.body.textContent).toContain(
+      "Trajectory-to-skill: evidence audit",
+    );
+    expect(document.body.textContent).toContain(
+      "Scientific evidence instruction",
+    );
+    expect(document.body.textContent).toContain(
+      "Mark every unsupported conclusion as a hypothesis",
+    );
 
-      const activity = document.querySelector<HTMLElement>(".system-activity");
-      expect(activity?.textContent).toContain(outcome === "failed" ? "Failed" : "Cancelled");
-      expect(activity?.textContent).not.toContain("completed");
-      expect(activity?.querySelector(".system-activity-state-icon.succeeded")).toBeNull();
-      expect(activity?.querySelector(`.system-activity-state-icon.${outcome}`)).not.toBeNull();
-      if (outcome === "failed") {
-        expect(activity?.textContent).toContain("The remote maintenance operation failed.");
-        expect(activity?.textContent).toContain("Next action:");
-        expect(activity?.textContent).toContain("Review System diagnostics before retrying.");
-        expect(button("Repair").disabled).toBe(true);
-        expect(button("Repair").title).toContain("required user or reconnection action");
-      }
-    },
-  );
+    await click("Changes");
+    expect(document.body.textContent).toContain(
+      "Compared with artifact-memory-1",
+    );
+    expect(document.body.textContent).toContain(
+      "Summarize the strongest conclusion",
+    );
 
-  it("renders cancelling before a cancelled maintenance outcome", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    const originalDoctor = provider.doctorProject.bind(provider);
-    let completed: LocalOperationV1 | null = null;
-    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
-      completed = await originalDoctor(...arguments_);
-      return {
-        ...completed,
-        state: "cancelling",
-        checks: [],
-        result: null,
-        finished_at: null,
-      };
-    });
-    vi.spyOn(provider, "getLocalOperation").mockImplementation(async () => {
-      if (!completed) throw new Error("The completed maintenance result is unavailable.");
-      return {
-        ...completed,
-        state: "cancelled",
-        checks: [],
-        result: null,
-        error: null,
-      };
-    });
-    root = await renderProduct(provider);
-
-    await clickButton("System");
-    await clickButton("Check");
-    expect(screenText()).toContain("Cancelling");
-    expect(document.querySelector(".system-activity-state-icon.cancelling")).not.toBeNull();
-
-    await advance(755);
-    const activity = document.querySelector<HTMLElement>(".system-activity");
-    expect(activity?.textContent).toContain("Cancelled");
-    expect(activity?.textContent).not.toContain("completed");
-    expect(activity?.querySelector(".system-activity-state-icon.cancelled")).not.toBeNull();
+    await click("Trajectory-to-skill: evidence audit");
+    expect(document.body.textContent).toContain(
+      "skills/evidence-audit/SKILL.md",
+    );
+    expect(document.body.textContent).toContain("Enumerate claims");
+    expect(provider.getArtifactContent).toHaveBeenCalled();
+    expect(provider.getArtifactDiff).toHaveBeenCalled();
   });
 
-  it("does not render a timed-out maintenance poll as completed", async () => {
-    vi.useFakeTimers();
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    const originalDoctor = provider.doctorProject.bind(provider);
-    let running: LocalOperationV1 | null = null;
-    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
-      const completed = await originalDoctor(...arguments_);
-      running = {
-        ...completed,
-        state: "running",
-        checks: [],
-        result: null,
-        finished_at: null,
-      };
-      return running;
-    });
-    const lookup = vi.spyOn(provider, "getLocalOperation").mockImplementation(async () => {
-      if (!running) throw new Error("The running maintenance result is unavailable.");
-      return running;
-    });
-    root = await renderProduct(provider);
+  it("updates the entered task and starts the session with one user action", async () => {
+    const snapshot = authoritySnapshot();
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
 
-    await clickButton("System");
-    await clickButton("Check");
-    for (let attempt = 0; attempt < 480; attempt += 1) {
-      await advance(755);
-    }
-
-    const activity = document.querySelector<HTMLElement>(".system-activity");
-    expect(lookup).toHaveBeenCalledTimes(480);
-    expect(screenText()).toContain("The remote operation is still running.");
-    expect(activity?.textContent).toContain("Running");
-    expect(activity?.textContent).not.toContain("completed");
-    expect(activity?.querySelector(".system-activity-state-icon.running")).not.toBeNull();
-    expect(activity?.querySelector(".system-activity-state-icon.succeeded")).toBeNull();
-  });
-
-  it("traps confirmation focus, closes on Escape, and restores both dangerous-action triggers", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    root = await renderProduct(provider);
-    await clickButton("System");
-
-    const restart = document.querySelector<HTMLButtonElement>('button[aria-label="Restart OpenEvo runtime"]');
-    if (!restart) throw new Error("Restart action was not found.");
-    restart.focus();
-    await clickElement(restart);
-
-    let dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
-    if (!dialog) throw new Error("Restart confirmation was not found.");
-    const cancel = Array.from(dialog.querySelectorAll<HTMLButtonElement>("button"))
-      .find((item) => item.textContent?.trim() === "Cancel");
-    const confirm = Array.from(dialog.querySelectorAll<HTMLButtonElement>("button"))
-      .find((item) => item.textContent?.trim() === "Confirm");
-    expect(dialog.getAttribute("aria-modal")).toBe("true");
-    expect(document.activeElement).toBe(cancel);
-    confirm?.focus();
-    if (!confirm) throw new Error("Confirm action was not found.");
-    await pressKey(confirm, "Tab");
-    expect(document.activeElement).toBe(cancel);
-    await pressKey(cancel!, "Escape");
-    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
-    expect(document.activeElement).toBe(restart);
-
-    const cleanup = button("Clean diagnostic history");
-    cleanup.focus();
-    await clickElement(cleanup);
-    dialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
-    expect(dialog?.textContent).toContain("Clean diagnostic history?");
-    const cleanupCancel = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
-      .find((item) => item.textContent?.trim() === "Cancel");
-    if (!cleanupCancel) throw new Error("Cache cleanup cancel action was not found.");
-    await pressKey(cleanupCancel, "Escape");
-    expect(document.querySelector('[role="alertdialog"]')).toBeNull();
-    expect(document.activeElement).toBe(cleanup);
-  });
-
-  it("gates Start, selection, settings, and lifecycle mutations while System maintenance is busy", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    const originalDoctor = provider.doctorProject.bind(provider);
-    const releaseDoctor = deferred<undefined>();
-    vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
-      await releaseDoctor.promise;
-      return originalDoctor(...arguments_);
-    });
-    root = await renderProduct(provider);
-
-    await clickButton("System");
-    await clickButton("Check");
-
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    expect(switcher?.disabled).toBe(true);
-    expect(button("Edit").disabled).toBe(true);
-    expect(button("Repair").disabled).toBe(true);
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
-    expect(document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]')?.disabled).toBe(true);
-
-    await clickButton("Research");
-    expect(button("Start session").disabled).toBe(true);
-    expect(button("Start session").title).toContain("Wait for System maintenance to finish");
-    expect(switcher?.disabled).toBe(true);
-
-    await act(async () => releaseDoctor.resolve(undefined));
-    await flush();
+    expect(input("Task title").value).toBe("Review evidence");
+    expect(textarea("Task instructions").value).toBe(
+      "Review the evidence and update the workspace.",
+    );
     expect(button("Start session").disabled).toBe(false);
-    expect(switcher?.disabled).toBe(false);
+    expect(document.body.textContent).not.toContain("Save task");
+
+    setInput("Task title", "Verify the selected evidence");
+    setTextarea(
+      "Task instructions",
+      "Run the existing checks and summarize any unsupported claims.",
+    );
+    expect(button("Start session").disabled).toBe(false);
+
+    await click("Start session");
+
+    expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Protein study",
+      {
+        ...snapshot.projects[0]!.config,
+        task: {
+          title: "Verify the selected evidence",
+          objective:
+            "Run the existing checks and summarize any unsupported claims.",
+        },
+      },
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+    expect(provider.validateProject).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ streamEpoch: 2 }),
+    );
+    expect(provider.submitTask).toHaveBeenCalledWith(
+      "project-1",
+      expect.objectContaining({ streamEpoch: 2 }),
+    );
+    expect(
+      document.querySelector('[data-testid="session-detail-workspace"]'),
+    ).toBeTruthy();
   });
 
-  it.each(["stale", "error"] as const)(
-    "disables every System maintenance mutation when the snapshot stream is %s",
-    async (streamState) => {
-      provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-      const doctor = vi.spyOn(provider, "doctorProject");
-      const diagnostics = vi.spyOn(provider, "createDiagnostic");
-      const restart = vi.spyOn(provider, "restartService");
-      const repair = vi.spyOn(provider, "repairProject");
-      const cleanup = vi.spyOn(provider, "cleanupCaches");
-      root = await renderProduct(provider);
+  it("keeps the v1 create-project entry beside the project switcher", async () => {
+    const provider = providerFixture(authoritySnapshot());
+    root = await render(provider);
 
-      await clickButton("System");
-      await clickButton("Check");
-      expect(button("Repair").disabled).toBe(false);
-      await clickAria("Restart OpenEvo runtime");
-      expect(document.querySelector('[role="alertdialog"]')).not.toBeNull();
+    const createProject = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Create project"]',
+    );
+    expect(createProject).toBeTruthy();
+    await act(async () => createProject!.click());
 
-      if (streamState === "stale") {
-        await act(async () => provider?.markStreamStale());
-      } else {
-        provider.failNextRefresh();
-        await act(async () => provider?.resetEventCursor());
-      }
-      await flush();
+    expect(dialog()?.textContent).toContain("Create science project");
+    expect(input("Project name").value).toBe("New research project");
+  });
 
-      expect(document.querySelector('[role="alertdialog"]')).toBeNull();
-      expect(button("Check").disabled).toBe(true);
-      expect(button("Diagnostics").disabled).toBe(true);
-      expect(button("Repair").disabled).toBe(true);
-      expect(button("Clean diagnostic history").disabled).toBe(true);
-      const restartButton = document.querySelector<HTMLButtonElement>(
-        'button[aria-label="Restart OpenEvo runtime"]',
-      );
-      expect(restartButton?.disabled).toBe(true);
-      expect(button("Refresh status").disabled).toBe(false);
-      expect(button("Reconnect").disabled).toBe(false);
-
-      await clickElement(button("Repair"));
-      await clickElement(button("Clean diagnostic history"));
-      if (restartButton) await clickElement(restartButton);
-      expect(document.querySelector('[role="alertdialog"]')).toBeNull();
-      expect(doctor).toHaveBeenCalledTimes(1);
-      expect(diagnostics).not.toHaveBeenCalled();
-      expect(restart).not.toHaveBeenCalled();
-      expect(repair).not.toHaveBeenCalled();
-      expect(cleanup).not.toHaveBeenCalled();
-    },
-  );
-
-  it.each(["project identity", "revision generation"] as const)(
-    "releases the global maintenance lock when authoritative %s changes",
-    async (authorityChange) => {
-      provider = createFixtureDesktopProductProvider({ startOnline: true });
-      const originalDoctor = provider.doctorProject.bind(provider);
-      const releaseDoctor = deferred<undefined>();
-      vi.spyOn(provider, "doctorProject").mockImplementation(async (...arguments_) => {
-        await releaseDoctor.promise;
-        return originalDoctor(...arguments_);
-      });
-      root = await renderProduct(provider);
-      const current = await provider.refresh();
-      if (current.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-      const currentProject = current.snapshot.projects[0];
-      const remote = currentProject?.remote;
-      const activeRevision = remote?.active_revision;
-      if (!currentProject || !remote || !activeRevision) {
-        throw new Error("Expected an active project revision.");
-      }
-
-      await clickButton("System");
-      await clickButton("Check");
-      const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-      expect(switcher?.disabled).toBe(true);
-
-      const nextCoreProjectId = authorityChange === "project identity"
-        ? `${remote.core_project_id}-replacement`
-        : remote.core_project_id;
-      const changedProject = {
-        ...currentProject,
-        remote: {
-          ...remote,
-          core_project_id: nextCoreProjectId,
-          active_revision: {
-            ...activeRevision,
-            id: authorityChange === "project identity"
-              ? `${activeRevision.id}-replacement`
-              : activeRevision.id,
-            project_id: nextCoreProjectId,
-            generation: authorityChange === "revision generation"
-              ? activeRevision.generation + 1
-              : activeRevision.generation,
+  it("lists every real project and activates the selected one without mixing Sessions", async () => {
+    const initial = authoritySnapshot();
+    const secondProject = {
+      ...initial.projects[0]!,
+      project_id: "project-2",
+      display_name: "Second protein study",
+      active_project_head: {
+        ...initial.projects[0]!.active_project_head!,
+        project_head_id: "project-head-second",
+        project_id: "project-2",
+      },
+    };
+    const secondTask = {
+      ...initial.tasks[0]!,
+      task_id: "task-2",
+      project_id: "project-2",
+      admission: {
+        ...initial.tasks[0]!.admission,
+        task_id: "task-2",
+        project_id: "project-2",
+        predecessor_project_head: secondProject.active_project_head,
+      },
+    };
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...initial,
+      projects: [...initial.projects, secondProject] as never,
+      tasks: [...initial.tasks, secondTask] as never,
+      fixturePresentation: {
+        ...initial.fixturePresentation!,
+        tasks: {
+          ...initial.fixturePresentation!.tasks,
+          "task-2": {
+            instruction: {
+              title: "Second project session",
+              objective: "Only belongs to project 2.",
+            },
+            transcript: [],
+            outputFiles: [],
+            usedArtifactIds: [],
+            producedArtifactIds: [],
           },
         },
+      },
+    };
+    const provider = providerFixture(snapshot);
+    provider.activateProject = vi.fn(
+      async () => ({ schema_version: "2" }) as never,
+    );
+    root = await render(provider);
+
+    const switcher = document.querySelector<HTMLSelectElement>(
+      "#v2-project-switcher",
+    )!;
+    expect([...switcher.options].map((option) => option.textContent)).toEqual(
+      expect.arrayContaining(["Protein study", "Second protein study"]),
+    );
+
+    await act(async () => {
+      switcher.value = "project:project-2";
+      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(provider.activateProject).toHaveBeenCalledWith(
+      "project-2",
+      expect.objectContaining({ actionId: expect.any(String) }),
+    );
+    expect(
+      document.querySelector('[data-testid="session-detail-workspace"]'),
+    ).toBeFalsy();
+  });
+
+  it("renders a supported Core-owned selection resolver as the saved method", async () => {
+    const snapshot = authoritySnapshot();
+    const project = snapshot.projects[0]!;
+    (project.config.evolution.targets as Record<string, unknown>).agent_system =
+      {
+        enabled: true,
+        method: "auto",
+        config: { target_path: "AGENTS.md" },
       };
-      vi.spyOn(provider, "refresh").mockResolvedValueOnce({
-        status: "fresh",
-        snapshot: {
-          ...current.snapshot,
-          state: authorityChange === "project identity"
-            ? {
-                ...current.snapshot.state,
-                active_project: current.snapshot.state.active_project
-                  ? {
-                      ...current.snapshot.state.active_project,
-                      project_id: `${current.snapshot.state.active_project.project_id}-replacement`,
-                    }
-                  : null,
-              }
-            : current.snapshot.state,
-          projects: current.snapshot.projects.map((project) =>
-            project.project_id === changedProject.project_id ? changedProject : project),
+    snapshot.capability!.capabilities.targets = [
+      {
+        target_id: "agent_system",
+        display_name: "Agent system",
+        description: "Core-owned agent-system evolution.",
+        exposure: "desktop",
+        effective_default_method_id: "concrete_agent_system",
+        methods: [
+          {
+            method_id: "concrete_agent_system",
+            display_name: "Concrete method",
+            default_config_json: "{}",
+          },
+        ],
+        accepted_methods: [
+          {
+            method_id: "concrete_agent_system",
+            implementation_identity_digest: DIGEST,
+            support: { overall: "supported" },
+          },
+        ],
+        selection_resolvers: [
+          {
+            selection_value: "auto",
+            display_name: "Automatic",
+            description: "Core selects an accepted concrete method.",
+            resolved_methods: [
+              {
+                method_id: "concrete_agent_system",
+                implementation_identity_digest: DIGEST,
+                support: { overall: "supported" },
+              },
+            ],
+          },
+        ],
+      },
+    ] as never;
+    root = await render(providerFixture(snapshot));
+
+    await click("Evolution");
+
+    const method = document.querySelector<HTMLSelectElement>(
+      ".v2-target-list select",
+    );
+    expect(method?.value).toBe("auto");
+    expect([...method!.options].map((option) => option.textContent)).toContain(
+      "Automatic",
+    );
+    expect(document.body.textContent).not.toContain("blocks Task admission");
+  });
+
+  it("blocks a new task while the successor is not ready and exposes transition recovery", async () => {
+    const provider = providerFixture(authoritySnapshot("not_ready"));
+    root = await render(provider);
+
+    expect(
+      document.querySelector('[data-testid="session-detail-workspace"]'),
+    ).toBeTruthy();
+    expect(document.body.textContent).not.toContain("Task draft");
+    expect(
+      [...document.querySelectorAll("button")].some((candidate) =>
+        candidate.textContent?.includes("Start session"),
+      ),
+    ).toBe(false);
+    expect(button("Retry successor transition")).toBeTruthy();
+    expect(document.body.textContent).toContain("Build successor Project Head");
+    expect(document.body.textContent).toContain("Successor state: failed");
+    expect(document.body.textContent).toContain("2 of 5 items");
+    expect(provider.submitTask).not.toHaveBeenCalled();
+  });
+
+  it("renders an active Task through the shared long-operation presentation", async () => {
+    const snapshot = authoritySnapshot();
+    const runningTask = {
+      ...snapshot.tasks[0]!,
+      state: "running" as const,
+      successor_transition: null,
+    };
+    const runningSnapshot: DesktopProductSnapshotV2 = {
+      ...snapshot,
+      tasks: [runningTask],
+      transitions: {},
+    };
+    const loadTaskLogs = vi.fn(async () => ({
+      schema_version: "2" as const,
+      items: [
+        {
+          sequence: 1,
+          occurred_at: NOW,
+          stream: "system" as const,
+          message: "Daemon started the managed Task attempt.",
         },
-      });
+      ],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const provider = {
+      ...providerFixture(runningSnapshot),
+      loadTaskLogs,
+    } satisfies DesktopProductProviderV2;
 
-      await act(async () => provider?.emitAuthoritativeRefresh());
-      await flush();
+    root = await render(provider);
 
-      expect(switcher?.disabled).toBe(false);
-      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(false);
-      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(false);
+    expect(document.body.textContent).toContain("Run science Task");
+    expect(document.body.textContent).toContain("Task state: running");
+    expect(document.body.textContent).toContain(
+      "Working — progress is not measurable for this phase",
+    );
+    expect(loadTaskLogs).toHaveBeenCalledWith("task-1", { limit: 100 });
+    expect(document.body.textContent).toContain(
+      "Daemon started the managed Task attempt.",
+    );
+    expect(document.body.textContent).toContain("Task state");
+  });
 
-      await act(async () => releaseDoctor.resolve(undefined));
-      await flush();
-      expect(switcher?.disabled).toBe(false);
-    },
-  );
+  it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {
+    const operation: OperationV2 = {
+      schema_version: "2",
+      operation_id: "core-service-restart-1",
+      kind: "service_restart",
+      status: "running",
+      progress_completed: 2,
+      progress_total: 4,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const cancelCoreOperation = vi.fn(async () => ({
+      ...operation,
+      status: "cancelled" as const,
+      updated_at: "2026-07-23T06:00:01Z",
+    }));
+    const provider = {
+      ...providerFixture(authoritySnapshot()),
+      listCoreOperations: () => [operation],
+      cancelCoreOperation,
+    } satisfies DesktopProductProviderV2;
 
-  it.each(["project_doctor", "project_repair"] as const)(
-    "does not offer global cancellation for an active %s operation",
-    async (operationKind) => {
-      provider = createFixtureDesktopProductProvider({ startOnline: true });
-      const initial = await provider.refresh();
-      if (initial.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-      const project = initial.snapshot.projects[0];
-      if (!project) throw new Error("Expected a project fixture.");
-      const activeOperation: LocalOperationV1 = {
-        schema_version: "1",
-        operation_id: `operation-${operationKind}`,
-        operation_kind: operationKind,
-        state: "running",
-        resource: { resource_type: "project", resource_id: project.project_id },
-        progress: { current: 1, total: 2, label: "Remote maintenance is running" },
-        checks: [],
+    root = await render(provider);
+
+    expect(document.body.textContent).toContain("Restart remote service");
+    expect(document.body.textContent).toContain("Core status: running");
+    expect(document.body.textContent).toContain("2 of 4 items");
+    await click("Cancel operation");
+    expect(cancelCoreOperation).toHaveBeenCalledWith(
+      operation.operation_id,
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("offers reconciliation for a reserved lifecycle cancellation", async () => {
+    const operation = {
+      schema_version: "2" as const,
+      operation_id: "lifecycle-cancel-ambiguous-1",
+      kind: "profile_connect" as const,
+      resource: {
+        resource_kind: "profile" as const,
+        resource_id: "profile-gpu",
+      },
+      request_sha256: DIGEST,
+      status: "running" as const,
+      phase: "connecting" as const,
+      phase_index: 3,
+      phase_total: 17,
+      progress: { kind: "indeterminate" as const },
+      cancellable: false,
+      result: null,
+      failure: null,
+      log_sequence_high_watermark: 0,
+      created_at: NOW,
+      started_at: NOW,
+      updated_at: NOW,
+      finished_at: null,
+      etag: ETAG,
+    };
+    const resumeMutationIntent = vi.fn(async () => {});
+    const provider = {
+      ...providerFixture(baseSnapshot()),
+      listLifecycleOperations: () => [
+        {
+          operation,
+          logs: [],
+          droppedBeforeSequence: 0,
+          hasOlderLogs: false,
+          hasNewerLogs: false,
+        },
+      ],
+      listMutationIntents: () => [
+        {
+          action_id: "connect-lifecycle-original-ui-0001",
+          mutation_kind: "profile_connect" as const,
+          resource_scope: "profile:profile-gpu",
+          request_sha256: DIGEST,
+          authority_sha256: DIGEST,
+          provider_stream_instance: "provider-instance-test",
+          provider_stream_epoch: 1,
+          chain_step: "single" as const,
+          accepted_operation_id: operation.operation_id,
+          completed_operation_ids: [],
+          state: "accepted" as const,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+        {
+          action_id: "cancel-lifecycle-ambiguous-ui-0001",
+          mutation_kind: "lifecycle_cancel" as const,
+          resource_scope: `lifecycle_operation:${operation.operation_id}`,
+          request_sha256: DIGEST,
+          authority_sha256: DIGEST,
+          provider_stream_instance: "provider-instance-test",
+          provider_stream_epoch: 1,
+          chain_step: "single" as const,
+          accepted_operation_id: null,
+          completed_operation_ids: [],
+          state: "reserved" as const,
+          created_at: NOW,
+          updated_at: NOW,
+        },
+      ],
+      resumeMutationIntent,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+
+    await click("Resume / reconcile");
+    expect(resumeMutationIntent).toHaveBeenCalledWith(
+      "cancel-lifecycle-ambiguous-ui-0001",
+    );
+  });
+
+  it("keeps diagnostic collection observable as its own Core resource", async () => {
+    const snapshot = authoritySnapshot();
+    const diagnostic = {
+      schema_version: "2" as const,
+      diagnostic_id: "diagnostic-system-1",
+      scope: "system" as const,
+      resource_id: null,
+      status: "running" as const,
+      artifact_id: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const createDiagnostic = vi.fn(async () => diagnostic);
+    const provider = {
+      ...providerFixture(snapshot),
+      listDiagnostics: () => [diagnostic],
+      createDiagnostic,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("System");
+
+    expect(document.body.textContent).toContain("Diagnostic status: running");
+    await click("Collect system diagnostics");
+    expect(createDiagnostic).toHaveBeenCalledWith(
+      { scope: "system", resource_id: null },
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("loads remote service output and starts idempotent safe-cache cleanup", async () => {
+    const base = authoritySnapshot();
+    const service = {
+      schema_version: "2" as const,
+      service_id: "service-daemon-1",
+      kind: "daemon" as const,
+      status: "ready" as const,
+      updated_at: NOW,
+      etag: ETAG,
+    };
+    const snapshot: DesktopProductSnapshotV2 = { ...base, services: [service] };
+    const loadServiceLogs = vi.fn(async () => ({
+      schema_version: "2" as const,
+      items: [
+        {
+          sequence: 1,
+          occurred_at: NOW,
+          stream: "stdout" as const,
+          message: "Daemon registry is ready",
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const cleanupCaches = vi.fn(async () => ({
+      schema_version: "2" as const,
+      operation_id: "core-cache-cleanup-1",
+      kind: "cache_cleanup" as const,
+      status: "queued" as const,
+      progress_completed: 0,
+      progress_total: 0,
+      error: null,
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    }));
+    const provider = {
+      ...providerFixture(snapshot),
+      loadServiceLogs,
+      cleanupCaches,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("System");
+    await click("View logs");
+
+    expect(document.body.textContent).toContain("Daemon registry is ready");
+    expect(document.body.textContent).toContain("Service output");
+    await click("Clean safe caches");
+    expect(cleanupCaches).toHaveBeenCalledWith(
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("creates a project with the release-owned Self-Deployed execution profile", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const createProject = vi.fn(async () => ({
+      schema_version: "2" as const,
+      operation_id: "project-create-self-deployed-1",
+      kind: "project_create" as const,
+      resource: {
+        resource_kind: "project" as const,
+        resource_id: "project-pending-1",
+      },
+      request_sha256: DIGEST,
+      status: "queued" as const,
+      phase: "queued" as const,
+      phase_index: 1,
+      phase_total: 17,
+      progress: { kind: "indeterminate" as const },
+      cancellable: true,
+      result: null,
+      failure: null,
+      log_sequence_high_watermark: 0,
+      created_at: NOW,
+      started_at: null,
+      updated_at: NOW,
+      finished_at: null,
+      etag: ETAG,
+    }));
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      createProject,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("New project");
+    await click("Self-Deployed");
+    expect(document.body.textContent).toContain("Qwen3 0.6B");
+    setTextarea(
+      "Task objective",
+      "Run this task through the managed local model.",
+    );
+    await click("Create project");
+
+    expect(createProject).toHaveBeenCalledWith(
+      expect.objectContaining({
+        config: expect.objectContaining({
+          execution: {
+            mode: "self-deployed",
+            capture_mode: "transcript",
+            token_level_metrics_available: false,
+            harness_id: "codex",
+            model_profile_id: "qwen3-0.6b-v1",
+            token_limit: 8_192,
+            task_network_allow_internet: true,
+          },
+        }),
+      }),
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("closes project setup after HTTP 202 while progress and logs stay visible", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-07-27T08:00:00Z"));
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
+    });
+    const lifecycleState = {
+      operation: {
+        schema_version: "2",
+        operation_id: "project-create-long-1",
+        kind: "project_create",
+        resource: {
+          resource_kind: "project",
+          resource_id: "project-pending-1",
+        },
+        request_sha256: DIGEST,
+        status: "running",
+        phase: "creating_remote_project",
+        phase_index: 13,
+        phase_total: 17,
+        progress: { kind: "indeterminate" },
+        cancellable: true,
         result: null,
-        error: null,
-        created_at: "2025-01-01T00:00:00Z",
-        started_at: "2025-01-01T00:00:01Z",
+        failure: null,
+        log_sequence_high_watermark: 2,
+        created_at: "2026-07-27T08:00:00Z",
+        started_at: "2026-07-27T08:00:00Z",
+        updated_at: "2026-07-27T08:00:00Z",
         finished_at: null,
-        etag: "\"operation-maintenance-running\"",
-      };
-      const cancelOperation = vi.spyOn(provider, "cancelOperation");
-      vi.spyOn(provider, "refresh").mockResolvedValue({
-        ...initial,
-        snapshot: { ...initial.snapshot, activeOperation },
-      });
-
-      root = await renderProduct(provider);
-
-      expect(screenText()).toContain("Remote maintenance is running");
-      expect(optionalButton("Cancel operation")).toBeNull();
-      expect(button("Start session").disabled).toBe(true);
-      expect(button("Start session").title).toContain("Wait for System maintenance to finish");
-      expect(document.querySelector<HTMLSelectElement>("#project-switcher")?.disabled).toBe(true);
-      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Create project"]')?.disabled).toBe(true);
-      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Remote workspace settings"]')?.disabled).toBe(true);
-      expect(document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]')?.disabled).toBe(true);
-      await clickButton("System");
-      expect(button("Repair").disabled).toBe(true);
-      expect(cancelOperation).not.toHaveBeenCalled();
-    },
-  );
-
-  it("fails closed when a ready project has no authoritative service status", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.useEmptyServicesScenario();
-    root = await renderProduct(provider);
-
-    expect(button("Start session").disabled).toBe(true);
-    expect(button("Start session").title).toContain("Remote service status is unavailable");
-    await clickButton("Open System");
-    expect(screenText()).toContain("Services are unavailable for this project.");
-    expect(button("Reconnect").disabled).toBe(false);
-  });
-
-  it("requires explicit activation after a project switch", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    provider.addDraftProject();
-    root = await renderProduct(provider);
-
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    if (!switcher) throw new Error("Project switcher was not found.");
-    await act(async () => {
-      switcher.value = projectOptionValue(switcher, "project-fixture-2");
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
+        etag: ETAG,
+      },
+      logs: [
+        {
+          schema_version: "2",
+          operation_id: "project-create-long-1",
+          sequence: 1,
+          occurred_at: "2026-07-27T08:00:00Z",
+          source: "ssh_stdout",
+          text: "Remote project request accepted",
+          truncated: false,
+        },
+        {
+          schema_version: "2",
+          operation_id: "project-create-long-1",
+          sequence: 2,
+          occurred_at: "2026-07-27T08:00:00Z",
+          source: "daemon_stdout",
+          text: "Materializing workspace snapshot",
+          truncated: false,
+        },
+      ],
+      droppedBeforeSequence: 0,
+      hasOlderLogs: false,
+      hasNewerLogs: false,
+    } satisfies LifecycleOperationStateV2;
+    let operationVisible = false;
+    let listener: (() => void) | null = null;
+    const createProject = vi.fn(async () => {
+      operationVisible = true;
+      listener?.();
+      return lifecycleState.operation;
     });
-    expect(screenText()).toContain("Activate this project");
-    expect(button("Start session").disabled).toBe(true);
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      subscribe: vi.fn((next: () => void) => {
+        listener = next;
+        return () => {
+          listener = null;
+        };
+      }),
+      listLifecycleOperations: () => (operationVisible ? [lifecycleState] : []),
+      listMutationIntents: () =>
+        operationVisible
+          ? [
+              {
+                action_id: "create-project-long-running-0001",
+                mutation_kind: "project_create" as const,
+                resource_scope: "project:new:profile-gpu",
+                request_sha256: DIGEST,
+                authority_sha256: DIGEST,
+                provider_stream_instance: "provider-instance-test",
+                provider_stream_epoch: 1,
+                chain_step: "single" as const,
+                accepted_operation_id: "project-create-long-1",
+                completed_operation_ids: [],
+                state: "accepted" as const,
+                created_at: "2026-07-27T08:00:00Z",
+                updated_at: "2026-07-27T08:00:00Z",
+              },
+            ]
+          : [],
+      createProject,
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
 
-    await clickButton("Activate project");
-    expect(screenText()).toContain("Second research task");
-    expect(button("Start session").disabled).toBe(false);
-  });
-
-  it("does not expose project A services or restart actions while project B is selected", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true });
-    provider.addDraftProject();
-    root = await renderProduct(provider);
-
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    if (!switcher) throw new Error("Project switcher was not found.");
-    await act(async () => {
-      switcher.value = projectOptionValue(switcher, "project-fixture-2");
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    await clickButton("System");
-
-    expect(screenText()).toContain("Services are unavailable for this project.");
-    expect(screenText()).not.toContain("Model service");
-    expect(document.querySelector('button[aria-label="Restart Model service"]')).toBeNull();
-  });
-
-  it("shows only reconnect recovery after an active project loses its tunnel", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, degraded: true, seedCompletedRun: true });
-    provider.useRunStateReviewScenario();
-    provider.loseActiveCoreSession();
-    const activateProject = vi.spyOn(provider, "activateProject");
-    root = await renderProduct(provider);
-
-    expect(screenText()).toContain("Remote workspace is offline");
-    expect(screenText()).not.toContain("Activate this project");
-    expect(screenText()).not.toContain("Preparing the selected model.");
-    await clickButton("System");
-    expect(screenText()).toContain("Services are unavailable for this project.");
-    expect(document.querySelector('button[aria-label^="Restart "]')).toBeNull();
-    expect(optionalButton("Activate project")).toBeNull();
-    expect(activateProject).not.toHaveBeenCalled();
-  });
-
-  it("loads project B when selection changes while project A's drawer remains open", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    provider.addDraftProject({ subscription: true });
-    const before = await provider.refresh();
-    if (before.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    const projectA = before.snapshot.projects.find((project) => project.project_id === "project-fixture-1");
-    if (!projectA) throw new Error("Expected project A.");
-    const updateProject = vi.spyOn(provider, "updateProject");
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    const projectADialog = document.querySelector('[role="dialog"]');
-    setInput("Project name", "Stale project A draft");
-    setInput("Hugging Face model", "example/stale-a-model");
-    const staleRefresh = deferred<Awaited<ReturnType<FixtureDesktopProductProvider["refresh"]>>>();
-    vi.spyOn(provider, "refresh").mockImplementationOnce(() => staleRefresh.promise);
-    await act(async () => provider?.emitAuthoritativeRefresh());
-    const switcher = document.querySelector<HTMLSelectElement>("#project-switcher");
-    if (!switcher) throw new Error("Project switcher was not found.");
-    await act(async () => {
-      switcher.value = projectOptionValue(switcher, "project-fixture-2");
-      switcher.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    await flush();
-
-    const projectBDialog = document.querySelector('[role="dialog"]');
-    expect(projectBDialog).not.toBeNull();
-    expect(projectBDialog).not.toBe(projectADialog);
-    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("Second research project");
-    expect(labelledControl<HTMLInputElement>("Task title", "input").value).toBe("Second research task");
-    expect(button("Subscription").getAttribute("aria-checked")).toBe("true");
-    expect(labelledControl<HTMLInputElement>("Codex model", "input").value).toBe("gpt-5.5");
-    expect(screenText()).not.toContain("example/stale-a-model");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
-    expect(screenText()).toContain("Capabilities are unavailable for this project and mode.");
-
-    await act(async () => staleRefresh.resolve(before));
-    await flush();
-    expect(labelledControl<HTMLInputElement>("Project name", "input").value).toBe("Second research project");
-    expect(document.querySelectorAll(".target-toggle")).toHaveLength(0);
-
-    setInput("Objective", "Updated project B objective.");
-    expect(button("Save and activate").disabled).toBe(true);
-    expect(updateProject).not.toHaveBeenCalled();
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Expected a fresh fixture snapshot.");
-    expect(refreshed.snapshot.projects.find((item) => item.project_id === "project-fixture-1")?.name).toBe(projectA.name);
-  });
-
-  it("selects a native folder through an opaque snapshot reference without fake sync", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const selectSource = vi.spyOn(provider, "selectProjectSource");
-    const settleSource = vi.spyOn(provider, "settleProjectSource");
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    await clickButton("Folder snapshot");
-    expect(selectSource).toHaveBeenCalledWith(expect.objectContaining({ projectId: "project-fixture-1" }));
-    expect(screenText()).toContain("Selected research folder");
-    expect(document.querySelector('input[type="file"]')).toBeNull();
-    await clickButton("Save");
-    expect(settleSource).toHaveBeenCalledWith(
-      selectSource.mock.calls[0]?.[0].actionId,
-      "adopt",
+    await click("New project");
+    setTextarea(
+      "Task objective",
+      "Create a reproducible result from this workspace.",
     );
-    await clickAria("Project settings");
-    expect(optionalButton("Sync snapshot")).toBeNull();
-    await clickAria("Close settings");
+    await click("Create project");
+    await act(async () => vi.advanceTimersByTime(16_000));
 
-    const refreshed = await provider.refresh();
-    if (refreshed.status !== "fresh") throw new Error("Fixture refresh was not fresh.");
-    expect(refreshed.snapshot.projects[0]?.source).toMatchObject({
-      kind: "native_folder_snapshot",
-      display_name: "Selected research folder",
-      import_ref: { import_id: "source-fixture-1" },
-    });
-  });
-
-  it("discards pending picker imports on close, reselection, and save failure", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const selectSource = vi.spyOn(provider, "selectProjectSource");
-    const settleSource = vi.spyOn(provider, "settleProjectSource");
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    await clickButton("Folder snapshot");
-    const closedAction = selectSource.mock.calls[0]?.[0].actionId;
-    await clickAria("Close settings");
-    await clickButton("Discard changes");
-    await flush();
-    expect(settleSource).toHaveBeenCalledWith(closedAction, "discard");
-
-    await clickAria("Project settings");
-    await clickButton("Folder snapshot");
-    const replacedAction = selectSource.mock.calls[1]?.[0].actionId;
-    await clickButton("Folder snapshot");
-    expect(settleSource).toHaveBeenCalledWith(replacedAction, "discard");
-
-    provider.failNextProjectSave();
-    const failedAction = selectSource.mock.calls[2]?.[0].actionId;
-    await clickButton("Save");
-    await flush();
-    expect(settleSource).toHaveBeenCalledWith(failedAction, "discard");
-    expect(screenText()).toContain("New workspace");
-  });
-
-  it("keeps the source and dirty state when the native picker is cancelled", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const selectSource = vi.spyOn(provider, "selectProjectSource");
-    selectSource.mockRejectedValueOnce({
-      code: "workspace_selection_cancelled",
-      message: "No research folder was selected.",
-    });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Keep this dirty draft after cancellation.");
-    expect(button("Save").disabled).toBe(false);
-    await clickButton("Folder snapshot");
-
-    expect(screenText()).toContain("New workspace");
-    expect(screenText()).toContain("Keep this dirty draft after cancellation.");
-    expect(document.querySelector(".form-error")).toBeNull();
-    expect(button("Save").disabled).toBe(false);
-
-    selectSource.mockRejectedValueOnce({
-      code: "workspace_selection_invalid",
-      message: "workspace_selection_cancelled",
-    });
-    await clickButton("Folder snapshot");
-    expect(document.querySelector(".form-error")?.textContent).toBe("The request could not be completed.");
-  });
-
-  it("allows only one native picker request while selection is in flight", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const initialSource = await provider.selectProjectSource({
-      kind: "native_folder_snapshot",
-      projectId: "project-fixture-1",
-      actionId: "source-test-seed",
-      streamEpoch: 1,
-    });
-    root = await renderProduct(provider);
-    await clickAria("Project settings");
-    await clickButton("Folder snapshot");
-    await clickButton("Save");
-    await clickAria("Project settings");
-    setInput("Objective", "Keep controls locked during selection.");
-
-    const pending = deferred<ProjectSourceV1>();
-    const selectSource = vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
-    const folderButton = button("Folder snapshot");
-    await act(async () => {
-      folderButton.click();
-      folderButton.click();
-      await Promise.resolve();
-    });
-
-    expect(selectSource).toHaveBeenCalledTimes(1);
-    expect(button("Scratch").disabled).toBe(true);
-    expect(folderButton.disabled).toBe(true);
-    expect(button("Save").disabled).toBe(true);
-    expect(button("Undo").disabled).toBe(true);
-
-    await act(async () => pending.resolve({ ...initialSource, display_name: "Replacement research folder" }));
-    await flush();
-    expect(screenText()).toContain("Replacement research folder");
-    expect(button("Save").disabled).toBe(false);
-  });
-
-  it("cancels an in-flight native ingest and closes without waiting for its original promise", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const pending = deferred<ProjectSourceV1>();
-    const selectSource = vi.spyOn(provider, "selectProjectSource").mockImplementation(() => pending.promise);
-    const cancelSource = vi.spyOn(provider, "cancelProjectSource").mockImplementation(async () => {
-      pending.reject({
-        code: "workspace_selection_cancelled",
-        message: "No research folder was selected.",
-      });
-    });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Cancel this in-flight snapshot.");
-    await clickElement(button("Folder snapshot"));
-    const actionId = selectSource.mock.calls[0]?.[0].actionId;
-    await clickAria("Close settings");
-    expect(cancelSource).toHaveBeenCalledWith(actionId);
-    await clickButton("Discard changes");
-    await flush();
-
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-  });
-
-  it("ignores a picker completion after a close request and a later selection wins", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    const first = deferred<ProjectSourceV1>();
-    const selected = await provider.selectProjectSource({
-      kind: "native_folder_snapshot",
-      projectId: "project-fixture-1",
-      actionId: "source-test-stale",
-      streamEpoch: 1,
-    });
-    const selectSource = vi.spyOn(provider, "selectProjectSource")
-      .mockImplementationOnce(() => first.promise)
-      .mockResolvedValueOnce({ ...selected, display_name: "Current research folder" });
-    const settleSource = vi.spyOn(provider, "settleProjectSource");
-    const cancelSource = vi.spyOn(provider, "cancelProjectSource");
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    setInput("Objective", "Keep editing after invalidating the first picker.");
-    const folderButton = button("Folder snapshot");
-    await clickElement(folderButton);
-    await clickAria("Close settings");
-    expect(screenText()).toContain("Discard unsaved changes?");
-    expect(cancelSource).toHaveBeenCalledWith(selectSource.mock.calls[0]?.[0].actionId);
-    await clickButton("Keep editing");
-
-    expect(folderButton.disabled).toBe(true);
-    await clickElement(folderButton);
-    expect(selectSource).toHaveBeenCalledTimes(1);
-    expect(screenText()).toContain("Keep editing after invalidating the first picker.");
-    expect(screenText()).toContain("New workspace");
-    expect(document.querySelector(".form-error")).toBeNull();
-
-    await act(async () => first.resolve({ ...selected, display_name: "Stale research folder" }));
-    await flush();
-    expect(screenText()).not.toContain("Stale research folder");
-    expect(settleSource).toHaveBeenCalledWith(
-      selectSource.mock.calls[0]?.[0].actionId,
-      "discard",
+    expect(createProject).toHaveBeenCalledTimes(1);
+    expect(document.body.textContent).toContain(
+      "Creating or loading the remote project",
     );
-
-    expect(folderButton.disabled).toBe(false);
-    await clickButton("Folder snapshot");
-    expect(screenText()).toContain("Current research folder");
-    expect(selectSource).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain(
+      "Remote project request accepted",
+    );
+    expect(document.body.textContent).toContain(
+      "Materializing workspace snapshot",
+    );
+    expect(document.body.textContent).toContain("Elapsed 16s");
+    expect(document.body.textContent).not.toContain(
+      "Desktop Local API request timed out",
+    );
+    expect(document.body.textContent).toContain("Project creation started");
+    expect(
+      Array.from(document.querySelectorAll("button")).some(
+        (candidate) => candidate.textContent?.trim() === "Create project",
+      ),
+    ).toBe(false);
   });
 
-  it("keeps dirty drawer drafts until Escape, overlay, or close is confirmed", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-    const opener = document.querySelector<HTMLButtonElement>('button[aria-label="Project settings"]');
-    if (!opener) throw new Error("Project settings opener was not found.");
-    opener.focus();
-    await clickAria("Project settings");
-    setInput("Objective", "A retained draft objective.");
-    provider.failNextProjectSaveWithUnknownError();
-    await clickButton("Save");
-
-    expect(screenText()).toContain("A retained draft objective.");
-    expect(screenText()).toContain("The request could not be completed.");
-    expect(screenText()).not.toContain("internal host path");
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-
-    await pressEscape();
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Discard unsaved changes?");
-    const alertDialog = document.querySelector<HTMLElement>('[role="alertdialog"]');
-    expect(alertDialog?.contains(document.activeElement)).toBe(true);
-    expect(document.activeElement?.textContent).toContain("Keep editing");
-    const drawerContent = document.querySelector<HTMLElement>(".drawer-content");
-    expect(drawerContent?.inert).toBe(true);
-    const objective = labelledControl<HTMLTextAreaElement>("Objective", "textarea");
-    await act(async () => objective.focus());
-    expect(alertDialog?.contains(document.activeElement)).toBe(true);
-    await clickButton("Keep editing");
-    expect(drawerContent?.inert).toBe(false);
-
-    const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
-    if (!backdrop) throw new Error("Drawer backdrop was not found.");
-    let firstBackdropAccepted = true;
-    await act(async () => {
-      firstBackdropAccepted = backdrop.dispatchEvent(
-        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
-      );
+  it("can cancel native workspace preparation while the lifecycle operation is running", async () => {
+    const connected = systemProfile({
+      connection_state: "connected",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
     });
-    expect(firstBackdropAccepted).toBe(false);
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("Discard unsaved changes?");
-    const keepEditing = button("Keep editing");
-    expect(document.activeElement).toBe(keepEditing);
-    await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true })));
-    expect(document.activeElement).toBe(keepEditing);
-    await pressKey(keepEditing, "Escape");
-    expect(screenText()).not.toContain("Discard unsaved changes?");
-
-    await act(async () => backdrop.dispatchEvent(new MouseEvent("mousedown", { bubbles: true })));
-    expect(screenText()).toContain("Discard unsaved changes?");
-    await clickButton("Keep editing");
-
-    await clickAria("Close settings");
-    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
-    expect(screenText()).toContain("A retained draft objective.");
-    await clickButton("Discard changes");
-    expect(document.querySelector('[role="dialog"]')).toBeNull();
-    expect(document.activeElement).toBe(opener);
-  });
-
-  it("locks background scrolling while a modal drawer is open", async () => {
-    document.body.style.overflow = "auto";
-    provider = createFixtureDesktopProductProvider({ startOnline: true, seedCompletedRun: true });
-    root = await renderProduct(provider);
-
-    await clickAria("Project settings");
-    expect(document.body.style.overflow).toBe("hidden");
-    await clickAria("Close settings");
-    expect(document.body.style.overflow).toBe("auto");
-
-    await clickAria("Remote workspace settings");
-    expect(document.body.style.overflow).toBe("hidden");
-    await clickAria("Close connection settings");
-    expect(document.body.style.overflow).toBe("auto");
-  });
-
-  it("keeps first-backdrop focus inside a dirty remote workspace confirmation", async () => {
-    provider = createFixtureDesktopProductProvider({ startOnline: true });
-    root = await renderProduct(provider);
-    await clickAria("Remote workspace settings");
-    setInput("Workspace name", "Unsaved remote workspace");
-    const backdrop = document.querySelector<HTMLElement>(".drawer-backdrop");
-    if (!backdrop) throw new Error("Remote workspace backdrop was not found.");
-
-    let backdropAccepted = true;
-    await act(async () => {
-      backdropAccepted = backdrop.dispatchEvent(
-        new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
-      );
+    const snapshot = baseSnapshot({
+      profiles: [connected] as never,
+      state: {
+        ...baseSnapshot().state,
+        profiles: [connected] as never,
+        active_profile_id: connected.profile_id,
+      },
     });
+    const selectNativeWorkspace = vi.fn(
+      async () => new Promise<never>(() => {}),
+    );
+    const cancelNativeWorkspace = vi.fn(async () => {});
+    const provider = {
+      ...unavailableDesktopProductProviderV2,
+      featureFlags: ["system_openssh_profiles"],
+      refresh: vi.fn(async () => ({ status: "fresh" as const, snapshot })),
+      selectNativeWorkspace,
+      cancelNativeWorkspace,
+      settleNativeWorkspace: vi.fn(async () => {}),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
 
-    expect(backdropAccepted).toBe(false);
-    expect(screenText()).toContain("Discard unsaved changes?");
-    expect(document.activeElement).toBe(button("Keep editing"));
-    await clickButton("Discard changes");
+    await click("New project");
+    setTextarea("Task objective", "Prepare a native workspace safely.");
+    await click("Choose folder snapshot");
+    expect(selectNativeWorkspace).toHaveBeenCalledTimes(1);
+    await click("Cancel");
+
+    expect(cancelNativeWorkspace).toHaveBeenCalledWith(expect.any(String));
   });
 });
 
-async function renderProduct(fixture: FixtureDesktopProductProvider): Promise<Root> {
-  const container = document.createElement("div");
-  document.body.appendChild(container);
-  const rendered = createRoot(container);
+async function render(provider: DesktopProductProviderV2): Promise<Root> {
+  const container = document.querySelector("#root");
+  if (!container) throw new Error("root is missing");
+  const root = createRoot(container);
   await act(async () => {
-    rendered.render(<DesktopProductApp provider={fixture} />);
-    await Promise.resolve();
-  });
-  await flush();
-  return rendered;
-}
-
-function projectOptionValue(switcher: HTMLSelectElement, projectId: string): string {
-  const option = Array.from(switcher.options).find(
-    (candidate) => candidate.dataset.projectId === projectId,
-  );
-  if (!option) throw new Error(`Project option ${projectId} was not found.`);
-  return option.value;
-}
-
-async function flush(): Promise<void> {
-  await act(async () => {
+    root.render(<DesktopProductApp provider={provider} />);
     await Promise.resolve();
     await Promise.resolve();
   });
-}
-
-async function advance(milliseconds: number): Promise<void> {
-  await act(async () => {
-    vi.advanceTimersByTime(milliseconds);
-    await Promise.resolve();
-    await Promise.resolve();
-  });
-}
-
-async function clickButton(label: string): Promise<void> {
-  const target = button(label);
-  await act(async () => {
-    target.click();
-    await Promise.resolve();
-  });
-  await flush();
-}
-
-async function clickAria(label: string): Promise<void> {
-  const target = document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
-  if (!target) throw new Error(`Button with aria-label ${label} was not found.`);
-  await act(async () => {
-    target.click();
-    await Promise.resolve();
-  });
-  await flush();
-}
-
-async function clickElement(target: HTMLButtonElement): Promise<void> {
-  await act(async () => {
-    target.click();
-    await Promise.resolve();
-  });
-  await flush();
+  return root;
 }
 
 function button(label: string): HTMLButtonElement {
-  const all = Array.from(document.querySelectorAll<HTMLButtonElement>("button"));
-  const exact = all.filter((item) => item.textContent?.trim() === label);
-  const matches = exact.length ? exact : all.filter((item) => item.textContent?.trim().startsWith(label));
-  const enabled = matches.find((item) => !item.disabled);
-  const target = enabled ?? matches[0];
-  if (!target) throw new Error(`Button ${label} was not found.`);
-  return target;
+  const match = [
+    ...document.querySelectorAll<HTMLButtonElement>("button"),
+  ].find((candidate) => candidate.textContent?.trim().includes(label));
+  if (!match) throw new Error(`button not found: ${label}`);
+  return match;
 }
 
-function optionalButton(label: string): HTMLButtonElement | null {
-  return Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
-    .find((item) => item.textContent?.trim() === label) ?? null;
+async function click(label: string): Promise<void> {
+  await act(async () => {
+    button(label).click();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+function dialog(): HTMLElement | null {
+  return document.querySelector('[role="dialog"]');
 }
 
 function setInput(label: string, value: string): void {
-  const control = labelledControl<HTMLInputElement>(label, "input, textarea");
+  const labels = [...document.querySelectorAll<HTMLLabelElement>("label")];
+  const owner = labels.find((candidate) =>
+    candidate.textContent?.includes(label),
+  );
+  const input = owner?.querySelector<HTMLInputElement>("input");
+  if (!input) throw new Error(`input not found: ${label}`);
   act(() => {
-    const prototype = control instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    Object.getOwnPropertyDescriptor(prototype, "value")?.set?.call(control, value);
-    control.dispatchEvent(new Event("input", { bubbles: true }));
-    control.dispatchEvent(new Event("change", { bubbles: true }));
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLInputElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
   });
 }
 
-function setSelect(label: string, value: string): void {
-  const control = labelledControl<HTMLSelectElement>(label, "select");
+function setTextarea(label: string, value: string): void {
+  const labels = [...document.querySelectorAll<HTMLLabelElement>("label")];
+  const owner = labels.find((candidate) =>
+    candidate.textContent?.includes(label),
+  );
+  const input = owner?.querySelector<HTMLTextAreaElement>("textarea");
+  if (!input) throw new Error(`textarea not found: ${label}`);
   act(() => {
-    control.value = value;
-    control.dispatchEvent(new Event("change", { bubbles: true }));
+    const setter = Object.getOwnPropertyDescriptor(
+      HTMLTextAreaElement.prototype,
+      "value",
+    )?.set;
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
   });
 }
 
-function setCheckbox(label: string, checked: boolean): void {
-  const control = labelledControl<HTMLInputElement>(label, 'input[type="checkbox"]');
-  act(() => {
-    if (control.checked !== checked) control.click();
-  });
-}
-
-async function pressEscape(): Promise<void> {
-  await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
-  await flush();
-}
-
-async function pressKey(target: HTMLElement, key: string): Promise<void> {
-  await act(async () => target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true })));
-  await flush();
-}
-
-function labelledControl<T extends HTMLElement>(text: string, selector: string): T {
-  const label = Array.from(document.querySelectorAll("label")).find((item) => item.textContent?.trim().startsWith(text));
-  const control = label?.querySelector<T>(selector);
-  if (!control) throw new Error(`Control ${text} was not found.`);
+function input(label: string): HTMLInputElement {
+  const owner = [...document.querySelectorAll<HTMLLabelElement>("label")].find(
+    (candidate) => candidate.textContent?.includes(label),
+  );
+  const control = owner?.querySelector<HTMLInputElement>("input");
+  if (!control) throw new Error(`input not found: ${label}`);
   return control;
 }
 
-function screenText(): string {
-  return document.body.textContent ?? "";
-}
-
-function withAdvancedRetry(snapshot: DesktopProductSnapshot): DesktopProductSnapshot {
-  const failedRun = snapshot.runs.find((run) => run.id === "run-failed-model");
-  if (!failedRun?.current_attempt) throw new Error("Expected the failed fixture run.");
-  const queuedReason = {
-    code: "admission_pending" as const,
-    summary: "The retry was admitted.",
-    retry_after_seconds: null,
-  };
-  const queuedRun: RunV1 = {
-    ...failedRun,
-    status: "queued",
-    queued_reason: queuedReason,
-    attempt_count: failedRun.attempt_count + 1,
-    current_attempt_id: "attempt-run-failed-model-retry",
-    current_attempt: {
-      ...failedRun.current_attempt,
-      id: "attempt-run-failed-model-retry",
-      number: failedRun.attempt_count + 1,
-      status: "queued",
-      queued_reason: queuedReason,
-      error: null,
-      started_at: null,
-      finished_at: null,
-    },
-    current_error: null,
-    attempts: [
-      ...failedRun.attempts,
-      {
-        ...failedRun.current_attempt,
-        id: "attempt-run-failed-model-retry",
-        number: failedRun.attempt_count + 1,
-        status: "queued",
-        queued_reason: queuedReason,
-        error: null,
-        started_at: null,
-        finished_at: null,
-      },
-    ],
-    started_at: null,
-    finished_at: null,
-    etag: `"${"e".repeat(64)}"`,
-  };
-  return {
-    ...snapshot,
-    runs: snapshot.runs.map((run) => run.id === queuedRun.id ? queuedRun : run),
-  };
-}
-
-function withTwoAdvancedRetries(snapshot: DesktopProductSnapshot): DesktopProductSnapshot {
-  const once = withAdvancedRetry(snapshot);
-  const first = once.runs.find((run) => run.id === "run-failed-model");
-  if (!first?.current_attempt) throw new Error("Expected the first retry attempt.");
-  const failedFirstRetry = {
-    ...first.current_attempt,
-    status: "failed" as const,
-    queued_reason: null,
-    error: snapshot.runs.find((run) => run.id === first.id)?.current_error ?? null,
-    started_at: first.current_attempt.created_at,
-    finished_at: first.current_attempt.updated_at,
-  };
-  const queuedReason = {
-    code: "admission_pending" as const,
-    summary: "A later retry was admitted.",
-    retry_after_seconds: null,
-  };
-  const secondRetry = {
-    ...first.current_attempt,
-    id: "attempt-run-failed-model-retry-2",
-    number: first.attempt_count + 1,
-    status: "queued" as const,
-    queued_reason: queuedReason,
-    error: null,
-    started_at: null,
-    finished_at: null,
-  };
-  const twice: RunV1 = {
-    ...first,
-    status: "queued",
-    queued_reason: queuedReason,
-    current_attempt_id: secondRetry.id,
-    current_attempt: secondRetry,
-    current_error: null,
-    attempt_count: first.attempt_count + 1,
-    attempts: [...first.attempts.slice(0, -1), failedFirstRetry, secondRetry],
-    started_at: null,
-    finished_at: null,
-    etag: `"${"d".repeat(64)}"`,
-  };
-  return {
-    ...once,
-    runs: once.runs.map((run) => run.id === twice.id ? twice : run),
-  };
-}
-
-function withRunOutputIdentity(
-  snapshot: DesktopProductSnapshot,
-  runId: string,
-  attemptId: string | null,
-): DesktopProductSnapshot {
-  const source = snapshot.runs[0];
-  if (!source) throw new Error("Expected a run fixture.");
-  const sourceAttempt = source.current_attempt ?? source.attempts[0];
-  if (attemptId !== null && !sourceAttempt) throw new Error("Expected an attempt fixture.");
-  const attempt = attemptId === null
-    ? null
-    : { ...sourceAttempt, id: attemptId, run_id: runId };
-  const run = {
-    ...source,
-    id: runId,
-    current_attempt_id: attemptId,
-    current_attempt: attempt,
-    attempt_count: attempt === null ? 0 : 1,
-    attempts: attempt === null ? [] : [attempt],
-  };
-  return {
-    ...snapshot,
-    runs: [run],
-    timelines: { [runId]: snapshot.timelines[source.id] ?? [] },
-  };
-}
-
-function relabelLogs(
-  logs: Awaited<ReturnType<FixtureDesktopProductProvider["getRunLogs"]>>,
-  runId: string,
-  attemptId: string | null,
-  message: string,
-) {
-  return logs.map((entry, index) => ({
-    ...entry,
-    id: `${runId}-log-${index}`,
-    run_id: runId,
-    attempt_id: attemptId,
-    message: index === 0 ? message : entry.message,
-  }));
-}
-
-function deferred<T>(): {
-  readonly promise: Promise<T>;
-  readonly resolve: (value: T) => void;
-  readonly reject: (reason?: unknown) => void;
-} {
-  let resolve!: (value: T) => void;
-  let reject!: (reason?: unknown) => void;
-  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
-    resolve = resolvePromise;
-    reject = rejectPromise;
-  });
-  return { promise, resolve, reject };
+function textarea(label: string): HTMLTextAreaElement {
+  const owner = [...document.querySelectorAll<HTMLLabelElement>("label")].find(
+    (candidate) => candidate.textContent?.includes(label),
+  );
+  const control = owner?.querySelector<HTMLTextAreaElement>("textarea");
+  if (!control) throw new Error(`textarea not found: ${label}`);
+  return control;
 }

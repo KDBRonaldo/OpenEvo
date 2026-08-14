@@ -8,7 +8,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DesktopApiError } from "./api/v1/client";
 import { AppShell, ReleaseDesktopProductShell } from "./App";
-import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./product/fixtureProvider";
+import { createFixtureDesktopProductProvider, type FixtureDesktopProductProvider } from "./product/legacyFixtureProvider";
 import type { NativeStartupStatusV2 } from "./product/releaseProvider";
 
 const invokeMock = vi.hoisted(() => vi.fn());
@@ -308,7 +308,7 @@ describe("ReleaseDesktopProductShell", () => {
     expect(factory).toHaveBeenCalledTimes(2);
     expect(reportStage).toHaveBeenCalledWith("provider_create_failed");
     expect(reportStage).toHaveBeenCalledWith("product_committed");
-    expect(document.body.textContent).toContain("Research brief");
+    expect(document.body.textContent).toContain("Task draft");
     expect(document.querySelector('[role="dialog"]')).not.toBeNull();
     expect(document.body.textContent).toContain("Server connection");
     const firstStart = lifecycle.indexOf("start-1");
@@ -510,7 +510,7 @@ describe("ReleaseDesktopProductShell", () => {
       })),
     );
 
-    expect(document.body.textContent).toContain("Research brief");
+    expect(document.body.textContent).toContain("Task draft");
     expect(invokeMock).not.toHaveBeenCalled();
   });
 
@@ -583,7 +583,7 @@ describe("ReleaseDesktopProductShell", () => {
     const stop = vi.fn(async () => { lifecycle.push("stop"); });
     let productCommittedWhenReported = false;
     const reportReady = vi.fn(async () => {
-      productCommittedWhenReported = document.body.textContent?.includes("Research brief") ?? false;
+      productCommittedWhenReported = document.body.textContent?.includes("Task draft") ?? false;
       lifecycle.push("ready");
     });
     const reportStage = vi.fn(async (stage: string) => { lifecycle.push(stage); });
@@ -619,7 +619,7 @@ describe("ReleaseDesktopProductShell", () => {
       "product_committed",
     ]);
     expect(productCommittedWhenReported).toBe(true);
-    expect(document.body.textContent).toContain("Research brief");
+    expect(document.body.textContent).toContain("Task draft");
   });
 
   it("ignores a provider resolved by a superseded factory", async () => {
@@ -670,7 +670,7 @@ describe("ReleaseDesktopProductShell", () => {
       await Promise.resolve();
       await Promise.resolve();
     });
-    expect(document.body.textContent).toContain("Research brief");
+    expect(document.body.textContent).toContain("Task draft");
     expect(document.body.textContent).not.toContain("Create your first research project");
     expect(stop).toHaveBeenCalled();
     expect(reportReady).toHaveBeenCalledTimes(1);
@@ -733,7 +733,7 @@ describe("ReleaseDesktopProductShell", () => {
 
     expect(reportStage).toHaveBeenCalledTimes(2);
     expect(reportReady).toHaveBeenCalledTimes(1);
-    expect(document.body.textContent).toContain("Research brief");
+    expect(document.body.textContent).toContain("Task draft");
     expect(document.body.textContent).not.toContain("diagnostic bridge");
   });
 
