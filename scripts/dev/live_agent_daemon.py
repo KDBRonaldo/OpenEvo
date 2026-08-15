@@ -1458,6 +1458,10 @@ class DevelopmentRuntimeContextMaterializer:
             InlineTextPayloadContribution,
             StagedPayloadContribution,
         )
+        from openevo.evolution.framework.runtime_controls import (
+            AgentSystemRuntimeControlV1,
+            validate_runtime_control,
+        )
 
         self._copy_workspace(persistent_workspace, runtime_workspace)
         pairs, payload_documents = self._project(contexts)
@@ -1472,6 +1476,7 @@ class DevelopmentRuntimeContextMaterializer:
         instructions: list[str] = []
         activations: list[str] = []
         environment: dict[str, str] = {}
+        runtime_controls: list[dict[str, Any]] = []
 
         for output in outputs:
             handler_descriptor = self._registry.target_handlers[output.handler_id]
@@ -1487,6 +1492,26 @@ class DevelopmentRuntimeContextMaterializer:
                     contribution_paths[payload.contribution_id] = self._write_text(
                         root, payload.destination_relative_path, payload.text
                     )
+                    if payload.destination_relative_path.startswith("runtime-controls/"):
+                        try:
+                            control = validate_runtime_control(json.loads(payload.text))
+                        except (json.JSONDecodeError, ValueError) as exc:
+                            raise AgentRunError(
+                                "Core returned an invalid runtime-control contribution"
+                            ) from exc
+                        runtime_controls.append(control.model_dump(mode="json"))
+                        activations.append(
+                            f"{output.target_id}: {control.kind} runtime control v"
+                            f"{control.contract_version} loaded"
+                        )
+                        if (
+                            isinstance(control, AgentSystemRuntimeControlV1)
+                            and control.spawn_plan is not None
+                        ):
+                            activations.append(
+                                f"{output.target_id}: structured spawn plan staged for "
+                                "the harness adapter"
+                            )
                     continue
                 if not isinstance(payload, StagedPayloadContribution):
                     raise AgentRunError("Core returned an unsupported payload contribution")
@@ -1557,6 +1582,7 @@ class DevelopmentRuntimeContextMaterializer:
             "instruction_sections": instructions,
             "environment": environment,
             "activations": activations,
+            "runtime_controls": runtime_controls,
         }
 
 

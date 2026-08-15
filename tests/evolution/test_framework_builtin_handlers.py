@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 
 import pytest
 
@@ -216,6 +217,35 @@ def test_text_memory_rejects_bad_utf8_or_manifest(
         text_memory_handler(_input("text_memory", (artifact,)), _services(payload))
 
 
+def test_text_memory_runtime_control_can_switch_to_on_demand_reading(
+    builtin_snapshot,
+) -> None:
+    artifact, payload = _artifact(
+        "memory-on-demand",
+        "text_memory",
+        0,
+        {"memory.md": (b"# Memory", "text/markdown")},
+        manifest={
+            "content_path": "memory.md",
+            "runtime_control": {
+                "kind": "memory",
+                "read_timing": "on_demand",
+                "write_timing": "manual",
+            },
+        },
+    )
+    handler_input = _input("text_memory", (artifact,))
+
+    output = text_memory_handler(handler_input, _services(payload))
+
+    assert output.instructions == ()
+    assert output.renderer.source_contribution_ids == ("memory_file",)
+    assert builtin_snapshot.validate_handler_output(
+        output,
+        handler_input=handler_input,
+    ) == output
+
+
 def test_text_handlers_reject_source_mime_outside_descriptor_allowlist() -> None:
     memory, memory_payload = _artifact(
         "memory-html",
@@ -339,6 +369,50 @@ def test_agent_system_merges_native_targets_without_prompt_instruction(
         ),
         "OPENEVO_AGENTS_MD": ("agent_system_target_0",),
     }
+    assert builtin_snapshot.validate_handler_output(
+        output,
+        handler_input=handler_input,
+    ) == output
+
+
+def test_agent_system_projects_a_structured_spawn_plan_for_the_harness(
+    builtin_snapshot,
+) -> None:
+    artifact, payload = _artifact(
+        "agent-spawn-plan",
+        "agent_system",
+        0,
+        {"AGENTS.md": (b"# Coordinator", "text/markdown")},
+        manifest={
+            "content_path": "AGENTS.md",
+            "target_path": "AGENTS.md",
+            "runtime_control": {
+                "kind": "agent_system",
+                "spawn_plan": {
+                    "max_parallel": 1,
+                    "agents": [
+                        {
+                            "agent_id": "reviewer",
+                            "role": "Reviewer",
+                            "instructions": "Review the result.",
+                        }
+                    ],
+                },
+            },
+        },
+    )
+    handler_input = _input("agent_system", (artifact,))
+
+    output = agent_system_handler(handler_input, _services(payload))
+
+    runtime_control_payload = next(
+        payload
+        for payload in output.staged_payloads
+        if payload.destination_relative_path == "runtime-controls/agent_system.json"
+    )
+    runtime_control = json.loads(runtime_control_payload.text)
+    assert runtime_control["spawn_plan"]["agents"][0]["agent_id"] == "reviewer"
+    assert output.environment[-1].name == "OPENEVO_AGENT_SYSTEM_RUNTIME_CONTROL"
     assert builtin_snapshot.validate_handler_output(
         output,
         handler_input=handler_input,

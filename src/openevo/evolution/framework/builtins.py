@@ -598,7 +598,10 @@ def _handler_descriptors(
             allowed_uri_schemes=("file",),
             allowed_media_types=("text/markdown", "text/plain"),
             allowed_destination_scopes=(DestinationScope.TARGET_DATA,),
-            environment_allowlist=("OPENEVO_MEMORY_FILE",),
+            environment_allowlist=(
+                "OPENEVO_MEMORY_FILE",
+                "OPENEVO_MEMORY_RUNTIME_CONTROL",
+            ),
             allowed_contribution_kinds=(
                 ContributionKind.INSTRUCTION,
                 ContributionKind.STAGED_PAYLOAD,
@@ -632,8 +635,14 @@ def _handler_descriptors(
                 "text/x-shellscript",
                 "text/yaml",
             ),
-            allowed_destination_scopes=(DestinationScope.HARNESS_SKILLS,),
-            environment_allowlist=("OPENEVO_SKILLS_DIR",),
+            allowed_destination_scopes=(
+                DestinationScope.HARNESS_SKILLS,
+                DestinationScope.TARGET_DATA,
+            ),
+            environment_allowlist=(
+                "OPENEVO_SKILLS_DIR",
+                "OPENEVO_SKILL_RUNTIME_CONTROL",
+            ),
             allowed_contribution_kinds=(
                 ContributionKind.STAGED_PAYLOAD,
                 ContributionKind.ENVIRONMENT,
@@ -657,6 +666,7 @@ def _handler_descriptors(
                 "OPENEVO_AGENT_SYSTEM_FILE",
                 "OPENEVO_AGENT_SYSTEM_TARGET",
                 "OPENEVO_AGENT_SYSTEM_TARGETS",
+                "OPENEVO_AGENT_SYSTEM_RUNTIME_CONTROL",
             ),
             allowed_contribution_kinds=(
                 ContributionKind.STAGED_PAYLOAD,

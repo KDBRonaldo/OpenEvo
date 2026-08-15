@@ -192,6 +192,76 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     assert result["response"] == "The next answer used prior memory."
 
 
+def test_runtime_materializer_passes_explicit_memory_and_spawn_controls_to_harness(
+    tmp_path: Path,
+) -> None:
+    persistent_workspace = tmp_path / "persistent-workspace"
+    persistent_workspace.mkdir()
+    runtime_workspace = tmp_path / "runtime-workspace"
+
+    runtime = MODULE.DevelopmentRuntimeContextMaterializer().materialize(
+        persistent_workspace=persistent_workspace,
+        runtime_workspace=runtime_workspace,
+        contexts=[
+            {
+                "artifact_id": "memory-policy-1",
+                "artifact_type": "text_memory",
+                "target_id": "text_memory",
+                "manifest": {
+                    "content_path": "memory.md",
+                    "runtime_control": {
+                        "kind": "memory",
+                        "read_timing": "on_demand",
+                        "write_timing": "manual",
+                    },
+                },
+                "documents": [{
+                    "path": "memory.md",
+                    "media_type": "text/markdown",
+                    "content": "# On-demand memory",
+                }],
+            },
+            {
+                "artifact_id": "agent-policy-1",
+                "artifact_type": "agent_system",
+                "target_id": "agent_system",
+                "manifest": {
+                    "content_path": "AGENTS.md",
+                    "target_path": "AGENTS.md",
+                    "runtime_control": {
+                        "kind": "agent_system",
+                        "spawn_plan": {
+                            "agents": [{
+                                "agent_id": "reviewer",
+                                "role": "Reviewer",
+                                "instructions": "Review the proposed result.",
+                            }],
+                        },
+                    },
+                },
+                "documents": [{
+                    "path": "AGENTS.md",
+                    "media_type": "text/markdown",
+                    "content": "# Coordinator",
+                }],
+            },
+        ],
+    )
+
+    assert runtime["instruction_sections"] == []
+    assert {control["kind"] for control in runtime["runtime_controls"]} == {
+        "agent_system",
+        "memory",
+    }
+    assert runtime["environment"]["OPENEVO_MEMORY_RUNTIME_CONTROL"].endswith(
+        "/runtime-controls/text_memory.json"
+    )
+    assert runtime["environment"]["OPENEVO_AGENT_SYSTEM_RUNTIME_CONTROL"].endswith(
+        "/runtime-controls/agent_system.json"
+    )
+    assert any("structured spawn plan staged" in item for item in runtime["activations"])
+
+
 def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
@@ -526,6 +596,7 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
     assert (runtime_workspace / ".openevo" / "evolution" / "memory.md").is_file()
     assert runtime["instruction_sections"]
     assert runtime["environment"]["OPENEVO_SKILLS_DIR"].endswith("/.agents/skills")
+    assert runtime["runtime_controls"] == []
 
 
 def test_desktop_default_reflectors_receive_the_current_transcript_dataset(

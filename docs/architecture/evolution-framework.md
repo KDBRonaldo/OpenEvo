@@ -485,6 +485,30 @@ building the ordered runtime instruction prefix.
   logical destination root, such as the shared harness skills directory;
 - one renderer payload referencing output contribution IDs.
 
+The three non-parametric target handlers can also publish one closed, versioned
+runtime-control JSON file through the existing staged-payload/environment
+vocabulary when an artifact explicitly contains `manifest.runtime_control`.
+This is the stable boundary between Core-owned evolution semantics and a harness
+adapter:
+
+- `memory` declares `read_timing`, `write_timing`, and the invariant that an
+  accepted update is visible only to the next session;
+- `skill` declares harness discovery/loading semantics while the skill contents
+  remain an ordinary verified bundle;
+- `agent_system` declares native instruction-file loading and may carry a
+  data-only `AgentSpawnPlanV1` containing bounded agent roles and instructions.
+
+The spawn plan cannot contain commands, executables, environment variables,
+credentials, model credentials, or host paths. A verified harness adapter owns
+actual spawning and must fail closed when it does not support the declared
+control version. When the field is absent, the built-in defaults reproduce the
+pre-control behavior without adding another contribution:
+memory is read at session start and updated after session close, skills use
+harness discovery, agent-system uses native instruction files, and no structured
+agents are spawned. Existing artifacts without `manifest.runtime_control`
+therefore behave unchanged. A Core method may evolve the policy by returning the
+same typed manifest field; Desktop does not inspect or hard-code these controls.
+
 Output/contribution v2 adds the mandatory approved payload digest and byte size to
 adapter contributions. This is intentionally versioned separately from renderer v1;
 v1 handler outputs are not accepted as v2, so installed handlers and consumers cannot

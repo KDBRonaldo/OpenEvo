@@ -159,9 +159,19 @@ contribution; skill bundles are staged under the isolated runtime workspace's
 `.agents/skills/<artifact>/`; and agent-system targets are staged as native harness
 instruction files such as `AGENTS.md`. Runtime paths are supplied through the
 handler-declared `OPENEVO_*` environment bindings. The temporary runtime projection
-adds the required `name` and `description` frontmatter to a runtime-only `SKILL.md`
-copy when an older artifact lacks it; the authoritative evolved artifact is not
-rewritten. The temporary runtime projection
+also stages an explicit Core-owned runtime-control v1 contract for memory, skill,
+or agent-system when the artifact provides one. Existing artifacts default to the
+current behavior without gaining an extra runtime contribution. A future Core
+method can instead declare on-demand memory reads or a bounded structured agent
+spawn plan in `manifest.runtime_control` without adding method IDs or method tables
+to Desktop/daemon. The development Codex adapter passes those controls as verified
+files and environment bindings; native harness instruction and skill loading work
+today. A structured spawn plan is transport-ready but still requires a harness
+adapter that implements actual sub-agent spawning, and unsupported control versions
+fail closed rather than being treated as Markdown.
+The development adapter also adds the required `name` and `description` frontmatter
+to a runtime-only `SKILL.md` copy when an older artifact lacks it; the authoritative
+evolved artifact is not rewritten. The temporary runtime projection
 is discarded after the turn, while the authoritative artifacts and user workspace
 remain persisted on the remote server. Only method outputs marked promoted participate
 in the next Session; candidate/report outputs remain visible without being injected. This

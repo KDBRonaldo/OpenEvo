@@ -4,10 +4,16 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from typing import Literal
 
 from openevo.evolution.agent_system import normalize_agent_system_target_path
 
-from .contracts import MAX_PAYLOAD_ENTRIES, DestinationScope, EnvironmentValueKind
+from .contracts import (
+    MAX_PAYLOAD_ENTRIES,
+    DestinationScope,
+    EnvironmentValueKind,
+    canonical_json,
+)
 from .contributions import (
     AdapterContribution,
     AdapterRendererData,
@@ -29,11 +35,66 @@ from .handlers import (
     payload_tree_digest,
     payload_tree_size,
 )
+from .runtime_controls import (
+    AgentSystemRuntimeControlV1,
+    MemoryRuntimeControlV1,
+    RuntimeControlV1,
+    SkillRuntimeControlV1,
+    runtime_control_from_manifest,
+)
 
 
 _SAFE_SKILL_NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 _STABLE_ID_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
 _BUILTIN_TEXT_MEDIA_TYPES = frozenset({"text/markdown", "text/plain"})
+
+
+def _runtime_control(
+    artifacts: tuple[TrustedArtifactSnapshot, ...],
+    *,
+    expected_kind: Literal["memory", "skill", "agent_system"],
+) -> tuple[RuntimeControlV1, bool]:
+    if not artifacts:
+        raise ValueError("runtime control requires one selected artifact")
+    manifest = artifacts[0].manifest()
+    try:
+        return (
+            runtime_control_from_manifest(
+                manifest,
+                expected_kind=expected_kind,
+            ),
+            manifest.get("runtime_control") is not None,
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"artifact {artifacts[0].artifact_id!r} has an invalid runtime control"
+        ) from exc
+
+
+def _runtime_control_projection(
+    *,
+    target_id: str,
+    artifact_ids: tuple[str, ...],
+    control: RuntimeControlV1,
+) -> tuple[InlineTextPayloadContribution, EnvironmentBinding]:
+    payload = InlineTextPayloadContribution(
+        contribution_id=f"{target_id}_runtime_control",
+        source_artifact_ids=artifact_ids,
+        text=canonical_json(control),
+        media_type="text/plain",
+        destination_scope=DestinationScope.TARGET_DATA,
+        destination_relative_path=f"runtime-controls/{target_id}.json",
+    )
+    binding = EnvironmentBinding(
+        name={
+            "text_memory": "OPENEVO_MEMORY_RUNTIME_CONTROL",
+            "skill_bundle": "OPENEVO_SKILL_RUNTIME_CONTROL",
+            "agent_system": "OPENEVO_AGENT_SYSTEM_RUNTIME_CONTROL",
+        }[target_id],
+        value_contribution_ids=(payload.contribution_id,),
+        value_kind=EnvironmentValueKind.PATH,
+    )
+    return payload, binding
 
 
 def _require_handler(handler_input: TargetHandlerInput, target_id: str) -> None:
@@ -148,6 +209,12 @@ def text_memory_handler(
         require_content_path=False,
     )
     artifact_ids = tuple(artifact.artifact_id for artifact, _ in selected)
+    control, explicit_control = _runtime_control(
+        tuple(artifact for artifact, _ in selected),
+        expected_kind="memory",
+    )
+    if not isinstance(control, MemoryRuntimeControlV1):
+        raise AssertionError("memory runtime control validation returned the wrong type")
     markdown = "\n\n".join(text for _, text in selected)
     instruction = InstructionContribution(
         contribution_id="memory_instruction",
@@ -162,23 +229,38 @@ def text_memory_handler(
         destination_scope=DestinationScope.TARGET_DATA,
         destination_relative_path="memory.md",
     )
+    instructions = (instruction,) if control.read_timing == "session_start" else ()
+    staged_payloads: tuple[InlineTextPayloadContribution, ...] = (payload,)
+    environment = [
+        EnvironmentBinding(
+            name="OPENEVO_MEMORY_FILE",
+            value_contribution_ids=(payload.contribution_id,),
+            value_kind=EnvironmentValueKind.PATH,
+        )
+    ]
+    if explicit_control:
+        control_payload, control_binding = _runtime_control_projection(
+            target_id="text_memory",
+            artifact_ids=(artifact_ids[0],),
+            control=control,
+        )
+        staged_payloads = (control_payload, payload)
+        environment.append(control_binding)
     return TargetHandlerOutput(
         target_id="text_memory",
         handler_id="text_memory_handler",
         artifact_ids=artifact_ids,
-        instructions=(instruction,),
-        staged_payloads=(payload,),
-        environment=(
-            EnvironmentBinding(
-                name="OPENEVO_MEMORY_FILE",
-                value_contribution_ids=(payload.contribution_id,),
-                value_kind=EnvironmentValueKind.PATH,
-            ),
-        ),
+        instructions=instructions,
+        staged_payloads=staged_payloads,
+        environment=tuple(environment),
         renderer=RendererPayload(
             kind="markdown",
             title="Text memory",
-            source_contribution_ids=(instruction.contribution_id,),
+            source_contribution_ids=(
+                instruction.contribution_id
+                if instructions
+                else payload.contribution_id,
+            ),
             data=MarkdownRendererData(markdown=markdown),
         ),
     )
@@ -240,18 +322,41 @@ def skill_bundle_handler(
         payload_bytes += tree_size
     if not payloads:
         raise ValueError("handler limits selected no skill bundles")
+    artifact_ids = tuple(item.source_artifact_id for item in payloads)
+    selected_artifact_ids = set(artifact_ids)
+    control, explicit_control = _runtime_control(
+        tuple(
+            artifact
+            for artifact in _selected_artifacts(handler_input)
+            if artifact.artifact_id in selected_artifact_ids
+        ),
+        expected_kind="skill",
+    )
+    if not isinstance(control, SkillRuntimeControlV1):
+        raise AssertionError("skill runtime control validation returned the wrong type")
+    staged_payloads: tuple[StagedPayloadContribution | InlineTextPayloadContribution, ...]
+    staged_payloads = tuple(payloads)
+    environment = [
+        EnvironmentBinding(
+            name="OPENEVO_SKILLS_DIR",
+            value_kind=EnvironmentValueKind.SCOPE_ROOT,
+            destination_scope=DestinationScope.HARNESS_SKILLS,
+        )
+    ]
+    if explicit_control:
+        control_payload, control_binding = _runtime_control_projection(
+            target_id="skill_bundle",
+            artifact_ids=(artifact_ids[0],),
+            control=control,
+        )
+        staged_payloads = (control_payload, *payloads)
+        environment.append(control_binding)
     return TargetHandlerOutput(
         target_id="skill_bundle",
         handler_id="skill_bundle_handler",
-        artifact_ids=tuple(item.source_artifact_id for item in payloads),
-        staged_payloads=tuple(payloads),
-        environment=(
-            EnvironmentBinding(
-                name="OPENEVO_SKILLS_DIR",
-                value_kind=EnvironmentValueKind.SCOPE_ROOT,
-                destination_scope=DestinationScope.HARNESS_SKILLS,
-            ),
-        ),
+        artifact_ids=artifact_ids,
+        staged_payloads=staged_payloads,
+        environment=tuple(environment),
         renderer=RendererPayload(
             kind="file_bundle",
             title="Skill bundles",
@@ -282,6 +387,12 @@ def agent_system_handler(
         grouped.setdefault(target_path, []).append((artifact, text))
 
     artifact_ids = tuple(artifact.artifact_id for artifact, _ in selected)
+    control, explicit_control = _runtime_control(
+        tuple(artifact for artifact, _ in selected),
+        expected_kind="agent_system",
+    )
+    if not isinstance(control, AgentSystemRuntimeControlV1):
+        raise AssertionError("agent-system runtime control validation returned the wrong type")
     markdown = "\n\n".join(text for _, text in selected)
     canonical = InlineTextPayloadContribution(
         contribution_id="agent_system_file",
@@ -331,11 +442,20 @@ def agent_system_handler(
                 value_kind=EnvironmentValueKind.PATH,
             )
         )
+    staged_payloads: tuple[InlineTextPayloadContribution, ...] = (canonical, *targets)
+    if explicit_control:
+        control_payload, control_binding = _runtime_control_projection(
+            target_id="agent_system",
+            artifact_ids=(artifact_ids[0],),
+            control=control,
+        )
+        staged_payloads = (control_payload, canonical, *targets)
+        environment.append(control_binding)
     return TargetHandlerOutput(
         target_id="agent_system",
         handler_id="agent_system_handler",
         artifact_ids=artifact_ids,
-        staged_payloads=(canonical, *targets),
+        staged_payloads=staged_payloads,
         environment=tuple(environment),
         renderer=RendererPayload(
             kind="markdown",
