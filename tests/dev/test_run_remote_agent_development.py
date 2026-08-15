@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ MODULE_PATH = (
 SPEC = importlib.util.spec_from_file_location("run_remote_agent_development", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 remote_launcher = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = remote_launcher
 SPEC.loader.exec_module(remote_launcher)
 
 
@@ -32,6 +34,47 @@ def test_accepts_literal_ssh_alias(alias: str) -> None:
 def test_rejects_ssh_command_syntax(alias: str) -> None:
     with pytest.raises(remote_launcher.LauncherError):
         remote_launcher.validate_ssh_alias(alias)
+
+
+def test_resolves_direct_ssh_connection_without_config_alias() -> None:
+    args = remote_launcher.parse_args(
+        [
+            "--host",
+            "js4.blockelite.cn",
+            "--user",
+            "root",
+            "--ssh-port",
+            "27104",
+        ]
+    )
+
+    connection = remote_launcher.resolve_ssh_connection(args)
+
+    assert connection.options == ("-p", "27104")
+    assert connection.destination == "root@js4.blockelite.cn"
+    assert connection.display_name == "root@js4.blockelite.cn:27104"
+
+
+@pytest.mark.parametrize(
+    ("host", "user"),
+    [
+        ("host;bad", "root"),
+        ("-oProxyCommand=bad", "root"),
+        ("js4.blockelite.cn", "root;bad"),
+    ],
+)
+def test_rejects_direct_ssh_command_syntax(host: str, user: str) -> None:
+    with pytest.raises(remote_launcher.LauncherError):
+        remote_launcher.validate_ssh_host(host)
+        remote_launcher.validate_ssh_user(user)
+
+
+def test_rejects_mixing_alias_and_direct_ssh_inputs() -> None:
+    args = remote_launcher.parse_args(
+        ["--ssh-alias", "openevo-lab", "--host", "js4.blockelite.cn", "--user", "root"]
+    )
+    with pytest.raises(remote_launcher.LauncherError):
+        remote_launcher.resolve_ssh_connection(args)
 
 
 def test_normalizes_public_github_fork_urls() -> None:

@@ -156,6 +156,20 @@ the server once to the local system OpenSSH configuration, then run this from
 npm run dev:agent:remote -- --ssh-alias openevo-lab
 ```
 
+For a source-development server that is not present in `~/.ssh/config`, the
+launcher also accepts a validated host, user, and port directly:
+
+```bash
+npm run dev:agent:remote -- \
+  --host js4.blockelite.cn \
+  --user root \
+  --ssh-port 27104
+```
+
+These direct connection values remain local launcher arguments and never enter
+the React renderer or packaged Desktop contract. The release UI continues to
+use only system OpenSSH aliases discovered by the native sidecar.
+
 The launcher derives the credential-free GitHub repository URL from local
 `origin` and the branch from the current checkout. `--repository-url` and
 `--branch` may override those values. The local checkout must be clean and its

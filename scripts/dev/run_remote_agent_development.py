@@ -8,6 +8,7 @@ Desktop uses its authenticated native sidecar and sealed release assets.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -26,11 +27,22 @@ from urllib.parse import urlsplit, urlunsplit
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 DESKTOP_ROOT = REPOSITORY_ROOT / "desktop"
 SSH_ALIAS_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+SSH_HOST_PATTERN = re.compile(
+    r"(?=.{1,253}\Z)[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?"
+)
+SSH_USER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,31}")
 BRANCH_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}")
 
 
 class LauncherError(RuntimeError):
     """A user-actionable remote development setup failure."""
+
+
+@dataclass(frozen=True)
+class SshConnection:
+    options: tuple[str, ...]
+    destination: str
+    display_name: str
 
 
 def _checked_port(value: str) -> int:
@@ -51,6 +63,41 @@ def validate_ssh_alias(value: str) -> str:
             "letters, numbers, '.', '_' or '-'"
         )
     return alias
+
+
+def validate_ssh_host(value: str) -> str:
+    host = value.strip()
+    if not SSH_HOST_PATTERN.fullmatch(host) or ".." in host:
+        raise LauncherError("SSH host must be a plain DNS name or IPv4 address")
+    return host
+
+
+def validate_ssh_user(value: str) -> str:
+    user = value.strip()
+    if not SSH_USER_PATTERN.fullmatch(user):
+        raise LauncherError("SSH user contains unsupported characters")
+    return user
+
+
+def resolve_ssh_connection(args: argparse.Namespace) -> SshConnection:
+    if args.ssh_alias and (args.host or args.user or args.ssh_port != 22):
+        raise LauncherError(
+            "use either --ssh-alias or --host/--user/--ssh-port, not both"
+        )
+    if args.ssh_alias:
+        alias = validate_ssh_alias(args.ssh_alias)
+        return SshConnection(options=(), destination=alias, display_name=alias)
+    if not args.host:
+        raise LauncherError("provide --ssh-alias or --host")
+    if not args.user:
+        raise LauncherError("--user is required when --host is used")
+    host = validate_ssh_host(args.host)
+    user = validate_ssh_user(args.user)
+    return SshConnection(
+        options=("-p", str(args.ssh_port)),
+        destination=f"{user}@{host}",
+        display_name=f"{user}@{host}:{args.ssh_port}",
+    )
 
 
 def validate_branch(value: str) -> str:
@@ -271,9 +318,15 @@ echo "Remote development daemon is ready on loopback port $remote_port."
 """
 
 
-def _run_remote(ssh_binary: str, alias: str, script: str) -> None:
+def _run_remote(ssh_binary: str, connection: SshConnection, script: str) -> None:
     completed = subprocess.run(
-        [ssh_binary, alias, "sh", "-s"],
+        [
+            ssh_binary,
+            *connection.options,
+            connection.destination,
+            "sh",
+            "-s",
+        ],
         input=script,
         text=True,
         check=False,
@@ -286,18 +339,19 @@ def _run_remote(ssh_binary: str, alias: str, script: str) -> None:
 
 def _start_tunnel(
     ssh_binary: str,
-    alias: str,
+    connection: SshConnection,
     local_port: int,
     remote_port: int,
 ) -> subprocess.Popen[str]:
     command = [
         ssh_binary,
+        *connection.options,
         "-o",
         "ExitOnForwardFailure=yes",
         "-N",
         "-L",
         f"127.0.0.1:{local_port}:127.0.0.1:{remote_port}",
-        alias,
+        connection.destination,
     ]
     tunnel = subprocess.Popen(command, text=True)
     time.sleep(0.8)
@@ -351,6 +405,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="literal Host alias from ~/.ssh/config (or OPENEVO_DEV_SSH_ALIAS)",
     )
     parser.add_argument(
+        "--host",
+        help="development server DNS name or IPv4 address (alternative to --ssh-alias)",
+    )
+    parser.add_argument(
+        "--user",
+        help="SSH login user; required with --host",
+    )
+    parser.add_argument("--ssh-port", type=_checked_port, default=22)
+    parser.add_argument(
         "--repository-url",
         help="credential-free GitHub fork URL; defaults to the local origin remote",
     )
@@ -371,9 +434,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    if not args.ssh_alias:
-        raise LauncherError("--ssh-alias is required")
-    alias = validate_ssh_alias(args.ssh_alias)
+    connection = resolve_ssh_connection(args)
     repository_url = resolve_repository_url(args.repository_url)
     branch = resolve_branch(args.branch)
     dirty = _git_output("status", "--porcelain")
@@ -388,7 +449,10 @@ def main(argv: list[str] | None = None) -> int:
     if not ssh_binary:
         raise LauncherError("system OpenSSH client was not found")
 
-    print(f"Deploying {repository_url} branch {branch} through SSH alias {alias}...")
+    print(
+        f"Deploying {repository_url} branch {branch} through SSH "
+        f"{connection.display_name}..."
+    )
     remote_script = build_remote_script(
         repository_url=repository_url,
         branch=branch,
@@ -397,7 +461,7 @@ def main(argv: list[str] | None = None) -> int:
         remote_port=args.remote_port,
         evolution_model=args.evolution_model,
     )
-    _run_remote(ssh_binary, alias, remote_script)
+    _run_remote(ssh_binary, connection, remote_script)
     if args.deploy_only:
         print("Deployment complete. The remote daemon remains running.")
         return 0
@@ -410,7 +474,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         tunnel = _start_tunnel(
             ssh_binary,
-            alias,
+            connection,
             args.local_port,
             args.remote_port,
         )
