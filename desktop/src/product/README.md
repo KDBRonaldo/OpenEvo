@@ -155,9 +155,13 @@ packaged release entrypoint.
 
 Each development Project also owns a persistent scratch workspace at
 `~/.openevo/dev-agent/workspaces/<project-id>/`. A new Project starts with an
-empty directory. Codex runs with that directory as its `workspace-write`
-working directory and may use shell tools to create or edit task files; later
-Sessions in the same Project see the retained files. The state response exposes
+empty directory. The daemon gives Codex a bounded text projection of that
+workspace and asks for a structured file-mutation plan. The daemon then validates
+relative paths, reserved directories, mutation counts, and UTF-8 byte limits
+before atomically writing the files. This brokered path also works on remote
+servers where the Codex CLI cannot start its Linux `bwrap` sandbox; Codex never
+receives unrestricted host filesystem access. Later Sessions in the same Project
+see the retained files. The state response exposes
 only a bounded, no-symlink readable projection: at most 1,000 entries, 256 KiB
 per previewed text file, and 2 MiB of text in aggregate. Host paths are never
 returned. Per-Session created, modified, and deleted files are persisted in

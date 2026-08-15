@@ -152,12 +152,31 @@ export function createDevelopmentAgentProvider(
   const fetchImpl = options.fetchImpl ?? fetch;
 
   const requestJson = async (path: string, init?: RequestInit): Promise<unknown> => {
-    const response = await fetchImpl(`${baseUrl}${path}`, init);
-    if (!response.ok) {
-      const detail = await response.text();
-      throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+    const controller = new AbortController();
+    const timeoutMs = path === "/sessions" ? 20 * 60_000 : 15_000;
+    const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetchImpl(`${baseUrl}${path}`, {
+        ...init,
+        signal: controller.signal,
+      });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+      }
+      return response.json();
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error(
+          path === "/sessions"
+            ? "The remote Session timed out. Check the daemon log before retrying."
+            : "The SSH development tunnel stopped responding. Restart the remote development launcher.",
+        );
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeout);
     }
-    return response.json();
   };
 
   const backend: DevelopmentAgentBackend = {

@@ -55,6 +55,37 @@ def test_resolves_direct_ssh_connection_without_config_alias() -> None:
     assert connection.display_name == "root@js4.blockelite.cn:27104"
 
 
+def test_tunnel_enables_keepalive_so_dead_forwarding_does_not_hang(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeProcess:
+        def poll(self) -> None:
+            return None
+
+    def popen(command: list[str], **kwargs: object) -> FakeProcess:
+        captured["command"] = command
+        captured["kwargs"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(remote_launcher.subprocess, "Popen", popen)
+    monkeypatch.setattr(remote_launcher.time, "sleep", lambda _: None)
+    connection = remote_launcher.SshConnection(
+        options=("-p", "27104"),
+        destination="root@js4.blockelite.cn",
+        display_name="lab",
+    )
+
+    remote_launcher._start_tunnel("ssh", connection, 8765, 8787)
+
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "ServerAliveInterval=10" in command
+    assert "ServerAliveCountMax=3" in command
+    assert "TCPKeepAlive=yes" in command
+
+
 @pytest.mark.parametrize(
     ("host", "user"),
     [

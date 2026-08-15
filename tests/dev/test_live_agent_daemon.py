@@ -101,11 +101,15 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["prompt"] = str(kwargs["input"])
         captured["args"] = args
-        Path(args[args.index("--cd") + 1], "answer.py").write_text(
-            "print(4)\n", encoding="utf-8"
-        )
         output_path = Path(args[args.index("--output-last-message") + 1])
-        output_path.write_text("The next answer used prior memory.", encoding="utf-8")
+        output_path.write_text(
+            json.dumps({
+                "answer": "The next answer used prior memory.",
+                "file_writes": [{"path": "answer.py", "content": "print(4)\n"}],
+                "delete_paths": [],
+            }),
+            encoding="utf-8",
+        )
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(MODULE.subprocess, "run", run)
@@ -114,6 +118,7 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
         "task_title": "Second question",
         "instruction": "Answer the next question.",
         "workspace_path": workspace,
+        "workspace_snapshot": {"entries": []},
         "evolved_contexts": [{
             "target_id": "text_memory",
             "documents": [{
@@ -126,10 +131,17 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
     assert "Evolved text_memory from earlier sessions" in captured["prompt"]
     assert "Verify the answer before responding" in captured["prompt"]
     assert "persistent OpenEvo project workspace" in captured["prompt"]
-    assert "workspace-write" in captured["args"]
-    assert "shell_tool" not in captured["args"]
+    assert "read-only" in captured["args"]
+    assert "shell_tool" in captured["args"]
+    assert "--output-schema" in captured["args"]
     assert Path(captured["args"][captured["args"].index("--cd") + 1]) == workspace
-    assert (workspace / "answer.py").read_text(encoding="utf-8") == "print(4)\n"
+    assert not (workspace / "answer.py").exists()
+    MODULE.ProjectWorkspaceStore(tmp_path / "workspaces").apply_mutations(
+        "project-1", result["file_mutations"]
+    )
+    assert (tmp_path / "workspaces" / "project-1" / "answer.py").read_text(
+        encoding="utf-8"
+    ) == "print(4)\n"
     assert result["response"] == "The next answer used prior memory."
 
 
@@ -214,9 +226,11 @@ def test_project_workspace_files_persist_on_the_server_and_are_bounded(tmp_path:
         "display_name": "Coding project",
         "config": {},
     })
+    store.apply_workspace_mutations("development-project-files", {
+        "file_writes": [{"path": "src/main.py", "content": "print('hello')\n"}],
+        "delete_paths": [],
+    })
     workspace = store.workspace_path("development-project-files")
-    (workspace / "src").mkdir()
-    (workspace / "src" / "main.py").write_text("print('hello')\n", encoding="utf-8")
     (workspace / "binary.bin").write_bytes(b"\x00\x01")
 
     restored = MODULE.DevelopmentStateStore(database).snapshot()["workspaces"][0]
@@ -227,6 +241,23 @@ def test_project_workspace_files_persist_on_the_server_and_are_bounded(tmp_path:
     assert len(entries["src/main.py"]["content_sha256"]) == 64
     assert entries["binary.bin"]["content"] is None
     assert all("/root/" not in entry["path"] for entry in restored["entries"])
+
+
+def test_project_workspace_broker_rejects_paths_outside_the_project(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project({
+        "project_id": "development-project-safe",
+        "display_name": "Safe project",
+        "config": {},
+    })
+
+    with pytest.raises(MODULE.AgentRunError, match="unsafe workspace path"):
+        store.apply_workspace_mutations("development-project-safe", {
+            "file_writes": [{"path": "../escaped.txt", "content": "no"}],
+            "delete_paths": [],
+        })
+
+    assert not (tmp_path / "escaped.txt").exists()
 
 
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:
@@ -535,10 +566,21 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
         def run(self, request: dict[str, object]) -> dict[str, object]:
             workspace = request["workspace_path"]
             assert isinstance(workspace, Path)
-            (workspace / "hello.py").write_text("print('hello')\n", encoding="utf-8")
+            assert request["workspace_snapshot"] == {
+                "project_id": "development-project-1",
+                "entries": [],
+                "truncated": False,
+            }
             return {
                 "schema_version": "1",
                 "response": f"Answer to: {request['instruction']}",
+                "file_mutations": {
+                    "file_writes": [{
+                        "path": "hello.py",
+                        "content": "print('hello')\n",
+                    }],
+                    "delete_paths": [],
+                },
                 "model": "fake-model",
                 "duration_ms": 5,
                 "logs": ["admitted", "completed"],

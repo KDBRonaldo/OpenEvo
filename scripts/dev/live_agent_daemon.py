@@ -15,7 +15,7 @@ import hmac
 import json
 import mimetypes
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import shutil
@@ -43,6 +43,10 @@ MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 1_000
 MAX_WORKSPACE_TEXT_FILE_BYTES = 256 * 1024
 MAX_WORKSPACE_TEXT_BYTES = 2 * 1024 * 1024
+MAX_WORKSPACE_MUTATIONS = 64
+MAX_WORKSPACE_WRITE_FILE_BYTES = 192 * 1024
+MAX_WORKSPACE_WRITE_BYTES = 256 * 1024
+MAX_AGENT_WORKSPACE_CONTEXT_BYTES = 512 * 1024
 DEFAULT_TIMEOUT_SECONDS = 300
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ALLOWED_REQUEST_FIELDS = {
@@ -281,6 +285,96 @@ class ProjectWorkspaceStore:
             "entries": entries,
             "truncated": truncated,
         }
+
+    def apply_mutations(self, project_id: str, mutations: object) -> None:
+        """Apply a bounded Codex file plan without giving Codex host filesystem access."""
+
+        if not isinstance(mutations, dict) or set(mutations) != {"file_writes", "delete_paths"}:
+            raise AgentRunError("Codex returned an invalid workspace mutation plan")
+        file_writes = mutations.get("file_writes")
+        delete_paths = mutations.get("delete_paths")
+        if not isinstance(file_writes, list) or not isinstance(delete_paths, list):
+            raise AgentRunError("Codex returned an invalid workspace mutation plan")
+        if len(file_writes) + len(delete_paths) > MAX_WORKSPACE_MUTATIONS:
+            raise AgentRunError("Codex requested too many workspace mutations")
+
+        project_root = self.project_path(project_id)
+        normalized_writes: list[tuple[Path, bytes]] = []
+        normalized_deletes: list[Path] = []
+        seen: set[str] = set()
+        total_bytes = 0
+        for write in file_writes:
+            if not isinstance(write, dict) or set(write) != {"path", "content"}:
+                raise AgentRunError("Codex returned an invalid file write")
+            path = self._mutation_path(project_root, write.get("path"))
+            content = write.get("content")
+            if not isinstance(content, str):
+                raise AgentRunError("Codex returned a non-text file write")
+            payload = content.encode("utf-8")
+            if len(payload) > MAX_WORKSPACE_WRITE_FILE_BYTES:
+                raise AgentRunError("Codex requested a workspace file that is too large")
+            total_bytes += len(payload)
+            if total_bytes > MAX_WORKSPACE_WRITE_BYTES:
+                raise AgentRunError("Codex requested too much workspace output")
+            identity = path.relative_to(project_root).as_posix()
+            if identity in seen:
+                raise AgentRunError("Codex requested duplicate workspace mutations")
+            seen.add(identity)
+            normalized_writes.append((path, payload))
+        for value in delete_paths:
+            path = self._mutation_path(project_root, value)
+            identity = path.relative_to(project_root).as_posix()
+            if identity in seen:
+                raise AgentRunError("Codex requested duplicate workspace mutations")
+            seen.add(identity)
+            normalized_deletes.append(path)
+
+        for path in normalized_deletes:
+            if path.is_symlink():
+                raise AgentRunError("Codex cannot delete workspace symlinks")
+            if path.exists():
+                if not path.is_file():
+                    raise AgentRunError("Codex can only delete regular workspace files")
+                path.unlink()
+        for path, payload in normalized_writes:
+            try:
+                path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                resolved_parent = path.parent.resolve(strict=True)
+            except OSError as exc:
+                raise AgentRunError(f"could not prepare workspace directory: {exc}") from exc
+            if resolved_parent != project_root and project_root not in resolved_parent.parents:
+                raise AgentRunError("Codex workspace write escaped the managed project")
+            if path.is_symlink() or (path.exists() and not path.is_file()):
+                raise AgentRunError("Codex can only replace regular workspace files")
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".openevo-write-",
+                dir=resolved_parent,
+            )
+            temporary_path = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(payload)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary_path.chmod(0o600)
+                os.replace(temporary_path, path)
+            except OSError as exc:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise AgentRunError(f"could not write workspace file: {exc}") from exc
+
+    @staticmethod
+    def _mutation_path(project_root: Path, value: object) -> Path:
+        if not isinstance(value, str) or not value or len(value) > 512 or "\\" in value:
+            raise AgentRunError("Codex returned an invalid workspace path")
+        relative = PurePosixPath(value)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise AgentRunError("Codex returned an unsafe workspace path")
+        if relative.parts[0] in {".git", ".openevo"}:
+            raise AgentRunError("Codex cannot mutate reserved workspace paths")
+        return project_root.joinpath(*relative.parts)
 
     @staticmethod
     def changes(
@@ -647,6 +741,10 @@ class DevelopmentStateStore:
     def workspace_snapshot(self, project_id: str) -> dict[str, Any]:
         self.workspace_path(project_id)
         return self.workspaces.snapshot(project_id)
+
+    def apply_workspace_mutations(self, project_id: str, mutations: object) -> None:
+        self.workspace_path(project_id)
+        self.workspaces.apply_mutations(project_id, mutations)
 
     def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -1053,6 +1151,51 @@ class CodexRunner:
             detail = status_output.strip()[:500]
             raise AgentRunError(f"Codex is not logged in: {detail or 'login status failed'}")
 
+    @staticmethod
+    def _workspace_context(snapshot: object) -> str:
+        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("entries"), list):
+            return "[]"
+        projected: list[dict[str, Any]] = []
+        consumed = 2
+        for entry in snapshot["entries"]:
+            if not isinstance(entry, dict):
+                continue
+            item = {
+                "path": entry.get("path"),
+                "kind": entry.get("kind"),
+                "byte_size": entry.get("byte_size"),
+                "media_type": entry.get("media_type"),
+                "content": entry.get("content"),
+            }
+            encoded = canonical_json(item).encode("utf-8")
+            if consumed + len(encoded) > MAX_AGENT_WORKSPACE_CONTEXT_BYTES:
+                break
+            projected.append(item)
+            consumed += len(encoded) + 1
+        return canonical_json(projected)
+
+    @staticmethod
+    def _parse_workspace_plan(raw_response: str) -> dict[str, Any]:
+        try:
+            plan = json.loads(raw_response)
+        except json.JSONDecodeError as exc:
+            raise AgentRunError("Codex returned an invalid structured workspace response") from exc
+        if not isinstance(plan, dict) or set(plan) != {"answer", "file_writes", "delete_paths"}:
+            raise AgentRunError("Codex returned an invalid structured workspace response")
+        answer = plan.get("answer")
+        if not isinstance(answer, str) or not answer.strip():
+            raise AgentRunError("Codex returned an empty answer")
+        mutations = {
+            "file_writes": plan.get("file_writes"),
+            "delete_paths": plan.get("delete_paths"),
+        }
+        # ProjectWorkspaceStore performs the authoritative path and byte validation.
+        if not isinstance(mutations["file_writes"], list) or not isinstance(
+            mutations["delete_paths"], list
+        ):
+            raise AgentRunError("Codex returned an invalid workspace mutation plan")
+        return {"answer": answer.strip(), "mutations": mutations}
+
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
         workspace_path = request.get("workspace_path")
         if not isinstance(workspace_path, Path) or not workspace_path.is_dir():
@@ -1073,19 +1216,53 @@ class CodexRunner:
                     f"in this project:\n{rendered}\n"
                     "Apply it only when relevant and do not mention that it was injected.\n"
                 )
+        workspace_context = self._workspace_context(request.get("workspace_snapshot"))
         prompt = (
-            "You are working inside a persistent OpenEvo project workspace. "
-            "You may inspect, create, and edit files and run shell commands within this workspace "
-            "when the task requires it. Keep all task files inside the current workspace. "
-            "After completing the work, return a concise helpful answer describing the result.\n\n"
+            "You are planning changes for a persistent OpenEvo project workspace. "
+            "The trusted daemon, not you, applies file mutations after validating them. "
+            "Do not call shell, patch, or filesystem tools. Read the supplied workspace JSON, "
+            "solve the user's task, and return only the requested structured result. "
+            "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
+            "changed in file_writes. Put only regular files that must be removed in delete_paths. "
+            "Do not include unchanged files and do not use absolute paths or '..'. "
+            "If no file change is needed, return empty arrays.\n\n"
             f"Project: {request['project_name']}\n"
             f"Session: {request['task_title']}\n\n"
             f"{''.join(context_sections)}"
+            f"Current workspace JSON:\n{workspace_context}\n\n"
             f"User message:\n{request['instruction']}\n"
         )
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="openevo-dev-agent-") as temporary_directory:
             output_path = Path(temporary_directory) / "last-message.txt"
+            schema_path = Path(temporary_directory) / "workspace-response.schema.json"
+            schema_path.write_text(
+                canonical_json({
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "answer": {"type": "string"},
+                        "file_writes": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "properties": {
+                                    "path": {"type": "string"},
+                                    "content": {"type": "string"},
+                                },
+                                "required": ["path", "content"],
+                            },
+                        },
+                        "delete_paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["answer", "file_writes", "delete_paths"],
+                }),
+                encoding="utf-8",
+            )
             argv = [
                 self._codex_binary,
                 "exec",
@@ -1094,10 +1271,14 @@ class CodexRunner:
                 "--ignore-rules",
                 "--ephemeral",
                 "--sandbox",
-                "workspace-write",
+                "read-only",
+                "--disable",
+                "shell_tool",
                 "--skip-git-repo-check",
                 "--cd",
                 os.fspath(workspace_path),
+                "--output-schema",
+                os.fspath(schema_path),
                 "--output-last-message",
                 os.fspath(output_path),
             ]
@@ -1126,18 +1307,20 @@ class CodexRunner:
                 detail = (completed.stderr or completed.stdout).strip()[-4_000:]
                 raise AgentRunError(f"Codex exited with code {completed.returncode}: {detail}")
             try:
-                response = output_path.read_text(encoding="utf-8").strip()
+                raw_response = output_path.read_text(encoding="utf-8").strip()
             except OSError as exc:
                 raise AgentRunError(f"Codex did not publish a final response: {exc}") from exc
-            if not response:
+            if not raw_response:
                 raise AgentRunError("Codex published an empty final response")
-            if len(response.encode("utf-8")) > MAX_REQUEST_BYTES:
+            if len(raw_response.encode("utf-8")) > MAX_REQUEST_BYTES:
                 raise AgentRunError("Codex final response exceeded the development safety limit")
+            workspace_plan = self._parse_workspace_plan(raw_response)
 
         duration_ms = round((time.monotonic() - started) * 1000)
         return {
             "schema_version": "1",
-            "response": response,
+            "response": workspace_plan["answer"],
+            "file_mutations": workspace_plan["mutations"],
             "model": self._model,
             "duration_ms": duration_ms,
             "logs": [
@@ -1619,11 +1802,17 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             execution_request = {
                 **request,
                 "workspace_path": workspace_path,
+                "workspace_snapshot": workspace_before,
                 "evolved_contexts": self.server.store.latest_context_artifacts(
                     request["project_id"]
                 ),
             }
             result = self.server.runner.run(execution_request)
+            mutations = result.pop("file_mutations", {
+                "file_writes": [],
+                "delete_paths": [],
+            })
+            self.server.store.apply_workspace_mutations(request["project_id"], mutations)
         except AgentRunError as exc:
             workspace_after = self.server.store.workspace_snapshot(request["project_id"])
             workspace_changes = ProjectWorkspaceStore.changes(

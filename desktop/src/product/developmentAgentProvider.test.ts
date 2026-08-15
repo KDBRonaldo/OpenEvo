@@ -222,6 +222,7 @@ describe("development agent provider", () => {
     expect(completed.snapshot.fixturePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({
       method: "POST",
+      signal: expect.any(AbortSignal),
     }));
 
     const providerAfterPageReload = createDevelopmentAgentProvider({ fetchImpl });
