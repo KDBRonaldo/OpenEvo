@@ -102,6 +102,32 @@ def selected_document_evolution(config: object) -> list[dict[str, Any]]:
     return selected
 
 
+def normalize_selected_evolution(value: object) -> list[dict[str, Any]]:
+    """Upgrade pre-capability session selections to the generic selection shape."""
+
+    if not isinstance(value, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    for selection in value:
+        if not isinstance(selection, dict):
+            continue
+        target_id = selection.get("target_id")
+        method = selection.get("method")
+        config = selection.get("config", {})
+        if not isinstance(target_id, str) or not ID_PATTERN.fullmatch(target_id):
+            continue
+        if not isinstance(method, str) or not ID_PATTERN.fullmatch(method):
+            continue
+        if not isinstance(config, dict):
+            config = {}
+        normalized.append({
+            "target_id": target_id,
+            "method": method,
+            "config": config,
+        })
+    return normalized
+
+
 def validate_project_request(payload: object, *, updating: bool = False) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise RequestError("request body must be a JSON object")
@@ -263,6 +289,18 @@ class DevelopmentStateStore:
                     "ALTER TABLE development_sessions "
                     "ADD COLUMN evolution_errors_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            for row in connection.execute(
+                "SELECT session_id, selected_evolution_json FROM development_sessions"
+            ).fetchall():
+                stored = json.loads(row["selected_evolution_json"])
+                normalized = normalize_selected_evolution(stored)
+                normalized_json = canonical_json(normalized)
+                if normalized_json != row["selected_evolution_json"]:
+                    connection.execute(
+                        "UPDATE development_sessions SET selected_evolution_json = ? "
+                        "WHERE session_id = ?",
+                        (normalized_json, row["session_id"]),
+                    )
             connection.execute(
                 """
                 INSERT OR IGNORE INTO development_document_artifacts(
@@ -662,7 +700,9 @@ class DevelopmentStateStore:
             "state": row["state"],
             "duration_ms": row["duration_ms"],
             "logs": json.loads(row["logs_json"]),
-            "selected_evolution": json.loads(row["selected_evolution_json"]),
+            "selected_evolution": normalize_selected_evolution(
+                json.loads(row["selected_evolution_json"])
+            ),
             "evolution_errors": json.loads(row["evolution_errors_json"]),
             "error": row["error"],
             "created_at": row["created_at"],

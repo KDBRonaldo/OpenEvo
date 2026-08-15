@@ -185,6 +185,53 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
     } <= tables
 
 
+def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project(
+        {
+            "project_id": "development-project-legacy",
+            "display_name": "Legacy project",
+            "config": {},
+        }
+    )
+    store.start_session(
+        "dev-session-legacy",
+        {
+            "project_id": "development-project-legacy",
+            "project_name": "Legacy project",
+            "task_title": "Old selection",
+            "instruction": "Restore this session.",
+        },
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE development_sessions SET selected_evolution_json = ? WHERE session_id = ?",
+            (
+                json.dumps([
+                    {"target_id": "text_memory", "method": "text_memory_reflector"}
+                ]),
+                "dev-session-legacy",
+            ),
+        )
+
+    restored = MODULE.DevelopmentStateStore(database).snapshot()
+
+    assert restored["sessions"][0]["selected_evolution"] == [
+        {
+            "target_id": "text_memory",
+            "method": "text_memory_reflector",
+            "config": {},
+        }
+    ]
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT selected_evolution_json FROM development_sessions WHERE session_id = ?",
+            ("dev-session-legacy",),
+        ).fetchone()[0]
+    assert json.loads(stored)[0]["config"] == {}
+
+
 def test_real_text_memory_reflector_persists_and_consumes_prior_memory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

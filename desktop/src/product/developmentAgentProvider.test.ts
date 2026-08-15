@@ -122,7 +122,9 @@ describe("development agent provider", () => {
           state: "completed",
           duration_ms: 42,
           logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
-          selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector", config: {} }],
+          // Old development databases persisted these two fields before generic method config
+          // became part of the session contract. The provider must keep those sessions readable.
+          selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector" }],
           evolution_errors: [],
           error: null,
           created_at: "2026-08-14T10:01:00Z",
@@ -177,6 +179,9 @@ describe("development agent provider", () => {
       { speaker: "agent", text: "Two plus two is four." },
     ]);
     expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.producedArtifactIds).toEqual(["dev-text-memory-1"]);
+    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.selectedEvolution).toEqual([
+      { targetId: "text_memory", method: "text_memory_reflector", config: {} },
+    ]);
     expect(completed.snapshot.artifacts.map((artifact) => artifact.artifact_id)).toEqual(["dev-text-memory-1"]);
     expect(completed.snapshot.fixturePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({

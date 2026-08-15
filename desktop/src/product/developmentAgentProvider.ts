@@ -65,7 +65,7 @@ const sessionSchema = z.object({
   selected_evolution: z.array(z.object({
     target_id: z.string().min(1),
     method: z.string().min(1),
-    config: z.record(z.string(), z.unknown()),
+    config: z.record(z.string(), z.unknown()).default({}),
   }).strict()),
   evolution_errors: z.array(z.object({
     target_id: z.string().min(1),
