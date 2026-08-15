@@ -136,7 +136,13 @@ its target, method, support, schema, and renderer metadata from the Core framewo
 catalog at `GET /openevo-dev-agent/v1/capabilities`. The response is explicitly
 marked `development_catalog_unverified`; it is not a verified release registry.
 The development bridge executes compatible legacy-worker methods selected for each
-successful Session and rejects unknown target/method pairs or undeclared outputs. The
+successful Session and rejects unknown target/method pairs or undeclared outputs. A
+selection value such as `agent_system.method=auto` is resolved through the Core-owned
+method-selection boundary; the daemon records and invokes only the resulting concrete
+method. Each completed Session is also sealed as a persistent transcript dataset. Input
+artifacts are assembled from the method descriptor's binding sources, so history methods
+receive the project's ordered prior datasets plus the current dataset without method-ID
+branches in Desktop or the daemon. The
 server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
 forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
 while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
@@ -146,8 +152,21 @@ duration, errors, process-log summaries, per-Session evolution selections,
 per-target method/config/job state/artifact IDs, and versioned typed artifacts in
 the remote SQLite database `~/.openevo/dev-agent/state.sqlite3`. Dataset and
 generated artifact payloads live under
-`~/.openevo/dev-agent/evolution-artifacts/`. The latest promoted documents are
-injected into the next Project Session. The renderer
+`~/.openevo/dev-agent/evolution-artifacts/`. Before the next Project Session, the
+development daemon runs the selected artifacts through the Core target-handler and
+contribution contracts. Text memory becomes the handler's bounded instruction
+contribution; skill bundles are staged under the isolated runtime workspace's
+`.agents/skills/<artifact>/`; and agent-system targets are staged as native harness
+instruction files such as `AGENTS.md`. Runtime paths are supplied through the
+handler-declared `OPENEVO_*` environment bindings. The temporary runtime projection
+adds the required `name` and `description` frontmatter to a runtime-only `SKILL.md`
+copy when an older artifact lacks it; the authoritative evolved artifact is not
+rewritten. The temporary runtime projection
+is discarded after the turn, while the authoritative artifacts and user workspace
+remain persisted on the remote server. Only method outputs marked promoted participate
+in the next Session; candidate/report outputs remain visible without being injected. This
+development materializer is still explicitly unverified and does not claim the sealed
+release artifact-store contract. The renderer
 reloads that authority from `GET /openevo-dev-agent/v1/state`, so a browser
 refresh preserves Project, conversation, selection, and evolution history. This bridge is
 reachable only in Vite mode `openevo-live-agent` and is not imported by the

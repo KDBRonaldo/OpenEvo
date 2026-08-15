@@ -118,7 +118,7 @@ from .plan import (
 )
 from .profiles import ReleaseExecutionMode, execution_profile_for_release_mode
 from .registry import CanonicalModelView, EvolutionFrameworkRegistry, RegistrySnapshot
-from .resolution import resolve_agent_system_method
+from .resolution import resolve_agent_system_method, resolve_evolution_method
 from .runtime import (
     FrameworkDistributionLock,
     load_framework_distribution_lock,
@@ -261,6 +261,7 @@ __all__ = [
     "evaluate_method_support",
     "execution_profile_for_release_mode",
     "resolve_agent_system_method",
+    "resolve_evolution_method",
     "resolve_method_inputs",
     "validate_config_schema",
     "validate_payload_source_path",

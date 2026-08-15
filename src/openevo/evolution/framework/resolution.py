@@ -1,4 +1,4 @@
-"""Narrow compatibility resolution for existing algorithm-owned method requests."""
+"""Core-owned resolution for algorithm method selections."""
 
 from __future__ import annotations
 
@@ -34,4 +34,28 @@ def resolve_agent_system_method(
     )
 
 
-__all__ = ["resolve_agent_system_method"]
+def resolve_evolution_method(
+    *,
+    target_id: str,
+    requested_method: str,
+    prior_dataset_artifact_ids: Sequence[str],
+) -> str:
+    """Resolve a selection without exposing algorithm policy to a product client.
+
+    Desktop and Daemon call this target-neutral boundary. Core remains responsible
+    for mapping resolver values such as ``auto`` to concrete registered methods.
+    """
+
+    if not isinstance(target_id, str) or not target_id.strip():
+        raise ValueError("evolution target ID must not be empty")
+    if target_id == "agent_system":
+        return resolve_agent_system_method(
+            requested_method,
+            prior_dataset_artifact_ids,
+        )
+    if not isinstance(requested_method, str) or not requested_method.strip():
+        raise ValueError("requested evolution method must not be empty")
+    return requested_method
+
+
+__all__ = ["resolve_agent_system_method", "resolve_evolution_method"]

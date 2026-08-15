@@ -90,7 +90,7 @@ def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pyt
     MODULE.CodexRunner("codex", 30, None).check_ready()
 
 
-def test_codex_runner_injects_evolved_memory_into_the_next_session(
+def test_codex_runner_materializes_core_runtime_contributions_for_the_next_session(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -101,6 +101,14 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["prompt"] = str(kwargs["input"])
         captured["args"] = args
+        captured["env"] = kwargs["env"]
+        runtime_workspace = Path(args[args.index("--cd") + 1])
+        captured["agents_md"] = (runtime_workspace / "AGENTS.md").read_text(
+            encoding="utf-8"
+        )
+        captured["skill_md"] = next(
+            (runtime_workspace / ".agents" / "skills").glob("*/SKILL.md")
+        ).read_text(encoding="utf-8")
         output_path = Path(args[args.index("--output-last-message") + 1])
         output_path.write_text(
             json.dumps({
@@ -119,22 +127,61 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
         "instruction": "Answer the next question.",
         "workspace_path": workspace,
         "workspace_snapshot": {"entries": []},
-        "evolved_contexts": [{
-            "target_id": "text_memory",
-            "documents": [{
-                "path": "memory.md",
-                "content": "# Evolved memory\n\n- Verify the answer before responding.",
-            }],
-        }],
+        "evolved_contexts": [
+            {
+                "artifact_id": "memory-artifact-1",
+                "artifact_type": "text_memory",
+                "target_id": "text_memory",
+                "manifest": {"content_path": "memory.md"},
+                "documents": [{
+                    "path": "memory.md",
+                    "media_type": "text/markdown",
+                    "content": "# Evolved memory\n\n- Verify the answer before responding.",
+                }],
+            },
+            {
+                "artifact_id": "skill-artifact-1",
+                "artifact_type": "skill_bundle",
+                "target_id": "skill_bundle",
+                "manifest": {"content_path": "SKILL.md"},
+                "documents": [{
+                    "path": "SKILL.md",
+                    "media_type": "text/markdown",
+                    "content": "# Native evolved skill\n\nUse this workflow when relevant.",
+                }],
+            },
+            {
+                "artifact_id": "agent-system-artifact-1",
+                "artifact_type": "agent_system",
+                "target_id": "agent_system",
+                "manifest": {"content_path": "AGENTS.md", "target_path": "AGENTS.md"},
+                "documents": [{
+                    "path": "AGENTS.md",
+                    "media_type": "text/markdown",
+                    "content": "# Native evolved agent system\n\nFollow the project policy.",
+                }],
+            },
+        ],
     })
 
-    assert "Evolved text_memory from earlier sessions" in captured["prompt"]
+    assert "Runtime instructions resolved by OpenEvo Core" in captured["prompt"]
     assert "Verify the answer before responding" in captured["prompt"]
+    assert "Native evolved skill" not in captured["prompt"]
+    assert "Native evolved agent system" not in captured["prompt"]
+    assert captured["agents_md"] == "# Native evolved agent system\n\nFollow the project policy."
+    assert captured["skill_md"].startswith(
+        "---\nname: skill-artifact-1\ndescription: "
+    )
+    assert "\n---\n\n# Native evolved skill\n" in captured["skill_md"]
     assert "persistent OpenEvo project workspace" in captured["prompt"]
     assert "read-only" in captured["args"]
     assert "shell_tool" in captured["args"]
+    assert "--ignore-rules" not in captured["args"]
     assert "--output-schema" in captured["args"]
-    assert Path(captured["args"][captured["args"].index("--cd") + 1]) == workspace
+    assert Path(captured["args"][captured["args"].index("--cd") + 1]) != workspace
+    assert captured["env"]["OPENEVO_MEMORY_FILE"].endswith("/memory.md")
+    assert captured["env"]["OPENEVO_SKILLS_DIR"].endswith("/.agents/skills")
+    assert captured["env"]["OPENEVO_AGENTS_MD"].endswith("/AGENTS.md")
     assert not (workspace / "answer.py").exists()
     MODULE.ProjectWorkspaceStore(tmp_path / "workspaces").apply_mutations(
         "project-1", result["file_mutations"]
@@ -208,6 +255,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "development_document_artifacts",
         "development_evolution_artifacts_v2",
         "development_evolution_jobs",
+        "development_dataset_artifacts",
     } <= tables
 
     workspace = restored["workspaces"][0]
@@ -461,6 +509,24 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
     assert all(job["state"] == "completed" and job["artifact_ids"] for job in jobs)
     assert all(job["config"] == {} for job in jobs)
 
+    persistent_workspace = tmp_path / "persistent-workspace"
+    persistent_workspace.mkdir()
+    runtime_workspace = tmp_path / "runtime-workspace"
+    runtime = MODULE.DevelopmentRuntimeContextMaterializer().materialize(
+        persistent_workspace=persistent_workspace,
+        runtime_workspace=runtime_workspace,
+        contexts=store.latest_context_artifacts(project["project_id"]),
+    )
+    assert (runtime_workspace / "AGENTS.md").is_file()
+    skill_paths = list(
+        (runtime_workspace / ".agents" / "skills").glob("*/SKILL.md")
+    )
+    assert skill_paths
+    assert skill_paths[0].read_text(encoding="utf-8").startswith("---\nname: ")
+    assert (runtime_workspace / ".openevo" / "evolution" / "memory.md").is_file()
+    assert runtime["instruction_sections"]
+    assert runtime["environment"]["OPENEVO_SKILLS_DIR"].endswith("/.agents/skills")
+
 
 def test_desktop_default_reflectors_receive_the_current_transcript_dataset(
     tmp_path: Path,
@@ -603,6 +669,90 @@ def test_document_evolution_runner_allows_a_session_with_no_selected_method(
 
     assert batch == {"artifacts": [], "errors": []}
     assert store.snapshot()["sessions"][0]["selected_evolution"] == []
+    assert [item["artifact_id"] for item in store.dataset_artifacts(project["project_id"])] == [
+        "dataset-dev-session-none"
+    ]
+
+
+def test_development_runner_resolves_auto_and_supplies_ordered_project_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import methods
+
+    monkeypatch.setattr(
+        methods,
+        "_generate_audited_agent_system_reflection",
+        lambda *_args, **_kwargs: ("# Agent system\n\n- Preserve useful history.\n", {}),
+    )
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-auto-history",
+        "display_name": "Automatic history",
+        "config": {
+            "schema_version": "2",
+            "evolution": {
+                "targets": {
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "auto",
+                        "config": {},
+                    },
+                },
+            },
+        },
+    }
+    store.create_project(project)
+    runner = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    )
+
+    for ordinal in (1, 2):
+        session_id = f"dev-session-auto-{ordinal}"
+        request = {
+            "project_id": project["project_id"],
+            "project_name": project["display_name"],
+            "task_title": f"Round {ordinal}",
+            "instruction": f"Learn from round {ordinal}.",
+        }
+        result = {
+            "response": f"Completed round {ordinal}.",
+            "model": "test",
+            "duration_ms": 1,
+            "logs": [],
+        }
+        store.start_session(session_id, request)
+        store.complete_session(session_id, result)
+        batch = runner.evolve(
+            session_id=session_id,
+            request=request,
+            result=result,
+            store=store,
+        )
+        assert batch["errors"] == []
+
+    jobs = store.snapshot()["evolution_jobs"]
+    assert [job["method_id"] for job in jobs] == [
+        "agent_system_reflector",
+        "agent_system_history_reflector",
+    ]
+    with sqlite3.connect(store.path) as connection:
+        resolution_audit = connection.execute(
+            "SELECT requested_method_id, resolver_input_artifact_ids_json "
+            "FROM development_evolution_jobs ORDER BY created_at, job_id"
+        ).fetchall()
+    assert resolution_audit == [
+        ("auto", "[]"),
+        ("auto", '["dataset-dev-session-auto-1"]'),
+    ]
+    artifacts = store.snapshot()["artifacts"]
+    assert artifacts[-1]["manifest"]["source_dataset_artifact_ids"] == [
+        "dataset-dev-session-auto-1",
+        "dataset-dev-session-auto-2",
+    ]
 
 
 def test_sqlite_store_marks_interrupted_running_session_failed_on_restart(tmp_path: Path) -> None:

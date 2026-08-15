@@ -84,6 +84,24 @@ def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def development_registry_snapshot() -> Any:
+    """Build the explicit unverified catalog used only by this development bridge."""
+
+    from openevo.evolution.framework.builtins import (
+        ImplementationDistributionIdentity,
+        build_builtin_registry,
+    )
+
+    identity = ImplementationDistributionIdentity(
+        distribution="openevo",
+        distribution_version="0.1.10.dev0",
+        distribution_digest=hashlib.sha256(
+            b"openevo-development-catalog-v1"
+        ).hexdigest(),
+    )
+    return build_builtin_registry(identity)
+
+
 def selected_document_evolution(config: object) -> list[dict[str, Any]]:
     if not isinstance(config, dict):
         return []
@@ -547,6 +565,7 @@ class DevelopmentStateStore:
                     content_sha256 TEXT NOT NULL,
                     byte_size INTEGER NOT NULL,
                     previous_artifact_id TEXT,
+                    promoted INTEGER NOT NULL DEFAULT 1 CHECK (promoted IN (0, 1)),
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS development_evolution_artifacts_v2_project_created
@@ -558,6 +577,8 @@ class DevelopmentStateStore:
                     session_id TEXT NOT NULL REFERENCES development_sessions(session_id),
                     target_id TEXT NOT NULL,
                     method_id TEXT NOT NULL,
+                    requested_method_id TEXT NOT NULL,
+                    resolver_input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
                     config_json TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed')),
                     artifact_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -568,6 +589,16 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_evolution_jobs_session
                     ON development_evolution_jobs(session_id, created_at, job_id);
+                CREATE TABLE IF NOT EXISTS development_dataset_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                    session_id TEXT NOT NULL UNIQUE REFERENCES development_sessions(session_id),
+                    uri TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS development_dataset_artifacts_project_created
+                    ON development_dataset_artifacts(project_id, created_at, artifact_id);
                 """
             )
             session_columns = {
@@ -588,6 +619,39 @@ class DevelopmentStateStore:
                 connection.execute(
                     "ALTER TABLE development_sessions "
                     "ADD COLUMN workspace_changes_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            artifact_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(development_evolution_artifacts_v2)"
+                )
+            }
+            if "promoted" not in artifact_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_artifacts_v2 "
+                    "ADD COLUMN promoted INTEGER NOT NULL DEFAULT 1 "
+                    "CHECK (promoted IN (0, 1))"
+                )
+            job_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(development_evolution_jobs)"
+                )
+            }
+            if "requested_method_id" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_jobs "
+                    "ADD COLUMN requested_method_id TEXT"
+                )
+                connection.execute(
+                    "UPDATE development_evolution_jobs "
+                    "SET requested_method_id = method_id "
+                    "WHERE requested_method_id IS NULL"
+                )
+            if "resolver_input_artifact_ids_json" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_jobs "
+                    "ADD COLUMN resolver_input_artifact_ids_json TEXT NOT NULL DEFAULT '[]'"
                 )
             for row in connection.execute(
                 "SELECT session_id, selected_evolution_json FROM development_sessions"
@@ -868,7 +932,7 @@ class DevelopmentStateStore:
             row = connection.execute(
                 """
                 SELECT * FROM development_evolution_artifacts_v2
-                WHERE project_id = ? AND target_id = ?
+                WHERE project_id = ? AND target_id = ? AND promoted = 1
                 ORDER BY created_at DESC, artifact_id DESC
                 LIMIT 1
                 """,
@@ -898,7 +962,7 @@ class DevelopmentStateStore:
                 JOIN (
                     SELECT target_id, MAX(created_at || artifact_id) AS latest
                     FROM development_evolution_artifacts_v2
-                    WHERE project_id = ? AND artifact_type != 'report'
+                    WHERE project_id = ? AND artifact_type != 'report' AND promoted = 1
                     GROUP BY target_id
                 ) AS selected
                   ON selected.target_id = artifact.target_id
@@ -910,6 +974,43 @@ class DevelopmentStateStore:
             ).fetchall()
         return [self._artifact_record(row) for row in rows]
 
+    def record_dataset_artifact(
+        self,
+        *,
+        artifact_id: str,
+        project_id: str,
+        session_id: str,
+        uri: str,
+        name: str,
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO development_dataset_artifacts(
+                    artifact_id, project_id, session_id, uri, name, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id) DO UPDATE SET
+                    artifact_id = excluded.artifact_id,
+                    project_id = excluded.project_id,
+                    uri = excluded.uri,
+                    name = excluded.name
+                """,
+                (artifact_id, project_id, session_id, uri, name, utc_now()),
+            )
+
+    def dataset_artifacts(self, project_id: str) -> list[dict[str, str]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT artifact_id, project_id, session_id, uri, name, created_at
+                FROM development_dataset_artifacts
+                WHERE project_id = ?
+                ORDER BY created_at, artifact_id
+                """,
+                (project_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def start_evolution_job(
         self,
         *,
@@ -917,6 +1018,8 @@ class DevelopmentStateStore:
         session_id: str,
         target_id: str,
         method_id: str,
+        requested_method_id: str,
+        resolver_input_artifact_ids: list[str],
         config: dict[str, Any],
     ) -> None:
         now = utc_now()
@@ -924,11 +1027,22 @@ class DevelopmentStateStore:
             connection.execute(
                 """
                 INSERT INTO development_evolution_jobs(
-                    job_id, session_id, target_id, method_id, config_json, state,
+                    job_id, session_id, target_id, method_id, requested_method_id,
+                    resolver_input_artifact_ids_json, config_json, state,
                     artifact_ids_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
                 """,
-                (job_id, session_id, target_id, method_id, canonical_json(config), now, now),
+                (
+                    job_id,
+                    session_id,
+                    target_id,
+                    method_id,
+                    requested_method_id,
+                    canonical_json(resolver_input_artifact_ids),
+                    canonical_json(config),
+                    now,
+                    now,
+                ),
             )
 
     def finish_evolution_job(
@@ -967,6 +1081,7 @@ class DevelopmentStateStore:
         documents: list[dict[str, str]],
         manifest: dict[str, Any],
         previous_artifact_id: str | None,
+        promoted: bool,
     ) -> dict[str, Any]:
         encoded = canonical_json(documents).encode("utf-8")
         created_at = utc_now()
@@ -976,8 +1091,8 @@ class DevelopmentStateStore:
                 INSERT INTO development_evolution_artifacts_v2(
                     artifact_id, project_id, session_id, target_id, artifact_type,
                     method_id, renderer_kind, documents_json, manifest_json,
-                    content_sha256, byte_size, previous_artifact_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    content_sha256, byte_size, previous_artifact_id, promoted, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact_id,
@@ -992,6 +1107,7 @@ class DevelopmentStateStore:
                     hashlib.sha256(encoded).hexdigest(),
                     sum(len(document["content"].encode("utf-8")) for document in documents),
                     previous_artifact_id,
+                    int(promoted),
                     created_at,
                 ),
             )
@@ -1121,11 +1237,335 @@ def extract_event_logs(stdout: str) -> list[str]:
     return messages[-20:]
 
 
+class _DevelopmentArtifactPayloads:
+    """Bounded read service for DB-owned development artifact documents."""
+
+    def __init__(self, documents: dict[str, dict[str, str]]) -> None:
+        self._documents = documents
+
+    def read_utf8_prefix(
+        self,
+        payload_handle: str,
+        relative_path: str,
+        *,
+        max_chars: int,
+        max_bytes: int,
+    ) -> str:
+        try:
+            content = self._documents[payload_handle][relative_path]
+        except KeyError as exc:
+            raise ValueError("development artifact payload is unavailable") from exc
+        clipped = content[:max_chars]
+        encoded = clipped.encode("utf-8")
+        if len(encoded) > max_bytes:
+            clipped = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        return clipped
+
+
+class DevelopmentRuntimeContextMaterializer:
+    """Project Core handler contributions into one isolated Codex runtime workspace.
+
+    This is a development adapter, not the release artifact store/materializer. It deliberately
+    consumes the same closed handler input/output contracts so target behavior is not inferred
+    from a UI card or renderer kind.
+    """
+
+    def __init__(self, registry: Any | None = None) -> None:
+        self._registry = registry or development_registry_snapshot()
+
+    @staticmethod
+    def _copy_workspace(source: Path, destination: Path) -> None:
+        destination.mkdir(mode=0o700, parents=True, exist_ok=False)
+        entries = 0
+        for candidate in sorted(source.rglob("*")):
+            entries += 1
+            if entries > MAX_WORKSPACE_ENTRIES:
+                raise AgentRunError("persistent workspace exceeds the runtime entry limit")
+            if candidate.is_symlink():
+                raise AgentRunError("persistent workspace contains an unsupported symbolic link")
+            relative = candidate.relative_to(source)
+            target = destination / relative
+            if candidate.is_dir():
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+            elif candidate.is_file():
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                shutil.copyfile(candidate, target)
+            else:
+                raise AgentRunError("persistent workspace contains an unsupported entry")
+
+    @staticmethod
+    def _scope_roots(runtime_workspace: Path) -> dict[str, Path]:
+        return {
+            "target_data": runtime_workspace / ".openevo" / "evolution",
+            "harness_skills": runtime_workspace / ".agents" / "skills",
+            "harness_instruction": runtime_workspace,
+        }
+
+    @staticmethod
+    def _write_text(root: Path, relative_path: str, content: str) -> Path:
+        from openevo.evolution.framework.contracts import validate_relative_path
+
+        normalized = validate_relative_path(relative_path)
+        destination = root.joinpath(*PurePosixPath(normalized).parts)
+        root_resolved = root.resolve()
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if destination.is_symlink() or root_resolved not in destination.resolve().parents:
+            raise AgentRunError("runtime contribution escaped its destination scope")
+        destination.write_text(content, encoding="utf-8")
+        return destination
+
+    @staticmethod
+    def _codex_skill_entrypoint(skill_directory: str, content: str) -> str:
+        """Add required Codex skill metadata without changing the stored artifact."""
+
+        if content.startswith("---\n"):
+            closing = content.find("\n---\n", 4)
+            if closing != -1:
+                header = content[4:closing]
+                if re.search(r"(?m)^name:\s*\S+", header) and re.search(
+                    r"(?m)^description:\s*\S+", header
+                ):
+                    return content
+        normalized = re.sub(r"[^a-z0-9-]+", "-", skill_directory.lower()).strip("-")
+        if not normalized or not normalized[0].isalpha():
+            normalized = f"openevo-{normalized or 'evolved-skill'}"
+        normalized = normalized[:64].rstrip("-")
+        return (
+            "---\n"
+            f"name: {normalized}\n"
+            "description: Apply this evolved OpenEvo workflow when the current task "
+            "matches its instructions.\n"
+            "---\n\n"
+            f"{content.lstrip()}"
+        )
+
+    def _project(self, contexts: object) -> tuple[list[tuple[Any, Any]], dict[str, dict[str, str]]]:
+        from openevo.evolution.framework.builtin_handlers import BUILTIN_HANDLER_REGISTRY
+        from openevo.evolution.framework.contracts import EvolutionExecutionProfile
+        from openevo.evolution.framework.handlers import (
+            PayloadManifestEntry,
+            RuntimeDestinationRoots,
+            TargetHandlerInput,
+            TargetHandlerServices,
+            TrustedArtifactSnapshot,
+            payload_tree_digest,
+        )
+
+        pairs: list[tuple[Any, Any]] = []
+        payload_documents: dict[str, dict[str, str]] = {}
+        if not isinstance(contexts, list):
+            return pairs, payload_documents
+        for rank, context in enumerate(contexts):
+            if not isinstance(context, dict):
+                raise AgentRunError("evolved context record is invalid")
+            target_id = context.get("target_id")
+            try:
+                target = self._registry.targets[target_id]
+                handler_descriptor = self._registry.target_handlers[target.handler_id]
+                handler = BUILTIN_HANDLER_REGISTRY[target.handler_id]
+            except (KeyError, TypeError) as exc:
+                raise AgentRunError(f"evolved target {target_id!r} is not in the Core catalog") from exc
+            if context.get("artifact_type") != target.artifact_type:
+                raise AgentRunError(f"evolved target {target_id!r} has the wrong artifact type")
+            raw_documents = context.get("documents")
+            if not isinstance(raw_documents, list) or not raw_documents:
+                raise AgentRunError(f"evolved target {target_id!r} has no readable payload")
+            handle = f"development_payload_{rank}"
+            document_map: dict[str, str] = {}
+            entries: list[Any] = []
+            for raw_document in raw_documents:
+                if not isinstance(raw_document, dict):
+                    raise AgentRunError("evolved artifact document is invalid")
+                path = raw_document.get("path")
+                content = raw_document.get("content")
+                media_type = raw_document.get("media_type", "text/plain")
+                if not isinstance(path, str) or not isinstance(content, str) or not isinstance(
+                    media_type, str
+                ):
+                    raise AgentRunError("evolved artifact document is invalid")
+                encoded = content.encode("utf-8")
+                entry = PayloadManifestEntry(
+                    relative_path=path,
+                    media_type=media_type,
+                    size_bytes=len(encoded),
+                    sha256=hashlib.sha256(encoded).hexdigest(),
+                )
+                entries.append(entry)
+                document_map[entry.relative_path] = content
+            payload_documents[handle] = document_map
+            manifest = context.get("manifest")
+            if not isinstance(manifest, dict):
+                raise AgentRunError("evolved artifact manifest is invalid")
+            artifact_id = context.get("artifact_id")
+            if not isinstance(artifact_id, str) or not artifact_id:
+                raise AgentRunError("evolved artifact identity is invalid")
+            payload_entries = tuple(sorted(entries, key=lambda entry: entry.relative_path))
+            snapshot = TrustedArtifactSnapshot(
+                artifact_id=artifact_id,
+                artifact_type=target.artifact_type,
+                name=f"evolved {target.display_name}",
+                uri_scheme="file",
+                payload_handle=handle,
+                payload_entries=payload_entries,
+                payload_manifest_digest=payload_tree_digest(payload_entries),
+                manifest_json=canonical_json(manifest),
+                scores_json="{}",
+                rank_index=0,
+            )
+            handler_input = TargetHandlerInput(
+                target_id=target.id,
+                handler_id=target.handler_id,
+                execution_profile=EvolutionExecutionProfile(
+                    execution_mode="subscription",
+                    capture_mode="transcript",
+                    harness_id="codex",
+                ),
+                # Handler contracts require canonical Linux runtime roots. The development
+                # materializer maps these scopes into its private temporary workspace below.
+                destination_roots=RuntimeDestinationRoots(
+                    target_data="/openevo/session/evolution",
+                    harness_skills="/openevo/session/evolution/skills",
+                    harness_instruction="/workspace",
+                ),
+                ranked_artifacts=(snapshot,),
+            )
+            output = self._registry.validate_handler_output(
+                handler(
+                    handler_input,
+                    TargetHandlerServices(
+                        payloads=_DevelopmentArtifactPayloads(payload_documents)
+                    ),
+                ),
+                handler_input=handler_input,
+            )
+            if output.handler_id != handler_descriptor.id:
+                raise AgentRunError("Core target handler identity changed during projection")
+            pairs.append((handler_input, output))
+        return pairs, payload_documents
+
+    def materialize(
+        self,
+        *,
+        persistent_workspace: Path,
+        runtime_workspace: Path,
+        contexts: object,
+    ) -> dict[str, Any]:
+        from openevo.evolution.framework.contracts import (
+            DestinationScope,
+            EnvironmentValueKind,
+        )
+        from openevo.evolution.framework.contributions import (
+            InlineTextPayloadContribution,
+            StagedPayloadContribution,
+        )
+
+        self._copy_workspace(persistent_workspace, runtime_workspace)
+        pairs, payload_documents = self._project(contexts)
+        outputs = self._registry.validate_handler_outputs(pairs)
+        scope_roots = self._scope_roots(runtime_workspace)
+        artifact_handles = {
+            handler_input.ranked_artifacts[0].artifact_id:
+                handler_input.ranked_artifacts[0].payload_handle
+            for handler_input, _output in pairs
+        }
+        contribution_paths: dict[str, Path] = {}
+        instructions: list[str] = []
+        activations: list[str] = []
+        environment: dict[str, str] = {}
+
+        for output in outputs:
+            handler_descriptor = self._registry.target_handlers[output.handler_id]
+            for instruction in output.instructions:
+                section = instruction.text.strip()
+                if handler_descriptor.instruction_preamble:
+                    section = f"{handler_descriptor.instruction_preamble}\n{section}"
+                instructions.append(section)
+            for payload in output.staged_payloads:
+                scope = payload.destination_scope.value
+                root = scope_roots[scope]
+                if isinstance(payload, InlineTextPayloadContribution):
+                    contribution_paths[payload.contribution_id] = self._write_text(
+                        root, payload.destination_relative_path, payload.text
+                    )
+                    continue
+                if not isinstance(payload, StagedPayloadContribution):
+                    raise AgentRunError("Core returned an unsupported payload contribution")
+                source_handle = artifact_handles.get(payload.source_artifact_id)
+                source = payload_documents.get(source_handle or "")
+                if source is None:
+                    raise AgentRunError("Core contribution source is unavailable")
+                destination_root = root.joinpath(
+                    *PurePosixPath(payload.destination_relative_path).parts
+                )
+                written: list[Path] = []
+                if payload.source_relative_path == ".":
+                    for source_path, content in source.items():
+                        if (
+                            payload.destination_scope is DestinationScope.HARNESS_SKILLS
+                            and source_path == "SKILL.md"
+                        ):
+                            content = self._codex_skill_entrypoint(
+                                payload.destination_relative_path,
+                                content,
+                            )
+                        written.append(self._write_text(destination_root, source_path, content))
+                    contribution_paths[payload.contribution_id] = destination_root
+                else:
+                    try:
+                        content = source[payload.source_relative_path]
+                    except KeyError as exc:
+                        raise AgentRunError("Core contribution source file is unavailable") from exc
+                    written.append(
+                        self._write_text(
+                            root, payload.destination_relative_path, content
+                        )
+                    )
+                    contribution_paths[payload.contribution_id] = written[0]
+            for binding in output.environment:
+                if binding.value_kind is EnvironmentValueKind.SCOPE_ROOT:
+                    if binding.destination_scope is None:
+                        raise AgentRunError("Core returned an invalid scope-root binding")
+                    environment[binding.name] = os.fspath(
+                        scope_roots[binding.destination_scope.value]
+                    )
+                    continue
+                paths = [
+                    os.fspath(contribution_paths[contribution_id])
+                    for contribution_id in binding.value_contribution_ids
+                ]
+                if binding.value_kind is EnvironmentValueKind.JSON_PATHS:
+                    environment[binding.name] = canonical_json(paths)
+                elif len(paths) == 1:
+                    environment[binding.name] = paths[0]
+                else:
+                    raise AgentRunError("Core returned an invalid runtime path binding")
+            if output.instructions:
+                activations.append(f"{output.target_id}: instruction contribution loaded")
+            if any(
+                payload.destination_scope is DestinationScope.HARNESS_SKILLS
+                for payload in output.staged_payloads
+            ):
+                activations.append(f"{output.target_id}: Codex skill bundle staged")
+            if any(
+                payload.destination_scope is DestinationScope.HARNESS_INSTRUCTION
+                for payload in output.staged_payloads
+            ):
+                activations.append(f"{output.target_id}: native harness instruction staged")
+
+        return {
+            "workspace_path": runtime_workspace,
+            "instruction_sections": instructions,
+            "environment": environment,
+            "activations": activations,
+        }
+
+
 class CodexRunner:
     def __init__(self, codex_binary: str, timeout_seconds: int, model: str | None) -> None:
         self._codex_binary = codex_binary
         self._timeout_seconds = timeout_seconds
         self._model = model
+        self._context_materializer: DevelopmentRuntimeContextMaterializer | None = None
 
     @property
     def codex_binary(self) -> str:
@@ -1200,42 +1640,48 @@ class CodexRunner:
         workspace_path = request.get("workspace_path")
         if not isinstance(workspace_path, Path) or not workspace_path.is_dir():
             raise AgentRunError("persistent project workspace is unavailable")
-        context_sections: list[str] = []
-        for context in request.get("evolved_contexts", []):
-            if not isinstance(context, dict):
-                continue
-            documents = context.get("documents", [])
-            rendered = "\n\n".join(
-                document.get("content", "").strip()
-                for document in documents
-                if isinstance(document, dict) and document.get("content", "").strip()
-            )
-            if rendered:
-                context_sections.append(
-                    f"\nEvolved {context.get('target_id', 'context')} from earlier sessions "
-                    f"in this project:\n{rendered}\n"
-                    "Apply it only when relevant and do not mention that it was injected.\n"
-                )
         workspace_context = self._workspace_context(request.get("workspace_snapshot"))
-        prompt = (
-            "You are planning changes for a persistent OpenEvo project workspace. "
-            "The trusted daemon, not you, applies file mutations after validating them. "
-            "Do not call shell, patch, or filesystem tools. Read the supplied workspace JSON, "
-            "solve the user's task, and return only the requested structured result. "
-            "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
-            "changed in file_writes. Put only regular files that must be removed in delete_paths. "
-            "Do not include unchanged files and do not use absolute paths or '..'. "
-            "If no file change is needed, return empty arrays.\n\n"
-            f"Project: {request['project_name']}\n"
-            f"Session: {request['task_title']}\n\n"
-            f"{''.join(context_sections)}"
-            f"Current workspace JSON:\n{workspace_context}\n\n"
-            f"User message:\n{request['instruction']}\n"
-        )
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="openevo-dev-agent-") as temporary_directory:
-            output_path = Path(temporary_directory) / "last-message.txt"
-            schema_path = Path(temporary_directory) / "workspace-response.schema.json"
+            temporary_root = Path(temporary_directory)
+            runtime_workspace = temporary_root / "workspace"
+            if self._context_materializer is None:
+                try:
+                    self._context_materializer = DevelopmentRuntimeContextMaterializer()
+                except (ImportError, ModuleNotFoundError) as exc:
+                    raise AgentRunError(
+                        "OpenEvo runtime projection is unavailable; run this daemon with `uv run python`"
+                    ) from exc
+            runtime_context = self._context_materializer.materialize(
+                persistent_workspace=workspace_path,
+                runtime_workspace=runtime_workspace,
+                contexts=request.get("evolved_contexts", []),
+            )
+            memory_sections = "\n\n".join(runtime_context["instruction_sections"])
+            if memory_sections:
+                memory_sections = (
+                    "Runtime instructions resolved by OpenEvo Core for this session:\n"
+                    f"{memory_sections}\n\n"
+                )
+            prompt = (
+                "You are planning changes for a persistent OpenEvo project workspace. "
+                "The trusted daemon, not you, applies file mutations after validating them. "
+                "Do not call shell, patch, or filesystem tools. Read the supplied workspace JSON, "
+                "solve the user's task, and return only the requested structured result. "
+                "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
+                "changed in file_writes. Put only regular files that must be removed in delete_paths. "
+                "Do not include unchanged files and do not use absolute paths or '..'. "
+                "Do not return OpenEvo runtime files under .openevo or injected skills under "
+                ".agents/skills as workspace mutations. "
+                "If no file change is needed, return empty arrays.\n\n"
+                f"Project: {request['project_name']}\n"
+                f"Session: {request['task_title']}\n\n"
+                f"{memory_sections}"
+                f"Current workspace JSON:\n{workspace_context}\n\n"
+                f"User message:\n{request['instruction']}\n"
+            )
+            output_path = temporary_root / "last-message.txt"
+            schema_path = temporary_root / "workspace-response.schema.json"
             schema_path.write_text(
                 canonical_json({
                     "type": "object",
@@ -1268,7 +1714,6 @@ class CodexRunner:
                 "exec",
                 "--json",
                 "--ignore-user-config",
-                "--ignore-rules",
                 "--ephemeral",
                 "--sandbox",
                 "read-only",
@@ -1276,7 +1721,7 @@ class CodexRunner:
                 "shell_tool",
                 "--skip-git-repo-check",
                 "--cd",
-                os.fspath(workspace_path),
+                os.fspath(runtime_context["workspace_path"]),
                 "--output-schema",
                 os.fspath(schema_path),
                 "--output-last-message",
@@ -1285,10 +1730,13 @@ class CodexRunner:
             if self._model:
                 argv.extend(("--model", self._model))
             argv.append("-")
+            process_environment = os.environ.copy()
+            process_environment.update(runtime_context["environment"])
             try:
                 completed = subprocess.run(
                     argv,
                     input=prompt,
+                    env=process_environment,
                     check=False,
                     capture_output=True,
                     text=True,
@@ -1325,6 +1773,7 @@ class CodexRunner:
             "duration_ms": duration_ms,
             "logs": [
                 "Remote development daemon admitted the session.",
+                *[f"Runtime context: {item}." for item in runtime_context["activations"]],
                 *extract_event_logs(completed.stdout),
                 f"Codex completed the session in {duration_ms} ms.",
             ],
@@ -1372,21 +1821,10 @@ class DocumentEvolutionRunner:
         self._load_catalog()
 
     def _load_catalog(self) -> None:
-        from openevo.evolution.framework.builtins import (
-            ImplementationDistributionIdentity,
-            build_builtin_registry,
-        )
         from openevo.evolution.framework.capabilities import build_evolution_capabilities
         from openevo.evolution.framework.contracts import EvolutionExecutionProfile
 
-        identity = ImplementationDistributionIdentity(
-            distribution="openevo",
-            distribution_version="0.1.10.dev0",
-            distribution_digest=hashlib.sha256(
-                b"openevo-development-catalog-v1"
-            ).hexdigest(),
-        )
-        self._registry = build_builtin_registry(identity)
+        self._registry = development_registry_snapshot()
         capability = build_evolution_capabilities(
             self._registry,
             profile=EvolutionExecutionProfile(
@@ -1508,14 +1946,13 @@ class DocumentEvolutionRunner:
     ) -> dict[str, Any]:
         config = store.project_config(request["project_id"])
         selected = selected_document_evolution(config)
-        if not selected:
-            return {"artifacts": [], "errors": []}
 
         try:
             from openevo.evolution.framework.execution import (
                 InputBindingSource,
                 resolve_method_inputs,
             )
+            from openevo.evolution.framework.resolution import resolve_evolution_method
             from openevo.evolution.methods import METHOD_REGISTRY
             from openevo.evolution.models import WorkerClaimInputArtifact, WorkerClaimedJob
         except (ImportError, ModuleNotFoundError) as exc:
@@ -1523,6 +1960,7 @@ class DocumentEvolutionRunner:
                 "OpenEvo Python dependencies are unavailable; run this daemon with `uv run python`"
             ) from exc
 
+        prior_dataset_records = store.dataset_artifacts(request["project_id"])
         dataset_dir = self._artifact_root / "datasets" / session_id
         dataset_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
         records_path = dataset_dir / "records.jsonl"
@@ -1562,24 +2000,52 @@ class DocumentEvolutionRunner:
             "uri": manifest_path.resolve().as_uri(),
             "name": f"{request['task_title']} transcript",
         }
+        store.record_dataset_artifact(
+            artifact_id=dataset_input["artifact_id"],
+            project_id=request["project_id"],
+            session_id=session_id,
+            uri=dataset_input["uri"],
+            name=dataset_input["name"],
+        )
+        if not selected:
+            return {"artifacts": [], "errors": []}
+
+        prior_datasets = [
+            WorkerClaimInputArtifact(
+                artifact_id=dataset["artifact_id"],
+                type="dataset",
+                uri=dataset["uri"],
+                name=dataset["name"],
+            )
+            for dataset in prior_dataset_records
+        ]
+        current_dataset = WorkerClaimInputArtifact.model_validate(dataset_input)
+        ordered_datasets = [*prior_datasets, current_dataset]
+        prior_dataset_ids = [dataset.artifact_id for dataset in prior_datasets]
         persisted: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         for item in selected:
             target_id = item["target_id"]
-            method_id = item["method"]
+            requested_method_id = item["method"]
+            method_id = resolve_evolution_method(
+                target_id=target_id,
+                requested_method=requested_method_id,
+                prior_dataset_artifact_ids=prior_dataset_ids,
+            )
             job_id = f"job-{target_id.replace('_', '-')}-{session_id}"
             store.start_evolution_job(
                 job_id=job_id,
                 session_id=session_id,
                 target_id=target_id,
                 method_id=method_id,
+                requested_method_id=requested_method_id,
+                resolver_input_artifact_ids=prior_dataset_ids,
                 config=item["config"],
             )
             try:
                 target, method, handler = self._descriptor(target_id, method_id)
                 method_config = self._method_config(method, item["config"])
                 previous = store.latest_artifact(request["project_id"], target_id)
-                current_dataset = WorkerClaimInputArtifact.model_validate(dataset_input)
                 previous_input = None
                 if previous is not None:
                     previous_uri = self._materialize_previous(
@@ -1594,14 +2060,15 @@ class DocumentEvolutionRunner:
                     )
                 candidates: dict[str, list[Any]] = {}
                 for binding in method.input_bindings:
-                    if binding.source in {
-                        InputBindingSource.CURRENT_DATASET,
-                        InputBindingSource.HISTORY_DATASETS,
-                    } or (
+                    if binding.source is InputBindingSource.CURRENT_DATASET:
+                        candidates[binding.binding_id] = [current_dataset]
+                    elif binding.source is InputBindingSource.HISTORY_DATASETS:
+                        candidates[binding.binding_id] = prior_datasets
+                    elif (
                         binding.source is InputBindingSource.EXPLICIT_INPUTS
                         and binding.artifact_type == "dataset"
                     ):
-                        candidates[binding.binding_id] = [current_dataset]
+                        candidates[binding.binding_id] = ordered_datasets
                     elif binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
                         candidates[binding.binding_id] = [] if previous_input is None else [previous_input]
                     else:
@@ -1660,6 +2127,7 @@ class DocumentEvolutionRunner:
                             if previous is not None and artifact_type == target.artifact_type
                             else None
                         ),
+                        promoted=artifact.promoted,
                     ))
                 store.finish_evolution_job(job_id, artifact_ids=artifact_ids)
             except Exception as exc:
@@ -1667,7 +2135,11 @@ class DocumentEvolutionRunner:
                     store.finish_evolution_job(job_id, error=str(exc))
                 except Exception:
                     pass
-                errors.append({"target_id": target_id, "method": method_id, "message": str(exc)})
+                errors.append({
+                    "target_id": target_id,
+                    "method": requested_method_id,
+                    "message": str(exc),
+                })
         return {"artifacts": persisted, "errors": errors}
 
 
