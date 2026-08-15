@@ -202,24 +202,24 @@ describe("development agent provider", () => {
     });
     const completed = await provider.refresh();
     if (completed.status !== "fresh") throw new Error("completed provider was not fresh");
-    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.transcript).toEqual([
+    expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.transcript).toEqual([
       { speaker: "user", text: "What is two plus two?" },
       { speaker: "agent", text: "Two plus two is four." },
     ]);
-    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.producedArtifactIds).toEqual(["dev-text-memory-1"]);
-    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.outputFiles[0]).toMatchObject({
+    expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.producedArtifactIds).toEqual(["dev-text-memory-1"]);
+    expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.outputFiles[0]).toMatchObject({
       name: "src/answer.py",
       content: "print(4)\n",
     });
-    expect(completed.snapshot.fixturePresentation?.workspaces?.[project.project_id]?.entries[0]).toMatchObject({
+    expect(completed.snapshot.runtimePresentation?.workspaces?.[project.project_id]?.entries[0]).toMatchObject({
       path: "src/answer.py",
       content: "print(4)\n",
     });
-    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.selectedEvolution).toEqual([
+    expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.selectedEvolution).toEqual([
       { targetId: "text_memory", method: "text_memory_reflector", config: {} },
     ]);
     expect(completed.snapshot.artifacts.map((artifact) => artifact.artifact_id)).toEqual(["dev-text-memory-1"]);
-    expect(completed.snapshot.fixturePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
+    expect(completed.snapshot.runtimePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({
       method: "POST",
       signal: expect.any(AbortSignal),
@@ -230,7 +230,7 @@ describe("development agent provider", () => {
     if (restored.status !== "fresh") throw new Error("restored provider was not fresh");
     expect(restored.snapshot.projects.map((candidate) => candidate.display_name)).toEqual(["Live project"]);
     expect(restored.snapshot.tasks.map((candidate) => candidate.task_id)).toEqual(["dev-session-1"]);
-    expect(restored.snapshot.fixturePresentation?.tasks["dev-session-1"]?.transcript).toEqual([
+    expect(restored.snapshot.runtimePresentation?.tasks["dev-session-1"]?.transcript).toEqual([
       { speaker: "user", text: "What is two plus two?" },
       { speaker: "agent", text: "Two plus two is four." },
     ]);

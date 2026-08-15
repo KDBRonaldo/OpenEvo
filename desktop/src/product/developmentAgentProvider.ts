@@ -4,7 +4,7 @@ import {
   createDevelopmentAgentDesktopProductProvider,
   type DevelopmentAgentBackend,
   type DevelopmentAgentTurnRequest,
-} from "./fixtureProvider";
+} from "./developmentAgentDesktopProvider";
 import type { DesktopProductProviderV2 } from "./providerV2";
 
 const artifactSchema = z.object({

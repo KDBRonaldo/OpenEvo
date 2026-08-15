@@ -3,12 +3,15 @@ import ReactDOM from "react-dom/client";
 import "../styles.css";
 import { DesktopProductApp } from "./DesktopProductApp";
 import { createDevelopmentAgentProvider } from "./developmentAgentProvider";
-import { createFixtureDesktopProductProvider } from "./fixtureProvider";
 
 export function createProductPreviewProvider(mode = import.meta.env.MODE) {
-  return mode === "openevo-live-agent"
-    ? createDevelopmentAgentProvider()
-    : createFixtureDesktopProductProvider();
+  if (mode !== "openevo-live-agent") {
+    throw new Error(
+      "The Desktop development renderer requires the real remote-agent mode. "
+      + "Start it with npm run dev:agent:remote or npm run dev:agent.",
+    );
+  }
+  return createDevelopmentAgentProvider();
 }
 
 if (!import.meta.env.DEV) {

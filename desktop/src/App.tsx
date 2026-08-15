@@ -1,16 +1,14 @@
 import {
-  Activity,
   AlertCircle,
   BookOpen,
   ChevronDown,
   ChevronRight,
-  CircleDot,
   Download,
   FolderOpen,
   LoaderCircle,
   Plus,
   RefreshCw,
-  Sparkles,
+  Server,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Route, Routes, useLocation } from "react-router-dom";
@@ -30,19 +28,7 @@ import { OpenEvoDesktop } from "./routes/OpenEvoDesktop";
 import { subscribeOpenEvoEvents } from "./api/sse";
 import { OpenEvoMark } from "./components/OpenEvoMark";
 import { DesktopProductApp } from "./product/DesktopProductApp";
-import { LegacyDesktopProductApp } from "./product/LegacyDesktopProductApp";
-import { SampleScientificProjectView } from "./product/ScientificProjectSample";
-import {
-  SAMPLE_SCIENTIFIC_PROJECT,
-  SAMPLE_SCIENTIFIC_PROJECTS,
-  sampleScientificProject,
-  type SampleScientificProjectId,
-} from "./product/scientificProjectSampleData";
-import type { DesktopProductProvider } from "./product/provider";
-import {
-  isDesktopProductProviderV2,
-  type DesktopProductProviderV2,
-} from "./product/providerV2";
+import type { DesktopProductProviderV2 } from "./product/providerV2";
 import {
   createReleaseDesktopProductProvider,
   getReleaseDesktopStartupStatus,
@@ -65,10 +51,6 @@ import {
 
 const isOpenEvoDesktopOnlyBuild =
   import.meta.env.VITE_OPENEVO_DESKTOP_ONLY === "true";
-
-type DesktopProductProviderAny =
-  | DesktopProductProvider
-  | DesktopProductProviderV2;
 
 function NavItem({ to, label }: { to: string; label: string }) {
   return (
@@ -194,7 +176,7 @@ export function OpenEvoDesktopOnlyShell({
   openConnectionSettings = false,
   onConnectionSettingsOpened,
 }: {
-  provider?: DesktopProductProviderAny;
+  provider?: DesktopProductProviderV2;
   onInitialSnapshotFailed?: (error: unknown) => void;
   onReady?: () => void;
   openConnectionSettings?: boolean;
@@ -205,23 +187,13 @@ export function OpenEvoDesktopOnlyShell({
       <Route
         path="*"
         element={
-          provider && isDesktopProductProviderV2(provider) ? (
-            <DesktopProductApp
-              provider={provider}
-              onInitialSnapshotFailed={onInitialSnapshotFailed}
-              onReady={onReady}
-              openConnectionSettings={openConnectionSettings}
-              onConnectionSettingsOpened={onConnectionSettingsOpened}
-            />
-          ) : (
-            <LegacyDesktopProductApp
-              provider={provider}
-              onInitialSnapshotFailed={onInitialSnapshotFailed}
-              onReady={onReady}
-              openConnectionSettings={openConnectionSettings}
-              onConnectionSettingsOpened={onConnectionSettingsOpened}
-            />
-          )
+          <DesktopProductApp
+            provider={provider}
+            onInitialSnapshotFailed={onInitialSnapshotFailed}
+            onReady={onReady}
+            openConnectionSettings={openConnectionSettings}
+            onConnectionSettingsOpened={onConnectionSettingsOpened}
+          />
         }
       />
     </Routes>
@@ -233,7 +205,7 @@ export function AppShell({
   productProvider,
 }: {
   desktopOnly?: boolean;
-  productProvider?: DesktopProductProviderAny;
+  productProvider?: DesktopProductProviderV2;
 }) {
   return desktopOnly ? (
     <OpenEvoDesktopOnlyShell provider={productProvider} />
@@ -246,10 +218,10 @@ type ReleaseDesktopStartupState =
   | { readonly status: "loading"; readonly retrying: boolean }
   | {
       readonly status: "committing";
-      readonly provider: DesktopProductProviderAny;
+      readonly provider: DesktopProductProviderV2;
       readonly generation: number;
     }
-  | { readonly status: "ready"; readonly provider: DesktopProductProviderAny }
+  | { readonly status: "ready"; readonly provider: DesktopProductProviderV2 }
   | {
       readonly status: "failed";
       readonly stage: "bootstrap" | "readiness";
@@ -317,8 +289,6 @@ function safeStartupFailure(error: unknown): ReleaseDesktopStartupFailure {
       "Retry startup. If the problem continues, restart OpenEvo Desktop.",
   };
 }
-
-type ReadonlySampleWorkspace = "research" | "evolution" | "system";
 
 function StartupDiagnostics({ startupPending }: { startupPending: boolean }) {
   const [open, setOpen] = useState(false);
@@ -486,7 +456,7 @@ function StartupLogTail({ tail }: { tail: DesktopLogTailV1 }) {
   );
 }
 
-function ReleaseStartupSample({
+function ReleaseStartupState({
   onRetry,
   onAddRemoteWorkspace,
   startupPending = false,
@@ -505,119 +475,21 @@ function ReleaseStartupSample({
   nativeStartupStatus?: NativeStartupStatusV2 | null;
   onCancelStartup?: () => void;
 }) {
-  const [workspace, setWorkspace] =
-    useState<ReadonlySampleWorkspace>("research");
-  const [selectedSampleId, setSelectedSampleId] =
-    useState<SampleScientificProjectId>(SAMPLE_SCIENTIFIC_PROJECT.id);
-  const selectedSample = sampleScientificProject(selectedSampleId);
-  const sampleWorkspaces: ReadonlyArray<{
-    readonly id: ReadonlySampleWorkspace;
-    readonly label: string;
-    readonly icon: typeof BookOpen;
-  }> = [
-    { id: "research", label: "Research", icon: BookOpen },
-    { id: "evolution", label: "Evolution", icon: Sparkles },
-    { id: "system", label: "System", icon: Activity },
-  ];
-
-  const handleWorkspaceKeyDown = (event: React.KeyboardEvent<HTMLElement>) => {
-    if (
-      ![
-        "ArrowUp",
-        "ArrowDown",
-        "ArrowLeft",
-        "ArrowRight",
-        "Home",
-        "End",
-      ].includes(event.key)
-    ) {
-      return;
-    }
-    const tabs = Array.from(
-      event.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'),
-    );
-    const current = tabs.indexOf(document.activeElement as HTMLButtonElement);
-    if (current < 0 || tabs.length === 0) return;
-    event.preventDefault();
-    const next =
-      event.key === "Home"
-        ? 0
-        : event.key === "End"
-          ? tabs.length - 1
-          : (current +
-              (["ArrowRight", "ArrowDown"].includes(event.key) ? 1 : -1) +
-              tabs.length) %
-            tabs.length;
-    tabs[next]?.focus();
-    tabs[next]?.click();
-  };
-
   return (
     <div
       className="product-shell initial-sync-shell"
-      data-testid="release-startup-sample"
       data-provider-kind="desktop_sidecar"
       data-system-maintenance-available="false"
     >
       <aside className="product-sidebar" aria-label="Primary navigation">
         <div className="product-brand" aria-label="OpenEvo Desktop">
-          <span className="product-mark">
-            <OpenEvoMark />
-          </span>
+          <span className="product-mark"><OpenEvoMark /></span>
           <span>OpenEvo</span>
-        </div>
-        <nav
-          className="product-nav"
-          role="tablist"
-          aria-label="Demo views"
-          aria-orientation="vertical"
-          onKeyDown={handleWorkspaceKeyDown}
-        >
-          {sampleWorkspaces.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              type="button"
-              role="tab"
-              className={`product-nav-item ${workspace === id ? "active" : ""}`}
-              aria-selected={workspace === id}
-              tabIndex={workspace === id ? 0 : -1}
-              onClick={() => setWorkspace(id)}
-            >
-              <Icon size={17} /> {label}
-            </button>
-          ))}
-        </nav>
-        <div className="sidebar-foot">
-          <div className="sidebar-foot-label">Demo progress</div>
-          <div className="sidebar-revision">
-            <CircleDot size={15} />
-            <span>Generation {selectedSample.activeProjectHeadGeneration}</span>
-          </div>
         </div>
       </aside>
       <div className="product-stage">
         <header className="product-topbar">
-          <div className="project-switcher-wrap">
-            <label htmlFor="startup-sample-project">Project</label>
-            <div className="project-switcher-control">
-              <select
-                id="startup-sample-project"
-                value={selectedSample.id}
-                onChange={(event) => {
-                  const selected = SAMPLE_SCIENTIFIC_PROJECTS.find(
-                    (sample) => sample.id === event.target.value,
-                  );
-                  if (selected) setSelectedSampleId(selected.id);
-                }}
-              >
-                {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
-                  <option key={sample.id} value={sample.id}>
-                    [Demo] {sample.name}
-                  </option>
-                ))}
-              </select>
-            </div>
-          </div>
+          <strong>OpenEvo Desktop</strong>
           <button
             type="button"
             className="primary-button topbar-primary-action"
@@ -644,22 +516,15 @@ function ReleaseStartupSample({
               {failure ? <span>{failure.message}</span> : null}
               {failure?.nextAction ? <span>{failure.nextAction}</span> : null}
               {connectionRequested ? (
-                <span>
-                  Your remote workspace will open when OpenEvo Desktop is ready.
-                </span>
+                <span>Your remote workspace will open when OpenEvo Desktop is ready.</span>
               ) : null}
             </div>
             {startupPending ? (
               <button type="button" className="secondary-button" disabled>
-                <LoaderCircle className="spin" size={15} />{" "}
-                {retrying ? "Retrying" : "Starting"}
+                <LoaderCircle className="spin" size={15} /> {retrying ? "Retrying" : "Starting"}
               </button>
             ) : (
-              <button
-                type="button"
-                className="secondary-button"
-                onClick={onRetry}
-              >
+              <button type="button" className="secondary-button" onClick={onRetry}>
                 <RefreshCw size={15} /> Retry
               </button>
             )}
@@ -668,18 +533,14 @@ function ReleaseStartupSample({
           {startupPending && nativeStartupStatus !== null ? (
             <LifecycleOperationPanelV2
               model={nativeStartupPanelModelV2(nativeStartupStatus)}
-              onCancel={
-                nativeStartupStatus.cancellable ? onCancelStartup : undefined
-              }
+              onCancel={nativeStartupStatus.cancellable ? onCancelStartup : undefined}
             />
           ) : null}
-          <div className="initial-sync-sample">
-            <SampleScientificProjectView
-              workspace={workspace}
-              project={selectedSample}
-              onConnectRemote={onAddRemoteWorkspace}
-            />
-          </div>
+          <section className="quiet-empty empty-project-state">
+            <Server size={28} />
+            <h1>Waiting for authoritative Desktop state</h1>
+            <p>No project, Session, artifact, or workspace data is shown until the packaged sidecar and remote daemon are ready.</p>
+          </section>
         </main>
       </div>
     </div>
@@ -748,7 +609,7 @@ export function ReleaseDesktopProductShell({
   reportReady = reportReleaseDesktopReady,
   getStartupStatus = getReleaseDesktopStartupStatus,
 }: {
-  createProvider?: () => Promise<DesktopProductProviderAny>;
+  createProvider?: () => Promise<DesktopProductProviderV2>;
   stopProvider?: () => Promise<void>;
   reportStage?: (stage: ReleaseDesktopBootstrapStage) => Promise<void> | void;
   reportReady?: () => Promise<void>;
@@ -810,7 +671,7 @@ export function ReleaseDesktopProductShell({
           // credential from the Tauri host.
           await stopProvider();
           if (generation.current !== requestGeneration) return;
-          let provider: DesktopProductProviderAny;
+          let provider: DesktopProductProviderV2;
           try {
             provider = await createProvider();
           } catch (error) {
@@ -850,7 +711,7 @@ export function ReleaseDesktopProductShell({
   );
 
   const reportCommittedProduct = useCallback(
-    (committingGeneration: number, provider: DesktopProductProviderAny) => {
+    (committingGeneration: number, provider: DesktopProductProviderV2) => {
       if (readinessGeneration.current === committingGeneration) return;
       readinessGeneration.current = committingGeneration;
       void enqueueLifecycle(async () => {
@@ -972,7 +833,7 @@ export function ReleaseDesktopProductShell({
   }
   if (startup.status === "failed") {
     return (
-      <ReleaseStartupSample
+      <ReleaseStartupState
         onRetry={() => start(true)}
         onAddRemoteWorkspace={requestRemoteWorkspace}
         failure={startup.failure}
@@ -981,7 +842,7 @@ export function ReleaseDesktopProductShell({
     );
   }
   return (
-    <ReleaseStartupSample
+    <ReleaseStartupState
       onRetry={start}
       onAddRemoteWorkspace={requestRemoteWorkspace}
       startupPending

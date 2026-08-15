@@ -330,7 +330,7 @@ function authoritySnapshot(
       [transitionRef.successor_transition_id]: transition,
     } as never,
     artifacts: artifacts as never,
-    fixturePresentation: {
+    runtimePresentation: {
       tasks: {
         "task-1": {
           instruction: project.config.task,
@@ -611,7 +611,7 @@ function providerFixture(initial: DesktopProductSnapshotV2) {
       );
       if (!artifact) throw new Error("artifact is missing");
       const previous =
-        current.fixturePresentation?.artifacts[artifactId]
+        current.runtimePresentation?.artifacts[artifactId]
           ?.previousArtifactId ?? null;
       return {
         schema_version: "2",
@@ -663,11 +663,12 @@ describe("Desktop v2 product renderer", () => {
     expect(button("Use another SSH alias")).toBeTruthy();
   });
 
-  it("labels the offline sample head as demo authority instead of an active remote head", async () => {
+  it("shows an explicit empty project state without demo authority", async () => {
     root = await render(providerFixture(baseSnapshot()));
 
-    expect(document.body.textContent).toContain("Demo Project Head");
-    expect(document.body.textContent).not.toContain("Active Project Head");
+    expect(document.body.textContent).toContain("Active Project Head");
+    expect(document.body.textContent).toContain("No project yet");
+    expect(document.body.textContent).not.toContain("Demo Project Head");
   });
 
   it("keeps one authoritative event subscription across the initial refresh", async () => {
@@ -1034,10 +1035,10 @@ describe("Desktop v2 product renderer", () => {
       ...initial,
       projects: [...initial.projects, secondProject] as never,
       tasks: [...initial.tasks, secondTask] as never,
-      fixturePresentation: {
-        ...initial.fixturePresentation!,
+      runtimePresentation: {
+        ...initial.runtimePresentation!,
         tasks: {
-          ...initial.fixturePresentation!.tasks,
+          ...initial.runtimePresentation!.tasks,
           "task-2": {
             instruction: {
               title: "Second project session",

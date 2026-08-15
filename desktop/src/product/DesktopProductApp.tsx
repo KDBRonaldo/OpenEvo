@@ -40,7 +40,6 @@ import type {
   TaskV2,
 } from "../api/v2/schemas";
 import { OpenEvoMark } from "../components/OpenEvoMark";
-import { SampleScientificProjectView } from "./ScientificProjectSample";
 import {
   LifecycleOperationPanelV2,
   coreOperationPanelModelV2,
@@ -50,12 +49,6 @@ import {
   taskPanelModelV2,
   transitionPanelModelV2,
 } from "./LifecycleOperationPanelV2";
-import {
-  SAMPLE_SCIENTIFIC_PROJECT,
-  SAMPLE_SCIENTIFIC_PROJECTS,
-  sampleScientificProject,
-  type SampleScientificProjectId,
-} from "./scientificProjectSampleData";
 import {
   unavailableDesktopProductProviderV2,
   type DesktopProductProviderV2,
@@ -104,10 +97,6 @@ export function DesktopProductApp({
   const [projectEditing, setProjectEditing] = useState(false);
   const [taskLogs, setTaskLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
   const [serviceLogs, setServiceLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
-  const [selectedSampleId, setSelectedSampleId] = useState<SampleScientificProjectId>(
-    SAMPLE_SCIENTIFIC_PROJECT.id,
-  );
-  const [samplePreviewOpen, setSamplePreviewOpen] = useState(false);
   const readyReported = useRef(false);
   const initialFailureReported = useRef(false);
   const refreshSequence = useRef(0);
@@ -215,14 +204,12 @@ export function DesktopProductApp({
   const activeProject = snapshot.projects.find(
     (project) => project.project_id === snapshot.state.active_project_id,
   ) ?? null;
-  const displayedProject = samplePreviewOpen ? null : activeProject;
+  const displayedProject = activeProject;
   const activeProfile = snapshot.profiles.find(
     (profile) => profile.profile_id === snapshot.state.active_profile_id,
   ) ?? null;
   const connectedProfiles = snapshot.profiles.filter(isConnectedProfile);
-  const selectedSample = sampleScientificProject(selectedSampleId);
-  const generation = displayedProject?.active_project_head?.generation
-    ?? selectedSample.activeProjectHeadGeneration;
+  const generation = displayedProject?.active_project_head?.generation ?? 0;
   const lifecycleStates = provider.listLifecycleOperations();
   const coreOperations = provider.listCoreOperations();
   const diagnostics = provider.listDiagnostics();
@@ -298,7 +285,7 @@ export function DesktopProductApp({
               <div className="sidebar-sessions-label">Sessions</div>
               {snapshot.tasks.filter((task) => task.project_id === activeProject.project_id).map((task, index) => (
                 <button type="button" className={`sidebar-session-item ${workspace === "research" && selectedTaskId === task.task_id ? "active" : ""}`} key={task.task_id} onClick={() => { setWorkspace("research"); setSelectedTaskId(task.task_id); }}>
-                  <span>{snapshot.fixturePresentation?.tasks[task.task_id]?.instruction?.title ?? `Session ${index + 1}`}</span>
+                  <span>{snapshot.runtimePresentation?.tasks[task.task_id]?.instruction?.title ?? `Session ${index + 1}`}</span>
                   <small>{task.state.replaceAll("_", " ")}</small>
                 </button>
               ))}
@@ -309,7 +296,7 @@ export function DesktopProductApp({
         </nav>
         <div className="sidebar-foot">
           <div className="sidebar-foot-label">
-            {displayedProject === null ? "Demo Project Head" : "Active Project Head"}
+            Active Project Head
           </div>
           <div className="sidebar-revision"><CircleDot size={15} /><span>Generation {generation}</span></div>
         </div>
@@ -322,19 +309,11 @@ export function DesktopProductApp({
             <div className="project-switcher-control">
               <select
                 id="v2-project-switcher"
-                value={displayedProject ? `project:${displayedProject.project_id}` : `sample:${selectedSampleId}`}
+                value={displayedProject ? `project:${displayedProject.project_id}` : ""}
                 onChange={(event) => {
-                  if (event.target.value.startsWith("sample:")) {
-                    setSelectedSampleId(event.target.value.slice(7) as SampleScientificProjectId);
-                    setSamplePreviewOpen(true);
-                    setSelectedTaskId(null);
-                    setWorkspace("research");
-                    return;
-                  }
                   const projectId = event.target.value.slice(8);
                   const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
                   if (!project) return;
-                  setSamplePreviewOpen(false);
                   setSelectedTaskId(null);
                   setWorkspace("research");
                   if (project.project_id === activeProject?.project_id) return;
@@ -344,11 +323,9 @@ export function DesktopProductApp({
                   );
                 }}
               >
+                {snapshot.projects.length === 0 ? <option value="">No projects</option> : null}
                 {snapshot.projects.map((project) => (
                   <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>
-                ))}
-                {SAMPLE_SCIENTIFIC_PROJECTS.map((sample) => (
-                  <option key={sample.id} value={`sample:${sample.id}`}>[Demo] {sample.name}</option>
                 ))}
               </select>
             </div>
@@ -387,10 +364,10 @@ export function DesktopProductApp({
           ) : null}
 
           {displayedProject === null ? (
-            <SampleScientificProjectView
-              workspace={workspace}
-              project={selectedSample}
+            <EmptyProjectWorkspace
+              connected={connectedProfiles.length > 0}
               onConnectRemote={() => setConnectionOpen(true)}
+              onCreateProject={() => { setProjectEditing(false); setProjectOpen(true); }}
             />
           ) : workspace === "research" ? (
             <ResearchWorkspaceV2
@@ -401,7 +378,7 @@ export function DesktopProductApp({
               taskLogs={taskLogs}
               artifacts={snapshot.artifacts}
               capability={snapshot.capability}
-              fixturePresentation={snapshot.fixturePresentation}
+              runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
               busy={busy}
               sessionEvolutionAvailable={developmentAgentBridge}
@@ -591,7 +568,6 @@ export function DesktopProductApp({
           onClose={() => { setProjectOpen(false); setProjectEditing(false); }}
           onCreated={async () => {
             await refresh();
-            setSamplePreviewOpen(false);
             setSelectedTaskId(null);
             setWorkspace("research");
             setProjectOpen(false);
@@ -616,7 +592,6 @@ function InitialV2View({
   readonly onRetry: () => void;
   readonly onAddRemote: () => void;
 }) {
-  const sample = sampleScientificProject(SAMPLE_SCIENTIFIC_PROJECT.id);
   return (
     <div className="product-shell initial-sync-shell">
       <aside className="product-sidebar">
@@ -631,10 +606,38 @@ function InitialV2View({
             detail={error ?? "Verifying the packaged Desktop Local API v2 authority."}
             action={error ? <button className="secondary-button" type="button" onClick={onRetry}><RefreshCw size={15} /> Retry</button> : <LoaderCircle className="spin" size={18} />}
           />
-          <SampleScientificProjectView workspace="research" project={sample} onConnectRemote={onAddRemote} />
+          <section className="quiet-empty empty-project-state">
+            <Server size={28} />
+            <h1>No authoritative workspace loaded</h1>
+            <p>Connect a remote OpenEvo daemon to load projects, sessions, artifacts, and workspace files.</p>
+            <button className="primary-button" type="button" onClick={onAddRemote}><Plus size={16} /> Add remote workspace</button>
+          </section>
         </main>
       </div>
     </div>
+  );
+}
+
+function EmptyProjectWorkspace({
+  connected,
+  onConnectRemote,
+  onCreateProject,
+}: {
+  readonly connected: boolean;
+  readonly onConnectRemote: () => void;
+  readonly onCreateProject: () => void;
+}) {
+  return (
+    <section className="quiet-empty empty-project-state">
+      <FolderOpen size={28} />
+      <h1>No project yet</h1>
+      <p>{connected
+        ? "Create a project. Its workspace, sessions, and artifacts will be stored by the connected daemon."
+        : "Connect a remote daemon before creating a project."}</p>
+      <button className="primary-button" type="button" onClick={connected ? onCreateProject : onConnectRemote}>
+        <Plus size={16} /> {connected ? "New project" : "Add remote workspace"}
+      </button>
+    </section>
   );
 }
 
@@ -974,7 +977,7 @@ function ResearchWorkspaceV2({
   taskLogs,
   artifacts,
   capability,
-  fixturePresentation,
+  runtimePresentation,
   selectedTaskId,
   busy,
   sessionEvolutionAvailable,
@@ -994,7 +997,7 @@ function ResearchWorkspaceV2({
   readonly taskLogs: Readonly<Record<string, readonly LogEntryV2[]>>;
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
   readonly capability: DesktopProductSnapshotV2["capability"];
-  readonly fixturePresentation: DesktopProductSnapshotV2["fixturePresentation"];
+  readonly runtimePresentation: DesktopProductSnapshotV2["runtimePresentation"];
   readonly selectedTaskId: string | null;
   readonly busy: boolean;
   readonly sessionEvolutionAvailable: boolean;
@@ -1065,7 +1068,7 @@ function ResearchWorkspaceV2({
     const transition = selectedTask.successor_transition
       ? transitions[selectedTask.successor_transition.successor_transition_id] ?? null
       : null;
-    const taskContent = fixturePresentation?.tasks[selectedTask.task_id]?.instruction
+    const taskContent = runtimePresentation?.tasks[selectedTask.task_id]?.instruction
       ?? (selectedTask.admission.project_config_sha256 === project.project_config_sha256
         ? project.config.task
         : null);
@@ -1080,9 +1083,9 @@ function ResearchWorkspaceV2({
         <TaskAuthorityCardV2
           task={selectedTask}
           taskContent={taskContent}
-          presentation={fixturePresentation?.tasks[selectedTask.task_id]}
+          presentation={runtimePresentation?.tasks[selectedTask.task_id]}
           artifacts={artifacts}
-          artifactPresentation={fixturePresentation?.artifacts}
+          artifactPresentation={runtimePresentation?.artifacts}
           transition={transition}
           timeline={timelines[selectedTask.task_id] ?? []}
           logs={taskLogs[selectedTask.task_id] ?? []}
@@ -1150,12 +1153,12 @@ function ResearchWorkspaceV2({
         <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? selectedEvolutionCount : Object.values(project.config.evolution.targets).filter((target) => target.enabled).length} selected</strong></div></div>
       </section>
       <section className="product-panel active-run-panel">
-        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? fixturePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
-        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{fixturePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>Open session result <ArrowRight size={14} /></button></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
+        <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? runtimePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
+        {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>Open session result <ArrowRight size={14} /></button></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
       </section>
       </div>
-      <ProjectWorkspacePanelV2 workspace={fixturePresentation?.workspaces?.[project.project_id]} />
-      <section className="history-section"><div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{projectTasks.length} total</span></div>{projectTasks.length ? <TaskHistoryTableV2 tasks={projectTasks} presentation={fixturePresentation?.tasks} selectedTaskId={selectedTaskId} transitions={transitions} onOpenTask={onSelectTask} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}</section>
+      <ProjectWorkspacePanelV2 workspace={runtimePresentation?.workspaces?.[project.project_id]} />
+      <section className="history-section"><div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{projectTasks.length} total</span></div>{projectTasks.length ? <TaskHistoryTableV2 tasks={projectTasks} presentation={runtimePresentation?.tasks} selectedTaskId={selectedTaskId} transitions={transitions} onOpenTask={onSelectTask} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}</section>
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
   );
@@ -1165,7 +1168,7 @@ function ProjectWorkspacePanelV2({
   workspace,
 }: {
   readonly workspace: NonNullable<
-    NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["workspaces"]
+    NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["workspaces"]
   >[string] | undefined;
 }) {
   const entries = workspace?.entries ?? [];
@@ -1241,7 +1244,7 @@ function AuthorityCardsV2({ project }: { readonly project: ProjectV2 }) {
 
 function TaskHistoryTableV2({ tasks, presentation, selectedTaskId, transitions, onOpenTask }: {
   readonly tasks: readonly TaskV2[];
-  readonly presentation: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["tasks"] | undefined;
+  readonly presentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"] | undefined;
   readonly selectedTaskId: string | null;
   readonly transitions: Readonly<Record<string, SuccessorTransitionV2>>;
   readonly onOpenTask: (taskId: string) => void;
@@ -1270,9 +1273,9 @@ function TaskAuthorityCardV2({
 }: {
   readonly task: TaskV2;
   readonly taskContent: ScienceProjectConfigV2["task"] | null;
-  readonly presentation: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["tasks"][string] | undefined;
+  readonly presentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"][string] | undefined;
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
-  readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["artifacts"] | undefined;
+  readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"] | undefined;
   readonly transition: SuccessorTransitionV2 | null;
   readonly timeline: DesktopProductSnapshotV2["timelines"][string];
   readonly logs: readonly LogEntryV2[];
@@ -1365,8 +1368,8 @@ function SessionResultInspectorV2({
     | { readonly kind: "artifact"; readonly artifactId: string }
     | { readonly kind: "output"; readonly fileName: string };
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
-  readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["artifacts"] | undefined;
-  readonly outputFiles: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["tasks"][string]["outputFiles"];
+  readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"] | undefined;
+  readonly outputFiles: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"][string]["outputFiles"];
   readonly onClose: () => void;
 }) {
   const [view, setView] = useState<"content" | "changes">("changes");
@@ -1392,7 +1395,7 @@ function SessionResultInspectorV2({
         <div>
           <span className="panel-kicker">{artifact ? artifactTypeLabel(artifact.artifact_type) : "Output file"}</span>
           <h3>{title}</h3>
-          <p>{artifactPreview?.statusDetail ?? output?.summary ?? "Readable fixture content is unavailable."}</p>
+          <p>{artifactPreview?.statusDetail ?? output?.summary ?? "Readable artifact content is unavailable."}</p>
         </div>
         <button type="button" className="icon-button" aria-label="Close result preview" onClick={onClose}><X size={16} /></button>
       </div>
@@ -1402,9 +1405,9 @@ function SessionResultInspectorV2({
       </div>
       {view === "content" ? (
         artifact ? (
-          artifactPreview?.documents.length ? <div className="v2-artifact-documents">{artifactPreview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>text/markdown</small></div><pre>{document.content}</pre></section>)}</div> : <p className="v2-empty-copy">{contentUnavailable ? "The real artifact metadata exists, but this fixture does not provide a readable body." : "No readable document body is available."}</p>
+          artifactPreview?.documents.length ? <div className="v2-artifact-documents">{artifactPreview.documents.map((document) => <section key={document.path}><div><FileText size={14} /><strong>{document.path}</strong><small>text/markdown</small></div><pre>{document.content}</pre></section>)}</div> : <p className="v2-empty-copy">{contentUnavailable ? "The artifact metadata exists, but the daemon did not provide a readable body." : "No readable document body is available."}</p>
         ) : output?.content ? (
-          <div className="v2-artifact-documents"><section><div><FileText size={14} /><strong>{output.name}</strong><small>fixture preview</small></div><pre>{output.content}</pre></section></div>
+          <div className="v2-artifact-documents"><section><div><FileText size={14} /><strong>{output.name}</strong><small>workspace output</small></div><pre>{output.content}</pre></section></div>
         ) : <p className="v2-empty-copy">No readable output-file body is available.</p>
       ) : (
         <div className="v2-artifact-diff">
@@ -1477,14 +1480,14 @@ function EvolutionWorkspaceV2({
         })}</div>}
         <div className="v2-primary-row"><button type="button" className="primary-button" disabled={busy || snapshot.capability === null} onClick={() => onSave({ ...project.config, evolution: { targets } })}>Save evolution configuration</button></div>
       </section>
-      <EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.fixturePresentation?.artifacts} provider={provider} />
+      <EvolutionArtifactBrowserV2 artifacts={artifacts} presentation={snapshot.runtimePresentation?.artifacts} provider={provider} />
     </div>
   );
 }
 
 function EvolutionArtifactBrowserV2({ artifacts, presentation, provider }: {
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
-  readonly presentation: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["artifacts"] | undefined;
+  readonly presentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"] | undefined;
   readonly provider: DesktopProductProviderV2;
 }) {
   const [selectedId, setSelectedId] = useState<string | null>(artifacts[0]?.artifact_id ?? null);
@@ -1697,7 +1700,7 @@ function artifactTypeLabel(type: DesktopProductSnapshotV2["artifacts"][number]["
   return labels[type];
 }
 
-function artifactStatusLabel(status: NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["artifacts"][string]["status"]): string {
+function artifactStatusLabel(status: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"][string]["status"]): string {
   const labels = {
     created: "First version",
     updated: "Updated",

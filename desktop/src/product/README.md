@@ -16,45 +16,15 @@ or inconsistent duplicate identities, and uses the verified Desktop v2 content
 and diff routes for on-demand inspection. It never falls back to Desktop v1,
 direct SSH, or a direct Core URL.
 
-## Built-in scientific project demos
+## Authoritative data only
 
-The Desktop demonstration surface contains two scientifically distinct,
-curated project stories. Neither story represents a remote run or authoritative
-project state.
+The product renderer contains no built-in Project, Session, transcript, artifact,
+workspace, capability, or evolution sample data. An empty or unavailable backend
+renders an explicit empty/error state. Product runtime paths never fall back to a
+fixture, simulator, legacy provider, or curated scientific story.
 
-- The renderer owns an enzyme-kinetics tour and a protein-stability evidence
-  tour. Both are always listed as `[Demo]` in the real release
-  project selector, including before any remote workspace exists and while the
-  Desktop sidecar startup fallback is visible.
-- `Add remote workspace` remains visible in the top bar throughout startup and
-  snapshot recovery. A request made before authority is available is retained,
-  recovery is retried, and the real connection drawer opens only after the
-  provider has published an authoritative snapshot.
-- Each project contains three sessions with a rejected baseline, later
-  corrective work, concise transcript activity, and a validated
-  condition-scoped result. The protein project uses plate-aware DSF plus
-  orthogonal SEC evidence rather than copying the enzyme workflow.
-- Both projects advance Project Head generations 0 through 3 and separately
-  identify their Evolution Revisions. Every session pins one predecessor and
-  makes its successor available to the next session.
-- Every project contains `text_memory`, `skill_bundle`, and `agent_system`
-  histories with three evolution steps, readable Markdown, and an explicit
-  previous-versus-current diff.
-- All sample data and rendering live in `scientificProjectSampleData.ts` and
-  `ScientificProjectSample.tsx`; samples are not inserted into
-  `DesktopProductProvider`, Local API state, Core state, or run admission.
-- The deeper session timeline keeps project generations and evolution update
-  identities separate; the demonstrations do not collapse the full project
-  composition into its evolution artifact set.
-- Demonstration interactions issue no mutations and initiate no SSH, Daemon, Core,
-  artifact, or external-network work. Normal read-only Desktop-local state
-  synchronization remains active so real projects stay discoverable.
-- The samples remain available beside real projects, but never replace an
-  authoritative project selection or revision.
-- `npm run test:product-browser` verifies the first-run Research and Evolution
-  views at the closed 1440, 1024, and 760 pixel viewports with Chromium,
-  committed visual baselines, keyboard interaction, viewport bounds, and
-  serious/critical axe findings.
+Deterministic fixtures remain confined to automated contract tests and are not
+imported by either the live development entry or the packaged release renderer.
 
 The product renderer consumes only `DesktopProductProvider`. Mutations carry the
 renderer-observed stream epoch, resource ETag, and a stable action identity.
@@ -90,22 +60,15 @@ data crosses this diagnostic channel.
 The `openevo-desktop` Vite mode replaces the general provider-kind parser with
 `providerKinds.release.ts`, whose only accepted value is `desktop_sidecar`.
 Rollup can then remove simulator, scaffold, and dry-run provider definitions and
-their strings from the packaged renderer. Normal development/typecheck/test
-imports continue to use `providerKinds.ts`, so contract fixtures remain usable
-without becoming release dependencies.
+their strings from the packaged renderer. Normal typecheck and unit tests
+continue to use `providerKinds.ts`; test-only contract samples do not become
+release dependencies or a renderer fallback.
 
-For renderer visual QA, run the Vite development server and open
-`/product-preview.html?scenario=<name>`. The closed scenario set is `new-user`,
-`offline`, `online`, `completed`, `degraded`, and `failed`. Except for the empty
-`new-user` state, these scenarios use the release-supported
-`codex_subscription_transcript` profile with transcript capture and `gpt-5.5`.
-The `failed` scenario contains one genuinely failed run and exercises the
-same-run retry action; it does not add a successful run to make the history look
-healthy. This secondary HTML entry is
-served only by Vite during development; the Tauri release build starts from
-`index.html`, and `preview.tsx` also rejects production execution. The preview
-therefore exercises the real product components against strict contract
-fixtures without becoming a release provider or fallback.
+`/product-preview.html` is a live remote-agent development entry only. It
+requires Vite mode `openevo-live-agent` and a reachable authenticated daemon;
+opening it from plain Vite mode fails immediately instead of displaying a
+sample Project, Session, artifact, capability, or agent response. The Tauri
+release build continues to start from `index.html`.
 
 Native development uses `npm run tauri:dev`. Tauri starts Vite through
 `dev:openevo`, which selects the same product-only entrypoint as the release
@@ -127,8 +90,7 @@ OpenSSH alias. It requires two explicit local inputs:
 
 The fixed Vite origins are admitted only when the sidecar reports the
 `development` build channel. Release and test compositions retain the closed
-Tauri-only origin set. `npm run dev:fixture` remains the explicit visual-fixture
-loop behind `/product-preview.html`; it is never a live Daemon workflow.
+Tauri-only origin set. There is no visual-fixture or sample-data launch command.
 
 For the narrower "ask the remote Codex and evolve selected documents" loop, use
 `npm run dev:agent`. This mode bypasses the sealed release lifecycle, but obtains

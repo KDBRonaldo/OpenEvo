@@ -54,11 +54,11 @@ export interface DesktopProductSnapshotV2 {
   readonly validation: ProjectValidationV2 | null;
   readonly activeOperation: ProductOperationV2 | null;
   readonly stream: ProductStreamStateV2;
-  /** Development/demo-only readable projections. Real Local API snapshots omit this. */
-  readonly fixturePresentation?: FixturePresentationV2;
+  /** Readable task, artifact, and workspace projections supplied by the active backend. */
+  readonly runtimePresentation?: RuntimePresentationV2;
 }
 
-export interface FixturePresentationV2 {
+export interface RuntimePresentationV2 {
   readonly tasks: Readonly<Record<string, {
     readonly instruction: { readonly title: string; readonly objective: string } | null;
     readonly transcript: readonly { readonly speaker: "user" | "agent" | "system"; readonly text: string }[];
