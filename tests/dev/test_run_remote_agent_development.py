@@ -118,6 +118,11 @@ def test_remote_script_quotes_values_and_uses_private_managed_paths() -> None:
     assert "git -C \"$source_root\" merge --ff-only" in script
     assert 'deployed_commit="$(git -C "$source_root" rev-parse HEAD)"' in script
     assert '"$uv_bin" sync --frozen --python 3.11' in script
+    assert "bash -lc 'command -v codex'" in script
+    assert '"$HOME/.npm-global/bin/codex"' in script
+    assert '"$HOME"/.nvm/versions/node/*/bin/codex' in script
+    assert '"PATH=$codex_dir:$PATH"' in script
+    assert '--codex-binary "$codex_bin"' in script
     assert "scripts/dev/live_agent_daemon.py" in script
     assert "Refusing to modify an unrecognized path" in script
     assert "'\"'\"'" in script

@@ -255,6 +255,39 @@ fi
 cd "$source_root"
 "$uv_bin" sync --frozen --python 3.11
 
+codex_bin="$(command -v codex || true)"
+if [ -z "$codex_bin" ] && command -v bash >/dev/null 2>&1; then
+  codex_bin="$(bash -lc 'command -v codex' 2>/dev/null || true)"
+fi
+if [ -z "$codex_bin" ]; then
+  for candidate in \
+    "$HOME/.local/bin/codex" \
+    "$HOME/.npm-global/bin/codex" \
+    /usr/local/bin/codex \
+    /usr/bin/codex \
+    "$HOME"/.nvm/versions/node/*/bin/codex; do
+    if [ -x "$candidate" ]; then
+      codex_bin="$candidate"
+      break
+    fi
+  done
+fi
+case "$codex_bin" in
+  /*) ;;
+  *) codex_bin='' ;;
+esac
+if [ -z "$codex_bin" ] || [ ! -x "$codex_bin" ]; then
+  echo "Codex CLI was not found in the non-interactive SSH environment." >&2
+  echo "Log in normally and run: command -v codex" >&2
+  exit 27
+fi
+codex_dir="$(dirname "$codex_bin")"
+if ! env "PATH=$codex_dir:$PATH" "$codex_bin" login status >/dev/null 2>&1; then
+  echo "Codex CLI is installed but is not logged in for remote user $(id -un)." >&2
+  echo "Run 'codex login --device-auth' as that same remote user, then retry." >&2
+  exit 28
+fi
+
 echo "[remote 3/4] Restarting the development daemon..."
 if [ -f "$pid_file" ]; then
   old_pid="$(cat "$pid_file" 2>/dev/null || true)"
@@ -281,10 +314,12 @@ if [ -f "$pid_file" ]; then
 fi
 
 nohup env \
+  "PATH=$codex_dir:$PATH" \
   "OPENEVO_DEV_AGENT_TOKEN=$agent_token" \
   "OPENEVO_DEV_EVOLUTION_MODEL=$evolution_model" \
   "$uv_bin" run --frozen --python 3.11 python \
-  scripts/dev/live_agent_daemon.py --port "$remote_port" \
+  scripts/dev/live_agent_daemon.py \
+  --port "$remote_port" --codex-binary "$codex_bin" \
   >"$log_file" 2>&1 </dev/null &
 daemon_pid=$!
 printf '%s\n' "$daemon_pid" > "$pid_file"
