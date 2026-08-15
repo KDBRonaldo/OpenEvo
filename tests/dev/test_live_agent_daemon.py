@@ -90,6 +90,30 @@ def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pyt
     MODULE.CodexRunner("codex", 30, None).check_ready()
 
 
+def test_codex_runner_injects_evolved_memory_into_the_next_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, str] = {}
+
+    def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured["prompt"] = str(kwargs["input"])
+        output_path = Path(args[args.index("--output-last-message") + 1])
+        output_path.write_text("The next answer used prior memory.", encoding="utf-8")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(MODULE.subprocess, "run", run)
+    result = MODULE.CodexRunner("codex", 30, "test-model").run({
+        "project_name": "Memory project",
+        "task_title": "Second question",
+        "instruction": "Answer the next question.",
+        "evolved_memory": "# Evolved memory\n\n- Verify the answer before responding.",
+    })
+
+    assert "Evolved memory from earlier sessions" in captured["prompt"]
+    assert "Verify the answer before responding" in captured["prompt"]
+    assert result["response"] == "The next answer used prior memory."
+
+
 def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path) -> None:
     database = tmp_path / "state.sqlite3"
     store = MODULE.DevelopmentStateStore(database)
@@ -146,7 +170,79 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "development_metadata",
         "development_projects",
         "development_sessions",
+        "development_artifacts",
     } <= tables
+
+
+def test_real_text_memory_reflector_persists_and_consumes_prior_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import methods
+
+    prompts: list[str] = []
+
+    def reflect(prompt: str, _config: dict[str, object], **_kwargs: object) -> str:
+        prompts.append(prompt)
+        return (
+            "# Evolved memory\n\n"
+            f"- Reflection round {len(prompts)}: verify the answer before responding.\n"
+        )
+
+    monkeypatch.setattr(methods, "_generate_reflector_markdown", reflect)
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-1",
+        "display_name": "Evolving project",
+        "config": {
+            "schema_version": "2",
+            "evolution": {
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
+                        "config": {},
+                    }
+                }
+            },
+        },
+    }
+    store.create_project(project)
+    evolver = MODULE.TextMemoryEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    )
+
+    artifacts = []
+    for ordinal in (1, 2):
+        session_id = f"dev-session-{ordinal}"
+        request = {
+            "project_id": project["project_id"],
+            "project_name": project["display_name"],
+            "task_title": f"Question {ordinal}",
+            "instruction": f"Answer question {ordinal}",
+        }
+        result = {
+            "response": f"Answer {ordinal}",
+            "model": "test-model",
+            "duration_ms": 1,
+            "logs": ["completed"],
+        }
+        store.start_session(session_id, request)
+        store.complete_session(session_id, result)
+        artifacts.append(evolver.evolve(
+            session_id=session_id,
+            request=request,
+            result=result,
+            store=store,
+        ))
+
+    assert artifacts[0]["method"] == "text_memory_reflector"
+    assert artifacts[1]["previous_artifact_id"] == artifacts[0]["artifact_id"]
+    assert "Reflection round 1" in prompts[1]
+    assert store.latest_memory(project["project_id"])["content"].startswith("# Evolved memory")
 
 
 def test_sqlite_store_marks_interrupted_running_session_failed_on_restart(tmp_path: Path) -> None:

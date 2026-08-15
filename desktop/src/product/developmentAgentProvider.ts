@@ -7,6 +7,19 @@ import {
 } from "./fixtureProvider";
 import type { DesktopProductProviderV2 } from "./providerV2";
 
+const artifactSchema = z.object({
+  artifact_id: z.string().min(1),
+  project_id: z.string().min(1),
+  session_id: z.string().min(1),
+  artifact_type: z.literal("text_memory"),
+  method: z.literal("text_memory_reflector"),
+  content: z.string().min(1),
+  content_sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  byte_size: z.number().int().nonnegative(),
+  previous_artifact_id: z.string().min(1).nullable(),
+  created_at: z.string().min(1),
+}).strict();
+
 const turnResponseSchema = z.object({
   schema_version: z.literal("1"),
   session_id: z.string().min(1),
@@ -14,6 +27,8 @@ const turnResponseSchema = z.object({
   model: z.string().min(1).nullable(),
   duration_ms: z.number().int().nonnegative(),
   logs: z.array(z.string()),
+  evolution_artifact: artifactSchema.optional(),
+  evolution_error: z.string().min(1).optional(),
 }).strict();
 
 const projectSchema = z.object({
@@ -44,6 +59,7 @@ const stateSchema = z.object({
   active_project_id: z.string().min(1).nullable(),
   projects: z.array(projectSchema),
   sessions: z.array(sessionSchema),
+  artifacts: z.array(artifactSchema),
 }).strict();
 
 export interface DevelopmentAgentProviderOptions {
@@ -96,6 +112,7 @@ export function createDevelopmentAgentProvider(
           createdAt: session.created_at,
           updatedAt: session.updated_at,
         })),
+        artifacts: payload.artifacts.map(toPersistedArtifact),
       };
     },
     createProject: async (project) => {
@@ -129,11 +146,29 @@ export function createDevelopmentAgentProvider(
         model: payload.model,
         durationMs: payload.duration_ms,
         logMessages: payload.logs,
+        evolutionArtifact: payload.evolution_artifact
+          ? toPersistedArtifact(payload.evolution_artifact)
+          : null,
       };
     },
   };
 
   return createDevelopmentAgentDesktopProductProvider(backend);
+}
+
+function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {
+  return {
+    artifactId: artifact.artifact_id,
+    projectId: artifact.project_id,
+    sessionId: artifact.session_id,
+    artifactType: artifact.artifact_type,
+    method: artifact.method,
+    content: artifact.content,
+    contentSha256: artifact.content_sha256,
+    byteSize: artifact.byte_size,
+    previousArtifactId: artifact.previous_artifact_id,
+    createdAt: artifact.created_at,
+  };
 }
 
 function jsonRequest(method: "POST" | "PUT", body: object): RequestInit {

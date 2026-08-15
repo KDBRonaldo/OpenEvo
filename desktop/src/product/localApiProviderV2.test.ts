@@ -320,7 +320,7 @@ describe("Desktop v2 product provider", () => {
     expect(result.status).toBe("fresh");
   });
 
-  it("refreshes completed tasks without calling the unavailable artifact collection", async () => {
+  it("loads authoritative v2 artifacts for completed tasks", async () => {
     const current = profile({
       connection_state: "connected",
       active_project_id: "project-1",
@@ -372,7 +372,20 @@ describe("Desktop v2 product provider", () => {
       next_cursor: null,
       has_more: false,
     });
-    vi.mocked(client.taskArtifacts).mockRejectedValue(new Error("route unavailable"));
+    vi.mocked(client.taskArtifacts).mockResolvedValue({
+      schema_version: "2",
+      items: [{
+        schema_version: "2",
+        artifact_id: "artifact-memory-1",
+        project_id: "project-1",
+        artifact_type: "text_memory",
+        manifest_sha256: DIGEST,
+        byte_size: 864,
+        created_at: NOW,
+      }],
+      next_cursor: null,
+      has_more: false,
+    });
 
     const provider = createLocalApiDesktopProductProviderV2({
       client,
@@ -386,8 +399,11 @@ describe("Desktop v2 product provider", () => {
     expect(result.status).toBe("fresh");
     if (result.status !== "fresh") throw new Error("fixture refresh failed");
     expect(result.snapshot.tasks).toHaveLength(1);
-    expect(result.snapshot.artifacts).toEqual([]);
-    expect(client.taskArtifacts).not.toHaveBeenCalled();
+    expect(result.snapshot.artifacts).toEqual([expect.objectContaining({
+      artifact_id: "artifact-memory-1",
+      artifact_type: "text_memory",
+    })]);
+    expect(client.taskArtifacts).toHaveBeenCalledWith("task-1", { limit: 100 });
   });
 
   it("creates a profile from an alias only and uses catalog generation authority", async () => {

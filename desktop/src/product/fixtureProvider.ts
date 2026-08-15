@@ -28,6 +28,20 @@ export interface DevelopmentAgentTurnResult {
   readonly model: string | null;
   readonly durationMs: number;
   readonly logMessages: readonly string[];
+  readonly evolutionArtifact: PersistedDevelopmentArtifact | null;
+}
+
+export interface PersistedDevelopmentArtifact {
+  readonly artifactId: string;
+  readonly projectId: string;
+  readonly sessionId: string;
+  readonly artifactType: "text_memory";
+  readonly method: "text_memory_reflector";
+  readonly content: string;
+  readonly contentSha256: string;
+  readonly byteSize: number;
+  readonly previousArtifactId: string | null;
+  readonly createdAt: string;
 }
 
 export interface PersistedDevelopmentProject {
@@ -57,6 +71,7 @@ export interface PersistedDevelopmentState {
   readonly activeProjectId: string | null;
   readonly projects: readonly PersistedDevelopmentProject[];
   readonly sessions: readonly PersistedDevelopmentSession[];
+  readonly artifacts: readonly PersistedDevelopmentArtifact[];
 }
 
 export interface DevelopmentAgentBackend {
@@ -130,8 +145,8 @@ export function createFixtureDesktopProductProvider(): DesktopProductProviderV2 
 }
 
 /**
- * Development-only provider that keeps project metadata locally but obtains every agent reply
- * from the supplied remote runner. It deliberately publishes no evolution artifacts.
+ * Development-only provider that obtains agent replies and real text-memory evolution artifacts
+ * from the supplied remote runner.
  */
 export function createDevelopmentAgentDesktopProductProvider(
   backend: DevelopmentAgentBackend,
@@ -186,7 +201,7 @@ function createInMemoryDesktopProductProvider(
       const projectId = `${simulateEvolution ? "fixture" : "development"}-project-${sequence}`;
       const config = simulateEvolution
         ? withFixtureEvolutionDefaults(draft.config)
-        : withEvolutionDisabled(draft.config);
+        : withDevelopmentTextMemoryEvolution(draft.config);
       const head = fixtureGenesisHead(projectId, config, sequence);
       const project = {
         schema_version: "2" as const,
@@ -241,7 +256,7 @@ function createInMemoryDesktopProductProvider(
       await ensureDevelopmentState();
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project) throw new Error("Fixture project is missing.");
-      const persistedConfig = simulateEvolution ? config : withEvolutionDisabled(config);
+      const persistedConfig = simulateEvolution ? config : withDevelopmentTextMemoryEvolution(config);
       const updated = {
         ...project,
         display_name: displayName,
@@ -320,7 +335,7 @@ function createInMemoryDesktopProductProvider(
       const admittedTask = fixtureTask(project, ordinal, agentTurn?.sessionId);
       const evolutionRound = simulateEvolution
         ? fixtureEvolutionRound(snapshot, project, admittedTask, ordinal)
-        : { artifacts: [], presentation: {}, usedArtifactIds: [] };
+        : developmentEvolutionRound(snapshot, agentTurn?.evolutionArtifact ?? null);
       const successorHead = fixtureSuccessorHead(
         project.active_project_head,
         project.config,
@@ -747,7 +762,12 @@ export function createFixtureSnapshot(): DesktopProductSnapshotV2 {
 }
 
 function createDevelopmentAgentSnapshot(
-  persisted: PersistedDevelopmentState = { activeProjectId: null, projects: [], sessions: [] },
+  persisted: PersistedDevelopmentState = {
+    activeProjectId: null,
+    projects: [],
+    sessions: [],
+    artifacts: [],
+  },
 ): DesktopProductSnapshotV2 {
   const fixture = createFixtureSnapshot();
   const persistedProjectIds = new Set(persisted.projects.map((project) => project.projectId));
@@ -767,7 +787,7 @@ function createDevelopmentAgentSnapshot(
     NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["tasks"][string]
   > = {};
   const projects = persisted.projects.map((storedProject, projectIndex) => {
-    const config = withEvolutionDisabled(storedProject.config);
+    const config = withDevelopmentTextMemoryEvolution(storedProject.config);
     let activeHead = fixtureGenesisHead(storedProject.projectId, config, projectIndex + 1);
     const projectSessions = persisted.sessions.filter((session) => session.projectId === storedProject.projectId);
     for (const [sessionIndex, session] of projectSessions.entries()) {
@@ -796,6 +816,7 @@ function createDevelopmentAgentSnapshot(
         created_at: session.createdAt,
         updated_at: session.updatedAt,
       });
+      const produced = persisted.artifacts.find((artifact) => artifact.sessionId === session.sessionId);
       taskPresentation[session.sessionId] = {
         instruction: sessionConfig.task,
         transcript: [
@@ -804,11 +825,11 @@ function createDevelopmentAgentSnapshot(
           ...(session.error ? [{ speaker: "system" as const, text: session.error }] : []),
         ],
         outputFiles: [],
-        usedArtifactIds: [],
-        producedArtifactIds: [],
+        usedArtifactIds: produced?.previousArtifactId ? [produced.previousArtifactId] : [],
+        producedArtifactIds: produced ? [produced.artifactId] : [],
       };
       if (session.state === "completed") {
-        activeHead = fixtureSuccessorHead(activeHead, config, 0);
+        activeHead = fixtureSuccessorHead(activeHead, config, produced ? 1 : 0);
       }
     }
     return {
@@ -826,6 +847,19 @@ function createDevelopmentAgentSnapshot(
     };
   });
   const activeProject = projects.find((project) => project.project_id === activeProjectId) ?? null;
+  const artifacts = persisted.artifacts.map((stored) => ({
+    schema_version: "2" as const,
+    artifact_id: stored.artifactId,
+    project_id: stored.projectId,
+    artifact_type: stored.artifactType,
+    manifest_sha256: stored.contentSha256,
+    byte_size: stored.byteSize,
+    created_at: stored.createdAt,
+  }));
+  const artifactPresentation = Object.fromEntries(persisted.artifacts.map((stored) => {
+    const previous = persisted.artifacts.find((candidate) => candidate.artifactId === stored.previousArtifactId);
+    return [stored.artifactId, developmentArtifactPresentation(stored, previous?.content ?? null)];
+  }));
   return {
     ...fixture,
     state: {
@@ -840,14 +874,14 @@ function createDevelopmentAgentSnapshot(
     tasks,
     transitions: {},
     timelines: {},
-    artifacts: [],
+    artifacts,
     services: [],
     capability: activeProject
       ? developmentAgentCapability(activeProject.project_id, activeProject.config.execution.mode)
       : null,
     validation: null,
     activeOperation: null,
-    fixturePresentation: { tasks: taskPresentation, artifacts: {} },
+    fixturePresentation: { tasks: taskPresentation, artifacts: artifactPresentation },
     stream: { status: "fresh", epoch: 1, lastEventId: null },
   };
 }
@@ -1034,12 +1068,31 @@ function developmentAgentCapability(
 ): DesktopProductSnapshotV2["capability"] {
   const capability = fixtureCapability(projectId, executionMode);
   if (!capability) return null;
+  const textMemory = capability.capabilities.targets.find((target) => target.target_id === "text_memory");
+  if (!textMemory) return null;
+  const supportedMethod = textMemory.methods[0]!;
+  const method = {
+    ...supportedMethod,
+    method_id: "text_memory_reflector",
+    display_name: "Text memory reflector",
+    description: "Reflect over real Codex transcripts and publish reusable memory.md for the next Session.",
+  };
   return {
     ...capability,
     capabilities: {
       ...capability.capabilities,
       core_version: "development-agent-bridge",
-      targets: [],
+      targets: [{
+        ...textMemory,
+        configured_default_method_id: method.method_id,
+        effective_default_method_id: method.method_id,
+        accepted_methods: [{
+          method_id: method.method_id,
+          implementation_identity_digest: method.implementation_identity_digest,
+          support: method.support,
+        }],
+        methods: [method],
+      }],
     },
   };
 }
@@ -1057,15 +1110,65 @@ function withFixtureEvolutionDefaults(config: ScienceProjectConfigV2): SciencePr
   return { ...config, evolution: { targets: fixtureEvolutionSelections() } };
 }
 
-function withEvolutionDisabled(config: ScienceProjectConfigV2): ScienceProjectConfigV2 {
+function withDevelopmentTextMemoryEvolution(config: ScienceProjectConfigV2): ScienceProjectConfigV2 {
+  const current = config.evolution.targets.text_memory;
   return {
     ...config,
     evolution: {
-      targets: Object.fromEntries(Object.entries(config.evolution.targets).map(([targetId, selection]) => [
-        targetId,
-        { ...selection, enabled: false },
-      ])),
+      targets: {
+        text_memory: current?.method === "text_memory_reflector"
+          ? current
+          : { enabled: true, method: "text_memory_reflector", config: {} },
+      },
     },
+  };
+}
+
+function developmentEvolutionRound(
+  snapshot: DesktopProductSnapshotV2,
+  artifact: PersistedDevelopmentArtifact | null,
+) {
+  if (artifact === null) return { artifacts: [], presentation: {}, usedArtifactIds: [] };
+  const previousContent = artifact.previousArtifactId
+    ? snapshot.fixturePresentation?.artifacts[artifact.previousArtifactId]?.documents[0]?.content ?? null
+    : null;
+  return {
+    artifacts: [{
+      schema_version: "2" as const,
+      artifact_id: artifact.artifactId,
+      project_id: artifact.projectId,
+      artifact_type: artifact.artifactType,
+      manifest_sha256: artifact.contentSha256,
+      byte_size: artifact.byteSize,
+      created_at: artifact.createdAt,
+    }],
+    presentation: {
+      [artifact.artifactId]: developmentArtifactPresentation(artifact, previousContent),
+    },
+    usedArtifactIds: artifact.previousArtifactId ? [artifact.previousArtifactId] : [],
+  };
+}
+
+function developmentArtifactPresentation(
+  artifact: PersistedDevelopmentArtifact,
+  previousContent: string | null,
+) {
+  return {
+    title: "Evolved text memory",
+    sourceTaskId: artifact.sessionId,
+    targetPath: "memory.md",
+    status: previousContent ? "updated" as const : "created" as const,
+    statusDetail: previousContent
+      ? "The real text_memory_reflector updated memory from this Session transcript."
+      : "The real text_memory_reflector created the first memory from this Session transcript.",
+    documents: [{ path: "memory.md", content: artifact.content }],
+    previousArtifactId: artifact.previousArtifactId,
+    diffLines: previousContent
+      ? [
+          ...previousContent.trimEnd().split("\n").map((text) => ({ kind: "removed" as const, text })),
+          ...artifact.content.trimEnd().split("\n").map((text) => ({ kind: "added" as const, text })),
+        ]
+      : artifact.content.trimEnd().split("\n").map((text) => ({ kind: "added" as const, text })),
   };
 }
 

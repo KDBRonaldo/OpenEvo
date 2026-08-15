@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Development-only loopback daemon for the minimal Desktop -> real Codex turn.
+"""Development-only loopback daemon for real Codex turns and text-memory evolution.
 
 This is intentionally not the release OpenEvo Daemon and must never be exposed directly to a
-network. Bind it to the server loopback interface and reach it only through an SSH tunnel.
+network. It reuses the real text_memory_reflector implementation without claiming the sealed
+release orchestration contract. Bind it to loopback and reach it only through an SSH tunnel.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -17,6 +19,7 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -25,6 +28,12 @@ from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Iterator
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+SOURCE_ROOT = REPOSITORY_ROOT / "src"
+if os.fspath(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, os.fspath(SOURCE_ROOT))
 
 
 MAX_REQUEST_BYTES = 256 * 1024
@@ -49,6 +58,10 @@ class RequestError(ValueError):
 
 
 class AgentRunError(RuntimeError):
+    pass
+
+
+class EvolutionRunError(RuntimeError):
     pass
 
 
@@ -133,6 +146,20 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_sessions_project_created
                     ON development_sessions(project_id, created_at, session_id);
+                CREATE TABLE IF NOT EXISTS development_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                    session_id TEXT NOT NULL UNIQUE REFERENCES development_sessions(session_id),
+                    artifact_type TEXT NOT NULL CHECK (artifact_type = 'text_memory'),
+                    method TEXT NOT NULL CHECK (method = 'text_memory_reflector'),
+                    content TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    previous_artifact_id TEXT REFERENCES development_artifacts(artifact_id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS development_artifacts_project_created
+                    ON development_artifacts(project_id, created_at, artifact_id);
                 """
             )
             restarted_at = utc_now()
@@ -177,6 +204,9 @@ class DevelopmentStateStore:
             sessions = [self._session_record(row) for row in connection.execute(
                 "SELECT * FROM development_sessions ORDER BY created_at, session_id"
             )]
+            artifacts = [self._artifact_record(row) for row in connection.execute(
+                "SELECT * FROM development_artifacts ORDER BY created_at, artifact_id"
+            )]
             active_row = connection.execute(
                 "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
             ).fetchone()
@@ -188,6 +218,7 @@ class DevelopmentStateStore:
             "active_project_id": active_project_id,
             "projects": projects,
             "sessions": sessions,
+            "artifacts": artifacts,
         }
 
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -294,6 +325,84 @@ class DevelopmentStateStore:
                 ),
             )
 
+    def append_session_log(self, session_id: str, message: str) -> list[str]:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT logs_json FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            logs = json.loads(row["logs_json"])
+            logs.append(message)
+            connection.execute(
+                "UPDATE development_sessions SET logs_json = ?, updated_at = ? WHERE session_id = ?",
+                (canonical_json(logs), now, session_id),
+            )
+        return logs
+
+    def latest_memory(self, project_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM development_artifacts
+                WHERE project_id = ? AND artifact_type = 'text_memory'
+                ORDER BY created_at DESC, artifact_id DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        return None if row is None else self._artifact_record(row)
+
+    def project_config(self, project_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT config_json FROM development_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(project_id)
+        return json.loads(row["config_json"])
+
+    def record_text_memory(
+        self,
+        *,
+        artifact_id: str,
+        project_id: str,
+        session_id: str,
+        content: str,
+        previous_artifact_id: str | None,
+    ) -> dict[str, Any]:
+        encoded = content.encode("utf-8")
+        created_at = utc_now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO development_artifacts(
+                    artifact_id, project_id, session_id, artifact_type, method, content,
+                    content_sha256, byte_size, previous_artifact_id, created_at
+                ) VALUES (?, ?, ?, 'text_memory', 'text_memory_reflector', ?, ?, ?, ?, ?)
+                """,
+                (
+                    artifact_id,
+                    project_id,
+                    session_id,
+                    content,
+                    hashlib.sha256(encoded).hexdigest(),
+                    len(encoded),
+                    previous_artifact_id,
+                    created_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM development_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("text memory artifact was not persisted")
+        return self._artifact_record(row)
+
     def fail_session(self, session_id: str, error: str) -> None:
         now = utc_now()
         logs = ["Remote development daemon admitted the session.", f"Codex failed: {error}"]
@@ -322,6 +431,21 @@ class DevelopmentStateStore:
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _artifact_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "artifact_id": row["artifact_id"],
+            "project_id": row["project_id"],
+            "session_id": row["session_id"],
+            "artifact_type": row["artifact_type"],
+            "method": row["method"],
+            "content": row["content"],
+            "content_sha256": row["content_sha256"],
+            "byte_size": row["byte_size"],
+            "previous_artifact_id": row["previous_artifact_id"],
+            "created_at": row["created_at"],
         }
 
 
@@ -370,6 +494,14 @@ class CodexRunner:
         self._timeout_seconds = timeout_seconds
         self._model = model
 
+    @property
+    def codex_binary(self) -> str:
+        return self._codex_binary
+
+    @property
+    def model(self) -> str | None:
+        return self._model
+
     def check_ready(self) -> None:
         try:
             result = subprocess.run(
@@ -387,12 +519,21 @@ class CodexRunner:
             raise AgentRunError(f"Codex is not logged in: {detail or 'login status failed'}")
 
     def run(self, request: dict[str, str]) -> dict[str, Any]:
+        evolved_memory = request.get("evolved_memory", "").strip()
+        memory_section = (
+            "\nEvolved memory from earlier sessions in this project:\n"
+            f"{evolved_memory}\n"
+            "Apply this memory only when relevant. Do not mention that it was injected.\n"
+            if evolved_memory
+            else ""
+        )
         prompt = (
             "You are answering one user message inside an OpenEvo development session. "
             "Do not edit files or run shell commands. Return only the helpful answer that should "
             "be shown to the user.\n\n"
             f"Project: {request['project_name']}\n"
             f"Session: {request['task_title']}\n\n"
+            f"{memory_section}"
             f"User message:\n{request['instruction']}\n"
         )
         started = time.monotonic()
@@ -463,6 +604,159 @@ class CodexRunner:
         }
 
 
+class TextMemoryEvolutionRunner:
+    """Development adapter around OpenEvo's real text_memory_reflector method."""
+
+    def __init__(
+        self,
+        *,
+        state_root: Path,
+        codex_binary: str,
+        model: str,
+        timeout_seconds: int,
+    ) -> None:
+        self._artifact_root = state_root / "evolution-artifacts"
+        self._artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._codex_binary = codex_binary
+        self._model = model
+        self._timeout_seconds = timeout_seconds
+
+    def check_ready(self) -> None:
+        if sys.version_info < (3, 11):
+            raise EvolutionRunError(
+                "real text memory evolution requires Python 3.11 or newer; use `uv run python`"
+            )
+        try:
+            from openevo.evolution.methods import run_method  # noqa: F401
+            from openevo.evolution.models import WorkerClaimedJob  # noqa: F401
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise EvolutionRunError(
+                "OpenEvo Python dependencies are unavailable; run this daemon with `uv run python`"
+            ) from exc
+
+    def evolve(
+        self,
+        *,
+        session_id: str,
+        request: dict[str, str],
+        result: dict[str, Any],
+        store: DevelopmentStateStore,
+    ) -> dict[str, Any] | None:
+        config = store.project_config(request["project_id"])
+        selection = (
+            config.get("evolution", {}).get("targets", {}).get("text_memory")
+            if isinstance(config, dict)
+            else None
+        )
+        if not isinstance(selection, dict) or selection.get("method") != "text_memory_reflector":
+            # Migrate projects created by the earlier no-evolution development bridge.
+            selection = {"enabled": True, "method": "text_memory_reflector", "config": {}}
+        if selection.get("enabled") is not True:
+            return None
+
+        try:
+            from openevo.evolution.methods import run_method
+            from openevo.evolution.models import WorkerClaimedJob
+        except (ImportError, ModuleNotFoundError) as exc:
+            raise EvolutionRunError(
+                "OpenEvo Python dependencies are unavailable; run this daemon with `uv run python`"
+            ) from exc
+
+        dataset_dir = self._artifact_root / "datasets" / session_id
+        dataset_dir.mkdir(mode=0o700, parents=True, exist_ok=False)
+        records_path = dataset_dir / "records.jsonl"
+        record = {
+            "event_id": f"{session_id}-completed",
+            "task_id": session_id,
+            "session_id": session_id,
+            "status": "COMPLETED",
+            "reward": 1.0,
+            "traces": [{
+                "prompt_messages": [{"role": "user", "content": request["instruction"]}],
+                "response_messages": [{"role": "assistant", "content": result["response"]}],
+                "metadata": {
+                    "capture_mode": "transcript",
+                    "token_level_metrics_available": False,
+                },
+            }],
+        }
+        records_path.write_text(canonical_json(record) + "\n", encoding="utf-8")
+        manifest_path = dataset_dir / "manifest.json"
+        manifest_path.write_text(
+            canonical_json({
+                "dataset_id": f"dataset-{session_id}",
+                "name": f"{request['task_title']} transcript",
+                "records_path": records_path.name,
+                "records_uri": records_path.resolve().as_uri(),
+                "event_count": 1,
+                "capture_mode": "transcript",
+                "token_level_metrics_available": False,
+            }),
+            encoding="utf-8",
+        )
+
+        previous = store.latest_memory(request["project_id"])
+        inputs: list[dict[str, Any]] = [{
+            "artifact_id": f"dataset-{session_id}",
+            "type": "dataset",
+            "uri": manifest_path.resolve().as_uri(),
+            "name": f"{request['task_title']} transcript",
+        }]
+        if previous is not None:
+            previous_path = dataset_dir / "previous-memory.md"
+            previous_path.write_text(previous["content"], encoding="utf-8")
+            inputs.append({
+                "artifact_id": previous["artifact_id"],
+                "type": "text_memory",
+                "uri": previous_path.resolve().as_uri(),
+                "name": "previous evolved memory",
+            })
+
+        method_config = selection.get("config")
+        method_config = dict(method_config) if isinstance(method_config, dict) else {}
+        method_config.update({
+            "name": f"{request['project_name']} evolved memory",
+            "promoted": True,
+            "reflector_llm": {
+                "provider": "codex_cli",
+                "model": self._model,
+                "codex_bin": self._codex_binary,
+                "timeout_seconds": self._timeout_seconds,
+            },
+        })
+        try:
+            [artifact] = run_method(
+                WorkerClaimedJob(
+                    job_id=f"job-text-memory-{session_id}",
+                    lease_id=f"lease-text-memory-{session_id}",
+                    job_type="reference",
+                    method="text_memory_reflector",
+                    input_artifacts=inputs,
+                    config=method_config,
+                ),
+                artifact_root=self._artifact_root,
+            )
+            if str(artifact.type) not in {"text_memory", "ArtifactType.TEXT_MEMORY"}:
+                raise EvolutionRunError("text_memory_reflector returned the wrong artifact type")
+            if not artifact.uri.startswith("file://"):
+                raise EvolutionRunError("text_memory_reflector returned a non-file artifact")
+            memory_path = Path(artifact.uri.removeprefix("file://"))
+            memory_content = memory_path.read_text(encoding="utf-8")
+        except EvolutionRunError:
+            raise
+        except Exception as exc:
+            raise EvolutionRunError(f"text_memory_reflector failed: {exc}") from exc
+
+        artifact_id = f"dev-text-memory-{session_id.removeprefix('dev-session-')}"
+        return store.record_text_memory(
+            artifact_id=artifact_id,
+            project_id=request["project_id"],
+            session_id=session_id,
+            content=memory_content,
+            previous_artifact_id=None if previous is None else previous["artifact_id"],
+        )
+
+
 class DevelopmentAgentServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -472,11 +766,13 @@ class DevelopmentAgentServer(ThreadingHTTPServer):
         token: str,
         runner: CodexRunner,
         store: DevelopmentStateStore,
+        evolution_runner: TextMemoryEvolutionRunner | None = None,
     ) -> None:
         super().__init__(address, DevelopmentAgentHandler)
         self.token = token
         self.runner = runner
         self.store = store
+        self.evolution_runner = evolution_runner
         self.turn_lock = threading.Lock()
 
 
@@ -575,13 +871,43 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except StateConflictError as exc:
                 self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
                 return
-            result = self.server.runner.run(request)
+            previous_memory = self.server.store.latest_memory(request["project_id"])
+            execution_request = {
+                **request,
+                **(
+                    {"evolved_memory": previous_memory["content"]}
+                    if previous_memory is not None
+                    else {}
+                ),
+            }
+            result = self.server.runner.run(execution_request)
         except AgentRunError as exc:
             self.server.store.fail_session(session_id, str(exc))
             self._json_error(HTTPStatus.BAD_GATEWAY, "codex_failed", str(exc))
         else:
             result = {**result, "session_id": session_id}
             self.server.store.complete_session(session_id, result)
+            if self.server.evolution_runner is not None:
+                try:
+                    evolved = self.server.evolution_runner.evolve(
+                        session_id=session_id,
+                        request=request,
+                        result=result,
+                        store=self.server.store,
+                    )
+                except EvolutionRunError as exc:
+                    result["evolution_error"] = str(exc)
+                    result["logs"] = self.server.store.append_session_log(
+                        session_id,
+                        f"Text memory evolution failed: {exc}",
+                    )
+                else:
+                    if evolved is not None:
+                        result["evolution_artifact"] = evolved
+                        result["logs"] = self.server.store.append_session_log(
+                            session_id,
+                            "OpenEvo text_memory_reflector published evolved memory for the next session.",
+                        )
             self._json(HTTPStatus.OK, result)
         finally:
             self.server.turn_lock.release()
@@ -655,9 +981,31 @@ def main() -> int:
     runner.check_ready()
     state_path = args.state_path.expanduser().resolve()
     store = DevelopmentStateStore(state_path)
-    server = DevelopmentAgentServer(("127.0.0.1", args.port), token, runner, store)
+    evolution_model = (
+        os.environ.get("OPENEVO_DEV_EVOLUTION_MODEL", "").strip()
+        or model
+        or "gpt-5.5"
+    )
+    evolution_runner = TextMemoryEvolutionRunner(
+        state_root=state_path.parent,
+        codex_binary=codex_binary,
+        model=evolution_model,
+        timeout_seconds=args.timeout_seconds,
+    )
+    try:
+        evolution_runner.check_ready()
+    except EvolutionRunError as exc:
+        raise SystemExit(str(exc)) from exc
+    server = DevelopmentAgentServer(
+        ("127.0.0.1", args.port),
+        token,
+        runner,
+        store,
+        evolution_runner,
+    )
     print(f"Development agent daemon listening on 127.0.0.1:{args.port}", flush=True)
     print(f"Development state database: {state_path}", flush=True)
+    print(f"Real text_memory_reflector enabled with model {evolution_model}.", flush=True)
     print("It is loopback-only; connect through an SSH local-forward tunnel.", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)

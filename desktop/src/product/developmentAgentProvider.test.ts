@@ -27,6 +27,7 @@ describe("development agent provider", () => {
   it("restores persisted projects and real transcripts after creating a new provider", async () => {
     const projects: Record<string, unknown>[] = [];
     const sessions: Record<string, unknown>[] = [];
+    const artifacts: Record<string, unknown>[] = [];
     let activeProjectId: string | null = null;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -37,6 +38,7 @@ describe("development agent provider", () => {
           active_project_id: activeProjectId,
           projects,
           sessions,
+          artifacts,
         });
       }
       if (url.endsWith("/projects") && init?.method === "POST") {
@@ -51,6 +53,19 @@ describe("development agent provider", () => {
         return jsonResponse({ schema_version: "1" }, 201);
       }
       if (url.endsWith("/sessions") && init?.method === "POST") {
+        const evolved = {
+          artifact_id: "dev-text-memory-1",
+          project_id: body!.project_id,
+          session_id: "dev-session-1",
+          artifact_type: "text_memory",
+          method: "text_memory_reflector",
+          content: "# Evolved memory\n\n- Verify arithmetic before answering.\n",
+          content_sha256: "c".repeat(64),
+          byte_size: 54,
+          previous_artifact_id: null,
+          created_at: "2026-08-14T10:01:02Z",
+        };
+        artifacts.push(evolved);
         sessions.push({
           session_id: "dev-session-1",
           project_id: body!.project_id,
@@ -72,6 +87,7 @@ describe("development agent provider", () => {
           model: null,
           duration_ms: 42,
           logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
+          evolution_artifact: evolved,
         });
       }
       throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
@@ -89,8 +105,12 @@ describe("development agent provider", () => {
     const created = await provider.refresh();
     if (created.status !== "fresh") throw new Error("created provider was not fresh");
     const project = created.snapshot.projects[0]!;
-    expect(Object.values(project.config.evolution.targets).every((target) => !target.enabled)).toBe(true);
-    expect(created.snapshot.capability?.capabilities.targets).toEqual([]);
+    expect(project.config.evolution.targets.text_memory).toEqual({
+      enabled: true,
+      method: "text_memory_reflector",
+      config: {},
+    });
+    expect(created.snapshot.capability?.capabilities.targets[0]?.methods[0]?.method_id).toBe("text_memory_reflector");
 
     const task = await provider.submitTask(project.project_id, {
       actionId: "submit-live-task",
@@ -102,8 +122,9 @@ describe("development agent provider", () => {
       { speaker: "user", text: "What is two plus two?" },
       { speaker: "agent", text: "Two plus two is four." },
     ]);
-    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.producedArtifactIds).toEqual([]);
-    expect(completed.snapshot.artifacts).toEqual([]);
+    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.producedArtifactIds).toEqual(["dev-text-memory-1"]);
+    expect(completed.snapshot.artifacts.map((artifact) => artifact.artifact_id)).toEqual(["dev-text-memory-1"]);
+    expect(completed.snapshot.fixturePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({
       method: "POST",
     }));
