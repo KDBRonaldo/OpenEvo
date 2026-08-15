@@ -131,24 +131,36 @@ Tauri-only origin set. `npm run dev:fixture` remains the explicit visual-fixture
 loop behind `/product-preview.html`; it is never a live Daemon workflow.
 
 For the narrower "ask the remote Codex and evolve selected documents" loop, use
-`npm run dev:agent`. This mode bypasses the sealed release lifecycle, but calls
-the repository's real `text_memory_reflector`, `skill_bundle_reflector`, and
-`agent_system_reflector` implementations selected for each successful Session. The
+`npm run dev:agent`. This mode bypasses the sealed release lifecycle, but obtains
+its target, method, support, schema, and renderer metadata from the Core framework
+catalog at `GET /openevo-dev-agent/v1/capabilities`. The response is explicitly
+marked `development_catalog_unverified`; it is not a verified release registry.
+The development bridge executes compatible legacy-worker methods selected for each
+successful Session and rejects unknown target/method pairs or undeclared outputs. The
 server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
 forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
 while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
 SSH command, or remote address. The development daemon stores Projects, active
 Project selection, Session state, instructions, Codex responses, model label,
-duration, errors, process-log summaries, per-Session evolution selections, and
-versioned document artifacts in
+duration, errors, process-log summaries, per-Session evolution selections,
+per-target method/config/job state/artifact IDs, and versioned typed artifacts in
 the remote SQLite database `~/.openevo/dev-agent/state.sqlite3`. Dataset and
-generated `memory.md`, `SKILL.md`, and `AGENTS.md` files live under
+generated artifact payloads live under
 `~/.openevo/dev-agent/evolution-artifacts/`. The latest promoted documents are
 injected into the next Project Session. The renderer
 reloads that authority from `GET /openevo-dev-agent/v1/state`, so a browser
 refresh preserves Project, conversation, selection, and evolution history. This bridge is
 reachable only in Vite mode `openevo-live-agent` and is not imported by the
 packaged release entrypoint.
+
+The renderer has no development method table. It builds the optional multi-target
+Session picker from the returned capabilities, preserves the selected method and
+user config, and renders artifact bodies by `renderer_kind`: Markdown documents,
+file bundles, structured reports, or adapter metadata. Adding a future method to
+the Core registry therefore does not require another target-ID branch in the
+Desktop picker or development daemon dispatch. Methods using an invocation ABI the
+development bridge does not yet own remain unadvertised there instead of silently
+falling back.
 
 The same development bridge has an SSH-alias-driven one-command launcher. Add
 the server once to the local system OpenSSH configuration, then run this from

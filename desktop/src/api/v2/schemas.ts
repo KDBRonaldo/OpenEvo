@@ -760,7 +760,7 @@ export const artifactV2Schema = z.object({
   schema_version: schemaVersionV2Schema,
   artifact_id: opaqueIdV2Schema,
   project_id: opaqueIdV2Schema,
-  artifact_type: z.enum(["dataset", "workspace_result", "text_memory", "skill_bundle", "agent_system", "parametric_memory", "diagnostic"]),
+  artifact_type: z.enum(["dataset", "workspace_result", "text_memory", "skill_bundle", "agent_system", "parametric_memory", "report", "diagnostic"]),
   manifest_sha256: sha256DigestV2Schema,
   byte_size: z.number().int().safe().min(0).max(16 * 1024 * 1024 * 1024),
   created_at: utcTimestampV2Schema,

@@ -70,13 +70,23 @@ export interface FixturePresentationV2 {
       readonly diffLines?: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
     }[];
     readonly selectedEvolution?: readonly {
-      readonly targetId: "text_memory" | "skill_bundle" | "agent_system";
-      readonly method: "text_memory_reflector" | "skill_bundle_reflector" | "agent_system_reflector";
+      readonly targetId: string;
+      readonly method: string;
+      readonly config?: Readonly<Record<string, unknown>>;
     }[];
     readonly evolutionErrors?: readonly {
-      readonly targetId: "text_memory" | "skill_bundle" | "agent_system";
-      readonly method: "text_memory_reflector" | "skill_bundle_reflector" | "agent_system_reflector";
+      readonly targetId: string;
+      readonly method: string;
       readonly message: string;
+    }[];
+    readonly evolutionJobs?: readonly {
+      readonly jobId: string;
+      readonly targetId: string;
+      readonly methodId: string;
+      readonly config: Readonly<Record<string, unknown>>;
+      readonly state: "queued" | "running" | "completed" | "failed";
+      readonly artifactIds: readonly string[];
+      readonly error: string | null;
     }[];
     readonly usedArtifactIds: readonly string[];
     readonly producedArtifactIds: readonly string[];

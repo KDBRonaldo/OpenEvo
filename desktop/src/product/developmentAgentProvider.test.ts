@@ -18,13 +18,46 @@ const config: ScienceProjectConfigV2 = {
   },
   evolution: {
     targets: {
-      text_memory: { enabled: true, method: "ignored-in-live-agent-mode", config: {} },
+      text_memory: { enabled: true, method: "text_memory_reflector", config: {} },
     },
   },
 };
 
 describe("development agent provider", () => {
   it("restores persisted projects and real transcripts after creating a new provider", async () => {
+    const methodIds = ["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"];
+    const supportedAxis = { state: "supported", message: "Supported", reason_code: null, missing_requirements: [] } as const;
+    const support = { overall: "supported", execution: supportedAxis, capture: supportedAxis, harness: supportedAxis, runtime: supportedAxis } as const;
+    const capabilities = {
+      schema_version: "1",
+      core_version: "development-catalog-unverified",
+      registry_digest: "a".repeat(64),
+      evaluated_profile: { execution_mode: "subscription", capture_mode: "transcript", harness_id: "codex", harness_capabilities: [], runtime_capabilities: [] },
+      targets: methodIds.map((methodId, index) => {
+        const targetId = ["text_memory", "skill_bundle", "agent_system"][index]!;
+        const digest = (index + 1).toString().repeat(64);
+        const method = {
+          method_id: methodId, display_name: methodId, description: "Development method",
+          exposure: "desktop", maturity: "experimental", execution_modes: ["subscription"],
+          capture_modes: ["transcript"], supported_harness_ids: ["codex"], harness_requirements: [],
+          runtime_requirements: [], input_bindings: [], output_artifact_types: [targetId],
+          config_schema_json: '{"additionalProperties":false,"properties":{},"type":"object"}',
+          default_config_json: "{}", implementation_identity_digest: digest, support,
+        } as const;
+        return {
+          target_id: targetId, display_name: targetId, description: "Development target",
+          artifact_type: targetId, exposure: "desktop", maturity: "experimental",
+          handler_id: `${targetId}_handler`, configured_default_method_id: methodId,
+          effective_default_method_id: methodId, configured_default_support: support,
+          renderer_kind: targetId === "skill_bundle" ? "file_bundle" : "markdown",
+          renderer_contract_version: "1", contribution_contract_version: "2", context_order: index,
+          implementation_identity_digest: digest, handler_identity_digest: digest,
+          accepted_methods: [{ method_id: methodId, implementation_identity_digest: method.implementation_identity_digest, support: method.support }],
+          selection_resolvers: [],
+          methods: [method],
+        };
+      }),
+    };
     const projects: Record<string, unknown>[] = [];
     const sessions: Record<string, unknown>[] = [];
     const artifacts: Record<string, unknown>[] = [];
@@ -39,6 +72,14 @@ describe("development agent provider", () => {
           projects,
           sessions,
           artifacts,
+          evolution_jobs: [],
+        });
+      }
+      if (url.endsWith("/capabilities")) {
+        return jsonResponse({
+          schema_version: "1",
+          authority: "development_catalog_unverified",
+          capabilities,
         });
       }
       if (url.endsWith("/projects") && init?.method === "POST") {
@@ -58,7 +99,11 @@ describe("development agent provider", () => {
           project_id: body!.project_id,
           session_id: "dev-session-1",
           artifact_type: "text_memory",
+          target_id: "text_memory",
           method: "text_memory_reflector",
+          renderer_kind: "markdown",
+          documents: [{ path: "memory.md", media_type: "text/markdown", content: "# Evolved memory\n\n- Verify arithmetic before answering.\n" }],
+          manifest: { content_path: "memory.md" },
           content_path: "memory.md",
           content: "# Evolved memory\n\n- Verify arithmetic before answering.\n",
           content_sha256: "c".repeat(64),
@@ -77,7 +122,7 @@ describe("development agent provider", () => {
           state: "completed",
           duration_ms: 42,
           logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
-          selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector" }],
+          selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector", config: {} }],
           evolution_errors: [],
           error: null,
           created_at: "2026-08-14T10:01:00Z",

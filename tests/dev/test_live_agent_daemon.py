@@ -106,10 +106,16 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
         "project_name": "Memory project",
         "task_title": "Second question",
         "instruction": "Answer the next question.",
-        "evolved_memory": "# Evolved memory\n\n- Verify the answer before responding.",
+        "evolved_contexts": [{
+            "target_id": "text_memory",
+            "documents": [{
+                "path": "memory.md",
+                "content": "# Evolved memory\n\n- Verify the answer before responding.",
+            }],
+        }],
     })
 
-    assert "Evolved memory from earlier sessions" in captured["prompt"]
+    assert "Evolved text_memory from earlier sessions" in captured["prompt"]
     assert "Verify the answer before responding" in captured["prompt"]
     assert result["response"] == "The next answer used prior memory."
 
@@ -174,6 +180,8 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "development_sessions",
         "development_artifacts",
         "development_document_artifacts",
+        "development_evolution_artifacts_v2",
+        "development_evolution_jobs",
     } <= tables
 
 
@@ -241,6 +249,7 @@ def test_real_text_memory_reflector_persists_and_consumes_prior_memory(
             result=result,
             store=store,
         )
+        assert batch["errors"] == []
         artifacts.append(batch["artifacts"][0])
 
     assert artifacts[0]["method"] == "text_memory_reflector"
@@ -278,7 +287,11 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
             "evolution": {
                 "targets": {
                     target_id: {"enabled": True, "method": method, "config": {}}
-                    for target_id, (method, _path) in MODULE.DOCUMENT_EVOLUTION_METHODS.items()
+                    for target_id, method in {
+                        "text_memory": "text_memory_reflector",
+                        "skill_bundle": "skill_bundle_reflector",
+                        "agent_system": "agent_system_reflector",
+                    }.items()
                 }
             },
         },
@@ -317,6 +330,41 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
         "SKILL.md",
         "AGENTS.md",
     }
+    jobs = store.snapshot()["evolution_jobs"]
+    assert {job["target_id"] for job in jobs} == {
+        "text_memory",
+        "skill_bundle",
+        "agent_system",
+    }
+    assert all(job["state"] == "completed" and job["artifact_ids"] for job in jobs)
+    assert all(job["config"] == {} for job in jobs)
+
+
+def test_development_capabilities_are_projected_from_the_core_catalog(tmp_path: Path) -> None:
+    runner = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    )
+    runner.check_ready()
+    payload = runner.capabilities()
+
+    assert payload["authority"] == "development_catalog_unverified"
+    targets = payload["capabilities"]["targets"]
+    assert {target["target_id"] for target in targets} >= {
+        "text_memory",
+        "skill_bundle",
+        "agent_system",
+    }
+    assert all(target["renderer_kind"] in {
+        "markdown", "file_bundle", "structured_summary", "adapter"
+    } for target in targets)
+    assert all(
+        method["method_id"] != "text_memory_memevolve"
+        for target in targets
+        for method in target["methods"]
+    )
 
 
 def test_document_evolution_runner_allows_a_session_with_no_selected_method(
@@ -330,7 +378,11 @@ def test_document_evolution_runner_allows_a_session_with_no_selected_method(
             "evolution": {
                 "targets": {
                     target_id: {"enabled": False, "method": method, "config": {}}
-                    for target_id, (method, _path) in MODULE.DOCUMENT_EVOLUTION_METHODS.items()
+                    for target_id, method in {
+                        "text_memory": "text_memory_reflector",
+                        "skill_bundle": "skill_bundle_reflector",
+                        "agent_system": "agent_system_reflector",
+                    }.items()
                 }
             }
         },

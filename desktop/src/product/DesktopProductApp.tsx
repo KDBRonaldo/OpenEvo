@@ -64,48 +64,16 @@ import {
 } from "./providerV2";
 
 type Workspace = "research" | "evolution" | "system";
-type DocumentEvolutionTargetId = "text_memory" | "skill_bundle" | "agent_system";
-
-const DOCUMENT_EVOLUTION_OPTIONS = [
-  {
-    targetId: "text_memory",
-    method: "text_memory_reflector",
-    title: "Text memory",
-    description: "Summarize reusable experience into memory.md.",
-  },
-  {
-    targetId: "skill_bundle",
-    method: "skill_bundle_reflector",
-    title: "Skill bundle",
-    description: "Distill a reusable workflow into SKILL.md.",
-  },
-  {
-    targetId: "agent_system",
-    method: "agent_system_reflector",
-    title: "Agent system",
-    description: "Turn lessons into future AGENTS.md instructions.",
-  },
-] as const;
 
 function withSessionDocumentEvolution(
   config: ScienceProjectConfigV2,
   task: ScienceProjectConfigV2["task"],
-  selectedTargets: readonly DocumentEvolutionTargetId[],
+  targets: ScienceProjectConfigV2["evolution"]["targets"],
 ): ScienceProjectConfigV2 {
-  const selected = new Set(selectedTargets);
   return {
     ...config,
     task,
-    evolution: {
-      targets: Object.fromEntries(DOCUMENT_EVOLUTION_OPTIONS.map((option) => {
-        const current = config.evolution.targets[option.targetId];
-        return [option.targetId, {
-          enabled: selected.has(option.targetId),
-          method: option.method,
-          config: current?.method === option.method ? current.config : {},
-        }];
-      })),
-    },
+    evolution: { targets },
   } as ScienceProjectConfigV2;
 }
 
@@ -265,7 +233,7 @@ export function DesktopProductApp({
   const runProject = async (
     project: ProjectV2,
     task: ScienceProjectConfigV2["task"],
-    selectedEvolutionTargets: readonly DocumentEvolutionTargetId[],
+    selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
   ): Promise<void> => {
     if (project.state !== "ready") return;
     setBusy(true);
@@ -432,6 +400,7 @@ export function DesktopProductApp({
               timelines={snapshot.timelines}
               taskLogs={taskLogs}
               artifacts={snapshot.artifacts}
+              capability={snapshot.capability}
               fixturePresentation={snapshot.fixturePresentation}
               selectedTaskId={selectedTaskId}
               busy={busy}
@@ -1004,6 +973,7 @@ function ResearchWorkspaceV2({
   timelines,
   taskLogs,
   artifacts,
+  capability,
   fixturePresentation,
   selectedTaskId,
   busy,
@@ -1023,6 +993,7 @@ function ResearchWorkspaceV2({
   readonly timelines: DesktopProductSnapshotV2["timelines"];
   readonly taskLogs: Readonly<Record<string, readonly LogEntryV2[]>>;
   readonly artifacts: DesktopProductSnapshotV2["artifacts"];
+  readonly capability: DesktopProductSnapshotV2["capability"];
   readonly fixturePresentation: DesktopProductSnapshotV2["fixturePresentation"];
   readonly selectedTaskId: string | null;
   readonly busy: boolean;
@@ -1031,7 +1002,7 @@ function ResearchWorkspaceV2({
   readonly onOpenSettings: () => void;
   readonly onRun: (
     task: ScienceProjectConfigV2["task"],
-    selectedEvolutionTargets: readonly DocumentEvolutionTargetId[],
+    selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
   ) => void;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
@@ -1050,18 +1021,41 @@ function ResearchWorkspaceV2({
   const ready = project.state === "ready" && project.active_project_head !== null && project.admission_etag !== null;
   const [taskTitle, setTaskTitle] = useState(project.config.task.title);
   const [taskObjective, setTaskObjective] = useState(project.config.task.objective);
-  const [selectedEvolutionTargets, setSelectedEvolutionTargets] = useState<readonly DocumentEvolutionTargetId[]>(
-    DOCUMENT_EVOLUTION_OPTIONS.flatMap((option) => (
-      project.config.evolution.targets[option.targetId]?.enabled ? [option.targetId] : []
-    )),
+  const sessionEvolutionCapabilities = useMemo(() => (
+    capability?.project_id === project.project_id
+      ? capability.capabilities.targets
+        .filter((target) => target.exposure === "desktop")
+        .map((target) => ({
+          ...target,
+          methods: target.methods.filter((method) => method.support?.overall !== "unsupported" && method.support?.overall !== "unavailable"),
+        }))
+        .filter((target) => target.methods.length > 0)
+      : []
+  ), [capability, project.project_id]);
+  const initialSessionEvolutionTargets = useCallback(() => Object.fromEntries(
+    sessionEvolutionCapabilities.map((target) => {
+      const current = project.config.evolution.targets[target.target_id];
+      const selectedMethod = target.methods.find((method) => method.method_id === current?.method)
+        ?? target.methods.find((method) => method.method_id === target.effective_default_method_id)
+        ?? target.methods[0]!;
+      let defaultConfig: ScienceProjectConfigV2["evolution"]["targets"][string]["config"] = {};
+      try { defaultConfig = JSON.parse(selectedMethod.default_config_json) as typeof defaultConfig; } catch { defaultConfig = {}; }
+      return [target.target_id, {
+        enabled: current?.enabled === true,
+        method: selectedMethod.method_id,
+        config: current?.method === selectedMethod.method_id ? current.config : defaultConfig,
+      }];
+    }),
+  ) as ScienceProjectConfigV2["evolution"]["targets"], [project.config.evolution.targets, sessionEvolutionCapabilities]);
+  const [selectedEvolutionTargets, setSelectedEvolutionTargets] = useState<ScienceProjectConfigV2["evolution"]["targets"]>(
+    initialSessionEvolutionTargets,
   );
   useEffect(() => {
     setTaskTitle(project.config.task.title);
     setTaskObjective(project.config.task.objective);
-    setSelectedEvolutionTargets(DOCUMENT_EVOLUTION_OPTIONS.flatMap((option) => (
-      project.config.evolution.targets[option.targetId]?.enabled ? [option.targetId] : []
-    )));
-  }, [project.project_id, project.project_config_sha256]);
+    setSelectedEvolutionTargets(initialSessionEvolutionTargets());
+  }, [initialSessionEvolutionTargets, project.project_id, project.project_config_sha256]);
+  const selectedEvolutionCount = Object.values(selectedEvolutionTargets).filter((target) => target.enabled).length;
   const normalizedTask = {
     title: taskTitle.trim(),
     objective: taskObjective.trim(),
@@ -1124,24 +1118,36 @@ function ResearchWorkspaceV2({
         {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy}>
           <legend>Evolution after this session <span>Optional · select any number</span></legend>
           <div className="session-evolution-options">
-            {DOCUMENT_EVOLUTION_OPTIONS.map((option) => {
-              const checked = selectedEvolutionTargets.includes(option.targetId);
-              return <label key={option.targetId} className={checked ? "selected" : ""}>
-                <input type="checkbox" checked={checked} onChange={(event) => {
-                  setSelectedEvolutionTargets((current) => event.target.checked
-                    ? [...current, option.targetId]
-                    : current.filter((targetId) => targetId !== option.targetId));
-                }} />
-                <span><strong>{option.title}</strong><small>{option.description}</small></span>
-              </label>;
+            {sessionEvolutionCapabilities.map((target) => {
+              const selection = selectedEvolutionTargets[target.target_id]!;
+              return <article key={target.target_id} className={selection.enabled ? "selected" : ""}>
+                <label>
+                  <input type="checkbox" checked={selection.enabled} onChange={(event) => {
+                    setSelectedEvolutionTargets((current) => ({
+                      ...current,
+                      [target.target_id]: { ...selection, enabled: event.target.checked },
+                    }));
+                  }} />
+                  <span><strong>{target.display_name}</strong><small>{target.description}</small></span>
+                </label>
+                {target.methods.length > 1 ? <select aria-label={`${target.display_name} method`} value={selection.method ?? ""} onChange={(event) => {
+                  const method = target.methods.find((candidate) => candidate.method_id === event.target.value)!;
+                  let defaultConfig: ScienceProjectConfigV2["evolution"]["targets"][string]["config"] = {};
+                  try { defaultConfig = JSON.parse(method.default_config_json) as typeof defaultConfig; } catch { defaultConfig = {}; }
+                  setSelectedEvolutionTargets((current) => ({
+                    ...current,
+                    [target.target_id]: { enabled: true, method: method.method_id, config: defaultConfig },
+                  }));
+                }}>{target.methods.map((method) => <option key={method.method_id} value={method.method_id}>{method.display_name}</option>)}</select> : null}
+              </article>;
             })}
           </div>
-          <p>{selectedEvolutionTargets.length === 0
+          <p>{selectedEvolutionCount === 0
             ? "No evolution will run after this session."
-            : `${selectedEvolutionTargets.length} evolution method${selectedEvolutionTargets.length === 1 ? "" : "s"} will run after the agent replies.`}</p>
+            : `${selectedEvolutionCount} evolution method${selectedEvolutionCount === 1 ? "" : "s"} will run after the agent replies.`}</p>
         </fieldset> : null}
         {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
-        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? selectedEvolutionTargets.length : Object.values(project.config.evolution.targets).filter((target) => target.enabled).length} selected</strong></div></div>
+        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? selectedEvolutionCount : Object.values(project.config.evolution.targets).filter((target) => target.enabled).length} selected</strong></div></div>
       </section>
       <section className="product-panel active-run-panel">
         <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? fixturePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
@@ -1248,26 +1254,34 @@ function TaskAuthorityCardV2({
     <article className="v2-task-card v2-task-result-detail">
       <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
-      <section className="v2-result-section v2-conversation-section" data-session-priority="conversation"><div className="v2-result-section-head"><div><span className="panel-kicker">Conversation</span><h3>Agent response</h3></div><strong>{presentation?.transcript.length ?? logs.length} messages</strong></div>{presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : <p className="v2-empty-copy">The agent response is not loaded yet.</p>}</section>
-      <section className="v2-evolution-priority" data-session-priority="evolution">
+      <section className="v2-result-section v2-conversation-section v2-session-module" data-session-priority="conversation">
+        <header className="v2-session-module-heading"><div><h2>Conversation</h2><p>The request and the agent's response from this Session.</p></div><strong>{presentation?.transcript.length ?? logs.length} messages</strong></header>
+        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : <p className="v2-empty-copy">The agent response is not loaded yet.</p>}
+      </section>
+      <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
+        <header className="v2-session-module-heading"><div><h2>Evolution</h2><p>Document changes learned from this Session for future Sessions.</p></div><strong>{producedArtifacts.length} produced</strong></header>
         <div className="session-evolution-summary">
           <div><span className="panel-kicker">Selected for this session</span><strong>{presentation?.selectedEvolution?.length ?? 0} methods</strong></div>
           {presentation?.selectedEvolution?.length ? <div className="session-evolution-statuses">{presentation.selectedEvolution.map((selection) => {
-            const option = DOCUMENT_EVOLUTION_OPTIONS.find((candidate) => candidate.targetId === selection.targetId)!;
             const error = presentation.evolutionErrors?.find((candidate) => candidate.targetId === selection.targetId);
-            const produced = producedArtifacts.some((artifact) => artifact.artifact_type === selection.targetId);
-            return <span key={selection.targetId} className={error ? "failed" : produced ? "produced" : "pending"} title={error?.message}>
-              {option.title} · {error ? "failed" : produced ? "produced" : "pending"}
+            const job = presentation.evolutionJobs?.find((candidate) => candidate.targetId === selection.targetId);
+            const produced = (job?.artifactIds.length ?? 0) > 0;
+            const state = error ? "failed" : job?.state ?? (produced ? "completed" : "pending");
+            return <span key={selection.targetId} className={error ? "failed" : produced ? "produced" : "pending"} title={error?.message ?? `${selection.method} · ${state}`}>
+              {selection.targetId.replaceAll("_", " ")} · {selection.method} · {state}
             </span>;
           })}</div> : <p>No document evolution was selected for this session.</p>}
         </div>
         <ResultCollection title="Evolution produced" empty="This Task did not publish an evolution artifact." artifacts={producedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} />
+        {selectedProducedArtifact ? resultInspector : null}
       </section>
-      {selectedProducedArtifact ? resultInspector : null}
-      <section className="v2-supporting-results" data-session-priority="supporting"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></section>
-      {selectedResult && !selectedProducedArtifact ? resultInspector : null}
-      <section className="v2-session-technical-details" data-session-priority="technical">
-        <header><span className="panel-kicker">Technical run details</span><p>Execution status and immutable identifiers for troubleshooting.</p></header>
+      <section className="v2-supporting-module v2-session-module" data-session-priority="supporting">
+        <header className="v2-session-module-heading secondary"><div><h2>Files and context</h2><p>Supporting inputs and files associated with this Session.</p></div></header>
+        <div className="v2-supporting-results"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></div>
+        {selectedResult && !selectedProducedArtifact ? resultInspector : null}
+      </section>
+      <section className="v2-session-technical-details v2-session-module" data-session-priority="technical">
+        <header className="v2-session-module-heading tertiary"><div><h2>Technical details</h2><p>Execution status and immutable identifiers for troubleshooting.</p></div></header>
       <div className="v2-task-authority"><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
       <div className="v2-attempt-list">{task.attempts.map((attempt) => {
         const authoritative = attempt.attempt_id === task.authoritative_attempt_id;
@@ -1374,7 +1388,10 @@ function EvolutionWorkspaceV2({
   const capabilities = snapshot.capability?.project_id === project.project_id
     ? snapshot.capability.capabilities.targets.filter((target) => target.exposure === "desktop")
     : [];
-  const artifacts = snapshot.artifacts.filter((artifact) => artifact.project_id === project.project_id && ["text_memory", "skill_bundle", "agent_system"].includes(artifact.artifact_type));
+  const artifacts = snapshot.artifacts.filter((artifact) => (
+    artifact.project_id === project.project_id
+    && !["dataset", "workspace_result", "diagnostic"].includes(artifact.artifact_type)
+  ));
   return (
     <div className="workspace-stack" data-testid="evolution-workspace">
       <div className="workspace-heading"><div><p className="eyebrow">Evolution</p><h1>Cross-session changes</h1><p>Review what changed and which Project Head the next session will use.</p></div></div>
@@ -1384,7 +1401,12 @@ function EvolutionWorkspaceV2({
         {capabilities.length === 0 ? <Notice tone="warning" title="No visible evolution methods" detail="The active verified Core registry did not publish a Desktop-visible target for this execution profile." /> : <div className="v2-target-list">{capabilities.map((target) => {
           const current = targets[target.target_id] ?? { enabled: false, method: null, config: {} };
           const methodId = current.method ?? target.effective_default_method_id ?? "";
-          const methods = target.methods;
+          const methods = target.methods.filter((method) => (
+            (
+              method.support?.overall !== "unsupported"
+              && method.support?.overall !== "unavailable"
+            ) || method.method_id === methodId
+          ));
           const resolvers = target.selection_resolvers.map((resolver) => ({
             ...resolver,
             supported: resolver.resolved_methods.length > 0
@@ -1616,6 +1638,7 @@ function artifactTypeLabel(type: DesktopProductSnapshotV2["artifacts"][number]["
     skill_bundle: "Skill bundle",
     agent_system: "Agent system",
     parametric_memory: "Parametric memory",
+    report: "Report",
     diagnostic: "Diagnostic",
   };
   return labels[type];

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { scienceProjectConfigV2Schema } from "../api/v2/schemas";
+import { evolutionCapabilitiesV2Schema, scienceProjectConfigV2Schema } from "../api/v2/schemas";
 import {
   createDevelopmentAgentDesktopProductProvider,
   type DevelopmentAgentBackend,
@@ -11,10 +11,18 @@ const artifactSchema = z.object({
   artifact_id: z.string().min(1),
   project_id: z.string().min(1),
   session_id: z.string().min(1),
-  artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system"]),
-  method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
-  content_path: z.enum(["memory.md", "SKILL.md", "AGENTS.md"]),
-  content: z.string().min(1),
+  target_id: z.string().min(1),
+  artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system", "parametric_memory", "report"]),
+  method: z.string().min(1),
+  renderer_kind: z.enum(["markdown", "file_bundle", "structured_summary", "adapter"]),
+  documents: z.array(z.object({
+    path: z.string().min(1),
+    media_type: z.string().min(1),
+    content: z.string(),
+  }).strict()),
+  manifest: z.record(z.string(), z.unknown()),
+  content_path: z.string().min(1).nullable(),
+  content: z.string().nullable(),
   content_sha256: z.string().regex(/^[0-9a-f]{64}$/),
   byte_size: z.number().int().nonnegative(),
   previous_artifact_id: z.string().min(1).nullable(),
@@ -30,8 +38,8 @@ const turnResponseSchema = z.object({
   logs: z.array(z.string()),
   evolution_artifacts: z.array(artifactSchema).optional(),
   evolution_errors: z.array(z.object({
-    target_id: z.enum(["text_memory", "skill_bundle", "agent_system"]),
-    method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+    target_id: z.string().min(1),
+    method: z.string().min(1),
     message: z.string().min(1),
   }).strict()).optional(),
 }).strict();
@@ -55,12 +63,13 @@ const sessionSchema = z.object({
   duration_ms: z.number().int().nonnegative().nullable(),
   logs: z.array(z.string()),
   selected_evolution: z.array(z.object({
-    target_id: z.enum(["text_memory", "skill_bundle", "agent_system"]),
-    method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+    target_id: z.string().min(1),
+    method: z.string().min(1),
+    config: z.record(z.string(), z.unknown()),
   }).strict()),
   evolution_errors: z.array(z.object({
-    target_id: z.enum(["text_memory", "skill_bundle", "agent_system"]),
-    method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+    target_id: z.string().min(1),
+    method: z.string().min(1),
     message: z.string().min(1),
   }).strict()),
   error: z.string().nullable(),
@@ -74,6 +83,24 @@ const stateSchema = z.object({
   projects: z.array(projectSchema),
   sessions: z.array(sessionSchema),
   artifacts: z.array(artifactSchema),
+  evolution_jobs: z.array(z.object({
+    job_id: z.string().min(1),
+    session_id: z.string().min(1),
+    target_id: z.string().min(1),
+    method_id: z.string().min(1),
+    config: z.record(z.string(), z.unknown()),
+    state: z.enum(["queued", "running", "completed", "failed"]),
+    artifact_ids: z.array(z.string().min(1)),
+    error: z.string().nullable(),
+    created_at: z.string().min(1),
+    updated_at: z.string().min(1),
+  }).strict()),
+}).strict();
+
+const capabilityResponseSchema = z.object({
+  schema_version: z.literal("1"),
+  authority: z.literal("development_catalog_unverified"),
+  capabilities: evolutionCapabilitiesV2Schema,
 }).strict();
 
 export interface DevelopmentAgentProviderOptions {
@@ -102,7 +129,10 @@ export function createDevelopmentAgentProvider(
 
   const backend: DevelopmentAgentBackend = {
     loadState: async () => {
-      const payload = stateSchema.parse(await requestJson("/state"));
+      const [payload, capabilityPayload] = await Promise.all([
+        requestJson("/state").then((value) => stateSchema.parse(value)),
+        requestJson("/capabilities").then((value) => capabilityResponseSchema.parse(value)),
+      ]);
       return {
         activeProjectId: payload.active_project_id,
         projects: payload.projects.map((project) => ({
@@ -125,6 +155,7 @@ export function createDevelopmentAgentProvider(
           selectedEvolution: session.selected_evolution.map((selection) => ({
             targetId: selection.target_id,
             method: selection.method,
+            config: selection.config,
           })),
           evolutionErrors: session.evolution_errors.map((error) => ({
             targetId: error.target_id,
@@ -136,6 +167,17 @@ export function createDevelopmentAgentProvider(
           updatedAt: session.updated_at,
         })),
         artifacts: payload.artifacts.map(toPersistedArtifact),
+        evolutionJobs: payload.evolution_jobs.map((job) => ({
+          jobId: job.job_id,
+          sessionId: job.session_id,
+          targetId: job.target_id,
+          methodId: job.method_id,
+          config: job.config,
+          state: job.state,
+          artifactIds: job.artifact_ids,
+          error: job.error,
+        })),
+        capabilities: capabilityPayload.capabilities,
       };
     },
     createProject: async (project) => {
@@ -187,8 +229,16 @@ function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {
     artifactId: artifact.artifact_id,
     projectId: artifact.project_id,
     sessionId: artifact.session_id,
+    targetId: artifact.target_id,
     artifactType: artifact.artifact_type,
     method: artifact.method,
+    rendererKind: artifact.renderer_kind,
+    documents: artifact.documents.map((document) => ({
+      path: document.path,
+      mediaType: document.media_type,
+      content: document.content,
+    })),
+    manifest: artifact.manifest,
     contentPath: artifact.content_path,
     content: artifact.content,
     contentSha256: artifact.content_sha256,

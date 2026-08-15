@@ -51,13 +51,6 @@ ALLOWED_PROJECT_FIELDS = {"schema_version", "project_id", "display_name", "confi
 ALLOWED_PROJECT_UPDATE_FIELDS = {"schema_version", "display_name", "config"}
 PROJECT_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)$")
 ACTIVATE_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)/activate$")
-DOCUMENT_EVOLUTION_METHODS = {
-    "text_memory": ("text_memory_reflector", "memory.md"),
-    "skill_bundle": ("skill_bundle_reflector", "SKILL.md"),
-    "agent_system": ("agent_system_reflector", "AGENTS.md"),
-}
-
-
 class RequestError(ValueError):
     pass
 
@@ -82,22 +75,30 @@ def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
-def selected_document_evolution(config: object) -> list[dict[str, str]]:
+def selected_document_evolution(config: object) -> list[dict[str, Any]]:
     if not isinstance(config, dict):
         return []
     evolution = config.get("evolution")
     targets = evolution.get("targets") if isinstance(evolution, dict) else None
     if not isinstance(targets, dict):
         return []
-    selected: list[dict[str, str]] = []
-    for target_id, (method, _content_path) in DOCUMENT_EVOLUTION_METHODS.items():
-        selection = targets.get(target_id)
-        if (
-            isinstance(selection, dict)
-            and selection.get("enabled") is True
-            and selection.get("method") == method
-        ):
-            selected.append({"target_id": target_id, "method": method})
+    selected: list[dict[str, Any]] = []
+    for target_id, selection in sorted(targets.items()):
+        if not isinstance(target_id, str) or not ID_PATTERN.fullmatch(target_id):
+            continue
+        if not isinstance(selection, dict) or selection.get("enabled") is not True:
+            continue
+        method = selection.get("method")
+        method_config = selection.get("config", {})
+        if not isinstance(method, str) or not ID_PATTERN.fullmatch(method):
+            continue
+        if not isinstance(method_config, dict):
+            continue
+        selected.append({
+            "target_id": target_id,
+            "method": method,
+            "config": method_config,
+        })
     return selected
 
 
@@ -210,6 +211,42 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_document_artifacts_project_created
                     ON development_document_artifacts(project_id, artifact_type, created_at, artifact_id);
+                CREATE TABLE IF NOT EXISTS development_evolution_artifacts_v2 (
+                    artifact_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                    session_id TEXT NOT NULL REFERENCES development_sessions(session_id),
+                    target_id TEXT NOT NULL,
+                    artifact_type TEXT NOT NULL,
+                    method_id TEXT NOT NULL,
+                    renderer_kind TEXT NOT NULL CHECK (
+                        renderer_kind IN ('markdown', 'file_bundle', 'structured_summary', 'adapter')
+                    ),
+                    documents_json TEXT NOT NULL,
+                    manifest_json TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    previous_artifact_id TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS development_evolution_artifacts_v2_project_created
+                    ON development_evolution_artifacts_v2(
+                        project_id, target_id, created_at, artifact_id
+                    );
+                CREATE TABLE IF NOT EXISTS development_evolution_jobs (
+                    job_id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL REFERENCES development_sessions(session_id),
+                    target_id TEXT NOT NULL,
+                    method_id TEXT NOT NULL,
+                    config_json TEXT NOT NULL,
+                    state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed')),
+                    artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(session_id, target_id)
+                );
+                CREATE INDEX IF NOT EXISTS development_evolution_jobs_session
+                    ON development_evolution_jobs(session_id, created_at, job_id);
                 """
             )
             session_columns = {
@@ -237,7 +274,32 @@ class DevelopmentStateStore:
                 FROM development_artifacts
                 """
             )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO development_evolution_artifacts_v2(
+                    artifact_id, project_id, session_id, target_id, artifact_type,
+                    method_id, renderer_kind, documents_json, manifest_json,
+                    content_sha256, byte_size, previous_artifact_id, created_at
+                )
+                SELECT artifact_id, project_id, session_id, artifact_type, artifact_type,
+                       method,
+                       CASE artifact_type WHEN 'skill_bundle' THEN 'file_bundle' ELSE 'markdown' END,
+                       json_array(json_object('path', content_path, 'media_type', 'text/markdown',
+                                              'content', content)),
+                       json_object('content_path', content_path),
+                       content_sha256, byte_size, previous_artifact_id, created_at
+                FROM development_document_artifacts
+                """
+            )
             restarted_at = utc_now()
+            connection.execute(
+                """
+                UPDATE development_evolution_jobs
+                SET state = 'failed', error = ?, updated_at = ?
+                WHERE state IN ('queued', 'running')
+                """,
+                ("Development daemon restarted before this evolution job completed.", restarted_at),
+            )
             connection.execute(
                 """
                 UPDATE development_sessions
@@ -280,7 +342,10 @@ class DevelopmentStateStore:
                 "SELECT * FROM development_sessions ORDER BY created_at, session_id"
             )]
             artifacts = [self._artifact_record(row) for row in connection.execute(
-                "SELECT * FROM development_document_artifacts ORDER BY created_at, artifact_id"
+                "SELECT * FROM development_evolution_artifacts_v2 ORDER BY created_at, artifact_id"
+            )]
+            jobs = [self._job_record(row) for row in connection.execute(
+                "SELECT * FROM development_evolution_jobs ORDER BY created_at, job_id"
             )]
             active_row = connection.execute(
                 "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
@@ -294,6 +359,7 @@ class DevelopmentStateStore:
             "projects": projects,
             "sessions": sessions,
             "artifacts": artifacts,
+            "evolution_jobs": jobs,
         }
 
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -431,16 +497,16 @@ class DevelopmentStateStore:
                 (canonical_json(errors), utc_now(), session_id),
             )
 
-    def latest_artifact(self, project_id: str, artifact_type: str) -> dict[str, Any] | None:
+    def latest_artifact(self, project_id: str, target_id: str) -> dict[str, Any] | None:
         with self._lock, self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT * FROM development_document_artifacts
-                WHERE project_id = ? AND artifact_type = ?
+                SELECT * FROM development_evolution_artifacts_v2
+                WHERE project_id = ? AND target_id = ?
                 ORDER BY created_at DESC, artifact_id DESC
                 LIMIT 1
                 """,
-                (project_id, artifact_type),
+                (project_id, target_id),
             ).fetchone()
         return None if row is None else self._artifact_record(row)
 
@@ -457,44 +523,114 @@ class DevelopmentStateStore:
     def latest_memory(self, project_id: str) -> dict[str, Any] | None:
         return self.latest_artifact(project_id, "text_memory")
 
-    def record_document_artifact(
+    def latest_context_artifacts(self, project_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT artifact.*
+                FROM development_evolution_artifacts_v2 AS artifact
+                JOIN (
+                    SELECT target_id, MAX(created_at || artifact_id) AS latest
+                    FROM development_evolution_artifacts_v2
+                    WHERE project_id = ? AND artifact_type != 'report'
+                    GROUP BY target_id
+                ) AS selected
+                  ON selected.target_id = artifact.target_id
+                 AND selected.latest = artifact.created_at || artifact.artifact_id
+                WHERE artifact.project_id = ?
+                ORDER BY artifact.target_id
+                """,
+                (project_id, project_id),
+            ).fetchall()
+        return [self._artifact_record(row) for row in rows]
+
+    def start_evolution_job(
+        self,
+        *,
+        job_id: str,
+        session_id: str,
+        target_id: str,
+        method_id: str,
+        config: dict[str, Any],
+    ) -> None:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO development_evolution_jobs(
+                    job_id, session_id, target_id, method_id, config_json, state,
+                    artifact_ids_json, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
+                """,
+                (job_id, session_id, target_id, method_id, canonical_json(config), now, now),
+            )
+
+    def finish_evolution_job(
+        self,
+        job_id: str,
+        *,
+        artifact_ids: list[str] | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE development_evolution_jobs
+                SET state = ?, artifact_ids_json = ?, error = ?, updated_at = ?
+                WHERE job_id = ?
+                """,
+                (
+                    "failed" if error is not None else "completed",
+                    canonical_json(artifact_ids or []),
+                    error,
+                    utc_now(),
+                    job_id,
+                ),
+            )
+
+    def record_evolution_artifact(
         self,
         *,
         artifact_id: str,
         project_id: str,
         session_id: str,
+        target_id: str,
         artifact_type: str,
-        method: str,
-        content_path: str,
-        content: str,
+        method_id: str,
+        renderer_kind: str,
+        documents: list[dict[str, str]],
+        manifest: dict[str, Any],
         previous_artifact_id: str | None,
     ) -> dict[str, Any]:
-        encoded = content.encode("utf-8")
+        encoded = canonical_json(documents).encode("utf-8")
         created_at = utc_now()
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO development_document_artifacts(
-                    artifact_id, project_id, session_id, artifact_type, method, content_path,
-                    content, content_sha256, byte_size, previous_artifact_id, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO development_evolution_artifacts_v2(
+                    artifact_id, project_id, session_id, target_id, artifact_type,
+                    method_id, renderer_kind, documents_json, manifest_json,
+                    content_sha256, byte_size, previous_artifact_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact_id,
                     project_id,
                     session_id,
+                    target_id,
                     artifact_type,
-                    method,
-                    content_path,
-                    content,
+                    method_id,
+                    renderer_kind,
+                    canonical_json(documents),
+                    canonical_json(manifest),
                     hashlib.sha256(encoded).hexdigest(),
-                    len(encoded),
+                    sum(len(document["content"].encode("utf-8")) for document in documents),
                     previous_artifact_id,
                     created_at,
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM development_document_artifacts WHERE artifact_id = ?",
+                "SELECT * FROM development_evolution_artifacts_v2 WHERE artifact_id = ?",
                 (artifact_id,),
             ).fetchone()
         if row is None:
@@ -535,18 +671,39 @@ class DevelopmentStateStore:
 
     @staticmethod
     def _artifact_record(row: sqlite3.Row) -> dict[str, Any]:
+        documents = json.loads(row["documents_json"])
+        primary = documents[0] if documents else None
         return {
             "artifact_id": row["artifact_id"],
             "project_id": row["project_id"],
             "session_id": row["session_id"],
+            "target_id": row["target_id"],
             "artifact_type": row["artifact_type"],
-            "method": row["method"],
-            "content_path": row["content_path"],
-            "content": row["content"],
+            "method": row["method_id"],
+            "renderer_kind": row["renderer_kind"],
+            "documents": documents,
+            "manifest": json.loads(row["manifest_json"]),
+            "content_path": primary["path"] if primary else None,
+            "content": primary["content"] if primary else None,
             "content_sha256": row["content_sha256"],
             "byte_size": row["byte_size"],
             "previous_artifact_id": row["previous_artifact_id"],
             "created_at": row["created_at"],
+        }
+
+    @staticmethod
+    def _job_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "job_id": row["job_id"],
+            "session_id": row["session_id"],
+            "target_id": row["target_id"],
+            "method_id": row["method_id"],
+            "config": json.loads(row["config_json"]),
+            "state": row["state"],
+            "artifact_ids": json.loads(row["artifact_ids_json"]),
+            "error": row["error"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
         }
 
 
@@ -619,40 +776,30 @@ class CodexRunner:
             detail = status_output.strip()[:500]
             raise AgentRunError(f"Codex is not logged in: {detail or 'login status failed'}")
 
-    def run(self, request: dict[str, str]) -> dict[str, Any]:
-        evolved_memory = request.get("evolved_memory", "").strip()
-        evolved_skill = request.get("evolved_skill", "").strip()
-        evolved_agent_system = request.get("evolved_agent_system", "").strip()
-        memory_section = (
-            "\nEvolved memory from earlier sessions in this project:\n"
-            f"{evolved_memory}\n"
-            "Apply this memory only when relevant. Do not mention that it was injected.\n"
-            if evolved_memory
-            else ""
-        )
-        skill_section = (
-            "\nEvolved reusable skill from earlier sessions in this project:\n"
-            f"{evolved_skill}\n"
-            "Follow this workflow only when it is relevant to the current request.\n"
-            if evolved_skill
-            else ""
-        )
-        agent_system_section = (
-            "\nEvolved agent-system instructions from earlier sessions in this project:\n"
-            f"{evolved_agent_system}\n"
-            "Treat these as project-specific operating guidance.\n"
-            if evolved_agent_system
-            else ""
-        )
+    def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        context_sections: list[str] = []
+        for context in request.get("evolved_contexts", []):
+            if not isinstance(context, dict):
+                continue
+            documents = context.get("documents", [])
+            rendered = "\n\n".join(
+                document.get("content", "").strip()
+                for document in documents
+                if isinstance(document, dict) and document.get("content", "").strip()
+            )
+            if rendered:
+                context_sections.append(
+                    f"\nEvolved {context.get('target_id', 'context')} from earlier sessions "
+                    f"in this project:\n{rendered}\n"
+                    "Apply it only when relevant and do not mention that it was injected.\n"
+                )
         prompt = (
             "You are answering one user message inside an OpenEvo development session. "
             "Do not edit files or run shell commands. Return only the helpful answer that should "
             "be shown to the user.\n\n"
             f"Project: {request['project_name']}\n"
             f"Session: {request['task_title']}\n\n"
-            f"{memory_section}"
-            f"{skill_section}"
-            f"{agent_system_section}"
+            f"{''.join(context_sections)}"
             f"User message:\n{request['instruction']}\n"
         )
         started = time.monotonic()
@@ -724,7 +871,7 @@ class CodexRunner:
 
 
 class DocumentEvolutionRunner:
-    """Development adapter around OpenEvo's real textual reflector methods."""
+    """Development adapter driven by Core framework descriptors instead of target switches."""
 
     def __init__(
         self,
@@ -739,6 +886,8 @@ class DocumentEvolutionRunner:
         self._codex_binary = codex_binary
         self._model = model
         self._timeout_seconds = timeout_seconds
+        self._registry: Any | None = None
+        self._capabilities: dict[str, Any] | None = None
 
     def check_ready(self) -> None:
         if sys.version_info < (3, 11):
@@ -746,12 +895,147 @@ class DocumentEvolutionRunner:
                 "real document evolution requires Python 3.11 or newer; use `uv run python`"
             )
         try:
-            from openevo.evolution.methods import run_method  # noqa: F401
+            from openevo.evolution.framework.builtins import (  # noqa: F401
+                ImplementationDistributionIdentity,
+                build_builtin_registry,
+            )
+            from openevo.evolution.framework.capabilities import (  # noqa: F401
+                build_evolution_capabilities,
+            )
+            from openevo.evolution.methods import METHOD_REGISTRY  # noqa: F401
             from openevo.evolution.models import WorkerClaimedJob  # noqa: F401
         except (ImportError, ModuleNotFoundError) as exc:
             raise EvolutionRunError(
                 "OpenEvo Python dependencies are unavailable; run this daemon with `uv run python`"
             ) from exc
+        self._load_catalog()
+
+    def _load_catalog(self) -> None:
+        from openevo.evolution.framework.builtins import (
+            ImplementationDistributionIdentity,
+            build_builtin_registry,
+        )
+        from openevo.evolution.framework.capabilities import build_evolution_capabilities
+        from openevo.evolution.framework.contracts import EvolutionExecutionProfile
+
+        identity = ImplementationDistributionIdentity(
+            distribution="openevo",
+            distribution_version="0.1.10.dev0",
+            distribution_digest=hashlib.sha256(
+                b"openevo-development-catalog-v1"
+            ).hexdigest(),
+        )
+        self._registry = build_builtin_registry(identity)
+        capability = build_evolution_capabilities(
+            self._registry,
+            profile=EvolutionExecutionProfile(
+                execution_mode="subscription",
+                capture_mode="transcript",
+                harness_id="codex",
+            ),
+            audience="maintainer",
+            core_version="development-catalog-unverified",
+        ).model_dump(mode="json")
+        # The development bridge currently executes the legacy worker ABI. Context-v1 methods
+        # stay registered in Core but are not advertised as runnable by this bridge yet.
+        for target in capability["targets"]:
+            target["methods"] = [
+                method
+                for method in target["methods"]
+                if self._registry.methods[method["method_id"]].invocation_abi.value
+                == "legacy_worker_job_v1"
+            ]
+        self._capabilities = capability
+
+    def capabilities(self) -> dict[str, Any]:
+        if self._capabilities is None:
+            self._load_catalog()
+        return {
+            "schema_version": "1",
+            "authority": "development_catalog_unverified",
+            "capabilities": self._capabilities,
+        }
+
+    def _descriptor(self, target_id: str, method_id: str) -> tuple[Any, Any, Any]:
+        if self._registry is None:
+            self._load_catalog()
+        try:
+            target = self._registry.targets[target_id]
+            method = self._registry.methods[method_id]
+            handler = self._registry.target_handlers[target.handler_id]
+        except KeyError as exc:
+            raise EvolutionRunError(f"unknown evolution selection {target_id}/{method_id}") from exc
+        if method.target_id != target.id:
+            raise EvolutionRunError(f"{method_id} does not belong to target {target_id}")
+        if method.invocation_abi.value != "legacy_worker_job_v1":
+            raise EvolutionRunError(
+                f"{method_id} uses {method.invocation_abi.value}, which this development bridge "
+                "does not execute yet"
+            )
+        return target, method, handler
+
+    def _method_config(self, method: Any, requested: dict[str, Any]) -> dict[str, Any]:
+        if self._registry is None:
+            raise EvolutionRunError("evolution catalog is unavailable")
+        config = dict(requested)
+        for injection in method.project_config_injections:
+            if injection.source.value == "reflector_llm":
+                config[injection.field_name] = {
+                    "provider": "codex_cli",
+                    "model": self._model,
+                    "timeout_seconds": self._timeout_seconds,
+                }
+            else:
+                raise EvolutionRunError(
+                    f"development bridge cannot provide {injection.source.value}"
+                )
+        normalized = self._registry.normalize_method_config(method.id, config)
+        normalized.update({"promoted": True})
+        return normalized
+
+    @staticmethod
+    def _materialize_previous(previous: dict[str, Any], root: Path) -> str:
+        documents = previous.get("documents", [])
+        if previous.get("renderer_kind") == "file_bundle":
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            for document in documents:
+                destination = root / document["path"]
+                destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                destination.write_text(document["content"], encoding="utf-8")
+            return root.resolve().as_uri()
+        root.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        content = documents[0]["content"] if documents else ""
+        root.write_text(content, encoding="utf-8")
+        return root.resolve().as_uri()
+
+    @staticmethod
+    def _read_documents(uri: str, renderer_kind: str) -> list[dict[str, str]]:
+        from urllib.parse import unquote, urlparse
+
+        parsed = urlparse(uri)
+        if parsed.scheme != "file":
+            return []
+        path = Path(unquote(parsed.path))
+        if renderer_kind == "adapter":
+            return []
+        candidates = [path] if path.is_file() else sorted(
+            candidate for candidate in path.rglob("*") if candidate.is_file()
+        )
+        documents: list[dict[str, str]] = []
+        for candidate in candidates[:128]:
+            if candidate.stat().st_size > MAX_CAPTURE_BYTES:
+                continue
+            try:
+                content = candidate.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            relative = candidate.name if path.is_file() else candidate.relative_to(path).as_posix()
+            documents.append({
+                "path": relative,
+                "media_type": "text/markdown" if relative.lower().endswith(".md") else "text/plain",
+                "content": content,
+            })
+        return documents
 
     def evolve(
         self,
@@ -767,8 +1051,12 @@ class DocumentEvolutionRunner:
             return {"artifacts": [], "errors": []}
 
         try:
-            from openevo.evolution.methods import run_method
-            from openevo.evolution.models import WorkerClaimedJob
+            from openevo.evolution.framework.execution import (
+                InputBindingSource,
+                resolve_method_inputs,
+            )
+            from openevo.evolution.methods import METHOD_REGISTRY
+            from openevo.evolution.models import WorkerClaimInputArtifact, WorkerClaimedJob
         except (ImportError, ModuleNotFoundError) as exc:
             raise EvolutionRunError(
                 "OpenEvo Python dependencies are unavailable; run this daemon with `uv run python`"
@@ -813,79 +1101,109 @@ class DocumentEvolutionRunner:
             "uri": manifest_path.resolve().as_uri(),
             "name": f"{request['task_title']} transcript",
         }
-        target_config = config.get("evolution", {}).get("targets", {})
         persisted: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         for item in selected:
             target_id = item["target_id"]
-            method, content_path = DOCUMENT_EVOLUTION_METHODS[target_id]
-            selection = target_config[target_id]
-            previous = store.latest_artifact(request["project_id"], target_id)
-            inputs: list[dict[str, Any]] = [dataset_input]
-            if previous is not None:
-                if target_id == "skill_bundle":
-                    previous_root = dataset_dir / "previous-skill-bundle"
-                    previous_root.mkdir(mode=0o700)
-                    previous_path = previous_root / "SKILL.md"
-                    previous_uri = previous_root.resolve().as_uri()
-                else:
-                    previous_path = dataset_dir / f"previous-{content_path.lower()}"
-                    previous_uri = previous_path.resolve().as_uri()
-                previous_path.write_text(previous["content"], encoding="utf-8")
-                inputs.append({
-                    "artifact_id": previous["artifact_id"],
-                    "type": target_id,
-                    "uri": previous_uri,
-                    "name": f"previous evolved {target_id.replace('_', ' ')}",
-                })
-
-            method_config = selection.get("config")
-            method_config = dict(method_config) if isinstance(method_config, dict) else {}
-            method_config.update({
-                "name": f"{request['project_name']} evolved {target_id.replace('_', ' ')}",
-                "promoted": True,
-                "reflector_llm": {
-                    "provider": "codex_cli",
-                    "model": self._model,
-                    "codex_bin": self._codex_binary,
-                    "timeout_seconds": self._timeout_seconds,
-                },
-            })
-            if target_id == "agent_system":
-                method_config.setdefault("target_path", "AGENTS.md")
+            method_id = item["method"]
+            job_id = f"job-{target_id.replace('_', '-')}-{session_id}"
+            store.start_evolution_job(
+                job_id=job_id,
+                session_id=session_id,
+                target_id=target_id,
+                method_id=method_id,
+                config=item["config"],
+            )
             try:
-                [artifact] = run_method(
+                target, method, handler = self._descriptor(target_id, method_id)
+                method_config = self._method_config(method, item["config"])
+                previous = store.latest_artifact(request["project_id"], target_id)
+                current_dataset = WorkerClaimInputArtifact.model_validate(dataset_input)
+                previous_input = None
+                if previous is not None:
+                    previous_uri = self._materialize_previous(
+                        previous,
+                        dataset_dir / f"previous-{target_id}",
+                    )
+                    previous_input = WorkerClaimInputArtifact(
+                        artifact_id=previous["artifact_id"],
+                        type=target.artifact_type,
+                        uri=previous_uri,
+                        name=f"previous evolved {target.display_name}",
+                    )
+                candidates: dict[str, list[Any]] = {}
+                for binding in method.input_bindings:
+                    if binding.source in {
+                        InputBindingSource.CURRENT_DATASET,
+                        InputBindingSource.HISTORY_DATASETS,
+                    }:
+                        candidates[binding.binding_id] = [current_dataset]
+                    elif binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
+                        candidates[binding.binding_id] = [] if previous_input is None else [previous_input]
+                    else:
+                        candidates[binding.binding_id] = []
+                resolved = resolve_method_inputs(method.input_bindings, candidates)
+                method_handle = METHOD_REGISTRY.get(method_id)
+                if method_handle is None:
+                    raise EvolutionRunError(f"{method_id} has no installed legacy worker handle")
+                artifacts = method_handle(
                     WorkerClaimedJob(
-                        job_id=f"job-{target_id.replace('_', '-')}-{session_id}",
+                        job_id=job_id,
                         lease_id=f"lease-{target_id.replace('_', '-')}-{session_id}",
-                        job_type="reference",
-                        method=method,
-                        input_artifacts=inputs,
-                        config=method_config,
+                        job_type="development_catalog",
+                        method=method_id,
+                        target_id=target_id,
+                        registry_snapshot_digest=self._registry.registry_digest,
+                        method_identity_digest=self._registry.identity_digest_for("method", method_id),
+                        input_artifacts=list(resolved.input_artifacts),
+                        config={
+                            **method_config,
+                            "name": f"{request['project_name']} evolved {target.display_name}",
+                        },
                     ),
                     artifact_root=self._artifact_root,
                 )
-                if str(artifact.type) not in {target_id, f"ArtifactType.{target_id.upper()}"}:
-                    raise EvolutionRunError(f"{method} returned the wrong artifact type")
-                if not artifact.uri.startswith("file://"):
-                    raise EvolutionRunError(f"{method} returned a non-file artifact")
-                output_path = Path(artifact.uri.removeprefix("file://"))
-                if target_id == "skill_bundle":
-                    output_path /= "SKILL.md"
-                content = output_path.read_text(encoding="utf-8")
-                artifact_id = f"dev-{target_id.replace('_', '-')}-{session_id.removeprefix('dev-session-')}"
-                persisted.append(store.record_document_artifact(
-                    artifact_id=artifact_id,
-                    project_id=request["project_id"],
-                    session_id=session_id,
-                    artifact_type=target_id,
-                    method=method,
-                    content_path=content_path,
-                    content=content,
-                    previous_artifact_id=None if previous is None else previous["artifact_id"],
-                ))
+                artifact_ids: list[str] = []
+                for output_index, artifact in enumerate(artifacts):
+                    artifact_type = artifact.type.value
+                    if artifact_type not in method.output_artifact_types:
+                        raise EvolutionRunError(
+                            f"{method_id} returned undeclared artifact type {artifact_type}"
+                        )
+                    renderer_kind = (
+                        "structured_summary" if artifact_type == "report"
+                        else handler.renderer_kind.value
+                    )
+                    documents = self._read_documents(artifact.uri, renderer_kind)
+                    suffix = "" if output_index == 0 else f"-{output_index + 1}"
+                    artifact_id = (
+                        f"dev-{artifact_type.replace('_', '-')}-"
+                        f"{session_id.removeprefix('dev-session-')}{suffix}"
+                    )
+                    artifact_ids.append(artifact_id)
+                    persisted.append(store.record_evolution_artifact(
+                        artifact_id=artifact_id,
+                        project_id=request["project_id"],
+                        session_id=session_id,
+                        target_id=target_id,
+                        artifact_type=artifact_type,
+                        method_id=method_id,
+                        renderer_kind=renderer_kind,
+                        documents=documents,
+                        manifest=artifact.manifest,
+                        previous_artifact_id=(
+                            previous["artifact_id"]
+                            if previous is not None and artifact_type == target.artifact_type
+                            else None
+                        ),
+                    ))
+                store.finish_evolution_job(job_id, artifact_ids=artifact_ids)
             except Exception as exc:
-                errors.append({"target_id": target_id, "method": method, "message": str(exc)})
+                try:
+                    store.finish_evolution_job(job_id, error=str(exc))
+                except Exception:
+                    pass
+                errors.append({"target_id": target_id, "method": method_id, "message": str(exc)})
         return {"artifacts": persisted, "errors": errors}
 
 
@@ -925,6 +1243,16 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             return
         if self.path == "/openevo-dev-agent/v1/state":
             self._json(HTTPStatus.OK, self.server.store.snapshot())
+            return
+        if self.path == "/openevo-dev-agent/v1/capabilities":
+            if self.server.evolution_runner is None:
+                self._json_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "capabilities_unavailable",
+                    "development evolution runner is unavailable",
+                )
+            else:
+                self._json(HTTPStatus.OK, self.server.evolution_runner.capabilities())
             return
         self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
 
@@ -1008,29 +1336,10 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except StateConflictError as exc:
                 self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
                 return
-            previous_memory = self.server.store.latest_memory(request["project_id"])
-            previous_skill = self.server.store.latest_artifact(
-                request["project_id"], "skill_bundle"
-            )
-            previous_agent_system = self.server.store.latest_artifact(
-                request["project_id"], "agent_system"
-            )
             execution_request = {
                 **request,
-                **(
-                    {"evolved_memory": previous_memory["content"]}
-                    if previous_memory is not None
-                    else {}
-                ),
-                **(
-                    {"evolved_skill": previous_skill["content"]}
-                    if previous_skill is not None
-                    else {}
-                ),
-                **(
-                    {"evolved_agent_system": previous_agent_system["content"]}
-                    if previous_agent_system is not None
-                    else {}
+                "evolved_contexts": self.server.store.latest_context_artifacts(
+                    request["project_id"]
                 ),
             }
             result = self.server.runner.run(execution_request)
@@ -1053,7 +1362,8 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 for artifact in evolved["artifacts"]:
                     result["logs"] = self.server.store.append_session_log(
                         session_id,
-                        f"OpenEvo {artifact['method']} published {artifact['content_path']} for the next session.",
+                        f"OpenEvo {artifact['method']} published {artifact['artifact_type']} "
+                        "for the next session.",
                     )
                 for error in evolved["errors"]:
                     result["logs"] = self.server.store.append_session_log(
@@ -1158,8 +1468,8 @@ def main() -> int:
     print(f"Development agent daemon listening on 127.0.0.1:{args.port}", flush=True)
     print(f"Development state database: {state_path}", flush=True)
     print(
-        "Real text_memory_reflector, skill_bundle_reflector, and "
-        f"agent_system_reflector enabled with model {evolution_model}.",
+        "Evolution methods are discovered from the Core development catalog "
+        f"and executed with model {evolution_model}.",
         flush=True,
     )
     print("It is loopback-only; connect through an SSH local-forward tunnel.", flush=True)

@@ -4290,6 +4290,7 @@ pre.json {
 }
 
 .v2-session-task-detail {
+  margin-top: 14px;
   padding: 15px 16px;
   border: 1px solid var(--line);
   border-radius: 6px;
@@ -4454,6 +4455,7 @@ pre.json {
 
 .v2-task-result-detail {
   min-width: 0;
+  gap: 0;
 }
 
 .v2-result-section,
@@ -4481,15 +4483,57 @@ pre.json {
 }
 
 .v2-conversation-section {
-  padding: 18px;
+  margin-top: 30px;
+  padding: 24px;
   border-color: #8fb9aa;
   border-left: 3px solid var(--accent);
   background: #fcfefd;
   box-shadow: 0 8px 24px rgb(20 61 49 / 6%);
 }
 
-.v2-conversation-section .v2-result-section-head h3 {
-  margin: 5px 0 0;
+.v2-session-module-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.v2-session-module-heading h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: 24px;
+  line-height: 1.2;
+  letter-spacing: -0.02em;
+}
+
+.v2-session-module-heading p {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.v2-session-module-heading > strong {
+  padding-top: 4px;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.v2-evolution-priority,
+.v2-supporting-module {
+  display: grid;
+  gap: 16px;
+  margin-top: 40px;
+  padding-top: 30px;
+  border-top: 1px solid var(--line-strong);
+}
+
+.v2-session-module-heading.secondary h2 {
+  font-size: 20px;
+}
+
+.v2-session-module-heading.tertiary h2 {
+  color: var(--muted);
   font-size: 17px;
 }
 
@@ -4529,21 +4573,29 @@ pre.json {
   gap: 10px;
 }
 
-.session-evolution-options label {
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
+.session-evolution-options article {
   min-width: 0;
   padding: 13px;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--surface-soft);
+}
+
+.session-evolution-options article > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   cursor: pointer;
 }
 
-.session-evolution-options label.selected {
+.session-evolution-options article.selected {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+
+.session-evolution-options article > select {
+  width: 100%;
+  margin-top: 12px;
 }
 
 .session-evolution-options input {
@@ -4611,15 +4663,13 @@ pre.json {
 .v2-session-technical-details {
   display: grid;
   gap: 10px;
-  margin-top: 8px;
-  padding-top: 16px;
+  margin-top: 38px;
+  padding-top: 24px;
   border-top: 1px solid var(--line);
 }
 
-.v2-session-technical-details > header p {
-  margin: 5px 0 0;
-  color: var(--muted);
-  font-size: 10px;
+.v2-session-technical-details > header {
+  margin-bottom: 4px;
 }
 
 .v2-transcript {
