@@ -9,14 +9,12 @@ trust to system OpenSSH. Once the project tunnel is active, project, Task,
 timeline, capability, validation, service, Project Head, Evolution Revision,
 and Runtime Context reads use Desktop/Core v2 contracts only.
 
-Core v2 does not yet publish the task-artifact collection or artifact-content
-operations. Consequently, the v0.1.9 snapshot refresh deliberately leaves its
-closed `artifacts` collection empty and presents the committed successor
-Evolution Revision's `artifact_count` as the authoritative output summary.
-Completed Tasks and their timelines remain refreshable. The provider must not
-probe an unavailable artifact route or fall back to Desktop v1, direct SSH, or
-a direct Core URL; artifact inspection can be enabled only after the verified
-Core v2 read operations exist.
+Core v2 publishes Task-scoped artifact metadata and bounded artifact content
+metadata through the active project tunnel. The renderer aggregates every
+bounded Task artifact page into the authoritative snapshot, rejects cross-project
+or inconsistent duplicate identities, and uses the verified Desktop v2 content
+and diff routes for on-demand inspection. It never falls back to Desktop v1,
+direct SSH, or a direct Core URL.
 
 ## Built-in scientific project demos
 
@@ -132,20 +130,48 @@ The fixed Vite origins are admitted only when the sidecar reports the
 Tauri-only origin set. `npm run dev:fixture` remains the explicit visual-fixture
 loop behind `/product-preview.html`; it is never a live Daemon workflow.
 
-For the narrower "ask the remote Codex once and render its real answer" loop,
-use `npm run dev:agent`. This mode deliberately bypasses project evolution and
-the sealed release lifecycle while those pieces are under development. The
+For the narrower "ask the remote Codex and evolve text memory" loop, use
+`npm run dev:agent`. This mode bypasses the sealed release lifecycle, but calls
+the repository's real `text_memory_reflector` implementation after each successful
+Session. The
 server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
 forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
 while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
 SSH command, or remote address. The development daemon stores Projects, active
 Project selection, Session state, instructions, Codex responses, model label,
-duration, errors and process-log summaries in the remote SQLite database
-`~/.openevo/dev-agent/state.sqlite3`. The renderer reloads that authority from
-`GET /openevo-dev-agent/v1/state`, so a browser refresh preserves Project and
-conversation history. Evolution artifacts remain disabled. This bridge is
+duration, errors, process-log summaries, and versioned text-memory artifacts in
+the remote SQLite database `~/.openevo/dev-agent/state.sqlite3`. Dataset and
+`memory.md` files live under `~/.openevo/dev-agent/evolution-artifacts/`. The
+latest promoted memory is injected into the next Project Session. The renderer
+reloads that authority from `GET /openevo-dev-agent/v1/state`, so a browser
+refresh preserves Project, conversation, and memory history. This bridge is
 reachable only in Vite mode `openevo-live-agent` and is not imported by the
 packaged release entrypoint.
+
+The same development bridge has an SSH-alias-driven one-command launcher. Add
+the server once to the local system OpenSSH configuration, then run this from
+`desktop/`:
+
+```bash
+npm run dev:agent:remote -- --ssh-alias openevo-lab
+```
+
+The launcher derives the credential-free GitHub repository URL from local
+`origin` and the branch from the current checkout. `--repository-url` and
+`--branch` may override those values. The local checkout must be clean and its
+exact HEAD must already be present on that fork branch, preventing an apparently
+successful deployment from silently running stale code. It creates and exclusively manages
+`~/.openevo/dev-agent/source` on the remote host, installs `uv` from its official
+installer when absent, syncs Python 3.11 dependencies, restarts the loopback-only
+development daemon, verifies its authenticated health endpoint, opens the SSH
+local-forward tunnel, and finally starts `dev:agent` with the bearer token kept
+in process environment. Closing Vite also closes the tunnel; the remote daemon
+continues running and will be safely restarted by the next launcher invocation.
+The launcher refuses to overwrite an unrecognized source directory, refuses a
+dirty managed checkout, and accepts only a literal SSH alias and a
+credential-free GitHub URL. It is a source-development convenience, not a
+replacement for the sealed sidecar deployment lifecycle used by packaged
+Desktop builds.
 
 The release adapter copies the authenticated
 `DesktopStateV1.execution_mode_capabilities` object into
