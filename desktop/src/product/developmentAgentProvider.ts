@@ -29,6 +29,35 @@ const artifactSchema = z.object({
   created_at: z.string().min(1),
 }).strict();
 
+const workspaceEntrySchema = z.object({
+  path: z.string().min(1),
+  kind: z.enum(["file", "directory", "symlink", "unreadable"]),
+  byte_size: z.number().int().nonnegative(),
+  content_sha256: z.string().regex(/^[0-9a-f]{64}$/).nullable(),
+  media_type: z.string().min(1).nullable(),
+  content: z.string().nullable(),
+  modified_at: z.string().min(1),
+}).strict();
+
+const workspaceSnapshotSchema = z.object({
+  project_id: z.string().min(1),
+  entries: z.array(workspaceEntrySchema),
+  truncated: z.boolean(),
+}).strict();
+
+const workspaceChangeSchema = z.object({
+  path: z.string().min(1),
+  change_type: z.enum(["created", "modified", "deleted"]),
+  byte_size: z.number().int().nonnegative(),
+  media_type: z.string().min(1).nullable(),
+  content: z.string().nullable(),
+  previous_path: z.string().min(1).nullable(),
+  diff_lines: z.array(z.object({
+    kind: z.enum(["added", "removed", "context"]),
+    text: z.string(),
+  }).strict()),
+}).strict();
+
 const turnResponseSchema = z.object({
   schema_version: z.literal("1"),
   session_id: z.string().min(1),
@@ -42,6 +71,8 @@ const turnResponseSchema = z.object({
     method: z.string().min(1),
     message: z.string().min(1),
   }).strict()).optional(),
+  workspace_changes: z.array(workspaceChangeSchema).default([]),
+  workspace: workspaceSnapshotSchema.optional(),
 }).strict();
 
 const projectSchema = z.object({
@@ -72,6 +103,7 @@ const sessionSchema = z.object({
     method: z.string().min(1),
     message: z.string().min(1),
   }).strict()),
+  workspace_changes: z.array(workspaceChangeSchema).default([]),
   error: z.string().nullable(),
   created_at: z.string().min(1),
   updated_at: z.string().min(1),
@@ -95,6 +127,7 @@ const stateSchema = z.object({
     created_at: z.string().min(1),
     updated_at: z.string().min(1),
   }).strict()),
+  workspaces: z.array(workspaceSnapshotSchema).default([]),
 }).strict();
 
 const capabilityResponseSchema = z.object({
@@ -162,6 +195,7 @@ export function createDevelopmentAgentProvider(
             method: error.method,
             message: error.message,
           })),
+          workspaceChanges: session.workspace_changes.map(toWorkspaceChange),
           error: session.error,
           createdAt: session.created_at,
           updatedAt: session.updated_at,
@@ -177,6 +211,7 @@ export function createDevelopmentAgentProvider(
           artifactIds: job.artifact_ids,
           error: job.error,
         })),
+        workspaces: payload.workspaces.map(toWorkspaceSnapshot),
         capabilities: capabilityPayload.capabilities,
       };
     },
@@ -217,11 +252,40 @@ export function createDevelopmentAgentProvider(
           method: error.method,
           message: error.message,
         })),
+        workspaceChanges: payload.workspace_changes.map(toWorkspaceChange),
       };
     },
   };
 
   return createDevelopmentAgentDesktopProductProvider(backend);
+}
+
+function toWorkspaceSnapshot(workspace: z.infer<typeof workspaceSnapshotSchema>) {
+  return {
+    projectId: workspace.project_id,
+    entries: workspace.entries.map((entry) => ({
+      path: entry.path,
+      kind: entry.kind,
+      byteSize: entry.byte_size,
+      contentSha256: entry.content_sha256,
+      mediaType: entry.media_type,
+      content: entry.content,
+      modifiedAt: entry.modified_at,
+    })),
+    truncated: workspace.truncated,
+  };
+}
+
+function toWorkspaceChange(change: z.infer<typeof workspaceChangeSchema>) {
+  return {
+    path: change.path,
+    changeType: change.change_type,
+    byteSize: change.byte_size,
+    mediaType: change.media_type,
+    content: change.content,
+    previousPath: change.previous_path,
+    diffLines: change.diff_lines,
+  };
 }
 
 function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {

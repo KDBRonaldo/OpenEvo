@@ -101,6 +101,18 @@ export interface FixturePresentationV2 {
     readonly previousArtifactId: string | null;
     readonly diffLines: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
   }>>;
+  readonly workspaces?: Readonly<Record<string, {
+    readonly entries: readonly {
+      readonly path: string;
+      readonly kind: "file" | "directory" | "symlink" | "unreadable";
+      readonly byteSize: number;
+      readonly contentSha256: string | null;
+      readonly mediaType: string | null;
+      readonly content: string | null;
+      readonly modifiedAt: string;
+    }[];
+    readonly truncated: boolean;
+  }>>;
 }
 
 export type ProductRefreshResultV2 =

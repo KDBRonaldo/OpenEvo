@@ -91,12 +91,19 @@ def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pyt
 
 
 def test_codex_runner_injects_evolved_memory_into_the_next_session(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, str] = {}
+    captured: dict[str, object] = {}
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["prompt"] = str(kwargs["input"])
+        captured["args"] = args
+        Path(args[args.index("--cd") + 1], "answer.py").write_text(
+            "print(4)\n", encoding="utf-8"
+        )
         output_path = Path(args[args.index("--output-last-message") + 1])
         output_path.write_text("The next answer used prior memory.", encoding="utf-8")
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
@@ -106,6 +113,7 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
         "project_name": "Memory project",
         "task_title": "Second question",
         "instruction": "Answer the next question.",
+        "workspace_path": workspace,
         "evolved_contexts": [{
             "target_id": "text_memory",
             "documents": [{
@@ -117,6 +125,11 @@ def test_codex_runner_injects_evolved_memory_into_the_next_session(
 
     assert "Evolved text_memory from earlier sessions" in captured["prompt"]
     assert "Verify the answer before responding" in captured["prompt"]
+    assert "persistent OpenEvo project workspace" in captured["prompt"]
+    assert "workspace-write" in captured["args"]
+    assert "shell_tool" not in captured["args"]
+    assert Path(captured["args"][captured["args"].index("--cd") + 1]) == workspace
+    assert (workspace / "answer.py").read_text(encoding="utf-8") == "print(4)\n"
     assert result["response"] == "The next answer used prior memory."
 
 
@@ -162,6 +175,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "logs": ["admitted", "completed"],
         "selected_evolution": [],
         "evolution_errors": [],
+        "workspace_changes": [],
         "error": None,
         "created_at": restored["sessions"][0]["created_at"],
         "updated_at": restored["sessions"][0]["updated_at"],
@@ -183,6 +197,36 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "development_evolution_artifacts_v2",
         "development_evolution_jobs",
     } <= tables
+
+    workspace = restored["workspaces"][0]
+    assert workspace == {
+        "project_id": "development-project-1",
+        "entries": [],
+        "truncated": False,
+    }
+
+
+def test_project_workspace_files_persist_on_the_server_and_are_bounded(tmp_path: Path) -> None:
+    database = tmp_path / "state.sqlite3"
+    store = MODULE.DevelopmentStateStore(database)
+    store.create_project({
+        "project_id": "development-project-files",
+        "display_name": "Coding project",
+        "config": {},
+    })
+    workspace = store.workspace_path("development-project-files")
+    (workspace / "src").mkdir()
+    (workspace / "src" / "main.py").write_text("print('hello')\n", encoding="utf-8")
+    (workspace / "binary.bin").write_bytes(b"\x00\x01")
+
+    restored = MODULE.DevelopmentStateStore(database).snapshot()["workspaces"][0]
+    entries = {entry["path"]: entry for entry in restored["entries"]}
+
+    assert entries["src"]["kind"] == "directory"
+    assert entries["src/main.py"]["content"] == "print('hello')\n"
+    assert len(entries["src/main.py"]["content_sha256"]) == 64
+    assert entries["binary.bin"]["content"] is None
+    assert all("/root/" not in entry["path"] for entry in restored["entries"])
 
 
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:
@@ -488,7 +532,10 @@ def test_sqlite_store_marks_interrupted_running_session_failed_on_restart(tmp_pa
 
 def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> None:
     class FakeRunner:
-        def run(self, request: dict[str, str]) -> dict[str, object]:
+        def run(self, request: dict[str, object]) -> dict[str, object]:
+            workspace = request["workspace_path"]
+            assert isinstance(workspace, Path)
+            (workspace / "hello.py").write_text("print('hello')\n", encoding="utf-8")
             return {
                 "schema_version": "1",
                 "response": f"Answer to: {request['instruction']}",
@@ -534,9 +581,13 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
         thread.join(timeout=5)
 
     assert turn["response"] == "Answer to: Hello"
+    assert turn["workspace_changes"][0]["path"] == "hello.py"
+    assert turn["workspace_changes"][0]["change_type"] == "created"
     assert state["projects"][0]["display_name"] == "Persistent project"
     assert state["sessions"][0]["response"] == "Answer to: Hello"
     assert state["sessions"][0]["state"] == "completed"
+    assert state["sessions"][0]["workspace_changes"][0]["path"] == "hello.py"
+    assert state["workspaces"][0]["entries"][0]["content"] == "print('hello')\n"
 
 
 def _request_json(

@@ -32,6 +32,33 @@ export interface DevelopmentAgentTurnResult {
   readonly logMessages: readonly string[];
   readonly evolutionArtifacts: readonly PersistedDevelopmentArtifact[];
   readonly evolutionErrors: readonly PersistedDevelopmentEvolutionError[];
+  readonly workspaceChanges: readonly PersistedDevelopmentWorkspaceChange[];
+}
+
+export interface PersistedDevelopmentWorkspaceEntry {
+  readonly path: string;
+  readonly kind: "file" | "directory" | "symlink" | "unreadable";
+  readonly byteSize: number;
+  readonly contentSha256: string | null;
+  readonly mediaType: string | null;
+  readonly content: string | null;
+  readonly modifiedAt: string;
+}
+
+export interface PersistedDevelopmentWorkspace {
+  readonly projectId: string;
+  readonly entries: readonly PersistedDevelopmentWorkspaceEntry[];
+  readonly truncated: boolean;
+}
+
+export interface PersistedDevelopmentWorkspaceChange {
+  readonly path: string;
+  readonly changeType: "created" | "modified" | "deleted";
+  readonly byteSize: number;
+  readonly mediaType: string | null;
+  readonly content: string | null;
+  readonly previousPath: string | null;
+  readonly diffLines: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
 }
 
 export interface PersistedDevelopmentEvolutionSelection {
@@ -95,6 +122,7 @@ export interface PersistedDevelopmentSession {
   readonly logMessages: readonly string[];
   readonly selectedEvolution: readonly PersistedDevelopmentEvolutionSelection[];
   readonly evolutionErrors: readonly PersistedDevelopmentEvolutionError[];
+  readonly workspaceChanges: readonly PersistedDevelopmentWorkspaceChange[];
   readonly error: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
@@ -106,6 +134,7 @@ export interface PersistedDevelopmentState {
   readonly sessions: readonly PersistedDevelopmentSession[];
   readonly artifacts: readonly PersistedDevelopmentArtifact[];
   readonly evolutionJobs: readonly PersistedDevelopmentEvolutionJob[];
+  readonly workspaces: readonly PersistedDevelopmentWorkspace[];
   readonly capabilities: EvolutionCapabilitiesV2;
 }
 
@@ -411,7 +440,7 @@ function createInMemoryDesktopProductProvider(
       const agentResponse = agentTurn?.responseText
         ?? "The fixture session was admitted and completed successfully.";
       const outputFiles = agentTurn
-        ? []
+        ? workspaceChangeOutputFiles(agentTurn.workspaceChanges)
         : [{
             name: "results/fixture-result.md",
             summary: "Simulated session result.",
@@ -815,6 +844,7 @@ function createDevelopmentAgentSnapshot(
     sessions: [],
     artifacts: [],
     evolutionJobs: [],
+    workspaces: [],
     capabilities: fixtureCapability("development", "codex_subscription_transcript")!.capabilities,
   },
 ): DesktopProductSnapshotV2 {
@@ -873,7 +903,7 @@ function createDevelopmentAgentSnapshot(
           ...(session.response ? [{ speaker: "agent" as const, text: session.response }] : []),
           ...(session.error ? [{ speaker: "system" as const, text: session.error }] : []),
         ],
-        outputFiles: [],
+        outputFiles: workspaceChangeOutputFiles(session.workspaceChanges),
         selectedEvolution: session.selectedEvolution,
         evolutionErrors: session.evolutionErrors,
         evolutionJobs: persisted.evolutionJobs
@@ -938,9 +968,37 @@ function createDevelopmentAgentSnapshot(
       : null,
     validation: null,
     activeOperation: null,
-    fixturePresentation: { tasks: taskPresentation, artifacts: artifactPresentation },
+    fixturePresentation: {
+      tasks: taskPresentation,
+      artifacts: artifactPresentation,
+      workspaces: Object.fromEntries(persisted.workspaces.map((workspace) => [
+        workspace.projectId,
+        {
+          entries: workspace.entries,
+          truncated: workspace.truncated,
+        },
+      ])),
+    },
     stream: { status: "fresh", epoch: 1, lastEventId: null },
   };
+}
+
+function workspaceChangeOutputFiles(
+  changes: readonly PersistedDevelopmentWorkspaceChange[],
+): NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["tasks"][string]["outputFiles"] {
+  return changes.map((change) => ({
+    name: change.path,
+    summary: `${change.changeType[0]!.toUpperCase()}${change.changeType.slice(1)} in the remote project workspace · ${formatDevelopmentBytes(change.byteSize)}`,
+    ...(change.content !== null ? { content: change.content } : {}),
+    previousName: change.previousPath,
+    diffLines: change.diffLines,
+  }));
+}
+
+function formatDevelopmentBytes(bytes: number): string {
+  if (bytes < 1_024) return `${bytes} B`;
+  if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)} KB`;
+  return `${(bytes / 1_048_576).toFixed(1)} MB`;
 }
 
 function artifact(

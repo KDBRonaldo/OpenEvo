@@ -153,6 +153,17 @@ refresh preserves Project, conversation, selection, and evolution history. This 
 reachable only in Vite mode `openevo-live-agent` and is not imported by the
 packaged release entrypoint.
 
+Each development Project also owns a persistent scratch workspace at
+`~/.openevo/dev-agent/workspaces/<project-id>/`. A new Project starts with an
+empty directory. Codex runs with that directory as its `workspace-write`
+working directory and may use shell tools to create or edit task files; later
+Sessions in the same Project see the retained files. The state response exposes
+only a bounded, no-symlink readable projection: at most 1,000 entries, 256 KiB
+per previewed text file, and 2 MiB of text in aggregate. Host paths are never
+returned. Per-Session created, modified, and deleted files are persisted in
+SQLite as change summaries and shown under Session output files, while file
+bodies remain authoritative on the remote server filesystem.
+
 The renderer has no development method table. It builds the optional multi-target
 Session picker from the returned capabilities, preserves the selected method and
 user config, and renders artifact bodies by `renderer_kind`: Markdown documents,

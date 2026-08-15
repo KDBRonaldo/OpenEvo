@@ -61,6 +61,7 @@ describe("development agent provider", () => {
     const projects: Record<string, unknown>[] = [];
     const sessions: Record<string, unknown>[] = [];
     const artifacts: Record<string, unknown>[] = [];
+    const workspaces: Record<string, unknown>[] = [];
     let activeProjectId: string | null = null;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
@@ -73,6 +74,7 @@ describe("development agent provider", () => {
           sessions,
           artifacts,
           evolution_jobs: [],
+          workspaces,
         });
       }
       if (url.endsWith("/capabilities")) {
@@ -91,9 +93,32 @@ describe("development agent provider", () => {
           created_at: "2026-08-14T10:00:00Z",
           updated_at: "2026-08-14T10:00:00Z",
         });
+        workspaces.push({ project_id: body!.project_id, entries: [], truncated: false });
         return jsonResponse({ schema_version: "1" }, 201);
       }
       if (url.endsWith("/sessions") && init?.method === "POST") {
+        const workspaceChanges = [{
+          path: "src/answer.py",
+          change_type: "created",
+          byte_size: 9,
+          media_type: "text/x-python",
+          content: "print(4)\n",
+          previous_path: null,
+          diff_lines: [{ kind: "added", text: "print(4)" }],
+        }];
+        workspaces.splice(0, workspaces.length, {
+          project_id: body!.project_id,
+          entries: [{
+            path: "src/answer.py",
+            kind: "file",
+            byte_size: 9,
+            content_sha256: "d".repeat(64),
+            media_type: "text/x-python",
+            content: "print(4)\n",
+            modified_at: "2026-08-14T10:01:01Z",
+          }],
+          truncated: false,
+        });
         const evolved = {
           artifact_id: "dev-text-memory-1",
           project_id: body!.project_id,
@@ -126,6 +151,7 @@ describe("development agent provider", () => {
           // became part of the session contract. The provider must keep those sessions readable.
           selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector" }],
           evolution_errors: [],
+          workspace_changes: workspaceChanges,
           error: null,
           created_at: "2026-08-14T10:01:00Z",
           updated_at: "2026-08-14T10:01:01Z",
@@ -139,6 +165,8 @@ describe("development agent provider", () => {
           logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
           evolution_artifacts: [evolved],
           evolution_errors: [],
+          workspace_changes: workspaceChanges,
+          workspace: workspaces[0],
         });
       }
       throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
@@ -179,6 +207,14 @@ describe("development agent provider", () => {
       { speaker: "agent", text: "Two plus two is four." },
     ]);
     expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.producedArtifactIds).toEqual(["dev-text-memory-1"]);
+    expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.outputFiles[0]).toMatchObject({
+      name: "src/answer.py",
+      content: "print(4)\n",
+    });
+    expect(completed.snapshot.fixturePresentation?.workspaces?.[project.project_id]?.entries[0]).toMatchObject({
+      path: "src/answer.py",
+      content: "print(4)\n",
+    });
     expect(completed.snapshot.fixturePresentation?.tasks[task.task_id]?.selectedEvolution).toEqual([
       { targetId: "text_memory", method: "text_memory_reflector", config: {} },
     ]);

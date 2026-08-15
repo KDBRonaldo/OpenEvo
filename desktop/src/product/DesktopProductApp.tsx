@@ -1154,9 +1154,62 @@ function ResearchWorkspaceV2({
         {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{fixturePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>Open session result <ArrowRight size={14} /></button></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
       </section>
       </div>
+      <ProjectWorkspacePanelV2 workspace={fixturePresentation?.workspaces?.[project.project_id]} />
       <section className="history-section"><div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{projectTasks.length} total</span></div>{projectTasks.length ? <TaskHistoryTableV2 tasks={projectTasks} presentation={fixturePresentation?.tasks} selectedTaskId={selectedTaskId} transitions={transitions} onOpenTask={onSelectTask} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}</section>
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
+  );
+}
+
+function ProjectWorkspacePanelV2({
+  workspace,
+}: {
+  readonly workspace: NonNullable<
+    NonNullable<DesktopProductSnapshotV2["fixturePresentation"]>["workspaces"]
+  >[string] | undefined;
+}) {
+  const entries = workspace?.entries ?? [];
+  const files = entries.filter((entry) => entry.kind === "file");
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  useEffect(() => {
+    if (selectedPath !== null && files.some((entry) => entry.path === selectedPath)) return;
+    setSelectedPath(files[0]?.path ?? null);
+  }, [files, selectedPath]);
+  const selected = files.find((entry) => entry.path === selectedPath) ?? null;
+  return (
+    <section className="product-panel project-workspace-panel" data-testid="project-workspace-panel">
+      <div className="panel-heading">
+        <div><span className="panel-kicker">Persistent remote workspace</span><h2>Project files</h2></div>
+        <span className="muted-pill">{files.length} files</span>
+      </div>
+      {entries.length === 0 ? (
+        <div className="project-workspace-empty"><FolderOpen size={24} /><div><strong>This workspace is empty.</strong><p>Start a Session and ask Codex to create files. They will remain on your server for later Sessions.</p></div></div>
+      ) : (
+        <div className="project-workspace-browser">
+          <div className="project-workspace-tree" aria-label="Project workspace files">
+            {entries.map((entry) => (
+              <button
+                type="button"
+                key={`${entry.kind}-${entry.path}`}
+                className={entry.path === selectedPath ? "selected" : ""}
+                disabled={entry.kind !== "file"}
+                onClick={() => setSelectedPath(entry.path)}
+              >
+                {entry.kind === "directory" ? <FolderOpen size={15} /> : <FileText size={15} />}
+                <span><strong>{entry.path}</strong><small>{entry.kind === "file" ? formatBytes(entry.byteSize) : entry.kind}</small></span>
+              </button>
+            ))}
+          </div>
+          <div className="project-workspace-preview">
+            {selected ? <>
+              <header><div><FileText size={15} /><strong>{selected.path}</strong></div><small>{selected.mediaType ?? "unknown"} · {formatBytes(selected.byteSize)}</small></header>
+              {selected.content !== null ? <pre>{selected.content}</pre> : <p className="v2-empty-copy">This file is binary, unreadable, or too large for the bounded browser preview.</p>}
+            </> : <p className="v2-empty-copy">Select a readable file to preview it.</p>}
+          </div>
+        </div>
+      )}
+      {workspace?.truncated ? <p className="form-help">The server workspace contains more data than the bounded preview can display.</p> : null}
+    </section>
   );
 }
 

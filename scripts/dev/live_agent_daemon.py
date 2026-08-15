@@ -9,9 +9,11 @@ release orchestration contract. Bind it to loopback and reach it only through an
 from __future__ import annotations
 
 import argparse
+import difflib
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 from pathlib import Path
 import re
@@ -38,6 +40,9 @@ if os.fspath(SOURCE_ROOT) not in sys.path:
 
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_CAPTURE_BYTES = 2 * 1024 * 1024
+MAX_WORKSPACE_ENTRIES = 1_000
+MAX_WORKSPACE_TEXT_FILE_BYTES = 256 * 1024
+MAX_WORKSPACE_TEXT_BYTES = 2 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 300
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 ALLOWED_REQUEST_FIELDS = {
@@ -156,12 +161,207 @@ def validate_project_request(payload: object, *, updating: bool = False) -> dict
     return result
 
 
+class ProjectWorkspaceStore:
+    """Own persistent per-project scratch directories and bounded readable projections."""
+
+    def __init__(self, root: Path) -> None:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if root.is_symlink() or not root.is_dir():
+            raise RuntimeError("development workspace root must be a real directory")
+        self.root = root.resolve(strict=True)
+        try:
+            self.root.chmod(0o700)
+        except OSError:
+            pass
+
+    def ensure_project(self, project_id: str) -> Path:
+        path = self._project_path(project_id)
+        path.mkdir(mode=0o700, exist_ok=True)
+        if path.is_symlink() or not path.is_dir():
+            raise RuntimeError("project workspace must be a real directory")
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
+        return path
+
+    def project_path(self, project_id: str) -> Path:
+        path = self.ensure_project(project_id)
+        if path.resolve(strict=True).parent != self.root:
+            raise RuntimeError("project workspace escaped the managed root")
+        return path
+
+    def snapshot(self, project_id: str) -> dict[str, Any]:
+        project_root = self.project_path(project_id)
+        entries: list[dict[str, Any]] = []
+        remaining_text_bytes = MAX_WORKSPACE_TEXT_BYTES
+        truncated = False
+
+        def walk(directory: Path, relative_directory: Path) -> None:
+            nonlocal remaining_text_bytes, truncated
+            try:
+                children = sorted(os.scandir(directory), key=lambda entry: entry.name)
+            except OSError:
+                truncated = True
+                return
+            for child in children:
+                if len(entries) >= MAX_WORKSPACE_ENTRIES:
+                    truncated = True
+                    return
+                if child.name in {".git", ".openevo"}:
+                    continue
+                relative = relative_directory / child.name
+                relative_text = relative.as_posix()
+                try:
+                    stat_result = child.stat(follow_symlinks=False)
+                except OSError:
+                    entries.append(self._unreadable_entry(relative_text))
+                    continue
+                modified_at = datetime.fromtimestamp(
+                    stat_result.st_mtime, timezone.utc
+                ).isoformat().replace("+00:00", "Z")
+                if child.is_symlink():
+                    entries.append({
+                        "path": relative_text,
+                        "kind": "symlink",
+                        "byte_size": 0,
+                        "content_sha256": None,
+                        "media_type": None,
+                        "content": None,
+                        "modified_at": modified_at,
+                    })
+                    continue
+                if child.is_dir(follow_symlinks=False):
+                    entries.append({
+                        "path": relative_text,
+                        "kind": "directory",
+                        "byte_size": 0,
+                        "content_sha256": None,
+                        "media_type": None,
+                        "content": None,
+                        "modified_at": modified_at,
+                    })
+                    walk(Path(child.path), relative)
+                    if truncated:
+                        return
+                    continue
+                if not child.is_file(follow_symlinks=False):
+                    entries.append(self._unreadable_entry(relative_text, modified_at))
+                    continue
+                size = stat_result.st_size
+                content: str | None = None
+                digest: str | None = None
+                media_type = mimetypes.guess_type(child.name)[0] or "application/octet-stream"
+                if size <= MAX_WORKSPACE_TEXT_FILE_BYTES and size <= remaining_text_bytes:
+                    try:
+                        payload = Path(child.path).read_bytes()
+                        if len(payload) != size:
+                            raise OSError("workspace file changed while being read")
+                        digest = hashlib.sha256(payload).hexdigest()
+                        if b"\x00" not in payload:
+                            content = payload.decode("utf-8")
+                            remaining_text_bytes -= len(payload)
+                            if media_type == "application/octet-stream":
+                                media_type = "text/plain"
+                    except (OSError, UnicodeDecodeError):
+                        content = None
+                entries.append({
+                    "path": relative_text,
+                    "kind": "file",
+                    "byte_size": size,
+                    "content_sha256": digest,
+                    "media_type": media_type,
+                    "content": content,
+                    "modified_at": modified_at,
+                })
+
+        walk(project_root, Path())
+        return {
+            "project_id": project_id,
+            "entries": entries,
+            "truncated": truncated,
+        }
+
+    @staticmethod
+    def changes(
+        before: dict[str, Any],
+        after: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        before_files = {
+            entry["path"]: entry
+            for entry in before["entries"]
+            if entry["kind"] == "file"
+        }
+        after_files = {
+            entry["path"]: entry
+            for entry in after["entries"]
+            if entry["kind"] == "file"
+        }
+        changes: list[dict[str, Any]] = []
+        for path in sorted(set(before_files) | set(after_files)):
+            old = before_files.get(path)
+            new = after_files.get(path)
+            if old is not None and new is not None and all(
+                old.get(field) == new.get(field)
+                for field in ("byte_size", "content_sha256", "modified_at")
+            ):
+                continue
+            change_type = "created" if old is None else "deleted" if new is None else "modified"
+            old_content = old.get("content") if old else None
+            new_content = new.get("content") if new else None
+            diff_lines: list[dict[str, str]] = []
+            if isinstance(old_content, str) or isinstance(new_content, str):
+                for line in difflib.unified_diff(
+                    (old_content or "").splitlines(),
+                    (new_content or "").splitlines(),
+                    lineterm="",
+                ):
+                    if line.startswith(("---", "+++", "@@")):
+                        continue
+                    kind = "added" if line.startswith("+") else "removed" if line.startswith("-") else "context"
+                    diff_lines.append({"kind": kind, "text": line[1:] if line[:1] in "+- " else line})
+                    if len(diff_lines) >= 400:
+                        break
+            current = new or old
+            changes.append({
+                "path": path,
+                "change_type": change_type,
+                "byte_size": current["byte_size"],
+                "media_type": current.get("media_type"),
+                "content": new_content,
+                "previous_path": path if old is not None else None,
+                "diff_lines": diff_lines,
+            })
+        return changes
+
+    def _project_path(self, project_id: str) -> Path:
+        if not ID_PATTERN.fullmatch(project_id):
+            raise RuntimeError("project_id is invalid")
+        path = self.root / project_id
+        if path.parent != self.root:
+            raise RuntimeError("project workspace escaped the managed root")
+        return path
+
+    @staticmethod
+    def _unreadable_entry(path: str, modified_at: str | None = None) -> dict[str, Any]:
+        return {
+            "path": path,
+            "kind": "unreadable",
+            "byte_size": 0,
+            "content_sha256": None,
+            "media_type": None,
+            "content": None,
+            "modified_at": modified_at or utc_now(),
+        }
+
+
 class DevelopmentStateStore:
     """Small SQLite authority for the development-only Project/Session loop."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.RLock()
+        self.workspaces = ProjectWorkspaceStore(path.parent / "workspaces")
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         try:
             path.parent.chmod(0o700)
@@ -193,6 +393,7 @@ class DevelopmentStateStore:
                     logs_json TEXT NOT NULL,
                     selected_evolution_json TEXT NOT NULL DEFAULT '[]',
                     evolution_errors_json TEXT NOT NULL DEFAULT '[]',
+                    workspace_changes_json TEXT NOT NULL DEFAULT '[]',
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -289,6 +490,11 @@ class DevelopmentStateStore:
                     "ALTER TABLE development_sessions "
                     "ADD COLUMN evolution_errors_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "workspace_changes_json" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN workspace_changes_json TEXT NOT NULL DEFAULT '[]'"
+                )
             for row in connection.execute(
                 "SELECT session_id, selected_evolution_json FROM development_sessions"
             ).fetchall():
@@ -346,6 +552,12 @@ class DevelopmentStateStore:
                 """,
                 ("Development daemon restarted before this session completed.", restarted_at),
             )
+            project_ids = [
+                row["project_id"]
+                for row in connection.execute("SELECT project_id FROM development_projects")
+            ]
+        for project_id in project_ids:
+            self.workspaces.ensure_project(project_id)
         try:
             path.chmod(0o600)
         except OSError:
@@ -398,6 +610,10 @@ class DevelopmentStateStore:
             "sessions": sessions,
             "artifacts": artifacts,
             "evolution_jobs": jobs,
+            "workspaces": [
+                self.workspaces.snapshot(project["project_id"])
+                for project in projects
+            ],
         }
 
     def create_project(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -417,7 +633,20 @@ class DevelopmentStateStore:
             except sqlite3.IntegrityError as exc:
                 raise StateConflictError("project_id already exists") from exc
             self._set_active(connection, request["project_id"])
+        self.workspaces.ensure_project(request["project_id"])
         return {**request, "created_at": now, "updated_at": now}
+
+    def workspace_path(self, project_id: str) -> Path:
+        with self._lock, self._connection() as connection:
+            if connection.execute(
+                "SELECT 1 FROM development_projects WHERE project_id = ?", (project_id,)
+            ).fetchone() is None:
+                raise KeyError(project_id)
+        return self.workspaces.project_path(project_id)
+
+    def workspace_snapshot(self, project_id: str) -> dict[str, Any]:
+        self.workspace_path(project_id)
+        return self.workspaces.snapshot(project_id)
 
     def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -471,8 +700,8 @@ class DevelopmentStateStore:
                 INSERT INTO development_sessions(
                     session_id, project_id, task_title, instruction, response, model,
                     state, duration_ms, logs_json, selected_evolution_json,
-                    evolution_errors_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', NULL, ?, ?)
+                    evolution_errors_json, workspace_changes_json, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', '[]', NULL, ?, ?)
                 """,
                 (
                     session_id,
@@ -493,7 +722,7 @@ class DevelopmentStateStore:
                 """
                 UPDATE development_sessions
                 SET response = ?, model = ?, state = 'completed', duration_ms = ?,
-                    logs_json = ?, error = NULL, updated_at = ?
+                    logs_json = ?, workspace_changes_json = ?, error = NULL, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
@@ -501,6 +730,7 @@ class DevelopmentStateStore:
                     result["model"],
                     result["duration_ms"],
                     canonical_json(result["logs"]),
+                    canonical_json(result.get("workspace_changes", [])),
                     now,
                     session_id,
                 ),
@@ -675,17 +905,23 @@ class DevelopmentStateStore:
             raise RuntimeError("document evolution artifact was not persisted")
         return self._artifact_record(row)
 
-    def fail_session(self, session_id: str, error: str) -> None:
+    def fail_session(
+        self,
+        session_id: str,
+        error: str,
+        workspace_changes: list[dict[str, Any]] | None = None,
+    ) -> None:
         now = utc_now()
         logs = ["Remote development daemon admitted the session.", f"Codex failed: {error}"]
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 UPDATE development_sessions
-                SET state = 'failed', logs_json = ?, error = ?, updated_at = ?
+                SET state = 'failed', logs_json = ?, workspace_changes_json = ?,
+                    error = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
-                (canonical_json(logs), error, now, session_id),
+                (canonical_json(logs), canonical_json(workspace_changes or []), error, now, session_id),
             )
 
     @staticmethod
@@ -704,6 +940,7 @@ class DevelopmentStateStore:
                 json.loads(row["selected_evolution_json"])
             ),
             "evolution_errors": json.loads(row["evolution_errors_json"]),
+            "workspace_changes": json.loads(row["workspace_changes_json"]),
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -817,6 +1054,9 @@ class CodexRunner:
             raise AgentRunError(f"Codex is not logged in: {detail or 'login status failed'}")
 
     def run(self, request: dict[str, Any]) -> dict[str, Any]:
+        workspace_path = request.get("workspace_path")
+        if not isinstance(workspace_path, Path) or not workspace_path.is_dir():
+            raise AgentRunError("persistent project workspace is unavailable")
         context_sections: list[str] = []
         for context in request.get("evolved_contexts", []):
             if not isinstance(context, dict):
@@ -834,9 +1074,10 @@ class CodexRunner:
                     "Apply it only when relevant and do not mention that it was injected.\n"
                 )
         prompt = (
-            "You are answering one user message inside an OpenEvo development session. "
-            "Do not edit files or run shell commands. Return only the helpful answer that should "
-            "be shown to the user.\n\n"
+            "You are working inside a persistent OpenEvo project workspace. "
+            "You may inspect, create, and edit files and run shell commands within this workspace "
+            "when the task requires it. Keep all task files inside the current workspace. "
+            "After completing the work, return a concise helpful answer describing the result.\n\n"
             f"Project: {request['project_name']}\n"
             f"Session: {request['task_title']}\n\n"
             f"{''.join(context_sections)}"
@@ -844,8 +1085,7 @@ class CodexRunner:
         )
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="openevo-dev-agent-") as temporary_directory:
-            workdir = Path(temporary_directory)
-            output_path = workdir / "last-message.txt"
+            output_path = Path(temporary_directory) / "last-message.txt"
             argv = [
                 self._codex_binary,
                 "exec",
@@ -854,12 +1094,10 @@ class CodexRunner:
                 "--ignore-rules",
                 "--ephemeral",
                 "--sandbox",
-                "read-only",
-                "--disable",
-                "shell_tool",
+                "workspace-write",
                 "--skip-git-repo-check",
                 "--cd",
-                os.fspath(workdir),
+                os.fspath(workspace_path),
                 "--output-last-message",
                 os.fspath(output_path),
             ]
@@ -1376,18 +1614,33 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             except StateConflictError as exc:
                 self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
                 return
+            workspace_path = self.server.store.workspace_path(request["project_id"])
+            workspace_before = self.server.store.workspace_snapshot(request["project_id"])
             execution_request = {
                 **request,
+                "workspace_path": workspace_path,
                 "evolved_contexts": self.server.store.latest_context_artifacts(
                     request["project_id"]
                 ),
             }
             result = self.server.runner.run(execution_request)
         except AgentRunError as exc:
-            self.server.store.fail_session(session_id, str(exc))
+            workspace_after = self.server.store.workspace_snapshot(request["project_id"])
+            workspace_changes = ProjectWorkspaceStore.changes(
+                workspace_before, workspace_after
+            )
+            self.server.store.fail_session(session_id, str(exc), workspace_changes)
             self._json_error(HTTPStatus.BAD_GATEWAY, "codex_failed", str(exc))
         else:
-            result = {**result, "session_id": session_id}
+            workspace_after = self.server.store.workspace_snapshot(request["project_id"])
+            result = {
+                **result,
+                "session_id": session_id,
+                "workspace_changes": ProjectWorkspaceStore.changes(
+                    workspace_before, workspace_after
+                ),
+                "workspace": workspace_after,
+            }
             self.server.store.complete_session(session_id, result)
             if self.server.evolution_runner is not None:
                 evolved = self.server.evolution_runner.evolve(
