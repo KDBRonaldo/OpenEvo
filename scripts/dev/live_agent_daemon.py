@@ -1597,7 +1597,10 @@ class DocumentEvolutionRunner:
                     if binding.source in {
                         InputBindingSource.CURRENT_DATASET,
                         InputBindingSource.HISTORY_DATASETS,
-                    }:
+                    } or (
+                        binding.source is InputBindingSource.EXPLICIT_INPUTS
+                        and binding.artifact_type == "dataset"
+                    ):
                         candidates[binding.binding_id] = [current_dataset]
                     elif binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
                         candidates[binding.binding_id] = [] if previous_input is None else [previous_input]

@@ -462,6 +462,75 @@ def test_document_evolution_runner_can_publish_all_selected_document_types(
     assert all(job["config"] == {} for job in jobs)
 
 
+def test_desktop_default_reflectors_receive_the_current_transcript_dataset(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import methods
+
+    monkeypatch.setattr(
+        methods,
+        "_generate_reflector_markdown",
+        lambda *_args, **_kwargs: "# Memory\n\n- Reuse the successful action.\n",
+    )
+    monkeypatch.setattr(
+        methods,
+        "_generate_audited_agent_system_reflection",
+        lambda *_args, **_kwargs: ("# Agent system\n\n- Verify the result.\n", {}),
+    )
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-default-reflectors",
+        "display_name": "Default reflectors",
+        "config": {
+            "schema_version": "2",
+            "evolution": {
+                "targets": {
+                    "agent_system": {
+                        "enabled": True,
+                        "method": "agent_system_gepa_reflector",
+                        "config": {},
+                    },
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_expel_reflector",
+                        "config": {},
+                    },
+                }
+            },
+        },
+    }
+    store.create_project(project)
+    request = {
+        "project_id": project["project_id"],
+        "project_name": project["display_name"],
+        "task_title": "Learn from file creation",
+        "instruction": "Create a file and remember the reusable lesson.",
+    }
+    result = {"response": "Created it.", "model": "test", "duration_ms": 1, "logs": []}
+    store.start_session("dev-session-default-reflectors", request)
+    store.complete_session("dev-session-default-reflectors", result)
+
+    batch = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    ).evolve(
+        session_id="dev-session-default-reflectors",
+        request=request,
+        result=result,
+        store=store,
+    )
+
+    assert batch["errors"] == []
+    assert {artifact["artifact_type"] for artifact in batch["artifacts"]} >= {
+        "agent_system",
+        "text_memory",
+    }
+    assert all(job["state"] == "completed" for job in store.snapshot()["evolution_jobs"])
+
+
 def test_development_capabilities_are_projected_from_the_core_catalog(tmp_path: Path) -> None:
     runner = MODULE.DocumentEvolutionRunner(
         state_root=tmp_path,
