@@ -69,6 +69,15 @@ export interface FixturePresentationV2 {
       readonly previousName?: string | null;
       readonly diffLines?: readonly { readonly kind: "added" | "removed" | "context"; readonly text: string }[];
     }[];
+    readonly selectedEvolution?: readonly {
+      readonly targetId: "text_memory" | "skill_bundle" | "agent_system";
+      readonly method: "text_memory_reflector" | "skill_bundle_reflector" | "agent_system_reflector";
+    }[];
+    readonly evolutionErrors?: readonly {
+      readonly targetId: "text_memory" | "skill_bundle" | "agent_system";
+      readonly method: "text_memory_reflector" | "skill_bundle_reflector" | "agent_system_reflector";
+      readonly message: string;
+    }[];
     readonly usedArtifactIds: readonly string[];
     readonly producedArtifactIds: readonly string[];
   }>>;

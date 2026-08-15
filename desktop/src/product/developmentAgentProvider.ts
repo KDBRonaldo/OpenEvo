@@ -11,8 +11,9 @@ const artifactSchema = z.object({
   artifact_id: z.string().min(1),
   project_id: z.string().min(1),
   session_id: z.string().min(1),
-  artifact_type: z.literal("text_memory"),
-  method: z.literal("text_memory_reflector"),
+  artifact_type: z.enum(["text_memory", "skill_bundle", "agent_system"]),
+  method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+  content_path: z.enum(["memory.md", "SKILL.md", "AGENTS.md"]),
   content: z.string().min(1),
   content_sha256: z.string().regex(/^[0-9a-f]{64}$/),
   byte_size: z.number().int().nonnegative(),
@@ -27,8 +28,12 @@ const turnResponseSchema = z.object({
   model: z.string().min(1).nullable(),
   duration_ms: z.number().int().nonnegative(),
   logs: z.array(z.string()),
-  evolution_artifact: artifactSchema.optional(),
-  evolution_error: z.string().min(1).optional(),
+  evolution_artifacts: z.array(artifactSchema).optional(),
+  evolution_errors: z.array(z.object({
+    target_id: z.enum(["text_memory", "skill_bundle", "agent_system"]),
+    method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+    message: z.string().min(1),
+  }).strict()).optional(),
 }).strict();
 
 const projectSchema = z.object({
@@ -49,6 +54,15 @@ const sessionSchema = z.object({
   state: z.enum(["running", "completed", "failed"]),
   duration_ms: z.number().int().nonnegative().nullable(),
   logs: z.array(z.string()),
+  selected_evolution: z.array(z.object({
+    target_id: z.enum(["text_memory", "skill_bundle", "agent_system"]),
+    method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+  }).strict()),
+  evolution_errors: z.array(z.object({
+    target_id: z.enum(["text_memory", "skill_bundle", "agent_system"]),
+    method: z.enum(["text_memory_reflector", "skill_bundle_reflector", "agent_system_reflector"]),
+    message: z.string().min(1),
+  }).strict()),
   error: z.string().nullable(),
   created_at: z.string().min(1),
   updated_at: z.string().min(1),
@@ -108,6 +122,15 @@ export function createDevelopmentAgentProvider(
           state: session.state,
           durationMs: session.duration_ms,
           logMessages: session.logs,
+          selectedEvolution: session.selected_evolution.map((selection) => ({
+            targetId: selection.target_id,
+            method: selection.method,
+          })),
+          evolutionErrors: session.evolution_errors.map((error) => ({
+            targetId: error.target_id,
+            method: error.method,
+            message: error.message,
+          })),
           error: session.error,
           createdAt: session.created_at,
           updatedAt: session.updated_at,
@@ -146,9 +169,12 @@ export function createDevelopmentAgentProvider(
         model: payload.model,
         durationMs: payload.duration_ms,
         logMessages: payload.logs,
-        evolutionArtifact: payload.evolution_artifact
-          ? toPersistedArtifact(payload.evolution_artifact)
-          : null,
+        evolutionArtifacts: (payload.evolution_artifacts ?? []).map(toPersistedArtifact),
+        evolutionErrors: (payload.evolution_errors ?? []).map((error) => ({
+          targetId: error.target_id,
+          method: error.method,
+          message: error.message,
+        })),
       };
     },
   };
@@ -163,6 +189,7 @@ function toPersistedArtifact(artifact: z.infer<typeof artifactSchema>) {
     sessionId: artifact.session_id,
     artifactType: artifact.artifact_type,
     method: artifact.method,
+    contentPath: artifact.content_path,
     content: artifact.content,
     contentSha256: artifact.content_sha256,
     byteSize: artifact.byte_size,

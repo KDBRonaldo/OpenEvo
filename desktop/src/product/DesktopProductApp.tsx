@@ -64,6 +64,50 @@ import {
 } from "./providerV2";
 
 type Workspace = "research" | "evolution" | "system";
+type DocumentEvolutionTargetId = "text_memory" | "skill_bundle" | "agent_system";
+
+const DOCUMENT_EVOLUTION_OPTIONS = [
+  {
+    targetId: "text_memory",
+    method: "text_memory_reflector",
+    title: "Text memory",
+    description: "Summarize reusable experience into memory.md.",
+  },
+  {
+    targetId: "skill_bundle",
+    method: "skill_bundle_reflector",
+    title: "Skill bundle",
+    description: "Distill a reusable workflow into SKILL.md.",
+  },
+  {
+    targetId: "agent_system",
+    method: "agent_system_reflector",
+    title: "Agent system",
+    description: "Turn lessons into future AGENTS.md instructions.",
+  },
+] as const;
+
+function withSessionDocumentEvolution(
+  config: ScienceProjectConfigV2,
+  task: ScienceProjectConfigV2["task"],
+  selectedTargets: readonly DocumentEvolutionTargetId[],
+): ScienceProjectConfigV2 {
+  const selected = new Set(selectedTargets);
+  return {
+    ...config,
+    task,
+    evolution: {
+      targets: Object.fromEntries(DOCUMENT_EVOLUTION_OPTIONS.map((option) => {
+        const current = config.evolution.targets[option.targetId];
+        return [option.targetId, {
+          enabled: selected.has(option.targetId),
+          method: option.method,
+          config: current?.method === option.method ? current.config : {},
+        }];
+      })),
+    },
+  } as ScienceProjectConfigV2;
+}
 
 export interface DesktopProductAppProps {
   readonly provider?: DesktopProductProviderV2;
@@ -221,6 +265,7 @@ export function DesktopProductApp({
   const runProject = async (
     project: ProjectV2,
     task: ScienceProjectConfigV2["task"],
+    selectedEvolutionTargets: readonly DocumentEvolutionTargetId[],
   ): Promise<void> => {
     if (project.state !== "ready") return;
     setBusy(true);
@@ -229,11 +274,14 @@ export function DesktopProductApp({
     try {
       let currentSnapshot = snapshot;
       let currentProject = project;
-      if (task.title !== project.config.task.title || task.objective !== project.config.task.objective) {
+      const nextConfig = developmentAgentBridge
+        ? withSessionDocumentEvolution(project.config, task, selectedEvolutionTargets)
+        : { ...project.config, task };
+      if (JSON.stringify(nextConfig) !== JSON.stringify(project.config)) {
         await provider.updateProject(
           project.project_id,
           project.display_name,
-          { ...project.config, task },
+          nextConfig,
           intentFor(currentSnapshot, "update-task-before-session"),
         );
         const refreshed = await refresh();
@@ -387,9 +435,10 @@ export function DesktopProductApp({
               fixturePresentation={snapshot.fixturePresentation}
               selectedTaskId={selectedTaskId}
               busy={busy}
+              sessionEvolutionAvailable={developmentAgentBridge}
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
-              onRun={(task) => void runProject(displayedProject, task)}
+              onRun={(task, selectedEvolutionTargets) => void runProject(displayedProject, task, selectedEvolutionTargets)}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
                 "Task cancellation requested.",
@@ -958,6 +1007,7 @@ function ResearchWorkspaceV2({
   fixturePresentation,
   selectedTaskId,
   busy,
+  sessionEvolutionAvailable,
   onSelectTask,
   onOpenSettings,
   onRun,
@@ -976,9 +1026,13 @@ function ResearchWorkspaceV2({
   readonly fixturePresentation: DesktopProductSnapshotV2["fixturePresentation"];
   readonly selectedTaskId: string | null;
   readonly busy: boolean;
+  readonly sessionEvolutionAvailable: boolean;
   readonly onSelectTask: (taskId: string | null) => void;
   readonly onOpenSettings: () => void;
-  readonly onRun: (task: ScienceProjectConfigV2["task"]) => void;
+  readonly onRun: (
+    task: ScienceProjectConfigV2["task"],
+    selectedEvolutionTargets: readonly DocumentEvolutionTargetId[],
+  ) => void;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
   readonly onLoadTaskLogs: (taskId: string) => void | Promise<void>;
@@ -996,9 +1050,17 @@ function ResearchWorkspaceV2({
   const ready = project.state === "ready" && project.active_project_head !== null && project.admission_etag !== null;
   const [taskTitle, setTaskTitle] = useState(project.config.task.title);
   const [taskObjective, setTaskObjective] = useState(project.config.task.objective);
+  const [selectedEvolutionTargets, setSelectedEvolutionTargets] = useState<readonly DocumentEvolutionTargetId[]>(
+    DOCUMENT_EVOLUTION_OPTIONS.flatMap((option) => (
+      project.config.evolution.targets[option.targetId]?.enabled ? [option.targetId] : []
+    )),
+  );
   useEffect(() => {
     setTaskTitle(project.config.task.title);
     setTaskObjective(project.config.task.objective);
+    setSelectedEvolutionTargets(DOCUMENT_EVOLUTION_OPTIONS.flatMap((option) => (
+      project.config.evolution.targets[option.targetId]?.enabled ? [option.targetId] : []
+    )));
   }, [project.project_id, project.project_config_sha256]);
   const normalizedTask = {
     title: taskTitle.trim(),
@@ -1048,7 +1110,7 @@ function ResearchWorkspaceV2({
     <div className="workspace-stack" data-testid="research-workspace">
       <div className="workspace-heading">
         <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task at a time against the current Project Head.</p></div>
-        <div className="heading-actions"><button className="secondary-button" type="button" onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || !ready || !taskValid} onClick={() => onRun(normalizedTask)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} Start session</button></div>
+        <div className="heading-actions"><button className="secondary-button" type="button" onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || !ready || !taskValid} onClick={() => onRun(normalizedTask, selectedEvolutionTargets)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} Start session</button></div>
       </div>
       {!ready ? <div className="disabled-reason"><AlertCircle size={14} /><span><strong>Next task is not ready.</strong> The current successor, settings, workspace, or runtime transition must finish before Core can admit another Task.</span></div> : null}
       <div className="research-grid">
@@ -1059,8 +1121,27 @@ function ResearchWorkspaceV2({
           <label>Task instructions<textarea rows={6} maxLength={65_536} value={taskObjective} disabled={busy} onChange={(event) => setTaskObjective(event.target.value)} /></label>
           <p className="form-help">Starting the session saves these instructions and runs them as the next task.</p>
         </div>
+        {sessionEvolutionAvailable ? <fieldset className="session-evolution-picker" disabled={busy}>
+          <legend>Evolution after this session <span>Optional · select any number</span></legend>
+          <div className="session-evolution-options">
+            {DOCUMENT_EVOLUTION_OPTIONS.map((option) => {
+              const checked = selectedEvolutionTargets.includes(option.targetId);
+              return <label key={option.targetId} className={checked ? "selected" : ""}>
+                <input type="checkbox" checked={checked} onChange={(event) => {
+                  setSelectedEvolutionTargets((current) => event.target.checked
+                    ? [...current, option.targetId]
+                    : current.filter((targetId) => targetId !== option.targetId));
+                }} />
+                <span><strong>{option.title}</strong><small>{option.description}</small></span>
+              </label>;
+            })}
+          </div>
+          <p>{selectedEvolutionTargets.length === 0
+            ? "No evolution will run after this session."
+            : `${selectedEvolutionTargets.length} evolution method${selectedEvolutionTargets.length === 1 ? "" : "s"} will run after the agent replies.`}</p>
+        </fieldset> : null}
         {!taskValid ? <p className="form-error" role="status">Enter both a task title and task instructions.</p> : null}
-        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{Object.values(project.config.evolution.targets).filter((target) => target.enabled).length} targets</strong></div></div>
+        <div className="brief-footer"><div><span>Mode</span><strong>{project.config.execution.mode === "codex_subscription_transcript" ? "Codex Subscription" : "Self-deployed"}</strong></div><div><span>Capture</span><strong>Session transcript</strong></div><div><span>Evolution</span><strong>{sessionEvolutionAvailable ? selectedEvolutionTargets.length : Object.values(project.config.evolution.targets).filter((target) => target.enabled).length} selected</strong></div></div>
       </section>
       <section className="product-panel active-run-panel">
         <div className="panel-heading"><div><span className="panel-kicker">{observedTask ? "Selected session" : "Active session"}</span><h2>{observedTask ? fixturePresentation?.tasks[observedTask.task_id]?.instruction?.title ?? observedTask.task_id : "No session selected"}</h2></div>{observedTask ? <span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span> : <span className="muted-pill">Ready</span>}</div>
@@ -1168,7 +1249,20 @@ function TaskAuthorityCardV2({
       <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
       <section className="v2-result-section v2-conversation-section" data-session-priority="conversation"><div className="v2-result-section-head"><div><span className="panel-kicker">Conversation</span><h3>Agent response</h3></div><strong>{presentation?.transcript.length ?? logs.length} messages</strong></div>{presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : <p className="v2-empty-copy">The agent response is not loaded yet.</p>}</section>
-      <section className="v2-evolution-priority" data-session-priority="evolution"><ResultCollection title="Evolution produced" empty="This Task did not publish an evolution artifact." artifacts={producedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /></section>
+      <section className="v2-evolution-priority" data-session-priority="evolution">
+        <div className="session-evolution-summary">
+          <div><span className="panel-kicker">Selected for this session</span><strong>{presentation?.selectedEvolution?.length ?? 0} methods</strong></div>
+          {presentation?.selectedEvolution?.length ? <div className="session-evolution-statuses">{presentation.selectedEvolution.map((selection) => {
+            const option = DOCUMENT_EVOLUTION_OPTIONS.find((candidate) => candidate.targetId === selection.targetId)!;
+            const error = presentation.evolutionErrors?.find((candidate) => candidate.targetId === selection.targetId);
+            const produced = producedArtifacts.some((artifact) => artifact.artifact_type === selection.targetId);
+            return <span key={selection.targetId} className={error ? "failed" : produced ? "produced" : "pending"} title={error?.message}>
+              {option.title} · {error ? "failed" : produced ? "produced" : "pending"}
+            </span>;
+          })}</div> : <p>No document evolution was selected for this session.</p>}
+        </div>
+        <ResultCollection title="Evolution produced" empty="This Task did not publish an evolution artifact." artifacts={producedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} />
+      </section>
       {selectedProducedArtifact ? resultInspector : null}
       <section className="v2-supporting-results" data-session-priority="supporting"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></section>
       {selectedResult && !selectedProducedArtifact ? resultInspector : null}

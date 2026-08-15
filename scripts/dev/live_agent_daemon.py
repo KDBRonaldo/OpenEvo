@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Development-only loopback daemon for real Codex turns and text-memory evolution.
+"""Development-only loopback daemon for real Codex turns and document evolution.
 
 This is intentionally not the release OpenEvo Daemon and must never be exposed directly to a
-network. It reuses the real text_memory_reflector implementation without claiming the sealed
+network. It reuses the real document-reflector implementations without claiming the sealed
 release orchestration contract. Bind it to loopback and reach it only through an SSH tunnel.
 """
 
@@ -51,6 +51,11 @@ ALLOWED_PROJECT_FIELDS = {"schema_version", "project_id", "display_name", "confi
 ALLOWED_PROJECT_UPDATE_FIELDS = {"schema_version", "display_name", "config"}
 PROJECT_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)$")
 ACTIVATE_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)/activate$")
+DOCUMENT_EVOLUTION_METHODS = {
+    "text_memory": ("text_memory_reflector", "memory.md"),
+    "skill_bundle": ("skill_bundle_reflector", "SKILL.md"),
+    "agent_system": ("agent_system_reflector", "AGENTS.md"),
+}
 
 
 class RequestError(ValueError):
@@ -75,6 +80,25 @@ def utc_now() -> str:
 
 def canonical_json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def selected_document_evolution(config: object) -> list[dict[str, str]]:
+    if not isinstance(config, dict):
+        return []
+    evolution = config.get("evolution")
+    targets = evolution.get("targets") if isinstance(evolution, dict) else None
+    if not isinstance(targets, dict):
+        return []
+    selected: list[dict[str, str]] = []
+    for target_id, (method, _content_path) in DOCUMENT_EVOLUTION_METHODS.items():
+        selection = targets.get(target_id)
+        if (
+            isinstance(selection, dict)
+            and selection.get("enabled") is True
+            and selection.get("method") == method
+        ):
+            selected.append({"target_id": target_id, "method": method})
+    return selected
 
 
 def validate_project_request(payload: object, *, updating: bool = False) -> dict[str, Any]:
@@ -140,6 +164,8 @@ class DevelopmentStateStore:
                     state TEXT NOT NULL CHECK (state IN ('running', 'completed', 'failed')),
                     duration_ms INTEGER,
                     logs_json TEXT NOT NULL,
+                    selected_evolution_json TEXT NOT NULL DEFAULT '[]',
+                    evolution_errors_json TEXT NOT NULL DEFAULT '[]',
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -160,6 +186,55 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_artifacts_project_created
                     ON development_artifacts(project_id, created_at, artifact_id);
+                CREATE TABLE IF NOT EXISTS development_document_artifacts (
+                    artifact_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL REFERENCES development_projects(project_id),
+                    session_id TEXT NOT NULL REFERENCES development_sessions(session_id),
+                    artifact_type TEXT NOT NULL CHECK (
+                        artifact_type IN ('text_memory', 'skill_bundle', 'agent_system')
+                    ),
+                    method TEXT NOT NULL CHECK (
+                        method IN (
+                            'text_memory_reflector',
+                            'skill_bundle_reflector',
+                            'agent_system_reflector'
+                        )
+                    ),
+                    content_path TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_sha256 TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    previous_artifact_id TEXT,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(session_id, artifact_type)
+                );
+                CREATE INDEX IF NOT EXISTS development_document_artifacts_project_created
+                    ON development_document_artifacts(project_id, artifact_type, created_at, artifact_id);
+                """
+            )
+            session_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(development_sessions)")
+            }
+            if "selected_evolution_json" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN selected_evolution_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            if "evolution_errors_json" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN evolution_errors_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO development_document_artifacts(
+                    artifact_id, project_id, session_id, artifact_type, method, content_path,
+                    content, content_sha256, byte_size, previous_artifact_id, created_at
+                )
+                SELECT artifact_id, project_id, session_id, artifact_type, method, 'memory.md',
+                       content, content_sha256, byte_size, previous_artifact_id, created_at
+                FROM development_artifacts
                 """
             )
             restarted_at = utc_now()
@@ -205,7 +280,7 @@ class DevelopmentStateStore:
                 "SELECT * FROM development_sessions ORDER BY created_at, session_id"
             )]
             artifacts = [self._artifact_record(row) for row in connection.execute(
-                "SELECT * FROM development_artifacts ORDER BY created_at, artifact_id"
+                "SELECT * FROM development_document_artifacts ORDER BY created_at, artifact_id"
             )]
             active_row = connection.execute(
                 "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
@@ -280,7 +355,7 @@ class DevelopmentStateStore:
         now = utc_now()
         with self._lock, self._connection() as connection:
             project = connection.execute(
-                "SELECT display_name FROM development_projects WHERE project_id = ?",
+                "SELECT display_name, config_json FROM development_projects WHERE project_id = ?",
                 (request["project_id"],),
             ).fetchone()
             if project is None:
@@ -291,8 +366,9 @@ class DevelopmentStateStore:
                 """
                 INSERT INTO development_sessions(
                     session_id, project_id, task_title, instruction, response, model,
-                    state, duration_ms, logs_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, NULL, ?, ?)
+                    state, duration_ms, logs_json, selected_evolution_json,
+                    evolution_errors_json, error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, NULL, NULL, 'running', NULL, ?, ?, '[]', NULL, ?, ?)
                 """,
                 (
                     session_id,
@@ -300,6 +376,7 @@ class DevelopmentStateStore:
                     request["task_title"],
                     request["instruction"],
                     canonical_json(["Remote development daemon admitted the session."]),
+                    canonical_json(selected_document_evolution(json.loads(project["config_json"]))),
                     now,
                     now,
                 ),
@@ -342,16 +419,28 @@ class DevelopmentStateStore:
             )
         return logs
 
-    def latest_memory(self, project_id: str) -> dict[str, Any] | None:
+    def record_evolution_errors(
+        self,
+        session_id: str,
+        errors: list[dict[str, str]],
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                "UPDATE development_sessions SET evolution_errors_json = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (canonical_json(errors), utc_now(), session_id),
+            )
+
+    def latest_artifact(self, project_id: str, artifact_type: str) -> dict[str, Any] | None:
         with self._lock, self._connection() as connection:
             row = connection.execute(
                 """
-                SELECT * FROM development_artifacts
-                WHERE project_id = ? AND artifact_type = 'text_memory'
+                SELECT * FROM development_document_artifacts
+                WHERE project_id = ? AND artifact_type = ?
                 ORDER BY created_at DESC, artifact_id DESC
                 LIMIT 1
                 """,
-                (project_id,),
+                (project_id, artifact_type),
             ).fetchone()
         return None if row is None else self._artifact_record(row)
 
@@ -365,12 +454,18 @@ class DevelopmentStateStore:
             raise KeyError(project_id)
         return json.loads(row["config_json"])
 
-    def record_text_memory(
+    def latest_memory(self, project_id: str) -> dict[str, Any] | None:
+        return self.latest_artifact(project_id, "text_memory")
+
+    def record_document_artifact(
         self,
         *,
         artifact_id: str,
         project_id: str,
         session_id: str,
+        artifact_type: str,
+        method: str,
+        content_path: str,
         content: str,
         previous_artifact_id: str | None,
     ) -> dict[str, Any]:
@@ -379,15 +474,18 @@ class DevelopmentStateStore:
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
-                INSERT INTO development_artifacts(
-                    artifact_id, project_id, session_id, artifact_type, method, content,
-                    content_sha256, byte_size, previous_artifact_id, created_at
-                ) VALUES (?, ?, ?, 'text_memory', 'text_memory_reflector', ?, ?, ?, ?, ?)
+                INSERT INTO development_document_artifacts(
+                    artifact_id, project_id, session_id, artifact_type, method, content_path,
+                    content, content_sha256, byte_size, previous_artifact_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     artifact_id,
                     project_id,
                     session_id,
+                    artifact_type,
+                    method,
+                    content_path,
                     content,
                     hashlib.sha256(encoded).hexdigest(),
                     len(encoded),
@@ -396,11 +494,11 @@ class DevelopmentStateStore:
                 ),
             )
             row = connection.execute(
-                "SELECT * FROM development_artifacts WHERE artifact_id = ?",
+                "SELECT * FROM development_document_artifacts WHERE artifact_id = ?",
                 (artifact_id,),
             ).fetchone()
         if row is None:
-            raise RuntimeError("text memory artifact was not persisted")
+            raise RuntimeError("document evolution artifact was not persisted")
         return self._artifact_record(row)
 
     def fail_session(self, session_id: str, error: str) -> None:
@@ -428,6 +526,8 @@ class DevelopmentStateStore:
             "state": row["state"],
             "duration_ms": row["duration_ms"],
             "logs": json.loads(row["logs_json"]),
+            "selected_evolution": json.loads(row["selected_evolution_json"]),
+            "evolution_errors": json.loads(row["evolution_errors_json"]),
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -441,6 +541,7 @@ class DevelopmentStateStore:
             "session_id": row["session_id"],
             "artifact_type": row["artifact_type"],
             "method": row["method"],
+            "content_path": row["content_path"],
             "content": row["content"],
             "content_sha256": row["content_sha256"],
             "byte_size": row["byte_size"],
@@ -520,11 +621,27 @@ class CodexRunner:
 
     def run(self, request: dict[str, str]) -> dict[str, Any]:
         evolved_memory = request.get("evolved_memory", "").strip()
+        evolved_skill = request.get("evolved_skill", "").strip()
+        evolved_agent_system = request.get("evolved_agent_system", "").strip()
         memory_section = (
             "\nEvolved memory from earlier sessions in this project:\n"
             f"{evolved_memory}\n"
             "Apply this memory only when relevant. Do not mention that it was injected.\n"
             if evolved_memory
+            else ""
+        )
+        skill_section = (
+            "\nEvolved reusable skill from earlier sessions in this project:\n"
+            f"{evolved_skill}\n"
+            "Follow this workflow only when it is relevant to the current request.\n"
+            if evolved_skill
+            else ""
+        )
+        agent_system_section = (
+            "\nEvolved agent-system instructions from earlier sessions in this project:\n"
+            f"{evolved_agent_system}\n"
+            "Treat these as project-specific operating guidance.\n"
+            if evolved_agent_system
             else ""
         )
         prompt = (
@@ -534,6 +651,8 @@ class CodexRunner:
             f"Project: {request['project_name']}\n"
             f"Session: {request['task_title']}\n\n"
             f"{memory_section}"
+            f"{skill_section}"
+            f"{agent_system_section}"
             f"User message:\n{request['instruction']}\n"
         )
         started = time.monotonic()
@@ -604,8 +723,8 @@ class CodexRunner:
         }
 
 
-class TextMemoryEvolutionRunner:
-    """Development adapter around OpenEvo's real text_memory_reflector method."""
+class DocumentEvolutionRunner:
+    """Development adapter around OpenEvo's real textual reflector methods."""
 
     def __init__(
         self,
@@ -624,7 +743,7 @@ class TextMemoryEvolutionRunner:
     def check_ready(self) -> None:
         if sys.version_info < (3, 11):
             raise EvolutionRunError(
-                "real text memory evolution requires Python 3.11 or newer; use `uv run python`"
+                "real document evolution requires Python 3.11 or newer; use `uv run python`"
             )
         try:
             from openevo.evolution.methods import run_method  # noqa: F401
@@ -641,18 +760,11 @@ class TextMemoryEvolutionRunner:
         request: dict[str, str],
         result: dict[str, Any],
         store: DevelopmentStateStore,
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         config = store.project_config(request["project_id"])
-        selection = (
-            config.get("evolution", {}).get("targets", {}).get("text_memory")
-            if isinstance(config, dict)
-            else None
-        )
-        if not isinstance(selection, dict) or selection.get("method") != "text_memory_reflector":
-            # Migrate projects created by the earlier no-evolution development bridge.
-            selection = {"enabled": True, "method": "text_memory_reflector", "config": {}}
-        if selection.get("enabled") is not True:
-            return None
+        selected = selected_document_evolution(config)
+        if not selected:
+            return {"artifacts": [], "errors": []}
 
         try:
             from openevo.evolution.methods import run_method
@@ -695,66 +807,91 @@ class TextMemoryEvolutionRunner:
             encoding="utf-8",
         )
 
-        previous = store.latest_memory(request["project_id"])
-        inputs: list[dict[str, Any]] = [{
+        dataset_input: dict[str, Any] = {
             "artifact_id": f"dataset-{session_id}",
             "type": "dataset",
             "uri": manifest_path.resolve().as_uri(),
             "name": f"{request['task_title']} transcript",
-        }]
-        if previous is not None:
-            previous_path = dataset_dir / "previous-memory.md"
-            previous_path.write_text(previous["content"], encoding="utf-8")
-            inputs.append({
-                "artifact_id": previous["artifact_id"],
-                "type": "text_memory",
-                "uri": previous_path.resolve().as_uri(),
-                "name": "previous evolved memory",
+        }
+        target_config = config.get("evolution", {}).get("targets", {})
+        persisted: list[dict[str, Any]] = []
+        errors: list[dict[str, str]] = []
+        for item in selected:
+            target_id = item["target_id"]
+            method, content_path = DOCUMENT_EVOLUTION_METHODS[target_id]
+            selection = target_config[target_id]
+            previous = store.latest_artifact(request["project_id"], target_id)
+            inputs: list[dict[str, Any]] = [dataset_input]
+            if previous is not None:
+                if target_id == "skill_bundle":
+                    previous_root = dataset_dir / "previous-skill-bundle"
+                    previous_root.mkdir(mode=0o700)
+                    previous_path = previous_root / "SKILL.md"
+                    previous_uri = previous_root.resolve().as_uri()
+                else:
+                    previous_path = dataset_dir / f"previous-{content_path.lower()}"
+                    previous_uri = previous_path.resolve().as_uri()
+                previous_path.write_text(previous["content"], encoding="utf-8")
+                inputs.append({
+                    "artifact_id": previous["artifact_id"],
+                    "type": target_id,
+                    "uri": previous_uri,
+                    "name": f"previous evolved {target_id.replace('_', ' ')}",
+                })
+
+            method_config = selection.get("config")
+            method_config = dict(method_config) if isinstance(method_config, dict) else {}
+            method_config.update({
+                "name": f"{request['project_name']} evolved {target_id.replace('_', ' ')}",
+                "promoted": True,
+                "reflector_llm": {
+                    "provider": "codex_cli",
+                    "model": self._model,
+                    "codex_bin": self._codex_binary,
+                    "timeout_seconds": self._timeout_seconds,
+                },
             })
+            if target_id == "agent_system":
+                method_config.setdefault("target_path", "AGENTS.md")
+            try:
+                [artifact] = run_method(
+                    WorkerClaimedJob(
+                        job_id=f"job-{target_id.replace('_', '-')}-{session_id}",
+                        lease_id=f"lease-{target_id.replace('_', '-')}-{session_id}",
+                        job_type="reference",
+                        method=method,
+                        input_artifacts=inputs,
+                        config=method_config,
+                    ),
+                    artifact_root=self._artifact_root,
+                )
+                if str(artifact.type) not in {target_id, f"ArtifactType.{target_id.upper()}"}:
+                    raise EvolutionRunError(f"{method} returned the wrong artifact type")
+                if not artifact.uri.startswith("file://"):
+                    raise EvolutionRunError(f"{method} returned a non-file artifact")
+                output_path = Path(artifact.uri.removeprefix("file://"))
+                if target_id == "skill_bundle":
+                    output_path /= "SKILL.md"
+                content = output_path.read_text(encoding="utf-8")
+                artifact_id = f"dev-{target_id.replace('_', '-')}-{session_id.removeprefix('dev-session-')}"
+                persisted.append(store.record_document_artifact(
+                    artifact_id=artifact_id,
+                    project_id=request["project_id"],
+                    session_id=session_id,
+                    artifact_type=target_id,
+                    method=method,
+                    content_path=content_path,
+                    content=content,
+                    previous_artifact_id=None if previous is None else previous["artifact_id"],
+                ))
+            except Exception as exc:
+                errors.append({"target_id": target_id, "method": method, "message": str(exc)})
+        return {"artifacts": persisted, "errors": errors}
 
-        method_config = selection.get("config")
-        method_config = dict(method_config) if isinstance(method_config, dict) else {}
-        method_config.update({
-            "name": f"{request['project_name']} evolved memory",
-            "promoted": True,
-            "reflector_llm": {
-                "provider": "codex_cli",
-                "model": self._model,
-                "codex_bin": self._codex_binary,
-                "timeout_seconds": self._timeout_seconds,
-            },
-        })
-        try:
-            [artifact] = run_method(
-                WorkerClaimedJob(
-                    job_id=f"job-text-memory-{session_id}",
-                    lease_id=f"lease-text-memory-{session_id}",
-                    job_type="reference",
-                    method="text_memory_reflector",
-                    input_artifacts=inputs,
-                    config=method_config,
-                ),
-                artifact_root=self._artifact_root,
-            )
-            if str(artifact.type) not in {"text_memory", "ArtifactType.TEXT_MEMORY"}:
-                raise EvolutionRunError("text_memory_reflector returned the wrong artifact type")
-            if not artifact.uri.startswith("file://"):
-                raise EvolutionRunError("text_memory_reflector returned a non-file artifact")
-            memory_path = Path(artifact.uri.removeprefix("file://"))
-            memory_content = memory_path.read_text(encoding="utf-8")
-        except EvolutionRunError:
-            raise
-        except Exception as exc:
-            raise EvolutionRunError(f"text_memory_reflector failed: {exc}") from exc
 
-        artifact_id = f"dev-text-memory-{session_id.removeprefix('dev-session-')}"
-        return store.record_text_memory(
-            artifact_id=artifact_id,
-            project_id=request["project_id"],
-            session_id=session_id,
-            content=memory_content,
-            previous_artifact_id=None if previous is None else previous["artifact_id"],
-        )
+# Kept as a source-compatible name for development tests and scripts written before document
+# evolution was expanded beyond text memory.
+TextMemoryEvolutionRunner = DocumentEvolutionRunner
 
 
 class DevelopmentAgentServer(ThreadingHTTPServer):
@@ -766,7 +903,7 @@ class DevelopmentAgentServer(ThreadingHTTPServer):
         token: str,
         runner: CodexRunner,
         store: DevelopmentStateStore,
-        evolution_runner: TextMemoryEvolutionRunner | None = None,
+        evolution_runner: DocumentEvolutionRunner | None = None,
     ) -> None:
         super().__init__(address, DevelopmentAgentHandler)
         self.token = token
@@ -872,11 +1009,27 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
                 return
             previous_memory = self.server.store.latest_memory(request["project_id"])
+            previous_skill = self.server.store.latest_artifact(
+                request["project_id"], "skill_bundle"
+            )
+            previous_agent_system = self.server.store.latest_artifact(
+                request["project_id"], "agent_system"
+            )
             execution_request = {
                 **request,
                 **(
                     {"evolved_memory": previous_memory["content"]}
                     if previous_memory is not None
+                    else {}
+                ),
+                **(
+                    {"evolved_skill": previous_skill["content"]}
+                    if previous_skill is not None
+                    else {}
+                ),
+                **(
+                    {"evolved_agent_system": previous_agent_system["content"]}
+                    if previous_agent_system is not None
                     else {}
                 ),
             }
@@ -888,26 +1041,25 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             result = {**result, "session_id": session_id}
             self.server.store.complete_session(session_id, result)
             if self.server.evolution_runner is not None:
-                try:
-                    evolved = self.server.evolution_runner.evolve(
-                        session_id=session_id,
-                        request=request,
-                        result=result,
-                        store=self.server.store,
-                    )
-                except EvolutionRunError as exc:
-                    result["evolution_error"] = str(exc)
+                evolved = self.server.evolution_runner.evolve(
+                    session_id=session_id,
+                    request=request,
+                    result=result,
+                    store=self.server.store,
+                )
+                result["evolution_artifacts"] = evolved["artifacts"]
+                result["evolution_errors"] = evolved["errors"]
+                self.server.store.record_evolution_errors(session_id, evolved["errors"])
+                for artifact in evolved["artifacts"]:
                     result["logs"] = self.server.store.append_session_log(
                         session_id,
-                        f"Text memory evolution failed: {exc}",
+                        f"OpenEvo {artifact['method']} published {artifact['content_path']} for the next session.",
                     )
-                else:
-                    if evolved is not None:
-                        result["evolution_artifact"] = evolved
-                        result["logs"] = self.server.store.append_session_log(
-                            session_id,
-                            "OpenEvo text_memory_reflector published evolved memory for the next session.",
-                        )
+                for error in evolved["errors"]:
+                    result["logs"] = self.server.store.append_session_log(
+                        session_id,
+                        f"{error['method']} failed: {error['message']}",
+                    )
             self._json(HTTPStatus.OK, result)
         finally:
             self.server.turn_lock.release()
@@ -986,7 +1138,7 @@ def main() -> int:
         or model
         or "gpt-5.5"
     )
-    evolution_runner = TextMemoryEvolutionRunner(
+    evolution_runner = DocumentEvolutionRunner(
         state_root=state_path.parent,
         codex_binary=codex_binary,
         model=evolution_model,
@@ -1005,7 +1157,11 @@ def main() -> int:
     )
     print(f"Development agent daemon listening on 127.0.0.1:{args.port}", flush=True)
     print(f"Development state database: {state_path}", flush=True)
-    print(f"Real text_memory_reflector enabled with model {evolution_model}.", flush=True)
+    print(
+        "Real text_memory_reflector, skill_bundle_reflector, and "
+        f"agent_system_reflector enabled with model {evolution_model}.",
+        flush=True,
+    )
     print("It is loopback-only; connect through an SSH local-forward tunnel.", flush=True)
     try:
         server.serve_forever(poll_interval=0.5)

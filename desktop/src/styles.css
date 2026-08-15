@@ -4503,6 +4503,111 @@ pre.json {
   font-size: 11px;
 }
 
+.session-evolution-picker {
+  margin: 18px 0 0;
+  padding: 18px 0 0;
+  border: 0;
+  border-top: 1px solid var(--line);
+}
+
+.session-evolution-picker legend {
+  width: 100%;
+  padding: 0 0 12px;
+  font-weight: 700;
+}
+
+.session-evolution-picker legend span {
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.session-evolution-options {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.session-evolution-options label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+  padding: 13px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-soft);
+  cursor: pointer;
+}
+
+.session-evolution-options label.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.session-evolution-options input {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.session-evolution-options span,
+.session-evolution-options small {
+  display: block;
+}
+
+.session-evolution-options small,
+.session-evolution-picker > p {
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.session-evolution-summary {
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--surface-soft);
+}
+
+.session-evolution-summary > div:first-child {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.session-evolution-summary p {
+  margin: 10px 0 0;
+  color: var(--muted);
+}
+
+.session-evolution-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.session-evolution-statuses span {
+  padding: 6px 9px;
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.session-evolution-statuses span.produced {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.session-evolution-statuses span.failed {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .v2-session-technical-details {
   display: grid;
   gap: 10px;
@@ -5061,6 +5166,7 @@ pre.json {
 }
 
 @media (max-width: 820px) {
+  .session-evolution-options,
   .v2-authority-grid,
   .v2-task-authority,
   .v2-supporting-results,

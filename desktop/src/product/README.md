@@ -130,21 +130,23 @@ The fixed Vite origins are admitted only when the sidecar reports the
 Tauri-only origin set. `npm run dev:fixture` remains the explicit visual-fixture
 loop behind `/product-preview.html`; it is never a live Daemon workflow.
 
-For the narrower "ask the remote Codex and evolve text memory" loop, use
+For the narrower "ask the remote Codex and evolve selected documents" loop, use
 `npm run dev:agent`. This mode bypasses the sealed release lifecycle, but calls
-the repository's real `text_memory_reflector` implementation after each successful
-Session. The
+the repository's real `text_memory_reflector`, `skill_bundle_reflector`, and
+`agent_system_reflector` implementations selected for each successful Session. The
 server runs `scripts/dev/live_agent_daemon.py` on `127.0.0.1:8787`; an SSH local
 forward exposes it as local `127.0.0.1:8765`; and Vite injects the bearer token
 while proxying `/openevo-dev-agent/*`. The renderer never receives the token,
 SSH command, or remote address. The development daemon stores Projects, active
 Project selection, Session state, instructions, Codex responses, model label,
-duration, errors, process-log summaries, and versioned text-memory artifacts in
+duration, errors, process-log summaries, per-Session evolution selections, and
+versioned document artifacts in
 the remote SQLite database `~/.openevo/dev-agent/state.sqlite3`. Dataset and
-`memory.md` files live under `~/.openevo/dev-agent/evolution-artifacts/`. The
-latest promoted memory is injected into the next Project Session. The renderer
+generated `memory.md`, `SKILL.md`, and `AGENTS.md` files live under
+`~/.openevo/dev-agent/evolution-artifacts/`. The latest promoted documents are
+injected into the next Project Session. The renderer
 reloads that authority from `GET /openevo-dev-agent/v1/state`, so a browser
-refresh preserves Project, conversation, and memory history. This bridge is
+refresh preserves Project, conversation, selection, and evolution history. This bridge is
 reachable only in Vite mode `openevo-live-agent` and is not imported by the
 packaged release entrypoint.
 

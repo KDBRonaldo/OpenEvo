@@ -154,6 +154,8 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "state": "completed",
         "duration_ms": 123,
         "logs": ["admitted", "completed"],
+        "selected_evolution": [],
+        "evolution_errors": [],
         "error": None,
         "created_at": restored["sessions"][0]["created_at"],
         "updated_at": restored["sessions"][0]["updated_at"],
@@ -171,6 +173,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "development_projects",
         "development_sessions",
         "development_artifacts",
+        "development_document_artifacts",
     } <= tables
 
 
@@ -232,17 +235,131 @@ def test_real_text_memory_reflector_persists_and_consumes_prior_memory(
         }
         store.start_session(session_id, request)
         store.complete_session(session_id, result)
-        artifacts.append(evolver.evolve(
+        batch = evolver.evolve(
             session_id=session_id,
             request=request,
             result=result,
             store=store,
-        ))
+        )
+        artifacts.append(batch["artifacts"][0])
 
     assert artifacts[0]["method"] == "text_memory_reflector"
     assert artifacts[1]["previous_artifact_id"] == artifacts[0]["artifact_id"]
     assert "Reflection round 1" in prompts[1]
     assert store.latest_memory(project["project_id"])["content"].startswith("# Evolved memory")
+
+
+def test_document_evolution_runner_can_publish_all_selected_document_types(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import methods
+
+    monkeypatch.setattr(
+        methods,
+        "_generate_reflector_markdown",
+        lambda prompt, _config, **_kwargs: (
+            "# Skill\n\n- Reuse the workflow.\n"
+            if "SKILL.md" in prompt
+            else "# Memory\n\n- Remember the lesson.\n"
+        ),
+    )
+    monkeypatch.setattr(
+        methods,
+        "_generate_audited_agent_system_reflection",
+        lambda *_args, **_kwargs: ("# Agent system\n\n- Verify before answering.\n", {}),
+    )
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-all",
+        "display_name": "All document methods",
+        "config": {
+            "schema_version": "2",
+            "evolution": {
+                "targets": {
+                    target_id: {"enabled": True, "method": method, "config": {}}
+                    for target_id, (method, _path) in MODULE.DOCUMENT_EVOLUTION_METHODS.items()
+                }
+            },
+        },
+    }
+    store.create_project(project)
+    request = {
+        "project_id": project["project_id"],
+        "project_name": project["display_name"],
+        "task_title": "Learn",
+        "instruction": "Learn from this exchange.",
+    }
+    result = {"response": "Done.", "model": "test", "duration_ms": 1, "logs": []}
+    store.start_session("dev-session-all", request)
+    store.complete_session("dev-session-all", result)
+
+    batch = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    ).evolve(
+        session_id="dev-session-all",
+        request=request,
+        result=result,
+        store=store,
+    )
+
+    assert batch["errors"] == []
+    assert {artifact["artifact_type"] for artifact in batch["artifacts"]} == {
+        "text_memory",
+        "skill_bundle",
+        "agent_system",
+    }
+    assert {artifact["content_path"] for artifact in batch["artifacts"]} == {
+        "memory.md",
+        "SKILL.md",
+        "AGENTS.md",
+    }
+
+
+def test_document_evolution_runner_allows_a_session_with_no_selected_method(
+    tmp_path: Path,
+) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-none",
+        "display_name": "No evolution",
+        "config": {
+            "evolution": {
+                "targets": {
+                    target_id: {"enabled": False, "method": method, "config": {}}
+                    for target_id, (method, _path) in MODULE.DOCUMENT_EVOLUTION_METHODS.items()
+                }
+            }
+        },
+    }
+    store.create_project(project)
+    request = {
+        "project_id": project["project_id"],
+        "project_name": project["display_name"],
+        "task_title": "Answer only",
+        "instruction": "Do not evolve documents.",
+    }
+    result = {"response": "Done.", "model": "test", "duration_ms": 1, "logs": []}
+    store.start_session("dev-session-none", request)
+    store.complete_session("dev-session-none", result)
+
+    batch = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    ).evolve(
+        session_id="dev-session-none",
+        request=request,
+        result=result,
+        store=store,
+    )
+
+    assert batch == {"artifacts": [], "errors": []}
+    assert store.snapshot()["sessions"][0]["selected_evolution"] == []
 
 
 def test_sqlite_store_marks_interrupted_running_session_failed_on_restart(tmp_path: Path) -> None:

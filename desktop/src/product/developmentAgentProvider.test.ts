@@ -59,6 +59,7 @@ describe("development agent provider", () => {
           session_id: "dev-session-1",
           artifact_type: "text_memory",
           method: "text_memory_reflector",
+          content_path: "memory.md",
           content: "# Evolved memory\n\n- Verify arithmetic before answering.\n",
           content_sha256: "c".repeat(64),
           byte_size: 54,
@@ -76,6 +77,8 @@ describe("development agent provider", () => {
           state: "completed",
           duration_ms: 42,
           logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
+          selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector" }],
+          evolution_errors: [],
           error: null,
           created_at: "2026-08-14T10:01:00Z",
           updated_at: "2026-08-14T10:01:01Z",
@@ -87,7 +90,8 @@ describe("development agent provider", () => {
           model: null,
           duration_ms: 42,
           logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
-          evolution_artifact: evolved,
+          evolution_artifacts: [evolved],
+          evolution_errors: [],
         });
       }
       throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
@@ -111,6 +115,11 @@ describe("development agent provider", () => {
       config: {},
     });
     expect(created.snapshot.capability?.capabilities.targets[0]?.methods[0]?.method_id).toBe("text_memory_reflector");
+    expect(created.snapshot.capability?.capabilities.targets.map((target) => target.methods[0]?.method_id)).toEqual([
+      "text_memory_reflector",
+      "skill_bundle_reflector",
+      "agent_system_reflector",
+    ]);
 
     const task = await provider.submitTask(project.project_id, {
       actionId: "submit-live-task",
