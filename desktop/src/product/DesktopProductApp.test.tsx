@@ -874,6 +874,11 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("authoritative · closed");
     expect(document.body.textContent).toContain("superseded");
     expect(document.body.textContent).toContain("successor-transition-8");
+    expect(
+      [...document.querySelectorAll("[data-session-priority]")].map((node) =>
+        node.getAttribute("data-session-priority"),
+      ),
+    ).toEqual(["task", "conversation", "evolution", "supporting", "technical"]);
 
     await click("artifact-memory-2");
     expect(

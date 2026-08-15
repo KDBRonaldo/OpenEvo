@@ -1152,10 +1152,28 @@ function TaskAuthorityCardV2({
     | null
   >(null);
   useEffect(() => setSelectedResult(null), [task.task_id]);
+  const selectedProducedArtifact = selectedResult?.kind === "artifact"
+    && producedArtifacts.some((artifact) => artifact.artifact_id === selectedResult.artifactId);
+  const resultInspector = selectedResult ? (
+    <SessionResultInspectorV2
+      selection={selectedResult}
+      artifacts={artifacts}
+      artifactPresentation={artifactPresentation}
+      outputFiles={presentation?.outputFiles ?? []}
+      onClose={() => setSelectedResult(null)}
+    />
+  ) : null;
   return (
     <article className="v2-task-card v2-task-result-detail">
       <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
-      <div className="session-task-detail v2-session-task-detail"><span className="panel-kicker">Session task</span>{taskContent ? <><h3>{taskContent.title}</h3><p>{taskContent.objective}</p></> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</div>
+      <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
+      <section className="v2-result-section v2-conversation-section" data-session-priority="conversation"><div className="v2-result-section-head"><div><span className="panel-kicker">Conversation</span><h3>Agent response</h3></div><strong>{presentation?.transcript.length ?? logs.length} messages</strong></div>{presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : <p className="v2-empty-copy">The agent response is not loaded yet.</p>}</section>
+      <section className="v2-evolution-priority" data-session-priority="evolution"><ResultCollection title="Evolution produced" empty="This Task did not publish an evolution artifact." artifacts={producedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /></section>
+      {selectedProducedArtifact ? resultInspector : null}
+      <section className="v2-supporting-results" data-session-priority="supporting"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></section>
+      {selectedResult && !selectedProducedArtifact ? resultInspector : null}
+      <section className="v2-session-technical-details" data-session-priority="technical">
+        <header><span className="panel-kicker">Technical run details</span><p>Execution status and immutable identifiers for troubleshooting.</p></header>
       <div className="v2-task-authority"><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
       <div className="v2-attempt-list">{task.attempts.map((attempt) => {
         const authoritative = attempt.attempt_id === task.authoritative_attempt_id;
@@ -1165,14 +1183,11 @@ function TaskAuthorityCardV2({
         model={taskPanelModelV2(task, timeline, logs)}
         onCancel={active ? onCancel : undefined}
       />
-      <div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Transcript</span><strong>{presentation?.transcript.length ?? logs.length} entries</strong></div>{presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : <p className="v2-empty-copy">Transcript content is not loaded yet.</p>}</div>
-      <div className="v2-result-columns"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><ResultCollection title="Evolution produced" empty="This Task did not publish an evolution artifact." artifacts={producedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /></div>
-      <div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div>
-      {selectedResult ? <SessionResultInspectorV2 selection={selectedResult} artifacts={artifacts} artifactPresentation={artifactPresentation} outputFiles={presentation?.outputFiles ?? []} onClose={() => setSelectedResult(null)} /> : null}
       {transition !== null && transition.state !== "committed" ? (
         <LifecycleOperationPanelV2 model={transitionPanelModelV2(transition, timeline)} />
       ) : null}
       {transition ? <div className="v2-transition"><div><span>Successor Transition</span><strong>{transition.transition.successor_transition_id}</strong><small>Expected Project Head generation {transition.transition.expected_successor_generation}</small></div><span className={`state-pill ${transition.state}`}>{transition.state}</span>{transition.error ? <p>{transition.error.message}</p> : null}{transition.state === "failed" ? <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={onRetryTransition}>Retry successor transition</button><button type="button" className="text-button" disabled={busy} onClick={onAbandonTransition}>Abandon evolution result</button></div> : null}</div> : null}
+      </section>
       <div className="v2-card-actions"><button type="button" className="secondary-button" disabled={busy} onClick={() => void onLoadLogs()}>Refresh task logs</button>{["failed", "cancelled"].includes(task.state) ? <button type="button" className="secondary-button" disabled={busy} onClick={onRetry}>Append infrastructure Attempt</button> : null}</div>
     </article>
   );
