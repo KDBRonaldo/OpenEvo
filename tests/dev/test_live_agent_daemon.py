@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sqlite3
 import threading
+import time
 import urllib.request
 
 import pytest
@@ -78,7 +79,7 @@ def test_extract_event_logs_ignores_agent_message_content() -> None:
 
 def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
-        MODULE.subprocess,
+        subprocess,
         "run",
         lambda *args, **kwargs: subprocess.CompletedProcess(
             args=args[0],
@@ -120,7 +121,7 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
         )
         return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
 
-    monkeypatch.setattr(MODULE.subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "run", run)
     result = MODULE.CodexRunner("codex", 30, "test-model").run({
         "project_name": "Memory project",
         "task_title": "Second question",
@@ -285,6 +286,12 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
             "model": "test-model",
             "duration_ms": 123,
             "logs": ["admitted", "completed"],
+            "runtime_activation": {
+                "schema_version": "1",
+                "adapter_id": "codex-development-v1",
+                "fully_supported": True,
+                "decisions": [],
+            },
         },
     )
 
@@ -301,10 +308,16 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
         "model": "test-model",
         "state": "completed",
         "duration_ms": 123,
-        "logs": ["admitted", "completed"],
+        "logs": ["Remote development daemon admitted the session.", "admitted", "completed"],
         "selected_evolution": [],
         "evolution_errors": [],
         "workspace_changes": [],
+        "runtime_activation": {
+            "schema_version": "1",
+            "adapter_id": "codex-development-v1",
+            "fully_supported": True,
+            "decisions": [],
+        },
         "error": None,
         "created_at": restored["sessions"][0]["created_at"],
         "updated_at": restored["sessions"][0]["updated_at"],
@@ -852,8 +865,13 @@ def test_sqlite_store_marks_interrupted_running_session_failed_on_restart(tmp_pa
 
 
 def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> None:
+    runner_started = threading.Event()
+    release_runner = threading.Event()
+
     class FakeRunner:
-        def run(self, request: dict[str, object]) -> dict[str, object]:
+        def run(self, request: dict[str, object], **_: object) -> dict[str, object]:
+            runner_started.set()
+            assert release_runner.wait(timeout=5)
             workspace = request["workspace_path"]
             assert isinstance(workspace, Path)
             assert request["workspace_snapshot"] == {
@@ -906,20 +924,70 @@ def test_http_api_round_trip_persists_a_real_runner_response(tmp_path: Path) -> 
                 "instruction": "Hello",
             },
         )
-        state = _request_json(base_url, "/openevo-dev-agent/v1/state", token)
+        assert runner_started.wait(timeout=1)
+        running = _request_json(base_url, "/openevo-dev-agent/v1/state", token)
+        assert running["sessions"][0]["state"] == "running"
+        release_runner.set()
+        deadline = time.monotonic() + 5
+        while True:
+            state = _request_json(base_url, "/openevo-dev-agent/v1/state", token)
+            if state["sessions"][0]["state"] != "running":
+                break
+            if time.monotonic() >= deadline:
+                raise AssertionError("asynchronous session did not finish")
+            time.sleep(0.01)
     finally:
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
 
-    assert turn["response"] == "Answer to: Hello"
-    assert turn["workspace_changes"][0]["path"] == "hello.py"
-    assert turn["workspace_changes"][0]["change_type"] == "created"
+    assert turn["state"] == "running"
+    assert turn["session_id"].startswith("dev-session-")
     assert state["projects"][0]["display_name"] == "Persistent project"
     assert state["sessions"][0]["response"] == "Answer to: Hello"
     assert state["sessions"][0]["state"] == "completed"
     assert state["sessions"][0]["workspace_changes"][0]["path"] == "hello.py"
     assert state["workspaces"][0]["entries"][0]["content"] == "print('hello')\n"
+
+
+def test_session_coordinator_cancels_a_running_harness(tmp_path: Path) -> None:
+    class BlockingRunner:
+        def run(
+            self,
+            request: dict[str, object],
+            *,
+            cancellation: MODULE.HarnessCancellation,
+            **_: object,
+        ) -> dict[str, object]:
+            while not cancellation.requested:
+                time.sleep(0.01)
+            raise MODULE.HarnessRunCancelled("Session cancelled by user")
+
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project({
+        "project_id": "development-project-1",
+        "display_name": "Persistent project",
+        "config": {},
+    })
+    coordinator = MODULE.DevelopmentSessionCoordinator(
+        runner=BlockingRunner(),
+        store=store,
+        evolution_runner=None,
+    )
+    session_id = coordinator.submit({
+        "project_id": "development-project-1",
+        "project_name": "Persistent project",
+        "task_title": "Cancel me",
+        "instruction": "Wait",
+    })
+    requested = coordinator.cancel(session_id)
+    assert requested["state"] == "cancelling"
+    deadline = time.monotonic() + 5
+    while store.get_session(session_id)["state"] != "cancelled":
+        if time.monotonic() >= deadline:
+            raise AssertionError("cancelled session did not become terminal")
+        time.sleep(0.01)
+    assert store.get_session(session_id)["error"] is None
 
 
 def _request_json(

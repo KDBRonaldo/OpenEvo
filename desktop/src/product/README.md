@@ -126,11 +126,18 @@ or agent-system when the artifact provides one. Existing artifacts default to th
 current behavior without gaining an extra runtime contribution. A future Core
 method can instead declare on-demand memory reads or a bounded structured agent
 spawn plan in `manifest.runtime_control` without adding method IDs or method tables
-to Desktop/daemon. The development Codex adapter passes those controls as verified
-files and environment bindings; native harness instruction and skill loading work
-today. A structured spawn plan is transport-ready but still requires a harness
-adapter that implements actual sub-agent spawning, and unsupported control versions
-fail closed rather than being treated as Markdown.
+to Desktop/daemon. Before harness execution, the daemon-owned versioned translator
+registry converts each Core control into stable desired-state feature intents. The
+Codex adapter reconciles those intents against an explicit capability set and records
+every decision as `active`, `delegated`, or `unsupported` in the persisted Session
+runtime-activation report. Native memory-at-session-start, harness instruction, and
+skill loading work today; session-closed memory writes are delegated to the development
+evolution runner. On-demand memory, manual writes, and structured spawn plans remain
+explicitly unsupported until a verified executor is installed. Unknown control kinds
+or versions fail closed rather than being treated as Markdown or imperative commands.
+Adding a future Core contract, such as a bounded tool policy, requires one translator
+and corresponding harness capabilities; it does not add algorithm-specific dispatch
+to the daemon.
 The development adapter also adds the required `name` and `description` frontmatter
 to a runtime-only `SKILL.md` copy when an older artifact lacks it; the authoritative
 evolved artifact is not rewritten. The temporary runtime projection
@@ -510,3 +517,20 @@ or artifact evidence are shown as unknown/unavailable with a refetch action
 rather than inferred from list order or a loaded run. The simulator keeps its
 Desktop and Core project IDs different by default so product tests exercise the
 same ownership boundary as release responses.
+
+## Real-agent development Session lifecycle
+
+The loopback development bridge admits `POST /openevo-dev-agent/v1/sessions`
+asynchronously. It returns HTTP 202 with a durable `session_id`; Codex and the
+selected evolution methods then run on a daemon-owned background thread. The
+Desktop provider refreshes the persisted remote state while a Session is
+`running` or `cancelling`, so transcript, logs, workspace changes, failures and
+terminal status survive renderer refreshes. A running Session can be cancelled
+through `POST /openevo-dev-agent/v1/sessions/<id>/cancel`.
+
+Harness mechanics are isolated behind `HarnessAdapter`. The first concrete
+implementation is `CodexHarnessAdapter`, which owns runtime preparation,
+memory instruction injection, native skill and agent-system staging, runtime
+control reconciliation, command construction, cancellable process execution,
+and transcript/result collection. Session persistence and orchestration do not
+branch on Codex-specific launch details; another harness adds another adapter.

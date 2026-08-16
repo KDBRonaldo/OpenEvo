@@ -11,6 +11,7 @@ import {
   unavailableDesktopProductProviderV2,
   type DesktopProductProviderV2,
   type DesktopProductSnapshotV2,
+  type ProductSubscriptionSignalV2,
 } from "./providerV2";
 
 const NOW = "2026-08-13T08:30:00Z";
@@ -24,15 +25,9 @@ export interface DevelopmentAgentTurnRequest {
   readonly instruction: string;
 }
 
-export interface DevelopmentAgentTurnResult {
+export interface DevelopmentAgentTurnSubmission {
   readonly sessionId: string;
-  readonly responseText: string;
-  readonly model: string | null;
-  readonly durationMs: number;
-  readonly logMessages: readonly string[];
-  readonly evolutionArtifacts: readonly PersistedDevelopmentArtifact[];
-  readonly evolutionErrors: readonly PersistedDevelopmentEvolutionError[];
-  readonly workspaceChanges: readonly PersistedDevelopmentWorkspaceChange[];
+  readonly state: "running";
 }
 
 export interface PersistedDevelopmentWorkspaceEntry {
@@ -117,7 +112,7 @@ export interface PersistedDevelopmentSession {
   readonly instruction: string;
   readonly response: string | null;
   readonly model: string | null;
-  readonly state: "running" | "completed" | "failed";
+  readonly state: "running" | "cancelling" | "completed" | "failed" | "cancelled";
   readonly durationMs: number | null;
   readonly logMessages: readonly string[];
   readonly selectedEvolution: readonly PersistedDevelopmentEvolutionSelection[];
@@ -151,11 +146,11 @@ export interface DevelopmentAgentBackend {
     readonly config: ScienceProjectConfigV2;
   }): Promise<void>;
   activateProject(projectId: string): Promise<void>;
-  runAgentTurn(request: DevelopmentAgentTurnRequest): Promise<DevelopmentAgentTurnResult>;
+  submitAgentTurn(request: DevelopmentAgentTurnRequest): Promise<DevelopmentAgentTurnSubmission>;
+  cancelAgentTurn(sessionId: string): Promise<void>;
 }
 
 interface DevelopmentProviderOptions {
-  readonly runAgentTurn: (request: DevelopmentAgentTurnRequest) => Promise<DevelopmentAgentTurnResult>;
   readonly developmentBackend: DevelopmentAgentBackend;
 }
 
@@ -171,7 +166,6 @@ export function createDevelopmentAgentDesktopProductProvider(
   backend: DevelopmentAgentBackend,
 ): DesktopProductProviderV2 {
   return createRemoteBackedDesktopProductProvider({
-    runAgentTurn: backend.runAgentTurn,
     developmentBackend: backend,
   });
 }
@@ -182,8 +176,34 @@ function createRemoteBackedDesktopProductProvider(
   let snapshot = createDevelopmentAgentSnapshot();
   let developmentCapabilities = snapshot.capability?.capabilities;
   const taskLogs = new Map<string, readonly string[]>();
+  const subscribers = new Set<(signal: ProductSubscriptionSignalV2) => void>();
   let developmentStateLoaded = false;
   let developmentStateLoad: Promise<void> | null = null;
+  let pollingTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+
+  const notifySubscribers = () => {
+    for (const listener of subscribers) listener({ kind: "cursor_reset", resumeFromEventId: null });
+  };
+
+  const hasActiveSession = () => snapshot.tasks.some(
+    (task) => task.state === "running" || task.state === "cancelling",
+  );
+
+  const schedulePolling = () => {
+    if (pollingTimer !== null || !hasActiveSession()) return;
+    pollingTimer = globalThis.setTimeout(async () => {
+      pollingTimer = null;
+      try {
+        await ensureDevelopmentState(true);
+        notifySubscribers();
+      } catch {
+        // A transient tunnel failure is surfaced by the normal refresh path; keep the polling
+        // loop alive so a restored tunnel can resume the same persisted Session.
+      } finally {
+        schedulePolling();
+      }
+    }, 750);
+  };
 
   const ensureDevelopmentState = async (force = false): Promise<void> => {
     if (developmentStateLoaded && !force) return;
@@ -201,6 +221,7 @@ function createRemoteBackedDesktopProductProvider(
       developmentStateLoad = null;
     });
     await developmentStateLoad;
+    schedulePolling();
   };
 
   return {
@@ -210,7 +231,10 @@ function createRemoteBackedDesktopProductProvider(
       await ensureDevelopmentState(true);
       return { status: "fresh", snapshot };
     },
-    subscribe: () => () => undefined,
+    subscribe: (listener) => {
+      subscribers.add(listener);
+      return () => subscribers.delete(listener);
+    },
     createProject: async (draft) => {
       await ensureDevelopmentState();
       const sequence = snapshot.projects.length + 1;
@@ -341,99 +365,58 @@ function createRemoteBackedDesktopProductProvider(
       await ensureDevelopmentState();
       const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
       if (!project?.active_project_head || project.state !== "ready") throw new Error("Remote project is not ready.");
-      const ordinal = snapshot.tasks.filter((candidate) => candidate.project_id === projectId).length + 1;
-      const agentTurn = await options.runAgentTurn({
+      const submission = await options.developmentBackend.submitAgentTurn({
         projectId,
         projectName: project.display_name,
         taskTitle: project.config.task.title,
         instruction: project.config.task.objective,
       });
-      const admittedTask = developmentTask(project, ordinal, agentTurn.sessionId);
-      const evolutionRound = developmentEvolutionRound(snapshot, agentTurn.evolutionArtifacts);
-      const successorHead = developmentSuccessorHead(
-        project.active_project_head,
-        project.config,
-        evolutionRound.artifacts.length,
-      );
-      const transitionRef = {
-        schema_version: "2" as const,
-        successor_transition_id: `${projectId}-transition-${successorHead.generation}`,
-        project_id: projectId,
-        kind: "run_result" as const,
-        predecessor_project_head: project.active_project_head,
-        expected_successor_generation: successorHead.generation,
-        plan_sha256: developmentDigest(successorHead.generation + 40),
-        task_admission: admittedTask.admission,
-        accepted_attempt: admittedTask.attempts[0]!,
-        successor_project_head: successorHead,
-      };
-      const task: TaskV2 = {
-        ...admittedTask,
-        successor_transition: transitionRef,
-        state: "closed",
-      };
-      const updatedProject = {
-        ...project,
-        active_project_head: successorHead,
-        updated_at: NOW,
-      };
-      const agentResponse = agentTurn.responseText;
-      const outputFiles = workspaceChangeOutputFiles(agentTurn.workspaceChanges);
-      taskLogs.set(task.task_id, agentTurn.logMessages);
-      snapshot = {
-        ...snapshot,
-        projects: snapshot.projects.map((candidate) => candidate.project_id === projectId ? updatedProject : candidate) as never,
-        tasks: [task, ...snapshot.tasks],
-        transitions: {
-          ...snapshot.transitions,
-          [transitionRef.successor_transition_id]: {
-            schema_version: "2",
-            transition: transitionRef,
-            state: "committed",
-            progress_completed: 5,
-            progress_total: 5,
-            error: null,
-            created_at: NOW,
-            updated_at: NOW,
-          },
-        } as never,
-        artifacts: [...evolutionRound.artifacts, ...snapshot.artifacts] as never,
-        runtimePresentation: {
-          tasks: {
-            ...(snapshot.runtimePresentation?.tasks ?? {}),
-            [task.task_id]: {
-              instruction: project.config.task,
-              transcript: [
-                { speaker: "user", text: project.config.task.objective },
-                { speaker: "agent", text: agentResponse },
-              ],
-              outputFiles,
-              selectedEvolution: developmentEvolutionSelections(project.config),
-              evolutionErrors: agentTurn.evolutionErrors,
-              usedArtifactIds: evolutionRound.usedArtifactIds,
-              producedArtifactIds: evolutionRound.artifacts.map((artifact) => artifact.artifact_id),
-            },
-          },
-          artifacts: {
-            ...(snapshot.runtimePresentation?.artifacts ?? {}),
-            ...evolutionRound.presentation,
-          },
-        },
-        stream: { ...snapshot.stream, epoch: snapshot.stream.epoch + 1 },
-      };
+      await ensureDevelopmentState(true);
+      const task = snapshot.tasks.find((candidate) => candidate.task_id === submission.sessionId);
+      if (!task) throw new Error("The admitted remote Session was not visible after submission.");
+      notifySubscribers();
+      schedulePolling();
       return task;
     },
-    loadTaskLogs: async (taskId) => ({
-      schema_version: "2",
-      items: (taskLogs.get(taskId) ?? ["No development runner logs were recorded."]).map((message, index) => ({
-        sequence: index + 1,
-        occurred_at: NOW,
-        stream: index === 0 ? "system" : "transcript",
-        message,
-      })),
-      next_cursor: null,
-      has_more: false,
-    }),
+    cancelTask: async (taskId) => {
+      await options.developmentBackend.cancelAgentTurn(taskId);
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+      schedulePolling();
+      return {
+        schema_version: "2",
+        operation_id: `development-session-cancel-${taskId}`,
+        kind: "task_cancel",
+        resource: { resource_kind: "task", resource_id: taskId },
+        request_sha256: developmentDigest(91),
+        status: "queued",
+        phase: "cancelling",
+        phase_index: 0,
+        phase_total: 1,
+        progress: null,
+        cancellable: false,
+        result: null,
+        failure: null,
+        created_at: NOW,
+        updated_at: NOW,
+        started_at: NOW,
+        finished_at: null,
+      } as never;
+    },
+    loadTaskLogs: async (taskId) => {
+      await ensureDevelopmentState(true);
+      return {
+        schema_version: "2",
+        items: (taskLogs.get(taskId) ?? ["No development runner logs were recorded."]).map((message, index) => ({
+          sequence: index + 1,
+          occurred_at: NOW,
+          stream: index === 0 ? "system" : "transcript",
+          message,
+        })),
+        next_cursor: null,
+        has_more: false,
+      };
+    },
     getArtifactContent: async (artifactId) => {
       const artifact = snapshot.artifacts.find((candidate) => candidate.artifact_id === artifactId);
       if (!artifact) throw new Error("Remote artifact is missing.");

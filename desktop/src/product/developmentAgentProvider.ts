@@ -58,21 +58,27 @@ const workspaceChangeSchema = z.object({
   }).strict()),
 }).strict();
 
-const turnResponseSchema = z.object({
+const runtimeActivationSchema = z.object({
+  schema_version: z.literal("1"),
+  adapter_id: z.string().min(1),
+  fully_supported: z.boolean(),
+  decisions: z.array(z.object({
+    intent_id: z.string().min(1),
+    feature_id: z.string().min(1),
+    source_kind: z.string().min(1),
+    source_contract_version: z.string().min(1),
+    parameters: z.record(z.string(), z.unknown()),
+    status: z.enum(["active", "delegated", "unsupported"]),
+    owner: z.string().min(1),
+    message: z.string().min(1),
+  }).strict()),
+}).strict();
+
+const turnSubmissionSchema = z.object({
   schema_version: z.literal("1"),
   session_id: z.string().min(1),
-  response: z.string().min(1),
-  model: z.string().min(1).nullable(),
-  duration_ms: z.number().int().nonnegative(),
-  logs: z.array(z.string()),
-  evolution_artifacts: z.array(artifactSchema).optional(),
-  evolution_errors: z.array(z.object({
-    target_id: z.string().min(1),
-    method: z.string().min(1),
-    message: z.string().min(1),
-  }).strict()).optional(),
-  workspace_changes: z.array(workspaceChangeSchema).default([]),
-  workspace: workspaceSnapshotSchema.optional(),
+  state: z.literal("running"),
+  status_url: z.string().min(1),
 }).strict();
 
 const projectSchema = z.object({
@@ -90,7 +96,7 @@ const sessionSchema = z.object({
   instruction: z.string().min(1),
   response: z.string().nullable(),
   model: z.string().nullable(),
-  state: z.enum(["running", "completed", "failed"]),
+  state: z.enum(["running", "cancelling", "completed", "failed", "cancelled"]),
   duration_ms: z.number().int().nonnegative().nullable(),
   logs: z.array(z.string()),
   selected_evolution: z.array(z.object({
@@ -104,6 +110,7 @@ const sessionSchema = z.object({
     message: z.string().min(1),
   }).strict()),
   workspace_changes: z.array(workspaceChangeSchema).default([]),
+  runtime_activation: runtimeActivationSchema.nullable().default(null),
   error: z.string().nullable(),
   created_at: z.string().min(1),
   updated_at: z.string().min(1),
@@ -153,7 +160,7 @@ export function createDevelopmentAgentProvider(
 
   const requestJson = async (path: string, init?: RequestInit): Promise<unknown> => {
     const controller = new AbortController();
-    const timeoutMs = path === "/sessions" ? 20 * 60_000 : 15_000;
+    const timeoutMs = 15_000;
     const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetchImpl(`${baseUrl}${path}`, {
@@ -168,9 +175,7 @@ export function createDevelopmentAgentProvider(
     } catch (error) {
       if (controller.signal.aborted) {
         throw new Error(
-          path === "/sessions"
-            ? "The remote Session timed out. Check the daemon log before retrying."
-            : "The SSH development tunnel stopped responding. Restart the remote development launcher.",
+          "The SSH development tunnel stopped responding. Restart the remote development launcher.",
         );
       }
       throw error;
@@ -254,25 +259,21 @@ export function createDevelopmentAgentProvider(
         schema_version: "1",
       }));
     },
-    runAgentTurn: async (request) => {
-      const payload = turnResponseSchema.parse(await requestJson(
+    submitAgentTurn: async (request) => {
+      const payload = turnSubmissionSchema.parse(await requestJson(
         "/sessions",
         jsonRequest("POST", toTurnRequestBody(request)),
       ));
       return {
         sessionId: payload.session_id,
-        responseText: payload.response,
-        model: payload.model,
-        durationMs: payload.duration_ms,
-        logMessages: payload.logs,
-        evolutionArtifacts: (payload.evolution_artifacts ?? []).map(toPersistedArtifact),
-        evolutionErrors: (payload.evolution_errors ?? []).map((error) => ({
-          targetId: error.target_id,
-          method: error.method,
-          message: error.message,
-        })),
-        workspaceChanges: payload.workspace_changes.map(toWorkspaceChange),
+        state: payload.state,
       };
+    },
+    cancelAgentTurn: async (sessionId) => {
+      await requestJson(
+        `/sessions/${encodeURIComponent(sessionId)}/cancel`,
+        jsonRequest("POST", { schema_version: "1" }),
+      );
     },
   };
 

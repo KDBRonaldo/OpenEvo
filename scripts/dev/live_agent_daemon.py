@@ -20,22 +20,28 @@ import re
 import secrets
 import shutil
 import sqlite3
-import subprocess
 import sys
 import tempfile
 import threading
-import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if os.fspath(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, os.fspath(SOURCE_ROOT))
+
+from openevo.backend.evolution_runtime import codex_development_runtime_adapter  # noqa: E402
+from openevo.backend.harness_adapter import (  # noqa: E402
+    CodexHarnessAdapter,
+    HarnessCancellation,
+    HarnessRunCancelled,
+    HarnessRunError,
+)
 
 
 MAX_REQUEST_BYTES = 256 * 1024
@@ -60,6 +66,10 @@ ALLOWED_PROJECT_FIELDS = {"schema_version", "project_id", "display_name", "confi
 ALLOWED_PROJECT_UPDATE_FIELDS = {"schema_version", "display_name", "config"}
 PROJECT_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)$")
 ACTIVATE_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/projects/([^/]+)/activate$")
+SESSION_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/sessions/([^/]+)$")
+SESSION_CANCEL_PATH_PATTERN = re.compile(
+    r"^/openevo-dev-agent/v1/sessions/([^/]+)/cancel$"
+)
 class RequestError(ValueError):
     pass
 
@@ -506,6 +516,10 @@ class DevelopmentStateStore:
                     selected_evolution_json TEXT NOT NULL DEFAULT '[]',
                     evolution_errors_json TEXT NOT NULL DEFAULT '[]',
                     workspace_changes_json TEXT NOT NULL DEFAULT '[]',
+                    runtime_activation_json TEXT NOT NULL DEFAULT 'null',
+                    cancellation_requested INTEGER NOT NULL DEFAULT 0
+                        CHECK (cancellation_requested IN (0, 1)),
+                    terminal_kind TEXT CHECK (terminal_kind IN ('failed', 'cancelled')),
                     error TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -620,6 +634,27 @@ class DevelopmentStateStore:
                     "ALTER TABLE development_sessions "
                     "ADD COLUMN workspace_changes_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            if "runtime_activation_json" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN runtime_activation_json TEXT NOT NULL DEFAULT 'null'"
+                )
+            if "cancellation_requested" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN cancellation_requested INTEGER NOT NULL DEFAULT 0 "
+                    "CHECK (cancellation_requested IN (0, 1))"
+                )
+            if "terminal_kind" not in session_columns:
+                connection.execute(
+                    "ALTER TABLE development_sessions "
+                    "ADD COLUMN terminal_kind TEXT "
+                    "CHECK (terminal_kind IN ('failed', 'cancelled'))"
+                )
+            connection.execute(
+                "UPDATE development_sessions SET runtime_activation_json = 'null' "
+                "WHERE runtime_activation_json = '{}'"
+            )
             artifact_columns = {
                 row["name"]
                 for row in connection.execute(
@@ -705,7 +740,7 @@ class DevelopmentStateStore:
             connection.execute(
                 """
                 UPDATE development_sessions
-                SET state = 'failed', error = ?, updated_at = ?
+                SET state = 'failed', terminal_kind = 'failed', error = ?, updated_at = ?
                 WHERE state = 'running'
                 """,
                 ("Development daemon restarted before this session completed.", restarted_at),
@@ -880,19 +915,36 @@ class DevelopmentStateStore:
     def complete_session(self, session_id: str, result: dict[str, Any]) -> None:
         now = utc_now()
         with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT logs_json, cancellation_requested FROM development_sessions "
+                "WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            if row["cancellation_requested"]:
+                raise HarnessRunCancelled("Session cancelled by user")
+            existing_logs = json.loads(row["logs_json"])
+            merged_logs = [*existing_logs]
+            for message in result["logs"]:
+                if message not in merged_logs:
+                    merged_logs.append(message)
             connection.execute(
                 """
                 UPDATE development_sessions
                 SET response = ?, model = ?, state = 'completed', duration_ms = ?,
-                    logs_json = ?, workspace_changes_json = ?, error = NULL, updated_at = ?
+                    logs_json = ?, workspace_changes_json = ?, runtime_activation_json = ?,
+                    cancellation_requested = 0, terminal_kind = NULL,
+                    error = NULL, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (
                     result["response"],
                     result["model"],
                     result["duration_ms"],
-                    canonical_json(result["logs"]),
+                    canonical_json(merged_logs),
                     canonical_json(result.get("workspace_changes", [])),
+                    canonical_json(result.get("runtime_activation")),
                     now,
                     session_id,
                 ),
@@ -914,6 +966,81 @@ class DevelopmentStateStore:
                 (canonical_json(logs), now, session_id),
             )
         return logs
+
+    def get_session(self, session_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        return self._session_record(row)
+
+    def cancellation_requested(self, session_id: str) -> bool:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT cancellation_requested FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        return bool(row["cancellation_requested"])
+
+    def request_session_cancellation(self, session_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT state, logs_json FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            if row["state"] != "running":
+                raise StateConflictError("session is already terminal")
+            logs = json.loads(row["logs_json"])
+            message = "Cancellation requested; stopping the active harness process."
+            if message not in logs:
+                logs.append(message)
+            connection.execute(
+                "UPDATE development_sessions "
+                "SET cancellation_requested = 1, logs_json = ?, updated_at = ? "
+                "WHERE session_id = ? AND state = 'running'",
+                (canonical_json(logs), now, session_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+        return self._session_record(updated)
+
+    def cancel_session(
+        self,
+        session_id: str,
+        workspace_changes: list[dict[str, Any]] | None = None,
+    ) -> None:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT logs_json FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            logs = json.loads(row["logs_json"])
+            message = "Session cancelled by user."
+            if message not in logs:
+                logs.append(message)
+            connection.execute(
+                """
+                UPDATE development_sessions
+                SET state = 'failed', cancellation_requested = 1,
+                    terminal_kind = 'cancelled', logs_json = ?, workspace_changes_json = ?,
+                    error = NULL, updated_at = ?
+                WHERE session_id = ? AND state = 'running'
+                """,
+                (canonical_json(logs), canonical_json(workspace_changes or []), now, session_id),
+            )
 
     def record_evolution_errors(
         self,
@@ -1126,13 +1253,20 @@ class DevelopmentStateStore:
         workspace_changes: list[dict[str, Any]] | None = None,
     ) -> None:
         now = utc_now()
-        logs = ["Remote development daemon admitted the session.", f"Codex failed: {error}"]
         with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT logs_json FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            logs = json.loads(row["logs_json"])
+            logs.append(f"Session failed: {error}")
             connection.execute(
                 """
                 UPDATE development_sessions
                 SET state = 'failed', logs_json = ?, workspace_changes_json = ?,
-                    error = ?, updated_at = ?
+                    terminal_kind = 'failed', error = ?, updated_at = ?
                 WHERE session_id = ?
                 """,
                 (canonical_json(logs), canonical_json(workspace_changes or []), error, now, session_id),
@@ -1140,6 +1274,11 @@ class DevelopmentStateStore:
 
     @staticmethod
     def _session_record(row: sqlite3.Row) -> dict[str, Any]:
+        state = row["state"]
+        if row["terminal_kind"] == "cancelled":
+            state = "cancelled"
+        elif state == "running" and row["cancellation_requested"]:
+            state = "cancelling"
         return {
             "session_id": row["session_id"],
             "project_id": row["project_id"],
@@ -1147,7 +1286,7 @@ class DevelopmentStateStore:
             "instruction": row["instruction"],
             "response": row["response"],
             "model": row["model"],
-            "state": row["state"],
+            "state": state,
             "duration_ms": row["duration_ms"],
             "logs": json.loads(row["logs_json"]),
             "selected_evolution": normalize_selected_evolution(
@@ -1155,6 +1294,7 @@ class DevelopmentStateStore:
             ),
             "evolution_errors": json.loads(row["evolution_errors_json"]),
             "workspace_changes": json.loads(row["workspace_changes_json"]),
+            "runtime_activation": json.loads(row["runtime_activation_json"]),
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -1588,223 +1728,48 @@ class DevelopmentRuntimeContextMaterializer:
 
 class CodexRunner:
     def __init__(self, codex_binary: str, timeout_seconds: int, model: str | None) -> None:
-        self._codex_binary = codex_binary
-        self._timeout_seconds = timeout_seconds
-        self._model = model
-        self._context_materializer: DevelopmentRuntimeContextMaterializer | None = None
+        self._adapter = CodexHarnessAdapter(
+            codex_binary=codex_binary,
+            timeout_seconds=timeout_seconds,
+            model=model,
+            context_materializer_factory=DevelopmentRuntimeContextMaterializer,
+            runtime_control_adapter=codex_development_runtime_adapter(),
+            extract_event_logs=extract_event_logs,
+            max_capture_bytes=MAX_CAPTURE_BYTES,
+            max_response_bytes=MAX_REQUEST_BYTES,
+            max_workspace_context_bytes=MAX_AGENT_WORKSPACE_CONTEXT_BYTES,
+        )
 
     @property
     def codex_binary(self) -> str:
-        return self._codex_binary
+        return self._adapter.codex_binary
 
     @property
     def model(self) -> str | None:
-        return self._model
+        return self._adapter.model
+
+    def runtime_capabilities(self) -> dict[str, Any]:
+        return self._adapter.runtime_capabilities()
 
     def check_ready(self) -> None:
         try:
-            result = subprocess.run(
-                [self._codex_binary, "login", "status"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AgentRunError(f"could not check Codex login status: {exc}") from exc
-        status_output = "\n".join(part for part in (result.stdout, result.stderr) if part)
-        if result.returncode != 0 or "Logged in" not in status_output:
-            detail = status_output.strip()[:500]
-            raise AgentRunError(f"Codex is not logged in: {detail or 'login status failed'}")
+            self._adapter.check_ready()
+        except HarnessRunError as exc:
+            raise AgentRunError(str(exc)) from exc
 
-    @staticmethod
-    def _workspace_context(snapshot: object) -> str:
-        if not isinstance(snapshot, dict) or not isinstance(snapshot.get("entries"), list):
-            return "[]"
-        projected: list[dict[str, Any]] = []
-        consumed = 2
-        for entry in snapshot["entries"]:
-            if not isinstance(entry, dict):
-                continue
-            item = {
-                "path": entry.get("path"),
-                "kind": entry.get("kind"),
-                "byte_size": entry.get("byte_size"),
-                "media_type": entry.get("media_type"),
-                "content": entry.get("content"),
-            }
-            encoded = canonical_json(item).encode("utf-8")
-            if consumed + len(encoded) > MAX_AGENT_WORKSPACE_CONTEXT_BYTES:
-                break
-            projected.append(item)
-            consumed += len(encoded) + 1
-        return canonical_json(projected)
-
-    @staticmethod
-    def _parse_workspace_plan(raw_response: str) -> dict[str, Any]:
+    def run(
+        self,
+        request: dict[str, Any],
+        *,
+        cancellation: HarnessCancellation | None = None,
+        log: Callable[[str], None] | None = None,
+    ) -> dict[str, Any]:
         try:
-            plan = json.loads(raw_response)
-        except json.JSONDecodeError as exc:
-            raise AgentRunError("Codex returned an invalid structured workspace response") from exc
-        if not isinstance(plan, dict) or set(plan) != {"answer", "file_writes", "delete_paths"}:
-            raise AgentRunError("Codex returned an invalid structured workspace response")
-        answer = plan.get("answer")
-        if not isinstance(answer, str) or not answer.strip():
-            raise AgentRunError("Codex returned an empty answer")
-        mutations = {
-            "file_writes": plan.get("file_writes"),
-            "delete_paths": plan.get("delete_paths"),
-        }
-        # ProjectWorkspaceStore performs the authoritative path and byte validation.
-        if not isinstance(mutations["file_writes"], list) or not isinstance(
-            mutations["delete_paths"], list
-        ):
-            raise AgentRunError("Codex returned an invalid workspace mutation plan")
-        return {"answer": answer.strip(), "mutations": mutations}
-
-    def run(self, request: dict[str, Any]) -> dict[str, Any]:
-        workspace_path = request.get("workspace_path")
-        if not isinstance(workspace_path, Path) or not workspace_path.is_dir():
-            raise AgentRunError("persistent project workspace is unavailable")
-        workspace_context = self._workspace_context(request.get("workspace_snapshot"))
-        started = time.monotonic()
-        with tempfile.TemporaryDirectory(prefix="openevo-dev-agent-") as temporary_directory:
-            temporary_root = Path(temporary_directory)
-            runtime_workspace = temporary_root / "workspace"
-            if self._context_materializer is None:
-                try:
-                    self._context_materializer = DevelopmentRuntimeContextMaterializer()
-                except (ImportError, ModuleNotFoundError) as exc:
-                    raise AgentRunError(
-                        "OpenEvo runtime projection is unavailable; run this daemon with `uv run python`"
-                    ) from exc
-            runtime_context = self._context_materializer.materialize(
-                persistent_workspace=workspace_path,
-                runtime_workspace=runtime_workspace,
-                contexts=request.get("evolved_contexts", []),
-            )
-            memory_sections = "\n\n".join(runtime_context["instruction_sections"])
-            if memory_sections:
-                memory_sections = (
-                    "Runtime instructions resolved by OpenEvo Core for this session:\n"
-                    f"{memory_sections}\n\n"
-                )
-            prompt = (
-                "You are planning changes for a persistent OpenEvo project workspace. "
-                "The trusted daemon, not you, applies file mutations after validating them. "
-                "Do not call shell, patch, or filesystem tools. Read the supplied workspace JSON, "
-                "solve the user's task, and return only the requested structured result. "
-                "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
-                "changed in file_writes. Put only regular files that must be removed in delete_paths. "
-                "Do not include unchanged files and do not use absolute paths or '..'. "
-                "Do not return OpenEvo runtime files under .openevo or injected skills under "
-                ".agents/skills as workspace mutations. "
-                "If no file change is needed, return empty arrays.\n\n"
-                f"Project: {request['project_name']}\n"
-                f"Session: {request['task_title']}\n\n"
-                f"{memory_sections}"
-                f"Current workspace JSON:\n{workspace_context}\n\n"
-                f"User message:\n{request['instruction']}\n"
-            )
-            output_path = temporary_root / "last-message.txt"
-            schema_path = temporary_root / "workspace-response.schema.json"
-            schema_path.write_text(
-                canonical_json({
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "answer": {"type": "string"},
-                        "file_writes": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "properties": {
-                                    "path": {"type": "string"},
-                                    "content": {"type": "string"},
-                                },
-                                "required": ["path", "content"],
-                            },
-                        },
-                        "delete_paths": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                        },
-                    },
-                    "required": ["answer", "file_writes", "delete_paths"],
-                }),
-                encoding="utf-8",
-            )
-            argv = [
-                self._codex_binary,
-                "exec",
-                "--json",
-                "--ignore-user-config",
-                "--ephemeral",
-                "--sandbox",
-                "read-only",
-                "--disable",
-                "shell_tool",
-                "--skip-git-repo-check",
-                "--cd",
-                os.fspath(runtime_context["workspace_path"]),
-                "--output-schema",
-                os.fspath(schema_path),
-                "--output-last-message",
-                os.fspath(output_path),
-            ]
-            if self._model:
-                argv.extend(("--model", self._model))
-            argv.append("-")
-            process_environment = os.environ.copy()
-            process_environment.update(runtime_context["environment"])
-            try:
-                completed = subprocess.run(
-                    argv,
-                    input=prompt,
-                    env=process_environment,
-                    check=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=self._timeout_seconds,
-                )
-            except subprocess.TimeoutExpired as exc:
-                raise AgentRunError(f"Codex exceeded the {self._timeout_seconds}s timeout") from exc
-            except OSError as exc:
-                raise AgentRunError(f"Codex could not be started: {exc}") from exc
-
-            stdout_bytes = len(completed.stdout.encode("utf-8"))
-            stderr_bytes = len(completed.stderr.encode("utf-8"))
-            if stdout_bytes + stderr_bytes > MAX_CAPTURE_BYTES:
-                raise AgentRunError("Codex process output exceeded the development safety limit")
-            if completed.returncode != 0:
-                detail = (completed.stderr or completed.stdout).strip()[-4_000:]
-                raise AgentRunError(f"Codex exited with code {completed.returncode}: {detail}")
-            try:
-                raw_response = output_path.read_text(encoding="utf-8").strip()
-            except OSError as exc:
-                raise AgentRunError(f"Codex did not publish a final response: {exc}") from exc
-            if not raw_response:
-                raise AgentRunError("Codex published an empty final response")
-            if len(raw_response.encode("utf-8")) > MAX_REQUEST_BYTES:
-                raise AgentRunError("Codex final response exceeded the development safety limit")
-            workspace_plan = self._parse_workspace_plan(raw_response)
-
-        duration_ms = round((time.monotonic() - started) * 1000)
-        return {
-            "schema_version": "1",
-            "response": workspace_plan["answer"],
-            "file_mutations": workspace_plan["mutations"],
-            "model": self._model,
-            "duration_ms": duration_ms,
-            "logs": [
-                "Remote development daemon admitted the session.",
-                *[f"Runtime context: {item}." for item in runtime_context["activations"]],
-                *extract_event_logs(completed.stdout),
-                f"Codex completed the session in {duration_ms} ms.",
-            ],
-        }
-
+            return self._adapter.run(request, cancellation=cancellation, log=log)
+        except HarnessRunCancelled:
+            raise
+        except HarnessRunError as exc:
+            raise AgentRunError(str(exc)) from exc
 
 class DocumentEvolutionRunner:
     """Development adapter driven by Core framework descriptors instead of target switches."""
@@ -1969,7 +1934,10 @@ class DocumentEvolutionRunner:
         request: dict[str, str],
         result: dict[str, Any],
         store: DevelopmentStateStore,
+        cancellation: HarnessCancellation | None = None,
     ) -> dict[str, Any]:
+        if cancellation is not None:
+            cancellation.raise_if_requested()
         config = store.project_config(request["project_id"])
         selected = selected_document_evolution(config)
 
@@ -2051,6 +2019,8 @@ class DocumentEvolutionRunner:
         persisted: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         for item in selected:
+            if cancellation is not None:
+                cancellation.raise_if_requested()
             target_id = item["target_id"]
             requested_method_id = item["method"]
             method_id = resolve_evolution_method(
@@ -2120,6 +2090,8 @@ class DocumentEvolutionRunner:
                     ),
                     artifact_root=self._artifact_root,
                 )
+                if cancellation is not None:
+                    cancellation.raise_if_requested()
                 artifact_ids: list[str] = []
                 for output_index, artifact in enumerate(artifacts):
                     artifact_type = artifact.type.value
@@ -2156,6 +2128,12 @@ class DocumentEvolutionRunner:
                         promoted=artifact.promoted,
                     ))
                 store.finish_evolution_job(job_id, artifact_ids=artifact_ids)
+            except HarnessRunCancelled:
+                try:
+                    store.finish_evolution_job(job_id, error="Session cancelled by user")
+                except Exception:
+                    pass
+                raise
             except Exception as exc:
                 try:
                     store.finish_evolution_job(job_id, error=str(exc))
@@ -2174,6 +2152,152 @@ class DocumentEvolutionRunner:
 TextMemoryEvolutionRunner = DocumentEvolutionRunner
 
 
+class DevelopmentSessionCoordinator:
+    """Own asynchronous development Session execution independently of HTTP request threads."""
+
+    def __init__(
+        self,
+        *,
+        runner: CodexRunner,
+        store: DevelopmentStateStore,
+        evolution_runner: DocumentEvolutionRunner | None,
+    ) -> None:
+        self._runner = runner
+        self._store = store
+        self._evolution_runner = evolution_runner
+        self._turn_lock = threading.Lock()
+        self._executions_lock = threading.Lock()
+        self._executions: dict[str, HarnessCancellation] = {}
+
+    def submit(self, request: dict[str, str]) -> str:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError("another development session is running")
+        session_id = f"dev-session-{secrets.token_hex(8)}"
+        try:
+            self._store.start_session(session_id, request)
+        except Exception:
+            self._turn_lock.release()
+            raise
+        cancellation = HarnessCancellation()
+        with self._executions_lock:
+            self._executions[session_id] = cancellation
+        thread = threading.Thread(
+            target=self._execute,
+            name=f"openevo-{session_id}",
+            args=(session_id, request, cancellation),
+            daemon=True,
+        )
+        thread.start()
+        return session_id
+
+    def cancel(self, session_id: str) -> dict[str, Any]:
+        session = self._store.request_session_cancellation(session_id)
+        with self._executions_lock:
+            cancellation = self._executions.get(session_id)
+        if cancellation is not None:
+            cancellation.cancel()
+        return session
+
+    def _execute(
+        self,
+        session_id: str,
+        request: dict[str, str],
+        cancellation: HarnessCancellation,
+    ) -> None:
+        workspace_before: dict[str, Any] = {
+            "project_id": request["project_id"],
+            "entries": [],
+            "truncated": False,
+        }
+        try:
+            workspace_path = self._store.workspace_path(request["project_id"])
+            workspace_before = self._store.workspace_snapshot(request["project_id"])
+            execution_request = {
+                **request,
+                "workspace_path": workspace_path,
+                "workspace_snapshot": workspace_before,
+                "evolved_contexts": self._store.latest_context_artifacts(
+                    request["project_id"]
+                ),
+            }
+            result = self._runner.run(
+                execution_request,
+                cancellation=cancellation,
+                log=lambda message: self._store.append_session_log(session_id, message),
+            )
+            cancellation.raise_if_requested()
+            mutations = result.pop(
+                "file_mutations",
+                {"file_writes": [], "delete_paths": []},
+            )
+            self._store.apply_workspace_mutations(request["project_id"], mutations)
+            workspace_after = self._store.workspace_snapshot(request["project_id"])
+            result = {
+                **result,
+                "session_id": session_id,
+                "workspace_changes": ProjectWorkspaceStore.changes(
+                    workspace_before, workspace_after
+                ),
+                "workspace": workspace_after,
+            }
+            cancellation.raise_if_requested()
+            if self._evolution_runner is not None:
+                self._store.append_session_log(
+                    session_id,
+                    "Running the selected evolution methods in the background.",
+                )
+                evolved = self._evolution_runner.evolve(
+                    session_id=session_id,
+                    request=request,
+                    result=result,
+                    store=self._store,
+                    cancellation=cancellation,
+                )
+                result["evolution_artifacts"] = evolved["artifacts"]
+                result["evolution_errors"] = evolved["errors"]
+                self._store.record_evolution_errors(session_id, evolved["errors"])
+                for artifact in evolved["artifacts"]:
+                    self._store.append_session_log(
+                        session_id,
+                        f"OpenEvo {artifact['method']} published {artifact['artifact_type']} "
+                        "for the next session.",
+                    )
+                for error in evolved["errors"]:
+                    self._store.append_session_log(
+                        session_id,
+                        f"{error['method']} failed: {error['message']}",
+                    )
+            cancellation.raise_if_requested()
+            self._store.complete_session(session_id, result)
+        except HarnessRunCancelled:
+            workspace_after = self._store.workspace_snapshot(request["project_id"])
+            self._store.cancel_session(
+                session_id,
+                ProjectWorkspaceStore.changes(workspace_before, workspace_after),
+            )
+        except (AgentRunError, HarnessRunError) as exc:
+            workspace_after = self._store.workspace_snapshot(request["project_id"])
+            self._store.fail_session(
+                session_id,
+                str(exc),
+                ProjectWorkspaceStore.changes(workspace_before, workspace_after),
+            )
+        except Exception as exc:
+            try:
+                workspace_after = self._store.workspace_snapshot(request["project_id"])
+                self._store.fail_session(
+                    session_id,
+                    f"unexpected development session failure: {exc}",
+                    ProjectWorkspaceStore.changes(workspace_before, workspace_after),
+                )
+            except Exception:
+                pass
+        finally:
+            with self._executions_lock:
+                self._executions.pop(session_id, None)
+            self._turn_lock.release()
+
+
 class DevelopmentAgentServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -2190,7 +2314,11 @@ class DevelopmentAgentServer(ThreadingHTTPServer):
         self.runner = runner
         self.store = store
         self.evolution_runner = evolution_runner
-        self.turn_lock = threading.Lock()
+        self.sessions = DevelopmentSessionCoordinator(
+            runner=runner,
+            store=store,
+            evolution_runner=evolution_runner,
+        )
 
 
 class DevelopmentAgentHandler(BaseHTTPRequestHandler):
@@ -2215,6 +2343,22 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 )
             else:
                 self._json(HTTPStatus.OK, self.server.evolution_runner.capabilities())
+            return
+        if self.path == "/openevo-dev-agent/v1/runtime-capabilities":
+            self._json(HTTPStatus.OK, self.server.runner.runtime_capabilities())
+            return
+        session_match = SESSION_PATH_PATTERN.fullmatch(self.path)
+        if session_match:
+            session_id = session_match.group(1)
+            if not ID_PATTERN.fullmatch(session_id):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "session_id is invalid")
+                return
+            try:
+                session = self.server.store.get_session(session_id)
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "session not found")
+            else:
+                self._json(HTTPStatus.OK, {"schema_version": "1", "session": session})
             return
         self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
 
@@ -2251,6 +2395,26 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
             else:
                 self._json(HTTPStatus.OK, {"schema_version": "1", "project_id": project_id})
             return
+        cancel_match = SESSION_CANCEL_PATH_PATTERN.fullmatch(self.path)
+        if cancel_match:
+            session_id = cancel_match.group(1)
+            if not ID_PATTERN.fullmatch(session_id):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "session_id is invalid")
+                return
+            try:
+                payload = self._read_json()
+                if payload != {"schema_version": "1"}:
+                    raise RequestError("cancellation request must contain only schema_version '1'")
+                session = self.server.sessions.cancel(session_id)
+            except RequestError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "session not found")
+            except StateConflictError as exc:
+                self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, {"schema_version": "1", "session": session})
+            return
         if self.path != "/openevo-dev-agent/v1/sessions":
             self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
             return
@@ -2285,77 +2449,23 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         except RequestError as exc:
             self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
             return
-        if not self.server.turn_lock.acquire(blocking=False):
-            self._json_error(HTTPStatus.CONFLICT, "agent_busy", "another development session is running")
-            return
-        session_id = f"dev-session-{secrets.token_hex(8)}"
         try:
-            try:
-                self.server.store.start_session(session_id, request)
-            except KeyError:
-                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
-                return
-            except StateConflictError as exc:
-                self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
-                return
-            workspace_path = self.server.store.workspace_path(request["project_id"])
-            workspace_before = self.server.store.workspace_snapshot(request["project_id"])
-            execution_request = {
-                **request,
-                "workspace_path": workspace_path,
-                "workspace_snapshot": workspace_before,
-                "evolved_contexts": self.server.store.latest_context_artifacts(
-                    request["project_id"]
-                ),
-            }
-            result = self.server.runner.run(execution_request)
-            mutations = result.pop("file_mutations", {
-                "file_writes": [],
-                "delete_paths": [],
-            })
-            self.server.store.apply_workspace_mutations(request["project_id"], mutations)
-        except AgentRunError as exc:
-            workspace_after = self.server.store.workspace_snapshot(request["project_id"])
-            workspace_changes = ProjectWorkspaceStore.changes(
-                workspace_before, workspace_after
-            )
-            self.server.store.fail_session(session_id, str(exc), workspace_changes)
-            self._json_error(HTTPStatus.BAD_GATEWAY, "codex_failed", str(exc))
+            session_id = self.server.sessions.submit(request)
+        except KeyError:
+            self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+        except StateConflictError as exc:
+            code = "agent_busy" if "another development session" in str(exc) else "state_conflict"
+            self._json_error(HTTPStatus.CONFLICT, code, str(exc))
         else:
-            workspace_after = self.server.store.workspace_snapshot(request["project_id"])
-            result = {
-                **result,
-                "session_id": session_id,
-                "workspace_changes": ProjectWorkspaceStore.changes(
-                    workspace_before, workspace_after
-                ),
-                "workspace": workspace_after,
-            }
-            self.server.store.complete_session(session_id, result)
-            if self.server.evolution_runner is not None:
-                evolved = self.server.evolution_runner.evolve(
-                    session_id=session_id,
-                    request=request,
-                    result=result,
-                    store=self.server.store,
-                )
-                result["evolution_artifacts"] = evolved["artifacts"]
-                result["evolution_errors"] = evolved["errors"]
-                self.server.store.record_evolution_errors(session_id, evolved["errors"])
-                for artifact in evolved["artifacts"]:
-                    result["logs"] = self.server.store.append_session_log(
-                        session_id,
-                        f"OpenEvo {artifact['method']} published {artifact['artifact_type']} "
-                        "for the next session.",
-                    )
-                for error in evolved["errors"]:
-                    result["logs"] = self.server.store.append_session_log(
-                        session_id,
-                        f"{error['method']} failed: {error['message']}",
-                    )
-            self._json(HTTPStatus.OK, result)
-        finally:
-            self.server.turn_lock.release()
+            self._json(
+                HTTPStatus.ACCEPTED,
+                {
+                    "schema_version": "1",
+                    "session_id": session_id,
+                    "state": "running",
+                    "status_url": f"/openevo-dev-agent/v1/sessions/{session_id}",
+                },
+            )
 
     def _read_json(self) -> object:
         try:

@@ -261,7 +261,7 @@ export function DesktopProductApp({
       setWorkspace("research");
       setSelectedTaskId(submittedTask.task_id);
       setActionStatus(developmentAgentBridge
-        ? "The remote Codex response was received and added to this development session."
+        ? "The remote Session started. Codex and the selected evolution methods are running in the background."
         : "Task admitted with immutable Project Head and execution authority.");
     } catch (error) {
       setActionError(userMessageV2(error));

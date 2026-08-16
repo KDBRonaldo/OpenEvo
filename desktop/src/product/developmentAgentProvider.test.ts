@@ -159,15 +159,9 @@ describe("development agent provider", () => {
         return jsonResponse({
           schema_version: "1",
           session_id: "dev-session-1",
-          response: "Two plus two is four.",
-          model: null,
-          duration_ms: 42,
-          logs: ["Remote development daemon admitted the session.", "Codex completed the session."],
-          evolution_artifacts: [evolved],
-          evolution_errors: [],
-          workspace_changes: workspaceChanges,
-          workspace: workspaces[0],
-        });
+          state: "running",
+          status_url: "/openevo-dev-agent/v1/sessions/dev-session-1",
+        }, 202);
       }
       throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
     });
