@@ -3760,6 +3760,58 @@ pre.json {
   box-shadow: 0 8px 24px rgb(20 61 49 / 6%);
 }
 
+.v2-agent-activity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding: 15px 16px;
+  border: 1px solid #b7d5ca;
+  border-radius: 10px;
+  background: var(--accent-soft);
+}
+
+.v2-agent-activity-indicator {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--surface);
+  color: var(--accent);
+}
+
+.v2-agent-activity-copy {
+  min-width: 0;
+  flex: 1;
+}
+
+.v2-agent-activity-copy strong {
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.v2-agent-activity-copy p {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.v2-thinking-dots span {
+  opacity: 0.25;
+  animation: v2-thinking-dot 1.2s infinite;
+}
+
+.v2-thinking-dots span:nth-child(2) { animation-delay: 0.18s; }
+.v2-thinking-dots span:nth-child(3) { animation-delay: 0.36s; }
+
+@keyframes v2-thinking-dot {
+  0%, 60%, 100% { opacity: 0.25; }
+  30% { opacity: 1; }
+}
+
 .v2-session-module-heading {
   display: flex;
   align-items: flex-start;
@@ -4549,7 +4601,8 @@ pre.json {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .lifecycle-subprogress progress:not([value]) {
+  .lifecycle-subprogress progress:not([value]),
+  .v2-thinking-dots span {
     animation: none;
   }
 }

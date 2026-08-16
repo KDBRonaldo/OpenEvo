@@ -1200,7 +1200,17 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain(
       "Daemon started the managed Task attempt.",
     );
+    expect(document.body.textContent).toContain("Agent is working");
+    expect(document.body.textContent).toContain("Stop session");
+    expect(document.querySelector('[data-testid="session-agent-activity"]')).toBeTruthy();
     expect(document.body.textContent).toContain("Task state");
+  });
+
+  it("hides the transient Agent activity after the Session is complete", async () => {
+    root = await render(providerFixture(authoritySnapshot()));
+
+    expect(document.querySelector('[data-testid="session-agent-activity"]')).toBeNull();
+    expect(document.body.textContent).not.toContain("Agent working");
   });
 
   it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {

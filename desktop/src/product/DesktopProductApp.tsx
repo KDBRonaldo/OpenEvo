@@ -1255,6 +1255,31 @@ function TaskHistoryTableV2({ tasks, presentation, selectedTaskId, transitions, 
   })}</div>;
 }
 
+function sessionActivityStageV2(
+  state: TaskV2["state"],
+  logs: readonly LogEntryV2[],
+): string {
+  if (state === "cancelling") return "Stopping the active Agent process safely.";
+  if (state === "waiting_for_successor") return "Saving the Session result and preparing the next Project Head.";
+  if (state === "admitted") return "The Session was accepted and is waiting for the background worker.";
+  if (state === "preparing") return "Preparing the project workspace and evolved context.";
+
+  const latest = logs.at(-1)?.message ?? "";
+  if (latest.includes("Preparing the Codex runtime workspace")) {
+    return "Preparing the project workspace and evolved context.";
+  }
+  if (latest.includes("Starting the Codex harness process")) {
+    return "Codex is reasoning and working in the project workspace.";
+  }
+  if (latest.includes("Running the selected evolution methods")) {
+    return "The Agent replied. OpenEvo is applying the selected evolution methods.";
+  }
+  if (latest.includes("published") && latest.includes("for the next session")) {
+    return "Saving evolved context for the next Session.";
+  }
+  return latest || "Codex is reasoning and working on the task.";
+}
+
 function TaskAuthorityCardV2({
   task,
   taskContent,
@@ -1287,6 +1312,15 @@ function TaskAuthorityCardV2({
   readonly onAbandonTransition: () => void;
 }) {
   const active = ["admitted", "preparing", "running", "cancelling"].includes(task.state);
+  const sessionInProgress = [
+    "admitted",
+    "preparing",
+    "running",
+    "cancelling",
+    "waiting_for_successor",
+  ].includes(task.state);
+  const conversationCount = presentation?.transcript.length ?? (sessionInProgress ? 0 : logs.length);
+  const activityStage = sessionActivityStageV2(task.state, logs);
   const producedArtifacts = artifacts.filter((artifact) => presentation?.producedArtifactIds.includes(artifact.artifact_id));
   const usedArtifacts = artifacts.filter((artifact) => presentation?.usedArtifactIds.includes(artifact.artifact_id));
   const [selectedResult, setSelectedResult] = useState<
@@ -1311,8 +1345,18 @@ function TaskAuthorityCardV2({
       <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
       <section className="v2-result-section v2-conversation-section v2-session-module" data-session-priority="conversation">
-        <header className="v2-session-module-heading"><div><h2>Conversation</h2><p>The request and the agent's response from this Session.</p></div><strong>{presentation?.transcript.length ?? logs.length} messages</strong></header>
-        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : <p className="v2-empty-copy">The agent response is not loaded yet.</p>}
+        <header className="v2-session-module-heading"><div><h2>Conversation</h2><p>The request and the agent's response from this Session.</p></div><strong>{sessionInProgress ? "Agent working" : `${conversationCount} messages`}</strong></header>
+        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : !sessionInProgress ? <p className="v2-empty-copy">The agent response is not loaded yet.</p> : null}
+        {sessionInProgress ? (
+          <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
+            <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
+            <div className="v2-agent-activity-copy">
+              <strong>{task.state === "cancelling" ? "Stopping the agent" : "Agent is working"}<span className="v2-thinking-dots"><span>.</span><span>.</span><span>.</span></span></strong>
+              <p>{activityStage}</p>
+            </div>
+            {active ? <button type="button" className="secondary-button" disabled={busy || task.state === "cancelling"} onClick={onCancel}>{task.state === "cancelling" ? "Stopping" : "Stop session"}</button> : null}
+          </div>
+        ) : null}
       </section>
       <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
         <header className="v2-session-module-heading"><div><h2>Evolution</h2><p>Document changes learned from this Session for future Sessions.</p></div><strong>{producedArtifacts.length} produced</strong></header>
