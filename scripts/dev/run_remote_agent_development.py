@@ -237,16 +237,30 @@ fi
 echo "[remote 2/4] Preparing uv and Python 3.11..."
 uv_bin="$(command -v uv || true)"
 if [ -z "$uv_bin" ]; then
+  for candidate in \
+    "$HOME/.local/bin/uv" \
+    "$HOME/.cargo/bin/uv"; do
+    if [ -x "$candidate" ]; then
+      uv_bin="$candidate"
+      break
+    fi
+  done
+fi
+if [ -z "$uv_bin" ]; then
   if ! command -v curl >/dev/null 2>&1; then
     echo "curl is required to install uv automatically." >&2
     exit 22
   fi
   curl -LsSf https://astral.sh/uv/install.sh | sh
-  if [ -x "$HOME/.local/bin/uv" ]; then
-    uv_bin="$HOME/.local/bin/uv"
-  elif [ -x "$HOME/.cargo/bin/uv" ]; then
-    uv_bin="$HOME/.cargo/bin/uv"
-  else
+  for candidate in \
+    "$HOME/.local/bin/uv" \
+    "$HOME/.cargo/bin/uv"; do
+    if [ -x "$candidate" ]; then
+      uv_bin="$candidate"
+      break
+    fi
+  done
+  if [ -z "$uv_bin" ]; then
     echo "uv installation completed but the uv executable was not found." >&2
     exit 23
   fi
