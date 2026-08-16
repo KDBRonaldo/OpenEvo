@@ -1407,7 +1407,12 @@ function TaskAuthorityCardV2({
             </span>;
           })}</div> : <p>No document evolution was selected for this session.</p>}
         </div>
-        <ResultCollection title="Evolution produced" empty="This Task did not publish an evolution artifact." artifacts={producedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} />
+        <EvolutionResultCollection
+          artifacts={producedArtifacts}
+          artifactPresentation={artifactPresentation}
+          jobs={presentation?.evolutionJobs ?? []}
+          onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })}
+        />
         {selectedProducedArtifact ? resultInspector : null}
       </section>
       <section className="v2-supporting-module v2-session-module" data-session-priority="supporting">
@@ -1503,6 +1508,63 @@ function SessionResultInspectorV2({
 
 function ResultCollection({ title, empty, artifacts, onOpen }: { readonly title: string; readonly empty: string; readonly artifacts: DesktopProductSnapshotV2["artifacts"]; readonly onOpen: (artifactId: string) => void }) {
   return <div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">{title}</span><strong>{artifacts.length}</strong></div>{artifacts.length ? <div className="v2-result-artifacts">{artifacts.map((artifact) => <button type="button" key={artifact.artifact_id} onClick={() => onOpen(artifact.artifact_id)}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{artifact.artifact_id}</strong><small>{formatBytes(artifact.byte_size)}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">{empty}</p>}</div>;
+}
+
+function EvolutionResultCollection({
+  artifacts,
+  artifactPresentation,
+  jobs,
+  onOpen,
+}: {
+  readonly artifacts: DesktopProductSnapshotV2["artifacts"];
+  readonly artifactPresentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["artifacts"] | undefined;
+  readonly jobs: NonNullable<NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"][string]["evolutionJobs"]>;
+  readonly onOpen: (artifactId: string) => void;
+}) {
+  const definitions = [
+    { targetId: "text_memory", title: "Memory", itemTitle: "Memory", description: "Reusable knowledge and preferences for future Sessions.", icon: BookOpen },
+    { targetId: "skill_bundle", title: "Skills", itemTitle: "Skill", description: "Reusable workflows the Agent can load when relevant.", icon: Sparkles },
+    { targetId: "agent_system", title: "Agent system", itemTitle: "Agent system", description: "Instructions and coordination behavior for future runs.", icon: Activity },
+  ] as const;
+  const targetForArtifact = (artifact: DesktopProductSnapshotV2["artifacts"][number]): string => (
+    jobs.find((job) => job.artifactIds.includes(artifact.artifact_id))?.targetId
+      ?? (["text_memory", "skill_bundle", "agent_system"].includes(artifact.artifact_type)
+        ? artifact.artifact_type
+        : "other")
+  );
+  const groups = definitions.map((definition) => ({
+    ...definition,
+    artifacts: artifacts.filter((artifact) => targetForArtifact(artifact) === definition.targetId),
+  }));
+  const related = artifacts.filter((artifact) => targetForArtifact(artifact) === "other");
+
+  return (
+    <div className="v2-result-section v2-evolution-result-collection">
+      <div className="v2-result-section-head"><span className="panel-kicker">Evolution produced</span><strong>{artifacts.length}</strong></div>
+      {artifacts.length ? (
+        <div className="v2-evolution-result-groups">
+          {groups.map((group) => {
+            const Icon = group.icon;
+            return (
+              <section className={`v2-evolution-result-group ${group.targetId}`} key={group.targetId}>
+                <header>
+                  <span aria-hidden="true"><Icon size={18} /></span>
+                  <div><h3>{group.title}</h3><p>{group.description}</p></div>
+                  <strong>{group.artifacts.length}</strong>
+                </header>
+                {group.artifacts.length ? <div className="v2-evolution-group-items">{group.artifacts.map((artifact, index) => {
+                  const preview = artifactPresentation?.[artifact.artifact_id];
+                  const versionLabel = group.artifacts.length > 1 ? `Candidate ${index + 1}` : "Update";
+                  return <button type="button" key={artifact.artifact_id} title={artifact.artifact_id} onClick={() => onOpen(artifact.artifact_id)}><span><strong>{group.itemTitle} · {versionLabel}</strong><small>{preview?.status ? `${artifactStatusLabel(preview.status)} · ` : ""}{formatBytes(artifact.byte_size)}</small></span><ArrowRight size={16} /></button>;
+                })}</div> : <p className="v2-evolution-group-empty">No output from this Session.</p>}
+              </section>
+            );
+          })}
+          {related.length ? <section className="v2-evolution-related"><h3>Related outputs</h3>{related.map((artifact, index) => <button type="button" key={artifact.artifact_id} title={artifact.artifact_id} onClick={() => onOpen(artifact.artifact_id)}><span><strong>Supporting result {index + 1}</strong><small>{artifactTypeLabel(artifact.artifact_type)} · {formatBytes(artifact.byte_size)}</small></span><ArrowRight size={16} /></button>)}</section> : null}
+        </div>
+      ) : <p className="v2-empty-copy">This Task did not publish an evolution artifact.</p>}
+    </div>
+  );
 }
 
 function EvolutionWorkspaceV2({

@@ -874,7 +874,10 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("03 / Workspace evidence");
     expect(document.body.textContent).toContain("Context and files");
     expect(document.body.textContent).toContain("04 / Execution trace");
-    expect(document.body.textContent).toContain("artifact-memory-2");
+    expect(document.body.textContent).toContain("Memory · Update");
+    expect(document.body.textContent).toContain("Skill · Update");
+    expect(document.body.textContent).toContain("Agent system · Update");
+    expect(document.body.textContent).not.toContain("artifact-memory-2");
     expect(document.body.textContent).toContain("Context used");
     expect(document.body.textContent).toContain("artifact-memory-1");
     expect(document.body.textContent).toContain("authoritative · closed");
@@ -886,7 +889,7 @@ describe("Desktop v2 product renderer", () => {
       ),
     ).toEqual(["task", "conversation", "evolution", "supporting", "technical"]);
 
-    await click("artifact-memory-2");
+    await click("Memory · Update");
     expect(
       document.querySelector('[data-testid="session-result-inspector"]'),
     ).toBeTruthy();
