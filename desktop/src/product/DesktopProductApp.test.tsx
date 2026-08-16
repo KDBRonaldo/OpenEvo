@@ -869,6 +869,11 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("I checked the evidence table");
     expect(document.body.textContent).toContain("results/evidence-review.md");
     expect(document.body.textContent).toContain("Evolution produced");
+    expect(document.body.textContent).toContain("01 / Session dialogue");
+    expect(document.body.textContent).toContain("02 / Cross-session adaptation");
+    expect(document.body.textContent).toContain("03 / Workspace evidence");
+    expect(document.body.textContent).toContain("Context and files");
+    expect(document.body.textContent).toContain("04 / Execution trace");
     expect(document.body.textContent).toContain("artifact-memory-2");
     expect(document.body.textContent).toContain("Context used");
     expect(document.body.textContent).toContain("artifact-memory-1");

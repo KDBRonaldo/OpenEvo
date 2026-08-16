@@ -12,6 +12,7 @@ import {
   FileText,
   History,
   LoaderCircle,
+  MessageSquareText,
   PanelLeft,
   Play,
   Plus,
@@ -22,6 +23,7 @@ import {
   Sparkles,
   X,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import {
   useCallback,
   useEffect,
@@ -1280,6 +1282,38 @@ function sessionActivityStageV2(
   return latest || "Codex is reasoning and working on the task.";
 }
 
+function SessionModuleHeadingV2({
+  index,
+  label,
+  title,
+  description,
+  metric,
+  icon: Icon,
+  tone,
+}: {
+  readonly index: string;
+  readonly label: string;
+  readonly title: string;
+  readonly description: string;
+  readonly metric: string;
+  readonly icon: LucideIcon;
+  readonly tone: "conversation" | "evolution" | "context" | "technical";
+}) {
+  return (
+    <header className={`v2-session-module-heading tone-${tone}`}>
+      <div className="v2-session-module-identity">
+        <span className="v2-session-module-icon" aria-hidden="true"><Icon size={19} /></span>
+        <div className="v2-session-module-copy">
+          <span className="v2-session-module-overline">{index} / {label}</span>
+          <h2>{title}</h2>
+          <p>{description}</p>
+        </div>
+      </div>
+      <strong className="v2-session-module-metric">{metric}</strong>
+    </header>
+  );
+}
+
 function TaskAuthorityCardV2({
   task,
   taskContent,
@@ -1323,6 +1357,7 @@ function TaskAuthorityCardV2({
   const activityStage = sessionActivityStageV2(task.state, logs);
   const producedArtifacts = artifacts.filter((artifact) => presentation?.producedArtifactIds.includes(artifact.artifact_id));
   const usedArtifacts = artifacts.filter((artifact) => presentation?.usedArtifactIds.includes(artifact.artifact_id));
+  const supportingItemCount = usedArtifacts.length + (presentation?.outputFiles.length ?? 0);
   const [selectedResult, setSelectedResult] = useState<
     | { readonly kind: "artifact"; readonly artifactId: string }
     | { readonly kind: "output"; readonly fileName: string }
@@ -1345,7 +1380,7 @@ function TaskAuthorityCardV2({
       <div className="v2-profile-card-head"><div><span className="panel-kicker">Task result</span><strong>{taskContent?.title ?? `Task ${task.task_id}`}</strong><small>Task {task.task_id}</small></div><span className={`state-pill ${task.state}`}>{task.state.replaceAll("_", " ")}</span></div>
       <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
       <section className="v2-result-section v2-conversation-section v2-session-module" data-session-priority="conversation">
-        <header className="v2-session-module-heading"><div><h2>Conversation</h2><p>The request and the agent's response from this Session.</p></div><strong>{sessionInProgress ? "Agent working" : `${conversationCount} messages`}</strong></header>
+        <SessionModuleHeadingV2 index="01" label="Session dialogue" title="Conversation" description="The request and the Agent's response from this Session." metric={sessionInProgress ? "Agent working" : `${conversationCount} messages`} icon={MessageSquareText} tone="conversation" />
         {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : !sessionInProgress ? <p className="v2-empty-copy">The agent response is not loaded yet.</p> : null}
         {sessionInProgress ? (
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
@@ -1359,7 +1394,7 @@ function TaskAuthorityCardV2({
         ) : null}
       </section>
       <section className="v2-evolution-priority v2-session-module" data-session-priority="evolution">
-        <header className="v2-session-module-heading"><div><h2>Evolution</h2><p>Document changes learned from this Session for future Sessions.</p></div><strong>{producedArtifacts.length} produced</strong></header>
+        <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title="Evolution" description="Changes learned from this Session and prepared for future Sessions." metric={`${producedArtifacts.length} produced`} icon={Sparkles} tone="evolution" />
         <div className="session-evolution-summary">
           <div><span className="panel-kicker">Selected for this session</span><strong>{presentation?.selectedEvolution?.length ?? 0} methods</strong></div>
           {presentation?.selectedEvolution?.length ? <div className="session-evolution-statuses">{presentation.selectedEvolution.map((selection) => {
@@ -1376,12 +1411,12 @@ function TaskAuthorityCardV2({
         {selectedProducedArtifact ? resultInspector : null}
       </section>
       <section className="v2-supporting-module v2-session-module" data-session-priority="supporting">
-        <header className="v2-session-module-heading secondary"><div><h2>Files and context</h2><p>Supporting inputs and files associated with this Session.</p></div></header>
+        <SessionModuleHeadingV2 index="03" label="Workspace evidence" title="Context and files" description="Inputs, workspace changes, and files associated with this Session." metric={`${supportingItemCount} items`} icon={FolderOpen} tone="context" />
         <div className="v2-supporting-results"><ResultCollection title="Context used" empty="No evolved context was recorded for this Task." artifacts={usedArtifacts} onOpen={(artifactId) => setSelectedResult({ kind: "artifact", artifactId })} /><div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">Output files</span><strong>{presentation?.outputFiles.length ?? 0} files</strong></div>{presentation?.outputFiles.length ? <div className="v2-output-files">{presentation.outputFiles.map((file) => <button type="button" key={file.name} onClick={() => setSelectedResult({ kind: "output", fileName: file.name })}><FileText size={16} /><span><strong>{file.name}</strong><small>{file.summary}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">No readable output-file summary is available.</p>}</div></div>
         {selectedResult && !selectedProducedArtifact ? resultInspector : null}
       </section>
       <section className="v2-session-technical-details v2-session-module" data-session-priority="technical">
-        <header className="v2-session-module-heading tertiary"><div><h2>Technical details</h2><p>Execution status and immutable identifiers for troubleshooting.</p></div></header>
+        <SessionModuleHeadingV2 index="04" label="Execution trace" title="Technical details" description="Execution status and immutable identifiers for troubleshooting." metric={task.state.replaceAll("_", " ")} icon={Activity} tone="technical" />
       <div className="v2-task-authority"><div><span>Task Admission</span><code>{task.admission.task_admission_id}</code><small>{shortDigest(task.admission.admission_sha256)}</small></div><div><span>Predecessor Project Head</span><code>{task.admission.predecessor_project_head.project_head_id}</code><small>Generation {task.admission.predecessor_project_head.generation}</small></div></div>
       <div className="v2-attempt-list">{task.attempts.map((attempt) => {
         const authoritative = attempt.attempt_id === task.authoritative_attempt_id;
