@@ -204,10 +204,13 @@ def main() -> int:
 
     if args.browser:
         print("Building the browser-hosted OpenEvo renderer.")
+        browser_build_environment = dict(os.environ)
+        browser_build_environment["VITE_OPENEVO_SOURCE_DEVELOPMENT"] = "1"
         built = subprocess.run(
             ["npm", "run", "build", "--", "--mode", "openevo-desktop"],
             cwd=DESKTOP_ROOT,
             check=False,
+            env=browser_build_environment,
         )
         if built.returncode != 0:
             return built.returncode

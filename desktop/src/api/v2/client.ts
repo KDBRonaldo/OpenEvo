@@ -351,7 +351,9 @@ export function negotiateDesktopVersionV2(
 }
 
 function desktopBuildChannelIsAllowed(buildChannel: string): boolean {
-  return buildChannel === "release" || (import.meta.env.DEV && buildChannel === "development");
+  const sourceDevelopmentBuild =
+    import.meta.env.DEV || import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT === "1";
+  return buildChannel === "release" || (sourceDevelopmentBuild && buildChannel === "development");
 }
 
 export function createDesktopApiClientV2(options: DesktopClientOptionsV2): DesktopApiClientV2 {
