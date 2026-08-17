@@ -91,10 +91,32 @@ export interface PersistedDevelopmentEvolutionJob {
   readonly sessionId: string;
   readonly targetId: string;
   readonly methodId: string;
+  readonly requestedMethodId: string;
+  readonly resolverInputArtifactIds: readonly string[];
+  readonly previousArtifactId: string | null;
   readonly config: Readonly<Record<string, unknown>>;
   readonly state: "queued" | "running" | "completed" | "failed";
   readonly artifactIds: readonly string[];
   readonly error: string | null;
+  readonly attempts: readonly PersistedDevelopmentEvolutionAttempt[];
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface PersistedDevelopmentEvolutionAttempt {
+  readonly attemptId: string;
+  readonly jobId: string;
+  readonly ordinal: number;
+  readonly state: "queued" | "running" | "completed" | "failed" | "cancelled";
+  readonly stage: string;
+  readonly artifactIds: readonly string[];
+  readonly errorCode: string | null;
+  readonly errorMessage: string | null;
+  readonly logs: readonly string[];
+  readonly createdAt: string;
+  readonly startedAt: string | null;
+  readonly completedAt: string | null;
+  readonly updatedAt: string;
 }
 
 export interface PersistedDevelopmentProject {
@@ -148,6 +170,7 @@ export interface DevelopmentAgentBackend {
   activateProject(projectId: string): Promise<void>;
   submitAgentTurn(request: DevelopmentAgentTurnRequest): Promise<DevelopmentAgentTurnSubmission>;
   cancelAgentTurn(sessionId: string): Promise<void>;
+  retryEvolutionJob(jobId: string): Promise<void>;
 }
 
 interface DevelopmentProviderOptions {
@@ -187,6 +210,10 @@ function createRemoteBackedDesktopProductProvider(
 
   const hasActiveSession = () => snapshot.tasks.some(
     (task) => task.state === "running" || task.state === "cancelling",
+  ) || Object.values(snapshot.runtimePresentation?.tasks ?? {}).some(
+    (presentation) => presentation.evolutionJobs?.some(
+      (job) => job.state === "queued" || job.state === "running",
+    ),
   );
 
   const schedulePolling = () => {
@@ -402,6 +429,13 @@ function createRemoteBackedDesktopProductProvider(
         started_at: NOW,
         finished_at: null,
       } as never;
+    },
+    retryEvolutionJob: async (jobId) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.retryEvolutionJob(jobId);
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+      schedulePolling();
     },
     loadTaskLogs: async (taskId) => {
       await ensureDevelopmentState(true);

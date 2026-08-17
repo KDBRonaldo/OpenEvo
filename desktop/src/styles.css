@@ -4199,6 +4199,178 @@ pre.json {
   color: var(--danger);
 }
 
+.v2-evolution-job-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  margin-top: 14px;
+}
+
+.v2-evolution-job {
+  display: grid;
+  align-content: start;
+  gap: 11px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.v2-evolution-job.running,
+.v2-evolution-job.queued {
+  border-left-color: var(--blue);
+}
+
+.v2-evolution-job.completed {
+  border-left-color: var(--accent);
+}
+
+.v2-evolution-job.failed {
+  border-color: #edcaca;
+  border-left-color: var(--danger);
+}
+
+.v2-evolution-job > header,
+.v2-evolution-job-title,
+.v2-evolution-job-progress,
+.v2-evolution-job-actions,
+.v2-evolution-attempt-list section > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.v2-evolution-job-title {
+  justify-content: flex-start;
+  min-width: 0;
+}
+
+.v2-evolution-job-title strong,
+.v2-evolution-job-title small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.v2-evolution-job-title strong {
+  text-transform: capitalize;
+}
+
+.v2-evolution-job-title small,
+.v2-evolution-job-progress span,
+.v2-evolution-attempt-list small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.v2-evolution-job-state {
+  display: grid;
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--subtle);
+  background: var(--surface-soft);
+}
+
+.v2-evolution-job-state.running,
+.v2-evolution-job-state.queued {
+  color: var(--blue);
+  background: var(--blue-soft);
+}
+
+.v2-evolution-job-state.completed {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.v2-evolution-job-state.failed {
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.v2-evolution-job-progress {
+  align-items: baseline;
+  padding: 9px 10px;
+  border-radius: 7px;
+  background: var(--surface-soft);
+}
+
+.v2-evolution-job-progress strong {
+  font-size: 12px;
+  text-align: right;
+}
+
+.v2-evolution-job-error {
+  padding: 10px 11px;
+  border: 1px solid #edcaca;
+  border-radius: 7px;
+  color: var(--danger);
+  background: var(--danger-soft);
+}
+
+.v2-evolution-job-error strong {
+  font-size: 11px;
+}
+
+.v2-evolution-job-error p {
+  margin: 4px 0 0;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.v2-evolution-attempt-details {
+  border-top: 1px solid var(--line);
+  padding-top: 9px;
+}
+
+.v2-evolution-attempt-details summary {
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.v2-evolution-attempt-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 9px;
+}
+
+.v2-evolution-attempt-list section {
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface-soft);
+}
+
+.v2-evolution-attempt-list ol {
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.v2-evolution-fixed-inputs {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--blue-soft);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.v2-evolution-job-actions {
+  justify-content: flex-end;
+}
+
 .v2-session-technical-details {
   display: grid;
   gap: 10px;

@@ -70,6 +70,11 @@ SESSION_PATH_PATTERN = re.compile(r"^/openevo-dev-agent/v1/sessions/([^/]+)$")
 SESSION_CANCEL_PATH_PATTERN = re.compile(
     r"^/openevo-dev-agent/v1/sessions/([^/]+)/cancel$"
 )
+EVOLUTION_JOB_RETRY_PATH_PATTERN = re.compile(
+    r"^/openevo-dev-agent/v1/evolution-jobs/([^/]+)/retry$"
+)
+
+
 class RequestError(ValueError):
     pass
 
@@ -593,6 +598,7 @@ class DevelopmentStateStore:
                     method_id TEXT NOT NULL,
                     requested_method_id TEXT NOT NULL,
                     resolver_input_artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                    previous_artifact_id TEXT,
                     config_json TEXT NOT NULL,
                     state TEXT NOT NULL CHECK (state IN ('queued', 'running', 'completed', 'failed')),
                     artifact_ids_json TEXT NOT NULL DEFAULT '[]',
@@ -603,6 +609,26 @@ class DevelopmentStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS development_evolution_jobs_session
                     ON development_evolution_jobs(session_id, created_at, job_id);
+                CREATE TABLE IF NOT EXISTS development_evolution_job_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    job_id TEXT NOT NULL REFERENCES development_evolution_jobs(job_id),
+                    ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+                    state TEXT NOT NULL CHECK (
+                        state IN ('queued', 'running', 'completed', 'failed', 'cancelled')
+                    ),
+                    stage TEXT NOT NULL,
+                    artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+                    error_code TEXT,
+                    error_message TEXT,
+                    logs_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(job_id, ordinal)
+                );
+                CREATE INDEX IF NOT EXISTS development_evolution_attempts_job
+                    ON development_evolution_job_attempts(job_id, ordinal);
                 CREATE TABLE IF NOT EXISTS development_dataset_artifacts (
                     artifact_id TEXT PRIMARY KEY,
                     project_id TEXT NOT NULL REFERENCES development_projects(project_id),
@@ -673,6 +699,11 @@ class DevelopmentStateStore:
                     "PRAGMA table_info(development_evolution_jobs)"
                 )
             }
+            if "previous_artifact_id" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE development_evolution_jobs "
+                    "ADD COLUMN previous_artifact_id TEXT"
+                )
             if "requested_method_id" not in job_columns:
                 connection.execute(
                     "ALTER TABLE development_evolution_jobs "
@@ -739,6 +770,38 @@ class DevelopmentStateStore:
             )
             connection.execute(
                 """
+                UPDATE development_evolution_job_attempts
+                SET state = 'failed', error_code = 'daemon_restarted',
+                    error_message = ?, completed_at = ?, updated_at = ?
+                WHERE state IN ('queued', 'running')
+                """,
+                (
+                    "Development daemon restarted before this evolution attempt completed.",
+                    restarted_at,
+                    restarted_at,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO development_evolution_job_attempts(
+                    attempt_id, job_id, ordinal, state, stage, artifact_ids_json,
+                    error_code, error_message, logs_json, created_at, started_at,
+                    completed_at, updated_at
+                )
+                SELECT job_id || '-attempt-1', job_id, 1,
+                       CASE state WHEN 'completed' THEN 'completed' ELSE 'failed' END,
+                       CASE state WHEN 'completed' THEN 'completed' ELSE 'unknown' END,
+                       artifact_ids_json,
+                       CASE WHEN state = 'completed' THEN NULL ELSE 'legacy_failure' END,
+                       error,
+                       '[]', created_at, created_at,
+                       CASE WHEN state IN ('completed', 'failed') THEN updated_at ELSE NULL END,
+                       updated_at
+                FROM development_evolution_jobs
+                """
+            )
+            connection.execute(
+                """
                 UPDATE development_sessions
                 SET state = 'failed', terminal_kind = 'failed', error = ?, updated_at = ?
                 WHERE state = 'running'
@@ -787,9 +850,20 @@ class DevelopmentStateStore:
             artifacts = [self._artifact_record(row) for row in connection.execute(
                 "SELECT * FROM development_evolution_artifacts_v2 ORDER BY created_at, artifact_id"
             )]
-            jobs = [self._job_record(row) for row in connection.execute(
-                "SELECT * FROM development_evolution_jobs ORDER BY created_at, job_id"
-            )]
+            attempt_rows = connection.execute(
+                "SELECT * FROM development_evolution_job_attempts ORDER BY job_id, ordinal"
+            ).fetchall()
+            attempts_by_job: dict[str, list[dict[str, Any]]] = {}
+            for attempt_row in attempt_rows:
+                attempts_by_job.setdefault(attempt_row["job_id"], []).append(
+                    self._attempt_record(attempt_row)
+                )
+            jobs = [
+                self._job_record(row, attempts_by_job.get(row["job_id"], []))
+                for row in connection.execute(
+                    "SELECT * FROM development_evolution_jobs ORDER BY created_at, job_id"
+                )
+            ]
             active_row = connection.execute(
                 "SELECT value FROM development_metadata WHERE key = 'active_project_id'"
             ).fetchone()
@@ -1054,6 +1128,38 @@ class DevelopmentStateStore:
                 (canonical_json(errors), utc_now(), session_id),
             )
 
+    def set_evolution_error(
+        self,
+        session_id: str,
+        *,
+        target_id: str,
+        method: str,
+        message: str | None,
+    ) -> None:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT evolution_errors_json FROM development_sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(session_id)
+            errors = [
+                item
+                for item in json.loads(row["evolution_errors_json"])
+                if item.get("target_id") != target_id
+            ]
+            if message is not None:
+                errors.append({
+                    "target_id": target_id,
+                    "method": method,
+                    "message": message,
+                })
+            connection.execute(
+                "UPDATE development_sessions SET evolution_errors_json = ?, updated_at = ? "
+                "WHERE session_id = ?",
+                (canonical_json(errors), utc_now(), session_id),
+            )
+
     def latest_artifact(self, project_id: str, target_id: str) -> dict[str, Any] | None:
         with self._lock, self._connection() as connection:
             row = connection.execute(
@@ -1076,6 +1182,22 @@ class DevelopmentStateStore:
         if row is None:
             raise KeyError(project_id)
         return json.loads(row["config_json"])
+
+    def project(self, project_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_projects WHERE project_id = ?",
+                (project_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(project_id)
+        return {
+            "project_id": row["project_id"],
+            "display_name": row["display_name"],
+            "config": json.loads(row["config_json"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def latest_memory(self, project_id: str) -> dict[str, Any] | None:
         return self.latest_artifact(project_id, "text_memory")
@@ -1147,17 +1269,19 @@ class DevelopmentStateStore:
         method_id: str,
         requested_method_id: str,
         resolver_input_artifact_ids: list[str],
+        previous_artifact_id: str | None,
         config: dict[str, Any],
-    ) -> None:
+    ) -> dict[str, Any]:
         now = utc_now()
+        attempt_id = f"{job_id}-attempt-1"
         with self._lock, self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO development_evolution_jobs(
                     job_id, session_id, target_id, method_id, requested_method_id,
-                    resolver_input_artifact_ids_json, config_json, state,
+                    resolver_input_artifact_ids_json, previous_artifact_id, config_json, state,
                     artifact_ids_json, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'running', '[]', NULL, ?, ?)
                 """,
                 (
                     job_id,
@@ -1166,20 +1290,147 @@ class DevelopmentStateStore:
                     method_id,
                     requested_method_id,
                     canonical_json(resolver_input_artifact_ids),
+                    previous_artifact_id,
                     canonical_json(config),
                     now,
                     now,
                 ),
+            )
+            connection.execute(
+                """
+                INSERT INTO development_evolution_job_attempts(
+                    attempt_id, job_id, ordinal, state, stage, artifact_ids_json,
+                    error_code, error_message, logs_json, created_at, started_at,
+                    completed_at, updated_at
+                ) VALUES (?, ?, 1, 'running', 'input_resolution', '[]', NULL, NULL,
+                          ?, ?, ?, NULL, ?)
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    canonical_json(["Resolving the fixed Evolution Job inputs."]),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM development_evolution_job_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._attempt_record(row)
+
+    def start_evolution_retry(self, job_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            job_row = connection.execute(
+                """
+                SELECT job.*, session.state AS session_state, session.project_id
+                FROM development_evolution_jobs AS job
+                JOIN development_sessions AS session ON session.session_id = job.session_id
+                WHERE job.job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if job_row is None:
+                raise KeyError(job_id)
+            if job_row["state"] != "failed":
+                raise StateConflictError("only a failed Evolution Job can be retried")
+            if job_row["session_state"] != "completed":
+                raise StateConflictError("the parent Session must be completed before retry")
+            running = connection.execute(
+                """
+                SELECT 1
+                FROM development_evolution_jobs AS candidate
+                JOIN development_sessions AS session
+                  ON session.session_id = candidate.session_id
+                WHERE session.project_id = ? AND candidate.state IN ('queued', 'running')
+                LIMIT 1
+                """,
+                (job_row["project_id"],),
+            ).fetchone()
+            if running is not None:
+                raise StateConflictError("another Evolution Job is already running for this project")
+            ordinal = connection.execute(
+                "SELECT COALESCE(MAX(ordinal), 0) + 1 AS ordinal "
+                "FROM development_evolution_job_attempts WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()["ordinal"]
+            attempt_id = f"{job_id}-attempt-{ordinal}"
+            connection.execute(
+                """
+                INSERT INTO development_evolution_job_attempts(
+                    attempt_id, job_id, ordinal, state, stage, artifact_ids_json,
+                    error_code, error_message, logs_json, created_at, started_at,
+                    completed_at, updated_at
+                ) VALUES (?, ?, ?, 'running', 'input_resolution', '[]', NULL, NULL,
+                          ?, ?, ?, NULL, ?)
+                """,
+                (
+                    attempt_id,
+                    job_id,
+                    ordinal,
+                    canonical_json(["Retry admitted with the original fixed inputs."]),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+            connection.execute(
+                "UPDATE development_evolution_jobs "
+                "SET state = 'running', artifact_ids_json = '[]', error = NULL, updated_at = ? "
+                "WHERE job_id = ?",
+                (now, job_id),
+            )
+            job = connection.execute(
+                "SELECT * FROM development_evolution_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT * FROM development_evolution_job_attempts WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+        return self._job_record(job, [self._attempt_record(attempt)]), self._attempt_record(attempt)
+
+    def update_evolution_attempt(self, attempt_id: str, *, stage: str, message: str) -> None:
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT logs_json, state FROM development_evolution_job_attempts "
+                "WHERE attempt_id = ?",
+                (attempt_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(attempt_id)
+            if row["state"] != "running":
+                raise StateConflictError("Evolution attempt is already terminal")
+            logs = json.loads(row["logs_json"])
+            logs.append(message)
+            connection.execute(
+                "UPDATE development_evolution_job_attempts "
+                "SET stage = ?, logs_json = ?, updated_at = ? WHERE attempt_id = ?",
+                (stage, canonical_json(logs), now, attempt_id),
             )
 
     def finish_evolution_job(
         self,
         job_id: str,
         *,
+        attempt_id: str | None = None,
         artifact_ids: list[str] | None = None,
         error: str | None = None,
+        error_stage: str | None = None,
+        error_code: str | None = None,
     ) -> None:
+        now = utc_now()
         with self._lock, self._connection() as connection:
+            if attempt_id is None:
+                attempt_row = connection.execute(
+                    "SELECT attempt_id FROM development_evolution_job_attempts "
+                    "WHERE job_id = ? AND state = 'running' ORDER BY ordinal DESC LIMIT 1",
+                    (job_id,),
+                ).fetchone()
+                attempt_id = None if attempt_row is None else attempt_row["attempt_id"]
             connection.execute(
                 """
                 UPDATE development_evolution_jobs
@@ -1190,10 +1441,80 @@ class DevelopmentStateStore:
                     "failed" if error is not None else "completed",
                     canonical_json(artifact_ids or []),
                     error,
-                    utc_now(),
+                    now,
                     job_id,
                 ),
             )
+            if attempt_id is not None:
+                attempt_row = connection.execute(
+                    "SELECT logs_json FROM development_evolution_job_attempts WHERE attempt_id = ?",
+                    (attempt_id,),
+                ).fetchone()
+                if attempt_row is None:
+                    raise KeyError(attempt_id)
+                logs = json.loads(attempt_row["logs_json"])
+                logs.append(
+                    "Evolution attempt failed." if error is not None
+                    else "Evolution attempt completed and published its outputs."
+                )
+                connection.execute(
+                    """
+                    UPDATE development_evolution_job_attempts
+                    SET state = ?, stage = ?, artifact_ids_json = ?, error_code = ?,
+                        error_message = ?, logs_json = ?, completed_at = ?, updated_at = ?
+                    WHERE attempt_id = ?
+                    """,
+                    (
+                        "failed" if error is not None else "completed",
+                        error_stage or ("failed" if error is not None else "completed"),
+                        canonical_json(artifact_ids or []),
+                        error_code,
+                        error,
+                        canonical_json(logs),
+                        now,
+                        now,
+                        attempt_id,
+                    ),
+                )
+
+    def get_evolution_job(self, job_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_evolution_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(job_id)
+            attempts = [
+                self._attempt_record(attempt)
+                for attempt in connection.execute(
+                    "SELECT * FROM development_evolution_job_attempts "
+                    "WHERE job_id = ? ORDER BY ordinal",
+                    (job_id,),
+                )
+            ]
+        return self._job_record(row, attempts)
+
+    def dataset_artifact(self, artifact_id: str) -> dict[str, str]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT artifact_id, project_id, session_id, uri, name, created_at "
+                "FROM development_dataset_artifacts WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(artifact_id)
+        return dict(row)
+
+    def artifact(self, artifact_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM development_evolution_artifacts_v2 WHERE artifact_id = ?",
+                (artifact_id,),
+            ).fetchone()
+        if row is None:
+            raise KeyError(artifact_id)
+        return self._artifact_record(row)
 
     def record_evolution_artifact(
         self,
@@ -1323,17 +1644,44 @@ class DevelopmentStateStore:
         }
 
     @staticmethod
-    def _job_record(row: sqlite3.Row) -> dict[str, Any]:
+    def _job_record(
+        row: sqlite3.Row,
+        attempts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "job_id": row["job_id"],
             "session_id": row["session_id"],
             "target_id": row["target_id"],
             "method_id": row["method_id"],
+            "requested_method_id": row["requested_method_id"],
+            "resolver_input_artifact_ids": json.loads(
+                row["resolver_input_artifact_ids_json"]
+            ),
+            "previous_artifact_id": row["previous_artifact_id"],
             "config": json.loads(row["config_json"]),
             "state": row["state"],
             "artifact_ids": json.loads(row["artifact_ids_json"]),
             "error": row["error"],
+            "attempts": attempts or [],
             "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    @staticmethod
+    def _attempt_record(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "attempt_id": row["attempt_id"],
+            "job_id": row["job_id"],
+            "ordinal": row["ordinal"],
+            "state": row["state"],
+            "stage": row["stage"],
+            "artifact_ids": json.loads(row["artifact_ids_json"]),
+            "error_code": row["error_code"],
+            "error_message": row["error_message"],
+            "logs": json.loads(row["logs_json"]),
+            "created_at": row["created_at"],
+            "started_at": row["started_at"],
+            "completed_at": row["completed_at"],
             "updated_at": row["updated_at"],
         }
 
@@ -1942,13 +2290,7 @@ class DocumentEvolutionRunner:
         selected = selected_document_evolution(config)
 
         try:
-            from openevo.evolution.framework.execution import (
-                InputBindingSource,
-                resolve_method_inputs,
-            )
             from openevo.evolution.framework.resolution import resolve_evolution_method
-            from openevo.evolution.methods import METHOD_REGISTRY
-            from openevo.evolution.models import WorkerClaimInputArtifact, WorkerClaimedJob
         except (ImportError, ModuleNotFoundError) as exc:
             raise EvolutionRunError(
                 "OpenEvo Python dependencies are unavailable; run this daemon with `uv run python`"
@@ -2004,18 +2346,7 @@ class DocumentEvolutionRunner:
         if not selected:
             return {"artifacts": [], "errors": []}
 
-        prior_datasets = [
-            WorkerClaimInputArtifact(
-                artifact_id=dataset["artifact_id"],
-                type="dataset",
-                uri=dataset["uri"],
-                name=dataset["name"],
-            )
-            for dataset in prior_dataset_records
-        ]
-        current_dataset = WorkerClaimInputArtifact.model_validate(dataset_input)
-        ordered_datasets = [*prior_datasets, current_dataset]
-        prior_dataset_ids = [dataset.artifact_id for dataset in prior_datasets]
+        prior_dataset_ids = [dataset["artifact_id"] for dataset in prior_dataset_records]
         persisted: list[dict[str, Any]] = []
         errors: list[dict[str, str]] = []
         for item in selected:
@@ -2029,122 +2360,246 @@ class DocumentEvolutionRunner:
                 prior_dataset_artifact_ids=prior_dataset_ids,
             )
             job_id = f"job-{target_id.replace('_', '-')}-{session_id}"
-            store.start_evolution_job(
+            previous = store.latest_artifact(request["project_id"], target_id)
+            attempt = store.start_evolution_job(
                 job_id=job_id,
                 session_id=session_id,
                 target_id=target_id,
                 method_id=method_id,
                 requested_method_id=requested_method_id,
                 resolver_input_artifact_ids=prior_dataset_ids,
+                previous_artifact_id=None if previous is None else previous["artifact_id"],
                 config=item["config"],
             )
             try:
-                target, method, handler = self._descriptor(target_id, method_id)
-                method_config = self._method_config(method, item["config"])
-                previous = store.latest_artifact(request["project_id"], target_id)
-                previous_input = None
-                if previous is not None:
-                    previous_uri = self._materialize_previous(
-                        previous,
-                        dataset_dir / f"previous-{target_id}",
-                    )
-                    previous_input = WorkerClaimInputArtifact(
-                        artifact_id=previous["artifact_id"],
-                        type=target.artifact_type,
-                        uri=previous_uri,
-                        name=f"previous evolved {target.display_name}",
-                    )
-                candidates: dict[str, list[Any]] = {}
-                for binding in method.input_bindings:
-                    if binding.source is InputBindingSource.CURRENT_DATASET:
-                        candidates[binding.binding_id] = [current_dataset]
-                    elif binding.source is InputBindingSource.HISTORY_DATASETS:
-                        candidates[binding.binding_id] = prior_datasets
-                    elif (
-                        binding.source is InputBindingSource.EXPLICIT_INPUTS
-                        and binding.artifact_type == "dataset"
-                    ):
-                        candidates[binding.binding_id] = ordered_datasets
-                    elif binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
-                        candidates[binding.binding_id] = [] if previous_input is None else [previous_input]
-                    else:
-                        candidates[binding.binding_id] = []
-                resolved = resolve_method_inputs(method.input_bindings, candidates)
-                method_handle = METHOD_REGISTRY.get(method_id)
-                if method_handle is None:
-                    raise EvolutionRunError(f"{method_id} has no installed legacy worker handle")
-                artifacts = method_handle(
-                    WorkerClaimedJob(
-                        job_id=job_id,
-                        lease_id=f"lease-{target_id.replace('_', '-')}-{session_id}",
-                        job_type="development_catalog",
-                        method=method_id,
-                        target_id=target_id,
-                        registry_snapshot_digest=self._registry.registry_digest,
-                        method_identity_digest=self._registry.identity_digest_for("method", method_id),
-                        input_artifacts=list(resolved.input_artifacts),
-                        config={
-                            **method_config,
-                            "name": f"{request['project_name']} evolved {target.display_name}",
-                        },
-                    ),
-                    artifact_root=self._artifact_root,
-                )
-                if cancellation is not None:
-                    cancellation.raise_if_requested()
-                artifact_ids: list[str] = []
-                for output_index, artifact in enumerate(artifacts):
-                    artifact_type = artifact.type.value
-                    if artifact_type not in method.output_artifact_types:
-                        raise EvolutionRunError(
-                            f"{method_id} returned undeclared artifact type {artifact_type}"
-                        )
-                    renderer_kind = (
-                        "structured_summary" if artifact_type == "report"
-                        else handler.renderer_kind.value
-                    )
-                    documents = self._read_documents(artifact.uri, renderer_kind)
-                    suffix = "" if output_index == 0 else f"-{output_index + 1}"
-                    artifact_id = (
-                        f"dev-{artifact_type.replace('_', '-')}-"
-                        f"{session_id.removeprefix('dev-session-')}{suffix}"
-                    )
-                    artifact_ids.append(artifact_id)
-                    persisted.append(store.record_evolution_artifact(
-                        artifact_id=artifact_id,
-                        project_id=request["project_id"],
-                        session_id=session_id,
-                        target_id=target_id,
-                        artifact_type=artifact_type,
-                        method_id=method_id,
-                        renderer_kind=renderer_kind,
-                        documents=documents,
-                        manifest=artifact.manifest,
-                        previous_artifact_id=(
-                            previous["artifact_id"]
-                            if previous is not None and artifact_type == target.artifact_type
-                            else None
-                        ),
-                        promoted=artifact.promoted,
-                    ))
-                store.finish_evolution_job(job_id, artifact_ids=artifact_ids)
+                job = store.get_evolution_job(job_id)
+                persisted.extend(self._execute_fixed_job(
+                    job=job,
+                    attempt=attempt,
+                    request=request,
+                    store=store,
+                    cancellation=cancellation,
+                ))
             except HarnessRunCancelled:
-                try:
-                    store.finish_evolution_job(job_id, error="Session cancelled by user")
-                except Exception:
-                    pass
                 raise
             except Exception as exc:
-                try:
-                    store.finish_evolution_job(job_id, error=str(exc))
-                except Exception:
-                    pass
                 errors.append({
                     "target_id": target_id,
                     "method": requested_method_id,
                     "message": str(exc),
                 })
         return {"artifacts": persisted, "errors": errors}
+
+    def retry(
+        self,
+        *,
+        job: dict[str, Any],
+        attempt: dict[str, Any],
+        store: DevelopmentStateStore,
+    ) -> list[dict[str, Any]]:
+        session = store.get_session(job["session_id"])
+        project = store.project(session["project_id"])
+        request = {
+            "project_id": project["project_id"],
+            "project_name": project["display_name"],
+            "task_title": session["task_title"],
+            "instruction": session["instruction"],
+        }
+        return self._execute_fixed_job(
+            job=job,
+            attempt=attempt,
+            request=request,
+            store=store,
+            cancellation=None,
+        )
+
+    def _execute_fixed_job(
+        self,
+        *,
+        job: dict[str, Any],
+        attempt: dict[str, Any],
+        request: dict[str, str],
+        store: DevelopmentStateStore,
+        cancellation: HarnessCancellation | None,
+    ) -> list[dict[str, Any]]:
+        from openevo.evolution.framework.execution import (
+            InputBindingSource,
+            resolve_method_inputs,
+        )
+        from openevo.evolution.methods import METHOD_REGISTRY
+        from openevo.evolution.models import WorkerClaimInputArtifact, WorkerClaimedJob
+
+        job_id = job["job_id"]
+        attempt_id = attempt["attempt_id"]
+        attempt_ordinal = attempt["ordinal"]
+        target_id = job["target_id"]
+        method_id = job["method_id"]
+        stage = "input_resolution"
+        try:
+            if cancellation is not None:
+                cancellation.raise_if_requested()
+            target, method, handler = self._descriptor(target_id, method_id)
+            method_config = self._method_config(method, job["config"])
+            current_record = store.dataset_artifact(f"dataset-{job['session_id']}")
+            current_dataset = WorkerClaimInputArtifact(
+                artifact_id=current_record["artifact_id"],
+                type="dataset",
+                uri=current_record["uri"],
+                name=current_record["name"],
+            )
+            prior_datasets = []
+            for artifact_id in job["resolver_input_artifact_ids"]:
+                record = store.dataset_artifact(artifact_id)
+                prior_datasets.append(WorkerClaimInputArtifact(
+                    artifact_id=record["artifact_id"],
+                    type="dataset",
+                    uri=record["uri"],
+                    name=record["name"],
+                ))
+            previous = (
+                None
+                if job["previous_artifact_id"] is None
+                else store.artifact(job["previous_artifact_id"])
+            )
+            previous_input = None
+            if previous is not None:
+                attempt_input_root = self._artifact_root / "attempt-inputs" / attempt_id
+                attempt_input_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+                previous_uri = self._materialize_previous(
+                    previous,
+                    attempt_input_root / f"previous-{target_id}",
+                )
+                previous_input = WorkerClaimInputArtifact(
+                    artifact_id=previous["artifact_id"],
+                    type=target.artifact_type,
+                    uri=previous_uri,
+                    name=f"previous evolved {target.display_name}",
+                )
+            ordered_datasets = [*prior_datasets, current_dataset]
+            candidates: dict[str, list[Any]] = {}
+            for binding in method.input_bindings:
+                if binding.source is InputBindingSource.CURRENT_DATASET:
+                    candidates[binding.binding_id] = [current_dataset]
+                elif binding.source is InputBindingSource.HISTORY_DATASETS:
+                    candidates[binding.binding_id] = prior_datasets
+                elif (
+                    binding.source is InputBindingSource.EXPLICIT_INPUTS
+                    and binding.artifact_type == "dataset"
+                ):
+                    candidates[binding.binding_id] = ordered_datasets
+                elif binding.source is InputBindingSource.CURRENT_TARGET_ARTIFACTS:
+                    candidates[binding.binding_id] = [] if previous_input is None else [previous_input]
+                else:
+                    candidates[binding.binding_id] = []
+            resolved = resolve_method_inputs(method.input_bindings, candidates)
+            store.update_evolution_attempt(
+                attempt_id,
+                stage="method_execution",
+                message=f"Running {method_id} with the original fixed inputs.",
+            )
+            stage = "method_execution"
+            method_handle = METHOD_REGISTRY.get(method_id)
+            if method_handle is None:
+                raise EvolutionRunError(f"{method_id} has no installed legacy worker handle")
+            artifacts = method_handle(
+                WorkerClaimedJob(
+                    job_id=job_id,
+                    lease_id=f"lease-{attempt_id}",
+                    job_type="development_catalog",
+                    method=method_id,
+                    target_id=target_id,
+                    registry_snapshot_digest=self._registry.registry_digest,
+                    method_identity_digest=self._registry.identity_digest_for("method", method_id),
+                    input_artifacts=list(resolved.input_artifacts),
+                    config={
+                        **method_config,
+                        "name": f"{request['project_name']} evolved {target.display_name}",
+                    },
+                ),
+                artifact_root=self._artifact_root,
+            )
+            if cancellation is not None:
+                cancellation.raise_if_requested()
+            stage = "output_validation"
+            store.update_evolution_attempt(
+                attempt_id,
+                stage=stage,
+                message="Validating the declared Evolution outputs.",
+            )
+            output_records: list[tuple[Any, str, list[dict[str, str]], str]] = []
+            for output_index, artifact in enumerate(artifacts):
+                artifact_type = artifact.type.value
+                if artifact_type not in method.output_artifact_types:
+                    raise EvolutionRunError(
+                        f"{method_id} returned undeclared artifact type {artifact_type}"
+                    )
+                renderer_kind = (
+                    "structured_summary" if artifact_type == "report"
+                    else handler.renderer_kind.value
+                )
+                documents = self._read_documents(artifact.uri, renderer_kind)
+                output_suffix = "" if output_index == 0 else f"-{output_index + 1}"
+                retry_suffix = "" if attempt_ordinal == 1 else f"-attempt-{attempt_ordinal}"
+                artifact_id = (
+                    f"dev-{artifact_type.replace('_', '-')}-"
+                    f"{job['session_id'].removeprefix('dev-session-')}"
+                    f"{retry_suffix}{output_suffix}"
+                )
+                output_records.append((artifact, artifact_type, documents, artifact_id))
+            stage = "artifact_persistence"
+            store.update_evolution_attempt(
+                attempt_id,
+                stage=stage,
+                message="Persisting the validated Evolution artifacts.",
+            )
+            persisted: list[dict[str, Any]] = []
+            artifact_ids: list[str] = []
+            for artifact, artifact_type, documents, artifact_id in output_records:
+                artifact_ids.append(artifact_id)
+                persisted.append(store.record_evolution_artifact(
+                    artifact_id=artifact_id,
+                    project_id=request["project_id"],
+                    session_id=job["session_id"],
+                    target_id=target_id,
+                    artifact_type=artifact_type,
+                    method_id=method_id,
+                    renderer_kind=(
+                        "structured_summary" if artifact_type == "report"
+                        else handler.renderer_kind.value
+                    ),
+                    documents=documents,
+                    manifest=artifact.manifest,
+                    previous_artifact_id=(
+                        previous["artifact_id"]
+                        if previous is not None and artifact_type == target.artifact_type
+                        else None
+                    ),
+                    promoted=artifact.promoted,
+                ))
+            store.finish_evolution_job(
+                job_id,
+                attempt_id=attempt_id,
+                artifact_ids=artifact_ids,
+            )
+            return persisted
+        except HarnessRunCancelled:
+            store.finish_evolution_job(
+                job_id,
+                attempt_id=attempt_id,
+                error="Session cancelled by user",
+                error_stage=stage,
+                error_code="cancelled",
+            )
+            raise
+        except Exception as exc:
+            store.finish_evolution_job(
+                job_id,
+                attempt_id=attempt_id,
+                error=str(exc),
+                error_stage=stage,
+                error_code=f"{stage}_failed",
+            )
+            raise
 
 
 # Kept as a source-compatible name for development tests and scripts written before document
@@ -2197,6 +2652,67 @@ class DevelopmentSessionCoordinator:
         if cancellation is not None:
             cancellation.cancel()
         return session
+
+    def retry_evolution(self, job_id: str) -> dict[str, Any]:
+        if self._evolution_runner is None:
+            raise StateConflictError("the Evolution runner is unavailable")
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError("another development session or Evolution retry is running")
+        try:
+            job, attempt = self._store.start_evolution_retry(job_id)
+            self._store.set_evolution_error(
+                job["session_id"],
+                target_id=job["target_id"],
+                method=job["requested_method_id"],
+                message=None,
+            )
+        except Exception:
+            self._turn_lock.release()
+            raise
+        thread = threading.Thread(
+            target=self._execute_evolution_retry,
+            name=f"openevo-retry-{attempt['attempt_id']}",
+            args=(job, attempt),
+            daemon=True,
+        )
+        thread.start()
+        return self._store.get_evolution_job(job_id)
+
+    def _execute_evolution_retry(
+        self,
+        job: dict[str, Any],
+        attempt: dict[str, Any],
+    ) -> None:
+        try:
+            artifacts = self._evolution_runner.retry(
+                job=job,
+                attempt=attempt,
+                store=self._store,
+            )
+            self._store.set_evolution_error(
+                job["session_id"],
+                target_id=job["target_id"],
+                method=job["requested_method_id"],
+                message=None,
+            )
+            self._store.append_session_log(
+                job["session_id"],
+                f"Evolution retry attempt {attempt['ordinal']} completed and published "
+                f"{len(artifacts)} artifact(s).",
+            )
+        except Exception as exc:
+            self._store.set_evolution_error(
+                job["session_id"],
+                target_id=job["target_id"],
+                method=job["requested_method_id"],
+                message=str(exc),
+            )
+            self._store.append_session_log(
+                job["session_id"],
+                f"Evolution retry attempt {attempt['ordinal']} failed: {exc}",
+            )
+        finally:
+            self._turn_lock.release()
 
     def _execute(
         self,
@@ -2394,6 +2910,26 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
                 self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
             else:
                 self._json(HTTPStatus.OK, {"schema_version": "1", "project_id": project_id})
+            return
+        retry_match = EVOLUTION_JOB_RETRY_PATH_PATTERN.fullmatch(self.path)
+        if retry_match:
+            job_id = retry_match.group(1)
+            if not ID_PATTERN.fullmatch(job_id):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "job_id is invalid")
+                return
+            try:
+                payload = self._read_json()
+                if payload != {"schema_version": "1"}:
+                    raise RequestError("retry request must contain only schema_version '1'")
+                job = self.server.sessions.retry_evolution(job_id)
+            except RequestError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "Evolution Job not found")
+            except StateConflictError as exc:
+                self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(HTTPStatus.ACCEPTED, {"schema_version": "1", "job": job})
             return
         cancel_match = SESSION_CANCEL_PATH_PATTERN.fullmatch(self.path)
         if cancel_match:

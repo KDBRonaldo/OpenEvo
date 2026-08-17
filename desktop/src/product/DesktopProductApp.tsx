@@ -395,6 +395,13 @@ export function DesktopProductApp({
                 () => provider.retryTask(task.task_id, intentFor(snapshot, "retry-task")),
                 "A new infrastructure Attempt was requested under the same Task Admission.",
               )}
+              onRetryEvolutionJob={(jobId) => void act(
+                async () => {
+                  if (!provider.retryEvolutionJob) throw new Error("This backend does not support retrying an individual Evolution method.");
+                  await provider.retryEvolutionJob(jobId, intentFor(snapshot, "retry-evolution-job"));
+                },
+                "The failed Evolution method is running again with the original Session inputs.",
+              )}
               onLoadTaskLogs={async (taskId) => {
                 setBusy(true);
                 setActionError(null);
@@ -988,6 +995,7 @@ function ResearchWorkspaceV2({
   onRun,
   onCancelTask,
   onRetryTask,
+  onRetryEvolutionJob,
   onLoadTaskLogs,
   onRetryTransition,
   onAbandonTransition,
@@ -1011,6 +1019,7 @@ function ResearchWorkspaceV2({
   ) => void;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
+  readonly onRetryEvolutionJob: (jobId: string) => void;
   readonly onLoadTaskLogs: (taskId: string) => void | Promise<void>;
   readonly onRetryTransition: (transition: SuccessorTransitionV2) => void;
   readonly onAbandonTransition: (transition: SuccessorTransitionV2) => void;
@@ -1094,6 +1103,7 @@ function ResearchWorkspaceV2({
           busy={busy}
           onCancel={() => onCancelTask(selectedTask)}
           onRetry={() => onRetryTask(selectedTask)}
+          onRetryEvolutionJob={onRetryEvolutionJob}
           onLoadLogs={() => onLoadTaskLogs(selectedTask.task_id)}
           onRetryTransition={() => transition && onRetryTransition(transition)}
           onAbandonTransition={() => transition && onAbandonTransition(transition)}
@@ -1326,6 +1336,7 @@ function TaskAuthorityCardV2({
   busy,
   onCancel,
   onRetry,
+  onRetryEvolutionJob,
   onLoadLogs,
   onRetryTransition,
   onAbandonTransition,
@@ -1341,6 +1352,7 @@ function TaskAuthorityCardV2({
   readonly busy: boolean;
   readonly onCancel: () => void;
   readonly onRetry: () => void;
+  readonly onRetryEvolutionJob: (jobId: string) => void;
   readonly onLoadLogs: () => void | Promise<void>;
   readonly onRetryTransition: () => void;
   readonly onAbandonTransition: () => void;
@@ -1397,15 +1409,15 @@ function TaskAuthorityCardV2({
         <SessionModuleHeadingV2 index="02" label="Cross-session adaptation" title="Evolution" description="Changes learned from this Session and prepared for future Sessions." metric={`${producedArtifacts.length} produced`} icon={Sparkles} tone="evolution" />
         <div className="session-evolution-summary">
           <div><span className="panel-kicker">Selected for this session</span><strong>{presentation?.selectedEvolution?.length ?? 0} methods</strong></div>
-          {presentation?.selectedEvolution?.length ? <div className="session-evolution-statuses">{presentation.selectedEvolution.map((selection) => {
-            const error = presentation.evolutionErrors?.find((candidate) => candidate.targetId === selection.targetId);
-            const job = presentation.evolutionJobs?.find((candidate) => candidate.targetId === selection.targetId);
-            const produced = (job?.artifactIds.length ?? 0) > 0;
-            const state = error ? "failed" : job?.state ?? (produced ? "completed" : "pending");
-            return <span key={selection.targetId} className={error ? "failed" : produced ? "produced" : "pending"} title={error?.message ?? `${selection.method} · ${state}`}>
-              {selection.targetId.replaceAll("_", " ")} · {selection.method} · {state}
-            </span>;
-          })}</div> : <p>No document evolution was selected for this session.</p>}
+          {presentation?.selectedEvolution?.length ? (
+            <EvolutionJobStatusCollectionV2
+              selections={presentation.selectedEvolution}
+              jobs={presentation.evolutionJobs ?? []}
+              errors={presentation.evolutionErrors ?? []}
+              busy={busy}
+              onRetry={onRetryEvolutionJob}
+            />
+          ) : <p>No Evolution method was selected for this Session.</p>}
         </div>
         <EvolutionResultCollection
           artifacts={producedArtifacts}
@@ -1508,6 +1520,92 @@ function SessionResultInspectorV2({
 
 function ResultCollection({ title, empty, artifacts, onOpen }: { readonly title: string; readonly empty: string; readonly artifacts: DesktopProductSnapshotV2["artifacts"]; readonly onOpen: (artifactId: string) => void }) {
   return <div className="v2-result-section"><div className="v2-result-section-head"><span className="panel-kicker">{title}</span><strong>{artifacts.length}</strong></div>{artifacts.length ? <div className="v2-result-artifacts">{artifacts.map((artifact) => <button type="button" key={artifact.artifact_id} onClick={() => onOpen(artifact.artifact_id)}><span className="v2-artifact-type">{artifactTypeLabel(artifact.artifact_type)}</span><span><strong>{artifact.artifact_id}</strong><small>{formatBytes(artifact.byte_size)}</small></span><ArrowRight size={14} /></button>)}</div> : <p className="v2-empty-copy">{empty}</p>}</div>;
+}
+
+function evolutionAttemptStageLabelV2(stage: string): string {
+  return ({
+    input_resolution: "Resolving fixed inputs",
+    method_execution: "Running Evolution method",
+    output_validation: "Validating method outputs",
+    artifact_persistence: "Saving produced artifacts",
+    completed: "Published for the next Session",
+    failed: "Evolution attempt failed",
+  } as Record<string, string>)[stage] ?? stage.replaceAll("_", " ");
+}
+
+function EvolutionJobStatusCollectionV2({
+  selections,
+  jobs,
+  errors,
+  busy,
+  onRetry,
+}: {
+  readonly selections: NonNullable<NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"][string]["selectedEvolution"]>;
+  readonly jobs: NonNullable<NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"][string]["evolutionJobs"]>;
+  readonly errors: NonNullable<NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"][string]["evolutionErrors"]>;
+  readonly busy: boolean;
+  readonly onRetry: (jobId: string) => void;
+}) {
+  return (
+    <div className="v2-evolution-job-list">
+      {selections.map((selection) => {
+        const job = jobs.find((candidate) => candidate.targetId === selection.targetId);
+        const latestAttempt = job?.attempts.at(-1);
+        const persistedError = errors.find((candidate) => candidate.targetId === selection.targetId);
+        const errorMessage = latestAttempt?.errorMessage ?? job?.error ?? persistedError?.message ?? null;
+        const state = job?.state ?? "queued";
+        const running = state === "queued" || state === "running";
+        return (
+          <article className={`v2-evolution-job ${state}`} key={selection.targetId}>
+            <header>
+              <div className="v2-evolution-job-title">
+                <span className={`v2-evolution-job-state ${state}`} aria-hidden="true">
+                  {running ? <LoaderCircle className="spin" size={16} /> : state === "completed" ? <CheckCircle2 size={16} /> : <AlertCircle size={16} />}
+                </span>
+                <div>
+                  <strong>{selection.targetId.replaceAll("_", " ")}</strong>
+                  <small>{job?.requestedMethodId ?? selection.method}</small>
+                </div>
+              </div>
+              <span className={`state-pill ${state}`}>{state}</span>
+            </header>
+            <div className="v2-evolution-job-progress">
+              <span>{latestAttempt ? `Attempt ${latestAttempt.ordinal}` : "Waiting for job admission"}</span>
+              <strong>{latestAttempt ? evolutionAttemptStageLabelV2(latestAttempt.stage) : "Pending"}</strong>
+            </div>
+            {errorMessage ? (
+              <div className="v2-evolution-job-error" role="alert">
+                <strong>{latestAttempt?.errorCode ?? "evolution_failed"}</strong>
+                <p>{errorMessage}</p>
+              </div>
+            ) : null}
+            {job ? (
+              <details className="v2-evolution-attempt-details" open={state === "failed"}>
+                <summary>Attempt history and logs</summary>
+                <div className="v2-evolution-attempt-list">
+                  {job.attempts.map((attempt) => (
+                    <section key={attempt.attemptId}>
+                      <div><strong>Attempt {attempt.ordinal}</strong><span className={`state-pill ${attempt.state}`}>{attempt.state}</span></div>
+                      <small>{evolutionAttemptStageLabelV2(attempt.stage)} · {formatTimeV2(attempt.updatedAt)}</small>
+                      {attempt.logs.length ? <ol>{attempt.logs.map((message, index) => <li key={`${attempt.attemptId}-log-${index}`}>{message}</li>)}</ol> : <p>No attempt log was recorded.</p>}
+                    </section>
+                  ))}
+                  <p className="v2-evolution-fixed-inputs">Retry uses the same Session transcript, prior datasets, previous artifact, method, and config. It does not rerun the Agent.</p>
+                </div>
+              </details>
+            ) : null}
+            {state === "failed" && job ? (
+              <div className="v2-evolution-job-actions">
+                <button type="button" className="secondary-button" disabled={busy} onClick={() => onRetry(job.jobId)}>
+                  <RefreshCw size={14} /> Retry this method
+                </button>
+              </div>
+            ) : null}
+          </article>
+        );
+      })}
+    </div>
+  );
 }
 
 function EvolutionResultCollection({

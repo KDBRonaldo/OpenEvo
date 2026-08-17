@@ -528,6 +528,17 @@ Desktop provider refreshes the persisted remote state while a Session is
 terminal status survive renderer refreshes. A running Session can be cancelled
 through `POST /openevo-dev-agent/v1/sessions/<id>/cancel`.
 
+Every selected Evolution method owns a durable Job plus ordered Attempts. Each
+Attempt records its current stage, bounded diagnostic log, typed error code,
+error message, timestamps, and produced artifact IDs. A failed method can be
+retried independently through
+`POST /openevo-dev-agent/v1/evolution-jobs/<job-id>/retry`. The retry reuses the
+original Session transcript dataset, ordered history dataset IDs, previous
+target artifact, resolved concrete method, and normalized method config; it
+does not rerun the Agent or silently adopt newer Project settings. Desktop
+polls while that Attempt is active and exposes both failure details and the
+complete Attempt history in the Session's Evolution section.
+
 Harness mechanics are isolated behind `HarnessAdapter`. The first concrete
 implementation is `CodexHarnessAdapter`, which owns runtime preparation,
 memory instruction injection, native skill and agent-system staging, runtime

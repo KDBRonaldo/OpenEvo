@@ -83,10 +83,29 @@ export interface RuntimePresentationV2 {
       readonly jobId: string;
       readonly targetId: string;
       readonly methodId: string;
+      readonly requestedMethodId: string;
+      readonly resolverInputArtifactIds: readonly string[];
+      readonly previousArtifactId: string | null;
       readonly config: Readonly<Record<string, unknown>>;
       readonly state: "queued" | "running" | "completed" | "failed";
       readonly artifactIds: readonly string[];
       readonly error: string | null;
+      readonly attempts: readonly {
+        readonly attemptId: string;
+        readonly ordinal: number;
+        readonly state: "queued" | "running" | "completed" | "failed" | "cancelled";
+        readonly stage: string;
+        readonly artifactIds: readonly string[];
+        readonly errorCode: string | null;
+        readonly errorMessage: string | null;
+        readonly logs: readonly string[];
+        readonly createdAt: string;
+        readonly startedAt: string | null;
+        readonly completedAt: string | null;
+        readonly updatedAt: string;
+      }[];
+      readonly createdAt: string;
+      readonly updatedAt: string;
     }[];
     readonly usedArtifactIds: readonly string[];
     readonly producedArtifactIds: readonly string[];
@@ -186,6 +205,7 @@ export interface DesktopProductProviderV2 {
   submitTask(projectId: string, intent: ProductMutationIntentV2): Promise<TaskV2>;
   cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
+  retryEvolutionJob?(jobId: string, intent: ProductMutationIntentV2): Promise<void>;
   loadTaskLogs(taskId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;
@@ -254,6 +274,7 @@ export const unavailableDesktopProductProviderV2: DesktopProductProviderV2 = {
   submitTask: unavailable,
   cancelTask: unavailable,
   retryTask: unavailable,
+  retryEvolutionJob: unavailable,
   loadTaskLogs: unavailable,
   getProjectHead: unavailable,
   getEvolutionRevision: unavailable,

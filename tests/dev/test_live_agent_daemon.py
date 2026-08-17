@@ -758,6 +758,91 @@ def test_document_evolution_runner_allows_a_session_with_no_selected_method(
     ]
 
 
+def test_failed_evolution_method_can_retry_with_fixed_inputs_without_rerunning_agent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from openevo.evolution import methods
+
+    invocations = 0
+
+    def generate(*_args: object, **_kwargs: object) -> str:
+        nonlocal invocations
+        invocations += 1
+        if invocations == 1:
+            raise RuntimeError("temporary reflector failure")
+        return "# Memory\n\n- Reuse the recovered Evolution result.\n"
+
+    monkeypatch.setattr(methods, "_generate_reflector_markdown", generate)
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project = {
+        "project_id": "development-project-retry",
+        "display_name": "Retry evolution",
+        "config": {
+            "schema_version": "2",
+            "evolution": {
+                "targets": {
+                    "text_memory": {
+                        "enabled": True,
+                        "method": "text_memory_reflector",
+                        "config": {},
+                    },
+                },
+            },
+        },
+    }
+    store.create_project(project)
+    request = {
+        "project_id": project["project_id"],
+        "project_name": project["display_name"],
+        "task_title": "Retain the transcript",
+        "instruction": "Learn this reusable lesson.",
+    }
+    result = {
+        "response": "Agent ran exactly once.",
+        "model": "test",
+        "duration_ms": 1,
+        "logs": [],
+    }
+    session_id = "dev-session-retry"
+    store.start_session(session_id, request)
+    store.complete_session(session_id, result)
+    runner = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    )
+
+    first = runner.evolve(
+        session_id=session_id,
+        request=request,
+        result=result,
+        store=store,
+    )
+    assert first["artifacts"] == []
+    assert first["errors"][0]["message"] == "temporary reflector failure"
+    failed_job = store.snapshot()["evolution_jobs"][0]
+    assert failed_job["state"] == "failed"
+    assert failed_job["attempts"][0]["stage"] == "method_execution"
+    assert failed_job["attempts"][0]["error_code"] == "method_execution_failed"
+
+    retry_job, retry_attempt = store.start_evolution_retry(failed_job["job_id"])
+    retried_artifacts = runner.retry(job=retry_job, attempt=retry_attempt, store=store)
+
+    assert invocations == 2
+    assert len(retried_artifacts) == 1
+    completed_job = store.get_evolution_job(failed_job["job_id"])
+    assert completed_job["state"] == "completed"
+    assert [attempt["state"] for attempt in completed_job["attempts"]] == [
+        "failed",
+        "completed",
+    ]
+    assert completed_job["attempts"][1]["ordinal"] == 2
+    assert completed_job["resolver_input_artifact_ids"] == []
+    assert len(store.dataset_artifacts(project["project_id"])) == 1
+
+
 def test_development_runner_resolves_auto_and_supplies_ordered_project_history(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

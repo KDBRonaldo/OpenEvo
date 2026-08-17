@@ -61,6 +61,7 @@ describe("development agent provider", () => {
     const projects: Record<string, unknown>[] = [];
     const sessions: Record<string, unknown>[] = [];
     const artifacts: Record<string, unknown>[] = [];
+    const evolutionJobs: Record<string, unknown>[] = [];
     const workspaces: Record<string, unknown>[] = [];
     let activeProjectId: string | null = null;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -73,7 +74,7 @@ describe("development agent provider", () => {
           projects,
           sessions,
           artifacts,
-          evolution_jobs: [],
+          evolution_jobs: evolutionJobs,
           workspaces,
         });
       }
@@ -137,6 +138,36 @@ describe("development agent provider", () => {
           created_at: "2026-08-14T10:01:02Z",
         };
         artifacts.push(evolved);
+        evolutionJobs.push({
+          job_id: "job-text-memory-dev-session-1",
+          session_id: "dev-session-1",
+          target_id: "text_memory",
+          method_id: "text_memory_reflector",
+          requested_method_id: "text_memory_reflector",
+          resolver_input_artifact_ids: [],
+          previous_artifact_id: null,
+          config: {},
+          state: "failed",
+          artifact_ids: [],
+          error: "temporary reflector failure",
+          attempts: [{
+            attempt_id: "job-text-memory-dev-session-1-attempt-1",
+            job_id: "job-text-memory-dev-session-1",
+            ordinal: 1,
+            state: "failed",
+            stage: "method_execution",
+            artifact_ids: [],
+            error_code: "method_execution_failed",
+            error_message: "temporary reflector failure",
+            logs: ["Running text_memory_reflector.", "Evolution attempt failed."],
+            created_at: "2026-08-14T10:01:01Z",
+            started_at: "2026-08-14T10:01:01Z",
+            completed_at: "2026-08-14T10:01:02Z",
+            updated_at: "2026-08-14T10:01:02Z",
+          }],
+          created_at: "2026-08-14T10:01:01Z",
+          updated_at: "2026-08-14T10:01:02Z",
+        });
         sessions.push({
           session_id: "dev-session-1",
           project_id: body!.project_id,
@@ -162,6 +193,33 @@ describe("development agent provider", () => {
           state: "running",
           status_url: "/openevo-dev-agent/v1/sessions/dev-session-1",
         }, 202);
+      }
+      if (url.endsWith("/evolution-jobs/job-text-memory-dev-session-1/retry") && init?.method === "POST") {
+        Object.assign(evolutionJobs[0]!, {
+          state: "completed",
+          artifact_ids: ["dev-text-memory-1"],
+          error: null,
+          attempts: [
+            ...(evolutionJobs[0]!.attempts as Record<string, unknown>[]),
+            {
+              attempt_id: "job-text-memory-dev-session-1-attempt-2",
+              job_id: "job-text-memory-dev-session-1",
+              ordinal: 2,
+              state: "completed",
+              stage: "completed",
+              artifact_ids: ["dev-text-memory-1"],
+              error_code: null,
+              error_message: null,
+              logs: ["Retry admitted with the original fixed inputs.", "Evolution attempt completed and published its outputs."],
+              created_at: "2026-08-14T10:02:00Z",
+              started_at: "2026-08-14T10:02:00Z",
+              completed_at: "2026-08-14T10:02:01Z",
+              updated_at: "2026-08-14T10:02:01Z",
+            },
+          ],
+          updated_at: "2026-08-14T10:02:01Z",
+        });
+        return jsonResponse({ schema_version: "1", job: evolutionJobs[0] }, 202);
       }
       throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
     });
@@ -212,6 +270,21 @@ describe("development agent provider", () => {
     expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.selectedEvolution).toEqual([
       { targetId: "text_memory", method: "text_memory_reflector", config: {} },
     ]);
+    expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionJobs?.[0]).toMatchObject({
+      jobId: "job-text-memory-dev-session-1",
+      state: "failed",
+      attempts: [{ ordinal: 1, stage: "method_execution", errorCode: "method_execution_failed" }],
+    });
+    await provider.retryEvolutionJob?.("job-text-memory-dev-session-1", {
+      actionId: "retry-text-memory",
+      streamEpoch: completed.snapshot.stream.epoch,
+    });
+    const retried = await provider.refresh();
+    if (retried.status !== "fresh") throw new Error("retried provider was not fresh");
+    expect(retried.snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionJobs?.[0]).toMatchObject({
+      state: "completed",
+      attempts: [{ ordinal: 1, state: "failed" }, { ordinal: 2, state: "completed" }],
+    });
     expect(completed.snapshot.artifacts.map((artifact) => artifact.artifact_id)).toEqual(["dev-text-memory-1"]);
     expect(completed.snapshot.runtimePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({
