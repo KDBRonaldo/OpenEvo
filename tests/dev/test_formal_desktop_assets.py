@@ -116,3 +116,5 @@ def test_formal_entrypoint_does_not_launch_the_development_daemon() -> None:
     assert "live_agent_daemon.py" not in source
     assert "live_agent_daemon.py" not in launcher
     assert "desktop.server.launcher" in launcher
+    assert '"TAURI_CONFIG"' in launcher
+    assert '{"bundle": {"externalBin": []}}' in launcher

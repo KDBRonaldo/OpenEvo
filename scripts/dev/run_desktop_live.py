@@ -220,6 +220,15 @@ def main() -> int:
                 sidecar_args, separators=(",", ":")
             ),
             "OPENEVO_DESKTOP_SIDECAR_WORKDIR": os.fspath(REPOSITORY_ROOT),
+            # Source development launches the sidecar through the explicit
+            # program/args contract above.  The release-only externalBin
+            # entries are not built into src-tauri/binaries for this path and
+            # must not make `tauri dev` validate packaged bundle inputs.
+            "TAURI_CONFIG": json.dumps(
+                {"bundle": {"externalBin": []}},
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
         }
     )
     print("Starting the real OpenEvo Desktop provider (fixtures disabled).")
