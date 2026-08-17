@@ -15,6 +15,12 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from typing import NoReturn
+
+from formal_desktop_assets import (
+    FormalDevelopmentAssetError,
+    prepare_formal_development_assets,
+)
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -45,10 +51,35 @@ def _parser() -> argparse.ArgumentParser:
         default=Path(configured_helper) if configured_helper else None,
         help="Path to the locally built openevo-ssh-askpass executable.",
     )
+    parser.add_argument(
+        "--prepare",
+        action="store_true",
+        help="Build and cache the current commit's formal Daemon/Desktop assets.",
+    )
+    parser.add_argument(
+        "--managed-runtime-archive",
+        type=Path,
+        default=(
+            Path(os.environ["OPENEVO_DEV_MANAGED_RUNTIME_ARCHIVE"])
+            if os.environ.get("OPENEVO_DEV_MANAGED_RUNTIME_ARCHIVE")
+            else None
+        ),
+        help="Optional verified managed-runtime archive; otherwise the pinned release is downloaded once.",
+    )
+    parser.add_argument(
+        "--cache-root",
+        type=Path,
+        default=(
+            Path(os.environ["OPENEVO_DEV_FORMAL_CACHE"])
+            if os.environ.get("OPENEVO_DEV_FORMAL_CACHE")
+            else Path.home() / ".cache/openevo/formal-desktop"
+        ),
+        help="Private cache used by --prepare.",
+    )
     return parser
 
 
-def _fail(message: str) -> "NoReturn":
+def _fail(message: str) -> NoReturn:
     raise SystemExit(f"OpenEvo live development is not ready: {message}")
 
 
@@ -101,10 +132,53 @@ def _helper_identity(path: Path) -> tuple[str, int]:
     return hashlib.sha256(payload).hexdigest(), len(payload)
 
 
+def _checkout_identity() -> str:
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+        source_commit = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=REPOSITORY_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        _fail(f"the Git checkout identity is unavailable ({exc})")
+    if status:
+        _fail("commit or stash local changes before building the formal Daemon")
+    if (
+        len(source_commit) != 40
+        or any(character not in "0123456789abcdef" for character in source_commit)
+    ):
+        _fail("the Git checkout does not have one full source commit")
+    return source_commit
+
+
 def main() -> int:
     if platform.system() not in {"Linux", "Darwin"}:
         _fail("the native sidecar requires Linux/WSL or macOS; Windows is unsupported")
     args = _parser().parse_args()
+    checkout_commit = _checkout_identity()
+    if args.prepare:
+        if args.release_assets_root is not None or args.askpass_helper is not None:
+            _fail("--prepare cannot be combined with prebuilt release assets or askpass helper")
+        try:
+            prepared = prepare_formal_development_assets(
+                repository_root=REPOSITORY_ROOT,
+                source_commit=checkout_commit,
+                cache_root=args.cache_root,
+                managed_runtime_archive=args.managed_runtime_archive,
+            )
+        except FormalDevelopmentAssetError as exc:
+            _fail(str(exc))
+        args.release_assets_root = prepared.release_assets_root
+        args.askpass_helper = prepared.askpass_helper
     if args.release_assets_root is None:
         _fail("set OPENEVO_DEV_RELEASE_ASSETS_ROOT or pass --release-assets-root")
     if args.askpass_helper is None:
@@ -118,6 +192,8 @@ def main() -> int:
     if assets_root.name != "openevo-release-assets" or not assets_root.is_dir():
         _fail("release assets root must be the staged openevo-release-assets directory")
     source_commit = _read_asset_source_commit(assets_root)
+    if source_commit != checkout_commit:
+        _fail("release assets do not match the current Git commit")
     helper_sha256, helper_size = _helper_identity(helper)
 
     sidecar_args = [

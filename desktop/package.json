@@ -8,6 +8,7 @@
     "dev:agent": "vite --mode openevo-live-agent --open /product-preview.html",
     "dev:agent:remote": "python3 ../scripts/dev/run_remote_agent_development.py",
     "dev:live": "uv run python ../scripts/dev/run_desktop_live.py",
+    "dev:formal": "uv run python ../scripts/dev/run_desktop_live.py --prepare",
     "dev:openevo": "vite --mode openevo-desktop",
     "build": "vite build",
     "build:openevo": "vite build --mode openevo-desktop && node scripts/package-openevo-product.mjs",

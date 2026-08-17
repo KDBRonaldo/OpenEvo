@@ -92,6 +92,17 @@ The fixed Vite origins are admitted only when the sidecar reports the
 `development` build channel. Release and test compositions retain the closed
 Tauri-only origin set. There is no visual-fixture or sample-data launch command.
 
+The first formal-Daemon migration entrypoint is `npm run dev:formal`. It builds
+the exact current-commit Core wheel and Linux Daemon bundle, downloads and
+verifies the pinned managed runtime once, builds the native askpass helper, and
+then delegates to `dev:live`. Generated inputs are cached by full Git commit
+under `~/.cache/openevo/formal-desktop`; the command refuses a dirty checkout or
+assets from another commit. This path uses the authenticated Desktop `/desktop/v2`
+sidecar and tunneled Daemon `/v2` APIs. It never starts
+`scripts/dev/live_agent_daemon.py`. The existing `dev:agent:remote` command is
+retained temporarily for development-only features that have not yet moved to
+the immutable formal workspace and artifact contracts.
+
 For the narrower "ask the remote Codex and evolve selected documents" loop, use
 `npm run dev:agent`. This mode bypasses the sealed release lifecycle, but obtains
 its target, method, support, schema, and renderer metadata from the Core framework
