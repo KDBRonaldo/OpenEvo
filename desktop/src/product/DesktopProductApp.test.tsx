@@ -700,6 +700,24 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
+  it("restores a listed alias after an empty manual alias", async () => {
+    const provider = providerFixture(baseSnapshot());
+    root = await render(provider);
+    await click("Add remote workspace");
+    await click("Use another SSH alias");
+    setInput("SSH host alias", "");
+    await click("Choose a listed SSH alias");
+
+    const save = button("Save and connect") as HTMLButtonElement;
+    expect(save.disabled).toBe(false);
+    await click("Save and connect");
+    expect(provider.createProfile).toHaveBeenCalledWith(
+      "Research server",
+      "gpu-lab",
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
   it("offers explicit rebind for retained Preview profiles", async () => {
     const legacy = {
       schema_version: "2",

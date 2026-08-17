@@ -708,6 +708,12 @@ function RemoteWorkspaceSetupV2({
   const [manualAlias, setManualAlias] = useState(selectableHosts.length === 0);
   const dialogRef = useDialogBoundary(onClose);
 
+  useEffect(() => {
+    if (manualAlias || selectableHosts.length === 0) return;
+    if (selectableHosts.some((host) => host.ssh_host_alias === alias)) return;
+    setAlias(selectableHosts[0]!.ssh_host_alias);
+  }, [alias, manualAlias, selectableHosts]);
+
   const mutate = async (operation: () => Promise<unknown>, close = false): Promise<void> => {
     onBusy(true);
     onClearError();
@@ -768,7 +774,15 @@ function RemoteWorkspaceSetupV2({
             ) : (
               <label>SSH host alias<select value={alias} onChange={(event) => setAlias(event.target.value)}>{selectableHosts.map((host) => <option key={host.ssh_host_alias} value={host.ssh_host_alias}>{host.ssh_host_alias}{host.availability === "manual_entry_only" ? " — manual check required" : ""}</option>)}</select></label>
             )}
-            <button type="button" className="text-button v2-manual-alias" onClick={() => setManualAlias((current) => !current)}>{manualAlias ? "Choose a listed SSH alias" : "Use another SSH alias"}</button>
+            <button type="button" className="text-button v2-manual-alias" onClick={() => {
+              setManualAlias((current) => {
+                const next = !current;
+                if (!next && !selectableHosts.some((host) => host.ssh_host_alias === alias)) {
+                  setAlias(selectableHosts[0]?.ssh_host_alias ?? "");
+                }
+                return next;
+              });
+            }}>{manualAlias ? "Choose a listed SSH alias" : "Use another SSH alias"}</button>
           </section>
 
           {snapshot.profiles.length > 0 ? (
