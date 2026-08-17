@@ -2114,11 +2114,37 @@ class DesktopCoreBridgeV2:
                     action="install_repair_daemon",
                     affected_resource_id=affected_resource_id,
                 )
-            self._observe_project_create_services(
+            services = self._observe_project_create_services(
                 client,
                 observed_sequences,
                 observed_cursors,
             )
+            unavailable = (
+                []
+                if services is None
+                else [
+                    service.service_id
+                    for service in services.items
+                    if service.status == "unavailable"
+                ]
+            )
+            if unavailable:
+                if self._output_observer is not None:
+                    names = ", ".join(unavailable)
+                    self._output_observer(
+                        "daemon_stderr",
+                        (
+                            "[desktop] Required remote services are unavailable: "
+                            f"{names}.\n"
+                        ).encode("utf-8"),
+                    )
+                raise _bridge_error(
+                    "core_project_services_unavailable",
+                    "The remote services required to create this project are unavailable.",
+                    status=503,
+                    action="install_repair_daemon",
+                    affected_resource_id=affected_resource_id,
+                )
             remaining = _remaining(deadline)
             time.sleep(min(_PROJECT_CREATE_PROGRESS_POLL_SECONDS, remaining))
             project = self._call_core(client.get_project, affected_resource_id)
@@ -2128,11 +2154,11 @@ class DesktopCoreBridgeV2:
         bootstrap: CoreControlClientV2 | CoreProjectBootstrapClientV2,
         observed_sequences: dict[str, int],
         observed_cursors: dict[str, str],
-    ) -> None:
-        if self._output_observer is None and self._progress_observer is None:
-            return
+    ) -> core_v2.ServicePageV2 | None:
         try:
             services = bootstrap.list_services(limit=100)
+            if self._output_observer is None and self._progress_observer is None:
+                return services
             for service in services.items:
                 after: str | None = observed_cursors.get(service.service_id)
                 pages = 0
@@ -2154,6 +2180,7 @@ class DesktopCoreBridgeV2:
                         break
                     after = page.next_cursor
                     observed_cursors[service.service_id] = after
+            return services
         except (CoreClientErrorV2, CoreMutationOutcomeUnknownV2):
             return
 

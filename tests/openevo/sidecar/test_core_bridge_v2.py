@@ -868,6 +868,81 @@ def test_project_create_log_polling_resumes_after_the_bounded_page_window(
         bridge.close()
 
 
+def test_activation_fails_promptly_when_required_project_services_are_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "desktop.sidecar.core_bridge_v2._PROJECT_CREATE_PROGRESS_POLL_SECONDS",
+        0.001,
+    )
+    pending = _not_ready_scratch_project()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/version":
+            return httpx.Response(200, json=_version())
+        if request.url.path == "/v2/system/status":
+            return httpx.Response(200, json=_status())
+        if request.url.path == "/v2/projects" and request.method == "POST":
+            return httpx.Response(201, json=pending.model_dump(mode="json"))
+        if request.url.path == "/v2/services":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "2",
+                    "items": [
+                        {
+                            "schema_version": "2",
+                            "service_id": "evolution-worker",
+                            "kind": "worker",
+                            "status": "unavailable",
+                            "updated_at": "2026-07-23T06:00:00Z",
+                            "etag": '"' + "1" * 64 + '"',
+                        }
+                    ],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+        if request.url.path == "/v2/services/evolution-worker/logs":
+            return httpx.Response(
+                200,
+                json={
+                    "schema_version": "2",
+                    "items": [],
+                    "next_cursor": None,
+                    "has_more": False,
+                },
+            )
+        raise AssertionError(
+            f"unexpected Core request: {request.method} {request.url.path}"
+        )
+
+    output: list[tuple[str, bytes]] = []
+    with _store(tmp_path) as store:
+        bridge = DesktopCoreBridgeV2(
+            host_service=_HostService(),
+            tunnel_factory=_TunnelFactory(),
+            persistence=store,
+            transport_factory=lambda: httpx.MockTransport(handler),
+            output_observer=lambda source, chunk: output.append((source, chunk)),
+        )
+
+        with pytest.raises(DesktopCoreBridgeErrorV2) as captured:
+            bridge.activate_project(
+                "desktop-project-1",
+                _create_request(),
+                idempotency_key="activate-project-unavailable-services-0001",
+            )
+
+        assert captured.value.error.code == "core_project_services_unavailable"
+        assert output[-1] == (
+            "daemon_stderr",
+            b"[desktop] Required remote services are unavailable: evolution-worker.\n",
+        )
+        bridge.close()
+
+
 def test_activation_accepts_exact_initial_native_workspace_authority(
     tmp_path: Path,
 ) -> None:

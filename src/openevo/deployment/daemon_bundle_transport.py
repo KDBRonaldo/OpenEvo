@@ -411,8 +411,15 @@ def build_daemon_bundle_ensure_command(
     expected_predecessor.__post_init__()
     executable = shlex.quote(bundle._executable_path)
     manifest_path = shlex.quote(f"{bundle._service_root}/bundle-{canonical_manifest_sha256}")
+    # ``service ensure`` launches the long-lived Daemon.  Non-interactive SSH
+    # sessions commonly omit the remote account's user-local bin directory,
+    # even though subscription harnesses such as Codex install there.  Give
+    # the Daemon one small, deterministic executable search path instead of
+    # inheriting an interactive shell profile that may not be loaded at all.
+    daemon_path = 'PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"'
     command = (
-        f"{executable} service ensure --port {port} --deadline-seconds {deadline_seconds:.6f}"
+        f"{daemon_path} {executable} service ensure --port {port}"
+        f" --deadline-seconds {deadline_seconds:.6f}"
         f" --expected-bundle-sha256 {bundle.sha256}"
         f" --expected-canonical-manifest-sha256 {canonical_manifest_sha256}"
         f" --canonical-manifest-path {manifest_path}"

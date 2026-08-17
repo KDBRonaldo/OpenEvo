@@ -1075,6 +1075,10 @@ def test_ssh_ensure_returns_existing_remote_attachment_model(tmp_path: Path) -> 
     assert status.bundle_sha256 == digest
     assert len(commands) == 3
     assert " service observe " in commands[0]
+    assert (
+        '\nPATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" '
+        in commands[2]
+    )
     assert " service ensure --port 0 " in commands[2]
     assert " --expect-service-absent" in commands[2]
     assert "openevo.backend.service" not in commands[2]
