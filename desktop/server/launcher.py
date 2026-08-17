@@ -27,6 +27,10 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, Validation
 from starlette.concurrency import run_in_threadpool
 
 from desktop.server.app import create_desktop_app
+from desktop.server.browser_host import (
+    ManagedOpenSshHome,
+    install_browser_host_routes,
+)
 from desktop.sidecar.release_app import (
     create_packaged_release_desktop_local_api_v2_app,
 )
@@ -288,6 +292,9 @@ def create_app(
     packaged_askpass_helper_path: Path | str | None = None,
     packaged_askpass_helper_sha256: str | None = None,
     packaged_askpass_helper_byte_size: int | None = None,
+    openssh_home: Path | str | None = None,
+    browser_endpoint: str | None = None,
+    browser_bootstrap_token: str | None = None,
 ) -> FastAPI:
     _validate_source_commit(source_commit, build_channel=build_channel)
     owned_apps: list[FastAPI] = []
@@ -303,6 +310,9 @@ def create_app(
             packaged_askpass_helper_path=packaged_askpass_helper_path,
             packaged_askpass_helper_sha256=packaged_askpass_helper_sha256,
             packaged_askpass_helper_byte_size=packaged_askpass_helper_byte_size,
+            openssh_home=openssh_home,
+            browser_endpoint=browser_endpoint,
+            browser_bootstrap_token=browser_bootstrap_token,
             owned_apps=owned_apps,
         )
     except PackagedLauncherStartupError:
@@ -335,6 +345,9 @@ def _create_app(
     packaged_askpass_helper_path: Path | str | None = None,
     packaged_askpass_helper_sha256: str | None = None,
     packaged_askpass_helper_byte_size: int | None = None,
+    openssh_home: Path | str | None = None,
+    browser_endpoint: str | None = None,
+    browser_bootstrap_token: str | None = None,
     owned_apps: list[FastAPI],
 ) -> FastAPI:
     startup_phase = "bundled_core_assets"
@@ -348,6 +361,8 @@ def _create_app(
     state_root = resolve_desktop_state_root(desktop_config_root)
     askpass_helper: AskpassHelperAuthority | None = None
     host_trust: SystemOpenSshHostTrust | None = None
+    managed_ssh_home: ManagedOpenSshHome | None = None
+    home = os.environ.get("HOME")
     try:
         if build_channel == "release" and release_assets_root is None and core_assets_root is None:
             raise ValueError("release assets root must be provided by the native host")
@@ -371,7 +386,9 @@ def _create_app(
                 expected_sha256=packaged_askpass_helper_sha256,
                 expected_byte_size=packaged_askpass_helper_byte_size,
             )
-            home = os.environ.get("HOME")
+            if openssh_home is not None:
+                managed_ssh_home = ManagedOpenSshHome(openssh_home)
+                home = os.fspath(managed_ssh_home.root)
             if home is None:
                 raise ValueError("system OpenSSH HOME is unavailable")
             host_trust = SystemOpenSshHostTrust(
@@ -391,6 +408,8 @@ def _create_app(
             release_assets_root=release_assets_root,
             system_ssh_askpass_helper=askpass_helper,
             system_ssh_host_trust=host_trust,
+            home=home,
+            inherited_environment=os.environ,
             startup_phase=record_startup_phase if build_channel == "release" else None,
             close_on_shutdown=build_channel != "release",
         )
@@ -573,6 +592,38 @@ def _create_app(
         except (WorkspaceImportError, OSError):
             return _native_workspace_error(status_code=409)
         return Response(status_code=204)
+
+    if (browser_endpoint is None) != (browser_bootstrap_token is None):
+        raise ValueError("browser endpoint and bootstrap token must be provided together")
+    if browser_endpoint is not None and browser_bootstrap_token is not None:
+        if managed_ssh_home is None:
+            raise ValueError("browser hosting requires a managed OpenSSH home")
+        version = app.state.desktop_release_provider._version({})
+        version_document = version.model_dump(mode="json")
+        negotiated_contract = {
+            "schema_version": "2",
+            "major": version_document["preferred_major"],
+            "mutation_major": version_document["mutation_major"],
+            "openapi_sha256": version_document["openapi_sha256"],
+            "event_schema_sha256": version_document["event_schema_sha256"],
+            "release_version": version_document["release_version"],
+            "build_id": version_document["build_id"],
+            "source_commit": version_document["source_commit"],
+            "build_channel": version_document["build_channel"],
+            "provider_kind": version_document["provider_kind"],
+            "feature_flags": version_document["feature_flags"],
+            "feature_set_sha256": version_document["feature_set_sha256"],
+            "required_core_api_major": version_document["required_core_api_major"],
+            "mutation_compatible": version_document["mutation_compatible"],
+        }
+        install_browser_host_routes(
+            app,
+            endpoint=browser_endpoint,
+            bootstrap_token=browser_bootstrap_token,
+            session_token=native_frame.session_token,
+            negotiated_contract=negotiated_contract,
+            managed_ssh_home=managed_ssh_home,
+        )
 
     try:
         if build_channel == "release":

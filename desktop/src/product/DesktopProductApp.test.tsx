@@ -631,6 +631,8 @@ describe("Desktop v2 product renderer", () => {
 
   beforeEach(() => {
     document.body.innerHTML = '<div id="root"></div>';
+    window.sessionStorage.clear();
+    window.history.replaceState(null, "", window.location.pathname);
     (
       globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
     ).IS_REACT_ACT_ENVIRONMENT = true;
@@ -641,6 +643,28 @@ describe("Desktop v2 product renderer", () => {
     root = null;
     vi.useRealTimers();
     document.body.innerHTML = "";
+    window.sessionStorage.clear();
+    window.history.replaceState(null, "", window.location.pathname);
+  });
+
+  it("shows direct server details when opened by the localhost browser host", async () => {
+    window.history.replaceState(
+      null,
+      "",
+      `${window.location.pathname}#browser-bootstrap=${"a1".repeat(32)}`,
+    );
+    root = await render(providerFixture(baseSnapshot()));
+
+    await click("Add remote workspace");
+
+    expect(dialog()?.textContent).toContain("Server connection");
+    const fieldLabels = [...(dialog()?.querySelectorAll("label") ?? [])]
+      .map((label) => label.textContent ?? "")
+      .join(" ");
+    expect(fieldLabels).toMatch(/server address/i);
+    expect(fieldLabels).toMatch(/ssh port/i);
+    expect(fieldLabels).toMatch(/username/i);
+    expect(fieldLabels).not.toMatch(/private key|password/i);
   });
 
   it("opens configured-host setup immediately and never renders manual connection fields", async () => {

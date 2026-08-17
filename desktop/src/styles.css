@@ -3220,6 +3220,38 @@ pre.json {
   gap: 14px;
 }
 
+.v2-connection-mode {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-soft);
+}
+
+.v2-connection-mode button {
+  min-height: 36px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.v2-connection-mode button.active {
+  color: var(--accent);
+  background: var(--surface);
+  box-shadow: 0 1px 4px rgb(16 48 42 / 10%);
+  font-weight: 700;
+}
+
+.v2-host-fields {
+  display: grid;
+  grid-template-columns: minmax(110px, 0.7fr) minmax(180px, 1.3fr);
+  gap: 12px;
+}
+
 .v2-section-heading h3,
 .v2-section-heading p {
   margin: 0;

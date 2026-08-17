@@ -59,6 +59,10 @@ import {
   type DesktopProductSnapshotV2,
   type ProductMutationIntentV2,
 } from "./providerV2";
+import {
+  isBrowserHostedReleaseRuntime,
+  registerBrowserSshHost,
+} from "./releaseProvider";
 
 type Workspace = "research" | "evolution" | "system";
 
@@ -703,9 +707,16 @@ function RemoteWorkspaceSetupV2({
   readonly onConnected: () => void;
 }) {
   const selectableHosts = snapshot.catalog.hosts.filter((host) => host.availability !== "unsupported");
+  const browserHosted = isBrowserHostedReleaseRuntime();
   const [alias, setAlias] = useState(selectableHosts[0]?.ssh_host_alias ?? "");
   const [displayName, setDisplayName] = useState("Research server");
-  const [manualAlias, setManualAlias] = useState(selectableHosts.length === 0);
+  const [manualAlias, setManualAlias] = useState(!browserHosted && selectableHosts.length === 0);
+  const [connectionMode, setConnectionMode] = useState<"server" | "alias">(
+    browserHosted ? "server" : "alias",
+  );
+  const [host, setHost] = useState("");
+  const [port, setPort] = useState("22");
+  const [username, setUsername] = useState("");
   const dialogRef = useDialogBoundary(onClose);
 
   useEffect(() => {
@@ -730,14 +741,31 @@ function RemoteWorkspaceSetupV2({
   };
 
   const saveAndConnect = async (): Promise<void> => {
-    if (alias.trim() === "" || displayName.trim() === "") return;
+    if (displayName.trim() === "") return;
     onBusy(true);
     onClearError();
     try {
+      let selectedAlias = alias.trim();
+      let authoritySnapshot = snapshot;
+      if (connectionMode === "server") {
+        const parsedPort = Number(port);
+        if (host.trim() === "" || username.trim() === "" || !Number.isInteger(parsedPort)) return;
+        selectedAlias = await registerBrowserSshHost({
+          host: host.trim(),
+          port: parsedPort,
+          username: username.trim(),
+        });
+        setAlias(selectedAlias);
+        await provider.rescanSshHosts(intentFor(snapshot, "rescan-browser-host"));
+        const rescanned = await onRefresh();
+        if (rescanned === null) throw new Error("The registered SSH server could not be reloaded.");
+        authoritySnapshot = rescanned;
+      }
+      if (selectedAlias === "") return;
       const created = await provider.createProfile(
         displayName.trim(),
-        alias.trim(),
-        intentFor(snapshot, "create-profile"),
+        selectedAlias,
+        intentFor(authoritySnapshot, "create-profile"),
       );
       const refreshed = await onRefresh();
       if (refreshed === null) throw new Error("The new profile could not be reloaded.");
@@ -758,13 +786,32 @@ function RemoteWorkspaceSetupV2({
     }}>
       <aside ref={dialogRef} className="settings-drawer v2-remote-drawer" role="dialog" aria-modal="true" aria-labelledby="v2-remote-title" tabIndex={-1}>
         <div className="drawer-head">
-          <div><span className="panel-kicker">Remote workspace</span><h2 id="v2-remote-title">Configured SSH host</h2></div>
+          <div><span className="panel-kicker">Remote workspace</span><h2 id="v2-remote-title">Connect a server</h2></div>
           <button className="icon-button" type="button" aria-label="Close remote workspace setup" onClick={onClose} disabled={busy}><X size={18} /></button>
         </div>
         <div className="drawer-content">
           {error ? <Notice tone="error" title="Connection action failed" detail={error} onDismiss={onClearError} /> : null}
           <section className="form-section">
-            <div className="v2-section-heading"><div><h3>Use your OpenSSH configuration</h3><p>Desktop invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for routing, user, identities, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
+            {browserHosted ? (
+              <div className="v2-connection-mode" role="group" aria-label="SSH connection input">
+                <button type="button" className={connectionMode === "server" ? "active" : ""} onClick={() => setConnectionMode("server")}>Server details</button>
+                <button type="button" className={connectionMode === "alias" ? "active" : ""} onClick={() => setConnectionMode("alias")}>OpenSSH alias</button>
+              </div>
+            ) : null}
+            {connectionMode === "server" ? (
+              <>
+                <div className="v2-section-heading"><div><h3>Server connection</h3><p>Enter the same server, port, and user you would pass to <code>ssh</code>. Authentication stays with system OpenSSH, ssh-agent, macOS Keychain, or the native password/passphrase prompt.</p></div></div>
+                <label>Workspace name<input maxLength={256} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
+                <label>Server address<input autoFocus maxLength={253} value={host} placeholder="gpu.example.edu" onChange={(event) => setHost(event.target.value)} /></label>
+                <div className="v2-host-fields">
+                  <label>SSH port<input inputMode="numeric" min={1} max={65535} value={port} onChange={(event) => setPort(event.target.value)} /></label>
+                  <label>Username<input maxLength={64} value={username} placeholder="researcher" onChange={(event) => setUsername(event.target.value)} /></label>
+                </div>
+                <div className="v2-catalog-warning" role="status"><ShieldCheck size={16} /><span>Passwords and private-key contents are never stored in the browser. OpenEvo asks the local Sidecar to run system SSH and deploy the formal Daemon.</span></div>
+              </>
+            ) : (
+              <>
+            <div className="v2-section-heading"><div><h3>Configured SSH host</h3><p>Desktop invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for routing, user, identities, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
             {snapshot.catalog.warnings.length > 0 ? (
               <div className="v2-catalog-warning" role="status"><AlertCircle size={16} /><span><strong>Some configured hosts cannot be listed.</strong> You can still enter their literal SSH alias below.</span></div>
             ) : null}
@@ -783,6 +830,8 @@ function RemoteWorkspaceSetupV2({
                 return next;
               });
             }}>{manualAlias ? "Choose a listed SSH alias" : "Use another SSH alias"}</button>
+              </>
+            )}
           </section>
 
           {snapshot.profiles.length > 0 ? (
@@ -806,7 +855,7 @@ function RemoteWorkspaceSetupV2({
         </div>
         <div className="drawer-footer">
           <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button>
-          <button type="button" className="primary-button" disabled={busy || alias.trim() === "" || displayName.trim() === ""} onClick={() => void saveAndConnect()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Server size={15} />} Save and connect</button>
+          <button type="button" className="primary-button" disabled={busy || displayName.trim() === "" || (connectionMode === "alias" ? alias.trim() === "" : host.trim() === "" || username.trim() === "" || !Number.isInteger(Number(port)) || Number(port) < 1 || Number(port) > 65535)} onClick={() => void saveAndConnect()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Server size={15} />} Save and connect</button>
         </div>
       </aside>
     </div>

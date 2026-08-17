@@ -1,7 +1,8 @@
 """Launch the real Desktop provider against sealed Daemon/runtime assets.
 
-This is a source-development launcher. It keeps the normal Tauri -> local
-sidecar -> system OpenSSH -> remote Daemon boundary and never enables fixtures.
+This is a source-development launcher. It keeps the normal local Sidecar ->
+system OpenSSH -> remote Daemon boundary and can host the renderer in either
+Tauri or the system browser. It never enables fixtures.
 """
 
 from __future__ import annotations
@@ -55,6 +56,11 @@ def _parser() -> argparse.ArgumentParser:
         "--prepare",
         action="store_true",
         help="Build and cache the current commit's formal Daemon/Desktop assets.",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="Host the formal Desktop UI on localhost and open the system browser instead of Tauri.",
     )
     parser.add_argument(
         "--managed-runtime-archive",
@@ -195,6 +201,41 @@ def main() -> int:
     if source_commit != checkout_commit:
         _fail("release assets do not match the current Git commit")
     helper_sha256, helper_size = _helper_identity(helper)
+
+    if args.browser:
+        print("Building the browser-hosted OpenEvo renderer.")
+        built = subprocess.run(
+            ["npm", "run", "build", "--", "--mode", "openevo-desktop"],
+            cwd=DESKTOP_ROOT,
+            check=False,
+        )
+        if built.returncode != 0:
+            return built.returncode
+        print("Starting the real OpenEvo Sidecar in the system browser (fixtures disabled).")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "desktop.server.browser_launcher",
+                "--static-root",
+                os.fspath(DESKTOP_ROOT / "dist"),
+                "--source-commit",
+                source_commit,
+                "--build-channel",
+                "development",
+                "--release-assets-root",
+                os.fspath(assets_root),
+                "--ssh-askpass-helper-path",
+                os.fspath(helper),
+                "--ssh-askpass-helper-sha256",
+                helper_sha256,
+                "--ssh-askpass-helper-byte-size",
+                str(helper_size),
+            ],
+            cwd=REPOSITORY_ROOT,
+            check=False,
+        )
+        return completed.returncode
 
     sidecar_args = [
         "-m",

@@ -99,6 +99,12 @@ export interface ReleaseProviderFactoryDependenciesV2 {
 
 const SIDECAR_BOOTSTRAP_POLL_INTERVAL_MS = 100;
 const SIDECAR_BOOTSTRAP_TIMEOUT_MS = 70_000;
+const BROWSER_BOOTSTRAP_STORAGE_KEY = "openevo.desktop.browser.bootstrap.v2";
+const BROWSER_MUTATION_JOURNAL_KEY = "openevo.desktop.browser.mutation-journal.v2";
+const browserSshHostResponseSchema = z.object({
+  schema_version: z.literal("2"),
+  ssh_host_alias: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/),
+}).strict();
 
 type NativeBeginOutcome =
   | { readonly status: "fulfilled" }
@@ -166,15 +172,145 @@ const tauriNativeBridge: ReleaseNativeBridgeV2 = {
   ),
 };
 
+export function isBrowserHostedReleaseRuntime(): boolean {
+  if (typeof window === "undefined") return false;
+  if (new URLSearchParams(window.location.hash.replace(/^#/, "")).has("browser-bootstrap")) {
+    return true;
+  }
+  try {
+    return window.sessionStorage.getItem(BROWSER_BOOTSTRAP_STORAGE_KEY) !== null;
+  } catch {
+    return false;
+  }
+}
+
+function readStoredBrowserBootstrap(): DesktopBootstrapContextV2 | null {
+  let encoded: string | null;
+  try {
+    encoded = window.sessionStorage.getItem(BROWSER_BOOTSTRAP_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+  if (encoded === null) return null;
+  try {
+    return JSON.parse(encoded) as DesktopBootstrapContextV2;
+  } catch {
+    try {
+      window.sessionStorage.removeItem(BROWSER_BOOTSTRAP_STORAGE_KEY);
+    } catch {
+      // An unavailable storage area is handled by the normal bootstrap path.
+    }
+    return null;
+  }
+}
+
+async function bootstrapBrowserSidecar(): Promise<DesktopBootstrapContextV2> {
+  const stored = readStoredBrowserBootstrap();
+  if (stored !== null) return stored;
+  const parameters = new URLSearchParams(window.location.hash.replace(/^#/, ""));
+  const bootstrapToken = parameters.get("browser-bootstrap");
+  if (bootstrapToken === null || !/^[0-9a-f]{64}$/.test(bootstrapToken)) {
+    throw new DesktopContractErrorV2(
+      "OpenEvo must be opened by its local browser host before it can connect to a server",
+    );
+  }
+  const response = await window.fetch("/openevo-native/browser/bootstrap", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ schema_version: "2", bootstrap_token: bootstrapToken }),
+    cache: "no-store",
+    credentials: "omit",
+    referrerPolicy: "no-referrer",
+  });
+  if (!response.ok) {
+    throw new DesktopContractErrorV2("OpenEvo could not establish its protected local browser session");
+  }
+  const context = await response.json() as DesktopBootstrapContextV2;
+  try {
+    window.sessionStorage.setItem(BROWSER_BOOTSTRAP_STORAGE_KEY, JSON.stringify(context));
+  } catch {
+    throw new DesktopContractErrorV2("OpenEvo could not retain its protected browser session");
+  }
+  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  return context;
+}
+
+const browserNativeBridge: ReleaseNativeBridgeV2 = {
+  bootstrap: bootstrapBrowserSidecar,
+  stop: async () => {},
+  selectProjectSource: async () => {
+    throw new DesktopContractErrorV2(
+      "Native folder selection is unavailable in the browser host; upload files into the project workspace instead",
+    );
+  },
+  cancelProjectSource: async () => {},
+  settleProjectSource: async () => {},
+  readMutationIntentJournalV2: async () => window.localStorage.getItem(BROWSER_MUTATION_JOURNAL_KEY),
+  compareAndSwapMutationIntentJournalV2: async (expectedValue, newValue) => {
+    const current = window.localStorage.getItem(BROWSER_MUTATION_JOURNAL_KEY);
+    if (current !== expectedValue) {
+      throw new DesktopContractErrorV2("The browser mutation journal changed concurrently");
+    }
+    if (newValue === null) window.localStorage.removeItem(BROWSER_MUTATION_JOURNAL_KEY);
+    else window.localStorage.setItem(BROWSER_MUTATION_JOURNAL_KEY, newValue);
+  },
+};
+
+function defaultNativeBridge(): ReleaseNativeBridgeV2 {
+  return isBrowserHostedReleaseRuntime() ? browserNativeBridge : tauriNativeBridge;
+}
+
+export async function registerBrowserSshHost(input: {
+  readonly host: string;
+  readonly port: number;
+  readonly username: string;
+}): Promise<string> {
+  if (!isBrowserHostedReleaseRuntime()) {
+    throw new DesktopContractErrorV2("Direct SSH server entry is available in the browser-hosted Desktop");
+  }
+  const bootstrap = validateDesktopBootstrapContextV2(
+    await bootstrapBrowserSidecar(),
+    DESKTOP_PRODUCT_RELEASE_CONTRACT,
+  );
+  const response = await window.fetch(`${bootstrap.endpoint}/openevo-native/browser/ssh-hosts`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-OpenEvo-Desktop-Session": bootstrap.session_token,
+    },
+    body: JSON.stringify({ schema_version: "2", ...input }),
+    cache: "no-store",
+    credentials: "omit",
+  });
+  if (!response.ok) {
+    throw new DesktopContractErrorV2("OpenEvo could not prepare the SSH server details");
+  }
+  return browserSshHostResponseSchema.parse(await response.json()).ssh_host_alias;
+}
+
 export async function stopReleaseDesktopProductProvider(): Promise<void> {
-  await tauriNativeBridge.stop();
+  await defaultNativeBridge().stop();
 }
 
 export async function getReleaseDesktopStartupStatus(): Promise<NativeStartupStatusV2> {
+  if (isBrowserHostedReleaseRuntime()) {
+    return nativeStartupStatusV2Schema.parse({
+      schema_version: "2",
+      startup_epoch: 1,
+      status: "succeeded",
+      phase: "ready",
+      phase_index: 5,
+      phase_total: 6,
+      elapsed_milliseconds: 0,
+      cancellable: false,
+      failure: null,
+    });
+  }
   return nativeStartupStatusV2Schema.parse(await invoke("sidecar_startup_status"));
 }
 
 export async function reportReleaseDesktopReady(): Promise<void> {
+  if (isBrowserHostedReleaseRuntime()) return;
   await invoke("renderer_ready", {
     openapiSha256: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedOpenApiDigests[0],
     eventSchemaSha256: DESKTOP_PRODUCT_RELEASE_CONTRACT.acceptedEventSchemaDigests[0],
@@ -183,6 +319,7 @@ export async function reportReleaseDesktopReady(): Promise<void> {
 }
 
 export function reportReleaseDesktopBootstrapStage(stage: ReleaseDesktopBootstrapStage): void {
+  if (isBrowserHostedReleaseRuntime()) return;
   try {
     void invoke("renderer_bootstrap_stage", { stage }).catch(() => {});
   } catch {
@@ -193,7 +330,7 @@ export function reportReleaseDesktopBootstrapStage(stage: ReleaseDesktopBootstra
 export async function createReleaseDesktopProductProvider(
   dependencies: ReleaseProviderFactoryDependenciesV2 = {},
 ): Promise<DesktopProductProviderV2> {
-  const native = dependencies.native ?? tauriNativeBridge;
+  const native = dependencies.native ?? defaultNativeBridge();
   const reportStage = dependencies.reportStage ?? reportReleaseDesktopBootstrapStage;
   let bootstrap: DesktopBootstrapContextV2;
   try {
