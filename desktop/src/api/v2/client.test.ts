@@ -121,6 +121,21 @@ describe("Desktop Local API v2 client", () => {
     }, contract)).toThrow(/event schema/i);
   });
 
+  it("accepts the authoritative development sidecar in source development", () => {
+    const development = bootstrap();
+    development.negotiated_contract.build_channel = "development";
+
+    expect(validateDesktopBootstrapContextV2(development, contract).negotiated_contract.build_channel)
+      .toBe("development");
+  });
+
+  it("never accepts a test-channel simulator as product authority", () => {
+    const simulator = bootstrap();
+    simulator.negotiated_contract.build_channel = "test";
+
+    expect(() => validateDesktopBootstrapContextV2(simulator, contract)).toThrow(/build channel/i);
+  });
+
   it("uses only /desktop/v2 and injects session plus generation mutation authority", async () => {
     const catalog = {
       schema_version: "2",

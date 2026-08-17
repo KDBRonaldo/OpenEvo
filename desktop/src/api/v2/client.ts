@@ -295,8 +295,8 @@ export function validateDesktopBootstrapContextV2(
   if (negotiated.release_version !== contract.releaseVersion) {
     throw new DesktopContractErrorV2("Native bootstrap reported another release version");
   }
-  if (negotiated.build_channel !== "release") {
-    throw new DesktopContractErrorV2("Native bootstrap did not report a release build");
+  if (!desktopBuildChannelIsAllowed(negotiated.build_channel)) {
+    throw new DesktopContractErrorV2("Native bootstrap did not report an allowed build channel");
   }
   if (!negotiated.mutation_compatible) {
     throw new DesktopContractErrorV2("Native bootstrap did not negotiate Desktop v2 mutations");
@@ -318,7 +318,7 @@ export function negotiateDesktopVersionV2(
   if (!contract.acceptedEventSchemaDigests.includes(version.event_schema_sha256)) {
     throw new DesktopContractErrorV2("Desktop Local API reported an unknown event schema digest");
   }
-  if (version.release_version !== contract.releaseVersion || version.build_channel !== "release") {
+  if (version.release_version !== contract.releaseVersion || !desktopBuildChannelIsAllowed(version.build_channel)) {
     throw new DesktopContractErrorV2("Desktop Local API reported another release identity");
   }
   if (!version.mutation_compatible) {
@@ -348,6 +348,10 @@ export function negotiateDesktopVersionV2(
     throw new DesktopContractErrorV2("Native bootstrap and Desktop Local API disagree on feature flags");
   }
   return version;
+}
+
+function desktopBuildChannelIsAllowed(buildChannel: string): boolean {
+  return buildChannel === "release" || (import.meta.env.DEV && buildChannel === "development");
 }
 
 export function createDesktopApiClientV2(options: DesktopClientOptionsV2): DesktopApiClientV2 {

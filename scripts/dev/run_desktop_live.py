@@ -215,7 +215,10 @@ def main() -> int:
     environment = os.environ.copy()
     environment.update(
         {
-            "OPENEVO_DESKTOP_SIDECAR_PROGRAM": os.fspath(Path(sys.executable).resolve()),
+            # Keep the virtual-environment entry point intact. Resolving this
+            # symlink escapes .venv and launches the bare base interpreter,
+            # which cannot import the installed Desktop dependencies.
+            "OPENEVO_DESKTOP_SIDECAR_PROGRAM": os.path.abspath(sys.executable),
             "OPENEVO_DESKTOP_SIDECAR_ARGS_JSON": json.dumps(
                 sidecar_args, separators=(",", ":")
             ),

@@ -900,7 +900,10 @@ class DesktopReleaseProviderV2:
             feature_flags=features,
             feature_set_sha256=_digest(features),
             required_core_api_major=2,
-            mutation_compatible=self._build_channel == "release",
+            # Source development runs the same authoritative v2 provider and
+            # mutation surface as a packaged release. The test channel stays
+            # read-only/fail-closed so a simulator cannot impersonate it.
+            mutation_compatible=self._build_channel in {"release", "development"},
         )
 
     def _health(self, arguments: Mapping[str, object]) -> local_v2.DesktopHealthV2:

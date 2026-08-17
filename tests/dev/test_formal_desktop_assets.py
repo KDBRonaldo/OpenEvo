@@ -118,3 +118,5 @@ def test_formal_entrypoint_does_not_launch_the_development_daemon() -> None:
     assert "desktop.server.launcher" in launcher
     assert '"TAURI_CONFIG"' in launcher
     assert '{"bundle": {"externalBin": []}}' in launcher
+    assert "os.path.abspath(sys.executable)" in launcher
+    assert "Path(sys.executable).resolve()" not in launcher

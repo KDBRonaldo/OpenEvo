@@ -309,6 +309,7 @@ class _BridgeActivation:
 def _provider(
     tmp_path: Path,
     *,
+    build_channel: str = "release",
     max_lifecycle_log_entries: int | None = None,
     event_broker: DesktopEventBrokerV2 | None = None,
     own_resources: bool = False,
@@ -335,7 +336,7 @@ def _provider(
         event_broker=event_broker or DesktopEventBrokerV2(clock=lambda: NOW),
         build_version="0.1.10",
         source_commit=SOURCE_COMMIT,
-        build_channel="release",
+        build_channel=build_channel,
         instance_id="instance-v2",
         clock=lambda: NOW,
         own_resources=own_resources,
@@ -777,7 +778,10 @@ def test_release_v2_cors_admits_the_exact_renderer_headers_outside_error_boundar
 def test_development_v2_cors_admits_only_the_fixed_vite_origins(
     tmp_path: Path,
 ) -> None:
-    provider, store, _lifecycle, _connector = _provider(tmp_path)
+    provider, store, _lifecycle, _connector = _provider(
+        tmp_path,
+        build_channel="development",
+    )
     app = create_release_desktop_local_api_v2_app(
         session_token=SESSION,
         provider=provider,
@@ -786,6 +790,11 @@ def test_development_v2_cors_admits_only_the_fixed_vite_origins(
     )
     client = TestClient(app)
     try:
+        version = client.get("/version")
+        assert version.status_code == 200
+        assert version.json()["build_channel"] == "development"
+        assert version.json()["mutation_compatible"] is True
+
         for origin in ("http://localhost:5173", "http://127.0.0.1:5173"):
             response = client.get("/health", headers={"Origin": origin})
             assert response.status_code == 200, response.text

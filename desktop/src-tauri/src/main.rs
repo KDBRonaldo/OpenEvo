@@ -4191,7 +4191,7 @@ fn read_validated_sidecar_version(port: u16) -> HostResult<VersionInfoV2> {
         || !(7..=40).contains(&version.source_commit.len())
         || !version.source_commit.bytes().all(is_lower_hex)
         || version.source_commit.bytes().all(|byte| byte == b'0')
-        || version.build_channel != "release"
+        || !sidecar_build_channel_is_allowed(&version.build_channel)
         || version.provider_kind != "desktop_sidecar"
         || version.feature_flags != REQUIRED_DESKTOP_FEATURE_FLAGS
         || version.feature_set_sha256 != DESKTOP_FEATURE_SET_SHA256
@@ -4201,6 +4201,11 @@ fn read_validated_sidecar_version(port: u16) -> HostResult<VersionInfoV2> {
         return Err(sidecar_contract_incompatible_error());
     }
     Ok(version)
+}
+
+fn sidecar_build_channel_is_allowed(build_channel: &str) -> bool {
+    build_channel == "release"
+        || (cfg!(debug_assertions) && build_channel == "development")
 }
 
 fn retain_sidecar_release_identity(
@@ -5987,6 +5992,12 @@ fn host_status_inner_with<C: ProcessControl>(
     if managed.lifecycle == ManagedLifecycle::CleanupPending {
         return Ok(managed.host_status());
     }
+    // The startup worker exclusively owns inspection and cleanup until the
+    // sidecar reaches Running. Renderer bootstrap polling must not reap a
+    // just-spawned child and mask its actual startup error.
+    if managed.lifecycle == ManagedLifecycle::Starting {
+        return Ok(managed.host_status());
+    }
     if managed.child.is_none() {
         return Ok(managed.host_status());
     }
@@ -6546,7 +6557,7 @@ fn negotiated_contract_matches_renderer(
         && contract.openapi_sha256 == openapi_sha256
         && contract.event_schema_sha256 == event_schema_sha256
         && contract.release_version == release_version
-        && contract.build_channel == "release"
+        && sidecar_build_channel_is_allowed(&contract.build_channel)
         && contract.provider_kind == "desktop_sidecar"
         && contract.feature_flags == REQUIRED_DESKTOP_FEATURE_FLAGS
         && contract.feature_set_sha256 == DESKTOP_FEATURE_SET_SHA256
@@ -10175,6 +10186,35 @@ mod tests {
         assert!(requests.contains(&format!("GET {LEGACY_DESKTOP_SHELL_ROUTE} HTTP/1.1")));
         assert!(requests.contains(&format!("GET {LEGACY_DESKTOP_V1_STATE_ROUTE} HTTP/1.1")));
         assert!(!requests.contains(&"7c".repeat(SESSION_TOKEN_BYTES)));
+    }
+
+    #[test]
+    fn bootstrap_polling_does_not_reap_a_starting_sidecar() {
+        let state = DesktopHostState::default();
+        let (mut managed, _, _) = managed_test_sidecar();
+        managed.lifecycle = ManagedLifecycle::Starting;
+        managed.status.state = "starting".to_string();
+        *state.sidecar.lock().unwrap() = Some(managed);
+
+        let status = host_status_inner_with(
+            &state,
+            &ScriptedProcessControl::wait_failure(),
+        )
+        .unwrap();
+
+        assert_eq!(status.state, "starting");
+        assert!(state.sidecar.lock().unwrap().is_some());
+    }
+
+    #[test]
+    fn build_channel_policy_keeps_test_simulators_fail_closed() {
+        assert!(sidecar_build_channel_is_allowed("release"));
+        assert_eq!(
+            sidecar_build_channel_is_allowed("development"),
+            cfg!(debug_assertions)
+        );
+        assert!(!sidecar_build_channel_is_allowed("test"));
+        assert!(!sidecar_build_channel_is_allowed("unknown"));
     }
 
     #[test]
