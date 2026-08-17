@@ -170,6 +170,64 @@ describe("lifecycle operation controller v2", () => {
     }))).toThrow(/regressed/i);
   });
 
+  it("discards a delayed refresh response after a newer concurrent observation", async () => {
+    let resolveRefresh!: (operation: LifecycleOperationV2) => void;
+    const transport = {
+      getLifecycleOperation: vi.fn(() => new Promise<LifecycleOperationV2>((resolve) => {
+        resolveRefresh = resolve;
+      })),
+      lifecycleOperationLogs: vi.fn(),
+      cancelLifecycleOperation: vi.fn(),
+    };
+    const controller = new LifecycleOperationControllerV2(transport);
+    controller.observe(lifecycle());
+
+    const pending = controller.refresh("lifecycle-connect-1");
+    const newest = lifecycle({
+      phase: "remote_preflight",
+      phase_index: 5,
+      updated_at: "2026-07-27T08:00:02Z",
+      etag: `"${"d".repeat(64)}"`,
+    });
+    controller.observe(newest);
+    resolveRefresh(lifecycle({
+      phase: "transferring",
+      phase_index: 4,
+      updated_at: LATER,
+      etag: OTHER_ETAG,
+    }));
+
+    await expect(pending).resolves.toEqual(newest);
+    expect(controller.get("lifecycle-connect-1")?.operation).toEqual(newest);
+  });
+
+  it("does not overwrite newer operation authority when a log request finishes late", async () => {
+    let resolveLogs!: (page: LifecycleLogPageV2) => void;
+    const transport = {
+      getLifecycleOperation: vi.fn(),
+      lifecycleOperationLogs: vi.fn(() => new Promise<LifecycleLogPageV2>((resolve) => {
+        resolveLogs = resolve;
+      })),
+      cancelLifecycleOperation: vi.fn(),
+    };
+    const controller = new LifecycleOperationControllerV2(transport);
+    controller.observe(lifecycle({ log_sequence_high_watermark: 1 }));
+
+    const pending = controller.loadLogs("lifecycle-connect-1");
+    const newest = lifecycle({
+      phase: "remote_preflight",
+      phase_index: 5,
+      log_sequence_high_watermark: 2,
+      updated_at: LATER,
+      etag: OTHER_ETAG,
+    });
+    controller.observe(newest);
+    resolveLogs(logPage("lifecycle-connect-1", 1, 1, null));
+
+    await expect(pending).resolves.toMatchObject({ operation: newest });
+    expect(controller.get("lifecycle-connect-1")?.operation).toEqual(newest);
+  });
+
   it("polls with bounded exponential delays and resets after authoritative progress", async () => {
     const observations = [
       lifecycle(),

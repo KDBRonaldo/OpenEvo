@@ -105,9 +105,26 @@ export class LifecycleOperationControllerV2 {
   }
 
   async refresh(operationId: string): Promise<LifecycleOperationV2> {
+    const observedAtDispatch = this.states.get(operationId)?.operation;
     const operation = await this.transport.getLifecycleOperation(operationId);
     if (operation.operation_id !== operationId) {
       throw new LifecycleOperationContractErrorV2("Lifecycle lookup returned another operation");
+    }
+    if (observedAtDispatch !== undefined) {
+      assertLifecycleOperationDoesNotRegressV2(observedAtDispatch, operation);
+    }
+    const current = this.states.get(operationId)?.operation;
+    if (current !== undefined
+      && observedAtDispatch !== undefined
+      && canonicalJsonV2(current) !== canonicalJsonV2(observedAtDispatch)
+      && canonicalJsonV2(current) !== canonicalJsonV2(operation)) {
+      try {
+        assertLifecycleOperationDoesNotRegressV2(operation, current);
+        return current;
+      } catch {
+        // The response may be newer than the concurrently observed state. In
+        // that case observe() performs the authoritative forward-only check.
+      }
     }
     return this.observe(operation);
   }
@@ -146,11 +163,16 @@ export class LifecycleOperationControllerV2 {
         ? await this.fetchAllLogPages(operationId)
         : await this.fetchRecentLogPages(current, mode);
     }
+    const latest = this.states.get(operationId);
+    if (latest === undefined) {
+      throw new LifecycleOperationContractErrorV2("Lifecycle logs reference an unobserved operation");
+    }
+    assertLifecycleOperationDoesNotRegressV2(current.operation, latest.operation);
     const bySequence = new Map<number, LifecycleLogEntryV2>();
     if (mode !== "older") {
-      for (const entry of current.logs) bySequence.set(entry.sequence, entry);
+      for (const entry of latest.logs) bySequence.set(entry.sequence, entry);
     }
-    let droppedBeforeSequence = current.droppedBeforeSequence;
+    let droppedBeforeSequence = latest.droppedBeforeSequence;
     for (const page of pages) {
       if (page.operation_id !== operationId) {
         throw new LifecycleOperationContractErrorV2("Lifecycle log page belongs to another operation");
@@ -167,34 +189,34 @@ export class LifecycleOperationControllerV2 {
     const retainedLogs = [...bySequence.values()]
       .sort((left, right) => left.sequence - right.sequence)
       .filter((entry) => entry.sequence > droppedBeforeSequence);
-    if (retainedLogs.some((entry) => entry.sequence > current.operation.log_sequence_high_watermark)) {
+    if (retainedLogs.some((entry) => entry.sequence > latest.operation.log_sequence_high_watermark)) {
       throw new LifecycleOperationContractErrorV2("Lifecycle logs exceed the observed operation watermark");
     }
     let logs: readonly LifecycleLogEntryV2[];
     if (mode === "older") {
-      const firstVisibleSequence = current.logs[0]?.sequence
-        ?? current.operation.log_sequence_high_watermark + 1;
+      const firstVisibleSequence = latest.logs[0]?.sequence
+        ?? latest.operation.log_sequence_high_watermark + 1;
       const older = retainedLogs.filter((entry) => entry.sequence < firstVisibleSequence).slice(-MAX_LOG_TAIL);
-      logs = older.length === 0 ? current.logs : older;
+      logs = older.length === 0 ? latest.logs : older;
     } else {
       logs = retainedLogs.slice(-MAX_LOG_TAIL);
     }
     const firstSequence = logs[0]?.sequence ?? null;
     const lastSequence = logs.at(-1)?.sequence ?? null;
     const next = Object.freeze({
-      operation: current.operation,
+      operation: latest.operation,
       logs: Object.freeze([...logs]),
       droppedBeforeSequence,
       hasOlderLogs: firstSequence !== null && firstSequence > droppedBeforeSequence + 1,
       hasNewerLogs: lastSequence === null
-        ? current.operation.log_sequence_high_watermark > droppedBeforeSequence
-        : lastSequence < current.operation.log_sequence_high_watermark,
+        ? latest.operation.log_sequence_high_watermark > droppedBeforeSequence
+        : lastSequence < latest.operation.log_sequence_high_watermark,
     });
-    if (canonicalJsonV2(current.logs) === canonicalJsonV2(next.logs)
-      && current.droppedBeforeSequence === next.droppedBeforeSequence
-      && current.hasOlderLogs === next.hasOlderLogs
-      && current.hasNewerLogs === next.hasNewerLogs) {
-      return current;
+    if (canonicalJsonV2(latest.logs) === canonicalJsonV2(next.logs)
+      && latest.droppedBeforeSequence === next.droppedBeforeSequence
+      && latest.hasOlderLogs === next.hasOlderLogs
+      && latest.hasNewerLogs === next.hasNewerLogs) {
+      return latest;
     }
     this.states.set(operationId, next);
     this.emit();
