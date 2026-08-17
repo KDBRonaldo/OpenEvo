@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import json
+import mimetypes
 import os
 from pathlib import Path
 import signal
@@ -18,6 +19,12 @@ import tempfile
 import threading
 import time
 from typing import Any, Protocol
+
+
+MAX_HARNESS_IMAGE_ATTACHMENTS = 8
+MAX_HARNESS_IMAGE_FILE_BYTES = 10 * 1024 * 1024
+MAX_HARNESS_IMAGE_BYTES = 32 * 1024 * 1024
+HARNESS_IMAGE_MEDIA_TYPES = {"image/gif", "image/jpeg", "image/png", "image/webp"}
 
 
 class HarnessRunError(RuntimeError):
@@ -259,6 +266,7 @@ class CodexHarnessAdapter:
         runtime_context: Mapping[str, Any],
         schema_path: Path,
         output_path: Path,
+        image_paths: list[Path] | None = None,
     ) -> list[str]:
         argv = [
             self._codex_binary,
@@ -278,10 +286,40 @@ class CodexHarnessAdapter:
             "--output-last-message",
             os.fspath(output_path),
         ]
+        for image_path in image_paths or []:
+            argv.extend(("--image", os.fspath(image_path)))
         if self._model:
             argv.extend(("--model", self._model))
         argv.append("-")
         return argv
+
+    @staticmethod
+    def _image_attachments(runtime_context: Mapping[str, Any]) -> list[Path]:
+        workspace_path = runtime_context.get("workspace_path")
+        if not isinstance(workspace_path, Path) or not workspace_path.is_dir():
+            return []
+        attachments: list[Path] = []
+        consumed = 0
+        for path in sorted(workspace_path.rglob("*")):
+            try:
+                relative = path.relative_to(workspace_path)
+                if relative.parts and relative.parts[0] in {".agents", ".openevo"}:
+                    continue
+                if path.is_symlink() or not path.is_file():
+                    continue
+                media_type = mimetypes.guess_type(path.name)[0]
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if media_type not in HARNESS_IMAGE_MEDIA_TYPES:
+                continue
+            if size > MAX_HARNESS_IMAGE_FILE_BYTES or consumed + size > MAX_HARNESS_IMAGE_BYTES:
+                continue
+            attachments.append(path)
+            consumed += size
+            if len(attachments) >= MAX_HARNESS_IMAGE_ATTACHMENTS:
+                break
+        return attachments
 
     def collect_transcript(
         self,
@@ -333,11 +371,14 @@ class CodexHarnessAdapter:
             self.install_skills(runtime_context)
             self.apply_agent_system(runtime_context)
             workspace_context = self._workspace_context(request.get("workspace_snapshot"))
+            image_paths = self._image_attachments(runtime_context)
             prompt = (
                 "You are planning changes for a persistent OpenEvo project workspace. "
                 "The trusted daemon, not you, applies file mutations after validating them. "
-                "Do not call shell, patch, or filesystem tools. Read the supplied workspace JSON, "
-                "solve the user's task, and return only the requested structured result. "
+                "Do not call shell, patch, or filesystem tools. The supplied workspace JSON is a "
+                "bounded index containing text and daemon-extracted document projections. Attached "
+                "workspace images are available as visual inputs. Solve the user's task and return "
+                "only the requested structured result. "
                 "Use relative POSIX paths. Put every complete UTF-8 text file that must be created or "
                 "changed in file_writes. Put only regular files that must be removed in delete_paths. "
                 "Do not include unchanged files and do not use absolute paths or '..'. "
@@ -375,6 +416,7 @@ class CodexHarnessAdapter:
                 runtime_context=runtime_context,
                 schema_path=schema_path,
                 output_path=output_path,
+                image_paths=image_paths,
             )
             environment = os.environ.copy()
             environment.update(runtime_context["environment"])

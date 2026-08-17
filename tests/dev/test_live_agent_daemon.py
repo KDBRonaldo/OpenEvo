@@ -9,6 +9,7 @@ import threading
 import time
 import urllib.request
 from urllib.parse import urlencode
+import zipfile
 
 import pytest
 
@@ -78,6 +79,60 @@ def test_extract_event_logs_ignores_agent_message_content() -> None:
     ]
 
 
+def test_workspace_snapshot_projects_bounded_pdf_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakePage:
+        def __init__(self, text: str) -> None:
+            self._text = text
+
+        def extract_text(self) -> str:
+            return self._text
+
+    class FakePdfReader:
+        def __init__(self, path: Path, *, strict: bool) -> None:
+            assert path.name == "paper.pdf"
+            assert strict is False
+            self.pages = [FakePage("A reusable result from the uploaded paper.")]
+
+    monkeypatch.setattr(MODULE, "PdfReader", FakePdfReader)
+    store = MODULE.ProjectWorkspaceStore(tmp_path / "workspaces")
+    project = store.ensure_project("project-1")
+    (project / "paper.pdf").write_bytes(b"%PDF-1.7\nfixture")
+
+    snapshot = store.snapshot("project-1")
+    entry = snapshot["entries"][0]
+
+    assert entry["path"] == "paper.pdf"
+    assert entry["media_type"] == "application/pdf"
+    assert entry["content"] == (
+        "[Text extracted from PDF: paper.pdf]\n"
+        "\n--- Page 1 ---\n"
+        "A reusable result from the uploaded paper.\n"
+    )
+
+
+def test_workspace_snapshot_projects_docx_text_and_zip_listing(tmp_path: Path) -> None:
+    store = MODULE.ProjectWorkspaceStore(tmp_path / "workspaces")
+    project = store.ensure_project("project-1")
+    with zipfile.ZipFile(project / "notes.docx", "w") as archive:
+        archive.writestr(
+            "word/document.xml",
+            """<?xml version="1.0" encoding="UTF-8"?>
+            <w:document xmlns:w="urn:test"><w:body><w:p>
+            <w:r><w:t>Uploaded Office document text.</w:t></w:r>
+            </w:p></w:body></w:document>""",
+        )
+    with zipfile.ZipFile(project / "sources.zip", "w") as archive:
+        archive.writestr("src/main.py", "print('hello')\n")
+
+    entries = {entry["path"]: entry for entry in store.snapshot("project-1")["entries"]}
+
+    assert "Uploaded Office document text." in entries["notes.docx"]["content"]
+    assert "src/main.py" in entries["sources.zip"]["content"]
+
+
 def test_codex_readiness_accepts_login_status_written_to_stderr(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         subprocess,
@@ -99,6 +154,7 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     captured: dict[str, object] = {}
     workspace = tmp_path / "workspace"
     workspace.mkdir()
+    (workspace / "reference.png").write_bytes(b"small image fixture")
 
     def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured["prompt"] = str(kwargs["input"])
@@ -178,6 +234,11 @@ def test_codex_runner_materializes_core_runtime_contributions_for_the_next_sessi
     assert "persistent OpenEvo project workspace" in captured["prompt"]
     assert "read-only" in captured["args"]
     assert "shell_tool" in captured["args"]
+    assert "--image" in captured["args"]
+    assert captured["args"][captured["args"].index("--image") + 1].endswith(
+        "/reference.png"
+    )
+    assert "daemon-extracted document projections" in captured["prompt"]
     assert "--ignore-rules" not in captured["args"]
     assert "--output-schema" in captured["args"]
     assert Path(captured["args"][captured["args"].index("--cd") + 1]) != workspace

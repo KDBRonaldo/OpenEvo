@@ -173,6 +173,11 @@ the matching `GET` endpoint. Paths are confined to the managed project root, res
 symlinked paths are rejected, uploads are limited to 32 MiB per file and 512 MiB per
 workspace, and downloads are limited to 64 MiB. Uploaded files are immediately visible in
 the Project files panel and become part of the next Session's persistent workspace.
+The daemon projects supported document formats into bounded text without giving Codex arbitrary
+host filesystem tools. Text-based PDFs, DOCX, PPTX, XLSX/XLSM, and safe ZIP listings are supported.
+PNG, JPEG, WebP, and GIF files are attached through the Codex image-input interface (up to 8 images,
+10 MiB each, and 32 MiB total). Image-only PDFs still require OCR. New document formats plug into
+the workspace projection layer without changing the Desktop or Session orchestration.
 
 The renderer has no development method table. It builds the optional multi-target
 Session picker from the returned capabilities, preserves the selected method and

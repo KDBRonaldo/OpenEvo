@@ -23,12 +23,16 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import zipfile
 from urllib.parse import parse_qs, quote, urlsplit
+from xml.etree import ElementTree
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Iterator
+
+from pypdf import PdfReader
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +54,12 @@ MAX_CAPTURE_BYTES = 2 * 1024 * 1024
 MAX_WORKSPACE_ENTRIES = 1_000
 MAX_WORKSPACE_TEXT_FILE_BYTES = 256 * 1024
 MAX_WORKSPACE_TEXT_BYTES = 2 * 1024 * 1024
+MAX_WORKSPACE_PDF_FILE_BYTES = 16 * 1024 * 1024
+MAX_WORKSPACE_PDF_PAGES = 200
+MAX_WORKSPACE_DOCUMENT_FILE_BYTES = 32 * 1024 * 1024
+MAX_WORKSPACE_ARCHIVE_ENTRIES = 2_000
+MAX_WORKSPACE_ARCHIVE_EXPANDED_BYTES = 64 * 1024 * 1024
+MAX_WORKSPACE_ARCHIVE_MEMBER_BYTES = 8 * 1024 * 1024
 MAX_WORKSPACE_MUTATIONS = 64
 MAX_WORKSPACE_WRITE_FILE_BYTES = 192 * 1024
 MAX_WORKSPACE_WRITE_BYTES = 256 * 1024
@@ -296,7 +306,41 @@ class ProjectWorkspaceStore:
                 content: str | None = None
                 digest: str | None = None
                 media_type = mimetypes.guess_type(child.name)[0] or "application/octet-stream"
-                if size <= MAX_WORKSPACE_TEXT_FILE_BYTES and size <= remaining_text_bytes:
+                suffix = Path(child.name).suffix.lower()
+                if (
+                    media_type == "application/pdf"
+                    and size <= MAX_WORKSPACE_PDF_FILE_BYTES
+                    and remaining_text_bytes > 0
+                ):
+                    content = self._extract_pdf_text(
+                        Path(child.path),
+                        min(MAX_WORKSPACE_TEXT_FILE_BYTES, remaining_text_bytes),
+                    )
+                    if content is not None:
+                        remaining_text_bytes -= len(content.encode("utf-8"))
+                elif (
+                    suffix in {".docx", ".pptx", ".xlsx", ".xlsm"}
+                    and size <= MAX_WORKSPACE_DOCUMENT_FILE_BYTES
+                    and remaining_text_bytes > 0
+                ):
+                    content = self._extract_ooxml_text(
+                        Path(child.path),
+                        min(MAX_WORKSPACE_TEXT_FILE_BYTES, remaining_text_bytes),
+                    )
+                    if content is not None:
+                        remaining_text_bytes -= len(content.encode("utf-8"))
+                elif (
+                    suffix in {".zip", ".whl"}
+                    and size <= MAX_WORKSPACE_DOCUMENT_FILE_BYTES
+                    and remaining_text_bytes > 0
+                ):
+                    content = self._extract_zip_listing(
+                        Path(child.path),
+                        min(MAX_WORKSPACE_TEXT_FILE_BYTES, remaining_text_bytes),
+                    )
+                    if content is not None:
+                        remaining_text_bytes -= len(content.encode("utf-8"))
+                elif size <= MAX_WORKSPACE_TEXT_FILE_BYTES and size <= remaining_text_bytes:
                     try:
                         payload = Path(child.path).read_bytes()
                         if len(payload) != size:
@@ -325,6 +369,258 @@ class ProjectWorkspaceStore:
             "entries": entries,
             "truncated": truncated,
         }
+
+    @staticmethod
+    def _extract_pdf_text(path: Path, byte_limit: int) -> str | None:
+        """Return a bounded text projection for a text-based PDF.
+
+        The original PDF remains the authoritative workspace file. This projection only lets
+        the read-only harness reason over its text without receiving host filesystem access.
+        """
+
+        if byte_limit <= 0:
+            return None
+        try:
+            reader = PdfReader(path, strict=False)
+        except Exception:
+            return None
+        chunks = [f"[Text extracted from PDF: {path.name}]\n"]
+        consumed = len(chunks[0].encode("utf-8"))
+        truncated = len(reader.pages) > MAX_WORKSPACE_PDF_PAGES
+        for page_number, page in enumerate(reader.pages[:MAX_WORKSPACE_PDF_PAGES], start=1):
+            try:
+                page_text = page.extract_text() or ""
+            except Exception:
+                continue
+            if not page_text.strip():
+                continue
+            section = f"\n--- Page {page_number} ---\n{page_text.strip()}\n"
+            encoded = section.encode("utf-8")
+            if consumed + len(encoded) > byte_limit:
+                available = max(0, byte_limit - consumed)
+                if available:
+                    chunks.append(encoded[:available].decode("utf-8", errors="ignore"))
+                truncated = True
+                break
+            chunks.append(section)
+            consumed += len(encoded)
+        if len(chunks) == 1:
+            return None
+        if truncated:
+            marker = "\n[PDF text projection truncated by OpenEvo.]\n"
+            encoded_marker = marker.encode("utf-8")
+            rendered = "".join(chunks)
+            rendered_bytes = rendered.encode("utf-8")
+            if len(encoded_marker) <= byte_limit:
+                rendered = (
+                    rendered_bytes[: byte_limit - len(encoded_marker)]
+                    .decode("utf-8", errors="ignore")
+                    + marker
+                )
+            return rendered
+        return "".join(chunks)
+
+    @staticmethod
+    def _bounded_projection(
+        header: str,
+        sections: list[str],
+        byte_limit: int,
+        *,
+        truncated: bool = False,
+    ) -> str | None:
+        if not sections or byte_limit <= 0:
+            return None
+        marker = "\n[Document projection truncated by OpenEvo.]\n"
+        rendered = header + "".join(sections)
+        encoded = rendered.encode("utf-8")
+        if len(encoded) <= byte_limit and not truncated:
+            return rendered
+        marker_bytes = marker.encode("utf-8")
+        if len(marker_bytes) >= byte_limit:
+            return encoded[:byte_limit].decode("utf-8", errors="ignore")
+        return (
+            encoded[: byte_limit - len(marker_bytes)].decode("utf-8", errors="ignore")
+            + marker
+        )
+
+    @staticmethod
+    def _safe_archive(path: Path) -> tuple[zipfile.ZipFile, list[zipfile.ZipInfo]]:
+        archive = zipfile.ZipFile(path)
+        infos = archive.infolist()
+        if len(infos) > MAX_WORKSPACE_ARCHIVE_ENTRIES:
+            archive.close()
+            raise ValueError("archive has too many entries")
+        expanded = 0
+        for info in infos:
+            if info.is_dir():
+                continue
+            expanded += info.file_size
+            if expanded > MAX_WORKSPACE_ARCHIVE_EXPANDED_BYTES:
+                archive.close()
+                raise ValueError("archive expands beyond the document budget")
+            if info.file_size > MAX_WORKSPACE_ARCHIVE_MEMBER_BYTES:
+                continue
+            if info.compress_size and info.file_size > info.compress_size * 200:
+                archive.close()
+                raise ValueError("archive member has an unsafe compression ratio")
+        return archive, infos
+
+    @classmethod
+    def _extract_ooxml_text(cls, path: Path, byte_limit: int) -> str | None:
+        """Project common Office Open XML formats into bounded plain text."""
+
+        try:
+            archive, infos = cls._safe_archive(path)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return None
+        suffix = path.suffix.lower()
+        sections: list[str] = []
+        truncated = False
+        try:
+            if suffix in {".xlsx", ".xlsm"}:
+                return cls._extract_spreadsheet_xml(
+                    path.name, archive, infos, byte_limit
+                )
+            names = [info.filename for info in infos if not info.is_dir()]
+            if suffix == ".docx":
+                selected = [
+                    name
+                    for name in names
+                    if name == "word/document.xml"
+                    or re.fullmatch(r"word/(?:header|footer)\d+\.xml", name)
+                    or name in {"word/footnotes.xml", "word/endnotes.xml"}
+                ]
+            else:
+                selected = [
+                    name for name in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)
+                ]
+                selected.sort(key=lambda value: int(re.search(r"(\d+)", value).group(1)))
+            info_by_name = {info.filename: info for info in infos}
+            for name in selected:
+                info = info_by_name[name]
+                if info.file_size > MAX_WORKSPACE_ARCHIVE_MEMBER_BYTES:
+                    truncated = True
+                    continue
+                try:
+                    root = ElementTree.fromstring(archive.read(info))
+                except (KeyError, OSError, ElementTree.ParseError):
+                    continue
+                values = [
+                    element.text.strip()
+                    for element in root.iter()
+                    if element.tag.rsplit("}", 1)[-1] == "t"
+                    and element.text
+                    and element.text.strip()
+                ]
+                if values:
+                    sections.append(f"\n--- {name} ---\n" + "\n".join(values) + "\n")
+        finally:
+            archive.close()
+        return cls._bounded_projection(
+            f"[Text extracted from {suffix[1:].upper()}: {path.name}]\n",
+            sections,
+            byte_limit,
+            truncated=truncated,
+        )
+
+    @classmethod
+    def _extract_spreadsheet_xml(
+        cls,
+        file_name: str,
+        archive: zipfile.ZipFile,
+        infos: list[zipfile.ZipInfo],
+        byte_limit: int,
+    ) -> str | None:
+        info_by_name = {info.filename: info for info in infos}
+        shared_strings: list[str] = []
+        shared_info = info_by_name.get("xl/sharedStrings.xml")
+        if shared_info is not None and shared_info.file_size <= MAX_WORKSPACE_ARCHIVE_MEMBER_BYTES:
+            try:
+                root = ElementTree.fromstring(archive.read(shared_info))
+                for item in root.iter():
+                    if item.tag.rsplit("}", 1)[-1] != "si":
+                        continue
+                    shared_strings.append("".join(
+                        node.text or ""
+                        for node in item.iter()
+                        if node.tag.rsplit("}", 1)[-1] == "t"
+                    ))
+            except (OSError, ElementTree.ParseError):
+                shared_strings = []
+        sheet_names = sorted(
+            (
+                info.filename
+                for info in infos
+                if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", info.filename)
+            ),
+            key=lambda value: int(re.search(r"(\d+)", value).group(1)),
+        )
+        sections: list[str] = []
+        truncated = False
+        for name in sheet_names:
+            info = info_by_name[name]
+            if info.file_size > MAX_WORKSPACE_ARCHIVE_MEMBER_BYTES:
+                truncated = True
+                continue
+            try:
+                root = ElementTree.fromstring(archive.read(info))
+            except (OSError, ElementTree.ParseError):
+                continue
+            cells: list[str] = []
+            for cell in root.iter():
+                if cell.tag.rsplit("}", 1)[-1] != "c":
+                    continue
+                coordinate = cell.attrib.get("r", "?")
+                cell_type = cell.attrib.get("t")
+                raw_value = next(
+                    (
+                        node.text
+                        for node in cell
+                        if node.tag.rsplit("}", 1)[-1] == "v" and node.text is not None
+                    ),
+                    None,
+                )
+                inline = "".join(
+                    node.text or ""
+                    for node in cell.iter()
+                    if node.tag.rsplit("}", 1)[-1] == "t"
+                )
+                value = inline or raw_value or ""
+                if cell_type == "s" and raw_value is not None:
+                    try:
+                        value = shared_strings[int(raw_value)]
+                    except (IndexError, ValueError):
+                        value = raw_value
+                if value:
+                    cells.append(f"{coordinate}={value}")
+            if cells:
+                sections.append(f"\n--- {name} ---\n" + "\n".join(cells) + "\n")
+        return cls._bounded_projection(
+            f"[Cells extracted from spreadsheet: {file_name}]\n",
+            sections,
+            byte_limit,
+            truncated=truncated,
+        )
+
+    @classmethod
+    def _extract_zip_listing(cls, path: Path, byte_limit: int) -> str | None:
+        try:
+            archive, infos = cls._safe_archive(path)
+        except (OSError, ValueError, zipfile.BadZipFile):
+            return None
+        try:
+            sections = [
+                f"{info.filename}\t{info.file_size} bytes\n"
+                for info in infos
+                if not info.is_dir()
+            ]
+        finally:
+            archive.close()
+        return cls._bounded_projection(
+            f"[Safe archive listing: {path.name}]\n",
+            sections,
+            byte_limit,
+        )
 
     def apply_mutations(self, project_id: str, mutations: object) -> None:
         """Apply a bounded Codex file plan without giving Codex host filesystem access."""

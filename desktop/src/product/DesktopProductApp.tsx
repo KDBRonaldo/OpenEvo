@@ -1290,7 +1290,7 @@ function ProjectWorkspacePanelV2({
           <div className="project-workspace-preview">
             {selected ? <>
               <header><div><FileText size={15} /><strong>{selected.path}</strong></div><small>{selected.mediaType ?? "unknown"} · {formatBytes(selected.byteSize)}</small></header>
-              {selected.content !== null ? <pre>{selected.content}</pre> : <p className="v2-empty-copy">This file is binary, unreadable, or too large for the bounded browser preview.</p>}
+              {selected.content !== null ? <pre>{selected.content}</pre> : <p className="v2-empty-copy">No bounded browser preview is available. The Agent can still inspect the real remote-workspace file during a Session when the active harness supports its format.</p>}
             </> : <p className="v2-empty-copy">Select a readable file to preview it.</p>}
           </div>
         </div>
