@@ -8,6 +8,7 @@ remote Daemon lifecycle.
 from __future__ import annotations
 
 import argparse
+import os
 import secrets
 import socket
 import threading
@@ -17,6 +18,19 @@ from pathlib import Path
 import uvicorn
 
 from desktop.server.launcher import _NativeLauncherFrame, create_app
+
+
+def _is_wsl() -> bool:
+    """Avoid handing the URL to a terminal browser inside WSL."""
+
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return True
+    try:
+        return "microsoft" in Path("/proc/sys/kernel/osrelease").read_text(
+            encoding="utf-8"
+        ).lower()
+    except OSError:
+        return False
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -74,12 +88,16 @@ def main(argv: list[str] | None = None) -> int:
         listener.close()
         raise
     url = f"{endpoint}/openevo#browser-bootstrap={bootstrap_token}"
-    if not args.no_open:
+    print("OpenEvo browser host is ready.", flush=True)
+    print(f"Open this complete URL in Edge, Chrome, or Safari:\n{url}", flush=True)
+    print(
+        "SSH and Daemon operations remain owned by the local Sidecar.",
+        flush=True,
+    )
+    if not args.no_open and not _is_wsl():
         opener = threading.Timer(0.5, lambda: webbrowser.open(url, new=1, autoraise=True))
         opener.daemon = True
         opener.start()
-    print(f"OpenEvo browser host is ready at {endpoint}/openevo")
-    print("SSH and Daemon operations remain owned by the local Sidecar.")
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=0))
     try:
         server.run(sockets=[listener])
