@@ -889,6 +889,7 @@ def create_packaged_release_desktop_local_api_v2_app(
     build_version: str = OPENEVO_VERSION,
     build_channel: Literal["release", "development", "test"] = "release",
     home: Path | str | None = None,
+    system_ssh_config_path: Path | str | None = None,
     inherited_environment: Mapping[str, str] | None = None,
     clock: Callable[[], datetime] | None = None,
     startup_phase: Callable[[str], None] | None = None,
@@ -913,6 +914,15 @@ def create_packaged_release_desktop_local_api_v2_app(
     home_path = Path(os.path.abspath(os.path.expanduser(os.fspath(home_value))))
     if not home_path.is_absolute():
         raise ValueError("system OpenSSH HOME must be absolute")
+    explicit_ssh_config_path = (
+        None
+        if system_ssh_config_path is None
+        else Path(os.path.abspath(os.path.expanduser(os.fspath(system_ssh_config_path))))
+    )
+    if explicit_ssh_config_path is not None and not explicit_ssh_config_path.is_absolute():
+        raise ValueError("system OpenSSH config path must be absolute")
+    catalog_config_path = explicit_ssh_config_path or home_path / ".ssh" / "config"
+    catalog_user_ssh_dir = catalog_config_path.parent
 
     local_state: ReleaseLocalStateV2 | None = None
     workspace_store: WorkspaceImportStore | None = None
@@ -939,8 +949,8 @@ def create_packaged_release_desktop_local_api_v2_app(
             startup_phase("ssh_catalog_v2")
         catalog = ConfiguredSshHostCatalogProviderV2(
             OpenSshHostCatalogLoader(
-                config_path=home_path / ".ssh" / "config",
-                user_ssh_dir=home_path / ".ssh",
+                config_path=catalog_config_path,
+                user_ssh_dir=catalog_user_ssh_dir,
             ),
             clock=clock,
         )
@@ -955,6 +965,7 @@ def create_packaged_release_desktop_local_api_v2_app(
                 askpass_helper=system_ssh_askpass_helper,
                 home=home_path,
                 inherited_environment=environment,
+                config_path=explicit_ssh_config_path,
                 owns_askpass_helper=False,
                 host_trust=system_ssh_host_trust,
             )

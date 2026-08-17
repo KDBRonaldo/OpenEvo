@@ -362,6 +362,7 @@ def _create_app(
     askpass_helper: AskpassHelperAuthority | None = None
     host_trust: SystemOpenSshHostTrust | None = None
     managed_ssh_home: ManagedOpenSshHome | None = None
+    system_ssh_config_path: Path | None = None
     home = os.environ.get("HOME")
     try:
         if build_channel == "release" and release_assets_root is None and core_assets_root is None:
@@ -388,12 +389,13 @@ def _create_app(
             )
             if openssh_home is not None:
                 managed_ssh_home = ManagedOpenSshHome(openssh_home)
-                home = os.fspath(managed_ssh_home.root)
+                system_ssh_config_path = managed_ssh_home.config_path
             if home is None:
                 raise ValueError("system OpenSSH HOME is unavailable")
             host_trust = SystemOpenSshHostTrust(
                 home=home,
                 inherited_environment=os.environ,
+                config_path=system_ssh_config_path,
             )
         if askpass_helper is None or host_trust is None:
             startup_phase = "remote_lifecycle_v2"
@@ -409,6 +411,7 @@ def _create_app(
             system_ssh_askpass_helper=askpass_helper,
             system_ssh_host_trust=host_trust,
             home=home,
+            system_ssh_config_path=system_ssh_config_path,
             inherited_environment=os.environ,
             startup_phase=record_startup_phase if build_channel == "release" else None,
             close_on_shutdown=build_channel != "release",

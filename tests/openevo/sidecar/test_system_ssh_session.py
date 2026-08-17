@@ -220,6 +220,7 @@ def _session(
     process_id: int = 901,
     profile: SystemOpenSshAliasProfile | None = None,
     use_default_runner: bool = False,
+    config_path: Path | None = None,
 ) -> tuple[SystemOpenSshSession, _FakeProcess, _Inspector, _Launcher, _Runner]:
     identity = ProcessIdentity(
         process_id=process_id,
@@ -241,6 +242,7 @@ def _session(
         owns_askpass_helper=True,
         home=str(tmp_path),
         inherited_environment={"LANG": "en_US.UTF-8"},
+        config_path=config_path,
         runtime_parent=tmp_path,
         inspector=inspector,
         launcher=launcher,
@@ -291,6 +293,27 @@ def test_session_owns_private_runtime_master_and_exact_socket_identity(
         assert "ControlPersist=no" in launcher.argv
         assert "ClearAllForwardings=yes" in launcher.argv
         assert runner.calls[0][0][-3:] == ["-O", "check", "--", "evolab"][-3:]
+    finally:
+        session.close()
+        launcher.close_socket()
+
+
+def test_session_uses_explicit_managed_config_for_master_and_followers(
+    short_tmp_path: Path,
+) -> None:
+    config_path = (short_tmp_path / "managed-ssh" / "config").resolve()
+    session, _process, _inspector, launcher, _runner = _session(
+        short_tmp_path,
+        config_path=config_path,
+    )
+    try:
+        session.start()
+
+        assert launcher.argv is not None
+        expected_prefix = [SSH_EXECUTABLE, "-F", str(config_path)]
+        assert launcher.argv[:3] == expected_prefix
+        assert session.command_argv("true")[:3] == expected_prefix
+        assert session.core_tunnel_argv(remote_port=8765)[:3] == expected_prefix
     finally:
         session.close()
         launcher.close_socket()

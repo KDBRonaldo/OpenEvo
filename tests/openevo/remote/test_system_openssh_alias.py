@@ -107,6 +107,49 @@ def test_probe_builder_is_exact_system_ssh_plus_literal_alias() -> None:
     ]
 
 
+def test_explicit_managed_config_is_used_by_every_system_ssh_process(
+    tmp_path: Path,
+) -> None:
+    config = (tmp_path / "managed" / "config").resolve()
+    control = _control_path(tmp_path)
+    config_prefix = [SSH_EXECUTABLE, "-F", str(config)]
+
+    argv_sets = (
+        build_system_openssh_probe_argv(_profile(), config_path=config),
+        build_system_openssh_master_argv(
+            _profile(), control_path=control, config_path=config
+        ),
+        build_system_openssh_command_argv(
+            _profile(),
+            control_path=control,
+            remote_command="true",
+            config_path=config,
+        ),
+        build_system_openssh_control_argv(
+            _profile(),
+            control_path=control,
+            operation="check",
+            config_path=config,
+        ),
+        build_system_openssh_core_tunnel_argv(
+            _profile(),
+            control_path=control,
+            remote_port=8765,
+            config_path=config,
+        ),
+    )
+
+    assert all(argv[:3] == config_prefix for argv in argv_sets)
+
+
+def test_explicit_managed_config_must_be_absolute(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="config path"):
+        build_system_openssh_probe_argv(
+            _profile(),
+            config_path=Path("relative/config"),
+        )
+
+
 def test_owned_master_builder_clears_ambient_sessions_and_forwards(tmp_path: Path) -> None:
     control = _control_path(tmp_path)
     argv = build_system_openssh_master_argv(

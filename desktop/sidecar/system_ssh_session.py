@@ -147,10 +147,12 @@ class SystemOpenSshHostTrust:
         *,
         home: Path | str,
         inherited_environment: Mapping[str, str],
+        config_path: Path | str | None = None,
         review_authority: SystemHostKeyReviewAuthority | None = None,
         runner: SessionRunner | None = None,
     ) -> None:
         self._home = Path(home)
+        self._config_path = None if config_path is None else Path(config_path)
         self._inherited_environment = dict(inherited_environment)
         self._owns_review_authority = review_authority is None
         self._review_authority = review_authority or SystemHostKeyReviewAuthority()
@@ -289,7 +291,7 @@ class SystemOpenSshHostTrust:
     ) -> SystemKnownHostsPolicy:
         try:
             completed = self._runner(
-                build_system_openssh_probe_argv(profile),
+                build_system_openssh_probe_argv(profile, config_path=self._config_path),
                 self._environment(),
                 timeout_seconds,
             )
@@ -699,6 +701,7 @@ class SystemOpenSshSession:
         askpass_helper: AskpassHelperAuthority,
         home: Path | str,
         inherited_environment: Mapping[str, str],
+        config_path: Path | str | None = None,
         owns_askpass_helper: bool = False,
         runtime_parent: Path | str = _DEFAULT_RUNTIME_PARENT,
         inspector: ProcessInspector | None = None,
@@ -736,6 +739,7 @@ class SystemOpenSshSession:
         self._askpass_helper = askpass_helper
         self._owns_askpass_helper = owns_askpass_helper
         self._home = os.fspath(home)
+        self._config_path = None if config_path is None else Path(config_path)
         self._inherited_environment = dict(inherited_environment)
         self._runtime_parent = Path(runtime_parent)
         self._inspector = inspector or SystemProcessInspector()
@@ -750,6 +754,7 @@ class SystemOpenSshSession:
         self._host_trust = host_trust or SystemOpenSshHostTrust(
             home=home,
             inherited_environment=inherited_environment,
+            config_path=self._config_path,
         )
         self._conditional_config = conditional_config
         self._startup_timeout = startup_timeout_seconds
@@ -874,6 +879,7 @@ class SystemOpenSshSession:
             argv = build_system_openssh_master_argv(
                 self._profile,
                 control_path=control_path,
+                config_path=self._config_path,
             )
             process = self._launcher.spawn(
                 argv,
@@ -938,6 +944,7 @@ class SystemOpenSshSession:
                 self._profile,
                 control_path=snapshot.control_path,
                 remote_command=remote_command,
+                config_path=self._config_path,
             )
 
     def core_tunnel_argv(self, *, remote_port: int) -> list[str]:
@@ -947,6 +954,7 @@ class SystemOpenSshSession:
                 self._profile,
                 control_path=snapshot.control_path,
                 remote_port=remote_port,
+                config_path=self._config_path,
             )
 
     def run(self, command: str, *, timeout_seconds: float = 30.0) -> RemoteCommandResult:
@@ -1065,6 +1073,7 @@ class SystemOpenSshSession:
                             self._profile,
                             control_path=snapshot.control_path,
                             operation="exit",
+                            config_path=self._config_path,
                         ),
                         self._base_environment(),
                         min(self._cleanup_timeout, 1.0),
@@ -1230,6 +1239,7 @@ class SystemOpenSshSession:
                 self._profile,
                 control_path=runtime.path / _CONTROL_SOCKET_NAME,
                 operation="check",
+                config_path=self._config_path,
             ),
             self._base_environment(),
             remaining,

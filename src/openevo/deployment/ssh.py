@@ -274,10 +274,18 @@ def build_system_openssh_environment(
 
 def build_system_openssh_probe_argv(
     profile: SystemOpenSshAliasProfile,
+    *,
+    config_path: Path | str | None = None,
 ) -> list[str]:
     """Build the post-selection, non-authoritative ``ssh -G`` probe."""
 
-    return [SSH_EXECUTABLE, "-G", "--", profile.ssh_host_alias]
+    return [
+        SSH_EXECUTABLE,
+        *_system_openssh_config_argv(config_path),
+        "-G",
+        "--",
+        profile.ssh_host_alias,
+    ]
 
 
 def build_system_ssh_keygen_remove_argv(
@@ -308,6 +316,7 @@ def build_system_openssh_master_argv(
     profile: SystemOpenSshAliasProfile,
     *,
     control_path: Path | str,
+    config_path: Path | str | None = None,
     connect_timeout_seconds: int = 15,
     keepalive_interval_seconds: int = 15,
     keepalive_count: int = 2,
@@ -335,6 +344,7 @@ def build_system_openssh_master_argv(
     )
     return [
         SSH_EXECUTABLE,
+        *_system_openssh_config_argv(config_path),
         "-M",
         "-S",
         socket_path,
@@ -370,6 +380,7 @@ def build_system_openssh_command_argv(
     *,
     control_path: Path | str,
     remote_command: str,
+    config_path: Path | str | None = None,
 ) -> list[str]:
     """Build a command intended to reuse exactly one owned master socket."""
 
@@ -381,7 +392,7 @@ def build_system_openssh_command_argv(
     ):
         raise ValueError("system OpenSSH remote command is invalid")
     return [
-        *_system_openssh_follower_argv(control_path),
+        *_system_openssh_follower_argv(control_path, config_path=config_path),
         "-o",
         "ClearAllForwardings=yes",
         "-o",
@@ -404,13 +415,14 @@ def build_system_openssh_control_argv(
     *,
     control_path: Path | str,
     operation: str,
+    config_path: Path | str | None = None,
 ) -> list[str]:
     """Build a closed master control request that cannot open a session."""
 
     if operation not in _SYSTEM_OPENSSH_CONTROL_OPERATIONS:
         raise ValueError("unsupported system OpenSSH control operation")
     return [
-        *_system_openssh_follower_argv(control_path),
+        *_system_openssh_follower_argv(control_path, config_path=config_path),
         "-o",
         "ClearAllForwardings=yes",
         "-o",
@@ -427,6 +439,7 @@ def build_system_openssh_core_tunnel_argv(
     *,
     control_path: Path | str,
     remote_port: int,
+    config_path: Path | str | None = None,
 ) -> list[str]:
     """Build a stdio Core tunnel through the exact owned master.
 
@@ -443,7 +456,7 @@ def build_system_openssh_core_tunnel_argv(
         maximum=65_535,
     )
     return [
-        *_system_openssh_follower_argv(control_path),
+        *_system_openssh_follower_argv(control_path, config_path=config_path),
         "-o",
         "ClearAllForwardings=yes",
         "-o",
@@ -462,9 +475,14 @@ def build_system_openssh_core_tunnel_argv(
     ]
 
 
-def _system_openssh_follower_argv(control_path: Path | str) -> list[str]:
+def _system_openssh_follower_argv(
+    control_path: Path | str,
+    *,
+    config_path: Path | str | None = None,
+) -> list[str]:
     return [
         SSH_EXECUTABLE,
+        *_system_openssh_config_argv(config_path),
         "-S",
         _validate_system_openssh_control_path(control_path),
         "-o",
@@ -472,6 +490,18 @@ def _system_openssh_follower_argv(control_path: Path | str) -> list[str]:
         "-o",
         "ControlPersist=no",
     ]
+
+
+def _system_openssh_config_argv(config_path: Path | str | None) -> list[str]:
+    if config_path is None:
+        return []
+    value = os.fspath(config_path)
+    _validate_absolute_local_path(
+        value,
+        field_name="system OpenSSH config path",
+        max_bytes=4_096,
+    )
+    return ["-F", value]
 
 
 def _validate_system_openssh_control_path(path: Path | str) -> str:
