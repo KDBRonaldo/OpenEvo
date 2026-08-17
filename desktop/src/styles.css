@@ -4457,6 +4457,29 @@ pre.json {
   gap: 14px;
 }
 
+.project-workspace-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.project-workspace-actions .secondary-button {
+  min-height: 34px;
+  padding: 7px 10px;
+}
+
+.project-workspace-file-input {
+  position: fixed;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 .project-workspace-empty {
   display: flex;
   align-items: center;

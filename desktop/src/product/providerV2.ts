@@ -172,6 +172,19 @@ export interface ProjectDraftV2 {
   readonly config: ScienceProjectConfigV2;
 }
 
+export interface WorkspaceFileUploadV2 {
+  readonly path: string;
+  readonly data: Blob;
+  readonly mediaType: string;
+  readonly overwrite: boolean;
+}
+
+export interface WorkspaceFileDownloadV2 {
+  readonly fileName: string;
+  readonly mediaType: string;
+  readonly data: Blob;
+}
+
 export interface DesktopProductProviderV2 {
   readonly apiVersion: 2;
   readonly providerKind: "desktop_sidecar";
@@ -206,6 +219,15 @@ export interface DesktopProductProviderV2 {
   cancelTask(taskId: string, intent: ProductMutationIntentV2): Promise<OperationV2>;
   retryTask(taskId: string, intent: ProductMutationIntentV2): Promise<LocalOperationV2>;
   retryEvolutionJob?(jobId: string, intent: ProductMutationIntentV2): Promise<void>;
+  uploadWorkspaceFile?(
+    projectId: string,
+    upload: WorkspaceFileUploadV2,
+    intent: ProductMutationIntentV2,
+  ): Promise<void>;
+  downloadWorkspaceFile?(
+    projectId: string,
+    path: string,
+  ): Promise<WorkspaceFileDownloadV2>;
   loadTaskLogs(taskId: string, options?: { readonly limit?: number; readonly after?: string }): Promise<LogPageV2>;
   getProjectHead(projectHeadId: string): Promise<ProjectHeadRefV2>;
   getEvolutionRevision(evolutionRevisionId: string): Promise<EvolutionRevisionRefV2>;

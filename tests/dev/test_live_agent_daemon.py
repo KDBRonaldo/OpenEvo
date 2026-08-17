@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import urllib.request
+from urllib.parse import urlencode
 
 import pytest
 
@@ -389,6 +390,97 @@ def test_project_workspace_broker_rejects_paths_outside_the_project(tmp_path: Pa
         })
 
     assert not (tmp_path / "escaped.txt").exists()
+
+
+def test_project_workspace_upload_and_download_preserve_binary_bytes(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project({
+        "project_id": "development-project-transfer",
+        "display_name": "Transfer project",
+        "config": {},
+    })
+    payload = b"\x00\x01OpenEvo\xff"
+
+    entry = store.upload_workspace_file(
+        "development-project-transfer",
+        "inputs/sample.bin",
+        payload,
+        overwrite=False,
+    )
+
+    assert entry["path"] == "inputs/sample.bin"
+    assert entry["byte_size"] == len(payload)
+    assert entry["content"] is None
+    downloaded, media_type, file_name = store.download_workspace_file(
+        "development-project-transfer",
+        "inputs/sample.bin",
+    )
+    assert downloaded == payload
+    assert media_type == "application/octet-stream"
+    assert file_name == "sample.bin"
+    with pytest.raises(MODULE.StateConflictError, match="already exists"):
+        store.upload_workspace_file(
+            "development-project-transfer",
+            "inputs/sample.bin",
+            b"replacement",
+            overwrite=False,
+        )
+    with pytest.raises(MODULE.RequestError, match="unsafe"):
+        store.upload_workspace_file(
+            "development-project-transfer",
+            "../escaped.bin",
+            b"no",
+            overwrite=False,
+        )
+
+
+def test_http_workspace_file_upload_and_download_round_trip(tmp_path: Path) -> None:
+    token = "t" * 32
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    store.create_project({
+        "project_id": "development-project-transfer",
+        "display_name": "Transfer project",
+        "config": {},
+    })
+    server = MODULE.DevelopmentAgentServer(
+        ("127.0.0.1", 0),
+        token,
+        object(),
+        store,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    query = urlencode({"path": "data/实验.csv", "overwrite": "false"})
+    payload = "name,value\n样本,42\n".encode()
+    try:
+        upload = urllib.request.Request(
+            f"{base_url}/openevo-dev-agent/v1/projects/development-project-transfer/workspace/files?{query}",
+            data=payload,
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "text/csv",
+            },
+        )
+        with urllib.request.urlopen(upload, timeout=5) as response:
+            created = json.loads(response.read())
+        download_query = urlencode({"path": "data/实验.csv"})
+        download = urllib.request.Request(
+            f"{base_url}/openevo-dev-agent/v1/projects/development-project-transfer/workspace/files?{download_query}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        with urllib.request.urlopen(download, timeout=5) as response:
+            downloaded = response.read()
+            content_type = response.headers["Content-Type"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert created["entry"]["path"] == "data/实验.csv"
+    assert downloaded == payload
+    assert content_type == "text/csv"
 
 
 def test_sqlite_store_upgrades_legacy_session_evolution_selections(tmp_path: Path) -> None:

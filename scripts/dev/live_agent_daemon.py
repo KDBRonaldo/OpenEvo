@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+from urllib.parse import parse_qs, quote, urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from http import HTTPStatus
@@ -52,6 +53,9 @@ MAX_WORKSPACE_TEXT_BYTES = 2 * 1024 * 1024
 MAX_WORKSPACE_MUTATIONS = 64
 MAX_WORKSPACE_WRITE_FILE_BYTES = 192 * 1024
 MAX_WORKSPACE_WRITE_BYTES = 256 * 1024
+MAX_WORKSPACE_UPLOAD_FILE_BYTES = 32 * 1024 * 1024
+MAX_WORKSPACE_DOWNLOAD_FILE_BYTES = 64 * 1024 * 1024
+MAX_WORKSPACE_TOTAL_BYTES = 512 * 1024 * 1024
 MAX_AGENT_WORKSPACE_CONTEXT_BYTES = 512 * 1024
 DEFAULT_TIMEOUT_SECONDS = 300
 ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
@@ -72,6 +76,9 @@ SESSION_CANCEL_PATH_PATTERN = re.compile(
 )
 EVOLUTION_JOB_RETRY_PATH_PATTERN = re.compile(
     r"^/openevo-dev-agent/v1/evolution-jobs/([^/]+)/retry$"
+)
+WORKSPACE_FILES_PATH_PATTERN = re.compile(
+    r"^/openevo-dev-agent/v1/projects/([^/]+)/workspace/files$"
 )
 
 
@@ -397,6 +404,126 @@ class ProjectWorkspaceStore:
                 except OSError:
                     pass
                 raise AgentRunError(f"could not write workspace file: {exc}") from exc
+
+    def upload_file(
+        self,
+        project_id: str,
+        relative_path: object,
+        payload: bytes,
+        *,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        """Atomically store one user-selected file inside a managed project workspace."""
+
+        if len(payload) > MAX_WORKSPACE_UPLOAD_FILE_BYTES:
+            raise RequestError(
+                f"uploaded file exceeds the {MAX_WORKSPACE_UPLOAD_FILE_BYTES // (1024 * 1024)} MiB limit"
+            )
+        project_root = self.project_path(project_id)
+        path = self._workspace_path(project_root, relative_path, actor="upload")
+        try:
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            resolved_parent = path.parent.resolve(strict=True)
+        except OSError as exc:
+            raise RequestError(f"could not prepare the upload directory: {exc}") from exc
+        if resolved_parent != project_root and project_root not in resolved_parent.parents:
+            raise RequestError("upload path escaped the managed project workspace")
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise RequestError("uploads may only replace regular workspace files")
+        if path.exists() and not overwrite:
+            raise StateConflictError("a workspace file already exists at this path")
+
+        replaced_size = path.stat().st_size if path.exists() else 0
+        if self._workspace_size(project_root) - replaced_size + len(payload) > MAX_WORKSPACE_TOTAL_BYTES:
+            raise RequestError(
+                f"project workspace exceeds the {MAX_WORKSPACE_TOTAL_BYTES // (1024 * 1024)} MiB limit"
+            )
+
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".openevo-upload-",
+            dir=resolved_parent,
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
+            temporary_path.chmod(0o600)
+            os.replace(temporary_path, path)
+        except OSError as exc:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise RequestError(f"could not store the uploaded file: {exc}") from exc
+
+        snapshot = self.snapshot(project_id)
+        identity = path.relative_to(project_root).as_posix()
+        return next(
+            entry for entry in snapshot["entries"]
+            if entry["kind"] == "file" and entry["path"] == identity
+        )
+
+    def read_file(self, project_id: str, relative_path: object) -> tuple[bytes, str, str]:
+        """Read one bounded regular workspace file for an authenticated download."""
+
+        project_root = self.project_path(project_id)
+        path = self._workspace_path(project_root, relative_path, actor="download")
+        try:
+            resolved_parent = path.parent.resolve(strict=True)
+        except OSError as exc:
+            raise KeyError(relative_path) from exc
+        if resolved_parent != project_root and project_root not in resolved_parent.parents:
+            raise RequestError("download path escaped the managed project workspace")
+        if path.is_symlink() or not path.is_file():
+            raise KeyError(relative_path)
+        size = path.stat().st_size
+        if size > MAX_WORKSPACE_DOWNLOAD_FILE_BYTES:
+            raise RequestError(
+                f"workspace file exceeds the {MAX_WORKSPACE_DOWNLOAD_FILE_BYTES // (1024 * 1024)} MiB download limit"
+            )
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise RequestError(f"could not read the workspace file: {exc}") from exc
+        if len(payload) != size or path.is_symlink() or not path.is_file():
+            raise RequestError("workspace file changed while it was being read")
+        media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return payload, media_type, path.name
+
+    @staticmethod
+    def _workspace_size(project_root: Path) -> int:
+        total = 0
+        entry_count = 0
+        for directory, directory_names, file_names in os.walk(project_root, followlinks=False):
+            directory_names[:] = [
+                name for name in directory_names
+                if name not in {".git", ".openevo"}
+                and not (Path(directory) / name).is_symlink()
+            ]
+            for name in file_names:
+                entry_count += 1
+                if entry_count > MAX_WORKSPACE_ENTRIES * 10:
+                    raise RequestError("project workspace contains too many files")
+                candidate = Path(directory) / name
+                if candidate.is_symlink() or not candidate.is_file():
+                    continue
+                total += candidate.stat().st_size
+                if total > MAX_WORKSPACE_TOTAL_BYTES:
+                    return total
+        return total
+
+    @staticmethod
+    def _workspace_path(project_root: Path, value: object, *, actor: str) -> Path:
+        if not isinstance(value, str) or not value or len(value) > 512 or "\\" in value:
+            raise RequestError(f"{actor} workspace path is invalid")
+        relative = PurePosixPath(value)
+        if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+            raise RequestError(f"{actor} workspace path is unsafe")
+        if relative.parts[0] in {".git", ".openevo"}:
+            raise RequestError(f"{actor} cannot access reserved workspace paths")
+        return project_root.joinpath(*relative.parts)
 
     @staticmethod
     def _mutation_path(project_root: Path, value: object) -> Path:
@@ -918,6 +1045,30 @@ class DevelopmentStateStore:
     def apply_workspace_mutations(self, project_id: str, mutations: object) -> None:
         self.workspace_path(project_id)
         self.workspaces.apply_mutations(project_id, mutations)
+
+    def upload_workspace_file(
+        self,
+        project_id: str,
+        relative_path: object,
+        payload: bytes,
+        *,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        self.workspace_path(project_id)
+        return self.workspaces.upload_file(
+            project_id,
+            relative_path,
+            payload,
+            overwrite=overwrite,
+        )
+
+    def download_workspace_file(
+        self,
+        project_id: str,
+        relative_path: object,
+    ) -> tuple[bytes, str, str]:
+        self.workspace_path(project_id)
+        return self.workspaces.read_file(project_id, relative_path)
 
     def update_project(self, project_id: str, request: dict[str, Any]) -> dict[str, Any]:
         now = utc_now()
@@ -2678,6 +2829,28 @@ class DevelopmentSessionCoordinator:
         thread.start()
         return self._store.get_evolution_job(job_id)
 
+    def upload_workspace_file(
+        self,
+        project_id: str,
+        relative_path: object,
+        payload: bytes,
+        *,
+        overwrite: bool,
+    ) -> dict[str, Any]:
+        if not self._turn_lock.acquire(blocking=False):
+            raise StateConflictError(
+                "workspace uploads are unavailable while a Session or Evolution retry is running"
+            )
+        try:
+            return self._store.upload_workspace_file(
+                project_id,
+                relative_path,
+                payload,
+                overwrite=overwrite,
+            )
+        finally:
+            self._turn_lock.release()
+
     def _execute_evolution_retry(
         self,
         job: dict[str, Any],
@@ -2844,6 +3017,26 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         if not self._authorized():
             return
+        parsed_path = urlsplit(self.path)
+        workspace_match = WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
+        if workspace_match:
+            project_id = workspace_match.group(1)
+            if not ID_PATTERN.fullmatch(project_id):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "project_id is invalid")
+                return
+            try:
+                relative_path, _ = self._workspace_query(parsed_path.query, allow_overwrite=False)
+                payload, media_type, file_name = self.server.store.download_workspace_file(
+                    project_id,
+                    relative_path,
+                )
+            except RequestError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "workspace file not found")
+            else:
+                self._binary(payload, media_type, file_name)
+            return
         if self.path == "/openevo-dev-agent/health":
             self._json(HTTPStatus.OK, {"schema_version": "1", "status": "ready"})
             return
@@ -2959,7 +3152,37 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:  # noqa: N802
         if not self._authorized():
             return
-        project_match = PROJECT_PATH_PATTERN.fullmatch(self.path)
+        parsed_path = urlsplit(self.path)
+        workspace_match = WORKSPACE_FILES_PATH_PATTERN.fullmatch(parsed_path.path)
+        if workspace_match:
+            project_id = workspace_match.group(1)
+            if not ID_PATTERN.fullmatch(project_id):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", "project_id is invalid")
+                return
+            try:
+                relative_path, overwrite = self._workspace_query(
+                    parsed_path.query,
+                    allow_overwrite=True,
+                )
+                entry = self.server.sessions.upload_workspace_file(
+                    project_id,
+                    relative_path,
+                    self._read_bytes(MAX_WORKSPACE_UPLOAD_FILE_BYTES),
+                    overwrite=overwrite,
+                )
+            except RequestError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(exc))
+            except KeyError:
+                self._json_error(HTTPStatus.NOT_FOUND, "not_found", "project not found")
+            except StateConflictError as exc:
+                self._json_error(HTTPStatus.CONFLICT, "state_conflict", str(exc))
+            else:
+                self._json(
+                    HTTPStatus.CREATED,
+                    {"schema_version": "1", "project_id": project_id, "entry": entry},
+                )
+            return
+        project_match = PROJECT_PATH_PATTERN.fullmatch(parsed_path.path)
         if not project_match:
             self._json_error(HTTPStatus.NOT_FOUND, "not_found", "endpoint not found")
             return
@@ -3017,6 +3240,43 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise RequestError(f"request body is not valid UTF-8 JSON: {exc}") from exc
 
+    def _read_bytes(self, maximum: int) -> bytes:
+        try:
+            content_length = int(self.headers.get("Content-Length", ""))
+        except ValueError as exc:
+            raise RequestError("Content-Length is invalid") from exc
+        if content_length < 0:
+            raise RequestError("Content-Length is invalid")
+        if content_length > maximum:
+            raise RequestError(
+                f"request body exceeds the {maximum // (1024 * 1024)} MiB limit"
+            )
+        payload = self.rfile.read(content_length)
+        if len(payload) != content_length:
+            raise RequestError("request body ended before Content-Length bytes were received")
+        return payload
+
+    @staticmethod
+    def _workspace_query(query: str, *, allow_overwrite: bool) -> tuple[str, bool]:
+        try:
+            parameters = parse_qs(query, keep_blank_values=True, strict_parsing=True)
+        except ValueError as exc:
+            raise RequestError("workspace file query is invalid") from exc
+        allowed = {"path", "overwrite"} if allow_overwrite else {"path"}
+        if set(parameters) - allowed:
+            raise RequestError("workspace file query contains unknown fields")
+        paths = parameters.get("path", [])
+        if len(paths) != 1 or not paths[0]:
+            raise RequestError("workspace file query requires one path")
+        overwrite_values = parameters.get("overwrite", [])
+        if not allow_overwrite:
+            return paths[0], False
+        if len(overwrite_values) > 1 or (
+            overwrite_values and overwrite_values[0] not in {"true", "false"}
+        ):
+            raise RequestError("overwrite must be true or false")
+        return paths[0], overwrite_values == ["true"]
+
     def _authorized(self) -> bool:
         expected = f"Bearer {self.server.token}"
         actual = self.headers.get("Authorization", "")
@@ -3036,6 +3296,19 @@ class DevelopmentAgentHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _binary(self, payload: bytes, media_type: str, file_name: str) -> None:
+        self.send_response(HTTPStatus.OK.value)
+        self.send_header("Content-Type", media_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header(
+            "Content-Disposition",
+            f"attachment; filename*=UTF-8''{quote(file_name, safe='')}",
+        )
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(payload)
 
     def log_message(self, format: str, *args: object) -> None:
         print(f"[{self.log_date_time_string()}] {format % args}", flush=True)

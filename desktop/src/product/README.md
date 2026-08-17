@@ -166,6 +166,14 @@ returned. Per-Session created, modified, and deleted files are persisted in
 SQLite as change summaries and shown under Session output files, while file
 bodies remain authoritative on the remote server filesystem.
 
+The real-agent development provider also supports authenticated binary file transfer for
+that same workspace. Desktop uploads selected local files with an atomic replace operation
+(`PUT /projects/<id>/workspace/files?path=...`) and downloads bounded regular files through
+the matching `GET` endpoint. Paths are confined to the managed project root, reserved and
+symlinked paths are rejected, uploads are limited to 32 MiB per file and 512 MiB per
+workspace, and downloads are limited to 64 MiB. Uploaded files are immediately visible in
+the Project files panel and become part of the next Session's persistent workspace.
+
 The renderer has no development method table. It builds the optional multi-target
 Session picker from the returned capabilities, preserves the selected method and
 user config, and renders artifact bodies by `renderer_kind`: Markdown documents,

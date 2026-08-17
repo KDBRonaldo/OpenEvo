@@ -8,6 +8,7 @@ import {
   ChevronDown,
   ChevronRight,
   CircleDot,
+  Download,
   FolderOpen,
   FileText,
   History,
@@ -21,6 +22,7 @@ import {
   Settings,
   ShieldCheck,
   Sparkles,
+  Upload,
   X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -387,6 +389,33 @@ export function DesktopProductApp({
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRun={(task, selectedEvolutionTargets) => void runProject(displayedProject, task, selectedEvolutionTargets)}
+              fileTransferAvailable={provider.uploadWorkspaceFile !== undefined && provider.downloadWorkspaceFile !== undefined}
+              onUploadWorkspaceFiles={(files, overwrite) => void act(
+                async () => {
+                  if (!provider.uploadWorkspaceFile) throw new Error("This backend does not support workspace uploads.");
+                  for (const file of files) {
+                    await provider.uploadWorkspaceFile(
+                      displayedProject.project_id,
+                      {
+                        path: file.name,
+                        data: file,
+                        mediaType: file.type || "application/octet-stream",
+                        overwrite,
+                      },
+                      intentFor(snapshot, "upload-workspace-file"),
+                    );
+                  }
+                },
+                `${files.length} workspace file${files.length === 1 ? "" : "s"} uploaded to the remote server.`,
+              )}
+              onDownloadWorkspaceFile={(path) => void act(
+                async () => {
+                  if (!provider.downloadWorkspaceFile) throw new Error("This backend does not support workspace downloads.");
+                  const download = await provider.downloadWorkspaceFile(displayedProject.project_id, path);
+                  saveBrowserDownload(download.data, download.fileName);
+                },
+                `${path} downloaded from the remote workspace.`,
+              )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
                 "Task cancellation requested.",
@@ -993,6 +1022,9 @@ function ResearchWorkspaceV2({
   onSelectTask,
   onOpenSettings,
   onRun,
+  fileTransferAvailable,
+  onUploadWorkspaceFiles,
+  onDownloadWorkspaceFile,
   onCancelTask,
   onRetryTask,
   onRetryEvolutionJob,
@@ -1017,6 +1049,9 @@ function ResearchWorkspaceV2({
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
   ) => void;
+  readonly fileTransferAvailable: boolean;
+  readonly onUploadWorkspaceFiles: (files: readonly File[], overwrite: boolean) => void;
+  readonly onDownloadWorkspaceFile: (path: string) => void;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
@@ -1169,7 +1204,13 @@ function ResearchWorkspaceV2({
         {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>Open session result <ArrowRight size={14} /></button></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
       </section>
       </div>
-      <ProjectWorkspacePanelV2 workspace={runtimePresentation?.workspaces?.[project.project_id]} />
+      <ProjectWorkspacePanelV2
+        workspace={runtimePresentation?.workspaces?.[project.project_id]}
+        busy={busy}
+        fileTransferAvailable={fileTransferAvailable}
+        onUpload={onUploadWorkspaceFiles}
+        onDownload={onDownloadWorkspaceFile}
+      />
       <section className="history-section"><div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{projectTasks.length} total</span></div>{projectTasks.length ? <TaskHistoryTableV2 tasks={projectTasks} presentation={runtimePresentation?.tasks} selectedTaskId={selectedTaskId} transitions={transitions} onOpenTask={onSelectTask} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}</section>
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
@@ -1178,14 +1219,23 @@ function ResearchWorkspaceV2({
 
 function ProjectWorkspacePanelV2({
   workspace,
+  busy,
+  fileTransferAvailable,
+  onUpload,
+  onDownload,
 }: {
   readonly workspace: NonNullable<
     NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["workspaces"]
   >[string] | undefined;
+  readonly busy: boolean;
+  readonly fileTransferAvailable: boolean;
+  readonly onUpload: (files: readonly File[], overwrite: boolean) => void;
+  readonly onDownload: (path: string) => void;
 }) {
   const entries = workspace?.entries ?? [];
   const files = entries.filter((entry) => entry.kind === "file");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const uploadInputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     if (selectedPath !== null && files.some((entry) => entry.path === selectedPath)) return;
     setSelectedPath(files[0]?.path ?? null);
@@ -1195,7 +1245,29 @@ function ProjectWorkspacePanelV2({
     <section className="product-panel project-workspace-panel" data-testid="project-workspace-panel">
       <div className="panel-heading">
         <div><span className="panel-kicker">Persistent remote workspace</span><h2>Project files</h2></div>
-        <span className="muted-pill">{files.length} files</span>
+        <div className="project-workspace-actions">
+          <span className="muted-pill">{files.length} files</span>
+          {fileTransferAvailable ? <>
+            <input
+              ref={uploadInputRef}
+              className="project-workspace-file-input"
+              type="file"
+              multiple
+              aria-label="Choose files to upload"
+              onChange={(event) => {
+                const selectedFiles = Array.from(event.currentTarget.files ?? []);
+                event.currentTarget.value = "";
+                if (selectedFiles.length === 0) return;
+                const existingPaths = new Set(files.map((file) => file.path));
+                const hasCollision = selectedFiles.some((file) => existingPaths.has(file.name));
+                if (hasCollision && !globalThis.confirm("One or more files already exist in this workspace. Replace them?")) return;
+                onUpload(selectedFiles, hasCollision);
+              }}
+            />
+            <button type="button" className="secondary-button" disabled={busy} onClick={() => uploadInputRef.current?.click()}><Upload size={15} /> Upload files</button>
+            <button type="button" className="secondary-button" disabled={busy || selected === null} onClick={() => selected && onDownload(selected.path)}><Download size={15} /> Download</button>
+          </> : null}
+        </div>
       </div>
       {entries.length === 0 ? (
         <div className="project-workspace-empty"><FolderOpen size={24} /><div><strong>This workspace is empty.</strong><p>Start a Session and ask Codex to create files. They will remain on your server for later Sessions.</p></div></div>
@@ -1226,6 +1298,18 @@ function ProjectWorkspacePanelV2({
       {workspace?.truncated ? <p className="form-help">The server workspace contains more data than the bounded preview can display.</p> : null}
     </section>
   );
+}
+
+function saveBrowserDownload(data: Blob, fileName: string): void {
+  const url = URL.createObjectURL(data);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = fileName;
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  globalThis.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
 function TaskPinnedAuthorityCardsV2({ task }: { readonly task: TaskV2 }) {

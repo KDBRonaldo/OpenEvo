@@ -176,9 +176,12 @@ export function createDevelopmentAgentProvider(
   const baseUrl = (options.baseUrl ?? "/openevo-dev-agent/v1").replace(/\/$/, "");
   const fetchImpl = options.fetchImpl ?? fetch;
 
-  const requestJson = async (path: string, init?: RequestInit): Promise<unknown> => {
+  const requestJson = async (
+    path: string,
+    init?: RequestInit,
+    timeoutMs = 15_000,
+  ): Promise<unknown> => {
     const controller = new AbortController();
-    const timeoutMs = 15_000;
     const timeout = globalThis.setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetchImpl(`${baseUrl}${path}`, {
@@ -195,6 +198,29 @@ export function createDevelopmentAgentProvider(
         throw new Error(
           "The SSH development tunnel stopped responding. Restart the remote development launcher.",
         );
+      }
+      throw error;
+    } finally {
+      globalThis.clearTimeout(timeout);
+    }
+  };
+
+  const requestBlob = async (path: string): Promise<{ data: Blob; mediaType: string }> => {
+    const controller = new AbortController();
+    const timeout = globalThis.setTimeout(() => controller.abort(), 60_000);
+    try {
+      const response = await fetchImpl(`${baseUrl}${path}`, { signal: controller.signal });
+      if (!response.ok) {
+        const detail = await response.text();
+        throw new Error(`Remote development daemon failed (${response.status}): ${detail || response.statusText}`);
+      }
+      return {
+        data: await response.blob(),
+        mediaType: response.headers.get("Content-Type") ?? "application/octet-stream",
+      };
+    } catch (error) {
+      if (controller.signal.aborted) {
+        throw new Error("The workspace download timed out. Check the SSH development tunnel.");
       }
       throw error;
     } finally {
@@ -318,6 +344,26 @@ export function createDevelopmentAgentProvider(
         `/evolution-jobs/${encodeURIComponent(jobId)}/retry`,
         jsonRequest("POST", { schema_version: "1" }),
       );
+    },
+    uploadWorkspaceFile: async (projectId, path, data, mediaType, overwrite) => {
+      await requestJson(
+        `/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}&overwrite=${overwrite}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": mediaType || "application/octet-stream" },
+          body: data,
+        },
+        60_000,
+      );
+    },
+    downloadWorkspaceFile: async (projectId, path) => {
+      const result = await requestBlob(
+        `/projects/${encodeURIComponent(projectId)}/workspace/files?path=${encodeURIComponent(path)}`,
+      );
+      return {
+        ...result,
+        fileName: path.split("/").at(-1) ?? "download",
+      };
     },
   };
 

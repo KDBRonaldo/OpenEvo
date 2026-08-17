@@ -66,7 +66,9 @@ describe("development agent provider", () => {
     let activeProjectId: string | null = null;
     const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);
-      const body = init?.body ? JSON.parse(String(init.body)) as Record<string, unknown> : null;
+      const body = typeof init?.body === "string"
+        ? JSON.parse(init.body) as Record<string, unknown>
+        : null;
       if (url.endsWith("/state")) {
         return jsonResponse({
           schema_version: "1",
@@ -221,6 +223,31 @@ describe("development agent provider", () => {
         });
         return jsonResponse({ schema_version: "1", job: evolutionJobs[0] }, 202);
       }
+      if (url.includes("/workspace/files?") && init?.method === "PUT") {
+        const requestUrl = new URL(url, "http://localhost");
+        const path = requestUrl.searchParams.get("path")!;
+        const data = init.body instanceof Blob ? await init.body.text() : "";
+        const workspace = workspaces[0] as { entries: Record<string, unknown>[] };
+        workspace.entries = [
+          ...workspace.entries.filter((entry) => entry.path !== path),
+          {
+            path,
+            kind: "file",
+            byte_size: new TextEncoder().encode(data).byteLength,
+            content_sha256: "e".repeat(64),
+            media_type: "text/plain",
+            content: data,
+            modified_at: "2026-08-14T10:03:00Z",
+          },
+        ];
+        return jsonResponse({ schema_version: "1", project_id: activeProjectId, entry: workspace.entries.at(-1) }, 201);
+      }
+      if (url.includes("/workspace/files?") && !init?.method) {
+        return new Response("uploaded evidence\n", {
+          status: 200,
+          headers: { "Content-Type": "text/plain" },
+        });
+      }
       throw new Error(`Unexpected development request: ${init?.method ?? "GET"} ${url}`);
     });
     const provider = createDevelopmentAgentProvider({ fetchImpl });
@@ -285,6 +312,24 @@ describe("development agent provider", () => {
       state: "completed",
       attempts: [{ ordinal: 1, state: "failed" }, { ordinal: 2, state: "completed" }],
     });
+    await provider.uploadWorkspaceFile?.(
+      project.project_id,
+      {
+        path: "evidence.txt",
+        data: new Blob(["uploaded evidence\n"], { type: "text/plain" }),
+        mediaType: "text/plain",
+        overwrite: false,
+      },
+      { actionId: "upload-evidence", streamEpoch: retried.snapshot.stream.epoch },
+    );
+    const afterUpload = await provider.refresh();
+    if (afterUpload.status !== "fresh") throw new Error("uploaded provider was not fresh");
+    expect(afterUpload.snapshot.runtimePresentation?.workspaces?.[project.project_id]?.entries).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "evidence.txt", content: "uploaded evidence\n" })]),
+    );
+    const downloaded = await provider.downloadWorkspaceFile?.(project.project_id, "evidence.txt");
+    expect(downloaded?.fileName).toBe("evidence.txt");
+    expect(await downloaded?.data.text()).toBe("uploaded evidence\n");
     expect(completed.snapshot.artifacts.map((artifact) => artifact.artifact_id)).toEqual(["dev-text-memory-1"]);
     expect(completed.snapshot.runtimePresentation?.artifacts["dev-text-memory-1"]?.documents[0]?.content).toContain("Verify arithmetic");
     expect(fetchImpl).toHaveBeenCalledWith("/openevo-dev-agent/v1/sessions", expect.objectContaining({

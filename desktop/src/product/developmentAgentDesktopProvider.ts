@@ -171,6 +171,17 @@ export interface DevelopmentAgentBackend {
   submitAgentTurn(request: DevelopmentAgentTurnRequest): Promise<DevelopmentAgentTurnSubmission>;
   cancelAgentTurn(sessionId: string): Promise<void>;
   retryEvolutionJob(jobId: string): Promise<void>;
+  uploadWorkspaceFile(
+    projectId: string,
+    path: string,
+    data: Blob,
+    mediaType: string,
+    overwrite: boolean,
+  ): Promise<void>;
+  downloadWorkspaceFile(
+    projectId: string,
+    path: string,
+  ): Promise<{ readonly fileName: string; readonly mediaType: string; readonly data: Blob }>;
 }
 
 interface DevelopmentProviderOptions {
@@ -437,6 +448,21 @@ function createRemoteBackedDesktopProductProvider(
       notifySubscribers();
       schedulePolling();
     },
+    uploadWorkspaceFile: async (projectId, upload) => {
+      await ensureDevelopmentState();
+      await options.developmentBackend.uploadWorkspaceFile(
+        projectId,
+        upload.path,
+        upload.data,
+        upload.mediaType,
+        upload.overwrite,
+      );
+      await ensureDevelopmentState(true);
+      notifySubscribers();
+    },
+    downloadWorkspaceFile: async (projectId, path) => (
+      options.developmentBackend.downloadWorkspaceFile(projectId, path)
+    ),
     loadTaskLogs: async (taskId) => {
       await ensureDevelopmentState(true);
       return {
