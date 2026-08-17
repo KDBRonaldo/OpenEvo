@@ -866,6 +866,8 @@ MAX_RECEIPT_BYTES = 4096
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
 FILE_FLAGS = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
 DOCKER = "/usr/bin/docker"
+if not os.path.exists(DOCKER):
+    DOCKER = "/usr/local/bin/docker"
 DOCKER_SOCKET = "/var/run/docker.sock"
 DOCKER_ENV = {
     "DOCKER_CONFIG": "/proc/self",

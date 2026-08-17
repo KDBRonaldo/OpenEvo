@@ -585,6 +585,59 @@ def test_remote_probe_ignores_polluted_path_docker(tmp_path: Path) -> None:
     assert not marker.exists()
 
 
+def test_remote_probe_uses_fixed_usr_local_docker_fallback(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    fake_bin = tmp_path / "trusted-bin"
+    fake_bin.mkdir()
+    _fake_docker(fake_bin)
+    socket_path = fake_bin / "docker.sock"
+    engine_socket = socket.socket(socket.AF_UNIX)
+    try:
+        engine_socket.bind(os.fspath(socket_path))
+    finally:
+        engine_socket.close()
+    socket_path.chmod(0o660)
+    missing_docker = tmp_path / "missing" / "docker"
+    script = (
+        assets._REMOTE_MANAGED_RUNTIME_SCRIPT.replace(
+            'DOCKER = "/usr/bin/docker"',
+            f"DOCKER = {os.fspath(missing_docker)!r}",
+            1,
+        )
+        .replace(
+            'DOCKER = "/usr/local/bin/docker"',
+            f"DOCKER = {os.fspath(fake_bin / 'docker')!r}",
+            1,
+        )
+        .replace(
+            'DOCKER_SOCKET = "/var/run/docker.sock"',
+            f"DOCKER_SOCKET = {os.fspath(socket_path)!r}",
+            1,
+        )
+        .replace(
+            '"DOCKER_HOST": "unix:///var/run/docker.sock"',
+            f'"DOCKER_HOST": "unix://{os.fspath(socket_path)}"',
+            1,
+        )
+        .replace("executable.st_uid != 0", "executable.st_uid != uid", 1)
+        .replace("engine_socket.st_uid != 0", "engine_socket.st_uid != uid", 1)
+    )
+    definitions, separator, unused = script.partition("\naction = sys.argv[1]")
+    assert separator
+    del unused
+
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", definitions + '\nrun_docker(["--version"])\n'],
+        check=False,
+        capture_output=True,
+        env={**os.environ, "HOME": os.fspath(home), "PATH": ""},
+        timeout=10,
+    )
+
+    assert completed.returncode == 0
+
+
 def test_remote_docker_process_receives_only_fixed_engine_environment(
     tmp_path: Path,
 ) -> None:
