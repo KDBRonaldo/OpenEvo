@@ -259,6 +259,15 @@ the original action ID and expected operation kind before it permits any retry.
 Multi-step native project creation derives a distinct sidecar idempotency key
 for each step while retaining one renderer action identity.
 
+Profile connection is the sole owner of remote Daemon preparation. It performs
+preflight, transfers and verifies the sealed Daemon/runtime assets, starts the
+Daemon, opens the private tunnel, and negotiates compatibility. The resulting
+attachment is reusable only by the exact profile connection generation and
+system-OpenSSH transport identity that produced it. Project create/activate and
+Session operations consume that established authority and cannot repeat Daemon
+staging or installation. If either identity changes, Sidecar fails closed and
+requires a new profile connection.
+
 Lifecycle operations expose ordered phases, typed progress, a cancellable flag,
 recoverable SSE updates, acknowledgement, and bounded SSH/Daemon process logs.
 Core may acknowledge a scratch project create with an exact `not_ready` project

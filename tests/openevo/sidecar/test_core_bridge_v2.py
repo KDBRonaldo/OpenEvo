@@ -181,6 +181,21 @@ class _HostService:
             bearer_identity=hashlib.sha256(_TOKEN.encode()).hexdigest(),
         )
 
+    def require_core(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV2:
+        return self.ensure_core(
+            profile_id,
+            profile_connection_generation,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+
 
 class _TunnelFactory:
     def __init__(self) -> None:
@@ -582,7 +597,7 @@ def test_activation_waits_for_not_ready_scratch_and_streams_service_progress(
         bridge.close()
 
 
-def test_activation_forwards_the_exact_cancellation_event_to_core_host_service(
+def test_activation_forwards_the_exact_cancellation_event_to_connected_core_host(
     tmp_path: Path,
 ) -> None:
     requests: list[httpx.Request] = []

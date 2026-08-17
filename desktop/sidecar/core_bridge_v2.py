@@ -395,6 +395,15 @@ class CoreHostAttachmentV2:
 
 
 class CoreHostServiceV2(Protocol):
+    def require_core(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        *,
+        deadline: float,
+        cancel_event: threading.Event,
+    ) -> CoreHostAttachmentV2: ...
+
     def ensure_core(
         self,
         profile_id: str,
@@ -762,14 +771,16 @@ class DesktopCoreBridgeV2:
                     )
                 candidate_generation = self._generation + 1
             attachment = self._call_adapter(
-                lambda: self._host_service.ensure_core(
+                lambda: self._host_service.require_core(
                     request.profile_id,
                     request.profile_connection_generation,
                     deadline=deadline,
                     cancel_event=activation_cancel,
                 ),
-                failure_code="core_host_unavailable",
-                failure_summary="Desktop could not attach the compatible OpenEvo Daemon.",
+                failure_code="core_host_not_connected",
+                failure_summary=(
+                    "Desktop has no compatible OpenEvo Daemon connection for this profile."
+                ),
             )
             if type(attachment) is not CoreHostAttachmentV2 or (
                 attachment.profile_id != request.profile_id

@@ -599,6 +599,14 @@ def test_v2_release_runtime_is_deferred_and_owns_only_v2_bridge_state(
         assert runtime.core_bridge._activation_timeout == 7200.0
         assert runtime.bridge_store.state_root.name == "core-bridge-v2"
         assert not missing_assets.exists()
+        with pytest.raises(DesktopCoreBridgeErrorV2) as not_connected:
+            runtime.core_bridge._host_service.require_core(
+                "profile-1",
+                2,
+                deadline=time.monotonic() + 1,
+            )
+        assert not_connected.value.error.code == "core_profile_daemon_not_connected"
+        assert not missing_assets.exists()
         with pytest.raises(DesktopCoreBridgeErrorV2) as exc_info:
             runtime.core_bridge._host_service.ensure_core(
                 "profile-1",

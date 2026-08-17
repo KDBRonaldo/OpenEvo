@@ -144,6 +144,76 @@ def test_adapter_binds_every_daemon_step_to_exact_profile_connection_generation(
     assert str(tmp_path) not in repr(adapter)
 
 
+def test_adapter_reuses_profile_connected_daemon_without_a_second_transfer(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    observed: list[str] = []
+    adapter = DesktopCoreSshBridgeAdapterV2(
+        lifecycle,
+        _bootstrap(tmp_path),
+        progress_observer=lambda phase, _progress, _cancellable: observed.append(phase),
+    )
+
+    first = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    operation_order = list(transport.operation_order)
+    progress = list(observed)
+    second = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    assert second == first
+    assert transport.operation_order == operation_order
+    assert observed == progress
+    assert lifecycle.calls[-1] == (PROFILE_ID, 7)
+
+
+def test_business_operation_requires_profile_connected_daemon_without_deploying(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    adapter = DesktopCoreSshBridgeAdapterV2(lifecycle, _bootstrap(tmp_path))
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as caught:
+        adapter.require_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    assert caught.value.error.code == "core_profile_daemon_not_connected"
+    assert caught.value.error.action == "reconnect"
+    assert not transport.operation_order
+
+
+def test_business_operation_reuses_exact_profile_connection_without_deploying(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    adapter = DesktopCoreSshBridgeAdapterV2(lifecycle, _bootstrap(tmp_path))
+    connected = adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    operation_order = list(transport.operation_order)
+
+    attached = adapter.require_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    assert attached == connected
+    assert transport.operation_order == operation_order
+
+
+def test_adapter_rejects_cached_daemon_if_system_ssh_transport_changed(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    adapter = DesktopCoreSshBridgeAdapterV2(lifecycle, _bootstrap(tmp_path))
+    adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+    replacement = FakeCoreTransport()
+    lifecycle.transport = replacement
+
+    with pytest.raises(DesktopCoreBridgeErrorV2) as caught:
+        adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    assert caught.value.error.code == "core_ssh_transport_identity_changed"
+    assert not replacement.operation_order
+
+
 def test_adapter_reports_explicit_monotonic_daemon_lifecycle_checkpoints(
     tmp_path: Path,
 ) -> None:

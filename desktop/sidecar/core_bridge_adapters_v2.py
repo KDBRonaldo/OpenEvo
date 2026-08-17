@@ -352,6 +352,16 @@ class DesktopCoreSshBridgeAdapterV2:
     ) -> CoreHostAttachmentV2:
         activation_cancel = cancel_event or threading.Event()
         _require_activation_not_cancelled(activation_cancel)
+        transport = self._active_transport(
+            profile_id, profile_connection_generation, require_tunnel=False
+        )
+        cached_attachment = self._cached_attachment(
+            profile_id,
+            profile_connection_generation,
+            transport,
+        )
+        if cached_attachment is not None:
+            return cached_attachment
         daemon = self._bootstrap.daemon_bundle
         runtime = self._bootstrap.managed_runtime_archive
         if daemon is None or runtime is None:
@@ -361,9 +371,6 @@ class DesktopCoreSshBridgeAdapterV2:
                 status=409,
                 action="install_repair_daemon",
             )
-        transport = self._active_transport(
-            profile_id, profile_connection_generation, require_tunnel=False
-        )
         manifest_path = Path(daemon.local_path).with_name(_DAEMON_MANIFEST_FILENAME)
         try:
             manifest_size = manifest_path.stat().st_size
@@ -532,6 +539,78 @@ class DesktopCoreSshBridgeAdapterV2:
             remote_port=remote.remote_port,
             bearer_token=remote.bearer_token,
             bearer_identity=bearer_identity,
+        )
+
+    def require_core(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV2:
+        """Return the Daemon authority established by profile connection.
+
+        This is the business-operation boundary. Unlike ``ensure_core``, it
+        never stages release assets, installs a runtime, starts a Daemon, or
+        replaces one. Project and Session operations may only consume the
+        exact connection generation already verified by the profile connector.
+        """
+
+        activation_cancel = cancel_event or threading.Event()
+        _require_activation_not_cancelled(activation_cancel)
+        _remaining(deadline)
+        transport = self._active_transport(
+            profile_id, profile_connection_generation, require_tunnel=False
+        )
+        attachment = self._cached_attachment(
+            profile_id,
+            profile_connection_generation,
+            transport,
+        )
+        if attachment is None:
+            raise _adapter_error(
+                "core_profile_daemon_not_connected",
+                "Connect this remote workspace before creating or opening a project.",
+                status=409,
+                retryable=True,
+                action="reconnect",
+                affected_resource_id=profile_id,
+            )
+        return attachment
+
+    def _cached_attachment(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        transport: _CoreSshTransport,
+    ) -> CoreHostAttachmentV2 | None:
+        """Reuse the Daemon verified during profile connection.
+
+        Project and Session operations consume an established profile
+        connection. They must not turn into a second Daemon installation. A
+        cached authority is reusable only for the exact system-SSH transport
+        object and connection generation that created it.
+        """
+
+        with self._lock:
+            authority = self._authority
+        if authority is None:
+            return None
+        if (
+            authority.profile_id != profile_id
+            or authority.profile_connection_generation != profile_connection_generation
+        ):
+            return None
+        if authority.transport is not transport:
+            raise _transport_changed_error(profile_id)
+        remote = authority.attachment
+        return CoreHostAttachmentV2(
+            profile_id=profile_id,
+            profile_connection_generation=profile_connection_generation,
+            remote_port=remote.remote_port,
+            bearer_token=remote.bearer_token,
+            bearer_identity=authority.bearer_identity,
         )
 
     def _observe_progress(

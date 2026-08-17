@@ -105,6 +105,15 @@ only that active project's verified loopback tunnel. The HTTP transport accepts
 only its fixed private loopback origin and cannot fall back to a launcher URL,
 shared backend URL, v1 route, or direct SSH business command.
 
+Profile connection is the only lifecycle step allowed to prepare the remote
+Daemon. It performs preflight, transfers and verifies the sealed Daemon/runtime
+assets, starts the Daemon, opens the private tunnel, and negotiates
+compatibility. The resulting attachment is cached only for the exact
+system-OpenSSH transport object and profile connection generation that created
+it. Project create/activate and Session operations reuse that authority and
+must not stage or install the Daemon again. A changed transport or generation
+fails closed and requires reconnect.
+
 The client verifies the exact release, OpenAPI, event-schema, registry, runtime,
 and Daemon identities before publishing an authority generation. JSON and SSE
 inputs are duplicate-key rejecting and bounded before model validation; cache

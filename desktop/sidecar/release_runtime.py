@@ -235,6 +235,36 @@ class _DeferredCoreSshBridgeAdapterV2:
             cancel_event=cancel_event,
         )
 
+    def require_core(
+        self,
+        profile_id: str,
+        profile_connection_generation: int,
+        *,
+        deadline: float,
+        cancel_event: threading.Event | None = None,
+    ) -> CoreHostAttachmentV2:
+        with self._lock:
+            adapter = self._adapter
+        if adapter is None:
+            raise DesktopCoreBridgeErrorV2(
+                409,
+                local_v2.DesktopErrorV2(
+                    code="core_profile_daemon_not_connected",
+                    summary=(
+                        "Connect this remote workspace before creating or opening a project."
+                    ),
+                    retryable=True,
+                    action="reconnect",
+                    affected_resource_id=profile_id,
+                ),
+            )
+        return adapter.require_core(
+            profile_id,
+            profile_connection_generation,
+            deadline=deadline,
+            cancel_event=cancel_event,
+        )
+
     def open_tunnel(
         self,
         *,
