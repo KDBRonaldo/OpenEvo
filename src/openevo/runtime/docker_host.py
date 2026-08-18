@@ -25,7 +25,27 @@ _CONTAINER_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _HOSTNAME_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{12}$")
 _NAMESPACE_RE: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
-DOCKER_EXECUTABLE_PATH: Final[str] = "/usr/bin/docker"
+_DOCKER_EXECUTABLE_CANDIDATES: Final[tuple[str, ...]] = (
+    "/usr/bin/docker",
+    "/usr/local/bin/docker",
+)
+
+
+def _select_docker_executable_path() -> str:
+    """Select the first regular file from the closed release path allowlist."""
+
+    for candidate in _DOCKER_EXECUTABLE_CANDIDATES:
+        try:
+            metadata = os.stat(candidate, follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            return candidate
+    # Preserve the canonical fail-closed path when neither candidate exists.
+    return _DOCKER_EXECUTABLE_CANDIDATES[0]
+
+
+DOCKER_EXECUTABLE_PATH: Final[str] = _select_docker_executable_path()
 DOCKER_SOCKET_PATH: Final[str] = "/var/run/docker.sock"
 DOCKER_HOST_ENDPOINT: Final[str] = f"unix://{DOCKER_SOCKET_PATH}"
 _DOCKER_CONFIG_PATH: Final[str] = "/proc/self"

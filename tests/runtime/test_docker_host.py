@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import socket
+import stat
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -24,6 +26,47 @@ from openevo.runtime.docker_host import (
 
 _HOSTNAME = "1" * 12
 _CONTAINER_ID = _HOSTNAME + ("2" * 52)
+
+
+def test_docker_executable_path_prefers_usr_bin(monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: list[str] = []
+
+    def fake_stat(path: str, *, follow_symlinks: bool) -> SimpleNamespace:
+        observed.append(path)
+        assert follow_symlinks is False
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o755)
+
+    monkeypatch.setattr(docker_host_module.os, "stat", fake_stat)
+
+    assert docker_host_module._select_docker_executable_path() == "/usr/bin/docker"
+    assert observed == ["/usr/bin/docker"]
+
+
+def test_docker_executable_path_accepts_usr_local_bin_when_usr_bin_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_stat(path: str, *, follow_symlinks: bool) -> SimpleNamespace:
+        assert follow_symlinks is False
+        if path == "/usr/bin/docker":
+            raise FileNotFoundError(path)
+        return SimpleNamespace(st_mode=stat.S_IFREG | 0o755)
+
+    monkeypatch.setattr(docker_host_module.os, "stat", fake_stat)
+
+    assert docker_host_module._select_docker_executable_path() == "/usr/local/bin/docker"
+
+
+def test_docker_executable_path_does_not_follow_usr_bin_symlink(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_stat(path: str, *, follow_symlinks: bool) -> SimpleNamespace:
+        assert follow_symlinks is False
+        mode = stat.S_IFLNK | 0o777 if path == "/usr/bin/docker" else stat.S_IFREG | 0o755
+        return SimpleNamespace(st_mode=mode)
+
+    monkeypatch.setattr(docker_host_module.os, "stat", fake_stat)
+
+    assert docker_host_module._select_docker_executable_path() == "/usr/local/bin/docker"
 
 
 def _inspect_payload(
