@@ -317,13 +317,20 @@ def build_system_openssh_master_argv(
     *,
     control_path: Path | str,
     config_path: Path | str | None = None,
+    connection_attempts: int = 3,
     connect_timeout_seconds: int = 15,
-    keepalive_interval_seconds: int = 15,
-    keepalive_count: int = 2,
+    keepalive_interval_seconds: int = 10,
+    keepalive_count: int = 3,
 ) -> list[str]:
     """Build one non-persistent OpenEvo-owned interactive SSH master."""
 
     socket_path = _validate_system_openssh_control_path(control_path)
+    _validate_system_openssh_count(
+        connection_attempts,
+        field_name="OpenSSH connection attempts",
+        minimum=1,
+        maximum=5,
+    )
     _validate_system_openssh_count(
         connect_timeout_seconds,
         field_name="OpenSSH connect timeout",
@@ -361,13 +368,15 @@ def build_system_openssh_master_argv(
         "-o",
         "ExitOnForwardFailure=yes",
         "-o",
-        "ConnectionAttempts=1",
+        f"ConnectionAttempts={connection_attempts}",
         "-o",
         f"ConnectTimeout={connect_timeout_seconds}",
         "-o",
         f"ServerAliveInterval={keepalive_interval_seconds}",
         "-o",
         f"ServerAliveCountMax={keepalive_count}",
+        "-o",
+        "TCPKeepAlive=yes",
         "-N",
         "-T",
         "--",

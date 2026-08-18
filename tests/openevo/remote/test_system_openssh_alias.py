@@ -155,6 +155,7 @@ def test_owned_master_builder_clears_ambient_sessions_and_forwards(tmp_path: Pat
     argv = build_system_openssh_master_argv(
         _profile(),
         control_path=control,
+        connection_attempts=3,
         connect_timeout_seconds=15,
         keepalive_interval_seconds=20,
         keepalive_count=3,
@@ -178,19 +179,34 @@ def test_owned_master_builder_clears_ambient_sessions_and_forwards(tmp_path: Pat
         "-o",
         "ExitOnForwardFailure=yes",
         "-o",
-        "ConnectionAttempts=1",
+        "ConnectionAttempts=3",
         "-o",
         "ConnectTimeout=15",
         "-o",
         "ServerAliveInterval=20",
         "-o",
         "ServerAliveCountMax=3",
+        "-o",
+        "TCPKeepAlive=yes",
         "-N",
         "-T",
         "--",
         "evolab",
     ]
     _assert_user_authority_not_flattened(argv)
+
+
+@pytest.mark.parametrize("connection_attempts", [0, 6, True])
+def test_owned_master_builder_rejects_invalid_connection_attempts(
+    tmp_path: Path,
+    connection_attempts: object,
+) -> None:
+    with pytest.raises(ValueError, match="connection attempts"):
+        build_system_openssh_master_argv(
+            _profile(),
+            control_path=_control_path(tmp_path),
+            connection_attempts=connection_attempts,  # type: ignore[arg-type]
+        )
 
 
 def test_command_builder_reuses_exact_socket_without_auth_or_route_options(
