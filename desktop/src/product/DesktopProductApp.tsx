@@ -762,14 +762,32 @@ function RemoteWorkspaceSetupV2({
         authoritySnapshot = rescanned;
       }
       if (selectedAlias === "") return;
-      const created = await provider.createProfile(
-        displayName.trim(),
+      let targetProfile = reusableSystemOpenSshProfile(
+        authoritySnapshot.profiles,
         selectedAlias,
-        intentFor(authoritySnapshot, "create-profile"),
       );
-      const refreshed = await onRefresh();
-      if (refreshed === null) throw new Error("The new profile could not be reloaded.");
-      await provider.connectProfile(created.profile_id, intentFor(refreshed, "connect-profile"));
+      if (targetProfile === null) {
+        const created = await provider.createProfile(
+          displayName.trim(),
+          selectedAlias,
+          intentFor(authoritySnapshot, "create-profile"),
+        );
+        const refreshed = await onRefresh();
+        if (refreshed === null) throw new Error("The new profile could not be reloaded.");
+        authoritySnapshot = refreshed;
+        targetProfile = refreshed.profiles.find(
+          (profile): profile is RemoteWorkspaceProfileV2 =>
+            profile.profile_kind === "system_openssh"
+            && profile.profile_id === created.profile_id,
+        ) ?? null;
+        if (targetProfile === null) throw new Error("The new profile could not be reloaded.");
+      }
+      if (targetProfile.connection_state !== "connected") {
+        await provider.connectProfile(
+          targetProfile.profile_id,
+          intentFor(authoritySnapshot, "connect-profile"),
+        );
+      }
       await onRefresh();
       onConnected();
     } catch (caught) {
@@ -914,7 +932,12 @@ function ProfileSetupCardV2({
           ) : cleanupAuthorityLost ? (
             <span>Administrator action is required before this workspace can reconnect.</span>
           ) : (
-            <button type="button" className="secondary-button" disabled={busy || ["connecting", "bootstrapping", "negotiating", "prompt_pending"].includes(profile.connection_state)} onClick={() => void mutate(() => provider.connectProfile(profile.profile_id, intentFor(snapshot, "connect-profile")))}>Connect</button>
+            <>
+              <button type="button" className="secondary-button" disabled={busy || ["connecting", "bootstrapping", "negotiating", "prompt_pending"].includes(profile.connection_state)} onClick={() => void mutate(() => provider.connectProfile(profile.profile_id, intentFor(snapshot, "connect-profile")))}>Connect</button>
+              {profile.connection_state === "disconnected" || profile.connection_state === "failed" ? (
+                <button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.deleteProfile(profile.profile_id, intentFor(snapshot, "delete-profile")))}>Remove</button>
+              ) : null}
+            </>
           )}
         </div>
       )}
@@ -1278,6 +1301,24 @@ function ResearchWorkspaceV2({
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
   );
+}
+
+function reusableSystemOpenSshProfile(
+  profiles: readonly RemoteProfileV2[],
+  sshHostAlias: string,
+): RemoteWorkspaceProfileV2 | null {
+  const matching = profiles.filter(
+    (profile): profile is RemoteWorkspaceProfileV2 =>
+      profile.profile_kind === "system_openssh"
+      && profile.ssh_host_alias === sshHostAlias,
+  );
+  matching.sort((left, right) => {
+    const leftConnected = left.connection_state === "connected" ? 1 : 0;
+    const rightConnected = right.connection_state === "connected" ? 1 : 0;
+    if (leftConnected !== rightConnected) return rightConnected - leftConnected;
+    return right.updated_at.localeCompare(left.updated_at);
+  });
+  return matching[0] ?? null;
 }
 
 function ProjectWorkspacePanelV2({

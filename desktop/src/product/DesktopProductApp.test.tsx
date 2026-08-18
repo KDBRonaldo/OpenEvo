@@ -541,6 +541,21 @@ function providerFixture(initial: DesktopProductSnapshotV2) {
           updated_at: NOW,
         }) as never,
     ),
+    deleteProfile: vi.fn(async (profileId: string) => {
+      const profiles = current.profiles.filter(
+        (profile) => profile.profile_id !== profileId,
+      );
+      current = baseSnapshot({
+        ...current,
+        profiles: profiles as never,
+        state: { ...current.state, profiles: profiles as never },
+        stream: {
+          status: "fresh",
+          epoch: current.stream.epoch + 1,
+          lastEventId: null,
+        },
+      });
+    }),
     rebindProfile: vi.fn(async () => systemProfile() as never),
     reviewHostKey: vi.fn(
       async () =>
@@ -721,6 +736,47 @@ describe("Desktop v2 product renderer", () => {
     );
     expect(JSON.stringify(provider.createProfile.mock.calls)).not.toMatch(
       /username|password|identity|host_path/i,
+    );
+  });
+
+  it("reuses an existing profile for the same SSH alias", async () => {
+    const existing = systemProfile({
+      profile_id: "profile-existing",
+      connection_state: "disconnected",
+    });
+    const snapshot = baseSnapshot({
+      profiles: [existing] as never,
+      state: { ...baseSnapshot().state, profiles: [existing] as never },
+    });
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    await click("Add remote workspace");
+    await click("Save and connect");
+
+    expect(provider.createProfile).not.toHaveBeenCalled();
+    expect(provider.connectProfile).toHaveBeenCalledWith(
+      "profile-existing",
+      expect.objectContaining({ streamEpoch: 1 }),
+    );
+  });
+
+  it("lets the user remove a disconnected saved workspace", async () => {
+    const existing = systemProfile({
+      profile_id: "profile-stale",
+      connection_state: "disconnected",
+    });
+    const snapshot = baseSnapshot({
+      profiles: [existing] as never,
+      state: { ...baseSnapshot().state, profiles: [existing] as never },
+    });
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    await click("Add remote workspace");
+    await click("Remove");
+
+    expect(provider.deleteProfile).toHaveBeenCalledWith(
+      "profile-stale",
+      expect.objectContaining({ streamEpoch: 1 }),
     );
   });
 
