@@ -94,7 +94,11 @@ from openevo.runtime.docker_host import (
     DockerHostPathSpec,
     discover_docker_host_path,
     docker_cli_environment,
+    docker_container_inspect_argv,
+    docker_inspect_matches_current_container,
+    docker_running_container_ids_argv,
     docker_self_inspect_argv,
+    parse_docker_container_ids,
 )
 from openevo.internal_auth import (
     INTERNAL_CREDENTIAL_FD_ENV,
@@ -494,6 +498,80 @@ class ProbeCommandRunner(Protocol):
         env: Mapping[str, str] | None = None,
         pass_fds: tuple[int, ...] = (),
     ) -> ProbeCommandResult: ...
+
+
+def _discover_docker_user_container_path(
+    run_docker: Callable[
+        [DockerEngineAuthority, tuple[str, ...], float, threading.Event | None],
+        ProbeCommandResult,
+    ],
+    docker_engine: DockerEngineAuthority,
+    *,
+    namespace: str,
+    deadline: float,
+    cancellation: threading.Event | None,
+    minimum_available_bytes: int = 512 * 1024 * 1024,
+) -> DockerHostPathSpec:
+    """Pin this Daemon container, including uniquely matched custom hostnames."""
+
+    current_hostname = socket.gethostname()
+    try:
+        self_inspect = docker_self_inspect_argv(current_hostname)
+        result = run_docker(
+            docker_engine,
+            self_inspect[1:],
+            deadline,
+            cancellation,
+        )
+        if result.returncode != 0:
+            raise DockerHostPathError("Docker could not inspect the Daemon user container")
+        return discover_docker_host_path(
+            result.stdout,
+            namespace=namespace,
+            hostname=current_hostname,
+            minimum_available_bytes=minimum_available_bytes,
+        )
+    except DockerHostPathError:
+        pass
+
+    inventory_command = docker_running_container_ids_argv()
+    inventory = run_docker(
+        docker_engine,
+        inventory_command[1:],
+        deadline,
+        cancellation,
+    )
+    if inventory.returncode != 0:
+        raise DockerHostPathError("Docker could not enumerate running containers")
+
+    matching_payloads: list[bytes] = []
+    for container_id in parse_docker_container_ids(inventory.stdout):
+        inspect_command = docker_container_inspect_argv(container_id)
+        result = run_docker(
+            docker_engine,
+            inspect_command[1:],
+            deadline,
+            cancellation,
+        )
+        if result.returncode != 0:
+            raise DockerHostPathError("Docker candidate inspection failed")
+        if docker_inspect_matches_current_container(
+            result.stdout,
+            container_id=container_id,
+            hostname=current_hostname,
+        ):
+            matching_payloads.append(result.stdout)
+    if len(matching_payloads) != 1:
+        raise DockerHostPathError(
+            "Docker custom-hostname self-container evidence is missing or ambiguous"
+        )
+    return discover_docker_host_path(
+        matching_payloads[0],
+        namespace=namespace,
+        hostname=current_hostname,
+        minimum_available_bytes=minimum_available_bytes,
+        allow_custom_hostname=True,
+    )
 
 
 class ProbeExecutableAuthority(Protocol):
@@ -1115,20 +1193,12 @@ class LocalManagedScienceRuntimeProbe:
             docker_host_path: DockerHostPathSpec | None = None
             if self._runtime_namespace is not None:
                 try:
-                    self_inspect = docker_self_inspect_argv()
-                    host_result = self._run_docker(
+                    docker_host_path = _discover_docker_user_container_path(
+                        self._run_docker,
                         docker_engine,
-                        self_inspect[1:],
-                        deadline,
-                        cancellation,
-                    )
-                    if host_result.returncode != 0:
-                        raise DockerHostPathError(
-                            "Docker could not inspect the Daemon user container"
-                        )
-                    docker_host_path = discover_docker_host_path(
-                        host_result.stdout,
                         namespace=self._runtime_namespace,
+                        deadline=deadline,
+                        cancellation=cancellation,
                     )
                 except Exception:
                     if self._require_docker_user_container:
@@ -1270,18 +1340,12 @@ class LocalSelfDeployedRuntimeProbe:
                 "The Docker user-container data-root mapping is unavailable.",
             )
         try:
-            self_inspect = docker_self_inspect_argv()
-            host_result = self._run_docker(
+            docker_host_path = _discover_docker_user_container_path(
+                self._run_docker,
                 docker_engine,
-                self_inspect[1:],
-                deadline,
-                cancellation,
-            )
-            if host_result.returncode != 0:
-                raise DockerHostPathError("Docker could not inspect the Daemon container")
-            docker_host_path = discover_docker_host_path(
-                host_result.stdout,
                 namespace=self._runtime_namespace,
+                deadline=deadline,
+                cancellation=cancellation,
                 minimum_available_bytes=profile.minimum_free_disk_bytes,
             )
         except Exception:

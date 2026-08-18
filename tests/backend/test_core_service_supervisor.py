@@ -58,6 +58,8 @@ from openevo.runtime.docker_host import (
     DOCKER_EXECUTABLE_PATH,
     DockerHostPathSpec,
     discover_docker_host_path,
+    docker_container_inspect_argv,
+    docker_running_container_ids_argv,
     docker_cli_environment,
     docker_self_inspect_argv,
 )
@@ -2897,6 +2899,70 @@ def test_release_probe_discovers_docker_user_container_data_root(
     assert runner.calls[-1] == self_inspect
     assert readiness.credential_authority is not None
     readiness.credential_authority.close()
+
+
+def test_release_probe_discovers_custom_hostname_docker_user_container(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data_root = tmp_path / "release-data"
+    data_root.mkdir()
+    hostname = "luht-dev"
+    matching_id = "c" * 64
+    unrelated_id = "d" * 64
+    inventory = docker_running_container_ids_argv()[1:]
+    matching_inspect = docker_container_inspect_argv(matching_id)[1:]
+    unrelated_inspect = docker_container_inspect_argv(unrelated_id)[1:]
+    runner = FakeProbeCommandRunner(
+        results={
+            inventory: ProbeCommandResult(
+                0,
+                f"{unrelated_id}\n{matching_id}\n".encode("ascii"),
+                b"",
+            ),
+            unrelated_inspect: ProbeCommandResult(
+                0,
+                _docker_host_evidence(
+                    data_root,
+                    hostname="other-container",
+                    container_id=unrelated_id,
+                ),
+                b"",
+            ),
+            matching_inspect: ProbeCommandResult(
+                0,
+                _docker_host_evidence(
+                    data_root,
+                    hostname=hostname,
+                    container_id=matching_id,
+                ),
+                b"",
+            ),
+        }
+    )
+    monkeypatch.setattr(
+        "openevo.runtime.docker_host.socket.gethostname",
+        lambda: hostname,
+    )
+    monkeypatch.setattr(supervisor_module.socket, "gethostname", lambda: hostname)
+
+    authority = supervisor_module._discover_docker_user_container_path(
+        lambda _engine, argv, deadline, cancellation: runner.run(
+            tuple(argv),
+            deadline,
+            cancellation,
+        ),
+        object(),
+        namespace="core-release",
+        minimum_available_bytes=0,
+        deadline=time.monotonic() + 1,
+        cancellation=None,
+    )
+
+    assert authority.container_id == matching_id
+    assert inventory in runner.calls
+    assert unrelated_inspect in runner.calls
+    assert matching_inspect in runner.calls
 
 
 def test_release_probe_fails_closed_without_docker_user_container_mapping(

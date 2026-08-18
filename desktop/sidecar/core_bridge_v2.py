@@ -1938,6 +1938,7 @@ class DesktopCoreBridgeV2:
         )
         observed_sequences: dict[str, int] = {}
         observed_cursors: dict[str, str] = {}
+        observed_errors: dict[str, str] = {}
         if replay.state is CoreBridgeMutationStateV2.APPLIED:
             assert replay.response_resource_id is not None
             connection = bootstrap_connection.bind(replay.response_resource_id)
@@ -1962,6 +1963,7 @@ class DesktopCoreBridgeV2:
                     affected_resource_id=desktop_project_id,
                     observed_sequences=observed_sequences,
                     observed_cursors=observed_cursors,
+                    observed_errors=observed_errors,
                 )
             finally:
                 self._close_client(probe, suppress_errors=True)
@@ -1987,6 +1989,7 @@ class DesktopCoreBridgeV2:
                     deadline=deadline,
                     observed_sequences=observed_sequences,
                     observed_cursors=observed_cursors,
+                    observed_errors=observed_errors,
                 )
             except CoreMutationOutcomeUnknownV2:
                 self._mark_unknown(replay)
@@ -2011,6 +2014,7 @@ class DesktopCoreBridgeV2:
                         affected_resource_id=desktop_project_id,
                         observed_sequences=observed_sequences,
                         observed_cursors=observed_cursors,
+                        observed_errors=observed_errors,
                     )
                 finally:
                     self._close_client(probe, suppress_errors=True)
@@ -2027,6 +2031,7 @@ class DesktopCoreBridgeV2:
         deadline: float,
         observed_sequences: dict[str, int],
         observed_cursors: dict[str, str],
+        observed_errors: dict[str, str],
     ) -> CoreProjectBootstrapResultV2:
         if not _PROJECT_CREATE_CAPACITY.acquire(blocking=False):
             raise _bridge_error(
@@ -2077,6 +2082,7 @@ class DesktopCoreBridgeV2:
                     bootstrap,
                     observed_sequences,
                     observed_cursors,
+                    observed_errors,
                 )
 
     def _wait_for_scratch_project_ready(
@@ -2090,6 +2096,7 @@ class DesktopCoreBridgeV2:
         affected_resource_id: str,
         observed_sequences: dict[str, int],
         observed_cursors: dict[str, str],
+        observed_errors: dict[str, str],
     ) -> core_v2.ProjectV2:
         """Finish a durable scratch create after Core acknowledges it as not ready."""
 
@@ -2129,29 +2136,38 @@ class DesktopCoreBridgeV2:
                 client,
                 observed_sequences,
                 observed_cursors,
+                observed_errors,
             )
             unavailable = (
                 []
                 if services is None
                 else [
-                    service.service_id
+                    service
                     for service in services.items
                     if service.status == "unavailable"
                 ]
             )
             if unavailable:
+                details = "; ".join(
+                    f"{service.service_id}: "
+                    f"{observed_errors.get(service.service_id, 'service readiness failed')}"
+                    for service in unavailable
+                )
+                details_sentence = details.rstrip(". ") + "."
                 if self._output_observer is not None:
-                    names = ", ".join(unavailable)
                     self._output_observer(
                         "daemon_stderr",
                         (
                             "[desktop] Required remote services are unavailable: "
-                            f"{names}.\n"
+                            f"{details_sentence}\n"
                         ).encode("utf-8"),
                     )
                 raise _bridge_error(
                     "core_project_services_unavailable",
-                    "The remote services required to create this project are unavailable.",
+                    (
+                        "The remote services required to create this project are "
+                        f"unavailable. {details_sentence}"
+                    ),
                     status=503,
                     action="install_repair_daemon",
                     affected_resource_id=affected_resource_id,
@@ -2165,10 +2181,15 @@ class DesktopCoreBridgeV2:
         bootstrap: CoreControlClientV2 | CoreProjectBootstrapClientV2,
         observed_sequences: dict[str, int],
         observed_cursors: dict[str, str],
+        observed_errors: dict[str, str] | None = None,
     ) -> core_v2.ServicePageV2 | None:
         try:
             services = bootstrap.list_services(limit=100)
-            if self._output_observer is None and self._progress_observer is None:
+            if (
+                self._output_observer is None
+                and self._progress_observer is None
+                and observed_errors is None
+            ):
                 return services
             for service in services.items:
                 after: str | None = observed_cursors.get(service.service_id)
@@ -2184,6 +2205,8 @@ class DesktopCoreBridgeV2:
                         if entry.sequence <= observed_sequences.get(service.service_id, 0):
                             continue
                         observed_sequences[service.service_id] = entry.sequence
+                        if observed_errors is not None and entry.stream == "stderr":
+                            observed_errors[service.service_id] = entry.message
                         self._observe_project_create_log(service.service_id, entry)
                     if not page.has_more:
                         break

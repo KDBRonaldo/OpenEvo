@@ -21,8 +21,13 @@ DOCKER_SELF_INSPECT_FORMAT: Final[str] = (
     '"running":{{json .State.Running}},"mounts":{{json .Mounts}}}'
 )
 _MAX_INSPECT_BYTES: Final[int] = 256 * 1024
+_MAX_CONTAINER_LIST_BYTES: Final[int] = 16 * 1024
+_MAX_CONTAINER_CANDIDATES: Final[int] = 128
 _CONTAINER_ID_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _HOSTNAME_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{12}$")
+_SAFE_HOSTNAME_RE: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,251}[A-Za-z0-9])?$"
+)
 _NAMESPACE_RE: Final[re.Pattern[str]] = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 _DIGEST_RE: Final[re.Pattern[str]] = re.compile(r"^[0-9a-f]{64}$")
 _DOCKER_EXECUTABLE_CANDIDATES: Final[tuple[str, ...]] = (
@@ -509,12 +514,80 @@ def docker_self_inspect_argv(hostname: str | None = None) -> tuple[str, ...]:
     )
 
 
+def docker_running_container_ids_argv() -> tuple[str, ...]:
+    """Return the bounded command used to enumerate self-container candidates."""
+
+    return (
+        DOCKER_EXECUTABLE_PATH,
+        "container",
+        "list",
+        "--quiet",
+        "--no-trunc",
+        "--filter",
+        "status=running",
+    )
+
+
+def parse_docker_container_ids(payload: bytes) -> tuple[str, ...]:
+    """Parse a bounded, duplicate-free list of full Docker container IDs."""
+
+    if len(payload) > _MAX_CONTAINER_LIST_BYTES:
+        raise DockerHostPathError("Docker container inventory exceeded its limit")
+    try:
+        text = payload.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise DockerHostPathError("Docker container inventory is invalid") from exc
+    values = tuple(line.strip() for line in text.splitlines() if line.strip())
+    if (
+        not values
+        or len(values) > _MAX_CONTAINER_CANDIDATES
+        or len(set(values)) != len(values)
+        or any(_CONTAINER_ID_RE.fullmatch(value) is None for value in values)
+    ):
+        raise DockerHostPathError("Docker container inventory is invalid")
+    return values
+
+
+def docker_container_inspect_argv(container_id: str) -> tuple[str, ...]:
+    """Return an exact-ID inspect command for one candidate container."""
+
+    if _CONTAINER_ID_RE.fullmatch(container_id) is None:
+        raise DockerHostPathError("Docker container identity is invalid")
+    return (
+        DOCKER_EXECUTABLE_PATH,
+        "container",
+        "inspect",
+        "--format",
+        DOCKER_SELF_INSPECT_FORMAT,
+        container_id,
+    )
+
+
+def docker_inspect_matches_current_container(
+    inspect_payload: bytes,
+    *,
+    container_id: str,
+    hostname: str | None = None,
+) -> bool:
+    """Return whether exact-ID evidence belongs to this kernel hostname."""
+
+    if _CONTAINER_ID_RE.fullmatch(container_id) is None:
+        raise DockerHostPathError("Docker container identity is invalid")
+    observation = _parse_closed_observation(inspect_payload)
+    if observation["id"] != container_id:
+        raise DockerHostPathError("Docker candidate identity changed during inspection")
+    current = hostname or socket.gethostname()
+    _require_safe_hostname(current)
+    return observation["running"] is True and observation["hostname"] == current
+
+
 def discover_docker_host_path(
     inspect_payload: bytes,
     *,
     namespace: str,
     hostname: str | None = None,
     minimum_available_bytes: int = 512 * 1024 * 1024,
+    allow_custom_hostname: bool = False,
 ) -> DockerHostPathSpec:
     """Select and pin one writable host bind mount from self-inspect evidence."""
 
@@ -523,7 +596,11 @@ def discover_docker_host_path(
     if minimum_available_bytes < 0:
         raise ValueError("minimum_available_bytes must not be negative")
     current = hostname or socket.gethostname()
-    observation = _parse_observation(inspect_payload, current)
+    observation = _parse_observation(
+        inspect_payload,
+        current,
+        require_default_hostname=not allow_custom_hostname,
+    )
     candidates: list[tuple[str, str, os.stat_result]] = []
     for item in observation["mounts"]:
         if not isinstance(item, dict) or item.get("Type") != "bind" or item.get("RW") is not True:
@@ -612,11 +689,16 @@ def verify_docker_host_path(
     inspect_payload: bytes,
     *,
     hostname: str | None = None,
+    allow_custom_hostname: bool = False,
 ) -> None:
     """Revalidate persisted Docker and local filesystem authority."""
 
     current = hostname or socket.gethostname()
-    observation = _parse_observation(inspect_payload, current)
+    observation = _parse_observation(
+        inspect_payload,
+        current,
+        require_default_hostname=not allow_custom_hostname,
+    )
     if observation["id"] != spec.container_id:
         raise DockerHostPathError("the Daemon container identity changed")
     matches = [
@@ -660,7 +742,7 @@ def verify_docker_host_path(
         raise DockerHostPathError("the verified Docker data-root identity changed")
 
 
-def _parse_observation(payload: bytes, hostname: str) -> dict[str, object]:
+def _parse_closed_observation(payload: bytes) -> dict[str, object]:
     if len(payload) > _MAX_INSPECT_BYTES:
         raise DockerHostPathError("Docker self-inspect evidence exceeded its limit")
     try:
@@ -680,15 +762,39 @@ def _parse_observation(payload: bytes, hostname: str) -> dict[str, object]:
     if (
         not isinstance(container_id, str)
         or _CONTAINER_ID_RE.fullmatch(container_id) is None
-        or _HOSTNAME_RE.fullmatch(hostname) is None
-        or hostname != container_id[:12]
-        or observed_hostname != hostname
+        or not isinstance(observed_hostname, str)
+        or _SAFE_HOSTNAME_RE.fullmatch(observed_hostname) is None
         or value.get("running") is not True
         or not isinstance(mounts, list)
-        or len(mounts) > 128
+        or len(mounts) > _MAX_CONTAINER_CANDIDATES
     ):
         raise DockerHostPathError("Docker self-container identity is invalid")
     return value
+
+
+def _parse_observation(
+    payload: bytes,
+    hostname: str,
+    *,
+    require_default_hostname: bool = True,
+) -> dict[str, object]:
+    _require_safe_hostname(hostname)
+    value = _parse_closed_observation(payload)
+    container_id = value["id"]
+    if (
+        value["hostname"] != hostname
+        or (
+            require_default_hostname
+            and (_HOSTNAME_RE.fullmatch(hostname) is None or hostname != container_id[:12])
+        )
+    ):
+        raise DockerHostPathError("Docker self-container identity is invalid")
+    return value
+
+
+def _require_safe_hostname(hostname: str) -> None:
+    if _SAFE_HOSTNAME_RE.fullmatch(hostname) is None:
+        raise DockerHostPathError("Docker container hostname is invalid")
 
 
 def _ensure_private_directory(path: Path, uid: int) -> None:
@@ -850,6 +956,10 @@ __all__ = [
     "HeldDockerSessionRoot",
     "discover_docker_host_path",
     "docker_cli_environment",
+    "docker_container_inspect_argv",
+    "docker_inspect_matches_current_container",
+    "docker_running_container_ids_argv",
     "docker_self_inspect_argv",
+    "parse_docker_container_ids",
     "verify_docker_host_path",
 ]

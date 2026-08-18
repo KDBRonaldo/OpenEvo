@@ -924,7 +924,16 @@ def test_activation_fails_promptly_when_required_project_services_are_unavailabl
                 200,
                 json={
                     "schema_version": "2",
-                    "items": [],
+                    "items": [
+                        {
+                            "sequence": 1,
+                            "occurred_at": "2026-07-23T06:00:00Z",
+                            "stream": "stderr",
+                            "message": (
+                                "The Docker user-container data-root mapping is unavailable."
+                            ),
+                        }
+                    ],
                     "next_cursor": None,
                     "has_more": False,
                 },
@@ -953,7 +962,10 @@ def test_activation_fails_promptly_when_required_project_services_are_unavailabl
         assert captured.value.error.code == "core_project_services_unavailable"
         assert output[-1] == (
             "daemon_stderr",
-            b"[desktop] Required remote services are unavailable: evolution-worker.\n",
+            (
+                b"[desktop] Required remote services are unavailable: evolution-worker: "
+                b"The Docker user-container data-root mapping is unavailable.\n"
+            ),
         )
         bridge.close()
 

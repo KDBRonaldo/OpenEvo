@@ -23,7 +23,7 @@ from openevo.runtime.docker_host import (
     DockerHostPathError,
     DockerHostPathSpec,
     HeldDockerSessionRoot,
-    docker_self_inspect_argv,
+    docker_container_inspect_argv,
     verify_docker_host_path,
 )
 from openevo.runtime.managed import (
@@ -745,7 +745,7 @@ class DockerRuntime(BaseRuntime):
         if self._docker_session_root is not None:
             self._docker_session_root.verify()
         rc, stdout, _ = await self._run_local_command(
-            *docker_self_inspect_argv(),
+            *docker_container_inspect_argv(authority.container_id),
             capture=True,
             timeout=self._STOP_TIMEOUT,
         )
@@ -754,6 +754,7 @@ class DockerRuntime(BaseRuntime):
         verify_docker_host_path(
             authority,
             str(stdout or "").encode("utf-8"),
+            allow_custom_hostname=True,
         )
         if self._docker_session_root is not None:
             self._docker_session_root.verify()

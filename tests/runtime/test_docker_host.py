@@ -19,7 +19,11 @@ from openevo.runtime.docker_host import (
     HeldDockerSessionRoot,
     discover_docker_host_path,
     docker_cli_environment,
+    docker_container_inspect_argv,
+    docker_inspect_matches_current_container,
+    docker_running_container_ids_argv,
     docker_self_inspect_argv,
+    parse_docker_container_ids,
     verify_docker_host_path,
 )
 
@@ -325,6 +329,69 @@ def test_self_inspect_command_requires_container_identity_hostname() -> None:
     assert docker_self_inspect_argv(_HOSTNAME)[-1] == _HOSTNAME
     with pytest.raises(DockerHostPathError, match="container-ID hostname"):
         docker_self_inspect_argv("gpu-server")
+
+
+def test_custom_hostname_discovery_pins_exact_container_identity(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    custom_hostname = "luht-dev"
+    payload = _inspect_payload(
+        [_bind_mount(data_root)],
+        hostname=custom_hostname,
+    )
+
+    assert docker_running_container_ids_argv()[-2:] == ("--filter", "status=running")
+    assert docker_container_inspect_argv(_CONTAINER_ID)[-1] == _CONTAINER_ID
+    assert parse_docker_container_ids(f"{_CONTAINER_ID}\n".encode("ascii")) == (
+        _CONTAINER_ID,
+    )
+    assert docker_inspect_matches_current_container(
+        payload,
+        container_id=_CONTAINER_ID,
+        hostname=custom_hostname,
+    )
+
+    authority = discover_docker_host_path(
+        payload,
+        namespace="core-release",
+        hostname=custom_hostname,
+        minimum_available_bytes=0,
+        allow_custom_hostname=True,
+    )
+    assert authority.container_id == _CONTAINER_ID
+    verify_docker_host_path(
+        authority,
+        payload,
+        hostname=custom_hostname,
+        allow_custom_hostname=True,
+    )
+
+
+def test_custom_hostname_discovery_remains_fail_closed_by_default(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    with pytest.raises(DockerHostPathError, match="self-container identity"):
+        discover_docker_host_path(
+            _inspect_payload([_bind_mount(data_root)], hostname="luht-dev"),
+            namespace="core-release",
+            hostname="luht-dev",
+            minimum_available_bytes=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"",
+        f"{_CONTAINER_ID}\n{_CONTAINER_ID}\n".encode("ascii"),
+        b"not-a-container-id\n",
+    ],
+)
+def test_container_inventory_parser_rejects_missing_duplicate_or_invalid_ids(
+    payload: bytes,
+) -> None:
+    with pytest.raises(DockerHostPathError, match="inventory is invalid"):
+        parse_docker_container_ids(payload)
 
 
 def test_host_path_admission_requires_hostname_to_equal_id_prefix(

@@ -199,10 +199,15 @@ Docker-daemon-side root. It MUST verify the resulting child-container mounts
 after creation. Missing, ambiguous, changed, read-only, or non-bind mount
 evidence blocks readiness. A bare host without the supported Docker API is not
 part of this first profile, and OpenEvo never falls back to unsandboxed host
-execution. The first profile also requires Docker's default short-container-ID
-hostname (`Config.Hostname == Id[:12]`) as the Daemon's initial
-self-identification input; preflight MUST verify it rather than accepting an
-operator-selected hostname.
+execution. Docker's default short-container-ID hostname
+(`Config.Hostname == Id[:12]`) is the preferred bounded self-identification
+fast path. A provisioned user container MAY instead use a custom hostname only
+when the Daemon enumerates a bounded set of running containers through the
+pinned local Docker Engine, inspects each by its full 64-character ID, and finds
+exactly one running container whose `Config.Hostname` equals the Daemon's kernel
+hostname. The Daemon MUST then pin that exact container ID and mount identity;
+zero matches, multiple matches, malformed inventory, changed identity, or an
+operator-supplied unverified container selector blocks readiness.
 
 Self-Deployed currently requires a release-supported Docker Engine API,
 compatible NVIDIA driver, NVIDIA Container Toolkit, sufficient VRAM, and

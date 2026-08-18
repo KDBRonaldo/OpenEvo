@@ -26,8 +26,8 @@ from openevo.runtime.docker import (
 from openevo.runtime.docker_host import (
     DOCKER_EXECUTABLE_PATH,
     docker_cli_environment,
+    docker_container_inspect_argv,
     discover_docker_host_path,
-    docker_self_inspect_argv,
 )
 from openevo.runtime.managed import (
     MANAGED_CODEX_HOME,
@@ -701,7 +701,7 @@ async def test_user_container_runtime_uses_and_verifies_translated_session_bind(
     async def run_command_impl(*args, **kwargs):
         nonlocal present
         del kwargs
-        if args == docker_self_inspect_argv(hostname):
+        if args == docker_container_inspect_argv(daemon_container_id):
             return 0, host_evidence.decode("utf-8"), None
         if args[1] == "create":
             _write_mock_cidfile(args, runtime_container_id)
@@ -811,7 +811,7 @@ async def test_user_container_runtime_rejects_daemon_source_path_aba_wrong_objec
     async def run_command_impl(*args, **kwargs):
         nonlocal present
         del kwargs
-        if args == docker_self_inspect_argv(hostname):
+        if args == docker_container_inspect_argv(daemon_container_id):
             return 0, host_evidence.decode("utf-8"), None
         if args[1] == "create":
             _write_mock_cidfile(args, runtime_container_id)
