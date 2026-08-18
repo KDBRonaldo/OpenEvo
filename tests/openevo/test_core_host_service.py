@@ -2584,6 +2584,70 @@ def test_dead_newer_daemon_floor_rejects_stale_desktop_downgrade(
     assert floor["bundle_sha256"] == DAEMON_V4.bundle_sha256
 
 
+def test_source_development_service_replaces_dead_newer_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, children = service_fakes
+    root = _root(tmp_path)
+    monkeypatch.setattr(service, "source_development_core_service_root", lambda: root)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    old = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V4,
+        process_controller=controller,
+    )
+    controller.current.pop(children[0].pid)
+
+    replacement = ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_A,
+        process_controller=controller,
+    )
+
+    assert replacement.attached is False
+    assert replacement.generation != old.generation
+    assert replacement.lifecycle_compatibility == DAEMON_A.lifecycle_compatibility
+    assert len(children) == 2
+
+
+def test_source_development_stop_does_not_persist_daemon_floor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    service_fakes: tuple[FakeController, list[FakeChild]],
+) -> None:
+    controller, _children = service_fakes
+    root = _root(tmp_path)
+    monkeypatch.setattr(service, "source_development_core_service_root", lambda: root)
+    lock = tmp_path / "framework-lock.json"
+    lock.write_text("{}", encoding="ascii")
+    ensure_core_service(
+        service_root=root,
+        framework_lock=lock,
+        source_commit=SOURCE_COMMIT,
+        expected_predecessor=CoreServicePredecessor.absent(),
+        daemon_bundle_identity=DAEMON_V4,
+        process_controller=controller,
+    )
+
+    stop_core_service(
+        service_root=root,
+        process_controller=controller,
+        preserve_compatibility_floor=True,
+    )
+
+    with HostServiceRoot(root, create=False) as pinned:
+        assert pinned.read_optional_json("service.json") is None
+
+
 def test_daemon_floor_allows_legacy_upgrade_and_rejects_same_abi_downgrade(
     tmp_path: Path,
     service_fakes: tuple[FakeController, list[FakeChild]],

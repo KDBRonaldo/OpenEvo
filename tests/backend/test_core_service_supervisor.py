@@ -565,6 +565,38 @@ def test_controlled_service_environment_preserves_gpu_selection(
     assert "OPENAI_API_KEY" not in environment
 
 
+def test_controlled_service_environment_includes_standard_user_bin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "remote-user"
+    monkeypatch.setenv("HOME", os.fspath(home))
+    monkeypatch.setenv("PATH", "/usr/local/sbin:/usr/local/bin:/usr/bin")
+
+    environment = supervisor_module._controlled_environment()
+
+    assert environment["PATH"].split(os.pathsep) == [
+        os.fspath(home / ".local" / "bin"),
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/bin",
+    ]
+
+
+def test_controlled_service_environment_does_not_duplicate_standard_user_bin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "remote-user"
+    user_bin = os.fspath(home / ".local" / "bin")
+    monkeypatch.setenv("HOME", os.fspath(home))
+    monkeypatch.setenv("PATH", f"{user_bin}{os.pathsep}/usr/bin")
+
+    environment = supervisor_module._controlled_environment()
+
+    assert environment["PATH"].split(os.pathsep) == [user_bin, "/usr/bin"]
+
+
 @pytest.mark.parametrize(
     "codex_model",
     [
@@ -2963,6 +2995,65 @@ def test_release_probe_discovers_custom_hostname_docker_user_container(
     assert inventory in runner.calls
     assert unrelated_inspect in runner.calls
     assert matching_inspect in runner.calls
+
+
+def test_release_probe_anchors_custom_hostname_mapping_to_service_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service_mount = tmp_path / "root"
+    service_root = service_mount / ".openevo" / "core-source"
+    shared_mount = tmp_path / "share"
+    service_root.mkdir(parents=True)
+    shared_mount.mkdir()
+    hostname = "luht-dev"
+    matching_id = "c" * 64
+    inventory = docker_running_container_ids_argv()[1:]
+    matching_inspect = docker_container_inspect_argv(matching_id)[1:]
+    evidence = json.dumps(
+        {
+            "id": matching_id,
+            "hostname": hostname,
+            "running": True,
+            "mounts": [
+                {
+                    "Type": "bind",
+                    "Source": "/data/home/researcher",
+                    "Destination": os.fspath(service_mount),
+                    "RW": True,
+                },
+                {
+                    "Type": "bind",
+                    "Source": "/data/share",
+                    "Destination": os.fspath(shared_mount),
+                    "RW": True,
+                },
+            ],
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    runner = FakeProbeCommandRunner(
+        results={
+            inventory: ProbeCommandResult(0, f"{matching_id}\n".encode("ascii"), b""),
+            matching_inspect: ProbeCommandResult(0, evidence, b""),
+        }
+    )
+    monkeypatch.setattr(supervisor_module.socket, "gethostname", lambda: hostname)
+
+    authority = supervisor_module._discover_docker_user_container_path(
+        lambda _engine, argv, deadline, cancellation: runner.run(
+            tuple(argv), deadline, cancellation
+        ),
+        object(),
+        namespace="core-release",
+        minimum_available_bytes=0,
+        preferred_container_path=service_root,
+        deadline=time.monotonic() + 1,
+        cancellation=None,
+    )
+
+    assert authority.mount_destination == os.fspath(service_mount)
+    assert authority.mount_source == "/data/home/researcher"
 
 
 def test_release_probe_fails_closed_without_docker_user_container_mapping(

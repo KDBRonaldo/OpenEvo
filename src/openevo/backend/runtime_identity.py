@@ -404,12 +404,21 @@ def default_core_service_root() -> Path:
     return home / ".openevo" / "core"
 
 
+def source_development_core_service_root() -> Path:
+    """Return the fixed service slot used only by source-development Desktop builds."""
+
+    return default_core_service_root().with_name("core-source-development")
+
+
 def require_host_global_service_root(path: str | Path) -> Path:
     candidate = Path(path)
-    expected = default_core_service_root()
-    if candidate != expected:
+    allowed = {
+        default_core_service_root(),
+        source_development_core_service_root(),
+    }
+    if candidate not in allowed:
         raise RuntimeIdentityError(
-            "Core service root must be the OS user's canonical host-global root"
+            "Core service root must be a canonical allowlisted OS-user host-global root"
         )
     return candidate
 
@@ -785,4 +794,5 @@ __all__ = [
     "require_host_global_service_root",
     "release_runtime_contract_sha256",
     "rotate_core_bearer_token",
+    "source_development_core_service_root",
 ]

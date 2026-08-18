@@ -93,12 +93,16 @@ The fixed Vite origins are admitted only when the sidecar reports the
 Tauri-only origin set. There is no visual-fixture or sample-data launch command.
 
 The first formal-Daemon migration entrypoint is `npm run dev:formal`. It builds
-the exact current-commit Core wheel and Linux Daemon bundle, downloads and
+the current source-development Core wheel and Linux Daemon bundle, downloads and
 verifies the pinned managed runtime once, builds the native askpass helper, and
-then delegates to `dev:live`. Generated inputs are cached by full Git commit
-under `~/.cache/openevo/formal-desktop`; the command refuses a dirty checkout or
-assets from another commit. This path uses the authenticated Desktop `/desktop/v2`
-sidecar and tunneled Daemon `/v2` APIs. It never starts
+then delegates to `dev:live`. Clean inputs are cached by full Git commit under
+`~/.cache/openevo/formal-desktop`. A dirty checkout is allowed only on this
+explicit development path and receives a content-derived `dirty` cache identity,
+so edited or untracked source bytes cannot reuse clean assets. It remains marked
+as build channel `development`; release packaging still requires an immutable,
+clean commit. Assets from another commit remain rejected. This path uses the
+authenticated Desktop `/desktop/v2` sidecar and tunneled Daemon `/v2` APIs. It
+never starts
 `scripts/dev/live_agent_daemon.py`. The existing `dev:agent:remote` command is
 retained temporarily for development-only features that have not yet moved to
 the immutable formal workspace and artifact contracts.

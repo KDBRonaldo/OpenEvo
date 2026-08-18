@@ -99,8 +99,10 @@ class ServiceBindingProviderV2(Protocol):
         self,
         execution_mode: ServiceExecutionMode,
         *,
+        model_ref: str | None = None,
         codex_model: str | None = None,
         runtime_image: str | None = None,
+        total_timeout: float | None = None,
     ) -> object: ...
 
     def run_binding(self) -> ServiceRunBinding: ...
@@ -1086,8 +1088,8 @@ class ProjectAuthorityV2:
         *,
         ensure_services: bool = False,
     ) -> tuple[VerifiedExecutionSnapshot, ServiceRunBinding] | None:
-        try:
-            if ensure_services:
+        if ensure_services:
+            try:
                 if config.execution.mode == "self-deployed":
                     self._services.ensure(
                         ServiceExecutionMode.SELF_DEPLOYED,
@@ -1101,6 +1103,11 @@ class ProjectAuthorityV2:
                         codex_model=config.execution.codex_model,
                         runtime_image=MANAGED_RUNTIME_IMAGES["managed_science"],
                     )
+            except Exception as exc:
+                raise ProjectAuthorityV2Error(
+                    "managed services could not be prepared for project authority"
+                ) from exc
+        try:
             binding = self._services.run_binding()
         except Exception:
             return None

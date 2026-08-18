@@ -511,6 +511,7 @@ def _discover_docker_user_container_path(
     deadline: float,
     cancellation: threading.Event | None,
     minimum_available_bytes: int = 512 * 1024 * 1024,
+    preferred_container_path: Path | None = None,
 ) -> DockerHostPathSpec:
     """Pin this Daemon container, including uniquely matched custom hostnames."""
 
@@ -530,6 +531,7 @@ def _discover_docker_user_container_path(
             namespace=namespace,
             hostname=current_hostname,
             minimum_available_bytes=minimum_available_bytes,
+            preferred_container_path=preferred_container_path,
         )
     except DockerHostPathError:
         pass
@@ -571,6 +573,7 @@ def _discover_docker_user_container_path(
         hostname=current_hostname,
         minimum_available_bytes=minimum_available_bytes,
         allow_custom_hostname=True,
+        preferred_container_path=preferred_container_path,
     )
 
 
@@ -975,12 +978,14 @@ class LocalManagedScienceRuntimeProbe:
         credential_probe_root: Path | None = None,
         runtime_namespace: str | None = None,
         require_docker_user_container: bool = False,
+        preferred_container_path: Path | None = None,
     ) -> None:
         self._command_runner = command_runner or BoundedProbeCommandRunner()
         self._codex_auth_path = codex_auth_path or (Path.home() / ".codex" / "auth.json")
         self._credential_probe_root = credential_probe_root
         self._runtime_namespace = runtime_namespace
         self._require_docker_user_container = require_docker_user_container
+        self._preferred_container_path = preferred_container_path
 
     def verify(
         self,
@@ -1199,6 +1204,7 @@ class LocalManagedScienceRuntimeProbe:
                         namespace=self._runtime_namespace,
                         deadline=deadline,
                         cancellation=cancellation,
+                        preferred_container_path=self._preferred_container_path,
                     )
                 except Exception:
                     if self._require_docker_user_container:
@@ -1285,10 +1291,12 @@ class LocalSelfDeployedRuntimeProbe:
         command_runner: ProbeCommandRunner | None = None,
         runtime_namespace: str | None = None,
         require_docker_user_container: bool = False,
+        preferred_container_path: Path | None = None,
     ) -> None:
         self._command_runner = command_runner or BoundedProbeCommandRunner()
         self._runtime_namespace = runtime_namespace
         self._require_docker_user_container = require_docker_user_container
+        self._preferred_container_path = preferred_container_path
 
     def verify(
         self,
@@ -1347,6 +1355,7 @@ class LocalSelfDeployedRuntimeProbe:
                 deadline=deadline,
                 cancellation=cancellation,
                 minimum_available_bytes=profile.minimum_free_disk_bytes,
+                preferred_container_path=self._preferred_container_path,
             )
         except Exception:
             if self._require_docker_user_container:
@@ -3078,6 +3087,7 @@ class CoreServiceSupervisor:
                     ).hexdigest()[:24]
                 ),
                 require_docker_user_container=(launch_mode is ServiceLaunchMode.RELEASE),
+                preferred_container_path=self._root.path,
             )
             self._self_deployed_runtime_probe = (
                 self_deployed_runtime_probe
@@ -3089,6 +3099,7 @@ class CoreServiceSupervisor:
                         ).hexdigest()[:24]
                     ),
                     require_docker_user_container=(launch_mode is ServiceLaunchMode.RELEASE),
+                    preferred_container_path=self._root.path,
                 )
             )
             self._startup_timeout = startup_timeout
@@ -5736,7 +5747,22 @@ def _controlled_environment() -> dict[str, str]:
         "TMPDIR",
     )
     result = {key: os.environ[key] for key in allowed if key in os.environ}
-    result.setdefault("PATH", os.defpath)
+    search_path = result.get("PATH", os.defpath)
+    home = result.get("HOME")
+    if home and os.path.isabs(home):
+        # Codex' supported device-auth installer places the stable launcher in
+        # ~/.local/bin.  Formal Daemons are normally started by a non-login SSH
+        # command, so that directory is not guaranteed to be present in PATH
+        # even though the same remote user can run `codex` interactively.
+        #
+        # This only extends discovery.  _HeldProbeExecutable still resolves the
+        # candidate, opens the final executable no-follow, validates its owner,
+        # mode, inode and size, and hashes the held bytes before executing it.
+        user_bin = os.fspath(Path(home) / ".local" / "bin")
+        search_entries = search_path.split(os.pathsep)
+        if user_bin not in search_entries:
+            search_path = os.pathsep.join((user_bin, *search_entries))
+    result["PATH"] = search_path
     result["PYTHONNOUSERSITE"] = "1"
     result["PYTHONSAFEPATH"] = "1"
     result["PYTHONUNBUFFERED"] = "1"

@@ -396,6 +396,7 @@ def build_daemon_bundle_ensure_command(
     deadline_seconds: float,
     expected_predecessor: DaemonBundleServicePredecessor,
     canonical_manifest_sha256: str,
+    source_development_service: bool = False,
 ) -> str:
     bundle.__post_init__()
     if (
@@ -406,6 +407,7 @@ def build_daemon_bundle_ensure_command(
         or not 0 < deadline_seconds <= 300
         or not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
         or not _valid_digest(canonical_manifest_sha256)
+        or type(source_development_service) is not bool
     ):
         raise DaemonBundleTransportContractError("Daemon bundle ensure request is invalid.")
     expected_predecessor.__post_init__()
@@ -424,6 +426,8 @@ def build_daemon_bundle_ensure_command(
         f" --expected-canonical-manifest-sha256 {canonical_manifest_sha256}"
         f" --canonical-manifest-path {manifest_path}"
     )
+    if source_development_service:
+        command += " --source-development-service"
     if expected_predecessor.state == "absent":
         return f"{command} --expect-service-absent"
     predecessor = (
@@ -448,6 +452,7 @@ def build_daemon_bundle_observe_command(
     *,
     deadline_seconds: float,
     canonical_manifest_sha256: str,
+    source_development_service: bool = False,
 ) -> str:
     bundle.__post_init__()
     if (
@@ -455,9 +460,10 @@ def build_daemon_bundle_observe_command(
         or not isinstance(deadline_seconds, (int, float))
         or not 0 < deadline_seconds <= 300
         or not _valid_digest(canonical_manifest_sha256)
+        or type(source_development_service) is not bool
     ):
         raise DaemonBundleTransportContractError("Daemon bundle observe request is invalid.")
-    return (
+    command = (
         f"{shlex.quote(bundle._executable_path)} service observe"
         f" --deadline-seconds {deadline_seconds:.6f}"
         f" --expected-bundle-sha256 {bundle.sha256}"
@@ -465,11 +471,23 @@ def build_daemon_bundle_observe_command(
         " --canonical-manifest-path "
         f"{shlex.quote(f'{bundle._service_root}/bundle-{canonical_manifest_sha256}')}"
     )
+    if source_development_service:
+        command += " --source-development-service"
+    return command
 
 
-def build_daemon_bundle_inspect_command(bundle: StagedDaemonBundle) -> str:
+def build_daemon_bundle_inspect_command(
+    bundle: StagedDaemonBundle,
+    *,
+    source_development_service: bool = False,
+) -> str:
     bundle.__post_init__()
-    return f"{shlex.quote(bundle._executable_path)} service inspect"
+    if type(source_development_service) is not bool:
+        raise DaemonBundleTransportContractError("Daemon bundle inspect request is invalid.")
+    command = f"{shlex.quote(bundle._executable_path)} service inspect"
+    if source_development_service:
+        command += " --source-development-service"
+    return command
 
 
 def build_daemon_bundle_stop_command(
@@ -477,6 +495,7 @@ def build_daemon_bundle_stop_command(
     *,
     deadline_seconds: float,
     expected_predecessor: DaemonBundleServicePredecessor,
+    source_development_service: bool = False,
 ) -> str:
     bundle.__post_init__()
     if (
@@ -484,6 +503,7 @@ def build_daemon_bundle_stop_command(
         or not isinstance(deadline_seconds, (int, float))
         or not 0 < deadline_seconds <= 300
         or not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
+        or type(source_development_service) is not bool
     ):
         raise DaemonBundleTransportContractError("Daemon bundle stop request is invalid.")
     try:
@@ -496,13 +516,16 @@ def build_daemon_bundle_stop_command(
         raise DaemonBundleTransportContractError("Daemon bundle stop request is invalid.")
     assert expected_predecessor.generation is not None
     assert expected_predecessor.release_identity is not None
-    return (
+    command = (
         f"{shlex.quote(bundle._executable_path)} service stop"
         f" --deadline-seconds {deadline_seconds:.6f}"
         f" --expect-service-generation {expected_predecessor.generation}"
         " --expect-service-release-identity "
         f"{expected_predecessor.release_identity}"
     )
+    if source_development_service:
+        command += " --source-development-service"
+    return command
 
 
 def parse_daemon_bundle_identity(payload: SecretStr) -> DaemonBundleIdentity:

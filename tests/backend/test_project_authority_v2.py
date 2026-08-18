@@ -28,6 +28,7 @@ import openevo.backend.contracts.v2.provider as provider_module
 from openevo.backend.project_authority_v2 import (
     ProjectAuthorityInvalidV2,
     ProjectAuthorityV2,
+    ProjectAuthorityV2Error,
     normalized_evolution_intent_sha256_for,
 )
 import openevo.backend.project_authority_v2 as authority_module
@@ -172,6 +173,7 @@ class _Services:
         self.binding = binding
         self.require_ensure = False
         self.ensured = False
+        self.ensure_error: Exception | None = None
         self.ensure_calls: list[
             tuple[object, str | None, str | None, str | None, float | None]
         ] = []
@@ -188,6 +190,8 @@ class _Services:
         self.ensure_calls.append(
             (execution_mode, model_ref, codex_model, runtime_image, total_timeout)
         )
+        if self.ensure_error is not None:
+            raise self.ensure_error
         self.ensured = True
         return object()
 
@@ -373,6 +377,29 @@ def test_unavailable_or_drifted_runtime_is_not_ready_without_partial_head(
     assert readiness.checks[-1].check_id == "effective-execution-snapshot"
     assert readiness.checks[-1].status == "failed"
     assert runtime.owner.active_project_head(record.project_id) == (authority.active_project_head)
+    runtime.close()
+
+
+def test_service_startup_failure_is_visible_and_genesis_can_be_retried(
+    tmp_path: Path,
+) -> None:
+    runtime = _Runtime(tmp_path)
+    record = runtime.create()
+    runtime.services.ensure_error = RuntimeError("gateway readiness failed")
+
+    with pytest.raises(
+        ProjectAuthorityV2Error,
+        match="managed services could not be prepared",
+    ) as rejected:
+        runtime.authority.ensure_project(record)
+    assert isinstance(rejected.value.__cause__, RuntimeError)
+    with pytest.raises(Exception, match="not found"):
+        runtime.owner.project_admission_authority(record.project_id)
+
+    runtime.services.ensure_error = None
+    authority = runtime.authority.ensure_project(record)
+    assert authority is not None
+    assert runtime.authority.readiness(record).ready is True
     runtime.close()
 
 

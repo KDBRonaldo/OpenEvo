@@ -45,6 +45,7 @@ from openevo.backend.runtime_identity import (
     release_runtime_contract_sha256,
     require_host_global_service_root,
     rotate_core_bearer_token,
+    source_development_core_service_root,
 )
 from openevo.evolution.framework import (
     load_framework_distribution_lock,
@@ -718,6 +719,9 @@ def ensure_core_service(
                     reuse_frozen_extraction_for_bounded_smoke=(
                         _reuse_frozen_extraction_for_bounded_smoke
                     ),
+                    allow_source_development_replacement=(
+                        Path(service_root) == source_development_core_service_root()
+                    ),
                 )
             finally:
                 os.close(lifecycle_lock_fd)
@@ -747,6 +751,7 @@ def observe_core_service_predecessor(
             "Core service root failed private ownership validation.",
             retryable=False,
         ) from exc
+    source_development = Path(service_root) == source_development_core_service_root()
     with root:
         root.ensure_directory("state")
         controller = process_controller or LinuxProcessController()
@@ -771,7 +776,7 @@ def observe_core_service_predecessor(
                         controller,
                         deadline=deadline,
                     )
-                    if _is_exact_daemon_ledger(ledger):
+                    if _is_exact_daemon_ledger(ledger) and not source_development:
                         root.atomic_write_json(
                             _LEDGER_NAME,
                             _floor_from_ledger(ledger),
@@ -869,6 +874,7 @@ def stop_core_service(
             "Core service root failed private ownership validation.",
             retryable=False,
         ) from exc
+    source_development = Path(service_root) == source_development_core_service_root()
     with root:
         controller = process_controller or LinuxProcessController()
         bootstrap_lock_fd = root.open_lock("bootstrap.lock")
@@ -886,7 +892,9 @@ def stop_core_service(
                             controller,
                             deadline=deadline,
                         )
-                        if preserve_compatibility_floor or _is_exact_daemon_ledger(state):
+                        if not source_development and (
+                            preserve_compatibility_floor or _is_exact_daemon_ledger(state)
+                        ):
                             root.atomic_write_json(
                                 _LEDGER_NAME,
                                 _floor_from_ledger(state),
@@ -934,6 +942,7 @@ def stop_core_service_if_generation(
             "Core service root failed private ownership validation.",
             retryable=False,
         ) from exc
+    source_development = Path(service_root) == source_development_core_service_root()
     with root:
         controller = process_controller or LinuxProcessController()
         bootstrap_lock_fd = root.open_lock("bootstrap.lock")
@@ -959,7 +968,7 @@ def stop_core_service_if_generation(
                     controller,
                     deadline=deadline,
                 )
-                if _is_exact_daemon_ledger(ledger):
+                if _is_exact_daemon_ledger(ledger) and not source_development:
                     root.atomic_write_json(
                         _LEDGER_NAME,
                         _floor_from_ledger(ledger),
@@ -1148,6 +1157,7 @@ def _ensure_locked(
     controller: LinuxProcessController,
     fault_injector: Callable[[str, int], None] | None = None,
     reuse_frozen_extraction_for_bounded_smoke: bool = False,
+    allow_source_development_replacement: bool = False,
 ) -> CoreServiceAttachment:
     bearer = load_or_create_core_bearer_token(root)
     existing_value = root.read_optional_json(_LEDGER_NAME)
@@ -1164,7 +1174,10 @@ def _ensure_locked(
             candidate=daemon_bundle_identity,
         )
         if state.get("state") == "stopped":
-            floor = state
+            if allow_source_development_replacement:
+                root.unlink_regular(_LEDGER_NAME)
+            else:
+                floor = state
             if expected_predecessor is not None:
                 _require_predecessor_match(
                     expected=expected_predecessor,
@@ -1182,7 +1195,11 @@ def _ensure_locked(
                     controller,
                     deadline=deadline,
                 )
-            if not alive and _is_exact_daemon_ledger(ledger):
+            if (
+                not alive
+                and _is_exact_daemon_ledger(ledger)
+                and not allow_source_development_replacement
+            ):
                 floor = _floor_from_ledger(ledger)
                 root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
                 root.unlink_regular(_READY_NAME)
@@ -1231,10 +1248,17 @@ def _ensure_locked(
                     if (
                         not replace_mismatched
                         or current_compatibility is None
-                        or daemon_bundle_identity.lifecycle_compatibility < current_compatibility
                         or (
-                            daemon_bundle_identity.lifecycle_compatibility == current_compatibility
-                            and not published_v019_upgrade
+                            not allow_source_development_replacement
+                            and (
+                                daemon_bundle_identity.lifecycle_compatibility
+                                < current_compatibility
+                                or (
+                                    daemon_bundle_identity.lifecycle_compatibility
+                                    == current_compatibility
+                                    and not published_v019_upgrade
+                                )
+                            )
                         )
                     ):
                         raise CoreServiceError(
@@ -1248,8 +1272,11 @@ def _ensure_locked(
                         controller,
                         deadline=deadline,
                     )
-                    floor = _floor_from_ledger(ledger)
-                    root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
+                    if allow_source_development_replacement:
+                        root.unlink_regular(_LEDGER_NAME)
+                    else:
+                        floor = _floor_from_ledger(ledger)
+                        root.atomic_write_json(_LEDGER_NAME, floor, replace=True)
                     root.unlink_regular(_READY_NAME)
                     root.unlink_regular(_PENDING_NAME)
                     predecessor_consumed = True
@@ -1272,12 +1299,13 @@ def _ensure_locked(
                     root.unlink_regular(_LEDGER_NAME)
                     root.unlink_regular(_READY_NAME)
                     root.unlink_regular(_PENDING_NAME)
-        if floor is not None:
+        if floor is not None and not allow_source_development_replacement:
             _require_floor_compatibility(
                 floor,
                 daemon_bundle_identity,
                 allow_equal_replacement=published_v019_upgrade,
             )
+        if floor is not None:
             if expected_predecessor is not None and not predecessor_consumed:
                 _require_predecessor_match(
                     expected=expected_predecessor,

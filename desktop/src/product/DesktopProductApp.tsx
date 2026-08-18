@@ -109,6 +109,7 @@ export function DesktopProductApp({
   const initialFailureReported = useRef(false);
   const refreshSequence = useRef(0);
   const snapshotRef = useRef<DesktopProductSnapshotV2 | null>(null);
+  const projectRecoveryRefreshInFlight = useRef(false);
 
   const refresh = useCallback(async (): Promise<DesktopProductSnapshotV2 | null> => {
     const sequence = refreshSequence.current + 1;
@@ -175,6 +176,26 @@ export function DesktopProductApp({
     };
   }, [provider, snapshot]);
 
+  const recoveringProjectId = snapshot?.projects.find((project) => (
+    project.project_id === snapshot.state.active_project_id
+      && project.state === "not_ready"
+      && project.active_project_head === null
+  ))?.project_id ?? null;
+
+  useEffect(() => {
+    if (recoveringProjectId === null) return;
+    const retry = (): void => {
+      if (projectRecoveryRefreshInFlight.current) return;
+      projectRecoveryRefreshInFlight.current = true;
+      void refresh().finally(() => {
+        projectRecoveryRefreshInFlight.current = false;
+      });
+    };
+    retry();
+    const timer = window.setInterval(retry, 2_000);
+    return () => window.clearInterval(timer);
+  }, [recoveringProjectId, refresh]);
+
   const act = useCallback(async <T,>(
     operation: () => Promise<T>,
     successMessage?: string,
@@ -235,15 +256,25 @@ export function DesktopProductApp({
     setActionError(null);
     setActionStatus(null);
     try {
-      let currentSnapshot = snapshot;
-      let currentProject = project;
+      // Starting a Task crosses multiple remote authority boundaries. Rebase
+      // on the latest snapshot before the first mutation instead of trusting
+      // the render-time snapshot, which an SSE event may already have made
+      // stale while the user was editing the draft.
+      const startingSnapshot = await refresh();
+      if (startingSnapshot === null) throw new Error("The current remote project state could not be loaded before starting the session.");
+      const startingProject = startingSnapshot.projects.find((candidate) => candidate.project_id === project.project_id);
+      if (!startingProject || startingProject.state !== "ready") {
+        throw new Error("The project is not ready for a new session yet.");
+      }
+      let currentSnapshot = startingSnapshot;
+      let currentProject = startingProject;
       const nextConfig = developmentAgentBridge
-        ? withSessionDocumentEvolution(project.config, task, selectedEvolutionTargets)
-        : { ...project.config, task };
-      if (JSON.stringify(nextConfig) !== JSON.stringify(project.config)) {
+        ? withSessionDocumentEvolution(currentProject.config, task, selectedEvolutionTargets)
+        : { ...currentProject.config, task };
+      if (JSON.stringify(nextConfig) !== JSON.stringify(currentProject.config)) {
         await provider.updateProject(
-          project.project_id,
-          project.display_name,
+          currentProject.project_id,
+          currentProject.display_name,
           nextConfig,
           intentFor(currentSnapshot, "update-task-before-session"),
         );
@@ -264,6 +295,18 @@ export function DesktopProductApp({
         setActionError("The active remote registry rejected this project configuration. Correct the failed checks before running.");
         return;
       }
+      // Project validation is itself an authoritative remote mutation and can
+      // emit a Desktop event. Refresh again so Task admission is bound to the
+      // post-validation stream epoch rather than the snapshot used to request
+      // validation.
+      const validatedSnapshot = await refresh();
+      if (validatedSnapshot === null) throw new Error("The validated project state could not be reloaded before starting the session.");
+      const validatedProject = validatedSnapshot.projects.find((candidate) => candidate.project_id === currentProject.project_id);
+      if (!validatedProject || validatedProject.state !== "ready") {
+        throw new Error("The validated project is not ready for a new session yet.");
+      }
+      currentSnapshot = validatedSnapshot;
+      currentProject = validatedProject;
       const submittedTask = await provider.submitTask(currentProject.project_id, intentFor(currentSnapshot, "submit-task"));
       await refresh();
       setWorkspace("research");
@@ -392,6 +435,7 @@ export function DesktopProductApp({
               sessionEvolutionAvailable={developmentAgentBridge}
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
+              onRetryInitialization={() => void refresh()}
               onRun={(task, selectedEvolutionTargets) => void runProject(displayedProject, task, selectedEvolutionTargets)}
               fileTransferAvailable={provider.uploadWorkspaceFile !== undefined && provider.downloadWorkspaceFile !== undefined}
               onUploadWorkspaceFiles={(files, overwrite) => void act(
@@ -1107,6 +1151,7 @@ function ResearchWorkspaceV2({
   sessionEvolutionAvailable,
   onSelectTask,
   onOpenSettings,
+  onRetryInitialization,
   onRun,
   fileTransferAvailable,
   onUploadWorkspaceFiles,
@@ -1131,6 +1176,7 @@ function ResearchWorkspaceV2({
   readonly sessionEvolutionAvailable: boolean;
   readonly onSelectTask: (taskId: string | null) => void;
   readonly onOpenSettings: () => void;
+  readonly onRetryInitialization: () => void;
   readonly onRun: (
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
@@ -1242,7 +1288,22 @@ function ResearchWorkspaceV2({
         <div><p className="eyebrow">Research</p><h1>{project.display_name}</h1><p>Prepare one task at a time against the current Project Head.</p></div>
         <div className="heading-actions"><button className="secondary-button" type="button" onClick={onOpenSettings}><Settings size={16} /> Edit project</button><button type="button" className="primary-button" disabled={busy || !ready || !taskValid} onClick={() => onRun(normalizedTask, selectedEvolutionTargets)}>{busy ? <LoaderCircle className="spin" size={15} /> : <Play size={15} fill="currentColor" />} Start session</button></div>
       </div>
-      {!ready ? <div className="disabled-reason"><AlertCircle size={14} /><span><strong>Next task is not ready.</strong> The current successor, settings, workspace, or runtime transition must finish before Core can admit another Task.</span></div> : null}
+      {!ready ? (
+        <div className="disabled-reason">
+          <AlertCircle size={14} />
+          <span>
+            <strong>Next task is not ready.</strong>{" "}
+            {project.state === "not_ready" && project.active_project_head === null
+              ? "OpenEvo is preparing the remote services and Generation 0 Project Head. This page retries automatically."
+              : "The current successor, settings, workspace, or runtime transition must finish before Core can admit another Task."}
+          </span>
+          {project.state === "not_ready" && project.active_project_head === null ? (
+            <button type="button" className="text-button" disabled={busy} onClick={onRetryInitialization}>
+              Retry now
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <div className="research-grid">
       <section className="product-panel task-panel">
         <div className="panel-heading"><div><span className="panel-kicker">Task draft</span><h2>What should the agent do next?</h2></div><span className={`state-pill ${project.state}`}>{project.state.replaceAll("_", " ")}</span></div>

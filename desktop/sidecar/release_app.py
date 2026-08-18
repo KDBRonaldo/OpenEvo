@@ -998,6 +998,7 @@ def create_packaged_release_desktop_local_api_v2_app(
             daemon_asset_root=daemon_root,
             runtime_asset_root=runtime_root,
             packaged_resource_assets=packaged_resource_assets,
+            build_channel=build_channel,
             startup_phase=startup_phase,
         )
         if startup_phase is not None:

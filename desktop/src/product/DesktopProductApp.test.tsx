@@ -596,15 +596,28 @@ function providerFixture(initial: DesktopProductSnapshotV2) {
       },
     ),
     validateProject: vi.fn(
-      async (projectId: string) =>
-        ({
+      async (projectId: string) => {
+        const validation = {
           schema_version: "2",
           project_id: projectId,
           valid: true,
           registry_sha256: DIGEST,
           checks: [],
           validated_at: NOW,
-        }) as never,
+        } as never;
+        // Formal validation advances the authoritative Desktop event stream.
+        // A caller must refresh before binding the subsequent Task admission.
+        current = {
+          ...current,
+          validation,
+          stream: {
+            status: "fresh",
+            epoch: current.stream.epoch + 1,
+            lastEventId: null,
+          },
+        };
+        return validation;
+      },
     ),
     submitTask: vi.fn(async () => current.tasks[0] as never),
     getArtifactContent: vi.fn(async (artifactId: string) => {
@@ -1093,7 +1106,7 @@ describe("Desktop v2 product renderer", () => {
     );
     expect(provider.submitTask).toHaveBeenCalledWith(
       "project-1",
-      expect.objectContaining({ streamEpoch: 2 }),
+      expect.objectContaining({ streamEpoch: 3 }),
     );
     expect(
       document.querySelector('[data-testid="session-detail-workspace"]'),
@@ -1262,6 +1275,38 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).toContain("Build successor Project Head");
     expect(document.body.textContent).toContain("Successor state: failed");
     expect(document.body.textContent).toContain("2 of 5 items");
+    expect(provider.submitTask).not.toHaveBeenCalled();
+  });
+
+  it("keeps generation-zero projects recoverable until task admission is ready", async () => {
+    const readySnapshot = authoritySnapshot();
+    const pendingProject = {
+      ...readySnapshot.projects[0]!,
+      active_project_head: null,
+      admission_etag: null,
+      state: "not_ready" as const,
+    };
+    const pendingSnapshot: DesktopProductSnapshotV2 = {
+      ...readySnapshot,
+      projects: [pendingProject],
+      tasks: [],
+      transitions: {},
+      runtimePresentation: {
+        ...readySnapshot.runtimePresentation!,
+        tasks: {},
+      },
+    };
+    const provider = providerFixture(pendingSnapshot);
+    root = await render(provider);
+
+    expect(button("Start session").disabled).toBe(true);
+    expect(document.body.textContent).toContain(
+      "OpenEvo is preparing the remote services and Generation 0 Project Head",
+    );
+
+    const refreshCalls = provider.refresh.mock.calls.length;
+    await click("Retry now");
+    expect(provider.refresh.mock.calls.length).toBeGreaterThan(refreshCalls);
     expect(provider.submitTask).not.toHaveBeenCalled();
   });
 

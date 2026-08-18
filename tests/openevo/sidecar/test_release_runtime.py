@@ -234,7 +234,24 @@ def test_v2_bootstrap_loader_reissues_only_exact_v2_asset_identities(
     assert type(config.framework_lock) is SealedCoreBootstrapAssetV2
     assert type(config.daemon_bundle) is SealedDaemonBundleV2
     assert config.daemon_bundle.source_commit == SOURCE_COMMIT
+    assert config.source_development_service is False
     assert "V1" not in repr(config)
+
+
+def test_v2_bootstrap_loader_marks_source_development_service_slot(
+    tmp_path: Path,
+) -> None:
+    wheel_root = _assets(tmp_path / "openevo" / "wheels")
+    daemon_root = _daemon_assets(tmp_path / "openevo" / "daemon", wheel_root)
+
+    config = load_core_bootstrap_config_v2(
+        wheel_root,
+        daemon_asset_root=daemon_root,
+        source_commit=SOURCE_COMMIT,
+        source_development_service=True,
+    )
+
+    assert config.source_development_service is True
 
 
 @pytest.mark.parametrize("mutation", ["binary", "manifest", "source_commit", "extra"])

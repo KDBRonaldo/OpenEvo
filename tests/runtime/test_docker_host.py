@@ -367,6 +367,61 @@ def test_custom_hostname_discovery_pins_exact_container_identity(tmp_path: Path)
     )
 
 
+def test_discovery_selects_mount_that_owns_preferred_container_path(
+    tmp_path: Path,
+) -> None:
+    home_root = tmp_path / "root"
+    service_root = home_root / ".openevo" / "core-service"
+    shared_root = tmp_path / "share"
+    service_root.mkdir(parents=True)
+    shared_root.mkdir()
+    payload = _inspect_payload(
+        [
+            _bind_mount(home_root, source="/data/home/researcher"),
+            _bind_mount(shared_root, source="/data/share"),
+        ],
+        hostname="luht-dev",
+    )
+
+    authority = discover_docker_host_path(
+        payload,
+        namespace="core-release",
+        hostname="luht-dev",
+        minimum_available_bytes=0,
+        allow_custom_hostname=True,
+        preferred_container_path=service_root,
+    )
+
+    assert authority.mount_destination == os.fspath(home_root)
+    assert authority.mount_source == "/data/home/researcher"
+
+
+def test_discovery_prefers_most_specific_mount_for_nested_bind_roots(
+    tmp_path: Path,
+) -> None:
+    home_root = tmp_path / "root"
+    service_parent = home_root / ".openevo"
+    service_root = service_parent / "core-service"
+    service_root.mkdir(parents=True)
+    payload = _inspect_payload(
+        [
+            _bind_mount(home_root, source="/data/home/researcher"),
+            _bind_mount(service_parent, source="/srv/openevo"),
+        ]
+    )
+
+    authority = discover_docker_host_path(
+        payload,
+        namespace="core-release",
+        hostname=_HOSTNAME,
+        minimum_available_bytes=0,
+        preferred_container_path=service_root,
+    )
+
+    assert authority.mount_destination == os.fspath(service_parent)
+    assert authority.mount_source == "/srv/openevo"
+
+
 def test_custom_hostname_discovery_remains_fail_closed_by_default(tmp_path: Path) -> None:
     data_root = tmp_path / "data"
     data_root.mkdir()

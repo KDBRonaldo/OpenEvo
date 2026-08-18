@@ -1939,6 +1939,7 @@ class SshRemoteExecutorTransport:
         port: int = 0,
         timeout_seconds: float = 90.0,
         cancel_event: threading.Event | None = None,
+        source_development_service: bool = False,
     ) -> tuple[RemoteCoreControlAttachment, DaemonBundleServiceStatus]:
         self._validate_daemon_bundle_control_request(
             bundle,
@@ -1950,6 +1951,7 @@ class SshRemoteExecutorTransport:
             or not 0 <= port <= 65535
             or not isinstance(expected_predecessor, DaemonBundleServicePredecessor)
             or re.fullmatch(r"[0-9a-f]{64}", canonical_manifest_sha256) is None
+            or type(source_development_service) is not bool
         ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         try:
@@ -1969,6 +1971,7 @@ class SshRemoteExecutorTransport:
                 deadline_seconds=_stage_remaining(deadline),
                 expected_predecessor=expected_predecessor,
                 canonical_manifest_sha256=canonical_manifest_sha256,
+                source_development_service=source_development_service,
             )
             payload = self._run_secret_with_remote_failure(
                 command,
@@ -2023,19 +2026,24 @@ class SshRemoteExecutorTransport:
         canonical_manifest_sha256: str,
         timeout_seconds: float = 30.0,
         cancel_event: threading.Event | None = None,
+        source_development_service: bool = False,
     ) -> DaemonBundleServicePredecessor:
         self._validate_daemon_bundle_control_request(
             bundle,
             timeout_seconds=timeout_seconds,
             cancel_event=cancel_event,
         )
-        if re.fullmatch(r"[0-9a-f]{64}", canonical_manifest_sha256) is None:
+        if (
+            re.fullmatch(r"[0-9a-f]{64}", canonical_manifest_sha256) is None
+            or type(source_development_service) is not bool
+        ):
             raise SshTransportError(SshTransportErrorCode.INVALID_REQUEST)
         try:
             command = build_daemon_bundle_observe_command(
                 bundle,
                 deadline_seconds=float(timeout_seconds),
                 canonical_manifest_sha256=canonical_manifest_sha256,
+                source_development_service=source_development_service,
             )
             payload = self._run_secret_with_remote_failure(
                 command,
@@ -2274,6 +2282,7 @@ class SshRemoteExecutorTransport:
         *,
         timeout_seconds: float = 30.0,
         cancel_event: threading.Event | None = None,
+        source_development_service: bool = False,
     ) -> DaemonBundleServiceStatus:
         self._validate_daemon_bundle_control_request(
             bundle,
@@ -2282,7 +2291,10 @@ class SshRemoteExecutorTransport:
         )
         try:
             payload = self._run_secret_with_remote_failure(
-                build_daemon_bundle_inspect_command(bundle),
+                build_daemon_bundle_inspect_command(
+                    bundle,
+                    source_development_service=source_development_service,
+                ),
                 timeout_seconds=float(timeout_seconds),
                 remote_failure_code=SshTransportErrorCode.DAEMON_BUNDLE_FAILED,
                 remote_error_codes={
@@ -2302,6 +2314,7 @@ class SshRemoteExecutorTransport:
         expected_predecessor: DaemonBundleServicePredecessor,
         timeout_seconds: float = 30.0,
         cancel_event: threading.Event | None = None,
+        source_development_service: bool = False,
     ) -> DaemonBundleStopReceipt:
         self._validate_daemon_bundle_control_request(
             bundle,
@@ -2319,6 +2332,7 @@ class SshRemoteExecutorTransport:
                 bundle,
                 deadline_seconds=float(timeout_seconds),
                 expected_predecessor=expected_predecessor,
+                source_development_service=source_development_service,
             )
             payload = self._run_secret_with_remote_failure(
                 command,

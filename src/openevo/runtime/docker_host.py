@@ -588,6 +588,7 @@ def discover_docker_host_path(
     hostname: str | None = None,
     minimum_available_bytes: int = 512 * 1024 * 1024,
     allow_custom_hostname: bool = False,
+    preferred_container_path: Path | None = None,
 ) -> DockerHostPathSpec:
     """Select and pin one writable host bind mount from self-inspect evidence."""
 
@@ -596,6 +597,14 @@ def discover_docker_host_path(
     if minimum_available_bytes < 0:
         raise ValueError("minimum_available_bytes must not be negative")
     current = hostname or socket.gethostname()
+    preferred_path: Path | None = None
+    if preferred_container_path is not None:
+        preferred_path = _canonical_absolute_path(
+            os.fspath(preferred_container_path),
+            "preferred Docker container path",
+        )
+        if preferred_path.resolve(strict=True) != preferred_path:
+            raise DockerHostPathError("preferred Docker container path is not canonical")
     observation = _parse_observation(
         inspect_payload,
         current,
@@ -617,6 +626,11 @@ def discover_docker_host_path(
             )
             if os.fspath(destination_path) in _EXCLUDED_DESTINATIONS:
                 continue
+            if preferred_path is not None:
+                try:
+                    preferred_path.relative_to(destination_path)
+                except ValueError:
+                    continue
             metadata = os.lstat(destination_path)
             if (
                 not stat.S_ISDIR(metadata.st_mode)
@@ -643,6 +657,20 @@ def discover_docker_host_path(
                 metadata,
             )
         )
+    if preferred_path is not None and candidates:
+        # Docker resolves overlapping bind mounts through the most-specific
+        # destination. Mirror that rule so a user container may safely expose
+        # several writable data mounts while the Daemon remains anchored to the
+        # mount that actually owns its service root.
+        most_specific_depth = max(
+            len(PurePosixPath(destination).parts)
+            for destination, _source, _metadata in candidates
+        )
+        candidates = [
+            candidate
+            for candidate in candidates
+            if len(PurePosixPath(candidate[0]).parts) == most_specific_depth
+        ]
     if not candidates:
         raise DockerHostPathError(
             "no writable Docker bind-mounted data root satisfies the release profile"

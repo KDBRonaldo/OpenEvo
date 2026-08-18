@@ -89,6 +89,7 @@ class _CoreSshTransport(Protocol):
         canonical_manifest_sha256: str,
         timeout_seconds: float,
         cancel_event: threading.Event | None = None,
+        source_development_service: bool = False,
     ) -> DaemonBundleServicePredecessor: ...
 
     def ensure_managed_runtime_from_daemon(
@@ -112,6 +113,7 @@ class _CoreSshTransport(Protocol):
         *,
         expected_predecessor: DaemonBundleServicePredecessor,
         timeout_seconds: float,
+        source_development_service: bool = False,
     ) -> object: ...
 
     def ensure_daemon_bundle(
@@ -122,6 +124,7 @@ class _CoreSshTransport(Protocol):
         canonical_manifest_sha256: str,
         port: int,
         timeout_seconds: float,
+        source_development_service: bool = False,
     ) -> tuple[RemoteCoreControlAttachment, DaemonBundleServiceStatus]: ...
 
     def run(
@@ -254,6 +257,7 @@ class CoreBootstrapConfigV2:
     managed_runtime_archive: SealedManagedRuntimeArchiveV2 | None
     remote_port: int = 0
     replace_mismatched: bool = False
+    source_development_service: bool = False
 
     def __post_init__(self) -> None:
         daemon = self.daemon_bundle
@@ -269,6 +273,7 @@ class CoreBootstrapConfigV2:
             or type(self.remote_port) is not int
             or not 0 <= self.remote_port <= 65_535
             or type(self.replace_mismatched) is not bool
+            or type(self.source_development_service) is not bool
             or _WHEEL_FILENAME.fullmatch(Path(self.wheel.local_path).name) is None
             or Path(self.framework_lock.local_path).name != "framework-lock.json"
             or self.framework_lock.byte_size > MAX_FRAMEWORK_LOCK_BYTES
@@ -431,6 +436,7 @@ class DesktopCoreSshBridgeAdapterV2:
                 canonical_manifest_sha256=daemon.manifest_sha256,
                 timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
                 cancel_event=activation_cancel,
+                source_development_service=self._bootstrap.source_development_service,
             )
             self._require_same_transport(profile_id, profile_connection_generation, transport)
             transport.ensure_managed_runtime_from_daemon(
@@ -475,12 +481,14 @@ class DesktopCoreSshBridgeAdapterV2:
                     staged,
                     expected_predecessor=predecessor,
                     timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+                    source_development_service=self._bootstrap.source_development_service,
                 )
                 self._require_same_transport(profile_id, profile_connection_generation, transport)
                 predecessor = transport.observe_daemon_bundle_service(
                     staged,
                     canonical_manifest_sha256=daemon.manifest_sha256,
                     timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+                    source_development_service=self._bootstrap.source_development_service,
                 )
                 if predecessor.state != "absent":
                     raise _adapter_error(
@@ -501,6 +509,7 @@ class DesktopCoreSshBridgeAdapterV2:
                 canonical_manifest_sha256=daemon.manifest_sha256,
                 port=self._bootstrap.remote_port,
                 timeout_seconds=min(_remaining(deadline), _MAX_REMOTE_OPERATION_SECONDS),
+                source_development_service=self._bootstrap.source_development_service,
             )
         except DesktopCoreBridgeErrorV2:
             raise

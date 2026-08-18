@@ -18,6 +18,7 @@ from openevo.backend.runtime_identity import (
     CoreReleaseIdentity,
     compute_release_identity,
     default_core_service_root,
+    source_development_core_service_root,
 )
 from openevo.backend.service import (
     CoreDaemonBundleIdentity,
@@ -726,6 +727,7 @@ def build_parser() -> argparse.ArgumentParser:
     service = subparsers.add_parser("service")
     service_subparsers = service.add_subparsers(dest="service_command", required=True)
     ensure = service_subparsers.add_parser("ensure")
+    ensure.add_argument("--source-development-service", action="store_true")
     ensure.add_argument("--port", type=int, default=0)
     ensure.add_argument("--deadline-seconds", type=float, default=45.0)
     predecessor = ensure.add_mutually_exclusive_group(required=True)
@@ -739,12 +741,15 @@ def build_parser() -> argparse.ArgumentParser:
     ensure.add_argument("--expected-canonical-manifest-sha256", required=True)
     ensure.add_argument("--canonical-manifest-path", required=True)
     observe = service_subparsers.add_parser("observe")
+    observe.add_argument("--source-development-service", action="store_true")
     observe.add_argument("--deadline-seconds", type=float, default=15.0)
     observe.add_argument("--expected-bundle-sha256", required=True)
     observe.add_argument("--expected-canonical-manifest-sha256", required=True)
     observe.add_argument("--canonical-manifest-path", required=True)
-    service_subparsers.add_parser("inspect")
+    inspect = service_subparsers.add_parser("inspect")
+    inspect.add_argument("--source-development-service", action="store_true")
     stop = service_subparsers.add_parser("stop")
+    stop.add_argument("--source-development-service", action="store_true")
     stop.add_argument("--deadline-seconds", type=float, default=15.0)
     stop.add_argument("--expect-service-generation", required=True)
     stop.add_argument("--expect-service-release-identity", required=True)
@@ -758,7 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _run_service_command(args: argparse.Namespace) -> dict[str, object]:
-    service_root = default_core_service_root()
+    service_root = (
+        source_development_core_service_root()
+        if args.source_development_service
+        else default_core_service_root()
+    )
     if args.service_command == "ensure":
         bundle_identity = _verified_running_bundle_identity(
             expected_bundle_sha256=args.expected_bundle_sha256,

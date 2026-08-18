@@ -18,6 +18,7 @@ from openevo.backend.runtime_identity import (
     load_or_create_core_bearer_token,
     release_runtime_contract_sha256,
     require_host_global_service_root,
+    source_development_core_service_root,
 )
 
 
@@ -76,6 +77,9 @@ def test_host_global_root_rejects_alternate_per_project_root(
     assert default_core_service_root() == expected
     assert require_host_global_service_root(default_core_service_root()) == (
         default_core_service_root()
+    )
+    assert require_host_global_service_root(source_development_core_service_root()) == (
+        source_development_core_service_root()
     )
     with pytest.raises(RuntimeIdentityError, match="canonical"):
         require_host_global_service_root(tmp_path / "project-a" / "core")

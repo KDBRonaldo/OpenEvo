@@ -17,7 +17,7 @@ import stat
 import sys
 import threading
 import time
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, Literal
 
 import httpx
 
@@ -1193,6 +1193,7 @@ def load_core_bootstrap_config_v2(
     runtime_asset_root: Path | str | None = None,
     source_commit: str,
     packaged_resource_assets: bool = False,
+    source_development_service: bool = False,
 ) -> CoreBootstrapConfigV2:
     """Reuse the sealed asset verifier while issuing only exact v2 identities."""
 
@@ -1250,6 +1251,7 @@ def load_core_bootstrap_config_v2(
         ),
         remote_port=legacy.remote_port,
         replace_mismatched=legacy.replace_mismatched,
+        source_development_service=source_development_service,
     )
 
 
@@ -1328,6 +1330,7 @@ def create_release_core_runtime_v2(
     daemon_asset_root: Path | str | None = None,
     runtime_asset_root: Path | str | None = None,
     packaged_resource_assets: bool = False,
+    build_channel: Literal["release", "development", "test"] = "release",
     startup_phase: Callable[[str], None] | None = None,
 ) -> DesktopReleaseCoreRuntimeV2:
     """Compose the v0.1.10 Core-only business authority."""
@@ -1336,6 +1339,8 @@ def create_release_core_runtime_v2(
         raise TypeError("v2 Core runtime requires the exact provider store")
     if not callable(getattr(remote_lifecycle, "active_transport", None)):
         raise TypeError("v2 Core runtime requires generation-bound system OpenSSH")
+    if build_channel not in {"release", "development", "test"}:
+        raise ValueError("v2 Core runtime build channel is invalid")
     if startup_phase is not None:
         startup_phase("core_bridge_store_v2")
     bridge_store = DesktopCoreBridgeStoreV2(provider_store.state_root / "core-bridge-v2")
@@ -1357,6 +1362,7 @@ def create_release_core_runtime_v2(
                 runtime_asset_root=runtime_asset_root,
                 source_commit=source_commit,
                 packaged_resource_assets=packaged_resource_assets,
+                source_development_service=(build_channel == "development"),
             ),
         )
         connector = DesktopCoreProfileConnectorV2(adapter)

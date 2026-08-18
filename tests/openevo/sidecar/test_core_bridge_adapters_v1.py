@@ -214,6 +214,9 @@ class FakeCoreTransport:
         self.operation_order: list[str] = []
         self.ensure_predecessors: list[DaemonBundleServicePredecessor] = []
         self.stop_predecessors: list[DaemonBundleServicePredecessor] = []
+        self.observe_kwargs: list[dict[str, object]] = []
+        self.stop_kwargs: list[dict[str, object]] = []
+        self.ensure_kwargs: list[dict[str, object]] = []
 
     def stage_daemon_bundle(
         self,
@@ -321,7 +324,8 @@ class FakeCoreTransport:
         bundle: StagedDaemonBundle,
         **kwargs: object,
     ) -> DaemonBundleServicePredecessor:
-        del bundle, kwargs
+        del bundle
+        self.observe_kwargs.append(kwargs)
         self.operation_order.append("daemon_observe")
         if self.observation_error is not None:
             raise self.observation_error
@@ -336,11 +340,15 @@ class FakeCoreTransport:
         expected_predecessor: DaemonBundleServicePredecessor,
         timeout_seconds: float = 30.0,
         cancel_event: threading.Event | None = None,
+        source_development_service: bool = False,
     ) -> DaemonBundleStopReceipt:
         del bundle, timeout_seconds
         if cancel_event is not None and cancel_event.is_set():
             raise SshTransportError(SshTransportErrorCode.CANCELLED)
         self.operation_order.append("daemon_stop")
+        self.stop_kwargs.append(
+            {"source_development_service": source_development_service}
+        )
         self.stop_predecessors.append(expected_predecessor)
         if self.stop_error is not None:
             raise self.stop_error
@@ -360,6 +368,7 @@ class FakeCoreTransport:
         **kwargs: object,
     ) -> object:
         self.operation_order.append("daemon_start")
+        self.ensure_kwargs.append(kwargs)
         predecessor = kwargs["expected_predecessor"]
         assert isinstance(predecessor, DaemonBundleServicePredecessor)
         self.ensure_predecessors.append(predecessor)

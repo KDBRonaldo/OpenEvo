@@ -43,6 +43,7 @@ def _bootstrap(
     tmp_path: Path,
     *,
     replace_mismatched: bool = False,
+    source_development_service: bool = False,
 ) -> CoreBootstrapConfigV2:
     wheel = tmp_path / "openevo-0.1.10-py3-none-any.whl"
     wheel.write_bytes(b"sealed-wheel")
@@ -88,6 +89,7 @@ def _bootstrap(
             oci_index_id=MANAGED_RUNTIME_ARCHIVE_RELEASE.oci_index_id,
         ),
         replace_mismatched=replace_mismatched,
+        source_development_service=source_development_service,
     )
 
 
@@ -142,6 +144,22 @@ def test_adapter_binds_every_daemon_step_to_exact_profile_connection_generation(
     assert not transport.secret_commands
     assert "BBBB" not in repr(attachment)
     assert str(tmp_path) not in repr(adapter)
+
+
+def test_source_development_bootstrap_uses_the_isolated_remote_service_slot(
+    tmp_path: Path,
+) -> None:
+    transport = FakeCoreTransport()
+    lifecycle = _Lifecycle(transport)
+    adapter = DesktopCoreSshBridgeAdapterV2(
+        lifecycle,
+        _bootstrap(tmp_path, source_development_service=True),
+    )
+
+    adapter.ensure_core(PROFILE_ID, 7, deadline=time.monotonic() + 5)
+
+    assert transport.observe_kwargs[-1]["source_development_service"] is True
+    assert transport.ensure_kwargs[-1]["source_development_service"] is True
 
 
 def test_adapter_reuses_profile_connected_daemon_without_a_second_transfer(

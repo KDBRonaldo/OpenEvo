@@ -25,6 +25,7 @@ from openevo.deployment.daemon_bundle_transport import (
     StagedDaemonBundle,
     _STAGE_SCRIPT,
     build_daemon_bundle_ensure_command,
+    build_daemon_bundle_inspect_command,
     build_daemon_bundle_observe_command,
     build_daemon_bundle_stage_command,
     build_daemon_bundle_stop_command,
@@ -696,6 +697,53 @@ def test_ensure_command_uses_public_bundle_command() -> None:
     assert f"--expect-service-release-identity {'5' * 64}" in replacement
     assert f"--expect-service-bundle-sha256 {'a' * 64}" in replacement
     assert "/home/alice" not in repr(bundle)
+
+
+def test_source_development_commands_select_the_isolated_service_slot() -> None:
+    bundle = _staged(digest="a" * 64, size=12)
+    predecessor = DaemonBundleServicePredecessor(
+        state="running",
+        generation="b" * 32,
+        release_identity="5" * 64,
+        bundle_sha256="a" * 64,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+        lifecycle_compatibility=2,
+    )
+
+    ensure = build_daemon_bundle_ensure_command(
+        bundle,
+        port=0,
+        deadline_seconds=45,
+        expected_predecessor=predecessor,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+        source_development_service=True,
+    )
+    observe = build_daemon_bundle_observe_command(
+        bundle,
+        deadline_seconds=12,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+        source_development_service=True,
+    )
+    inspect = build_daemon_bundle_inspect_command(
+        bundle,
+        source_development_service=True,
+    )
+    stop = build_daemon_bundle_stop_command(
+        bundle,
+        deadline_seconds=12,
+        expected_predecessor=predecessor,
+        source_development_service=True,
+    )
+
+    for command in (ensure, observe, inspect, stop):
+        assert command.count("--source-development-service") == 1
+
+    release_command = build_daemon_bundle_observe_command(
+        bundle,
+        deadline_seconds=12,
+        canonical_manifest_sha256=_MANIFEST_DIGEST,
+    )
+    assert "--source-development-service" not in release_command
 
 
 def test_observe_command_and_predecessor_parser_are_closed() -> None:

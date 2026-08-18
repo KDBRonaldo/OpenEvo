@@ -36,6 +36,7 @@ RUNTIME_DOWNLOAD_URL = (
 @dataclass(frozen=True, slots=True)
 class FormalDevelopmentAssets:
     source_commit: str
+    development_snapshot_sha256: str | None
     release_assets_root: Path
     askpass_helper: Path
 
@@ -49,14 +50,34 @@ def prepare_formal_development_assets(
     repository_root: Path,
     source_commit: str,
     cache_root: Path,
+    development_snapshot_sha256: str | None = None,
     managed_runtime_archive: Path | None = None,
     run: Callable[..., subprocess.CompletedProcess[object]] = subprocess.run,
 ) -> FormalDevelopmentAssets:
-    """Build and cache the exact assets consumed by the formal local sidecar."""
+    """Build and cache the exact assets consumed by the formal local sidecar.
+
+    ``development_snapshot_sha256`` is deliberately separate from the release
+    ``source_commit``.  Source-development launchers may build a dirty checkout,
+    but those bytes must never reuse the clean commit cache.  Release tooling
+    continues to use only the immutable commit identity.
+    """
 
     repository_root = repository_root.resolve(strict=True)
     cache_root = cache_root.expanduser().absolute()
-    commit_root = cache_root / source_commit
+    if development_snapshot_sha256 is not None and (
+        len(development_snapshot_sha256) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in development_snapshot_sha256
+        )
+    ):
+        raise FormalDevelopmentAssetError(
+            "development snapshot identity must be one lowercase SHA-256"
+        )
+    cache_identity = source_commit
+    if development_snapshot_sha256 is not None:
+        cache_identity = f"{source_commit}-dirty-{development_snapshot_sha256}"
+    commit_root = cache_root / cache_identity
     commit_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
         os.chmod(commit_root, 0o700)
@@ -89,6 +110,7 @@ def prepare_formal_development_assets(
     _verify_askpass_helper(askpass_helper)
     return FormalDevelopmentAssets(
         source_commit=source_commit,
+        development_snapshot_sha256=development_snapshot_sha256,
         release_assets_root=release_assets_root,
         askpass_helper=askpass_helper,
     )
@@ -163,7 +185,8 @@ def _build_release_assets(
 ) -> None:
     inputs = commit_root / "daemon-inputs"
     resource_script = repository_root / "scripts/ci/openevo_desktop_daemon_resource.py"
-    if not inputs.exists():
+    if not _release_inputs_complete(inputs, source_commit=source_commit):
+        _discard_incomplete_release_inputs(inputs, commit_root=commit_root)
         print("[formal 1/3] Building the commit-bound Core wheel and Daemon bundle...")
         _run_checked(
             run,
@@ -210,6 +233,52 @@ def _build_release_assets(
         ],
         cwd=repository_root,
     )
+
+
+def _release_inputs_complete(inputs: Path, *, source_commit: str) -> bool:
+    """Return whether an interrupted build left a reusable input bundle."""
+
+    try:
+        metadata = inputs.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    if not stat.S_ISDIR(metadata.st_mode):
+        return False
+    required = (
+        inputs / "daemon/openevo-daemon-linux-x86_64",
+        inputs / "daemon/openevo-daemon-bundle.json",
+        inputs / "core/framework-lock.json",
+    )
+    if any(not path.is_file() or path.is_symlink() for path in required):
+        return False
+    wheels = list((inputs / "core").glob("openevo-*.whl"))
+    if len(wheels) != 1 or wheels[0].is_symlink():
+        return False
+    try:
+        _read_registry_digest(required[1], source_commit=source_commit)
+    except FormalDevelopmentAssetError:
+        return False
+    return True
+
+
+def _discard_incomplete_release_inputs(inputs: Path, *, commit_root: Path) -> None:
+    """Remove only the private, commit-scoped, non-authoritative build cache."""
+
+    if not inputs.exists() and not inputs.is_symlink():
+        return
+    if inputs.parent != commit_root or inputs.name != "daemon-inputs":
+        raise FormalDevelopmentAssetError("refusing to replace an unexpected build cache path")
+    try:
+        if inputs.is_symlink() or not inputs.is_dir():
+            inputs.unlink()
+        else:
+            shutil.rmtree(inputs)
+    except OSError as exc:
+        raise FormalDevelopmentAssetError(
+            "incomplete formal build cache could not be replaced"
+        ) from exc
 
 
 def _read_registry_digest(manifest_path: Path, *, source_commit: str) -> str:
