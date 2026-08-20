@@ -93,6 +93,7 @@ export function DesktopProductApp({
   const [busy, setBusy] = useState(false);
   const [workspace, setWorkspace] = useState<Workspace>("research");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
   const [connectionOpen, setConnectionOpen] = useState(false);
   const [projectOpen, setProjectOpen] = useState(false);
   const [projectEditing, setProjectEditing] = useState(false);
@@ -250,6 +251,15 @@ export function DesktopProductApp({
   ) ?? null;
   const connectedProfiles = snapshot.profiles.filter(isConnectedProfile);
   const generation = displayedProject?.active_project_head?.generation ?? 0;
+  const displayedProjectTasks = displayedProject === null ? [] : snapshot.tasks.filter(
+    (task) => task.project_id === displayedProject.project_id,
+  );
+  const displayedWorkspace = displayedProject === null
+    ? undefined
+    : snapshot.runtimePresentation?.workspaces?.[displayedProject.project_id];
+  const selectedWorkspaceEntry = displayedWorkspace?.entries.find(
+    (entry) => entry.kind === "file" && entry.path === selectedWorkspacePath,
+  ) ?? null;
   const lifecycleStates = provider.listLifecycleOperations();
   const coreOperations = provider.listCoreOperations();
   const diagnostics = provider.listDiagnostics();
@@ -338,66 +348,99 @@ export function DesktopProductApp({
     }
   };
 
+  const selectProject = (projectId: string): void => {
+    const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
+    if (!project) return;
+    setSelectedWorkspacePath(null);
+    setWorkspace("research");
+    if (project.project_id === activeProject?.project_id) {
+      setSelectedTaskId(snapshot.tasks.find((task) => task.project_id === projectId)?.task_id ?? null);
+      return;
+    }
+    setSelectedTaskId(null);
+    void act(
+      () => provider.activateProject(project.project_id, intentFor(snapshot, "activate-project")),
+      `Switched to ${project.display_name}.`,
+    ).then((result) => {
+      if (result === null || result.snapshot === null) return;
+      setSelectedTaskId(result.snapshot.tasks.find((task) => task.project_id === projectId)?.task_id ?? null);
+    });
+  };
+
+  const uploadWorkspaceFiles = (files: readonly File[], overwrite: boolean): void => {
+    if (displayedProject === null) return;
+    void act(
+      async () => {
+        if (!provider.uploadWorkspaceFile) throw new Error("This backend does not support workspace uploads.");
+        for (const file of files) {
+          await provider.uploadWorkspaceFile(
+            displayedProject.project_id,
+            {
+              path: file.name,
+              data: file,
+              mediaType: file.type || "application/octet-stream",
+              overwrite,
+            },
+            intentFor(snapshot, "upload-workspace-file"),
+          );
+        }
+      },
+      `${files.length} workspace file${files.length === 1 ? "" : "s"} uploaded to the remote server.`,
+    );
+  };
+
+  const downloadWorkspaceFile = (path: string): void => {
+    if (displayedProject === null) return;
+    void act(
+      async () => {
+        if (!provider.downloadWorkspaceFile) throw new Error("This backend does not support workspace downloads.");
+        const download = await provider.downloadWorkspaceFile(displayedProject.project_id, path);
+        saveBrowserDownload(download.data, download.fileName);
+      },
+      `${path} downloaded from the remote workspace.`,
+    );
+  };
+
   return (
     <div className="product-shell product-v2-shell" data-provider-kind="desktop_sidecar" data-api-version="2">
-      <aside className="product-sidebar" aria-label="Primary navigation">
-        <div className="product-brand" aria-label="OpenEvo Desktop">
+      <aside className="product-activitybar" aria-label="Primary navigation">
+        <div className="product-brand" aria-label="OpenEvo Desktop" title="OpenEvo Desktop">
           <span className="product-mark"><OpenEvoMark /></span>
-          <span>OpenEvo</span>
         </div>
         <nav className="product-nav" aria-label="Workspace views">
-          <WorkspaceButton active={workspace === "research"} onClick={() => { setWorkspace("research"); setSelectedTaskId(null); }} icon={BookOpen}>Research</WorkspaceButton>
-          {activeProject && snapshot.tasks.some((task) => task.project_id === activeProject.project_id) ? (
-            <div className="sidebar-sessions" aria-label={`${activeProject.display_name} sessions`}>
-              <div className="sidebar-sessions-label">Sessions</div>
-              {snapshot.tasks.filter((task) => task.project_id === activeProject.project_id).map((task, index) => (
-                <button type="button" className={`sidebar-session-item ${workspace === "research" && selectedTaskId === task.task_id ? "active" : ""}`} key={task.task_id} onClick={() => { setWorkspace("research"); setSelectedTaskId(task.task_id); }}>
-                  <span>{snapshot.runtimePresentation?.tasks[task.task_id]?.instruction?.title ?? `Session ${index + 1}`}</span>
-                  <small>{task.state.replaceAll("_", " ")}</small>
-                </button>
-              ))}
-            </div>
-          ) : null}
+          <WorkspaceButton active={workspace === "research"} onClick={() => setWorkspace("research")} icon={BookOpen}>Research</WorkspaceButton>
           <WorkspaceButton active={workspace === "evolution"} onClick={() => setWorkspace("evolution")} icon={Sparkles}>Evolution</WorkspaceButton>
           <WorkspaceButton active={workspace === "system"} onClick={() => setWorkspace("system")} icon={Activity}>System</WorkspaceButton>
         </nav>
-        <div className="sidebar-foot">
-          <div className="sidebar-foot-label">
-            Active Project Head
-          </div>
-          <div className="sidebar-revision"><CircleDot size={15} /><span>Generation {generation}</span></div>
-        </div>
+        <button type="button" className="activitybar-settings" aria-label="Remote workspace settings" title="Remote workspace settings" onClick={() => setConnectionOpen(true)}><Settings size={19} /></button>
       </aside>
+
+      <ProjectExplorerV2
+        projects={snapshot.projects}
+        activeProject={displayedProject}
+        workspace={displayedWorkspace}
+        selectedPath={selectedWorkspacePath}
+        busy={busy}
+        fileTransferAvailable={provider.uploadWorkspaceFile !== undefined && provider.downloadWorkspaceFile !== undefined}
+        onSelectProject={selectProject}
+        onCreateProject={() => { setProjectEditing(false); setProjectOpen(true); }}
+        onSelectFile={(path) => { setWorkspace("research"); setSelectedTaskId(null); setSelectedWorkspacePath(path); }}
+        onUpload={uploadWorkspaceFiles}
+        generation={generation}
+      />
+
+      <SessionExplorerV2
+        project={displayedProject}
+        tasks={displayedProjectTasks}
+        presentation={snapshot.runtimePresentation?.tasks}
+        selectedTaskId={selectedTaskId}
+        onSelectTask={(taskId) => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(taskId); }}
+        onNewSession={() => { setWorkspace("research"); setSelectedWorkspacePath(null); setSelectedTaskId(null); }}
+      />
 
       <div className="product-stage">
         <header className="product-topbar">
-          <div className="project-switcher-wrap">
-            <label htmlFor="v2-project-switcher">Project</label>
-            <div className="project-switcher-control">
-              <select
-                id="v2-project-switcher"
-                value={displayedProject ? `project:${displayedProject.project_id}` : ""}
-                onChange={(event) => {
-                  const projectId = event.target.value.slice(8);
-                  const project = snapshot.projects.find((candidate) => candidate.project_id === projectId);
-                  if (!project) return;
-                  setSelectedTaskId(null);
-                  setWorkspace("research");
-                  if (project.project_id === activeProject?.project_id) return;
-                  void act(
-                    () => provider.activateProject(project.project_id, intentFor(snapshot, "activate-project")),
-                    `Switching to ${project.display_name}.`,
-                  );
-                }}
-              >
-                {snapshot.projects.length === 0 ? <option value="">No projects</option> : null}
-                {snapshot.projects.map((project) => (
-                  <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>
-                ))}
-              </select>
-            </div>
-            {connectedProfiles.length > 0 ? <button type="button" className="icon-button" aria-label="Create project" title="Create project" disabled={busy} onClick={() => { setProjectEditing(false); setProjectOpen(true); }}><Plus size={17} /></button> : null}
-          </div>
+          <div className="workspace-breadcrumb"><span>{workspace === "research" ? selectedWorkspaceEntry ? "File" : "Session" : workspace === "evolution" ? "Evolution" : "System"}</span><ChevronRight size={14} /><strong>{selectedWorkspaceEntry?.path ?? (selectedTaskId ? snapshot.runtimePresentation?.tasks[selectedTaskId]?.instruction?.title : displayedProject?.display_name) ?? "OpenEvo"}</strong></div>
           <div className="topbar-actions">
             {displayedProject === null && connectedProfiles.length > 0 ? (
               <button type="button" className="secondary-button" onClick={() => { setProjectEditing(false); setProjectOpen(true); }}>
@@ -436,6 +479,14 @@ export function DesktopProductApp({
               onConnectRemote={() => setConnectionOpen(true)}
               onCreateProject={() => { setProjectEditing(false); setProjectOpen(true); }}
             />
+          ) : workspace === "research" && selectedWorkspaceEntry !== null ? (
+            <ProjectFileWorkspaceV2
+              project={displayedProject}
+              entry={selectedWorkspaceEntry}
+              fileTransferAvailable={provider.downloadWorkspaceFile !== undefined}
+              busy={busy}
+              onDownload={() => downloadWorkspaceFile(selectedWorkspaceEntry.path)}
+            />
           ) : workspace === "research" ? (
             <ResearchWorkspaceV2
               project={displayedProject}
@@ -453,33 +504,6 @@ export function DesktopProductApp({
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
               onRun={(task, selectedEvolutionTargets) => void runProject(displayedProject, task, selectedEvolutionTargets)}
-              fileTransferAvailable={provider.uploadWorkspaceFile !== undefined && provider.downloadWorkspaceFile !== undefined}
-              onUploadWorkspaceFiles={(files, overwrite) => void act(
-                async () => {
-                  if (!provider.uploadWorkspaceFile) throw new Error("This backend does not support workspace uploads.");
-                  for (const file of files) {
-                    await provider.uploadWorkspaceFile(
-                      displayedProject.project_id,
-                      {
-                        path: file.name,
-                        data: file,
-                        mediaType: file.type || "application/octet-stream",
-                        overwrite,
-                      },
-                      intentFor(snapshot, "upload-workspace-file"),
-                    );
-                  }
-                },
-                `${files.length} workspace file${files.length === 1 ? "" : "s"} uploaded to the remote server.`,
-              )}
-              onDownloadWorkspaceFile={(path) => void act(
-                async () => {
-                  if (!provider.downloadWorkspaceFile) throw new Error("This backend does not support workspace downloads.");
-                  const download = await provider.downloadWorkspaceFile(displayedProject.project_id, path);
-                  saveBrowserDownload(download.data, download.fileName);
-                },
-                `${path} downloaded from the remote workspace.`,
-              )}
               onCancelTask={(task) => void act(
                 () => provider.cancelTask(task.task_id, intentFor(snapshot, "cancel-task")),
                 "Task cancellation requested.",
@@ -1144,6 +1168,134 @@ function NewProjectDialogV2({
   );
 }
 
+type ProjectWorkspacePresentationV2 = NonNullable<
+  NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["workspaces"]
+>[string];
+
+function ProjectExplorerV2({
+  projects,
+  activeProject,
+  workspace,
+  selectedPath,
+  busy,
+  fileTransferAvailable,
+  onSelectProject,
+  onCreateProject,
+  onSelectFile,
+  onUpload,
+  generation,
+}: {
+  readonly projects: readonly ProjectV2[];
+  readonly activeProject: ProjectV2 | null;
+  readonly workspace: ProjectWorkspacePresentationV2 | undefined;
+  readonly selectedPath: string | null;
+  readonly busy: boolean;
+  readonly fileTransferAvailable: boolean;
+  readonly onSelectProject: (projectId: string) => void;
+  readonly onCreateProject: () => void;
+  readonly onSelectFile: (path: string) => void;
+  readonly onUpload: (files: readonly File[], overwrite: boolean) => void;
+  readonly generation: number;
+}) {
+  const entries = [...(workspace?.entries ?? [])].sort((left, right) => left.path.localeCompare(right.path));
+  const files = entries.filter((entry) => entry.kind === "file");
+  const [collapsedDirectories, setCollapsedDirectories] = useState<ReadonlySet<string>>(new Set());
+  const uploadInputRef = useRef<HTMLInputElement>(null);
+  useEffect(() => setCollapsedDirectories(new Set()), [activeProject?.project_id]);
+  const visibleEntries = entries.filter((entry) => {
+    const parts = entry.path.split("/");
+    return !parts.slice(0, -1).some((_, index) => collapsedDirectories.has(parts.slice(0, index + 1).join("/")));
+  });
+  return (
+    <aside className="project-explorer" aria-label="Project explorer">
+      <div className="explorer-heading"><span>Project</span><button type="button" aria-label="Create project" title="Create project" disabled={busy} onClick={onCreateProject}><Plus size={15} /></button></div>
+      <select id="v2-project-switcher" aria-label="Select project" value={activeProject ? `project:${activeProject.project_id}` : ""} disabled={busy || projects.length === 0} onChange={(event) => onSelectProject(event.target.value.replace(/^project:/, ""))}>
+        {projects.length === 0 ? <option value="">No projects</option> : null}
+        {projects.map((project) => <option key={project.project_id} value={`project:${project.project_id}`}>{project.display_name}</option>)}
+      </select>
+      <div className="explorer-section-heading"><span>Files</span><div><span>{files.length}</span>{fileTransferAvailable ? <><input ref={uploadInputRef} className="project-workspace-file-input" type="file" multiple aria-label="Choose files to upload" onChange={(event) => {
+        const selectedFiles = Array.from(event.currentTarget.files ?? []);
+        event.currentTarget.value = "";
+        if (selectedFiles.length === 0) return;
+        const existingPaths = new Set(files.map((file) => file.path));
+        const hasCollision = selectedFiles.some((file) => existingPaths.has(file.name));
+        if (hasCollision && !globalThis.confirm("One or more files already exist in this workspace. Replace them?")) return;
+        onUpload(selectedFiles, hasCollision);
+      }} /><button type="button" aria-label="Upload files" title="Upload files" disabled={busy || activeProject === null} onClick={() => uploadInputRef.current?.click()}><Upload size={14} /></button></> : null}</div></div>
+      <div className="explorer-file-tree" role="tree" aria-label="Project workspace files">
+        {visibleEntries.length ? visibleEntries.map((entry) => {
+          const depth = Math.max(0, entry.path.split("/").length - 1);
+          const name = entry.path.split("/").at(-1) ?? entry.path;
+          const selected = entry.kind === "file" && entry.path === selectedPath;
+          const collapsed = entry.kind === "directory" && collapsedDirectories.has(entry.path);
+          return <button type="button" role="treeitem" aria-selected={selected} aria-expanded={entry.kind === "directory" ? !collapsed : undefined} key={`${entry.kind}:${entry.path}`} className={selected ? "selected" : ""} style={{ paddingLeft: `${9 + depth * 14}px` }} onClick={() => {
+            if (entry.kind === "directory") {
+              setCollapsedDirectories((current) => {
+                const next = new Set(current);
+                if (next.has(entry.path)) next.delete(entry.path); else next.add(entry.path);
+                return next;
+              });
+            } else if (entry.kind === "file") onSelectFile(entry.path);
+          }}>
+            {entry.kind === "directory" ? collapsed ? <ChevronRight size={13} /> : <ChevronDown size={13} /> : <span className="explorer-tree-spacer" />}
+            {entry.kind === "directory" ? <FolderOpen size={14} /> : <FileText size={14} />}
+            <span title={entry.path}>{name}</span>
+          </button>;
+        }) : <div className="explorer-empty">No files yet</div>}
+      </div>
+      {workspace?.truncated ? <div className="explorer-warning">File preview is truncated.</div> : null}
+      <div className="explorer-foot"><CircleDot size={13} /><span>Active Project Head {generation}</span></div>
+    </aside>
+  );
+}
+
+function SessionExplorerV2({
+  project,
+  tasks,
+  presentation,
+  selectedTaskId,
+  onSelectTask,
+  onNewSession,
+}: {
+  readonly project: ProjectV2 | null;
+  readonly tasks: readonly TaskV2[];
+  readonly presentation: NonNullable<DesktopProductSnapshotV2["runtimePresentation"]>["tasks"] | undefined;
+  readonly selectedTaskId: string | null;
+  readonly onSelectTask: (taskId: string) => void;
+  readonly onNewSession: () => void;
+}) {
+  return (
+    <aside className="session-explorer" aria-label="Project sessions">
+      <div className="explorer-heading"><span>Sessions</span><button type="button" aria-label="New session" title="New session" disabled={project === null} onClick={onNewSession}><Plus size={15} /></button></div>
+      <div className="session-explorer-project">{project?.display_name ?? "No project selected"}</div>
+      <div className="session-explorer-list">
+        {tasks.length ? tasks.map((task, index) => <button type="button" className={task.task_id === selectedTaskId ? "active" : ""} key={task.task_id} onClick={() => onSelectTask(task.task_id)}><span className={`session-state-dot ${task.state}`} aria-hidden="true" /><span><strong>{presentation?.[task.task_id]?.instruction?.title ?? `Session ${tasks.length - index}`}</strong><small>{formatTimeV2(task.updated_at)}</small></span><em>{task.state.replaceAll("_", " ")}</em></button>) : <div className="explorer-empty">No Sessions yet. Create the first task in the central workspace.</div>}
+      </div>
+    </aside>
+  );
+}
+
+function ProjectFileWorkspaceV2({
+  project,
+  entry,
+  fileTransferAvailable,
+  busy,
+  onDownload,
+}: {
+  readonly project: ProjectV2;
+  readonly entry: ProjectWorkspacePresentationV2["entries"][number];
+  readonly fileTransferAvailable: boolean;
+  readonly busy: boolean;
+  readonly onDownload: () => void;
+}) {
+  return (
+    <div className="workspace-stack project-file-workspace" data-testid="project-file-workspace">
+      <div className="workspace-heading"><div><p className="eyebrow">{project.display_name} / File</p><h1>{entry.path}</h1><p>{entry.mediaType ?? "unknown format"} · {formatBytes(entry.byteSize)}</p></div>{fileTransferAvailable ? <button type="button" className="secondary-button" disabled={busy} onClick={onDownload}><Download size={15} /> Download</button> : null}</div>
+      <section className="product-panel project-file-editor"><header><FileText size={16} /><strong>{entry.path}</strong><span>{entry.contentSha256 ? shortDigest(entry.contentSha256) : "No digest"}</span></header>{entry.content !== null ? <pre>{entry.content}</pre> : <div className="quiet-empty"><FileText size={24} /><p>This file is available to the remote Agent, but its format or size is outside the bounded browser preview.</p></div>}</section>
+    </div>
+  );
+}
+
 function ResearchWorkspaceV2({
   project,
   tasks,
@@ -1160,9 +1312,6 @@ function ResearchWorkspaceV2({
   onOpenSettings,
   onRetryInitialization,
   onRun,
-  fileTransferAvailable,
-  onUploadWorkspaceFiles,
-  onDownloadWorkspaceFile,
   onCancelTask,
   onRetryTask,
   onRetryEvolutionJob,
@@ -1188,9 +1337,6 @@ function ResearchWorkspaceV2({
     task: ScienceProjectConfigV2["task"],
     selectedEvolutionTargets: ScienceProjectConfigV2["evolution"]["targets"],
   ) => void;
-  readonly fileTransferAvailable: boolean;
-  readonly onUploadWorkspaceFiles: (files: readonly File[], overwrite: boolean) => void;
-  readonly onDownloadWorkspaceFile: (path: string) => void;
   readonly onCancelTask: (task: TaskV2) => void;
   readonly onRetryTask: (task: TaskV2) => void;
   readonly onRetryEvolutionJob: (jobId: string) => void;
@@ -1332,14 +1478,6 @@ function ResearchWorkspaceV2({
         {observedTask ? <><div className="revision-pin"><div><span>Pinned context</span><strong>Project Head {observedTask.admission.predecessor_project_head.generation}</strong></div><ArrowRight size={16} /><div><span>Admission source</span><strong>Immutable Task Admission</strong></div><span className={`state-pill ${observedTask.state}`}>{observedTask.state.replaceAll("_", " ")}</span></div><p className="v2-session-summary">{runtimePresentation?.tasks[observedTask.task_id]?.instruction?.objective ?? "The historical task text is not included in this authority response."}</p><button type="button" className="text-button" onClick={() => onSelectTask(observedTask.task_id)}>Open session result <ArrowRight size={14} /></button></> : <div className="quiet-empty"><Play size={22} /><p>Start a session when the remote workspace is ready.</p></div>}
       </section>
       </div>
-      <ProjectWorkspacePanelV2
-        workspace={runtimePresentation?.workspaces?.[project.project_id]}
-        busy={busy}
-        fileTransferAvailable={fileTransferAvailable}
-        onUpload={onUploadWorkspaceFiles}
-        onDownload={onDownloadWorkspaceFile}
-      />
-      <section className="history-section"><div className="section-heading"><div><History size={17} /><h2>Session history</h2></div><span>{projectTasks.length} total</span></div>{projectTasks.length ? <TaskHistoryTableV2 tasks={projectTasks} presentation={runtimePresentation?.tasks} selectedTaskId={selectedTaskId} transitions={transitions} onOpenTask={onSelectTask} /> : <div className="empty-row">Completed and active sessions will appear here.</div>}</section>
       {project.active_project_head ? <details className="v2-authority-details"><summary>View immutable project authority</summary><AuthorityCardsV2 project={project} /></details> : null}
     </div>
   );

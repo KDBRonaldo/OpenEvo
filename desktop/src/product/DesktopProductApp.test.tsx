@@ -729,6 +729,64 @@ describe("Desktop v2 product renderer", () => {
     expect(document.body.textContent).not.toContain("Demo Project Head");
   });
 
+  it("uses project files and Sessions as persistent sidebars around the central workspace", async () => {
+    const base = authoritySnapshot();
+    const snapshot: DesktopProductSnapshotV2 = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        workspaces: {
+          "project-1": {
+            entries: [
+              {
+                path: "results",
+                kind: "directory",
+                byteSize: 0,
+                contentSha256: null,
+                mediaType: null,
+                content: null,
+                modifiedAt: NOW,
+              },
+              {
+                path: "results/report.md",
+                kind: "file",
+                byteSize: 42,
+                contentSha256: DIGEST,
+                mediaType: "text/markdown",
+                content: "# Remote report\n\nA project workspace file.",
+                modifiedAt: NOW,
+              },
+            ],
+            truncated: false,
+          },
+        },
+      },
+    };
+    root = await render(providerFixture(snapshot));
+
+    expect(document.querySelector(".product-activitybar")).toBeTruthy();
+    expect(document.querySelector(".project-explorer")).toBeTruthy();
+    expect(document.querySelector(".session-explorer")).toBeTruthy();
+    expect(document.body.textContent).toContain("report.md");
+    expect(document.body.textContent).toContain("Review evidence");
+
+    await click("report.md");
+    expect(document.querySelector('[data-testid="project-file-workspace"]')).toBeTruthy();
+    expect(document.body.textContent).toContain("A project workspace file.");
+
+    await click("Review evidence");
+    expect(document.querySelector('[data-testid="session-detail-workspace"]')).toBeTruthy();
+    expect(document.body.textContent).toContain("Review the evidence and update the workspace.");
+    expect(document.body.textContent).toContain("I checked the evidence table");
+    expect(document.body.textContent).toContain("Context used");
+    expect(document.body.textContent).toContain("artifact-memory-1");
+
+    await click("Evolution");
+    expect(document.body.textContent).toContain("Cross-session changes");
+    expect(document.querySelector(".project-explorer")).toBeTruthy();
+    expect(document.querySelector(".session-explorer")).toBeTruthy();
+  });
+
   it("keeps one authoritative event subscription across the initial refresh", async () => {
     const provider = providerFixture(baseSnapshot());
     root = await render(provider);
@@ -1061,7 +1119,7 @@ describe("Desktop v2 product renderer", () => {
       "Unsupported conclusions are marked as hypotheses",
     );
     expect(document.body.textContent).not.toContain("Task draft");
-    expect(document.body.textContent).not.toContain("Session history");
+    expect(document.querySelector(".session-explorer")).toBeTruthy();
 
     await click("Back to Protein study");
 
@@ -1069,7 +1127,7 @@ describe("Desktop v2 product renderer", () => {
       document.querySelector('[data-testid="session-detail-workspace"]'),
     ).toBeFalsy();
     expect(document.body.textContent).toContain("Task draft");
-    expect(document.body.textContent).toContain("Session history");
+    expect(document.querySelector(".session-explorer-list")).toBeTruthy();
   });
 
   it("browses memory, skill, and agent-system previews and their changes", async () => {
