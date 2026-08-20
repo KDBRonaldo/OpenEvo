@@ -1153,6 +1153,64 @@ describe("Desktop v2 product renderer", () => {
     ).toBeTruthy();
   });
 
+  it("shows the latest standalone Evolution result inline and collapses history", async () => {
+    const base = authoritySnapshot();
+    const snapshot = {
+      ...base,
+      runtimePresentation: {
+        ...base.runtimePresentation!,
+        evolutionRuns: [
+          {
+            runId: "evolution-run-previous",
+            projectId: "project-1",
+            sourceTaskIds: ["task-1"],
+            selections: [{ targetId: "text_memory", method: "text_memory_reflector", config: {} }],
+            state: "applied" as const,
+            artifactIds: ["artifact-memory-1"],
+            jobIds: [],
+            error: null,
+            createdAt: "2026-07-22T06:00:00Z",
+            updatedAt: "2026-07-22T06:00:00Z",
+          },
+          {
+            runId: "evolution-run-current",
+            projectId: "project-1",
+            sourceTaskIds: ["task-1"],
+            selections: [
+              { targetId: "text_memory", method: "text_memory_reflector", config: {} },
+              { targetId: "skill_bundle", method: "skill_bundle_reflector", config: {} },
+            ],
+            state: "candidate_ready" as const,
+            artifactIds: ["artifact-memory-2", "artifact-skill-2"],
+            jobIds: [],
+            error: null,
+            createdAt: NOW,
+            updatedAt: NOW,
+          },
+        ],
+      },
+    };
+    const provider = {
+      ...providerFixture(snapshot),
+      startEvolutionRun: vi.fn(async () => undefined),
+      applyEvolutionRun: vi.fn(async () => undefined),
+    } satisfies DesktopProductProviderV2;
+    root = await render(provider);
+
+    await click("Evolution");
+
+    expect(document.body.textContent).toContain("Current Evolution Result");
+    expect(document.body.textContent).toContain(
+      "Mark every unsupported conclusion as a hypothesis",
+    );
+    expect(document.querySelector(".v2-evolution-history")?.hasAttribute("open")).toBe(false);
+    expect(document.querySelector(".v2-all-evolution-artifacts")?.hasAttribute("open")).toBe(false);
+    expect(document.body.textContent).toContain("Apply to future Sessions");
+
+    await click("Skill bundle");
+    expect(document.body.textContent).toContain("Enumerate claims");
+  });
+
   it("coalesces an SSE refresh with the Start session authority preflight", async () => {
     const snapshot = authoritySnapshot();
     const provider = providerFixture(snapshot);

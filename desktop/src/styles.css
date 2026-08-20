@@ -4234,6 +4234,11 @@ pre.json {
   border-left-color: var(--accent);
 }
 
+.v2-evolution-job.candidate_ready,
+.v2-evolution-job.applied {
+  border-left-color: var(--accent);
+}
+
 .v2-evolution-job.failed {
   border-color: #edcaca;
   border-left-color: var(--danger);
@@ -4295,6 +4300,12 @@ pre.json {
   background: var(--accent-soft);
 }
 
+.v2-evolution-job-state.candidate_ready,
+.v2-evolution-job-state.applied {
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
 .v2-evolution-job-state.failed {
   color: var(--danger);
   background: var(--danger-soft);
@@ -4330,6 +4341,172 @@ pre.json {
   font-size: 12px;
   line-height: 1.45;
   overflow-wrap: anywhere;
+}
+
+.v2-current-evolution-run {
+  margin-top: 14px;
+  padding: 18px;
+}
+
+.v2-current-evolution-result {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.28fr) minmax(0, 1fr);
+  gap: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line);
+}
+
+.v2-current-evolution-tabs {
+  display: grid;
+  align-content: start;
+  gap: 7px;
+}
+
+.v2-current-evolution-tabs button {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+}
+
+.v2-current-evolution-tabs button.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.v2-current-evolution-tabs button span,
+.v2-current-evolution-tabs button strong,
+.v2-current-evolution-tabs button small {
+  display: block;
+}
+
+.v2-current-evolution-tabs button small {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.v2-current-evolution-viewer {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.v2-current-evolution-viewer-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.v2-current-evolution-viewer-head h3,
+.v2-current-evolution-viewer-head p {
+  margin: 0;
+}
+
+.v2-current-evolution-viewer-head h3 {
+  margin-top: 4px;
+  font-size: 18px;
+}
+
+.v2-current-evolution-viewer-head p {
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.v2-current-evolution-viewer .segmented-control {
+  margin-top: 12px;
+}
+
+.v2-current-evolution-empty {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 74px;
+  padding: 14px;
+  border-radius: 8px;
+  color: var(--muted);
+  background: var(--surface-soft);
+}
+
+.v2-evolution-history,
+.v2-all-evolution-artifacts {
+  margin-top: 14px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: var(--surface);
+}
+
+.v2-evolution-history > summary,
+.v2-all-evolution-artifacts > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 14px;
+  color: var(--muted);
+  cursor: pointer;
+  list-style: none;
+}
+
+.v2-evolution-history > summary::-webkit-details-marker,
+.v2-all-evolution-artifacts > summary::-webkit-details-marker {
+  display: none;
+}
+
+.v2-evolution-history > summary span,
+.v2-all-evolution-artifacts > summary span {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 700;
+}
+
+.v2-evolution-history > summary strong,
+.v2-all-evolution-artifacts > summary strong {
+  display: grid;
+  min-width: 24px;
+  height: 24px;
+  place-items: center;
+  border-radius: 999px;
+  color: var(--ink);
+  background: var(--surface-soft);
+  font-size: 11px;
+}
+
+.v2-evolution-history[open] > summary,
+.v2-all-evolution-artifacts[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+
+.v2-evolution-history .v2-evolution-job-list {
+  padding: 0 14px 14px;
+}
+
+.v2-all-evolution-artifacts .v2-evolution-results {
+  padding: 14px;
+}
+
+@media (max-width: 920px) {
+  .v2-current-evolution-result {
+    grid-template-columns: 1fr;
+  }
+
+  .v2-current-evolution-tabs {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
 }
 
 .v2-evolution-attempt-details {
