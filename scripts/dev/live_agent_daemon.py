@@ -1389,9 +1389,21 @@ class DevelopmentStateStore:
                     "SELECT * FROM development_projects ORDER BY created_at, project_id"
                 )
             ]
-            sessions = [self._session_record(row) for row in connection.execute(
-                "SELECT * FROM development_sessions ORDER BY created_at, session_id"
-            )]
+            evidence_session_ids = {
+                row["session_id"]
+                for row in connection.execute(
+                    "SELECT session_id FROM development_dataset_artifacts"
+                )
+            }
+            sessions = [
+                self._session_record(
+                    row,
+                    evolution_evidence_ready=row["session_id"] in evidence_session_ids,
+                )
+                for row in connection.execute(
+                    "SELECT * FROM development_sessions ORDER BY created_at, session_id"
+                )
+            ]
             artifacts = [self._artifact_record(row) for row in connection.execute(
                 "SELECT * FROM development_evolution_artifacts_v2 ORDER BY created_at, artifact_id"
             )]
@@ -1623,9 +1635,13 @@ class DevelopmentStateStore:
                 "SELECT * FROM development_sessions WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
+            evidence_ready = connection.execute(
+                "SELECT 1 FROM development_dataset_artifacts WHERE session_id = ?",
+                (session_id,),
+            ).fetchone() is not None
         if row is None:
             raise KeyError(session_id)
-        return self._session_record(row)
+        return self._session_record(row, evolution_evidence_ready=evidence_ready)
 
     def cancellation_requested(self, session_id: str) -> bool:
         with self._lock, self._connection() as connection:
@@ -1837,6 +1853,17 @@ class DevelopmentStateStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def completed_sessions(self) -> list[dict[str, Any]]:
+        """Return successful Sessions that can be sealed as transcript evidence."""
+
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM development_sessions "
+                "WHERE state = 'completed' AND response IS NOT NULL "
+                "ORDER BY created_at, session_id"
+            ).fetchall()
+        return [self._session_record(row) for row in rows]
+
     def start_evolution_run(
         self,
         run_id: str,
@@ -1867,8 +1894,15 @@ class DevelopmentStateStore:
                 f"WHERE session_id IN ({','.join('?' for _ in session_ids)})",
                 tuple(session_ids),
             ).fetchall()
-            if {row["session_id"] for row in missing_dataset} != set(session_ids):
-                raise StateConflictError("one or more selected Sessions have no sealed transcript dataset")
+            available_session_ids = {row["session_id"] for row in missing_dataset}
+            if available_session_ids != set(session_ids):
+                unavailable = [
+                    session_id for session_id in session_ids
+                    if session_id not in available_session_ids
+                ]
+                raise StateConflictError(
+                    "Sessions unavailable as Evolution evidence: " + ", ".join(unavailable)
+                )
             running = connection.execute(
                 "SELECT 1 FROM development_evolution_runs "
                 "WHERE project_id = ? AND state = 'running' LIMIT 1",
@@ -2368,7 +2402,11 @@ class DevelopmentStateStore:
             )
 
     @staticmethod
-    def _session_record(row: sqlite3.Row) -> dict[str, Any]:
+    def _session_record(
+        row: sqlite3.Row,
+        *,
+        evolution_evidence_ready: bool = False,
+    ) -> dict[str, Any]:
         state = row["state"]
         if row["terminal_kind"] == "cancelled":
             state = "cancelled"
@@ -2390,6 +2428,7 @@ class DevelopmentStateStore:
             "evolution_errors": json.loads(row["evolution_errors_json"]),
             "workspace_changes": json.loads(row["workspace_changes_json"]),
             "runtime_activation": json.loads(row["runtime_activation_json"]),
+            "evolution_evidence_ready": evolution_evidence_ready,
             "error": row["error"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
@@ -3163,6 +3202,29 @@ class DocumentEvolutionRunner:
             name=dataset_input["name"],
         )
         return dataset_input
+
+    def seal_completed_session_datasets(
+        self,
+        store: DevelopmentStateStore,
+    ) -> list[str]:
+        """Rebuild durable transcript datasets for completed current or legacy Sessions."""
+
+        failures: list[str] = []
+        for session in store.completed_sessions():
+            try:
+                self.capture_session_dataset(
+                    session_id=session["session_id"],
+                    request={
+                        "project_id": session["project_id"],
+                        "task_title": session["task_title"],
+                        "instruction": session["instruction"],
+                    },
+                    result={"response": session["response"]},
+                    store=store,
+                )
+            except Exception as exc:
+                failures.append(f"{session['session_id']}: {exc}")
+        return failures
 
     def evolve_run(
         self,
@@ -4166,6 +4228,9 @@ def main() -> int:
         evolution_runner.check_ready()
     except EvolutionRunError as exc:
         raise SystemExit(str(exc)) from exc
+    evidence_failures = evolution_runner.seal_completed_session_datasets(store)
+    for failure in evidence_failures:
+        print(f"Could not seal legacy Evolution evidence: {failure}", flush=True)
     server = DevelopmentAgentServer(
         ("127.0.0.1", args.port),
         token,

@@ -422,7 +422,7 @@ export function DesktopProductApp({
             <Notice
               tone="warning"
               title="Real-agent development mode"
-              detail="Agent replies come from the remote Codex CLI. Project and Session history are persisted by the remote development daemon; release authority and evolution remain disabled."
+              detail="Agent replies come from the remote Codex CLI. Project and Session history are persisted by the remote development daemon; standalone Evolution is available through the unverified development registry."
             />
           ) : null}
           {actionStatus ? <Notice tone="success" title={developmentAgentBridge ? "Development session updated" : "Remote authority updated"} detail={actionStatus} onDismiss={() => setActionStatus(null)} /> : null}
@@ -1974,12 +1974,15 @@ function EvolutionWorkspaceV2({
   const completedTasks = useMemo(() => snapshot.tasks.filter((task) => (
     task.project_id === project.project_id && task.state === "closed"
   )), [project.project_id, snapshot.tasks]);
-  const completedTaskKey = completedTasks.map((task) => task.task_id).join("|");
+  const evidenceTasks = useMemo(() => completedTasks.filter((task) => (
+    snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionEvidenceReady === true
+  )), [completedTasks, snapshot.runtimePresentation?.tasks]);
+  const evidenceTaskKey = evidenceTasks.map((task) => task.task_id).join("|");
   const [selectedTaskIds, setSelectedTaskIds] = useState<readonly string[]>([]);
   useEffect(() => {
     if (!standaloneAvailable) return;
-    setSelectedTaskIds(completedTasks.map((task) => task.task_id));
-  }, [completedTaskKey, project.project_id, standaloneAvailable]);
+    setSelectedTaskIds(evidenceTasks.map((task) => task.task_id));
+  }, [evidenceTaskKey, project.project_id, standaloneAvailable]);
   const capabilities = snapshot.capability?.project_id === project.project_id
     ? snapshot.capability.capabilities.targets.filter((target) => target.exposure === "desktop")
     : [];
@@ -2017,9 +2020,11 @@ function EvolutionWorkspaceV2({
         <div className="panel-heading"><div><span className="panel-kicker">Step 1 · Evidence</span><h2>Completed Sessions</h2></div><span className="muted-pill">{selectedTaskIds.length} selected</span></div>
         {completedTasks.length === 0 ? <div className="empty-row">Complete at least one Session before running Evolution.</div> : <div className="session-evolution-options">{completedTasks.map((task) => {
           const selected = selectedTaskIds.includes(task.task_id);
+          const evidenceReady = snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionEvidenceReady === true;
           const title = snapshot.runtimePresentation?.tasks[task.task_id]?.instruction?.title ?? task.task_id;
-          return <article key={task.task_id} className={selected ? "selected" : ""}><label><input type="checkbox" checked={selected} disabled={busy} onChange={(event) => setSelectedTaskIds((current) => event.target.checked ? [...current, task.task_id] : current.filter((id) => id !== task.task_id))} /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)} · transcript evidence</small></span></label></article>;
+          return <article key={task.task_id} className={selected ? "selected" : ""}><label><input type="checkbox" checked={selected} disabled={busy || !evidenceReady} onChange={(event) => setSelectedTaskIds((current) => event.target.checked ? [...current, task.task_id] : current.filter((id) => id !== task.task_id))} /><span><strong>{title}</strong><small>{formatTimeV2(task.updated_at)} · {evidenceReady ? "transcript evidence" : "evidence unavailable"}</small></span></label></article>;
         })}</div>}
+        {completedTasks.length > evidenceTasks.length ? <Notice tone="warning" title="Some Sessions are unavailable" detail="Their transcript datasets were not sealed. Restart the updated development daemon to repair recoverable legacy Sessions; unavailable entries cannot be selected." /> : null}
       </section> : null}
       <section className="product-panel task-panel">
         <div className="panel-heading"><div><span className="panel-kicker">{standaloneAvailable ? "Step 2 · Methods" : "Verified remote registry"}</span><h2>Evolution targets</h2></div><span className="muted-pill">{shortDigest(snapshot.capability?.registry_sha256 ?? "")}</span></div>

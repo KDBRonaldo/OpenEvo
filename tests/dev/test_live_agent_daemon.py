@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import urllib.request
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 import zipfile
 
 import pytest
@@ -380,6 +380,7 @@ def test_sqlite_store_persists_projects_sessions_and_transcripts(tmp_path: Path)
             "fully_supported": True,
             "decisions": [],
         },
+        "evolution_evidence_ready": False,
         "error": None,
         "created_at": restored["sessions"][0]["created_at"],
         "updated_at": restored["sessions"][0]["updated_at"],
@@ -457,6 +458,10 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
         session["selected_evolution"] == []
         for session in store.snapshot()["sessions"]
     )
+    assert all(
+        session["evolution_evidence_ready"]
+        for session in store.snapshot()["sessions"]
+    )
     request = MODULE.validate_evolution_run_request({
         "schema_version": "1",
         "project_id": project_id,
@@ -528,6 +533,47 @@ def test_standalone_evolution_candidate_is_not_injected_until_applied(tmp_path: 
         config={},
     )
     assert second_attempt["ordinal"] == 1
+
+
+def test_completed_legacy_sessions_are_backfilled_as_evolution_evidence(tmp_path: Path) -> None:
+    store = MODULE.DevelopmentStateStore(tmp_path / "state.sqlite3")
+    project_id = "development-project-legacy-evidence"
+    store.create_project({
+        "project_id": project_id,
+        "display_name": "Legacy evidence",
+        "config": {"evolution": {"targets": {}}},
+    })
+    store.start_session("dev-session-legacy-evidence", {
+        "project_id": project_id,
+        "project_name": "Legacy evidence",
+        "task_title": "Old completed Session",
+        "instruction": "Preserve this question",
+    })
+    store.complete_session("dev-session-legacy-evidence", {
+        "response": "Preserve this answer",
+        "model": "test-model",
+        "duration_ms": 1,
+        "logs": [],
+    })
+    assert store.snapshot()["sessions"][0]["evolution_evidence_ready"] is False
+
+    runner = MODULE.DocumentEvolutionRunner(
+        state_root=tmp_path,
+        codex_binary="codex",
+        model="test-model",
+        timeout_seconds=30,
+    )
+    assert runner.seal_completed_session_datasets(store) == []
+
+    restored = store.snapshot()["sessions"][0]
+    assert restored["evolution_evidence_ready"] is True
+    dataset = store.dataset_artifacts(project_id)[0]
+    manifest_path = Path(urlparse(dataset["uri"]).path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    records_path = manifest_path.parent / manifest["records_path"]
+    record = json.loads(records_path.read_text(encoding="utf-8"))
+    assert record["traces"][0]["prompt_messages"][0]["content"] == "Preserve this question"
+    assert record["traces"][0]["response_messages"][0]["content"] == "Preserve this answer"
 
 
 def test_store_migrates_legacy_per_session_job_uniqueness(tmp_path: Path) -> None:

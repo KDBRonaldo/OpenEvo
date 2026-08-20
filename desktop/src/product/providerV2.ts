@@ -95,6 +95,8 @@ export interface RuntimePresentationV2 {
       readonly method: string;
       readonly message: string;
     }[];
+    /** True only when the backend has durably sealed this Session's transcript dataset. */
+    readonly evolutionEvidenceReady?: boolean;
     readonly evolutionJobs?: readonly {
       readonly jobId: string;
       readonly targetId: string;

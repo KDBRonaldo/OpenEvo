@@ -186,6 +186,7 @@ describe("development agent provider", () => {
           // became part of the session contract. The provider must keep those sessions readable.
           selected_evolution: [{ target_id: "text_memory", method: "text_memory_reflector" }],
           evolution_errors: [],
+          evolution_evidence_ready: true,
           workspace_changes: workspaceChanges,
           error: null,
           created_at: "2026-08-14T10:01:00Z",
@@ -320,6 +321,7 @@ describe("development agent provider", () => {
     expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.selectedEvolution).toEqual([
       { targetId: "text_memory", method: "text_memory_reflector", config: {} },
     ]);
+    expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionEvidenceReady).toBe(true);
     expect(completed.snapshot.runtimePresentation?.tasks[task.task_id]?.evolutionJobs?.[0]).toMatchObject({
       jobId: "job-text-memory-dev-session-1",
       state: "failed",
