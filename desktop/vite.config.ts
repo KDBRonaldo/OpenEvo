@@ -5,6 +5,9 @@ import { fileURLToPath } from "node:url";
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
+  const sourceDevelopmentBuild =
+    process.env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1" ||
+    env.VITE_OPENEVO_SOURCE_DEVELOPMENT?.trim() === "1";
   const developmentAgentMode = mode === "openevo-live-agent";
   const developmentAgentToken = env.OPENEVO_DEV_AGENT_TOKEN?.trim();
   const developmentAgentTarget = env.OPENEVO_DEV_AGENT_URL?.trim() || "http://127.0.0.1:8765";
@@ -21,6 +24,16 @@ export default defineConfig(({ mode }) => {
 
   return {
     plugins: [react(), tailwindcss()],
+    // Source-development browser builds still exercise the formal Desktop
+    // contract, but intentionally report a development build channel.  Make
+    // the opt-in explicit in the compiled renderer instead of relying on
+    // Vite's ambient env replacement, which is not guaranteed when the build
+    // is launched through the Python preparation wrapper.
+    define: {
+      "import.meta.env.VITE_OPENEVO_SOURCE_DEVELOPMENT": JSON.stringify(
+        sourceDevelopmentBuild ? "1" : "",
+      ),
+    },
     resolve: {
       alias:
         mode === "openevo-desktop"

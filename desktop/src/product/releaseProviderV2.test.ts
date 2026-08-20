@@ -171,6 +171,149 @@ describe("v0.1.10 release provider", () => {
     ]);
   });
 
+  it("shares one browser bootstrap request across concurrent renderer startups", async () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const token = "b7".repeat(32);
+    const sessionValues = new Map<string, string>();
+    let currentHash = `#browser-bootstrap=${token}`;
+    let releaseBootstrap: (() => void) | undefined;
+    const bootstrapGate = new Promise<void>((resolve) => {
+      releaseBootstrap = resolve;
+    });
+    const bootstrapFetch = vi.fn(async () => {
+      await bootstrapGate;
+      return new Response(JSON.stringify(bootstrap()), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+    const apiFetch = vi.fn<FetchLikeV2>().mockImplementation(async () => new Response(
+      JSON.stringify(version()),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    ));
+    const adapterFactory = vi.fn(() => unavailableDesktopProductProviderV2);
+    const sessionStorage = {
+      getItem: (key: string) => sessionValues.get(key) ?? null,
+      setItem: (key: string, value: string) => sessionValues.set(key, value),
+      removeItem: (key: string) => sessionValues.delete(key),
+    };
+    const browserWindow = {
+      location: {
+        get hash() {
+          return currentHash;
+        },
+        pathname: "/openevo",
+        search: "",
+      },
+      sessionStorage,
+      history: {
+        replaceState: () => {
+          currentHash = "";
+        },
+      },
+      fetch: bootstrapFetch,
+    };
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      writable: true,
+      value: browserWindow,
+    });
+
+    try {
+      const first = createReleaseDesktopProductProvider({
+        fetch: apiFetch,
+        adapterFactory,
+        reportStage: vi.fn(),
+      });
+      const second = createReleaseDesktopProductProvider({
+        fetch: apiFetch,
+        adapterFactory,
+        reportStage: vi.fn(),
+      });
+
+      await Promise.resolve();
+      releaseBootstrap?.();
+      await Promise.all([first, second]);
+
+      expect(bootstrapFetch).toHaveBeenCalledTimes(1);
+      expect(apiFetch).toHaveBeenCalledTimes(2);
+    } finally {
+      if (originalWindow === undefined) {
+        Reflect.deleteProperty(globalThis, "window");
+      } else {
+        Object.defineProperty(globalThis, "window", originalWindow);
+      }
+    }
+  });
+
+  it("keeps the browser bootstrap fragment available when session storage is blocked", async () => {
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const token = "c8".repeat(32);
+    const currentHash = `#browser-bootstrap=${token}`;
+    const replaceState = vi.fn();
+    const bootstrapFetch = vi.fn(async () => new Response(JSON.stringify(bootstrap()), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }));
+    const apiFetch = vi.fn<FetchLikeV2>().mockImplementation(async () => new Response(
+      JSON.stringify(version()),
+      {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      },
+    ));
+    const adapterFactory = vi.fn(() => unavailableDesktopProductProviderV2);
+    const browserWindow = {
+      location: {
+        hash: currentHash,
+        pathname: "/openevo",
+        search: "",
+      },
+      sessionStorage: {
+        getItem: () => null,
+        setItem: () => {
+          throw new Error("session storage is blocked");
+        },
+        removeItem: () => undefined,
+      },
+      history: { replaceState },
+      fetch: bootstrapFetch,
+    };
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      writable: true,
+      value: browserWindow,
+    });
+
+    try {
+      const first = await createReleaseDesktopProductProvider({
+        fetch: apiFetch,
+        adapterFactory,
+        reportStage: vi.fn(),
+      });
+      const second = await createReleaseDesktopProductProvider({
+        fetch: apiFetch,
+        adapterFactory,
+        reportStage: vi.fn(),
+      });
+
+      expect(first.apiVersion).toBe(2);
+      expect(second.apiVersion).toBe(2);
+      expect(bootstrapFetch).toHaveBeenCalledTimes(2);
+      expect(replaceState).not.toHaveBeenCalled();
+      expect(browserWindow.location.hash).toBe(currentHash);
+    } finally {
+      if (originalWindow === undefined) {
+        Reflect.deleteProperty(globalThis, "window");
+      } else {
+        Object.defineProperty(globalThis, "window", originalWindow);
+      }
+    }
+  });
+
   it("uses a quick native start request before observing the published bootstrap context", async () => {
     const fetch = vi.fn<FetchLikeV2>().mockResolvedValue(new Response(JSON.stringify(version()), {
       status: 200,

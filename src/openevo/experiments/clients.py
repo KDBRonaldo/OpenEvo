@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from types import TracebackType
 from typing import Any, Protocol
@@ -145,17 +146,31 @@ class RolloutHttpClient:
 
 
 class EvolutionHttpStatusError(RuntimeError):
-    def __init__(self, *, status_code: int) -> None:
+    def __init__(self, *, status_code: int, detail: str | None = None) -> None:
         if type(status_code) is not int or not 100 <= status_code <= 599:
             raise ValueError("evolution HTTP status code is invalid")
         self.status_code = status_code
+        self.detail = _bounded_http_error_detail(detail)
         self.retryable = (
             status_code >= 500
             or status_code in {408, 425, 429}
         )
-        super().__init__(
-            f"evolution service returned HTTP status {status_code}"
-        )
+        message = f"evolution service returned HTTP status {status_code}"
+        if self.detail is not None:
+            message = f"{message}: {self.detail}"
+        super().__init__(message)
+
+
+def _bounded_http_error_detail(value: str | None) -> str | None:
+    if not isinstance(value, str):
+        return None
+    normalized = re.sub(r"[\x00-\x1f\x7f]+", " ", value).strip()
+    if not normalized:
+        return None
+    encoded = normalized.encode("utf-8")
+    if len(encoded) <= 512:
+        return normalized
+    return encoded[:512].decode("utf-8", errors="ignore").rstrip()
 
 
 class EvolutionHttpClient:
@@ -193,7 +208,17 @@ class EvolutionHttpClient:
     def _raise_for_status(response: httpx.Response) -> None:
         if 200 <= response.status_code < 300:
             return
-        raise EvolutionHttpStatusError(status_code=response.status_code)
+        detail: str | None = None
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("detail"), str):
+            detail = payload["detail"]
+        raise EvolutionHttpStatusError(
+            status_code=response.status_code,
+            detail=detail,
+        )
 
     def create_dataset(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = self._client.post(f"{self.base_url}/v1/datasets", json=payload)

@@ -402,7 +402,16 @@ def test_project_task_attempt_context_and_events_are_authoritative(
         "attempt_appended",
         "attempt_appended",
     ]
-    events = runtime.provider.invoke("streamCoreEventsV2", {"last_event_id": None})
+    scoped_events = runtime.owner.list_events(project_id=runtime.authority.project_id)
+    assert [item.event_type for item in scoped_events] == [
+        "task_admitted",
+        "attempt_appended",
+        "attempt_appended",
+    ]
+    events = runtime.provider.invoke(
+        "streamCoreEventsV2",
+        {"project_id": runtime.authority.project_id, "last_event_id": None},
+    )
     assert isinstance(events, StreamingResponse)
 
     async def first_two_frames() -> tuple[bytes, bytes]:
@@ -654,12 +663,19 @@ def test_event_reconnect_rejects_unknown_cursor_without_fallback(
     )
     retained = runtime.owner.list_events()
     event_id = retained[-1].event_id
-    resumed = runtime.provider.invoke("streamCoreEventsV2", {"last_event_id": event_id})
+    resumed = runtime.provider.invoke(
+        "streamCoreEventsV2",
+        {"project_id": runtime.authority.project_id, "last_event_id": event_id},
+    )
     assert isinstance(resumed, StreamingResponse)
 
     expired = runtime.client.get(
         "/v2/events",
-        headers={**runtime.headers, "Last-Event-ID": "event-unknown"},
+        headers={
+            **runtime.headers,
+            "X-OpenEvo-Project-Id": runtime.authority.project_id,
+            "Last-Event-ID": "event-unknown",
+        },
     )
     assert expired.status_code == 410
     assert expired.json()["code"] == "event_cursor_expired"
@@ -1290,7 +1306,7 @@ def test_successor_events_are_recoverable_and_activate_the_next_admission(
         )
         replay = restarted_provider.invoke(
             "streamCoreEventsV2",
-            {"last_event_id": last_event_id},
+            {"project_id": authority.project_id, "last_event_id": last_event_id},
         )
         assert isinstance(replay, StreamingResponse)
     finally:

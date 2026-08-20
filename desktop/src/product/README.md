@@ -111,15 +111,18 @@ To run the same formal Sidecar in the system browser instead of a Tauri WebView,
 use `npm run dev:formal:browser` on macOS or Linux. The command builds the real
 renderer, starts an authenticated loopback Sidecar, opens `/openevo` in the
 default browser, and keeps all SSH and Daemon lifecycle work in that local
-process. The browser can submit a server address, SSH port, and username; the
-Sidecar converts them into a private managed OpenSSH host entry and then reuses
-the normal formal deployment and tunnel path. Passwords, passphrases, private
-keys, SSH commands, remote tokens, and host paths never enter browser storage or
-the React API. Authentication remains owned by system OpenSSH, ssh-agent,
-macOS Keychain, and the sealed native askpass helper. This source-development
-launcher is the browser-hosted product path, not a browser-only SSH
-implementation; a distributable build still needs to package and start the
-local Sidecar on the user's machine.
+process. Remote workspaces are selected only from literal aliases discovered in
+the current user's system `~/.ssh/config`. Users configure `HostName`, `User`,
+`Port`, `IdentityFile`, `ProxyJump`, and related routing or authentication
+settings with OpenSSH, verify `ssh <alias>` independently, then rescan and select
+that alias in OpenEvo. The React API never accepts raw server coordinates,
+passwords, passphrases, private keys, SSH commands, remote tokens, or host paths.
+Authentication remains owned by system OpenSSH, ssh-agent, macOS Keychain, and
+the sealed native askpass helper. The Sidecar invokes the selected alias and owns
+Daemon bootstrap and the authenticated tunnel. This source-development launcher
+is the browser-hosted product path, not a browser-only SSH implementation; a
+distributable build still needs to package and start the local Sidecar on the
+user's machine.
 
 For the narrower "ask the remote Codex and evolve selected documents" loop, use
 `npm run dev:agent`. This mode bypasses the sealed release lifecycle, but obtains

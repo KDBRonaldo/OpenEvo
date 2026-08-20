@@ -1748,6 +1748,12 @@ class DesktopProviderStoreV2:
         }
 
         def mutation(connection: sqlite3.Connection) -> BaseModel:
+            existing = self._reusable_system_profile_for_alias(
+                connection,
+                validated.ssh_host_alias,
+            )
+            if existing is not None:
+                return existing
             self._require_profile_capacity(connection)
             timestamp = self._timestamp()
             profile = self._new_system_profile(
@@ -2826,6 +2832,71 @@ class DesktopProviderStoreV2:
             self._update_profile(connection, updated, version=version)
             return updated
 
+    def clear_incompatible_active_project(
+        self,
+        profile_id: str,
+        *,
+        connection_generation: int,
+        project_id: str,
+    ) -> m.RemoteWorkspaceProfileV2:
+        """Detach a saved project that cannot be reactivated by this connection.
+
+        The immutable Core mapping remains available as historical audit input;
+        only the profile's reconnect preference is cleared.  This transition is
+        deliberately limited to an in-progress connection generation so it
+        cannot race a renderer mutation against a connected project tunnel.
+        """
+
+        self._validate_profile_id(profile_id)
+        self._validate_profile_id(project_id)
+        if (
+            type(connection_generation) is not int
+            or not 1 <= connection_generation <= m.MAX_JAVASCRIPT_SAFE_INTEGER
+        ):
+            raise ProviderContractV2Error("profile generation is outside v2 bounds")
+        with self._transaction(
+            write=True,
+            operation="clearIncompatibleActiveProjectV2",
+        ) as connection:
+            row = self._require_profile_row(connection, profile_id)
+            current = self._profile_from_row(row)
+            if not isinstance(current, m.RemoteWorkspaceProfileV2):
+                raise ProviderConflictV2("legacy profile cannot own an active project")
+            if (
+                current.connection_generation != connection_generation
+                or current.connection_state != "connecting"
+            ):
+                raise ProviderPreconditionFailedV2("profile connection generation changed")
+            if current.active_project_id is None:
+                return current
+            if current.active_project_id != project_id:
+                raise ProviderConflictV2("profile active project changed")
+            current_version = cast(int, row["resource_version"])
+            if current_version >= m.MAX_JAVASCRIPT_SAFE_INTEGER:
+                raise ProviderCapacityV2Error("profile resource version is exhausted")
+            version = current_version + 1
+            updated = m.RemoteWorkspaceProfileV2(
+                profile_id=current.profile_id,
+                display_name=current.display_name,
+                ssh_host_alias=current.ssh_host_alias,
+                catalog_generation=current.catalog_generation,
+                connection_generation=current.connection_generation,
+                connection_state=current.connection_state,
+                prompt=current.prompt,
+                trust=current.trust,
+                failure=current.failure,
+                active_project_id=None,
+                core_api_major=current.core_api_major,
+                core_openapi_sha256=current.core_openapi_sha256,
+                core_event_schema_sha256=current.core_event_schema_sha256,
+                core_registry_sha256=current.core_registry_sha256,
+                created_at=current.created_at,
+                updated_at=self._timestamp(),
+                etag=self._etag("profile", profile_id, version),
+            )
+            self._update_profile(connection, updated, version=version)
+            return updated
+
     def copy_legacy_draft(
         self,
         source: LegacyDraftSourceV2 | Mapping[str, object],
@@ -2950,7 +3021,38 @@ class DesktopProviderStoreV2:
                 raise ProviderCapacityConfigurationV2Error(
                     "persisted profiles exceed configured capacity"
                 )
-            return tuple(self._profile_from_row(cast(sqlite3.Row, row)) for row in rows)
+            decoded = tuple(
+                (cast(sqlite3.Row, row), self._profile_from_row(cast(sqlite3.Row, row)))
+                for row in rows
+            )
+            rebound_sources = {
+                cast(str, row["rebound_from_sha256"])
+                for row, profile in decoded
+                if isinstance(profile, m.RemoteWorkspaceProfileV2)
+                and row["rebound_from_sha256"] is not None
+            }
+            canonical_by_alias: dict[str, m.RemoteWorkspaceProfileV2] = {}
+            for _row, profile in decoded:
+                if not isinstance(profile, m.RemoteWorkspaceProfileV2):
+                    continue
+                current = canonical_by_alias.get(profile.ssh_host_alias)
+                if current is None or self._profile_reuse_rank(profile) > self._profile_reuse_rank(
+                    current
+                ):
+                    canonical_by_alias[profile.ssh_host_alias] = profile
+            canonical_ids = {profile.profile_id for profile in canonical_by_alias.values()}
+            return tuple(
+                profile
+                for row, profile in decoded
+                if (
+                    isinstance(profile, m.RemoteWorkspaceProfileV2)
+                    and profile.profile_id in canonical_ids
+                )
+                or (
+                    isinstance(profile, m.LegacyExplicitProfileV2)
+                    and row["legacy_source_ref_sha256"] not in rebound_sources
+                )
+            )
 
     def list_drafts(self) -> tuple[LocalProjectDraftV2, ...]:
         with self._transaction(write=False, operation="listDraftsV2") as connection:
@@ -4000,7 +4102,6 @@ class DesktopProviderStoreV2:
             valid_binding = (
                 scope == "profiles"
                 and isinstance(response, m.RemoteWorkspaceProfileV2)
-                and typed_current_row["rebound_from_sha256"] is None
             )
         elif operation in {
             "renameProfileV2",
@@ -4871,6 +4972,55 @@ class DesktopProviderStoreV2:
             updated_at=timestamp,
             etag=self._etag("profile", profile_id, 1),
         )
+
+    def _reusable_system_profile_for_alias(
+        self,
+        connection: sqlite3.Connection,
+        ssh_host_alias: str,
+    ) -> m.RemoteWorkspaceProfileV2 | None:
+        candidates: list[m.RemoteWorkspaceProfileV2] = []
+        for raw_row in connection.execute(
+            f"SELECT {_PROFILE_SELECT_COLUMNS} FROM profiles "
+            "WHERE profile_kind = 'system_openssh' ORDER BY updated_at DESC, profile_id"
+        ):
+            profile = self._profile_from_row(cast(sqlite3.Row, raw_row))
+            if (
+                isinstance(profile, m.RemoteWorkspaceProfileV2)
+                and profile.ssh_host_alias == ssh_host_alias
+            ):
+                candidates.append(profile)
+        if not candidates:
+            return None
+        return max(candidates, key=self._profile_reuse_rank)
+
+    @staticmethod
+    def _profile_reuse_rank(
+        profile: m.RemoteWorkspaceProfileV2,
+    ) -> tuple[int, str, str]:
+        cleanup_failure = profile.failure is not None and profile.failure.code in {
+            "ssh_cleanup_failed",
+            "ssh_cleanup_authority_lost",
+        }
+        if cleanup_failure:
+            state_rank = 6
+        elif profile.connection_state == "connected":
+            state_rank = 5
+        elif profile.connection_state in {
+            "connecting",
+            "prompt_pending",
+            "host_key_review",
+            "bootstrapping",
+            "negotiating",
+            "disconnecting",
+        }:
+            state_rank = 4
+        elif profile.active_project_id is not None:
+            state_rank = 3
+        elif profile.connection_state == "failed":
+            state_rank = 2
+        else:
+            state_rank = 1
+        return state_rank, profile.updated_at, profile.profile_id
 
     def _insert_profile(
         self,

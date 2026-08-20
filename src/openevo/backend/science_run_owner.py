@@ -835,9 +835,10 @@ class CoreScienceTaskOwnerV2:
             )
         except Exception as exc:
             logger.error(
-                "v2 science successor transition %s failed during preparation [%s]",
+                "v2 science successor transition %s failed during preparation [%s]: %s",
                 transition_id,
                 type(exc).__name__,
+                exc,
             )
             retryable = _successor_transition_failure_is_retryable(exc)
             error = _successor_transition_api_error(
@@ -1013,10 +1014,14 @@ class CoreScienceTaskOwnerV2:
     def list_events(
         self,
         *,
+        project_id: str | None = None,
         after_event_id: str | None = None,
     ) -> list[m2.EventEnvelopeV2]:
         try:
-            return self._ledger.list_events(after_event_id=after_event_id)
+            return self._ledger.list_events(
+                project_id=project_id,
+                after_event_id=after_event_id,
+            )
         except Exception as exc:
             _raise_v2_owner_error(exc, operation_id="streamCoreEventsV2")
 

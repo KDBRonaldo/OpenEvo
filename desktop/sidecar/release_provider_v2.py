@@ -920,7 +920,15 @@ class DesktopReleaseProviderV2:
                 if isinstance(profile, local_v2.RemoteWorkspaceProfileV2)
                 and profile.connection_state == "connected"
             ),
-            None,
+            next(
+                (
+                    profile
+                    for profile in profiles
+                    if isinstance(profile, local_v2.RemoteWorkspaceProfileV2)
+                    and profile.active_project_id is not None
+                ),
+                None,
+            ),
         )
         return local_v2.DesktopStateV2(
             profiles=profiles,
@@ -1421,6 +1429,7 @@ class DesktopReleaseProviderV2:
             negotiated = self._exact_core_version(remote, started.profile_id)
             self._reactivate_saved_project(
                 started,
+                core_version=negotiated,
                 cancel_event=context.cancellation_event,
             )
         except DesktopReleaseProviderV2Error as exc:
@@ -1650,6 +1659,17 @@ class DesktopReleaseProviderV2:
                 action="install_repair_daemon",
                 affected_resource_id=desktop_project_id,
             )
+        # ``activate_project`` has already switched the bridge to the new
+        # project tunnel.  Publish that authority locally before doing any
+        # potentially long-running workspace materialization so every reader
+        # observes one project identity on both sides of the tunnel.  Delaying
+        # this bind left the renderer holding the previous project id while all
+        # Core requests were already routed through the new tunnel.
+        self._store.bind_active_project(
+            profile.profile_id,
+            connection_generation=profile.connection_generation,
+            project_id=project.project_id,
+        )
         native_import_id = (
             native_import_id_for_action(action_id)
             if request.config.workspace.kind == "native_folder_snapshot"
@@ -1673,11 +1693,6 @@ class DesktopReleaseProviderV2:
             context,
             "activating",
             cancellable=False,
-        )
-        self._store.bind_active_project(
-            profile.profile_id,
-            connection_generation=profile.connection_generation,
-            project_id=project.project_id,
         )
         return local_v2.LifecycleProjectResultV2(
             result_kind="project",
@@ -1990,6 +2005,19 @@ class DesktopReleaseProviderV2:
 
     def _list_projects(self, arguments: Mapping[str, object]) -> core_v2.ProjectPageV2:
         limit, after = _page_arguments(arguments)
+        # A connected profile may legitimately have no active project after a
+        # first install, an incompatible development authority was retired, or
+        # the user disconnected the previous project.  Project creation is the
+        # operation that opens the first project tunnel, so reads must expose
+        # the empty catalog instead of requiring a tunnel that cannot exist
+        # yet.  Once a tunnel exists, all project data remains Core-owned and
+        # is read through that exact generation-bound authority.
+        if self._bridge.active_activation is None:
+            return core_v2.ProjectPageV2(
+                items=[],
+                next_cursor=None,
+                has_more=False,
+            )
         activation, desktop_project_id, generation, _project = self._active_authority()
         del activation
         return self._bridge.list_projects(  # type: ignore[attr-defined]
@@ -2901,6 +2929,7 @@ class DesktopReleaseProviderV2:
         self,
         profile: local_v2.RemoteWorkspaceProfileV2,
         *,
+        core_version: core_v2.VersionResponseV2,
         cancel_event: threading.Event | None = None,
     ) -> None:
         core_project_id = profile.active_project_id
@@ -2929,6 +2958,14 @@ class DesktopReleaseProviderV2:
                 action="reconnect",
                 affected_resource_id=core_project_id,
             )
+        if self._development_saved_project_authority_expired(mapping, core_version):
+            cleared = self._store.clear_incompatible_active_project(
+                profile.profile_id,
+                connection_generation=profile.connection_generation,
+                project_id=core_project_id,
+            )
+            self._publish_profile(cleared)
+            return
         request = local_v2.ProjectCreateV2(
             profile_id=profile.profile_id,
             profile_connection_generation=profile.connection_generation,
@@ -2947,6 +2984,34 @@ class DesktopReleaseProviderV2:
         project = getattr(activation, "project", None)
         if type(project) is not core_v2.ProjectV2 or project.project_id != core_project_id:
             raise _core_authority_invalid(core_project_id)
+
+    def _development_saved_project_authority_expired(
+        self,
+        mapping: CoreProjectMappingV2,
+        current: core_v2.VersionResponseV2,
+    ) -> bool:
+        if self._build_channel != "development":
+            return False
+        head = mapping.active_project_head
+        if head is None:
+            return False
+        allowed = {
+            (current.registry_sha256, current.runtime_contract_sha256),
+            *(
+                (authority.registry_sha256, authority.runtime_contract_sha256)
+                for authority in V0110_RELEASE_AUTHORITY_POLICY.retained_core_authorities
+            ),
+        }
+        head_authority = (
+            head.registry_sha256,
+            head.runtime_context_snapshot.runtime_contract_sha256,
+        )
+        return (
+            head_authority not in allowed
+            and mapping.daemon_release_version == current.release_version
+            and mapping.daemon_source_commit == current.source_commit
+            and mapping.daemon_build_id != current.build_id
+        )
 
     def _fail_profile_connect(
         self,

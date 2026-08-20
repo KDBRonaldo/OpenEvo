@@ -1068,6 +1068,46 @@ def test_v2_event_journal_survives_restart_and_tamper_fails_closed(
         _owner(tmp_path)
 
 
+def test_v2_event_replay_is_scoped_to_the_requested_project(tmp_path: Path) -> None:
+    first_authority = _authority(head=_head("project-1", seed="2"))
+    second_authority = _authority(head=_head("project-2", seed="8"))
+    owner = _owner(tmp_path)
+    owner.publish_project_admission_authority(first_authority)
+    owner.publish_project_admission_authority(second_authority)
+    try:
+        owner.invoke(
+            "submitCoreTaskV2",
+            {"request": _request(first_authority), "idempotency_key": "first-project"},
+        )
+        owner.invoke(
+            "submitCoreTaskV2",
+            {"request": _request(second_authority), "idempotency_key": "second-project"},
+        )
+
+        first_events = owner.list_events(project_id=first_authority.project_id)
+        second_events = owner.list_events(project_id=second_authority.project_id)
+        assert {event.project_id for event in first_events} == {first_authority.project_id}
+        assert {event.project_id for event in second_events} == {second_authority.project_id}
+        assert [event.event_type for event in first_events] == [
+            "task_admitted",
+            "attempt_appended",
+        ]
+        assert [event.event_type for event in second_events] == [
+            "task_admitted",
+            "attempt_appended",
+        ]
+
+        with pytest.raises(CoreTaskControlError) as foreign_cursor:
+            owner.list_events(
+                project_id=second_authority.project_id,
+                after_event_id=first_events[-1].event_id,
+            )
+        assert foreign_cursor.value.code == "event_cursor_expired"
+        assert foreign_cursor.value.http_status == 410
+    finally:
+        owner.close()
+
+
 def test_v2_task_recovery_rejects_a_rewritten_admission_authority_etag(
     tmp_path: Path,
 ) -> None:

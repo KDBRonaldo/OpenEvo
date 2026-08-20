@@ -33,7 +33,7 @@ export const CORE_PRODUCT_RELEASE_CONTRACT = Object.freeze({
   releaseVersion: "0.1.10",
   mutationMajor: 2,
   acceptedOpenApiDigests: nonEmpty([
-    "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86",
+    "ae677842c735e4b7be673d3e308b76737929c60ac5857d2c4a578d9b372c68fd",
   ], "a Core v2 OpenAPI digest"),
   acceptedEventSchemaDigests: nonEmpty([
     "0e5465c110fd42964f53f076a4bbeed55e899b27f235b5e26c3d478356c5b7d2",

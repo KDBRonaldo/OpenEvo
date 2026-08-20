@@ -364,6 +364,16 @@ LastEventId = Annotated[
     str | None,
     Header(alias="Last-Event-ID", min_length=1, max_length=128),
 ]
+EventProjectId = Annotated[
+    str,
+    Header(
+        alias="X-OpenEvo-Project-Id",
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$",
+        description="Active project authority whose event stream is requested.",
+    ),
+]
 ChunkIndex = Annotated[int, Path(ge=0, le=m.MAX_WORKSPACE_CHUNKS - 1)]
 ChunkSha256 = Annotated[
     str,
@@ -1020,7 +1030,10 @@ def create_core_control_v2_contract_app(
         responses=_ERROR_RESPONSES,
         tags=["events"],
     )
-    async def events(last_event_id: LastEventId = None) -> Response:
+    async def events(
+        project_id: EventProjectId,
+        last_event_id: LastEventId = None,
+    ) -> Response:
         return _not_implemented()
 
     app.include_router(router)

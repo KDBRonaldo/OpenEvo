@@ -8,6 +8,7 @@ from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
 import time
+from typing import Literal
 
 from fastapi.testclient import TestClient
 import pytest
@@ -943,6 +944,7 @@ def _provider(
     tmp_path: Path,
     *,
     workspace_import_store: WorkspaceImportStore | None = None,
+    build_channel: Literal["release", "development", "test"] = "release",
 ) -> tuple[
     DesktopReleaseProviderV2,
     DesktopProviderStoreV2,
@@ -963,7 +965,7 @@ def _provider(
         event_broker=DesktopEventBrokerV2(clock=lambda: NOW),
         build_version="0.1.10",
         source_commit=SOURCE_COMMIT,
-        build_channel="release",
+        build_channel=build_channel,
         instance_id="routing-instance-v2",
         clock=lambda: NOW,
         own_resources=False,
@@ -1454,6 +1456,103 @@ def test_disconnect_and_reconnect_restore_the_exact_v2_project_tunnel(
 
         read = client.get("/desktop/v2/projects/project-1", headers=_headers())
         assert read.status_code == 200, read.text
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_development_reconnect_detaches_project_from_expired_snapshot_authority(
+    tmp_path: Path,
+) -> None:
+    provider, store, _lifecycle, bridge = _provider(
+        tmp_path,
+        build_channel="development",
+    )
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        profile = _connected_profile(client)
+        created = client.post(
+            "/desktop/v2/projects",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        profile["connection_generation"]
+                    ),
+                    "Idempotency-Key": "expired-create-project-01",
+                }
+            ),
+            json=_project_create(profile),
+        )
+        assert created.status_code == 202, created.text
+        assert _wait_lifecycle_operation(client, created.json())["status"] == "succeeded"
+        bound = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        disconnected = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/disconnect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        bound["connection_generation"]
+                    ),
+                    "If-Match": str(bound["etag"]),
+                    "Idempotency-Key": "expired-disconnect-profile-01",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": bound["connection_generation"],
+            },
+        )
+        assert disconnected.status_code == 202, disconnected.text
+        assert _wait_lifecycle_operation(client, disconnected.json())["status"] == "succeeded"
+        offline = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert bridge.mapping is not None
+        bridge.mapping = replace(
+            bridge.mapping,
+            daemon_source_commit=SOURCE_COMMIT,
+            core_version=bridge.mapping.core_version.model_copy(
+                update={"source_commit": SOURCE_COMMIT}
+            ),
+        )
+        prior_activations = len(
+            [call for call in bridge.calls if call[0] == "activate_project"]
+        )
+
+        reconnected = client.post(
+            f"/desktop/v2/profiles/{profile['profile_id']}/connect",
+            headers=_headers(
+                **{
+                    "X-OpenEvo-Resource-Generation": str(
+                        offline["connection_generation"]
+                    ),
+                    "If-Match": str(offline["etag"]),
+                    "Idempotency-Key": "expired-connect-profile-02",
+                }
+            ),
+            json={
+                "schema_version": "2",
+                "expected_connection_generation": offline["connection_generation"],
+            },
+        )
+
+        assert reconnected.status_code == 202, reconnected.text
+        assert _wait_lifecycle_operation(client, reconnected.json())["status"] == "succeeded"
+        online = client.get(
+            f"/desktop/v2/profiles/{profile['profile_id']}", headers=_headers()
+        ).json()
+        assert online["connection_state"] == "connected"
+        assert online["active_project_id"] is None
+        assert len([call for call in bridge.calls if call[0] == "activate_project"]) == prior_activations
     finally:
         client.close()
         provider.close()
@@ -2114,6 +2213,38 @@ def test_active_project_business_surface_routes_to_core_v2_without_ssh(
             "create_diagnostic",
             "get_diagnostic",
         } <= called
+        assert lifecycle.calls == ssh_calls
+    finally:
+        client.close()
+        provider.close()
+        store.close()
+
+
+def test_connected_profile_without_active_project_lists_an_empty_catalog(
+    tmp_path: Path,
+) -> None:
+    provider, store, lifecycle, bridge = _provider(tmp_path)
+    client = TestClient(
+        create_release_desktop_local_api_v2_app(
+            session_token=SESSION,
+            provider=provider,
+            close_on_shutdown=False,
+        )
+    )
+    try:
+        _connected_profile(client)
+        bridge.active_activation = None
+        ssh_calls = list(lifecycle.calls)
+
+        response = client.get("/desktop/v2/projects", headers=_headers())
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {
+            "schema_version": "2",
+            "items": [],
+            "next_cursor": None,
+            "has_more": False,
+        }
         assert lifecycle.calls == ssh_calls
     finally:
         client.close()

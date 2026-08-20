@@ -36,6 +36,7 @@ from desktop.sidecar.release_provider import DesktopReleaseProvider
 from desktop.sidecar.release_runtime import (
     CoreRuntimeSessionBinding,
     DesktopCoreEventRelayV1,
+    DesktopCoreEventRelayV2,
     DesktopReleaseCoreRuntimeV1,
     DesktopReleaseCoreRuntimeV2,
     ReleaseRuntimeConfigurationError,
@@ -634,6 +635,161 @@ def test_v2_release_runtime_is_deferred_and_owns_only_v2_bridge_state(
     finally:
         runtime.close()
         provider_store.close()
+
+
+def test_v2_core_event_relay_consumes_active_project_stream() -> None:
+    complete = threading.Event()
+    activation = SimpleNamespace(
+        desktop_project_id="desktop-project-1",
+        profile_connection_generation=7,
+        bridge_generation=1,
+    )
+
+    class EventContext:
+        def __enter__(self):
+            def stream():
+                yield object()
+                complete.set()
+
+            return stream()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int]] = []
+
+        @property
+        def active_activation(self):
+            return None if complete.is_set() else activation
+
+        def events(self, desktop_project_id: str, generation: int):
+            self.calls.append((desktop_project_id, generation))
+            return EventContext()
+
+    bridge = Bridge()
+    relay = DesktopCoreEventRelayV2(bridge)  # type: ignore[arg-type]
+    relay.start()
+    assert complete.wait(timeout=2)
+    relay.request_stop()
+    relay.join()
+
+    assert bridge.calls == [("desktop-project-1", 7)]
+
+
+def test_v2_core_event_relay_switches_projects_while_old_stream_is_blocked() -> None:
+    first_entered = threading.Event()
+    second_consumed = threading.Event()
+    release_first = threading.Event()
+    first = SimpleNamespace(
+        desktop_project_id="desktop-project-1",
+        profile_connection_generation=7,
+        bridge_generation=1,
+    )
+    second = SimpleNamespace(
+        desktop_project_id="desktop-project-2",
+        profile_connection_generation=7,
+        bridge_generation=2,
+    )
+
+    class EventContext:
+        def __init__(self, project_id: str) -> None:
+            self.project_id = project_id
+
+        def __enter__(self):
+            def stream():
+                if self.project_id == "desktop-project-1":
+                    first_entered.set()
+                    release_first.wait(timeout=2)
+                    return
+                    yield  # pragma: no cover
+                yield object()
+                second_consumed.set()
+
+            return stream()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.activation = first
+            self.calls: list[tuple[str, int]] = []
+
+        @property
+        def active_activation(self):
+            return self.activation
+
+        def events(self, desktop_project_id: str, generation: int):
+            self.calls.append((desktop_project_id, generation))
+            return EventContext(desktop_project_id)
+
+    bridge = Bridge()
+    relay = DesktopCoreEventRelayV2(bridge)  # type: ignore[arg-type]
+    relay.start()
+    assert first_entered.wait(timeout=2)
+    bridge.activation = second
+    assert second_consumed.wait(timeout=2)
+    relay.request_stop()
+    release_first.set()
+    relay.join()
+
+    assert ("desktop-project-1", 7) in bridge.calls
+    assert ("desktop-project-2", 7) in bridge.calls
+
+
+def test_v2_core_event_relay_does_not_duplicate_stream_when_authority_refreshes() -> None:
+    entered = threading.Event()
+    authority_refreshed = threading.Event()
+    release_stream = threading.Event()
+
+    def activation(head: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            desktop_project_id="desktop-project-1",
+            profile_connection_generation=7,
+            bridge_generation=11,
+            head=head,
+        )
+
+    class EventContext:
+        def __enter__(self):
+            def stream():
+                entered.set()
+                bridge.activation = activation(2)
+                authority_refreshed.set()
+                yield object()
+                release_stream.wait(timeout=2)
+
+            return stream()
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.activation = activation(1)
+            self.calls: list[tuple[str, int]] = []
+
+        @property
+        def active_activation(self):
+            return self.activation
+
+        def events(self, desktop_project_id: str, generation: int):
+            self.calls.append((desktop_project_id, generation))
+            return EventContext()
+
+    bridge = Bridge()
+    relay = DesktopCoreEventRelayV2(bridge)  # type: ignore[arg-type]
+    relay.start()
+    assert entered.wait(timeout=2)
+    assert authority_refreshed.wait(timeout=2)
+    assert not release_stream.wait(timeout=0.2)
+    assert bridge.calls == [("desktop-project-1", 7)]
+
+    relay.request_stop()
+    release_stream.set()
+    relay.join()
 
 
 class _ProfileConnectorAdapterV2:

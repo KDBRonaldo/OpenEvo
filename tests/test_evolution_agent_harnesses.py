@@ -905,6 +905,48 @@ async def test_codex_subscription_setup_fails_closed_without_exact_canary(
 
 
 @pytest.mark.asyncio
+async def test_codex_subscription_setup_retries_one_nonzero_real_exec_canary(
+    tmp_path: Path,
+) -> None:
+    class RefreshingCredentialRuntime(RecordingRuntime):
+        canary_attempts = 0
+
+        async def exec(
+            self,
+            command: str,
+            *,
+            cwd: str | None = None,
+            env: dict[str, str] | None = None,
+            timeout_sec: float | None = None,
+        ) -> ExecResult:
+            del env, timeout_sec
+            self.commands.append(command)
+            if "-probe.sh" in command and "command_execution" in command:
+                assert cwd == CODEX_SUBSCRIPTION_CANARY_CWD
+                self.canary_attempts += 1
+                if self.canary_attempts == 1:
+                    return ExecResult(return_code=1)
+                return ExecResult(
+                    stdout=f"{CODEX_SUBSCRIPTION_CANARY_OK}\n",
+                    return_code=0,
+                )
+            return ExecResult(return_code=0)
+
+    harness = CodexHarness(
+        AgentSpec(
+            harness="codex",
+            settings={"auth_mode": "subscription", "capture_mode": "transcript"},
+        )
+    )
+    runtime = RefreshingCredentialRuntime(tmp_path)
+
+    await harness.setup(runtime)
+
+    assert runtime.canary_attempts == 2
+    assert harness.subscription_credential_isolation_receipt is not None
+
+
+@pytest.mark.asyncio
 async def test_codex_subscription_publishes_readiness_only_after_skill_install(
     tmp_path: Path,
 ) -> None:

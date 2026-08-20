@@ -252,6 +252,17 @@ def test_profile_create_replay_conflict_etag_and_restart_are_exact(
     assert created.connection_generation == 1
     assert created.catalog_generation == 7
 
+    reused = store.create_system_profile(
+        SystemOpenSshProfileCreateV2(
+            display_name="Another card name",
+            ssh_host_alias="evolab",
+        ),
+        catalog_generation=7,
+        idempotency_key="create-system-profile-same-alias-0002",
+    )
+    assert reused == created
+    assert store.list_profiles() == (created,)
+
     with pytest.raises(ProviderIdempotencyConflictV2):
         store.create_system_profile(
             _profile("other-lab"),
@@ -373,6 +384,80 @@ def test_disconnect_and_process_restart_preserve_the_reconnect_project_binding(
         assert current.core_api_major is None
     finally:
         reopened.close()
+
+
+def test_incompatible_saved_project_can_be_detached_only_while_reconnecting(
+    tmp_path: Path,
+) -> None:
+    store = DesktopProviderStoreV2(tmp_path / "provider-v2", clock=_Clock())
+    try:
+        created = store.create_system_profile(
+            _profile(),
+            catalog_generation=7,
+            idempotency_key="detach-profile-create-0001",
+        )
+        connecting = store.begin_profile_action(
+            created.profile_id,
+            ProfileConnectionActionV2(
+                expected_connection_generation=created.connection_generation
+            ),
+            action="connect",
+            resource_generation=created.connection_generation,
+            if_match=created.etag,
+            idempotency_key="detach-profile-connect-001",
+        )
+        connected = store.complete_profile_connection(
+            created.profile_id,
+            connection_generation=connecting.connection_generation,
+            core_version=_core_version(),
+        )
+        bound = store.bind_active_project(
+            created.profile_id,
+            connection_generation=connected.connection_generation,
+            project_id="desktop-project-expired",
+        )
+        disconnecting = store.begin_profile_action(
+            created.profile_id,
+            ProfileConnectionActionV2(
+                expected_connection_generation=bound.connection_generation
+            ),
+            action="disconnect",
+            resource_generation=bound.connection_generation,
+            if_match=bound.etag,
+            idempotency_key="detach-profile-disconnect-001",
+        )
+        disconnected = store.complete_profile_disconnect(
+            created.profile_id,
+            connection_generation=disconnecting.connection_generation,
+        )
+        reconnecting = store.begin_profile_action(
+            created.profile_id,
+            ProfileConnectionActionV2(
+                expected_connection_generation=disconnected.connection_generation
+            ),
+            action="connect",
+            resource_generation=disconnected.connection_generation,
+            if_match=disconnected.etag,
+            idempotency_key="detach-profile-connect-002",
+        )
+
+        cleared = store.clear_incompatible_active_project(
+            created.profile_id,
+            connection_generation=reconnecting.connection_generation,
+            project_id="desktop-project-expired",
+        )
+
+        assert cleared.connection_state == "connecting"
+        assert cleared.active_project_id is None
+        completed = store.complete_profile_connection(
+            created.profile_id,
+            connection_generation=cleared.connection_generation,
+            core_version=_core_version(),
+        )
+        assert completed.connection_state == "connected"
+        assert completed.active_project_id is None
+    finally:
+        store.close()
 
 
 def test_restart_quarantines_a_profile_with_unproven_ssh_cleanup(
@@ -591,6 +676,7 @@ def test_legacy_rebind_preserves_nonconnectable_record_and_creates_new_profile(
         assert rebound.profile_kind == "system_openssh"
         assert rebound.ssh_host_alias == "configured-lab"
         assert store.get_profile(legacy.profile_id) == legacy
+        assert store.list_profiles() == (rebound,)
         assert (
             store.rebind_legacy_profile(
                 legacy.profile_id,

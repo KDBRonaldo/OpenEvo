@@ -361,6 +361,7 @@ def test_typed_http_mutation_error_remains_deterministic_and_private_echo_is_rej
     def typed_handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/version":
             return httpx.Response(200, json=_version())
+        assert request.headers["X-OpenEvo-Project-Id"] == "project-1"
         return httpx.Response(
             409,
             json={

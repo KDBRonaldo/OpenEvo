@@ -134,3 +134,22 @@ def test_evolution_http_client_exposes_closed_retryability(
 
     assert captured.value.status_code == status_code
     assert captured.value.retryable is retryable
+    assert captured.value.detail == "remote failure"
+    assert str(captured.value).endswith(": remote failure")
+
+
+def test_evolution_http_client_bounds_remote_error_detail() -> None:
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(422, json={"detail": "bad\n" + ("x" * 700)})
+
+    client = EvolutionHttpClient(
+        "http://evolution.example",
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(EvolutionHttpStatusError) as captured:
+        client.create_dataset({"name": "dataset"})
+
+    assert captured.value.detail is not None
+    assert "\n" not in captured.value.detail
+    assert len(captured.value.detail.encode("utf-8")) <= 512

@@ -36,6 +36,7 @@ import {
 import { DesktopApiErrorV2 } from "../api/v2/client";
 import type { LogEntryV2 } from "../api/v2/logs";
 import type {
+  DesktopErrorV2,
   ProjectV2,
   RemoteProfileV2,
   RemoteWorkspaceProfileV2,
@@ -59,10 +60,6 @@ import {
   type DesktopProductSnapshotV2,
   type ProductMutationIntentV2,
 } from "./providerV2";
-import {
-  isBrowserHostedReleaseRuntime,
-  registerBrowserSshHost,
-} from "./releaseProvider";
 
 type Workspace = "research" | "evolution" | "system";
 
@@ -107,42 +104,59 @@ export function DesktopProductApp({
   const [serviceLogs, setServiceLogs] = useState<Readonly<Record<string, readonly LogEntryV2[]>>>({});
   const readyReported = useRef(false);
   const initialFailureReported = useRef(false);
-  const refreshSequence = useRef(0);
+  const refreshRequestSequence = useRef(0);
+  const refreshInFlight = useRef<Promise<DesktopProductSnapshotV2 | null> | null>(null);
   const snapshotRef = useRef<DesktopProductSnapshotV2 | null>(null);
   const projectRecoveryRefreshInFlight = useRef(false);
 
-  const refresh = useCallback(async (): Promise<DesktopProductSnapshotV2 | null> => {
-    const sequence = refreshSequence.current + 1;
-    refreshSequence.current = sequence;
-    try {
-      const result = await provider.refresh();
-      if (sequence !== refreshSequence.current) return null;
-      if (result.status !== "fresh") {
-        const error = new Error("OpenEvo Desktop state is not currently authoritative.");
-        setLoadError(userMessageV2(result.status === "error" ? result.stream.error : error));
-        if (snapshotRef.current === null && !initialFailureReported.current) {
-          initialFailureReported.current = true;
-          onInitialSnapshotFailed?.(error);
+  const refresh = useCallback((): Promise<DesktopProductSnapshotV2 | null> => {
+    refreshRequestSequence.current += 1;
+    if (refreshInFlight.current !== null) return refreshInFlight.current;
+
+    const worker = (async (): Promise<DesktopProductSnapshotV2 | null> => {
+      try {
+        for (;;) {
+          const requestSequence = refreshRequestSequence.current;
+          try {
+            const result = await provider.refresh();
+            // An SSE/lifecycle notification that arrives while authority is
+            // loading requests one trailing refresh.  Every waiter shares this
+            // worker, so an imperative action never receives a false null just
+            // because a subscription refresh superseded its preflight read.
+            if (requestSequence !== refreshRequestSequence.current) continue;
+            if (result.status !== "fresh") {
+              const error = new Error("OpenEvo Desktop state is not currently authoritative.");
+              setLoadError(userMessageV2(result.status === "error" ? result.stream.error : error));
+              if (snapshotRef.current === null && !initialFailureReported.current) {
+                initialFailureReported.current = true;
+                onInitialSnapshotFailed?.(error);
+              }
+              return null;
+            }
+            snapshotRef.current = result.snapshot;
+            setSnapshot(result.snapshot);
+            setLoadError(null);
+            if (!readyReported.current) {
+              readyReported.current = true;
+              onReady?.();
+            }
+            return result.snapshot;
+          } catch (error) {
+            if (requestSequence !== refreshRequestSequence.current) continue;
+            setLoadError(userMessageV2(error));
+            if (snapshotRef.current === null && !initialFailureReported.current) {
+              initialFailureReported.current = true;
+              onInitialSnapshotFailed?.(error);
+            }
+            return null;
+          }
         }
-        return null;
+      } finally {
+        refreshInFlight.current = null;
       }
-      snapshotRef.current = result.snapshot;
-      setSnapshot(result.snapshot);
-      setLoadError(null);
-      if (!readyReported.current) {
-        readyReported.current = true;
-        onReady?.();
-      }
-      return result.snapshot;
-    } catch (error) {
-      if (sequence !== refreshSequence.current) return null;
-      setLoadError(userMessageV2(error));
-      if (snapshotRef.current === null && !initialFailureReported.current) {
-        initialFailureReported.current = true;
-        onInitialSnapshotFailed?.(error);
-      }
-      return null;
-    }
+    })();
+    refreshInFlight.current = worker;
+    return worker;
   }, [onInitialSnapshotFailed, onReady, provider]);
 
   useEffect(() => {
@@ -158,12 +172,13 @@ export function DesktopProductApp({
 
   useEffect(() => {
     if (snapshot === null) return;
-    const activeTasks = snapshot.tasks.filter((task) => (
-      ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)
-    ));
-    if (activeTasks.length === 0) return;
+    const tasksToLoad = [...new Map(snapshot.tasks.filter((task) => (
+      task.task_id === selectedTaskId
+        || ["admitted", "preparing", "running", "cancelling", "waiting_for_successor"].includes(task.state)
+    )).map((task) => [task.task_id, task])).values()];
+    if (tasksToLoad.length === 0) return;
     let retained = true;
-    void Promise.all(activeTasks.map(async (task) => (
+    void Promise.all(tasksToLoad.map(async (task) => (
       [task.task_id, (await provider.loadTaskLogs(task.task_id, { limit: 100 })).items] as const
     ))).then((pages) => {
       if (!retained) return;
@@ -174,7 +189,7 @@ export function DesktopProductApp({
     return () => {
       retained = false;
     };
-  }, [provider, snapshot]);
+  }, [provider, selectedTaskId, snapshot]);
 
   const recoveringProjectId = snapshot?.projects.find((project) => (
     project.project_id === snapshot.state.active_project_id
@@ -245,6 +260,9 @@ export function DesktopProductApp({
   const mutationIntents = provider.listMutationIntents();
   const visibleOperationCount = lifecycleStates.length + coreOperations.length + diagnostics.length;
   const developmentAgentBridge = provider.featureFlags.includes("development_agent_bridge");
+  const sessionEvolutionAvailable = developmentAgentBridge || (
+    displayedProject !== null && snapshot.capability?.project_id === displayedProject.project_id
+  );
 
   const runProject = async (
     project: ProjectV2,
@@ -268,7 +286,7 @@ export function DesktopProductApp({
       }
       let currentSnapshot = startingSnapshot;
       let currentProject = startingProject;
-      const nextConfig = developmentAgentBridge
+      const nextConfig = sessionEvolutionAvailable
         ? withSessionDocumentEvolution(currentProject.config, task, selectedEvolutionTargets)
         : { ...currentProject.config, task };
       if (JSON.stringify(nextConfig) !== JSON.stringify(currentProject.config)) {
@@ -432,7 +450,7 @@ export function DesktopProductApp({
               runtimePresentation={snapshot.runtimePresentation}
               selectedTaskId={selectedTaskId}
               busy={busy}
-              sessionEvolutionAvailable={developmentAgentBridge}
+              sessionEvolutionAvailable={sessionEvolutionAvailable}
               onSelectTask={setSelectedTaskId}
               onOpenSettings={() => { setProjectEditing(true); setProjectOpen(true); }}
               onRetryInitialization={() => void refresh()}
@@ -750,24 +768,30 @@ function RemoteWorkspaceSetupV2({
   readonly onError: (error: unknown) => void;
   readonly onConnected: () => void;
 }) {
-  const selectableHosts = snapshot.catalog.hosts.filter((host) => host.availability !== "unsupported");
-  const browserHosted = isBrowserHostedReleaseRuntime();
+  const selectableHosts = useMemo(
+    () =>
+      snapshot.catalog.hosts.filter(
+        (host) => host.availability === "selectable",
+      ),
+    [snapshot.catalog.hosts],
+  );
   const [alias, setAlias] = useState(selectableHosts[0]?.ssh_host_alias ?? "");
   const [displayName, setDisplayName] = useState("Research server");
-  const [manualAlias, setManualAlias] = useState(!browserHosted && selectableHosts.length === 0);
-  const [connectionMode, setConnectionMode] = useState<"server" | "alias">(
-    browserHosted ? "server" : "alias",
+  const visibleProfiles = useMemo(
+    () => visibleConnectionProfiles(snapshot.profiles),
+    [snapshot.profiles],
   );
-  const [host, setHost] = useState("");
-  const [port, setPort] = useState("22");
-  const [username, setUsername] = useState("");
   const dialogRef = useDialogBoundary(onClose);
 
   useEffect(() => {
-    if (manualAlias || selectableHosts.length === 0) return;
-    if (selectableHosts.some((host) => host.ssh_host_alias === alias)) return;
-    setAlias(selectableHosts[0]!.ssh_host_alias);
-  }, [alias, manualAlias, selectableHosts]);
+    if (selectableHosts.length === 0) {
+      if (alias !== "") setAlias("");
+      return;
+    }
+    if (!selectableHosts.some((host) => host.ssh_host_alias === alias)) {
+      setAlias(selectableHosts[0]!.ssh_host_alias);
+    }
+  }, [alias, selectableHosts]);
 
   const mutate = async (operation: () => Promise<unknown>, close = false): Promise<void> => {
     onBusy(true);
@@ -785,27 +809,12 @@ function RemoteWorkspaceSetupV2({
   };
 
   const saveAndConnect = async (): Promise<void> => {
-    if (displayName.trim() === "") return;
+    const selectedAlias = alias.trim();
+    if (displayName.trim() === "" || selectedAlias === "") return;
     onBusy(true);
     onClearError();
     try {
-      let selectedAlias = alias.trim();
       let authoritySnapshot = snapshot;
-      if (connectionMode === "server") {
-        const parsedPort = Number(port);
-        if (host.trim() === "" || username.trim() === "" || !Number.isInteger(parsedPort)) return;
-        selectedAlias = await registerBrowserSshHost({
-          host: host.trim(),
-          port: parsedPort,
-          username: username.trim(),
-        });
-        setAlias(selectedAlias);
-        await provider.rescanSshHosts(intentFor(snapshot, "rescan-browser-host"));
-        const rescanned = await onRefresh();
-        if (rescanned === null) throw new Error("The registered SSH server could not be reloaded.");
-        authoritySnapshot = rescanned;
-      }
-      if (selectedAlias === "") return;
       let targetProfile = reusableSystemOpenSshProfile(
         authoritySnapshot.profiles,
         selectedAlias,
@@ -854,53 +863,27 @@ function RemoteWorkspaceSetupV2({
         <div className="drawer-content">
           {error ? <Notice tone="error" title="Connection action failed" detail={error} onDismiss={onClearError} /> : null}
           <section className="form-section">
-            {browserHosted ? (
-              <div className="v2-connection-mode" role="group" aria-label="SSH connection input">
-                <button type="button" className={connectionMode === "server" ? "active" : ""} onClick={() => setConnectionMode("server")}>Server details</button>
-                <button type="button" className={connectionMode === "alias" ? "active" : ""} onClick={() => setConnectionMode("alias")}>OpenSSH alias</button>
-              </div>
-            ) : null}
-            {connectionMode === "server" ? (
-              <>
-                <div className="v2-section-heading"><div><h3>Server connection</h3><p>Enter the same server, port, and user you would pass to <code>ssh</code>. Authentication stays with system OpenSSH, ssh-agent, macOS Keychain, or the native password/passphrase prompt.</p></div></div>
-                <label>Workspace name<input maxLength={256} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
-                <label>Server address<input autoFocus maxLength={253} value={host} placeholder="gpu.example.edu" onChange={(event) => setHost(event.target.value)} /></label>
-                <div className="v2-host-fields">
-                  <label>SSH port<input inputMode="numeric" min={1} max={65535} value={port} onChange={(event) => setPort(event.target.value)} /></label>
-                  <label>Username<input maxLength={64} value={username} placeholder="researcher" onChange={(event) => setUsername(event.target.value)} /></label>
-                </div>
-                <div className="v2-catalog-warning" role="status"><ShieldCheck size={16} /><span>Passwords and private-key contents are never stored in the browser. OpenEvo asks the local Sidecar to run system SSH and deploy the formal Daemon.</span></div>
-              </>
-            ) : (
-              <>
-            <div className="v2-section-heading"><div><h3>Configured SSH host</h3><p>Desktop invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for routing, user, identities, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
+            <div className="v2-section-heading"><div><h3>Configured SSH host</h3><p>OpenEvo reads aliases from your system <code>~/.ssh/config</code> and invokes the equivalent of <code>ssh alias</code>. OpenSSH remains authoritative for host, port, user, identities, ProxyJump, agent, Keychain, and trust policy.</p></div><button type="button" className="text-button" disabled={busy} onClick={() => void mutate(() => provider.rescanSshHosts(intentFor(snapshot, "rescan-hosts")))}><RefreshCw size={14} /> Rescan</button></div>
             {snapshot.catalog.warnings.length > 0 ? (
-              <div className="v2-catalog-warning" role="status"><AlertCircle size={16} /><span><strong>Some configured hosts cannot be listed.</strong> You can still enter their literal SSH alias below.</span></div>
+              <div className="v2-catalog-warning" role="status"><AlertCircle size={16} /><span><strong>Some SSH configuration entries could not be listed.</strong> Fix your system OpenSSH configuration, then rescan.</span></div>
             ) : null}
             <label>Workspace name<input maxLength={256} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /></label>
-            {manualAlias ? (
-              <label>SSH host alias<input autoFocus maxLength={128} value={alias} placeholder="gpu-lab" onChange={(event) => setAlias(event.target.value)} /></label>
+            {selectableHosts.length > 0 ? (
+              <label>SSH host alias<select autoFocus value={alias} onChange={(event) => setAlias(event.target.value)}>{selectableHosts.map((host) => <option key={host.ssh_host_alias} value={host.ssh_host_alias}>{host.ssh_host_alias}</option>)}</select></label>
             ) : (
-              <label>SSH host alias<select value={alias} onChange={(event) => setAlias(event.target.value)}>{selectableHosts.map((host) => <option key={host.ssh_host_alias} value={host.ssh_host_alias}>{host.ssh_host_alias}{host.availability === "manual_entry_only" ? " — manual check required" : ""}</option>)}</select></label>
+              <div className="v2-catalog-warning" role="status"><AlertCircle size={16} /><span><strong>No usable SSH aliases were found.</strong> Add a literal Host entry to your system <code>~/.ssh/config</code>, confirm that <code>ssh alias</code> works, then select Rescan.</span></div>
             )}
-            <button type="button" className="text-button v2-manual-alias" onClick={() => {
-              setManualAlias((current) => {
-                const next = !current;
-                if (!next && !selectableHosts.some((host) => host.ssh_host_alias === alias)) {
-                  setAlias(selectableHosts[0]?.ssh_host_alias ?? "");
-                }
-                return next;
-              });
-            }}>{manualAlias ? "Choose a listed SSH alias" : "Use another SSH alias"}</button>
-              </>
-            )}
+            {selectableHosts.length === 0 ? <pre className="v2-ssh-config-example">{`Host gpu-lab
+    HostName gpu.example.edu
+    User researcher
+    Port 22`}</pre> : null}
           </section>
 
-          {snapshot.profiles.length > 0 ? (
+          {visibleProfiles.length > 0 ? (
             <section className="form-section">
               <h3>Saved workspaces</h3>
               <div className="v2-profile-list">
-                {snapshot.profiles.map((profile) => (
+                {visibleProfiles.map((profile) => (
                   <ProfileSetupCardV2
                     key={profile.profile_id}
                     profile={profile}
@@ -917,7 +900,7 @@ function RemoteWorkspaceSetupV2({
         </div>
         <div className="drawer-footer">
           <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>Cancel</button>
-          <button type="button" className="primary-button" disabled={busy || displayName.trim() === "" || (connectionMode === "alias" ? alias.trim() === "" : host.trim() === "" || username.trim() === "" || !Number.isInteger(Number(port)) || Number(port) < 1 || Number(port) > 65535)} onClick={() => void saveAndConnect()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Server size={15} />} Save and connect</button>
+          <button type="button" className="primary-button" disabled={busy || displayName.trim() === "" || alias.trim() === ""} onClick={() => void saveAndConnect()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Server size={15} />} Save and connect</button>
         </div>
       </aside>
     </div>
@@ -1368,18 +1351,55 @@ function reusableSystemOpenSshProfile(
   profiles: readonly RemoteProfileV2[],
   sshHostAlias: string,
 ): RemoteWorkspaceProfileV2 | null {
-  const matching = profiles.filter(
+  const matching = visibleConnectionProfiles(profiles).filter(
     (profile): profile is RemoteWorkspaceProfileV2 =>
       profile.profile_kind === "system_openssh"
       && profile.ssh_host_alias === sshHostAlias,
   );
-  matching.sort((left, right) => {
-    const leftConnected = left.connection_state === "connected" ? 1 : 0;
-    const rightConnected = right.connection_state === "connected" ? 1 : 0;
-    if (leftConnected !== rightConnected) return rightConnected - leftConnected;
-    return right.updated_at.localeCompare(left.updated_at);
-  });
   return matching[0] ?? null;
+}
+
+function visibleConnectionProfiles(
+  profiles: readonly RemoteProfileV2[],
+): readonly RemoteProfileV2[] {
+  const canonicalByAlias = new Map<string, RemoteWorkspaceProfileV2>();
+  for (const profile of profiles) {
+    if (profile.profile_kind !== "system_openssh") continue;
+    const current = canonicalByAlias.get(profile.ssh_host_alias);
+    if (current === undefined || compareReusableProfiles(profile, current) > 0) {
+      canonicalByAlias.set(profile.ssh_host_alias, profile);
+    }
+  }
+  const canonicalIds = new Set(
+    [...canonicalByAlias.values()].map((profile) => profile.profile_id),
+  );
+  const systemDisplayNames = new Set(
+    [...canonicalByAlias.values()].map((profile) => profile.display_name),
+  );
+  return profiles.filter((profile) => (
+    profile.profile_kind === "system_openssh"
+      ? canonicalIds.has(profile.profile_id)
+      : !systemDisplayNames.has(profile.display_name)
+  ));
+}
+
+function compareReusableProfiles(
+  left: RemoteWorkspaceProfileV2,
+  right: RemoteWorkspaceProfileV2,
+): number {
+  const rank = (profile: RemoteWorkspaceProfileV2): number => {
+    if (["ssh_cleanup_failed", "ssh_cleanup_authority_lost"].includes(profile.failure?.code ?? "")) return 6;
+    if (profile.connection_state === "connected") return 5;
+    if (["connecting", "prompt_pending", "host_key_review", "bootstrapping", "negotiating", "disconnecting"].includes(profile.connection_state)) return 4;
+    if (profile.active_project_id !== null) return 3;
+    if (profile.connection_state === "failed") return 2;
+    return 1;
+  };
+  const rankDelta = rank(left) - rank(right);
+  if (rankDelta !== 0) return rankDelta;
+  const updatedDelta = left.updated_at.localeCompare(right.updated_at);
+  if (updatedDelta !== 0) return updatedDelta;
+  return left.profile_id.localeCompare(right.profile_id);
 }
 
 function ProjectWorkspacePanelV2({
@@ -1614,7 +1634,16 @@ function TaskAuthorityCardV2({
     "cancelling",
     "waiting_for_successor",
   ].includes(task.state);
-  const conversationCount = presentation?.transcript.length ?? (sessionInProgress ? 0 : logs.length);
+  const transcriptLogs = logs.filter((entry) => entry.stream === "transcript");
+  const fallbackTranscript = [
+    ...(taskContent ? [{ speaker: "user" as const, text: taskContent.objective }] : []),
+    ...transcriptLogs.map((entry) => ({
+      speaker: "agent" as const,
+      text: entry.message.replace(/^(assistant|agent):\s*/i, ""),
+      sequence: entry.sequence,
+    })),
+  ];
+  const conversationCount = presentation?.transcript.length ?? fallbackTranscript.length;
   const activityStage = sessionActivityStageV2(task.state, logs);
   const producedArtifacts = artifacts.filter((artifact) => presentation?.producedArtifactIds.includes(artifact.artifact_id));
   const usedArtifacts = artifacts.filter((artifact) => presentation?.usedArtifactIds.includes(artifact.artifact_id));
@@ -1642,7 +1671,7 @@ function TaskAuthorityCardV2({
       <section className="session-task-detail v2-session-task-detail" data-session-priority="task"><span className="panel-kicker">Task instructions</span>{taskContent ? <p>{taskContent.objective}</p> : <p className="session-task-unavailable">The immutable admission contains the historical project-config digest, but this API response does not include that configuration's task text.</p>}</section>
       <section className="v2-result-section v2-conversation-section v2-session-module" data-session-priority="conversation">
         <SessionModuleHeadingV2 index="01" label="Session dialogue" title="Conversation" description="The request and the Agent's response from this Session." metric={sessionInProgress ? "Agent working" : `${conversationCount} messages`} icon={MessageSquareText} tone="conversation" />
-        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && logs.length ? <div className="v2-transcript">{logs.map((entry) => <article key={entry.sequence} className="system"><span>{entry.stream}</span><p>{entry.message}</p></article>)}</div> : !sessionInProgress ? <p className="v2-empty-copy">The agent response is not loaded yet.</p> : null}
+        {presentation?.transcript.length ? <div className="v2-transcript">{presentation.transcript.map((entry, index) => <article key={`${entry.speaker}-${index}`} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress && transcriptLogs.length ? <div className="v2-transcript">{fallbackTranscript.map((entry, index) => <article key={("sequence" in entry ? entry.sequence : `${entry.speaker}-${index}`)} className={entry.speaker}><span>{entry.speaker}</span><p>{entry.text}</p></article>)}</div> : !sessionInProgress ? <p className="v2-empty-copy">The agent response is not loaded yet.</p> : null}
         {sessionInProgress ? (
           <div className="v2-agent-activity" role="status" aria-live="polite" data-testid="session-agent-activity">
             <div className="v2-agent-activity-indicator" aria-hidden="true"><LoaderCircle className="spin" size={18} /></div>
@@ -2151,8 +2180,21 @@ function actionIdV2(prefix: string): string {
 
 function userMessageV2(error: unknown): string {
   if (error instanceof DesktopApiErrorV2) return error.apiError.summary;
+  if (isDesktopErrorV2(error)) return error.summary;
   if (error instanceof Error && error.message.length > 0 && error.message.length <= 768) return error.message;
   return "OpenEvo Desktop could not complete this action. Refresh the current authority and try again.";
+}
+
+function isDesktopErrorV2(error: unknown): error is DesktopErrorV2 {
+  if (typeof error !== "object" || error === null) return false;
+  const candidate = error as Partial<DesktopErrorV2>;
+  return candidate.schema_version === "2"
+    && typeof candidate.code === "string"
+    && typeof candidate.summary === "string"
+    && candidate.summary.length > 0
+    && candidate.summary.length <= 768
+    && typeof candidate.retryable === "boolean"
+    && typeof candidate.action === "string";
 }
 
 function connectionLabel(state: RemoteWorkspaceProfileV2["connection_state"]): string {

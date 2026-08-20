@@ -150,6 +150,38 @@ function nativeLifecycleOperation(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function runningProjectCreateOperation(operationId: string, projectId: string) {
+  return {
+    ...lifecycleOperation(),
+    operation_id: operationId,
+    kind: "project_create" as const,
+    resource: { resource_kind: "project" as const, resource_id: projectId },
+    status: "running" as const,
+    phase: "opening_project_tunnel" as const,
+    phase_index: 10,
+    progress: { kind: "indeterminate" as const },
+    cancellable: true,
+    started_at: NOW,
+  };
+}
+
+function lifecycleReference(operation: ReturnType<typeof runningProjectCreateOperation>) {
+  return {
+    schema_version: operation.schema_version,
+    operation_id: operation.operation_id,
+    kind: operation.kind,
+    resource: operation.resource,
+    request_sha256: operation.request_sha256,
+    status: operation.status,
+    phase: operation.phase,
+    phase_index: operation.phase_index,
+    phase_total: operation.phase_total,
+    log_sequence_high_watermark: operation.log_sequence_high_watermark,
+    updated_at: operation.updated_at,
+    etag: operation.etag,
+  };
+}
+
 function clientFixture(profiles: RemoteWorkspaceProfileV2[] = []) {
   const client = {
     state: vi.fn().mockResolvedValue(state(profiles)),
@@ -253,6 +285,259 @@ describe("Desktop v2 product provider", () => {
     expect(client.listProjects).not.toHaveBeenCalled();
     expect(client.listTasks).not.toHaveBeenCalled();
     expect(client.listServices).not.toHaveBeenCalled();
+  });
+
+  it("keeps local connection authority readable while a persisted project tunnel is disconnected", async () => {
+    const disconnected = profile({ active_project_id: "project-lab" });
+    const client = clientFixture([disconnected]);
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([disconnected]),
+      active_profile_id: disconnected.profile_id,
+      active_project_id: "project-lab",
+    });
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("expected a fresh local-only snapshot");
+    expect(result.snapshot.state.active_project_id).toBe("project-lab");
+    expect(result.snapshot.projects).toEqual([]);
+    expect(client.listProjects).not.toHaveBeenCalled();
+    expect(client.listTasks).not.toHaveBeenCalled();
+    expect(client.listServices).not.toHaveBeenCalled();
+  });
+
+  it("does not read the previous project through a project-create tunnel hand-off", async () => {
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-old",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const client = clientFixture([current]);
+    const running = runningProjectCreateOperation(
+      "lifecycle-project-create-handoff-1",
+      "project-new",
+    );
+    vi.mocked(client.state).mockResolvedValue({
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: "project-old",
+      pending_operations: [lifecycleReference(running)],
+    });
+    vi.mocked(client.getLifecycleOperation).mockResolvedValue(running);
+    vi.mocked(client.lifecycleOperationLogs).mockResolvedValue({
+      schema_version: "2",
+      operation_id: running.operation_id,
+      dropped_before_sequence: 0,
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("expected a fresh transition snapshot");
+    expect(result.snapshot.state.active_project_id).toBe("project-old");
+    expect(result.snapshot.projects).toEqual([]);
+    expect(client.listProjects).not.toHaveBeenCalled();
+    expect(client.listTasks).not.toHaveBeenCalled();
+    expect(client.listServices).not.toHaveBeenCalled();
+  });
+
+  it("re-reads local authority when a project tunnel changes after state was read", async () => {
+    const current = profile({
+      connection_state: "connected",
+      active_project_id: "project-old",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const client = clientFixture([current]);
+    const running = runningProjectCreateOperation(
+      "lifecycle-project-create-race-1",
+      "project-new",
+    );
+    const stableState = {
+      ...state([current]),
+      active_profile_id: current.profile_id,
+      active_project_id: "project-old",
+    };
+    const transitionState = {
+      ...stableState,
+      pending_operations: [lifecycleReference(running)],
+    };
+    vi.mocked(client.state)
+      .mockResolvedValueOnce(stableState)
+      .mockResolvedValue(transitionState);
+    vi.mocked(client.listProjects).mockRejectedValue(new DesktopApiErrorV2(409, {
+      schema_version: "2",
+      code: "active_project_mismatch",
+      summary: "The requested resource does not belong to the active project tunnel.",
+      retryable: true,
+      action: "reconnect",
+      affected_resource_id: "project-old",
+    }));
+    vi.mocked(client.getLifecycleOperation).mockResolvedValue(running);
+    vi.mocked(client.lifecycleOperationLogs).mockResolvedValue({
+      schema_version: "2",
+      operation_id: running.operation_id,
+      dropped_before_sequence: 0,
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    expect(client.state).toHaveBeenCalledTimes(2);
+    expect(client.listProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("absorbs a retryable Core snapshot outage instead of failing the user action", async () => {
+    const connected = profile({
+      connection_state: "connected",
+      active_project_id: "project-old",
+      core_api_major: 2,
+      core_openapi_sha256: DIGEST,
+      core_event_schema_sha256: DIGEST,
+      core_registry_sha256: DIGEST,
+    });
+    const disconnected = profile();
+    const client = clientFixture([connected]);
+    vi.mocked(client.state)
+      .mockResolvedValueOnce({
+        ...state([connected]),
+        active_profile_id: connected.profile_id,
+        active_project_id: "project-old",
+      })
+      .mockResolvedValue(state([disconnected]));
+    vi.mocked(client.listProfiles)
+      .mockResolvedValueOnce({
+        schema_version: "2",
+        items: [connected],
+        next_cursor: null,
+        has_more: false,
+      })
+      .mockResolvedValue({
+        schema_version: "2",
+        items: [disconnected],
+        next_cursor: null,
+        has_more: false,
+      });
+    vi.mocked(client.listProjects).mockRejectedValueOnce(new DesktopApiErrorV2(503, {
+      schema_version: "2",
+      code: "core_connection_failed",
+      summary: "Desktop could not reach the active project tunnel.",
+      retryable: true,
+      action: "reconnect",
+      affected_resource_id: "project-old",
+    }));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    if (result.status !== "fresh") throw new Error("expected the transient outage to recover");
+    expect(result.snapshot.state.active_project_id).toBeNull();
+    expect(client.state).toHaveBeenCalledTimes(2);
+    expect(client.listProjects).toHaveBeenCalledTimes(1);
+  });
+
+  it("loads one active-project tunnel collection at a time", () => {
+    const source = readFileSync(new URL("./localApiProviderV2.ts", import.meta.url), "utf8");
+    const start = source.indexOf("const projects = await collectPages");
+    const tasks = source.indexOf("const tasks = await collectPages", start);
+    const services = source.indexOf("const services = await collectPages", tasks);
+    const capability = source.indexOf("const capability = await", services);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(tasks).toBeGreaterThan(start);
+    expect(services).toBeGreaterThan(tasks);
+    expect(capability).toBeGreaterThan(services);
+    expect(source.slice(start, capability)).not.toContain("Promise.all");
+  });
+
+  it("preserves contract validation details in refresh failures", async () => {
+    const localProfile = profile();
+    const client = clientFixture([]);
+    vi.mocked(client.state).mockResolvedValue(state([localProfile]));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("error");
+    if (result.status !== "error") throw new Error("expected an error snapshot");
+    expect(result.stream.error).toMatchObject({
+      code: "desktop_snapshot_invalid",
+      summary: "Desktop state and profile collection disagree",
+      retryable: true,
+      action: "retry",
+    });
+  });
+
+  it("retries one transient local authority race before failing the refresh", async () => {
+    const localProfile = profile();
+    const client = clientFixture([localProfile]);
+    vi.mocked(client.listProfiles)
+      .mockResolvedValueOnce({
+        schema_version: "2",
+        items: [],
+        next_cursor: null,
+        has_more: false,
+      })
+      .mockResolvedValue({
+        schema_version: "2",
+        items: [localProfile],
+        next_cursor: null,
+        has_more: false,
+      });
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const result = await provider.refresh();
+
+    expect(result.status).toBe("fresh");
+    expect(client.state).toHaveBeenCalledTimes(2);
+    expect(client.listSshHosts).toHaveBeenCalledTimes(2);
+    expect(client.listProfiles).toHaveBeenCalledTimes(2);
   });
 
   it("does not let an event subscription stale the first snapshot refresh", async () => {
@@ -727,9 +1012,7 @@ describe("Desktop v2 product provider", () => {
       next_cursor: null,
       has_more: false,
     } as never);
-    vi.mocked(client.getProject).mockResolvedValue({
-      project_id: "project-created-1",
-    } as never);
+    vi.mocked(client.getProject).mockRejectedValue(new Error("409 Conflict"));
     const provider = createLocalApiDesktopProductProviderV2({
       client,
       native,
@@ -778,6 +1061,7 @@ describe("Desktop v2 product provider", () => {
     expect(native.settleProjectSource).not.toHaveBeenCalledWith(actionId, "adopt");
     await expect(provider.refresh()).resolves.toMatchObject({ status: "fresh" });
     expect(native.settleProjectSource).toHaveBeenCalledWith(actionId, "adopt");
+    expect(client.getProject).not.toHaveBeenCalled();
     expect(native.journalValue()).toBeNull();
   });
 
@@ -1333,6 +1617,71 @@ describe("Desktop v2 product provider", () => {
 
     expect(recovered.status).toBe("fresh");
     expect(client.getProfile).toHaveBeenCalledWith(current.profile_id);
+    expect(client.acknowledgeLifecycleOperation).toHaveBeenCalledTimes(1);
+  });
+
+  it("acknowledges an inactive historical project result without querying the active-project endpoint", async () => {
+    const terminal = {
+      ...lifecycleOperation(),
+      operation_id: "lifecycle-project-create-history-1",
+      kind: "project_create" as const,
+      resource: {
+        resource_kind: "project" as const,
+        resource_id: "project-historical",
+      },
+      status: "succeeded" as const,
+      phase: "finalizing" as const,
+      phase_index: 16,
+      progress: null,
+      cancellable: false,
+      result: {
+        result_kind: "project" as const,
+        project_id: "project-historical",
+      },
+      updated_at: "2026-07-23T06:00:01Z",
+      finished_at: "2026-07-23T06:00:01Z",
+      etag: `"${"e".repeat(64)}"`,
+    };
+    const client = clientFixture();
+    vi.mocked(client.state).mockResolvedValue({
+      ...state(),
+      active_project_id: null,
+      pending_operations: [{
+        schema_version: "2",
+        operation_id: terminal.operation_id,
+        kind: terminal.kind,
+        resource: terminal.resource,
+        request_sha256: terminal.request_sha256,
+        status: terminal.status,
+        phase: terminal.phase,
+        phase_index: terminal.phase_index,
+        phase_total: terminal.phase_total,
+        log_sequence_high_watermark: terminal.log_sequence_high_watermark,
+        updated_at: terminal.updated_at,
+        etag: terminal.etag,
+      }],
+    });
+    vi.mocked(client.getLifecycleOperation).mockResolvedValue(terminal);
+    vi.mocked(client.lifecycleOperationLogs).mockResolvedValue({
+      schema_version: "2",
+      operation_id: terminal.operation_id,
+      dropped_before_sequence: 0,
+      items: [],
+      next_cursor: null,
+      has_more: false,
+    });
+    vi.mocked(client.getProject).mockRejectedValue(new Error("inactive project returns 409"));
+    const provider = createLocalApiDesktopProductProviderV2({
+      client,
+      native: nativeFixture(),
+      featureFlags: ["system_openssh_profiles"],
+      providerStreamInstance: "provider-instance-test",
+    });
+
+    const recovered = await provider.refresh();
+
+    expect(recovered.status).toBe("fresh");
+    expect(client.getProject).not.toHaveBeenCalled();
     expect(client.acknowledgeLifecycleOperation).toHaveBeenCalledTimes(1);
   });
 

@@ -757,7 +757,7 @@ def test_v2_openapi_snapshot_is_exactly_rebuildable() -> None:
     assert OPENAPI_SNAPSHOT_PATH.read_bytes() == rebuilt
     assert hashlib.sha256(rebuilt).hexdigest() == openapi_sha256()
     assert openapi_sha256() == (
-        "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86"
+        "ae677842c735e4b7be673d3e308b76737929c60ac5857d2c4a578d9b372c68fd"
     )
 
 

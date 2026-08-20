@@ -951,6 +951,9 @@ def test_packaged_v2_restart_invalidates_process_authority_and_preserves_project
         assert profile["active_project_id"] == "desktop-project-restart"
         assert profile["core_api_major"] is None
         assert profile["core_registry_sha256"] is None
+        state = client.get("/desktop/v2/state", headers=_headers()).json()
+        assert state["active_profile_id"] == created.profile_id
+        assert state["active_project_id"] == "desktop-project-restart"
     finally:
         client.close()
         app.state.desktop_release_provider.close()

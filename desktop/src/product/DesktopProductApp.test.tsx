@@ -499,7 +499,9 @@ function providerFixture(initial: DesktopProductSnapshotV2) {
       status: "fresh" as const,
       snapshot: current,
     })),
-    subscribe: vi.fn(() => () => undefined),
+    subscribe: vi.fn((
+      _listener: Parameters<DesktopProductProviderV2["subscribe"]>[0],
+    ) => () => undefined),
     createProfile: vi.fn(async (displayName: string, alias: string) => {
       const created = systemProfile({
         display_name: displayName,
@@ -675,7 +677,7 @@ describe("Desktop v2 product renderer", () => {
     window.history.replaceState(null, "", window.location.pathname);
   });
 
-  it("shows direct server details when opened by the localhost browser host", async () => {
+  it("uses configured OpenSSH aliases in the localhost browser host", async () => {
     window.history.replaceState(
       null,
       "",
@@ -685,14 +687,14 @@ describe("Desktop v2 product renderer", () => {
 
     await click("Add remote workspace");
 
-    expect(dialog()?.textContent).toContain("Server connection");
+    expect(dialog()?.textContent).toContain("Configured SSH host");
+    expect(dialog()?.textContent).toContain("gpu-lab");
     const fieldLabels = [...(dialog()?.querySelectorAll("label") ?? [])]
       .map((label) => label.textContent ?? "")
       .join(" ");
-    expect(fieldLabels).toMatch(/server address/i);
-    expect(fieldLabels).toMatch(/ssh port/i);
-    expect(fieldLabels).toMatch(/username/i);
-    expect(fieldLabels).not.toMatch(/private key|password/i);
+    expect(fieldLabels).not.toMatch(
+      /server address|user name|username|ssh port|private key|password/i,
+    );
   });
 
   it("opens configured-host setup immediately and never renders manual connection fields", async () => {
@@ -704,15 +706,19 @@ describe("Desktop v2 product renderer", () => {
     expect(dialog()?.textContent).toContain("Configured SSH host");
     expect(dialog()?.textContent).toContain("gpu-lab");
     expect(dialog()?.textContent).toContain(
-      "Some configured hosts cannot be listed",
+      "Some SSH configuration entries could not be listed.",
     );
     const fieldLabels = [...(dialog()?.querySelectorAll("label") ?? [])]
       .map((label) => label.textContent ?? "")
       .join(" ");
     expect(fieldLabels).not.toMatch(
-      /server address|user name|port|private key|password/i,
+      /server address|user name|username|ssh port|private key|password/i,
     );
-    expect(button("Use another SSH alias")).toBeTruthy();
+    expect(
+      [...(dialog()?.querySelectorAll("button") ?? [])].some((candidate) =>
+        candidate.textContent?.includes("Use another SSH alias"),
+      ),
+    ).toBe(false);
   });
 
   it("shows an explicit empty project state without demo authority", async () => {
@@ -773,6 +779,43 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
+  it("shows one saved workspace per SSH alias and hides its rebound Preview record", async () => {
+    const stale = systemProfile({
+      profile_id: "profile-stale-alias",
+      display_name: "GPU lab",
+      updated_at: "2026-07-23T05:00:00Z",
+    });
+    const connected = systemProfile({
+      profile_id: "profile-connected-alias",
+      display_name: "GPU lab",
+      connection_state: "connected",
+      updated_at: "2026-07-23T06:00:01Z",
+    });
+    const legacy = {
+      schema_version: "2",
+      profile_kind: "legacy_explicit",
+      profile_id: "legacy-profile-rebound",
+      display_name: "GPU lab",
+      connectable: false,
+      migration_state: "rebind_required",
+      created_at: NOW,
+      updated_at: NOW,
+      etag: ETAG,
+    } as const;
+    const profiles = [stale, legacy, connected] as never;
+    const snapshot = baseSnapshot({
+      profiles,
+      state: { ...baseSnapshot().state, profiles },
+    });
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+    await click("Add remote workspace");
+
+    expect(dialog()?.querySelectorAll(".v2-profile-card")).toHaveLength(1);
+    expect(dialog()?.textContent).toContain("connected");
+    expect(dialog()?.textContent).not.toContain("Retained Preview profile");
+  });
+
   it("lets the user remove a disconnected saved workspace", async () => {
     const existing = systemProfile({
       profile_id: "profile-stale",
@@ -793,22 +836,19 @@ describe("Desktop v2 product renderer", () => {
     );
   });
 
-  it("restores a listed alias after an empty manual alias", async () => {
-    const provider = providerFixture(baseSnapshot());
+  it("explains how to configure SSH when no literal alias is available", async () => {
+    const snapshot = baseSnapshot({
+      catalog: { ...baseSnapshot().catalog, hosts: [], warnings: [] },
+    });
+    const provider = providerFixture(snapshot);
     root = await render(provider);
     await click("Add remote workspace");
-    await click("Use another SSH alias");
-    setInput("SSH host alias", "");
-    await click("Choose a listed SSH alias");
 
+    expect(dialog()?.textContent).toContain("No usable SSH aliases were found");
+    expect(dialog()?.textContent).toContain("Host gpu-lab");
     const save = button("Save and connect") as HTMLButtonElement;
-    expect(save.disabled).toBe(false);
-    await click("Save and connect");
-    expect(provider.createProfile).toHaveBeenCalledWith(
-      "Research server",
-      "gpu-lab",
-      expect.objectContaining({ streamEpoch: 1 }),
-    );
+    expect(save.disabled).toBe(true);
+    expect(provider.createProfile).not.toHaveBeenCalled();
   });
 
   it("offers explicit rebind for retained Preview profiles", async () => {
@@ -1113,6 +1153,48 @@ describe("Desktop v2 product renderer", () => {
     ).toBeTruthy();
   });
 
+  it("coalesces an SSE refresh with the Start session authority preflight", async () => {
+    const snapshot = authoritySnapshot();
+    const provider = providerFixture(snapshot);
+    let signal: Parameters<DesktopProductProviderV2["subscribe"]>[0] | null = null;
+    provider.subscribe.mockImplementation((next) => {
+      signal = next;
+      return () => {
+        signal = null;
+      };
+    });
+    root = await render(provider);
+
+    let releasePreflight!: () => void;
+    const preflightBlocked = new Promise<void>((resolve) => {
+      releasePreflight = resolve;
+    });
+    const refreshCallsBeforeStart = provider.refresh.mock.calls.length;
+    provider.refresh.mockImplementationOnce(async () => {
+      await preflightBlocked;
+      return { status: "fresh" as const, snapshot };
+    });
+
+    await act(async () => {
+      button("Start session").click();
+      await vi.waitFor(() => {
+        expect(provider.refresh.mock.calls.length).toBe(refreshCallsBeforeStart + 1);
+      });
+      signal?.({ kind: "snapshot_changed" });
+      releasePreflight();
+      await vi.waitFor(() => {
+        expect(provider.submitTask).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    expect(document.body.textContent).not.toContain(
+      "The current remote project state could not be loaded before starting the session.",
+    );
+    expect(provider.refresh.mock.calls.length).toBeGreaterThan(
+      refreshCallsBeforeStart + 1,
+    );
+  });
+
   it("keeps the v1 create-project entry beside the project switcher", async () => {
     const provider = providerFixture(authoritySnapshot());
     root = await render(provider);
@@ -1362,6 +1444,103 @@ describe("Desktop v2 product renderer", () => {
 
     expect(document.querySelector('[data-testid="session-agent-activity"]')).toBeNull();
     expect(document.body.textContent).not.toContain("Agent working");
+  });
+
+  it("loads the final formal transcript when a completed Session is opened", async () => {
+    const snapshot = authoritySnapshot();
+    const formalSnapshot: DesktopProductSnapshotV2 = {
+      ...snapshot,
+      runtimePresentation: undefined,
+    };
+    const loadTaskLogs = vi.fn(async () => ({
+      schema_version: "2" as const,
+      items: [
+        {
+          sequence: 1,
+          occurred_at: NOW,
+          stream: "system" as const,
+          message: "Task closed after successor activation.",
+        },
+        {
+          sequence: 2,
+          occurred_at: NOW,
+          stream: "transcript" as const,
+          message: "assistant: The formal agent response was captured.",
+        },
+      ],
+      next_cursor: null,
+      has_more: false,
+    }));
+    const provider = {
+      ...providerFixture(formalSnapshot),
+      loadTaskLogs,
+    } satisfies DesktopProductProviderV2;
+
+    root = await render(provider);
+    await click("Session 1");
+    await vi.waitFor(() => {
+      expect(loadTaskLogs).toHaveBeenCalledWith("task-1", { limit: 100 });
+      expect(document.querySelector(".v2-conversation-section")?.textContent).toContain(
+        "The formal agent response was captured.",
+      );
+    });
+
+    const conversation = document.querySelector(".v2-conversation-section")!;
+    expect(conversation.textContent).toContain("Review the evidence and update the workspace.");
+    expect(conversation.textContent).toContain("2 messages");
+    expect(conversation.textContent).not.toContain("Task closed after successor activation.");
+  });
+
+  it("persists formal Core evolution selections before starting a Session", async () => {
+    const snapshot = authoritySnapshot();
+    snapshot.capability!.capabilities.targets = [
+      {
+        target_id: "text_memory",
+        display_name: "Memory",
+        description: "Learn durable research memory from the transcript.",
+        exposure: "desktop",
+        effective_default_method_id: "trajectory_to_memory",
+        methods: [
+          {
+            method_id: "trajectory_to_memory",
+            display_name: "Trajectory to memory",
+            default_config_json: "{}",
+            support: { overall: "supported" },
+          },
+        ],
+        accepted_methods: [],
+        selection_resolvers: [],
+      },
+    ] as never;
+    const provider = providerFixture(snapshot);
+    root = await render(provider);
+
+    const checkbox = document.querySelector<HTMLInputElement>(
+      '.session-evolution-picker input[type="checkbox"]',
+    );
+    expect(checkbox).toBeTruthy();
+    await act(async () => {
+      checkbox!.click();
+      await Promise.resolve();
+    });
+    await click("Start session");
+
+    expect(provider.updateProject).toHaveBeenCalledWith(
+      "project-1",
+      "Protein study",
+      expect.objectContaining({
+        evolution: {
+          targets: {
+            text_memory: {
+              enabled: true,
+              method: "trajectory_to_memory",
+              config: {},
+            },
+          },
+        },
+      }),
+      expect.anything(),
+    );
   });
 
   it("shows and controls Core-owned long operations without a Desktop lifecycle shadow", async () => {

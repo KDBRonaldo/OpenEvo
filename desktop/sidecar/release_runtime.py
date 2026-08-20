@@ -823,6 +823,118 @@ class DesktopReleaseCoreRuntimeV1:
                 raise failure
 
 
+class DesktopCoreEventRelayV2:
+    """Continuously consume the active v2 Core stream.
+
+    ``DesktopCoreBridgeV2`` durably advances the Core cursor and publishes one
+    typed Desktop invalidation while each frame is consumed.  The relay owns
+    the otherwise-missing long-lived consumer; without it, completed Tasks and
+    successor Project Heads remain invisible until a manual browser refresh.
+    """
+
+    def __init__(self, bridge: DesktopCoreBridgeV2) -> None:
+        self._bridge = bridge
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._workers: dict[tuple[str, int, int], threading.Thread] = {}
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None:
+                raise RuntimeError("v2 Core event relay was already started")
+            self._thread = threading.Thread(
+                target=self._run,
+                name="openevo-core-event-relay-v2",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def request_stop(self) -> None:
+        self._stop.set()
+
+    def join(self) -> None:
+        with self._lock:
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+        while True:
+            with self._lock:
+                workers = tuple(self._workers.values())
+            if not workers:
+                return
+            for worker in workers:
+                if worker is not threading.current_thread():
+                    worker.join()
+            with self._lock:
+                self._workers = {
+                    key: worker
+                    for key, worker in self._workers.items()
+                    if worker.is_alive()
+                }
+
+    def _run(self) -> None:
+        backoff = _RELAY_MIN_BACKOFF_SECONDS
+        while not self._stop.is_set():
+            try:
+                activation = self._bridge.active_activation
+                if activation is None:
+                    if self._stop.wait(backoff):
+                        return
+                    backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+                    continue
+                key = (
+                    activation.desktop_project_id,
+                    activation.profile_connection_generation,
+                    activation.bridge_generation,
+                )
+                with self._lock:
+                    finished = [
+                        worker_key
+                        for worker_key, worker in self._workers.items()
+                        if not worker.is_alive()
+                    ]
+                    for worker_key in finished:
+                        self._workers.pop(worker_key, None)
+                    worker = self._workers.get(key)
+                    if worker is None:
+                        worker = threading.Thread(
+                            target=self._consume_activation,
+                            args=(key,),
+                            name="openevo-core-event-stream-v2",
+                            daemon=True,
+                        )
+                        self._workers[key] = worker
+                        worker.start()
+                backoff = _RELAY_MIN_BACKOFF_SECONDS
+                if self._stop.wait(backoff):
+                    return
+            except (DesktopCoreBridgeErrorV2, OSError, RuntimeError):
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+            except Exception:
+                _LOGGER.exception("Desktop v2 Core event relay failed")
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, _RELAY_MAX_BACKOFF_SECONDS)
+
+    def _consume_activation(self, key: tuple[str, int, int]) -> None:
+        desktop_project_id, generation, _bridge_generation = key
+        try:
+            with self._bridge.events(desktop_project_id, generation) as events:
+                for _frame in events:
+                    if self._stop.is_set():
+                        return
+        except (DesktopCoreBridgeErrorV2, OSError, RuntimeError):
+            return
+        except Exception:
+            _LOGGER.exception(
+                "Desktop v2 Core event stream failed",
+                extra={"desktop_project_id": desktop_project_id},
+            )
+
+
 class DesktopReleaseCoreRuntimeV2:
     """Own the strict v2 bridge, profile connector, broker, and mapping store."""
 
@@ -840,15 +952,19 @@ class DesktopReleaseCoreRuntimeV2:
         self.event_broker = event_broker
         self.bridge_store = bridge_store
         self.managed_runtime_available = managed_runtime_available
+        self._relay = DesktopCoreEventRelayV2(bridge)
         self._lock = threading.Lock()
         self._closed = False
+        self._relay.start()
 
     def close(self) -> None:
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-        failure = _collect_cleanup_failure(self.core_bridge.close, None)
+        failure = _collect_cleanup_failure(self._relay.request_stop, None)
+        failure = _collect_cleanup_failure(self.core_bridge.close, failure)
+        failure = _collect_cleanup_failure(self._relay.join, failure)
         failure = _collect_cleanup_failure(self.core_connector.close, failure)
         failure = _collect_cleanup_failure(self.event_broker.close, failure)
         failure = _collect_cleanup_failure(self.bridge_store.close, failure)

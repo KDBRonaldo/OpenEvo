@@ -1046,52 +1046,91 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
   }
 
   private async loadSnapshot(): Promise<Omit<DesktopProductSnapshotV2, "activeOperation" | "stream">> {
-    const [state, catalog, profiles] = await Promise.all([
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.loadSnapshotAttemptV2();
+      } catch (error) {
+        // Project creation changes the bridge tunnel and the persisted local
+        // authority in two serialized steps.  A refresh that began just before
+        // the lifecycle reservation can still hit that very small hand-off
+        // window, so re-read local authority instead of surfacing a false 409.
+        const retryableAuthorityRead = error instanceof DesktopApiErrorV2
+          && (error.apiError.code === "active_project_mismatch"
+            || (error.apiError.retryable && [502, 503, 504].includes(error.status)));
+        if (!retryableAuthorityRead || attempt >= 5) throw error;
+        // A Task admission or project activation can rotate the verified Core
+        // authority while the renderer is loading its read model.  The remote
+        // mutation is already durable at that point; treat a short tunnel or
+        // service hand-off as an internal snapshot retry instead of telling the
+        // user that the Project/Session failed.  Keep the bound small so a real
+        // outage is still surfaced promptly.
+        await new Promise<void>((resolve) => {
+          globalThis.setTimeout(resolve, Math.min(800, 50 * (2 ** attempt)));
+        });
+      }
+    }
+  }
+
+  private async loadSnapshotAttemptV2(): Promise<Omit<DesktopProductSnapshotV2, "activeOperation" | "stream">> {
+    let [state, catalog, profiles] = await Promise.all([
       this.client.state(),
       this.client.listSshHosts(),
       collectPages((options) => this.client.listProfiles(options)),
     ]);
-    assertProfileAuthority(state, profiles);
+    try {
+      assertProfileAuthority(state, profiles);
+    } catch (error) {
+      if (!(error instanceof DesktopContractErrorV2)) throw error;
+      [state, catalog, profiles] = await Promise.all([
+        this.client.state(),
+        this.client.listSshHosts(),
+        collectPages((options) => this.client.listProfiles(options)),
+      ]);
+      assertProfileAuthority(state, profiles);
+    }
     if (state.active_project_id === null) {
-      this.validation = null;
-      return {
-        state,
-        catalog,
-        profiles,
-        projects: [],
-        tasks: [],
-        transitions: {},
-        timelines: {},
-        artifacts: [],
-        services: [],
-        capability: null,
-        validation: null,
-      };
+      return this.localOnlySnapshot(state, catalog, profiles);
+    }
+    const activeProfile = profiles.find((candidate) => candidate.profile_id === state.active_profile_id);
+    if (activeProfile?.profile_kind !== "system_openssh") {
+      throw new DesktopContractErrorV2("Active project authority has no system-OpenSSH profile");
+    }
+    if (activeProfile.connection_state !== "connected") {
+      return this.localOnlySnapshot(state, catalog, profiles);
+    }
+    if (hasUnboundProjectTunnelTransitionV2(state)) {
+      // The lifecycle operation is authoritative while the bridge changes
+      // tunnels.  Do not issue old-project Core reads through the new tunnel;
+      // the operation poll will trigger another snapshot as soon as the local
+      // active project binding catches up.
+      return this.localOnlySnapshot(state, catalog, profiles);
     }
     activeConnectedProfile({ state, profiles });
-    const [projects, tasks, services] = await Promise.all([
-      collectPages((options) => this.client.listProjects(options)),
-      collectPages((options) => this.client.listTasks({ ...options, projectId: state.active_project_id! })),
-      collectPages((options) => this.client.listServices(options)),
-    ]);
+    // All remote reads share one generation-bound system-OpenSSH tunnel.  Keep
+    // one ordered read stream here, matching the proven development daemon's
+    // single-state-snapshot behavior.  Parallel HTTP reads caused intermittent
+    // 503s from an otherwise healthy tunnel immediately after Task admission.
+    const projects = await collectPages((options) => this.client.listProjects(options));
+    const tasks = await collectPages((options) => this.client.listTasks({
+      ...options,
+      projectId: state.active_project_id!,
+    }));
+    const services = await collectPages((options) => this.client.listServices(options));
     const activeProject = projects.find((project) => project.project_id === state.active_project_id);
     if (!activeProject) throw new DesktopContractErrorV2("Active project is absent from the remote project collection");
     if (projects.some((project) => project.project_id !== state.active_project_id)) {
       throw new DesktopContractErrorV2("Active project tunnel returned another project");
     }
-    const [capability, taskDetails] = await Promise.all([
-      this.client.projectCapabilities(activeProject.project_id),
-      Promise.all(tasks.map(async (task) => {
-        const [timeline, artifacts, transition] = await Promise.all([
-          collectPages((options) => this.client.taskTimeline(task.task_id, options)),
-          collectPages((options) => this.client.taskArtifacts(task.task_id, options)),
-          task.successor_transition === null
-            ? Promise.resolve(null)
-            : this.client.getTransition(task.successor_transition.successor_transition_id),
-        ]);
-        return { task, timeline, artifacts, transition };
-      })),
-    ]);
+    const capability = await this.client.projectCapabilities(activeProject.project_id);
+    const taskDetails = [];
+    for (const task of tasks) {
+      const timeline = await collectPages((options) => this.client.taskTimeline(task.task_id, options));
+      const artifacts = await collectPages((options) => this.client.taskArtifacts(task.task_id, options));
+      const transition = task.successor_transition === null
+        ? null
+        : await this.client.getTransition(task.successor_transition.successor_transition_id);
+      taskDetails.push({ task, timeline, artifacts, transition });
+    }
     const timelines: Record<string, readonly CoreEventEnvelopeV2[]> = {};
     const transitions: Record<string, SuccessorTransitionV2> = {};
     const artifactsById = new Map<string, ArtifactV2>();
@@ -1128,6 +1167,27 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       services,
       capability,
       validation: this.validation,
+    };
+  }
+
+  private localOnlySnapshot(
+    state: DesktopStateV2,
+    catalog: DesktopProductSnapshotV2["catalog"],
+    profiles: readonly RemoteProfileV2[],
+  ): Omit<DesktopProductSnapshotV2, "activeOperation" | "stream"> {
+    this.validation = null;
+    return {
+      state,
+      catalog,
+      profiles,
+      projects: [],
+      tasks: [],
+      transitions: {},
+      timelines: {},
+      artifacts: [],
+      services: [],
+      capability: null,
+      validation: null,
     };
   }
 
@@ -1261,7 +1321,18 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
     for (const state of this.lifecycleOperations.list()) {
       if (!isLifecycleTerminalV2(state.operation)) continue;
       if (acknowledged.has(state.operation.operation_id)) continue;
-      if (!currentOperationIds.has(state.operation.operation_id)) {
+      const result = state.operation.result;
+      const isInactiveHistoricalProjectResult = (
+        !currentOperationIds.has(state.operation.operation_id)
+        && state.operation.status === "succeeded"
+        && result !== null
+        && result.result_kind === "project"
+        && result.project_id !== snapshot.state.active_project_id
+      );
+      if (
+        !currentOperationIds.has(state.operation.operation_id)
+        && !isInactiveHistoricalProjectResult
+      ) {
         await this.validateLifecycleResultV2(state.operation, snapshot);
       }
       await this.acknowledgeLifecycleTerminalV2(state.operation);
@@ -1399,6 +1470,11 @@ export class LocalApiDesktopProductProviderV2 implements DesktopProductProviderV
       return;
     }
     if (result.result_kind === "project") {
+      // A successful project_create result is not necessarily the active
+      // project yet, so the active-project endpoint cannot validate it.
+      // Project activation is a separate lifecycle operation and is checked
+      // against both the endpoint and the authoritative snapshot below.
+      if (operation.kind === "project_create") return;
       const project = await this.client.getProject(result.project_id);
       if (project.project_id !== result.project_id
         || (operation.kind === "project_activate" && snapshot.state.active_project_id !== result.project_id)) {
@@ -1780,6 +1856,15 @@ function assertProfileAuthority(state: DesktopStateV2, profiles: readonly Remote
   }
 }
 
+function hasUnboundProjectTunnelTransitionV2(state: DesktopStateV2): boolean {
+  return state.pending_operations.some((operation) => (
+    operation.kind === "project_create"
+    && (operation.status === "queued" || operation.status === "running")
+    && operation.resource.resource_kind === "project"
+    && operation.resource.resource_id !== state.active_project_id
+  ));
+}
+
 function activeConnectedProfile(snapshot: Pick<DesktopProductSnapshotV2, "state" | "profiles">): RemoteWorkspaceProfileV2 {
   const profile = snapshot.profiles.find((candidate) => candidate.profile_id === snapshot.state.active_profile_id);
   if (profile?.profile_kind !== "system_openssh" || profile.connection_state !== "connected") {
@@ -1972,7 +2057,22 @@ function waitForV2(milliseconds: number): Promise<void> {
 }
 
 function apiErrorOfV2(error: unknown): DesktopErrorV2 | null {
-  return error instanceof DesktopApiErrorV2 ? error.apiError : null;
+  if (error instanceof DesktopApiErrorV2) return error.apiError;
+  if (error instanceof DesktopContractErrorV2) {
+    const summary = error.message
+      .replace(/[\u0000-\u001f\u007f]/g, " ")
+      .trim()
+      .slice(0, 768);
+    return {
+      schema_version: "2",
+      code: "desktop_snapshot_invalid",
+      summary: summary || "Desktop state failed contract validation.",
+      retryable: true,
+      action: "retry",
+      affected_resource_id: null,
+    };
+  }
+  return null;
 }
 
 async function readStreamErrorV2(response: Response): Promise<unknown> {

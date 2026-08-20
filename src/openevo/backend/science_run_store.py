@@ -4648,14 +4648,24 @@ class ScienceTaskStoreV2:
     def list_events(
         self,
         *,
+        project_id: str | None = None,
         after_event_id: str | None = None,
     ) -> list[m2.EventEnvelopeV2]:
+        if project_id is not None:
+            project_id = _v2_resource_id(project_id, label="project")
         if after_event_id is not None:
             after_event_id = _v2_resource_id(after_event_id, label="event")
         with self._lock, self._reader() as connection:
-            bounds = connection.execute(
-                "SELECT MIN(sequence) AS minimum, MAX(sequence) AS maximum FROM events"
-            ).fetchone()
+            if project_id is None:
+                bounds = connection.execute(
+                    "SELECT MIN(sequence) AS minimum, MAX(sequence) AS maximum FROM events"
+                ).fetchone()
+            else:
+                bounds = connection.execute(
+                    "SELECT MIN(sequence) AS minimum, MAX(sequence) AS maximum FROM events "
+                    "WHERE project_id = ?",
+                    (project_id,),
+                ).fetchone()
             minimum = bounds["minimum"]
             maximum = bounds["maximum"]
             if minimum is None or maximum is None:
@@ -4668,20 +4678,33 @@ class ScienceTaskStoreV2:
             )
             after_sequence = replay_floor - 1
             if after_event_id is not None:
-                cursor = connection.execute(
-                    "SELECT sequence FROM events WHERE event_id = ?",
-                    (after_event_id,),
-                ).fetchone()
+                if project_id is None:
+                    cursor = connection.execute(
+                        "SELECT sequence FROM events WHERE event_id = ?",
+                        (after_event_id,),
+                    ).fetchone()
+                else:
+                    cursor = connection.execute(
+                        "SELECT sequence FROM events WHERE event_id = ? AND project_id = ?",
+                        (after_event_id, project_id),
+                    ).fetchone()
                 if cursor is None:
                     raise ScienceEventCursorExpiredV2("v2 event replay cursor is not retained")
                 after_sequence = int(cursor["sequence"])
                 if after_sequence < replay_floor:
                     raise ScienceEventCursorExpiredV2("v2 event replay cursor is not retained")
-            rows = connection.execute(
-                "SELECT task_id, event_json FROM events WHERE sequence > ? ORDER BY sequence "
-                "LIMIT ?",
-                (after_sequence, _MAX_V2_EVENT_REPLAY + 1),
-            ).fetchall()
+            if project_id is None:
+                rows = connection.execute(
+                    "SELECT task_id, event_json FROM events WHERE sequence > ? "
+                    "ORDER BY sequence LIMIT ?",
+                    (after_sequence, _MAX_V2_EVENT_REPLAY + 1),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT task_id, event_json FROM events WHERE sequence > ? "
+                    "AND project_id = ? ORDER BY sequence LIMIT ?",
+                    (after_sequence, project_id, _MAX_V2_EVENT_REPLAY + 1),
+                ).fetchall()
             if len(rows) > _MAX_V2_EVENT_REPLAY:
                 raise ScienceTaskStoreV2Error("v2 event replay exceeds its bound")
             events = [_load_and_validate_v2_event(connection, row) for row in rows]

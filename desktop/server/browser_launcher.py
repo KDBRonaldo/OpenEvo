@@ -80,7 +80,6 @@ def main(argv: list[str] | None = None) -> int:
             packaged_askpass_helper_path=args.ssh_askpass_helper_path,
             packaged_askpass_helper_sha256=args.ssh_askpass_helper_sha256,
             packaged_askpass_helper_byte_size=args.ssh_askpass_helper_byte_size,
-            openssh_home=config_root / "managed-openssh-home",
             browser_endpoint=endpoint,
             browser_bootstrap_token=bootstrap_token,
         )

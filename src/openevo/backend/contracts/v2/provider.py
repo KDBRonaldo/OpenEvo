@@ -1723,9 +1723,11 @@ class CoreControlProviderV2:
         )
 
     def _events(self, arguments: Mapping[str, object]) -> StreamingResponse:
-        _keys(arguments, "last_event_id")
+        _keys(arguments, "project_id", "last_event_id")
+        project_id = _string(arguments["project_id"])
         initial = self._task_owner.list_events(
-            after_event_id=_optional_string(arguments["last_event_id"])
+            project_id=project_id,
+            after_event_id=_optional_string(arguments["last_event_id"]),
         )
 
         async def stream():
@@ -1744,6 +1746,7 @@ class CoreControlProviderV2:
                     return
                 events = await asyncio.to_thread(
                     self._task_owner.list_events,
+                    project_id=project_id,
                     after_event_id=cursor,
                 )
                 if not events and loop.time() - last_emit >= 15:

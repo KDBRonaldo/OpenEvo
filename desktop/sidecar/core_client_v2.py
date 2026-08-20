@@ -54,7 +54,7 @@ CORE_BLOCKING_IO_WORKER_COUNT: Final = 8
 MAX_CORE_REQUEST_DEADLINE_SECONDS: Final = 7200.0
 MAX_JSON_NESTING: Final = 64
 
-CORE_OPENAPI_SHA256: Final = "7a1c8c9951e139345a8a744c2127531896d75aa6ba6c6fe2cf4e0d270c5f6e86"
+CORE_OPENAPI_SHA256: Final = "ae677842c735e4b7be673d3e308b76737929c60ac5857d2c4a578d9b372c68fd"
 CORE_EVENTS_SCHEMA_SHA256: Final = (
     "0e5465c110fd42964f53f076a4bbeed55e899b27f235b5e26c3d478356c5b7d2"
 )
@@ -1805,6 +1805,7 @@ class CoreControlClientV2:
                 deadline = token.deadline
                 self._require_version_authority()
                 headers = self._headers(authenticated=True, accept="text/event-stream")
+                headers["X-OpenEvo-Project-Id"] = self._connection.project_id
                 if last_event_id is not None:
                     headers["Last-Event-ID"] = _visible_ascii_sse_id(last_event_id)
                 response = self._send(

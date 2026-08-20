@@ -251,13 +251,18 @@ class CodexHarness(BaseHarness):
             )
 
         if auth_mode == AUTH_MODE_SUBSCRIPTION:
-            result = await runtime.exec(
-                codex_subscription_exec_canary_command(
-                    model=_validated_cli_model_name(self.model_name),
-                    allow_internet=self._subscription_allow_internet,
-                ),
-                cwd=CODEX_SUBSCRIPTION_CANARY_CWD,
+            canary_command = codex_subscription_exec_canary_command(
+                model=_validated_cli_model_name(self.model_name),
+                allow_internet=self._subscription_allow_internet,
             )
+            result = await runtime.exec(canary_command, cwd=CODEX_SUBSCRIPTION_CANARY_CWD)
+            # A subscription refresh or a transient upstream refusal can make
+            # the first real-exec proof exit non-zero after the staged credential
+            # has already been refreshed.  One exact retry is safe: admission
+            # still requires a complete successful isolation proof, while an
+            # rc=0 response with malformed evidence continues to fail closed.
+            if result.return_code != 0:
+                result = await runtime.exec(canary_command, cwd=CODEX_SUBSCRIPTION_CANARY_CWD)
             if (
                 result.return_code != 0
                 or (result.stdout or "").strip() != CODEX_SUBSCRIPTION_CANARY_OK

@@ -101,11 +101,7 @@ const SIDECAR_BOOTSTRAP_POLL_INTERVAL_MS = 100;
 const SIDECAR_BOOTSTRAP_TIMEOUT_MS = 70_000;
 const BROWSER_BOOTSTRAP_STORAGE_KEY = "openevo.desktop.browser.bootstrap.v2";
 const BROWSER_MUTATION_JOURNAL_KEY = "openevo.desktop.browser.mutation-journal.v2";
-const browserSshHostResponseSchema = z.object({
-  schema_version: z.literal("2"),
-  ssh_host_alias: z.string().regex(/^[A-Za-z0-9._-]{1,128}$/),
-}).strict();
-
+let browserBootstrapInFlight: Promise<DesktopBootstrapContextV2> | null = null;
 type NativeBeginOutcome =
   | { readonly status: "fulfilled" }
   | { readonly status: "rejected"; readonly error: unknown };
@@ -204,9 +200,7 @@ function readStoredBrowserBootstrap(): DesktopBootstrapContextV2 | null {
   }
 }
 
-async function bootstrapBrowserSidecar(): Promise<DesktopBootstrapContextV2> {
-  const stored = readStoredBrowserBootstrap();
-  if (stored !== null) return stored;
+async function requestBrowserSidecarBootstrap(): Promise<DesktopBootstrapContextV2> {
   const parameters = new URLSearchParams(window.location.hash.replace(/^#/, ""));
   const bootstrapToken = parameters.get("browser-bootstrap");
   if (bootstrapToken === null || !/^[0-9a-f]{64}$/.test(bootstrapToken)) {
@@ -214,25 +208,59 @@ async function bootstrapBrowserSidecar(): Promise<DesktopBootstrapContextV2> {
       "OpenEvo must be opened by its local browser host before it can connect to a server",
     );
   }
-  const response = await window.fetch("/openevo-native/browser/bootstrap", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ schema_version: "2", bootstrap_token: bootstrapToken }),
-    cache: "no-store",
-    credentials: "omit",
-    referrerPolicy: "no-referrer",
-  });
+  let response: Response;
+  try {
+    response = await window.fetch("/openevo-native/browser/bootstrap", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ schema_version: "2", bootstrap_token: bootstrapToken }),
+      cache: "no-store",
+      credentials: "omit",
+      referrerPolicy: "no-referrer",
+    });
+  } catch {
+    throw new DesktopContractErrorV2(
+      "OpenEvo Desktop could not reach its protected local browser service",
+    );
+  }
   if (!response.ok) {
     throw new DesktopContractErrorV2("OpenEvo could not establish its protected local browser session");
   }
-  const context = await response.json() as DesktopBootstrapContextV2;
+  let context: DesktopBootstrapContextV2;
+  try {
+    context = await response.json() as DesktopBootstrapContextV2;
+  } catch {
+    throw new DesktopContractErrorV2(
+      "OpenEvo Desktop received an invalid local browser bootstrap response",
+    );
+  }
+  let retainedInSessionStorage = false;
   try {
     window.sessionStorage.setItem(BROWSER_BOOTSTRAP_STORAGE_KEY, JSON.stringify(context));
+    retainedInSessionStorage = true;
   } catch {
-    throw new DesktopContractErrorV2("OpenEvo could not retain its protected browser session");
+    // Some browser privacy modes disable sessionStorage. Keep the bootstrap
+    // fragment in place so the idempotent loopback bootstrap endpoint can be
+    // called again by a renderer retry without losing the local session.
   }
-  window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  if (retainedInSessionStorage) {
+    window.history.replaceState(null, "", `${window.location.pathname}${window.location.search}`);
+  }
   return context;
+}
+
+async function bootstrapBrowserSidecar(): Promise<DesktopBootstrapContextV2> {
+  const stored = readStoredBrowserBootstrap();
+  if (stored !== null) return stored;
+  if (browserBootstrapInFlight !== null) return browserBootstrapInFlight;
+
+  const attempt = requestBrowserSidecarBootstrap();
+  browserBootstrapInFlight = attempt;
+  try {
+    return await attempt;
+  } finally {
+    if (browserBootstrapInFlight === attempt) browserBootstrapInFlight = null;
+  }
 }
 
 const browserNativeBridge: ReleaseNativeBridgeV2 = {
@@ -258,34 +286,6 @@ const browserNativeBridge: ReleaseNativeBridgeV2 = {
 
 function defaultNativeBridge(): ReleaseNativeBridgeV2 {
   return isBrowserHostedReleaseRuntime() ? browserNativeBridge : tauriNativeBridge;
-}
-
-export async function registerBrowserSshHost(input: {
-  readonly host: string;
-  readonly port: number;
-  readonly username: string;
-}): Promise<string> {
-  if (!isBrowserHostedReleaseRuntime()) {
-    throw new DesktopContractErrorV2("Direct SSH server entry is available in the browser-hosted Desktop");
-  }
-  const bootstrap = validateDesktopBootstrapContextV2(
-    await bootstrapBrowserSidecar(),
-    DESKTOP_PRODUCT_RELEASE_CONTRACT,
-  );
-  const response = await window.fetch(`${bootstrap.endpoint}/openevo-native/browser/ssh-hosts`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-OpenEvo-Desktop-Session": bootstrap.session_token,
-    },
-    body: JSON.stringify({ schema_version: "2", ...input }),
-    cache: "no-store",
-    credentials: "omit",
-  });
-  if (!response.ok) {
-    throw new DesktopContractErrorV2("OpenEvo could not prepare the SSH server details");
-  }
-  return browserSshHostResponseSchema.parse(await response.json()).ssh_host_alias;
 }
 
 export async function stopReleaseDesktopProductProvider(): Promise<void> {
